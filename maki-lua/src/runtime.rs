@@ -1563,6 +1563,7 @@ struct LuaCommandCompletion {
     command_arguments: CoalescedLatest<CommandArgumentRequest>,
     command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
     sessions: Mutex<HashMap<CompletionSessionId, LuaCompletionSession>>,
+    next_session_id: AtomicU64,
 }
 
 struct LuaCompletionSession {
@@ -1580,10 +1581,12 @@ impl LuaCommandCompletion {
             .sessions
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let next_id = sessions.len() as u64 + 1;
-        let id = sessions
-            .get(&context.session_id)
-            .map_or(next_id, |session| session.id);
+        // Ids come from a counter rather than the map size so that adding
+        // entry removal later cannot reintroduce collisions.
+        let id = sessions.get(&context.session_id).map_or_else(
+            || self.next_session_id.fetch_add(1, Ordering::Relaxed),
+            |session| session.id,
+        );
         sessions.insert(
             context.session_id,
             LuaCompletionSession {
@@ -1736,6 +1739,7 @@ fn command_registrations(
                     command_arguments: command_arguments.clone(),
                     command_argument_lifecycle: command_argument_lifecycle.clone(),
                     sessions: Mutex::new(HashMap::new()),
+                    next_session_id: AtomicU64::new(1),
                 }) as Arc<dyn CommandCompletion>
             }),
         })
@@ -1923,6 +1927,32 @@ impl LuaRuntime {
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
+        // Drop the Lua completion/handler keys before removing the producer,
+        // so invalidation callbacks from Producer::remove can still reach live
+        // handlers.
+        if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>()
+            && let Some(cmds) = cmd_map.remove(name)
+        {
+            for (_, entry) in cmds {
+                if let Err(e) = self.lua.remove_registry_value(entry.handler) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop command handler key");
+                }
+                for key in [
+                    entry.argument_completion,
+                    entry.completion_on_highlight,
+                    entry.completion_on_accept,
+                    entry.completion_on_cancel,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Err(e) = self.lua.remove_registry_value(key) {
+                        tracing::warn!(plugin = name, error = %e, "failed to drop command completion key");
+                    }
+                }
+            }
+            drop(cmd_map);
+        }
         if let Some(producer) = self
             .command_producers
             .lock()
@@ -1998,29 +2028,6 @@ impl LuaRuntime {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua describe key");
                 }
             }
-        }
-        if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>()
-            && let Some(cmds) = cmd_map.remove(name)
-        {
-            for (_, entry) in cmds {
-                if let Err(e) = self.lua.remove_registry_value(entry.handler) {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop command handler key");
-                }
-                for key in [
-                    entry.argument_completion,
-                    entry.completion_on_highlight,
-                    entry.completion_on_accept,
-                    entry.completion_on_cancel,
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if let Err(e) = self.lua.remove_registry_value(key) {
-                        tracing::warn!(plugin = name, error = %e, "failed to drop command completion key");
-                    }
-                }
-            }
-            drop(cmd_map);
         }
         if let Some(mut hints) = self.lua.app_data_mut::<PromptHintCallbacks>()
             && let Some(regs) = hints.remove(name)
@@ -2324,6 +2331,7 @@ impl LuaRuntime {
 
         if let Err(e) = self.registry.replace_plugin(&name, registry_entries) {
             self.discard_pending(pending);
+            self.drop_plugin_keys(&name);
             return Err(match e {
                 RegistryError::NameConflict { name: n, .. } => PluginError::NameConflict {
                     plugin: name.to_string(),
