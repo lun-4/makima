@@ -960,7 +960,7 @@ impl MessagesPanel {
         // and the reflow changes the heights both are derived from: resolve
         // before to aim the window, and after to place the result.
         self.resolve_scroll(width, streaming_sum, has_selection);
-        self.reflow_viewport(width);
+        self.reflow_viewport(width, has_selection);
         let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
@@ -1490,8 +1490,11 @@ impl MessagesPanel {
     /// only after each segment is reflowed. Document offsets move as the
     /// reflow runs, so a window expressed in them would need repeated passes
     /// to settle; this one is right the first time.
-    fn reflow_viewport(&mut self, width: u16) {
-        let anchor = (!self.auto_scroll)
+    fn reflow_viewport(&mut self, width: u16, has_selection: bool) {
+        // `resolve_scroll` only pins to the bottom when it owns the scroll, so
+        // that is exactly when the viewport is the document tail.
+        let pinned_to_bottom = self.auto_scroll && !has_selection;
+        let anchor = (!pinned_to_bottom)
             .then(|| self.cache.anchor_at(self.scroll_top as u32, width))
             .flatten();
         let viewport = self.viewport_height as u32;
@@ -1499,9 +1502,14 @@ impl MessagesPanel {
         let below = viewport.saturating_add(margin);
         // Pinned to the bottom (or scrolled into the streaming tail): the
         // viewport is the last `below` lines, so the window is all above.
-        let (start, above) = match anchor {
-            Some((i, _)) => (i, margin),
-            None => (self.cache.len().saturating_sub(1), below),
+        //
+        // Anchored, the first visible row sits `rel` rows into the anchor
+        // segment, so the downward window has to clear those before it starts
+        // covering the viewport; counting from the segment's start instead
+        // leaves stale segments on screen whenever `rel` exceeds the margin.
+        let (start, above, below) = match anchor {
+            Some((i, rel)) => (i, margin, below.saturating_add(rel as u32)),
+            None => (self.cache.len().saturating_sub(1), below, below),
         };
         let len_before = self.cache.len();
 

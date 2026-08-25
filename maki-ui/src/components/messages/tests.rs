@@ -2468,6 +2468,53 @@ fn big_widen_keeps_no_stale_segment_in_the_viewport() {
     );
 }
 
+/// `scroll_top` sits inside the anchor segment, so a downward window measured
+/// from that segment's start can be consumed entirely by rows above the first
+/// visible one, leaving the screen full of segments still wrapped at the old
+/// width.
+#[test]
+fn resize_low_in_a_tall_segment_leaves_no_stale_segment_in_the_viewport() {
+    const VIEWPORT_HEIGHT: u16 = 10;
+    const TALL_LINES: usize = 100;
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let tall = (0..TALL_LINES)
+        .map(|i| format!("line {i:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, tall));
+    for i in 0..8 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("tail {i} {}", "x".repeat(60)),
+        ));
+    }
+    render(&mut panel, 80, VIEWPORT_HEIGHT);
+
+    // Five rows from the bottom of the tall first segment: the rest of the
+    // viewport is filled by the segments after it.
+    panel.set_scroll_top(TALL_LINES as u16 - 5);
+    render(&mut panel, 80, VIEWPORT_HEIGHT);
+    assert!(
+        !panel.auto_scroll(),
+        "the test must start anchored deep inside the tall segment"
+    );
+
+    render(&mut panel, 40, VIEWPORT_HEIGHT);
+
+    let top = panel.scroll_top() as u32;
+    let mut offset: u32 = 0;
+    for seg in panel.cache.segments() {
+        let h = seg.height(39) as u32;
+        let in_view = offset < top + VIEWPORT_HEIGHT as u32 && offset + h > top;
+        assert!(
+            !(in_view && seg.stale),
+            "a stale segment overlaps the viewport after resizing low in a tall segment"
+        );
+        offset += h;
+    }
+}
+
 #[test]
 fn anchored_resize_keeps_the_topmost_visible_segment() {
     let mut panel = MessagesPanel::new(
