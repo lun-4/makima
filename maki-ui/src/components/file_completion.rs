@@ -238,7 +238,11 @@ impl FileCompletionMenu {
         s.nucleo
             .pattern
             .reparse(0, query, CaseMatching::Smart, Normalization::Smart, false);
-        s.query = query.to_lowercase();
+        let query = query.to_lowercase();
+        if s.query != query {
+            s.file_matches.clear();
+        }
+        s.query = query;
         s.selected = 0;
         s.scroll_offset = 0;
 
@@ -266,7 +270,7 @@ impl FileCompletionMenu {
             KeyCode::Down => move_selection(s, 1),
             KeyCode::Left if !super::is_ctrl(&key) => move_column(s, -1),
             KeyCode::Right if !super::is_ctrl(&key) => move_column(s, 1),
-            _ if super::is_ctrl(&key) => return CompletionAction::Consumed,
+            _ if super::is_ctrl(&key) => return CompletionAction::Passthrough,
             _ => return CompletionAction::Passthrough,
         }
         CompletionAction::Consumed
