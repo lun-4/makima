@@ -92,18 +92,37 @@ local function rebase(drift, indent)
 end
 
 -- The model can write `old_string` sloppily and `new_string` in the file's own
--- frame, and then there is nothing left to correct.
+-- frame, and then there is nothing left to correct. Two independent signs of
+-- that, either one enough: every column the replacement uses is already a file
+-- column, or the replacement's base column is the file's one rather than the
+-- model's. The second matters because a replacement that adds a nesting level
+-- uses a column neither side has seen, which defeats the first on its own and
+-- would push the whole block a level deeper.
+--
+-- The bases only tell the frames apart when they differ; when they agree the
+-- drift is a widening of the inner levels, which the column test still catches
+-- and reindent has to correct otherwise.
 local function written_in_file_frame(drift, replacement)
-  local file_columns = {}
-  for _, file_indent in pairs(drift) do
+  local file_columns, model_base, file_base = {}, nil, nil
+  for model_indent, file_indent in pairs(drift) do
     file_columns[file_indent] = true
-  end
-  for _, line in ipairs(split_lines(replacement)) do
-    if trim(line) ~= "" and not file_columns[indent_of(line)] then
-      return false
+    if not model_base or #model_indent < #model_base then
+      model_base, file_base = model_indent, file_indent
     end
   end
-  return true
+
+  local every_column_known, replacement_base = true, nil
+  for _, line in ipairs(split_lines(replacement)) do
+    if trim(line) ~= "" then
+      local indent = indent_of(line)
+      every_column_known = every_column_known and file_columns[indent] ~= nil
+      if not replacement_base or #indent < #replacement_base then
+        replacement_base = indent
+      end
+    end
+  end
+
+  return every_column_known or (replacement_base == file_base and file_base ~= model_base)
 end
 
 -- Corrects exactly what the match forgave in `old_string`, and nothing else.

@@ -59,6 +59,37 @@ case("reindent_leaves_a_correct_new_string_alone", function()
   eq(result, "def f():\n    a = 1\n    return a\n\n\ndef g():\n    return 2\n")
 end)
 
+-- A replacement that adds a nesting level uses a column the file has never
+-- shown, so the "every column is a file column" test cannot recognise the
+-- frame on its own and the whole block used to sink a level.
+case("reindent_leaves_a_file_frame_new_string_that_adds_a_level_alone", function()
+  local content = "def f():\n    if x:\n        a()\n    return 1\n"
+  local new = "    if x:\n        if y:\n            a()"
+  local result = fr.replace(content, "if x:\na()", new, false)
+  eq(result, "def f():\n    if x:\n        if y:\n            a()\n    return 1\n")
+end)
+
+case("reindent_still_rebases_a_model_frame_new_string_that_adds_a_level", function()
+  local content = "def f():\n    if x:\n        a()\n    return 1\n"
+  local new = "if x:\n    if y:\n        a()"
+  local result = fr.replace(content, "if x:\na()", new, false)
+  eq(result, "def f():\n    if x:\n        if y:\n            a()\n    return 1\n")
+end)
+
+-- Bases agree here, so only the columns tell the frames apart: the file's own
+-- widths are already in `new_string`, nothing to correct.
+case("reindent_leaves_a_file_frame_new_string_alone_when_only_widths_drifted", function()
+  local content = "if x:\n    a()\n"
+  local result = fr.replace(content, "if x:\n  a()", "if x:\n    a()\n    b()", false)
+  eq(result, "if x:\n    a()\n    b()\n")
+end)
+
+case("reindent_widens_inner_levels_when_the_base_column_is_shared", function()
+  local content = "if x:\n    a()\n"
+  local result = fr.replace(content, "if x:\n  a()", "if x:\n  a()\n  b()", false)
+  eq(result, "if x:\n    a()\n    b()\n")
+end)
+
 case("reindent_leaves_a_line_that_exits_the_block_alone", function()
   local content = "def f():\n    a = 1\n    return a\n"
   local new = "  a = 1\n  return a\n\n\ndef g():\n  return 2"
