@@ -1483,7 +1483,32 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         );
     }
 
-    crate::runtime::publish_registered_commands(lua, &plugin)?;
+    if let Err(error) = crate::runtime::publish_registered_commands(lua, &plugin) {
+        // The registry rejected the batch (invalid name, duplicate spelling);
+        // roll the entry back so later registrations from this plugin are not
+        // poisoned by it.
+        if let Some(mut map) = lua.app_data_mut::<CommandHandlerMap>() {
+            let commands = map.entry(Arc::clone(&plugin)).or_default();
+            if let Some(entry) = commands.remove(&name) {
+                let _ = lua.remove_registry_value(entry.handler);
+                for key in [
+                    entry.argument_completion,
+                    entry.completion_on_highlight,
+                    entry.completion_on_accept,
+                    entry.completion_on_cancel,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let _ = lua.remove_registry_value(key);
+                }
+            }
+            if commands.is_empty() {
+                map.remove(&plugin);
+            }
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
