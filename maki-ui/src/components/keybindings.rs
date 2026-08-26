@@ -155,6 +155,11 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+O",
     };
+    pub const DEFER_INPUT: Bind = Bind {
+        code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+M",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -460,6 +465,12 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::EDIT_INPUT.label),
         description: "Edit input in external editor",
         context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::DEFER_INPUT.label),
+        description: "Defer an input prompt, press again to restore",
+        context: KeybindContext::General,
         platform: Platform::All,
     },
     Keybind {
