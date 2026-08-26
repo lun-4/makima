@@ -768,12 +768,30 @@ impl App {
         }
     }
 
+    fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
+        if self
+            .command_palette
+            .sync_arguments(input, cursor, &self.state.mode.id_key())
+        {
+            self.command_runtime
+                .finish_theme_preview(self.command_target, false);
+        }
+    }
+
+    fn close_command_palette(&mut self) {
+        if self.command_palette.has_accepted_argument() {
+            self.command_runtime
+                .finish_theme_preview(self.command_target, false);
+        }
+        self.command_palette.close();
+    }
+
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !is_ctrl(&key) {
             return None;
         }
         if key::QUIT.matches(key) {
-            self.command_palette.close();
+            self.close_command_palette();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
                     return Some(self.handle_cancel());
@@ -914,10 +932,9 @@ impl App {
                         self.input_box.handle_paste_with_spaces(&path)
                     {
                         self.command_palette.sync(&val);
-                        self.command_palette.sync_arguments(
+                        self.sync_command_arguments(
                             &val,
                             self.input_box.buffer.cursor_byte_offset(),
-                            &self.state.mode.id_key(),
                         );
                         self.sync_file_completion();
                     }
@@ -1191,11 +1208,7 @@ impl App {
                 self.start_image_paste();
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
                 self.command_palette.sync(&val);
-                self.command_palette.sync_arguments(
-                    &val,
-                    self.input_box.buffer.cursor_byte_offset(),
-                    &self.state.mode.id_key(),
-                );
+                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
                 self.sync_file_completion();
             }
             return vec![];
@@ -1208,11 +1221,7 @@ impl App {
             CommandAction::Consumed => return vec![],
             CommandAction::SelectionChanged => {
                 let input = self.input_box.buffer.value();
-                self.command_palette.sync_arguments(
-                    &input,
-                    self.input_box.buffer.cursor_byte_offset(),
-                    &self.state.mode.id_key(),
-                );
+                self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
                 return vec![];
             }
             CommandAction::Execute(cmd) => {
@@ -1237,8 +1246,7 @@ impl App {
                 self.refresh_at_ref_labels(&text);
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
-                self.command_palette
-                    .sync_arguments(&text, cursor, &self.state.mode.id_key());
+                self.sync_command_arguments(&text, cursor);
                 return vec![];
             }
             CommandAction::Passthrough => {}
@@ -1267,11 +1275,7 @@ impl App {
             }
             InputAction::PaletteSync(val) => {
                 self.command_palette.sync(&val);
-                self.command_palette.sync_arguments(
-                    &val,
-                    self.input_box.buffer.cursor_byte_offset(),
-                    &self.state.mode.id_key(),
-                );
+                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
                 self.sync_file_completion();
                 vec![]
             }
@@ -1404,11 +1408,7 @@ impl App {
             .replace_range_on_current_line(start, end, &replacement);
         let val = self.input_box.buffer.value();
         self.command_palette.sync(&val);
-        self.command_palette.sync_arguments(
-            &val,
-            self.input_box.buffer.cursor_byte_offset(),
-            &self.state.mode.id_key(),
-        );
+        self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
     }
 
     /// Typing path for a focused subagent tab: characters go into the shared
@@ -2273,7 +2273,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
-        self.command_palette.close();
+        self.close_command_palette();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
 
@@ -2425,11 +2425,7 @@ impl App {
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
             self.command_palette.sync(&val);
-            self.command_palette.sync_arguments(
-                &val,
-                self.input_box.buffer.cursor_byte_offset(),
-                &self.state.mode.id_key(),
-            );
+            self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
             self.sync_file_completion();
         }
     }

@@ -254,25 +254,25 @@ impl CommandPalette {
         self.selected = 0;
     }
 
-    pub fn sync_arguments(&mut self, input: &str, cursor: usize, mode: &str) {
+    pub fn sync_arguments(&mut self, input: &str, cursor: usize, mode: &str) -> bool {
         self.argument_generation = self.argument_generation.wrapping_add(1);
         self.argument_range = None;
         self.pending_arguments = None;
         if self.accepted_argument_input.as_deref() == Some(input) {
-            return;
+            return false;
         }
-        self.accepted_argument_input = None;
+        let abandoned = self.accepted_argument_input.take().is_some();
         let Some(command) = self
             .filtered
             .get(self.selected)
             .map(|item| item.command.clone())
         else {
             self.cancel_arguments();
-            return;
+            return abandoned;
         };
         let Some((start, end, argument, index)) = argument_at_cursor(input, cursor) else {
             self.cancel_arguments();
-            return;
+            return abandoned;
         };
         let same_session = self.completion_session.as_ref().is_some_and(|session| {
             session.command().command_id() == command.command_id()
@@ -285,7 +285,7 @@ impl CommandPalette {
         }
         let Some(session) = self.completion_session.clone() else {
             self.argument_items.clear();
-            return;
+            return abandoned;
         };
         let (tx, rx) = flume::bounded(1);
         let request = session.complete(
@@ -304,6 +304,7 @@ impl CommandPalette {
             query: argument,
             range: (start, end),
         });
+        abandoned
     }
 
     pub fn poll_arguments(&mut self) -> Dirty {
@@ -485,6 +486,10 @@ impl CommandPalette {
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
         // Argument items survive here: sync_arguments follows every sync
         // and clears them when their session ends.
+    }
+
+    pub fn has_accepted_argument(&self) -> bool {
+        self.accepted_argument_input.is_some()
     }
 
     pub fn close(&mut self) {
