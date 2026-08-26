@@ -365,6 +365,7 @@ pub fn run(
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
+    let terminal_result_emitted = std::cell::Cell::new(false);
     let runner = |input: AgentInput| {
         let handle = maki_agent::headless::spawn(HeadlessParams {
             model: model.clone(),
@@ -552,6 +553,7 @@ pub fn run(
                     }
                     _ => println!("{}", serde_json::to_string(&result)?),
                 }
+                terminal_result_emitted.set(true);
             }
         }
 
@@ -563,9 +565,10 @@ pub fn run(
         }
     };
     let outcome = drive_print(&command_registry, &sink, literal, runner);
-    if let (Err(error), true) = (
+    if let (Err(error), true, false) = (
         &outcome,
         matches!(format, OutputFormat::Json | OutputFormat::StreamJson),
+        terminal_result_emitted.get(),
     ) {
         let result = PrintResult {
             result_type: "result",
