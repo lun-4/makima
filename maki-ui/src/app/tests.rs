@@ -1056,6 +1056,19 @@ fn reset_session_clears_plan() {
 }
 
 #[test]
+fn replacing_session_rotates_command_target() {
+    let mut app = test_app();
+    let reset_target = app.command_target;
+
+    app.reset_session();
+    assert_ne!(app.command_target, reset_target);
+
+    let load_target = app.command_target;
+    app.apply_loaded_session(AppSession::new("test-model", "/tmp/test"), &test_model());
+    assert_ne!(app.command_target, load_target);
+}
+
+#[test]
 fn reset_session_assigns_new_plan_path_in_plan_mode() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;

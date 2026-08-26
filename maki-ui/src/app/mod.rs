@@ -786,6 +786,14 @@ impl App {
         self.command_palette.close();
     }
 
+    fn rotate_command_target(&mut self) {
+        self.command_runtime
+            .finish_theme_preview(self.command_target, false);
+        self.command_target = self.command_runtime.registry.create_target();
+        self.command_palette =
+            CommandPalette::new(self.command_runtime.registry.clone(), self.command_target);
+    }
+
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !is_ctrl(&key) {
             return None;
