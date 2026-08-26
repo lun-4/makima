@@ -1571,11 +1571,13 @@ fn top_bar_shows_active_chat_running_count_and_cwd() {
     // One running subagent besides the main chat.
     assert!(bar.contains("1 tasks"), "running count: {bar}");
     assert!(bar.contains(kb::TASKS.label), "ctrl-x hint: {bar}");
-    // cwd:branch lives on the right, sourced from the status bar's cache.
-    assert!(
-        bar.contains(app.status_bar.cwd_branch()),
-        "cwd shown: {bar}"
-    );
+    // The right side may truncate the cwd, but the branch should remain visible.
+    let branch = app
+        .status_bar
+        .cwd_branch()
+        .rsplit_once(':')
+        .map_or_else(|| app.status_bar.cwd_branch(), |(_, branch)| branch);
+    assert!(bar.contains(branch), "branch shown: {bar}");
     // No per-subagent rows in the bar.
     assert!(!bar.contains("research"), "no name rows: {bar}");
 
