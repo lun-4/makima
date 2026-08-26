@@ -772,11 +772,12 @@ impl<'t> EventLoop<'t> {
     /// every tool result reaches disk within a frame while an idle session
     /// writes nothing.
     fn handle_command(&mut self, command: RoutedCommand) {
-        let Some(index) = self
-            .sessions
-            .iter()
-            .position(|runtime| runtime.app.command_target == command.target)
-        else {
+        let Some(index) = command_target_index(
+            self.sessions
+                .iter()
+                .map(|runtime| runtime.app.command_target),
+            command.target,
+        ) else {
             command
                 .lifecycle
                 .transition(maki_commands::CommandClassification::Failed(
@@ -1757,6 +1758,15 @@ impl<'t> EventLoop<'t> {
     }
 }
 
+fn command_target_index(
+    targets: impl IntoIterator<Item = maki_commands::InvocationTargetId>,
+    target: maki_commands::InvocationTargetId,
+) -> Option<usize> {
+    targets
+        .into_iter()
+        .position(|candidate| candidate == target)
+}
+
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     if kind == MouseEventKind::ScrollUp {
         lines as i32
@@ -1795,6 +1805,16 @@ mod tests {
         state.on_done(&done_event());
         state.on_drain();
         state
+    }
+
+    #[test]
+    fn command_routing_rejects_retired_target_after_session_replacement() {
+        let registry = maki_commands::CommandRegistry::new();
+        let retired = registry.create_target();
+        let live = registry.create_target();
+
+        assert_eq!(command_target_index([live], retired), None);
+        assert_eq!(command_target_index([live], live), Some(0));
     }
 
     #[test]
