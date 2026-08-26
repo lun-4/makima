@@ -13,6 +13,9 @@
 -- applies to real renders: expect roughly lua5.1/5 ms/frame there, plus the
 -- Rust-side per-segment parse the lua5.1 bench does not see. The script also
 -- prints that codegen estimate.
+--
+-- For real-VM numbers (same CLI, Luau + codegen, safeenv envs), run:
+--   cargo run -p maki-lua --example splash_bench -- --dir DIR name...
 
 local DIR = "."
 local SIZES = { { 80, 24 }, { 200, 79 } }
