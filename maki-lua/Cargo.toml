@@ -97,3 +97,7 @@ tracing-subscriber = { workspace = true }
 [[bench]]
 name = "luau_perf"
 harness = false
+
+[[bench]]
+name = "splash_perf"
+harness = false

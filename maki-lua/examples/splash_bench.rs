@@ -3,7 +3,8 @@
 // O2 compiler, sandbox, memory limit, and safeenv-marked envs (runtime.rs
 // build_env), so the reported numbers are the ones maki actually renders with.
 // The Rust-side per-segment parse is not included; see
-// maki-lua/tests/splash_bench.rs pull_roundtrip_200x79 for the full host.
+// maki-lua/benches/splash_perf.rs (pull_roundtrip_200x79 group) for the full
+// host meter.
 //
 //   cargo run -p maki-lua --example splash_bench -- [--dir DIR] [--sizes WxH[,WxH...]] [--budget SECS] name...
 
@@ -232,7 +233,7 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "measured on Luau with native codegen (safeenv envs, matches the plugin runtime); the Rust-side per-segment parse is excluded (see maki-lua/tests/splash_bench.rs pull_roundtrip_200x79). fps@60 means the frame fits in a 60hz tick."
+        "measured on Luau with native codegen (safeenv envs, matches the plugin runtime); the Rust-side per-segment parse is excluded (see maki-lua/benches/splash_perf.rs pull_roundtrip_200x79). fps@60 means the frame fits in a 60hz tick."
     );
     ExitCode::SUCCESS
 }

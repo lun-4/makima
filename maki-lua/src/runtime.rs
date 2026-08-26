@@ -1896,7 +1896,7 @@ impl LuaRuntime {
         // the VM only enters compiled code when the function's env is a safe
         // table (CHECK_SAFE_ENV at native entry), and every plugin chunk loads
         // with this env. Without it WarmJit compiles chunks that never run
-        // natively; see maki-lua/tests/splash_bench.rs env_d_late_codegen.
+        // natively; see maki-lua/benches/splash_perf.rs env_codegen_200x79.
         env.set_safeenv(true);
         env.set("maki", maki)?;
 

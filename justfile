@@ -9,7 +9,7 @@ build *ARGS:
 
 # Types only, no codegen, no lints. Add `-p <crate>` to make it cheaper still.
 check *ARGS:
-    cargo check --workspace --tests {{ARGS}}
+    cargo check --workspace --tests --benches {{ARGS}}
 
 run *ARGS:
     cargo run {{ARGS}}
@@ -18,10 +18,10 @@ test *ARGS:
     cargo nextest run --workspace {{ARGS}}
 
 lint:
-    cargo clippy --all --tests -- -D warnings
+    cargo clippy --all --tests --benches -- -D warnings
 
 lint-fix:
-    cargo clippy --all --tests --fix
+    cargo clippy --all --tests --benches --fix
 
 fmt-check:
     cargo fmt --all -- --check
@@ -43,6 +43,11 @@ gen-docs-check:
 
 machete:
     cargo machete
+
+# Criterion benches (maki-lua: luau_perf, splash_perf). Pass a filter to pick
+# one, e.g. `just bench -- pull_roundtrip`; slow meters are sample_size 10.
+bench *ARGS:
+    cargo bench -p maki-lua {{ARGS}}
 
 # Full CI check
 ci: fmt-check lint pylint test gen-docs-check machete

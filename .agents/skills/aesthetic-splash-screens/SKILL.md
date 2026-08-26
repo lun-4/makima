@@ -105,8 +105,15 @@ end)
    Real maki renders compile to native (plugin envs are marked safe via
    `lua_setsafeenv`, so luau codegen applies) and pay a Rust-side parse that
    scales with segment count; the example measures the compiled Lua but not
-   that parse (see `maki-lua/tests/splash_bench.rs`
-   `pull_roundtrip_200x79` for the full-host meter). The per-cell output
+   that parse. For the full-host meter (render + parse, per splash at 200x79)
+   run the criterion bench:
+
+   ```bash
+   cargo bench -p maki-lua --bench splash_perf -- pull_roundtrip
+   ```
+
+   `splash_perf` also holds the raw-interp-vs-codegen and safeenv codegen
+   regression meters (`cargo bench -p maki-lua --bench splash_perf`). The per-cell output
    path (quantize + ramp + segment coalescing) is the common floor;
    sampled-grid bilinear rendering (caustics-style, `SAMPLE_STEP`) cuts
    shade cost ~4x for smooth fields but smears steep gradients (metaballs
