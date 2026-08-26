@@ -836,3 +836,93 @@ fn timer_registered_from_config_does_not_block_boot() {
     // on the pump once the loop is running.
     wait_for_ticks(&guard, TIMER_TICKS_REL, 1);
 }
+
+const SPLASH_FPS_PREFIX: &str = "splash ";
+
+fn hint_text(reader: &maki_lua::HintReader) -> Option<String> {
+    reader
+        .load_full()
+        .entries
+        .iter()
+        .flat_map(|(_, pairs)| pairs.iter().map(|(text, _)| text.as_str()))
+        .find(|text| text.starts_with(SPLASH_FPS_PREFIX))
+        .map(str::to_owned)
+}
+
+fn wait_for_hint(reader: &maki_lua::HintReader, want: bool) -> Option<String> {
+    let start = Instant::now();
+    loop {
+        let text = hint_text(reader);
+        if text.is_some() == want {
+            return text;
+        }
+        assert!(
+            start.elapsed() < SPLASH_DEADLINE,
+            "fps readout never {}",
+            if want { "appeared" } else { "cleared" }
+        );
+        std::thread::sleep(SPLASH_BACKOFF);
+    }
+}
+
+#[test]
+fn splash_fps_overlay_toggles_through_store_and_readout() {
+    let (handle, guard) =
+        maki_lua::test_support::spawn_host_for_tests(&["perf", "splashes_default"]);
+    let hints = guard.host().hint_reader();
+    assert_eq!(hint_text(&hints), None, "overlay starts off");
+
+    // Drive real renders through the host before toggling: timings must see
+    // them, or the readout would show a dead pipeline (regression: PerfInfo
+    // was never seeded, so fps stayed 0 no matter what the splash did).
+    for _ in 0..3 {
+        let start = Instant::now();
+        loop {
+            if handle.splash_frame(80, 20, 10.0, 1.0).is_some() {
+                break;
+            }
+            assert!(
+                start.elapsed() < SPLASH_DEADLINE,
+                "blocking pull must render"
+            );
+            std::thread::sleep(SPLASH_BACKOFF);
+        }
+    }
+    guard
+        .host()
+        .load_source(
+            "perf-probe",
+            r#"local t = maki.perf.timings()
+               assert(t.fps >= 1, "host renders land in the fps window")"#,
+        )
+        .expect("timings reflect real renders");
+
+    let toggle = || {
+        handle.run_command(
+            Arc::from("perf"),
+            Arc::from("/splash-fps"),
+            String::new(),
+            0,
+        );
+    };
+
+    toggle();
+    let text = wait_for_hint(&hints, true).expect("readout after enable");
+    assert!(text.contains("fps"), "readout text: {text}");
+
+    let store_state = guard.host().load_source(
+        "perf-probe-flag",
+        r#"assert(maki.store.collect("perf").fps_overlay == true, "store flag not set")"#,
+    );
+    store_state.expect("enable flag lands in the store");
+
+    toggle();
+    wait_for_hint(&hints, false);
+    guard
+        .host()
+        .load_source(
+            "perf-probe-clear",
+            r#"assert(maki.store.collect("perf").fps_overlay == false, "store flag not cleared")"#,
+        )
+        .expect("disable flag lands in the store");
+}

@@ -516,12 +516,6 @@ pub enum UiAction {
     WinRestView {
         scroll_top: u16,
     },
-    /// Toggles the splash fps overlay: a live fps/round-trip readout drawn
-    /// into the top of the input bar. Set from Lua (`maki.perf`); the UI
-    /// measures frame arrivals itself, so the flag only rides the channel.
-    SplashFpsOverlay {
-        enabled: bool,
-    },
     Builtin(BuiltinAction),
     /// `reply_tx` answers whether {cmdline} resolved to a known command, not
     /// how the command itself went: `/compact` streams for a minute, and the

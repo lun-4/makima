@@ -301,7 +301,6 @@ impl App {
                 .then(|| self.plan_form.hint_line())
                 .flatten()
                 .or_else(|| self.lua_hint_line());
-            let panel_hint = self.main_chat().splash_debug_line().or(panel_hint);
             self.input_box.view(
                 frame,
                 layout.input_area,

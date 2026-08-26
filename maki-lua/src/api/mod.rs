@@ -112,7 +112,7 @@ pub(crate) fn create_maki_global(
         timer::create_timer_table(lua, Arc::clone(&plugin))?,
     )?;
     maki.set("time", time::create_time_table(lua)?)?;
-    maki.set("perf", perf::create_perf_table(lua, ui_action_tx.clone())?)?;
+    maki.set("perf", perf::create_perf_table(lua)?)?;
     crate::splash::register_version_api(lua, &maki)?;
 
     Ok(maki)

@@ -1561,6 +1561,7 @@ impl LuaRuntime {
         lua.set_app_data(Store::default());
         lua.set_app_data(SlotStore::default());
         lua.set_app_data(crate::splash::VersionInfo::default());
+        lua.set_app_data(crate::splash::PerfInfo::default());
         lua.set_app_data(KeymapStore::new());
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
@@ -2777,6 +2778,7 @@ fn splash_frame(
     )
     .with_kill_grace(SPLASH_RENDER_KILL_GRACE);
     let scope = TaskScope::new(lua, cell);
+    let started = Instant::now();
     let frame: Option<crate::splash::SplashFrame> =
         match crate::api::slot::invoke_slot_from_host(lua, "splash.render", args) {
             Err(e) => {
@@ -2797,6 +2799,9 @@ fn splash_frame(
             }),
         };
     drop(scope);
+    if let Some(mut perf) = lua.app_data_mut::<crate::splash::PerfInfo>() {
+        perf.record_render(started.elapsed());
+    }
     frame
 }
 

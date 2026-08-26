@@ -1,104 +1,72 @@
-//! `maki.perf`: opt-in performance instrumentation for the interactive UI.
-//! Nothing here runs unless a plugin calls it; every helper is a readout or
-//! overlay that the plugin turns on and off itself.
+//! `maki.perf`: performance instrumentation for the interactive UI. The host
+//! measures splash renders; plugins read the numbers and draw their own
+//! readouts (the bundled `perf` plugin turns one on from Lua).
 
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Lua, Result as LuaResult};
+use mlua::{Lua, Result as LuaResult, Table};
 
-use crate::api::util::command::{UiAction, ui_send};
-use crate::api::util::pair::{Pair, try_pair};
-
-/// Turns on the splash fps overlay: a live readout drawn into the top of
-/// the input bar showing the current splash's frame rate and the UI-side
-/// round-trip time per frame (from request to arrived frame, smoothed).
+/// Read the splash render timings the host measured: how long the most
+/// recent `splash.render` invocation took and how many renders completed in
+/// the trailing second. The numbers come from the host that drives the
+/// render, so they include the whole call (queue wait, warm-up, deadline)
+/// and need no instrumentation inside the splash itself.
 ///
-/// The numbers come from actual frame arrivals, so a renderer that claims
-/// smooth animation but delivers few frames shows up as low fps, and a slow
-/// `splash.render` shows up as a high round-trip. A still splash settles to
-/// `0 fps` once nothing animates, which is the point: it proves the splash is
-/// not burning CPU. The overlay also refreshes the readout about four times
-/// a second while enabled, so disable it once you are done measuring.
+/// A still splash settles to `0 fps` once nothing animates, which is the
+/// point: it proves the splash is not burning CPU.
 ///
-/// @return (boolean|nil, string|nil) `true` once the UI accepted the toggle,
-/// or nil and an error without an interactive UI attached.
+/// @return (table) `{ render_ms = number, fps = number }`.
 /// @example
-/// maki.perf.enable_splash_fps_overlay()
+/// local t = maki.perf.timings()
 #[lua_fn]
-fn enable_splash_fps_overlay(
-    _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-) -> LuaResult<Pair<bool>> {
-    try_pair!(ui_send(
-        tx.as_ref(),
-        UiAction::SplashFpsOverlay { enabled: true }
-    ));
-    Ok((Some(true), None))
-}
-
-/// Turns the splash fps overlay back off, hiding the fps readout and
-/// stopping its periodic refreshes.
-///
-/// @return (boolean|nil, string|nil) `true` once the UI accepted the toggle,
-/// or nil and an error without an interactive UI attached.
-/// @example
-/// maki.perf.disable_splash_fps_overlay()
-#[lua_fn]
-fn disable_splash_fps_overlay(
-    _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
-) -> LuaResult<Pair<bool>> {
-    try_pair!(ui_send(
-        tx.as_ref(),
-        UiAction::SplashFpsOverlay { enabled: false }
-    ));
-    Ok((Some(true), None))
+fn timings(lua: &Lua) -> LuaResult<Table> {
+    let perf = lua
+        .app_data_ref::<crate::splash::PerfInfo>()
+        .as_deref()
+        .cloned()
+        .unwrap_or_default();
+    let t = lua.create_table()?;
+    t.set("render_ms", perf.render_ms)?;
+    t.set("fps", perf.fps())?;
+    Ok(t)
 }
 
 lua_table! {
-    /// Performance readouts for splashes and the UI. Each function turns an
-    /// opt-in instrument on and off; none of them run on their own.
-    "maki.perf" => pub(crate) fn create_perf_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [enable_splash_fps_overlay(tx), disable_splash_fps_overlay(tx)]
+    /// Performance instrumentation for splashes and the UI. The host
+    /// measures splash renders; plugins read the timings and draw their own
+    /// readouts.
+    "maki.perf" => pub(crate) fn create_perf_table(), DOCS [timings]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::util::command::NO_UI_ERR;
-    use mlua::Value;
+    use crate::splash::PerfInfo;
+    use std::time::Duration;
 
-    fn perf_table(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn timings(lua: &Lua) -> Table {
+        let perf = create_perf_table(lua).unwrap();
+        let call: mlua::Function = perf.get("timings").unwrap();
+        call.call(()).unwrap()
+    }
+
+    #[test]
+    fn timings_without_host_records_zeros() {
         let lua = Lua::new();
-        let t = create_perf_table(&lua, tx).unwrap();
-        lua.globals().set("perf", t).unwrap();
-        lua
+        let t = timings(&lua);
+        assert_eq!(t.get::<f32>("render_ms").unwrap(), 0.0);
+        assert_eq!(t.get::<f32>("fps").unwrap(), 0.0);
     }
 
     #[test]
-    fn splash_fps_overlay_without_ui_returns_error_pair() {
-        let (val, err): (Value, Option<String>) = perf_table(None)
-            .load("return perf.enable_splash_fps_overlay()")
-            .eval()
-            .unwrap();
-        assert!(val.is_nil());
-        assert_eq!(err.as_deref(), Some(NO_UI_ERR));
-    }
-
-    #[test]
-    fn splash_fps_overlay_roundtrips_toggle_through_ui_channel() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = perf_table(Some(tx));
-        lua.load("perf.enable_splash_fps_overlay()").exec().unwrap();
-        lua.load("perf.disable_splash_fps_overlay()")
-            .exec()
-            .unwrap();
-        let (a, b) = (rx.recv().unwrap(), rx.recv().unwrap());
-        assert!(matches!(
-            (a, b),
-            (
-                UiAction::SplashFpsOverlay { enabled: true },
-                UiAction::SplashFpsOverlay { enabled: false }
-            )
-        ));
+    fn timings_roundtrip_host_recorded_renders() {
+        let lua = Lua::new();
+        let mut perf = PerfInfo::default();
+        for _ in 0..3 {
+            perf.record_render(Duration::from_millis(7));
+        }
+        lua.set_app_data(perf);
+        let t = timings(&lua);
+        assert_eq!(t.get::<f32>("render_ms").unwrap(), 7.0);
+        assert_eq!(t.get::<f32>("fps").unwrap(), 3.0);
     }
 }

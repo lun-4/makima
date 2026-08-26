@@ -85,7 +85,7 @@ The rules:
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
 | [`maki.api`](#maki-api) | Plugin registration. |
-| [`maki.perf`](#maki-perf) | Performance readouts for splashes and the UI. |
+| [`maki.perf`](#maki-perf) | Performance instrumentation for splashes and the UI. |
 | [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -844,55 +844,33 @@ end
 
 ## maki.perf {#maki-perf}
 
-Performance readouts for splashes and the UI. Each function turns an
-opt-in instrument on and off; none of them run on their own.
+Performance instrumentation for splashes and the UI. The host
+measures splash renders; plugins read the timings and draw their own
+readouts.
 
 ---
 
-### `maki.perf.enable_splash_fps_overlay()` {#maki-perf-enable_splash_fps_overlay}
+### `maki.perf.timings()` {#maki-perf-timings}
 
 ```lua
-maki.perf.enable_splash_fps_overlay()
+maki.perf.timings()
 ```
 
-Turns on the splash fps overlay: a live readout drawn into the top of
-the input bar showing the current splash's frame rate and the UI-side
-round-trip time per frame (from request to arrived frame, smoothed).
+Read the splash render timings the host measured: how long the most
+recent `splash.render` invocation took and how many renders completed in
+the trailing second. The numbers come from the host that drives the
+render, so they include the whole call (queue wait, warm-up, deadline)
+and need no instrumentation inside the splash itself.
 
-The numbers come from actual frame arrivals, so a renderer that claims
-smooth animation but delivers few frames shows up as low fps, and a slow
-`splash.render` shows up as a high round-trip. A still splash settles to
-`0 fps` once nothing animates, which is the point: it proves the splash is
-not burning CPU. The overlay also refreshes the readout about four times
-a second while enabled, so disable it once you are done measuring.
+A still splash settles to `0 fps` once nothing animates, which is the
+point: it proves the splash is not burning CPU.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` once the UI accepted the toggle,
-or nil and an error without an interactive UI attached.
+**Returns:** (`table`) `{ render_ms = number, fps = number }`.
 
 **Example:**
 
 ```lua
-maki.perf.enable_splash_fps_overlay()
-```
-
----
-
-### `maki.perf.disable_splash_fps_overlay()` {#maki-perf-disable_splash_fps_overlay}
-
-```lua
-maki.perf.disable_splash_fps_overlay()
-```
-
-Turns the splash fps overlay back off, hiding the fps readout and
-stopping its periodic refreshes.
-
-**Returns:** (`boolean|nil`, `string|nil`) `true` once the UI accepted the toggle,
-or nil and an error without an interactive UI attached.
-
-**Example:**
-
-```lua
-maki.perf.disable_splash_fps_overlay()
+local t = maki.perf.timings()
 ```
 
 

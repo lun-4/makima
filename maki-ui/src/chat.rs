@@ -19,7 +19,6 @@ use maki_providers::{ContentBlock, Message, Role};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-use ratatui::text::Line;
 
 use crate::repaint::{Cadence, Dirty};
 use crate::theme::ThemesProvider;
@@ -266,14 +265,6 @@ impl Chat {
 
     pub(crate) fn set_splash_frame(&mut self, frame: Option<maki_lua::SplashFrame>) {
         self.messages_panel.set_splash_frame(frame);
-    }
-
-    pub(crate) fn set_splash_debug_overlay(&mut self, enabled: bool) {
-        self.messages_panel.set_splash_debug_overlay(enabled);
-    }
-
-    pub(crate) fn splash_debug_line(&self) -> Option<Line<'static>> {
-        self.messages_panel.splash_debug_line()
     }
 
     #[doc(hidden)]
