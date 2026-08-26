@@ -55,6 +55,7 @@ pub enum InputAction {
     Submit(Submission),
     ContinueLine,
     PaletteSync(String),
+    CursorMoved,
     Passthrough(KeyEvent),
     None,
 }
@@ -101,11 +102,11 @@ impl InputBox {
         match key.code {
             KeyCode::Up if self.is_at_first_line() => {
                 self.history_up();
-                return InputAction::None;
+                return InputAction::PaletteSync(self.buffer.value());
             }
             KeyCode::Down if self.is_at_last_line() => {
                 self.history_down();
-                return InputAction::None;
+                return InputAction::PaletteSync(self.buffer.value());
             }
             KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
             _ if is_newline_key(&key) => {
@@ -127,7 +128,8 @@ impl InputBox {
 
         match self.buffer.handle_key(key) {
             EditResult::Changed => InputAction::PaletteSync(self.buffer.value()),
-            EditResult::Moved | EditResult::Ignored => InputAction::None,
+            EditResult::Moved => InputAction::CursorMoved,
+            EditResult::Ignored => InputAction::None,
         }
     }
 

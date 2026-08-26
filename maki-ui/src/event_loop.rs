@@ -679,6 +679,9 @@ impl<'t> EventLoop<'t> {
         let mut dirty = Dirty::YES;
         let result = loop {
             dirty |= self.tick();
+            if self.sessions[self.focused].app.take_pending_bell() {
+                ring_bell();
+            }
             match self.drain_channels() {
                 Ok(d) => dirty |= d,
                 Err(e) => break Err(e),
@@ -867,6 +870,9 @@ impl<'t> EventLoop<'t> {
         }
         let actions = self.sessions[idx].app.update(Msg::Agent(envelope));
         self.dispatch(idx, actions);
+        if self.sessions[idx].app.take_pending_bell() {
+            ring_bell();
+        }
     }
 
     fn drain_channels(&mut self) -> Result<Dirty> {
@@ -950,12 +956,10 @@ impl<'t> EventLoop<'t> {
                 cmd_rx,
             } => {
                 let app = self.focused_app();
-                let ring = app.bell_on_ask(config.needs_input);
-                app.float_mgr.open(buf, config, focus, event_tx, cmd_rx);
-                if focus {
-                    app.transition_plan(crate::app::mode::PlanTrigger::InteractivePrompt);
-                }
-                if ring {
+                app.handle_open_win(buf, config, focus, event_tx, cmd_rx);
+                // An active (non-deferred) ask rings now; a deferred one rings
+                // on promotion. Draining here keeps the active path immediate.
+                if app.take_pending_bell() {
                     ring_bell();
                 }
             }
@@ -1382,6 +1386,9 @@ impl<'t> EventLoop<'t> {
             if let Some(msg) = msg {
                 let actions = self.sessions[self.focused].app.update(msg);
                 self.dispatch(self.focused, actions);
+                if self.sessions[self.focused].app.take_pending_bell() {
+                    ring_bell();
+                }
             }
             pending = leftover;
         }

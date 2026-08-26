@@ -27,7 +27,7 @@ use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use test_case::test_case;
 
@@ -1829,7 +1829,7 @@ fn top_bar_shows_active_chat_running_count_and_cwd() {
         "task3",
         Some("third"),
     ));
-    let rows = rendered_rows(&mut app, 80, 24);
+    let rows = rendered_area(&mut app);
     let bar: String = rows
         .iter()
         .take(bar_h as usize)
@@ -1842,7 +1842,7 @@ fn top_bar_shows_active_chat_running_count_and_cwd() {
 #[test]
 fn top_bar_shows_task_hint_when_no_subagents_are_running() {
     let mut app = test_app();
-    let rows = rendered_rows(&mut app, 80, 24);
+    let rows = rendered_area(&mut app);
     let bar: String = rows.first().map(|s| s.as_str()).unwrap_or("").to_string();
     assert!(bar.contains("[Main]"), "badge always present: {bar}");
     assert!(
@@ -1856,7 +1856,7 @@ fn top_bar_shows_task_hint_when_no_subagents_are_running() {
 fn top_bar_shows_subagent_badge_when_tabbed_into_subagent() {
     let mut app = app_with_subagent();
     app.active_chat = 1;
-    let rows = rendered_rows(&mut app, 80, 24);
+    let rows = rendered_area(&mut app);
     let bar: String = rows.first().map(|s| s.as_str()).unwrap_or("").to_string();
     assert!(bar.contains("↳"), "subagent badge: {bar}");
     assert!(bar.contains("research"), "subagent name: {bar}");
@@ -1874,7 +1874,7 @@ fn top_bar_hint_excludes_finished_subagents() {
     ));
     finish_subagent(&mut app, "task1", false);
     // task2 still running, task1 finished: from Main, one more running.
-    let rows = rendered_rows(&mut app, 80, 24);
+    let rows = rendered_area(&mut app);
     let bar: String = rows.first().map(|s| s.as_str()).unwrap_or("").to_string();
     assert!(bar.contains("1 tasks"), "only running counted: {bar}");
 }
@@ -5225,6 +5225,7 @@ fn ctrl_c_denies_permission_prompt() {
         vec!["execute".into()],
         None,
     );
+    app.active_input = Some(InputKind::Permission);
     assert!(app.permission_prompt.is_open());
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
@@ -5261,16 +5262,21 @@ fn attention_float_marks_app_as_awaiting_input_until_close() {
     let buf = Arc::new(maki_agent::SharedBuf::new());
     let config = maki_lua::FloatConfig {
         needs_input: true,
+        split: maki_lua::Split::Below,
+        height: maki_lua::Dimension::Abs(4),
         ..maki_lua::FloatConfig::default()
     };
     let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
     let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
 
-    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+    let active = app.handle_open_win(buf, config, true, event_tx, cmd_rx);
+    assert!(active, "an idle input demand activates immediately");
+    assert!(app.question_active());
     assert!(app.awaiting_input());
 
     cmd_tx.send(maki_lua::WinCommand::Close).unwrap();
     let _ = app.float_mgr.tick();
+    app.reconcile_active();
     assert!(!app.awaiting_input());
 }
 
@@ -5375,7 +5381,7 @@ fn cancel_preserves_panel_window_and_closes_transient() {
         "panel dock survives cancel and stays visible",
     );
     assert!(
-        !app.float_mgr.needs_input(),
+        !app.float_mgr.is_focused(),
         "transient focused float is closed by cancel",
     );
 }
@@ -5392,6 +5398,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         vec!["ls".into()],
         None,
     );
+    app.active_input = Some(InputKind::Permission);
 
     let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
     assert!(
@@ -5976,6 +5983,20 @@ fn enter_inserts_skill() {
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.input_box.buffer.value(), "@skill:review");
+    assert!(!app.file_completion.is_active());
+}
+
+#[test_case(KeyModifiers::ALT ; "alt_left")]
+#[test_case(KeyModifiers::CONTROL ; "ctrl_left")]
+fn word_motion_left_with_completion_open_reaches_input(mods: KeyModifiers) {
+    let (_tmp, mut app, backend) = completion_app();
+    seed_skill(&backend, "review");
+    for c in "@skill:rev".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, mods)));
+    assert_eq!(app.input_box.buffer.x(), 0);
 }
 
 #[test]
@@ -6490,10 +6511,13 @@ fn permission_request_emits_bell() {
     app.status = Status::Streaming;
     app.run_id = 1;
     let actions = app.update(agent_msg(permission_request_event()));
-    assert_eq!(
-        actions.iter().filter(|a| matches!(a, Action::Bell)).count(),
-        1,
-        "default config should bell once on permission request"
+    assert!(
+        actions.iter().all(|a| !matches!(a, Action::Bell)),
+        "bell is routed via pending_bell, not Action::Bell"
+    );
+    assert!(
+        app.take_pending_bell(),
+        "default config should bell on permission request"
     );
 }
 
@@ -6508,16 +6532,10 @@ fn permission_request_bell_disabled() {
         !actions.iter().any(|a| matches!(a, Action::Bell)),
         "disabled permission should not bell"
     );
-}
-
-#[test_case(true,  true  ; "ask_input_and_enabled")]
-#[test_case(true,  false ; "ask_input_but_disabled")]
-#[test_case(false, true  ; "no_input_but_enabled")]
-#[test_case(false, false ; "no_input_and_disabled")]
-fn bell_on_ask_predicate(needs_input: bool, ask: bool) {
-    let mut app = test_app();
-    app.ui_config.bell.ask = ask;
-    assert_eq!(app.bell_on_ask(needs_input), needs_input && ask);
+    assert!(
+        !app.take_pending_bell(),
+        "disabled permission sets no pending bell"
+    );
 }
 
 // ---- home-screen splash via the Lua plugin ----
@@ -6837,5 +6855,687 @@ fn stale_target_command_fails_its_lifecycle() {
     assert_eq!(
         smol::block_on(classification),
         maki_commands::CommandClassification::Failed(maki_commands::CommandError::StaleTarget)
+    );
+}
+
+// ---- defer + z-order input-demand UI (plan 8) ----
+
+const PERM_TOOL: &str = "bash";
+const PERM_SCOPE: &str = "execute";
+const QUESTION_TEXT: &str = "QUESTIONLINE";
+
+fn perm_demand(id: &str, tool: maki_config::ToolKey, scopes: Vec<String>) -> InputDemand {
+    InputDemand {
+        kind: InputKind::Permission,
+        blocked_by_modal: false,
+        hold_until_submit: false,
+        perm: Some(PermissionPayload {
+            id: id.into(),
+            tool,
+            scopes,
+            subagent_id: None,
+        }),
+    }
+}
+
+fn bash_perm_demand(id: &str) -> InputDemand {
+    perm_demand(
+        id,
+        maki_config::ToolKey::native(PERM_TOOL),
+        vec![PERM_SCOPE.into()],
+    )
+}
+
+fn below_input_config(height: u16) -> maki_lua::FloatConfig {
+    maki_lua::FloatConfig {
+        needs_input: true,
+        split: maki_lua::Split::Below,
+        height: maki_lua::Dimension::Abs(height),
+        ..maki_lua::FloatConfig::default()
+    }
+}
+
+/// Opens a below+needs_input question window through the shared `handle_open_win`
+/// path. Returns whether it went active, plus the window's event/command channels.
+fn open_question_win(
+    app: &mut App,
+    focus: bool,
+) -> (
+    bool,
+    flume::Receiver<maki_lua::WinEvent>,
+    flume::Sender<maki_lua::WinCommand>,
+) {
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    let (event_tx, event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let active = app.handle_open_win(buf, below_input_config(4), focus, event_tx, cmd_rx);
+    (active, event_rx, cmd_tx)
+}
+
+fn app_with_tall_model_picker() -> App {
+    let (mut app, models) = app_with_model_slot();
+    let names: Vec<String> = (0..40).map(|i| format!("anthropic/model-{i}")).collect();
+    models.store(Some(Arc::new(names)));
+    app.run_builtin(BuiltinAction::ModelPicker);
+    assert!(app.model_picker.is_open());
+    app
+}
+
+const RENDER_AREA: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: 80,
+    height: 24,
+};
+/// `last_input` age that puts the app past the 2s deferral window (idle).
+const IDLE_AGE: Duration = Duration::from_secs(3);
+
+fn rendered_area(app: &mut App) -> Vec<String> {
+    rendered_rows(app, RENDER_AREA.width, RENDER_AREA.height)
+}
+
+#[test]
+fn permission_deferred_while_typing() {
+    let mut app = test_app();
+    app.last_input = Some(Instant::now());
+    let defer = app.begin_input_demand(bash_perm_demand("perm"));
+    assert!(defer, "demand queued while typing");
+    assert_eq!(app.input_queue.len(), 1);
+    assert!(!app.permission_active());
+    assert!(
+        !app.permission_prompt.is_open(),
+        "queued prompt is not opened (no overlay side effects)"
+    );
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(
+        !app.permission_prompt.is_open(),
+        "deferred prompt is not answered by typing"
+    );
+    assert_eq!(app.input_queue.len(), 1, "deferred demand survives the key");
+}
+
+#[test]
+fn permission_promotes_after_idle() {
+    let mut app = test_app();
+    app.last_input = Some(Instant::now());
+    assert!(app.begin_input_demand(bash_perm_demand("perm")));
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(
+        app.input_queue.is_empty(),
+        "queue drained on idle promotion"
+    );
+    assert!(app.permission_active(), "permission promoted and opened");
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(
+        !app.permission_prompt.is_open(),
+        "y answers the active prompt"
+    );
+}
+
+#[test]
+fn permission_promotes_on_modal_close() {
+    let mut app = test_app();
+    app.run_builtin(BuiltinAction::ModelPicker);
+    assert!(app.has_blocking_modal());
+    app.last_input = Some(Instant::now());
+    let mut demand = bash_perm_demand("perm");
+    demand.blocked_by_modal = true;
+    assert!(app.begin_input_demand(demand));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(
+        app.input_queue.is_empty(),
+        "demand promoted when the modal closed"
+    );
+    assert!(app.permission_active());
+}
+
+#[test]
+fn permission_immediate_when_idle() {
+    let mut app = test_app();
+    app.last_input = None;
+    let defer = app.begin_input_demand(bash_perm_demand("perm"));
+    assert!(!defer, "idle demand activates immediately");
+    assert!(app.input_queue.is_empty());
+    assert!(app.permission_active());
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(
+        !app.permission_prompt.is_open(),
+        "y answers the active prompt"
+    );
+}
+
+#[test]
+fn permission_drawn_on_top_of_model_picker() {
+    let mut app = app_with_tall_model_picker();
+    app.permission_prompt.open(
+        "perm".into(),
+        maki_config::ToolKey::native(PERM_TOOL),
+        vec![PERM_SCOPE.into()],
+        None,
+    );
+    app.active_input = Some(InputKind::Permission);
+    assert!(app.permission_active());
+
+    let (_msg, bottom, _status, _input, _splits) = app.layout_geometry(RENDER_AREA);
+    assert!(
+        bottom.height > 0,
+        "active permission reserves the bottom area"
+    );
+
+    let both_rows = rendered_area(&mut app);
+    let both_bottom: String =
+        both_rows[bottom.y as usize..(bottom.y + bottom.height) as usize].join("");
+    assert!(
+        both_bottom.contains("Permission Required"),
+        "permission painted on top in the bottom area"
+    );
+    assert!(
+        both_bottom.contains("defer"),
+        "Alt+M defer hint is shown on the active prompt"
+    );
+
+    app.permission_prompt.close();
+    app.active_input = None;
+    let picker_rows = rendered_area(&mut app);
+    let picker_bottom: String =
+        picker_rows[bottom.y as usize..(bottom.y + bottom.height) as usize].join("");
+    assert!(
+        picker_bottom.contains("model-"),
+        "picker content occupies the overlap without the prompt"
+    );
+    assert!(
+        !both_bottom.contains("model-"),
+        "permission painted over the picker in the overlap"
+    );
+}
+
+#[test]
+fn permission_hidden_while_deferred() {
+    let mut app = test_app();
+    let (_msg, _bottom, _status, baseline_input, _splits) = app.layout_geometry(RENDER_AREA);
+    app.last_input = Some(Instant::now());
+    app.begin_input_demand(bash_perm_demand("perm"));
+    let text = rendered(&mut app);
+    assert!(
+        !text.contains("Permission Required"),
+        "deferred prompt is not drawn"
+    );
+    let (_m, _b, _s, input, _sp) = app.layout_geometry(RENDER_AREA);
+    assert!(input.height > 0, "input box visible");
+    assert_eq!(
+        input.height, baseline_input.height,
+        "deferred prompt reserves no bottom area"
+    );
+}
+
+#[test]
+fn question_float_deferred_then_promoted() {
+    let mut app = test_app();
+    app.last_input = Some(Instant::now());
+    let (active, event_rx, _cmd_tx) = open_question_win(&mut app, true);
+    assert!(!active, "queued while busy");
+    assert!(
+        !app.float_mgr.is_focused(),
+        "a deferred question float takes no focus"
+    );
+    assert_eq!(app.input_queue.len(), 1);
+    assert!(!app.question_active());
+
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(
+        event_rx.try_recv().is_err(),
+        "deferred float does not receive keys"
+    );
+
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(
+        app.float_mgr.is_focused(),
+        "focus_input_window ran on promotion"
+    );
+    assert!(app.question_active());
+
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(event_rx.try_recv().is_ok(), "promoted float receives keys");
+}
+
+#[test]
+fn question_deferred_behind_focused_popup_waits_for_idle() {
+    let mut app = test_app();
+    // A focused centered popup (e.g. the sessions board): modal, owns focus.
+    let popup_buf = Arc::new(maki_agent::SharedBuf::new());
+    let popup_config = maki_lua::FloatConfig {
+        split: maki_lua::Split::None,
+        height: maki_lua::Dimension::Abs(4),
+        ..maki_lua::FloatConfig::default()
+    };
+    let (popup_tx, _popup_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (_popup_cmd_tx, popup_cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    app.float_mgr
+        .open(popup_buf, popup_config, true, popup_tx, popup_cmd_rx);
+    assert!(app.float_mgr.is_focused(), "popup is focused");
+    assert!(
+        app.has_blocking_modal(),
+        "focused popup is a blocking modal"
+    );
+
+    // Question arrives while the user is busy: it is queued behind the modal.
+    app.last_input = Some(Instant::now());
+    let (active, _event_rx, _cmd_tx) = open_question_win(&mut app, true);
+    assert!(!active, "queued while busy behind a modal");
+    assert!(
+        app.float_mgr.is_focused(),
+        "the in-use popup keeps its focus, not defocused"
+    );
+    assert!(
+        app.has_blocking_modal(),
+        "modal still present while deferred"
+    );
+    assert!(!app.question_active(), "question is not active yet");
+    assert_eq!(app.input_queue.len(), 1);
+
+    // Still busy (under 2s): promotion must NOT fire via the modal-close clause,
+    // because the modal is still open. It waits for idle.
+    let _ = app.tick();
+    assert!(
+        !app.question_active(),
+        "no immediate promotion while busy behind an open modal"
+    );
+    assert_eq!(app.input_queue.len(), 1);
+
+    // Idle: now it promotes (popup still open, but the user is idle).
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(app.question_active(), "promotes after idle");
+    assert_eq!(app.input_queue.len(), 0);
+}
+
+#[test]
+fn question_drawn_on_top_when_active() {
+    let mut app = app_with_tall_model_picker();
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    buf.append(maki_agent::SnapshotLine::plain(QUESTION_TEXT.into()));
+    let config = below_input_config(8);
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+    app.active_input = Some(InputKind::Question);
+    assert!(app.question_active());
+
+    let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(RENDER_AREA);
+    let below = splits
+        .rect(maki_lua::Split::Below)
+        .expect("active question split reserves space");
+
+    let both_rows = rendered_area(&mut app);
+    let both_below: String =
+        both_rows[below.y as usize..(below.y + below.height) as usize].join("");
+    assert!(
+        both_below.contains(QUESTION_TEXT),
+        "question painted on top in the below split"
+    );
+    assert!(
+        both_below.contains("defer"),
+        "Alt+M defer hint is shown on the active question float"
+    );
+
+    app.float_mgr.close_all();
+    app.active_input = None;
+    let picker_rows = rendered_area(&mut app);
+    let picker_below: String =
+        picker_rows[below.y as usize..(below.y + below.height) as usize].join("");
+    assert!(
+        picker_below.contains("model-"),
+        "picker content occupies the overlap without the question"
+    );
+    assert!(
+        !both_below.contains("model-"),
+        "question painted over the picker in the overlap"
+    );
+}
+
+#[test]
+fn bell_deferred_until_idle_promotion() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.last_input = Some(Instant::now());
+    let actions = app.update(agent_msg(permission_request_event()));
+    assert!(
+        actions.iter().all(|a| !matches!(a, Action::Bell)),
+        "no Action::Bell on arrival while deferred"
+    );
+    assert!(
+        !app.take_pending_bell(),
+        "no bell on arrival while deferred"
+    );
+    assert_eq!(app.input_queue.len(), 1);
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(app.permission_active());
+    assert!(app.take_pending_bell(), "bell fires on idle promotion");
+}
+
+#[test]
+fn bell_deferred_until_modal_close_promotion() {
+    let mut app = test_app();
+    app.run_builtin(BuiltinAction::ModelPicker);
+    app.last_input = Some(Instant::now());
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let actions = app.update(agent_msg(permission_request_event()));
+    assert!(
+        actions.iter().all(|a| !matches!(a, Action::Bell)),
+        "no Action::Bell on arrival behind a modal"
+    );
+    assert!(
+        !app.take_pending_bell(),
+        "no bell on arrival while deferred behind a modal"
+    );
+    assert_eq!(app.input_queue.len(), 1);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(app.permission_active(), "promoted when the modal closed");
+    assert!(
+        app.take_pending_bell(),
+        "bell fires on modal-close promotion"
+    );
+}
+
+#[test]
+fn active_surface_survives_typing_ticks() {
+    let mut app = test_app();
+    let (active, _event_rx, _cmd_tx) = open_question_win(&mut app, true);
+    assert!(active, "idle question activates immediately");
+    assert!(app.question_active());
+    app.last_input = Some(Instant::now());
+    for _ in 0..3 {
+        app.update(Msg::Key(key(KeyCode::Char('a'))));
+        let _ = app.tick();
+    }
+    assert!(
+        app.question_active(),
+        "active surface is not re-deferred by typing ticks"
+    );
+    assert!(app.float_mgr.is_focused(), "focus retained across ticks");
+    assert!(
+        app.input_queue.is_empty(),
+        "active surface is not re-queued"
+    );
+}
+
+#[test]
+fn non_input_window_not_deferred() {
+    fn open_non_input(split: maki_lua::Split, focus: bool) -> App {
+        let mut app = test_app();
+        app.last_input = Some(Instant::now());
+        // Plan mode with a ready plan: `transition_plan(InteractivePrompt)`
+        // would flip it back to drafting, so a ready plan afterwards proves the
+        // non-input path never invokes it.
+        app.state.mode = Mode::Plan;
+        app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+        let buf = Arc::new(maki_agent::SharedBuf::new());
+        let config = maki_lua::FloatConfig {
+            split,
+            height: maki_lua::Dimension::Abs(4),
+            ..maki_lua::FloatConfig::default()
+        };
+        let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+        let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+        let active = app.handle_open_win(buf, config, focus, event_tx, cmd_rx);
+        assert!(active, "non-input window is never deferred");
+        assert!(app.input_queue.is_empty(), "queue untouched");
+        assert!(!app.take_pending_bell(), "no bell for a non-input window");
+        assert!(
+            app.state.plan.is_ready(),
+            "non-input window does not trigger transition_plan"
+        );
+        app
+    }
+
+    let below = open_non_input(maki_lua::Split::Below, true);
+    assert!(
+        below.float_mgr.is_focused(),
+        "tool-output below split keeps focus"
+    );
+    let panel = open_non_input(maki_lua::Split::Panel, false);
+    assert!(
+        !panel.float_mgr.is_focused(),
+        "panel with focus=false stays unfocused"
+    );
+    let popup = open_non_input(maki_lua::Split::None, true);
+    assert!(popup.float_mgr.is_focused(), "centered popup keeps focus");
+}
+
+#[test]
+fn second_demand_enqueues_not_zombie() {
+    let mut app = test_app();
+    app.last_input = Some(Instant::now());
+    app.begin_input_demand(bash_perm_demand("p1"));
+    let (active, _event_rx, _cmd_tx) = open_question_win(&mut app, true);
+    assert!(!active, "second demand queues while the first is queued");
+    assert_eq!(app.input_queue.len(), 2);
+    assert!(matches!(app.input_queue[0].kind, InputKind::Permission));
+    assert!(matches!(app.input_queue[1].kind, InputKind::Question));
+    assert!(!app.permission_active());
+    assert!(!app.question_active());
+    assert!(
+        !app.float_mgr.is_focused(),
+        "queued question float is not focused"
+    );
+    assert!(!app.permission_prompt.is_open());
+    assert!(
+        !app.take_pending_bell(),
+        "no zombie bell on the second arrival"
+    );
+
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(app.permission_active(), "head permission promotes first");
+    assert_eq!(app.input_queue.len(), 1, "question still queued");
+
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(!app.permission_active(), "answering closes the permission");
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(
+        app.question_active(),
+        "question promotes after the permission resolves"
+    );
+    assert!(app.input_queue.is_empty());
+}
+
+#[test]
+fn queued_permission_no_overlay_side_effects() {
+    let mut app = test_app();
+    app.last_input = Some(Instant::now());
+    app.begin_input_demand(bash_perm_demand("p"));
+    assert!(
+        !app.any_overlay_open(),
+        "queued prompt does not count as an overlay"
+    );
+    assert!(!app.permission_prompt.is_open());
+    assert!(!app.has_modal_overlay(), "no modal blocks input clicks");
+    let (_msg, _bottom, _status, input, _splits) = app.layout_geometry(RENDER_AREA);
+    assert!(input.height > 0, "input box present");
+    let _ = rendered(&mut app);
+    let zone = app
+        .zone_at(input.y + 1, input.x + 1)
+        .expect("input position has a zone");
+    assert_eq!(
+        zone.zone,
+        SelectionZone::Input,
+        "Input zone is not shadowed by an Overlay while a permission is queued"
+    );
+}
+
+// ---- manual Alt+M defer (plan 9) ----
+
+fn alt_m() -> KeyEvent {
+    KeyEvent {
+        code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::ALT,
+        kind: crossterm::event::KeyEventKind::Press,
+        state: crossterm::event::KeyEventState::NONE,
+    }
+}
+
+#[test]
+fn alt_m_when_nothing_active_is_noop() {
+    let mut app = test_app();
+    app.last_input = None;
+    let actions = app.update(Msg::Key(alt_m()));
+    assert!(actions.is_empty(), "Alt+M is consumed without side effects");
+    assert!(app.input_queue.is_empty());
+    assert!(!app.permission_active());
+    assert!(!app.question_active());
+}
+
+#[test]
+fn alt_m_defers_active_permission_until_submit() {
+    let mut app = test_app();
+    app.last_input = None;
+    assert!(
+        !app.begin_input_demand(bash_perm_demand("perm")),
+        "idle demand activates immediately"
+    );
+    assert!(app.permission_active());
+
+    app.update(Msg::Key(alt_m()));
+    assert!(!app.permission_active(), "Alt+M hides the active prompt");
+    assert!(!app.permission_prompt.is_open(), "prompt closed on defer");
+    assert_eq!(app.input_queue.len(), 1, "deferred demand is queued");
+    assert!(
+        app.input_queue[0].hold_until_submit,
+        "manual defer holds until submit"
+    );
+
+    // The 2s idle timer must NOT release a manual hold.
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(!app.permission_active(), "hold ignores the idle timer");
+    assert!(!app.permission_prompt.is_open(), "prompt still hidden");
+    assert_eq!(app.input_queue.len(), 1);
+
+    // Typing in the freed input box must not answer the deferred prompt.
+    app.update(Msg::Key(key(KeyCode::Char('h'))));
+    assert!(
+        !app.permission_prompt.is_open(),
+        "typing does not misanswer"
+    );
+
+    // Submitting the focused input box releases the hold and re-promotes.
+    let actions = app.handle_submit(Submission::empty());
+    assert!(actions.is_empty(), "empty submit yields nothing");
+    assert!(app.submit_released, "submit arms the release");
+    let _ = app.promote_deferred_if_ready();
+    assert!(app.input_queue.is_empty());
+    assert!(app.permission_active(), "prompt re-promotes after submit");
+}
+
+#[test]
+fn alt_m_defers_active_question_until_submit() {
+    let mut app = test_app();
+    app.last_input = None;
+    let (active, _event_rx, _cmd_tx) = open_question_win(&mut app, true);
+    assert!(active, "idle question activates immediately");
+    assert!(app.question_active());
+    assert!(app.float_mgr.is_focused());
+
+    app.update(Msg::Key(alt_m()));
+    assert!(!app.question_active(), "Alt+M defers the question float");
+    assert!(!app.float_mgr.is_focused(), "float releases focus on defer");
+    assert_eq!(app.input_queue.len(), 1);
+    assert!(app.input_queue[0].hold_until_submit);
+
+    // The 2s idle timer must NOT release a manual hold either.
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(!app.question_active(), "hold ignores the idle timer");
+    assert!(!app.float_mgr.is_focused(), "float stays unfocused");
+    assert_eq!(app.input_queue.len(), 1);
+
+    let _ = app.handle_submit(Submission::empty());
+    let _ = app.promote_deferred_if_ready();
+    assert!(app.input_queue.is_empty());
+    assert!(app.question_active(), "float re-promotes after submit");
+    assert!(
+        app.float_mgr.is_focused(),
+        "focus restored on question promotion"
+    );
+}
+
+#[test]
+fn alt_m_toggles_back_to_the_held_permission() {
+    let mut app = test_app();
+    app.last_input = None;
+    assert!(!app.begin_input_demand(bash_perm_demand("perm")));
+    assert!(app.permission_active());
+
+    app.update(Msg::Key(alt_m()));
+    assert!(!app.permission_active());
+    assert!(app.held_input_pending(), "held demand reports pending");
+
+    let actions = app.update(Msg::Key(alt_m()));
+    assert!(actions.is_empty(), "toggle yields no agent actions");
+    assert!(
+        app.permission_active(),
+        "second Alt+M restores the held prompt"
+    );
+    assert!(app.input_queue.is_empty());
+    assert!(!app.held_input_pending());
+}
+
+#[test]
+fn alt_m_toggle_ignores_auto_deferred_head() {
+    // An auto-deferral (typing window) at the head promotes via the idle
+    // timer; Alt+M must not force it, nor reach past FIFO order.
+    let mut app = test_app();
+    app.last_input = Some(Instant::now());
+    assert!(app.begin_input_demand(bash_perm_demand("perm")));
+    assert!(!app.held_input_pending());
+
+    app.update(Msg::Key(alt_m()));
+    assert!(
+        !app.permission_active(),
+        "auto-deferred head is not promoted by Alt+M"
+    );
+    assert_eq!(app.input_queue.len(), 1);
+
+    app.last_input = Some(Instant::now() - IDLE_AGE);
+    let _ = app.tick();
+    assert!(app.permission_active(), "idle timer still releases it");
+}
+
+#[test]
+fn defer_hint_pins_above_status_bar_until_restored() {
+    let hint_row = |rows: &[String]| rows[RENDER_AREA.height as usize - 2].clone();
+
+    let mut app = test_app();
+    app.last_input = None;
+    assert!(!app.begin_input_demand(bash_perm_demand("perm")));
+    let baseline = rendered_area(&mut app);
+    assert!(
+        !hint_row(&baseline).contains("Undefer"),
+        "no hint while the prompt is active"
+    );
+
+    app.update(Msg::Key(alt_m()));
+    let deferred = rendered_area(&mut app);
+    let row = hint_row(&deferred);
+    assert!(
+        row.contains("Undefer pending model input"),
+        "hint appears once the demand is deferred"
+    );
+    assert!(
+        row.starts_with('('),
+        "the hint sits flush with the left edge: {row:?}"
+    );
+
+    app.update(Msg::Key(alt_m()));
+    let restored = rendered_area(&mut app);
+    assert!(
+        !hint_row(&restored).contains("Undefer"),
+        "hint clears once the demand is restored"
     );
 }

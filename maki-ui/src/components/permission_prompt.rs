@@ -12,6 +12,7 @@ use crate::components::Overlay;
 use crate::components::form::render_form;
 use crate::components::hint_line;
 use crate::components::is_ctrl;
+use crate::components::keybindings::key;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -26,6 +27,7 @@ const HINT_DENY_ROW: &[(&str, &str)] = &[
     ("d", "Deny-always (project)"),
     ("D", "Deny-always (all)"),
 ];
+const HINT_DEFER_ROW: &[(&str, &str)] = &[(key::DEFER_INPUT.label, "defer, keep typing")];
 
 const CONFIRM_ALLOW_PROJECT_HINTS: &[(&str, &str)] = &[
     ("Enter / y", "Confirm allow-always (project)"),
@@ -345,7 +347,11 @@ impl PermissionPrompt {
                 lines.push(hint_line(DENY_GUIDANCE_HINTS));
             }
             PromptState::Normal => {
-                lines.extend(aligned_hint_rows(&[HINT_ALLOW_ROW, HINT_DENY_ROW]));
+                lines.extend(aligned_hint_rows(&[
+                    HINT_ALLOW_ROW,
+                    HINT_DENY_ROW,
+                    HINT_DEFER_ROW,
+                ]));
             }
         }
         lines.push(Line::raw(""));

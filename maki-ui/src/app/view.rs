@@ -14,8 +14,9 @@ use crate::theme;
 use maki_lua::Split;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use super::{App, Mode, Status};
 
@@ -31,6 +32,7 @@ struct ViewLayout {
     msg_area: Rect,
     bottom_area: Rect,
     status_area: Rect,
+    defer_hint_area: Rect,
     queue_area: Rect,
     panel_windows: Vec<(usize, Rect)>,
     input_area: Rect,
@@ -41,7 +43,7 @@ struct ViewLayout {
 
 impl App {
     pub fn view(&mut self, frame: &mut Frame) {
-        let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
+        let form_visible = self.permission_active() || self.plan_form_active();
         let layout = self.compute_layout(frame.area(), form_visible);
         let render_chat = self.resolve_render_chat();
 
@@ -52,18 +54,26 @@ impl App {
         self.render_splits(frame, &layout);
         let mut overlay_rect = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
+        self.render_defer_hint(frame, layout.defer_hint_area);
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
+        self.render_active_input(frame, &layout);
     }
 
     fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
-        let permission_open = self.permission_prompt.is_open();
+        let permission_open = self.permission_active();
 
         // Carve the full-width status bar first so the split carving below only
-        // ever deals with the content region above it.
-        let [mut content, status_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        // ever deals with the content region above it. A manually deferred
+        // (Alt+M) input demand pins an undefer hint on the row above it.
+        let defer_hint_h = u16::from(self.held_input_pending());
+        let [mut content, defer_hint_area, status_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(defer_hint_h),
+            Constraint::Length(1),
+        ])
+        .areas(area);
 
         // A persistent one-line info bar pinned to the top: the active chat
         // badge, a running-subagent hint, and the cwd:branch. It never crowds
@@ -73,14 +83,16 @@ impl App {
             Layout::vertical([Constraint::Length(top_bar_h), Constraint::Min(1)]).areas(content);
         content = rest;
 
-        // The permission prompt owns the bottom area, so drop any `below` split
-        // here at the source. That keeps "prompt wins bottom" in one filter
-        // instead of needing a fix-up further down.
+        // The active permission prompt owns the bottom area, and a deferred
+        // (queued) below-input split reserves nothing, so drop `below` splits
+        // for either case at the source.
         let reqs: Vec<_> = self
             .float_mgr
             .split_reqs(content)
             .into_iter()
-            .filter(|r| !(permission_open && r.split == Split::Below))
+            .filter(|r| {
+                !(r.split == Split::Below && (permission_open || self.below_input_hidden()))
+            })
             .collect();
         let splits = carve(content, &reqs);
         let inner = splits.inner;
@@ -143,6 +155,7 @@ impl App {
             msg_area,
             bottom_area,
             status_area,
+            defer_hint_area,
             queue_area,
             panel_windows,
             input_area,
@@ -223,8 +236,9 @@ impl App {
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
-        if self.permission_prompt.is_open() {
-            self.permission_prompt.view(frame, layout.bottom_area);
+        if self.permission_active() {
+            // The active permission form is painted by the topmost pass
+            // (`render_active_input`) so it lands above pickers/modals.
         } else if !self.is_main_chat() {
             let panel_reqs = self.float_mgr.panel_reqs();
             let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
@@ -305,9 +319,33 @@ impl App {
 
     fn render_splits(&mut self, frame: &mut Frame, layout: &ViewLayout) {
         for dir in Split::ALL {
+            // The active question split is painted topmost by `render_active_input`;
+            // a queued one is hidden. Either way, skip it here.
+            if dir == Split::Below && self.float_mgr.below_is_input() {
+                continue;
+            }
             if let Some(rect) = layout.splits.rect(dir) {
                 self.float_mgr.view_split(frame, dir, rect);
             }
+        }
+    }
+
+    /// Topmost pass: paints the single active input surface last so it wins
+    /// every overlap with pickers/modals.
+    fn render_active_input(&mut self, frame: &mut Frame, layout: &ViewLayout) {
+        if self.permission_active() {
+            // Clear then re-fill the theme background so the prompt occludes any
+            // picker/modal drawn beneath it in this rect (the form has no fill).
+            frame.render_widget(Clear, layout.bottom_area);
+            frame.render_widget(
+                Block::default().style(Style::new().bg(theme::current().background)),
+                layout.bottom_area,
+            );
+            self.permission_prompt.view(frame, layout.bottom_area);
+        } else if self.question_active()
+            && let Some(rect) = layout.splits.rect(Split::Below)
+        {
+            self.float_mgr.view_split(frame, Split::Below, rect);
         }
     }
 
@@ -410,6 +448,21 @@ impl App {
         self.status_bar.view(frame, status_area, &ctx);
     }
 
+    /// Left-aligned affordance pinned on the row above the status bar while an
+    /// Alt+M-deferred prompt waits: how to bring it back without submitting.
+    fn render_defer_hint(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let t = theme::current();
+        let line = Line::from(vec![
+            Span::styled("(", t.tool_dim),
+            Span::styled(key::DEFER_INPUT.label, t.keybind_key),
+            Span::styled(" Undefer pending model input)", t.tool_dim),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
     fn register_zones(&mut self, layout: &ViewLayout, overlay_rect: Rect) {
         // Push order = z-order. zone_at() walks in reverse, so later entries win.
         self.zones = ZoneRegistry::new();
@@ -434,7 +487,7 @@ impl App {
 
         self.zones.push_overlay(layout.status_area);
 
-        if self.permission_prompt.is_open() || self.plan_form_active() {
+        if self.plan_form_active() {
             self.zones.push_overlay(layout.bottom_area);
         }
 
@@ -451,6 +504,11 @@ impl App {
         }
 
         for dir in Split::ALL {
+            // The active question split is pushed topmost below; a queued one
+            // pushes nothing.
+            if dir == Split::Below && self.float_mgr.below_is_input() {
+                continue;
+            }
             if let Some(rect) = layout.splits.rect(dir) {
                 self.zones.push_overlay(selection::inset_border(rect));
             }
@@ -459,6 +517,16 @@ impl App {
         if overlay_rect.width > 0 {
             self.zones
                 .push_overlay(selection::inset_border(overlay_rect));
+        }
+
+        // The active input surface is the single topmost zone so it wins clicks
+        // over any picker/modal that overlaps it.
+        if self.permission_active() {
+            self.zones.push_overlay(layout.bottom_area);
+        } else if self.question_active()
+            && let Some(rect) = layout.splits.rect(Split::Below)
+        {
+            self.zones.push_overlay(selection::inset_border(rect));
         }
 
         // Overlay zone was removed (e.g. dialog closed), drop the dangling selection
@@ -490,7 +558,7 @@ impl App {
     /// input_area, splits)`.
     #[cfg(test)]
     pub(super) fn layout_geometry(&self, area: Rect) -> (Rect, Rect, Rect, Rect, SplitLayout) {
-        let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
+        let form_visible = self.permission_active() || self.plan_form_active();
         let layout = self.compute_layout(area, form_visible);
         (
             layout.msg_area,
@@ -503,7 +571,7 @@ impl App {
 
     #[cfg(test)]
     pub(super) fn top_bar_rect(&self, area: Rect) -> Rect {
-        let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
+        let form_visible = self.permission_active() || self.plan_form_active();
         self.compute_layout(area, form_visible).top_bar_area
     }
 
