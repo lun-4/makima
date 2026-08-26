@@ -244,6 +244,13 @@ pub(crate) fn complete(command: &RoutedCommand, classification: CommandClassific
 }
 
 #[cfg(test)]
+impl CommandRuntime {
+    pub(crate) fn command_tx(&self) -> flume::Sender<RoutedCommand> {
+        self.command_tx.clone()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 

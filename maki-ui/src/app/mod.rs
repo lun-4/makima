@@ -1792,6 +1792,10 @@ impl App {
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.
+    /// Resolves and enqueues `cmdline` against this session. The caller only
+    /// waits on resolution; the command's effects are applied by the event
+    /// loop on a later iteration, so state inspected immediately after this
+    /// call may predate them.
     pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
         let trimmed = cmdline.trim();
         let input = format!("/{}", trimmed.trim_start_matches('/'));
@@ -1849,8 +1853,17 @@ impl App {
     fn execute_pending_commands(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         while let Some(command) = self.command_runtime.try_recv_for_test() {
+            // Mirror production `EventLoop::handle_command`: a command whose
+            // target is gone fails its lifecycle instead of being dropped.
             if command.target == self.command_target {
                 actions.extend(self.execute_routed_command(command));
+            } else {
+                complete(
+                    &command,
+                    maki_commands::CommandClassification::Failed(
+                        maki_commands::CommandError::StaleTarget,
+                    ),
+                );
             }
         }
         actions

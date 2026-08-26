@@ -6766,3 +6766,31 @@ fn alt_m_opens_model_picker() {
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
 }
+
+/// A routed command whose target is gone must fail its lifecycle (mirroring
+/// production `EventLoop::handle_command`) instead of being dropped, so a
+/// frontend awaiting the classification never hangs.
+#[test]
+fn stale_target_command_fails_its_lifecycle() {
+    let mut app = test_app();
+    let other_registry = maki_commands::CommandRegistry::new();
+    let lifecycle = maki_commands::InvocationLifecycle::detached();
+    let classification = lifecycle.classification();
+
+    app.command_runtime
+        .command_tx()
+        .send(crate::command_runtime::RoutedCommand {
+            target: other_registry.create_target(),
+            route: crate::command_runtime::CommandRoute::Prompt("hello".into()),
+            arguments: String::new(),
+            depth: 0,
+            lifecycle,
+        })
+        .unwrap();
+
+    assert!(app.execute_pending_commands().is_empty());
+    assert_eq!(
+        smol::block_on(classification),
+        maki_commands::CommandClassification::Failed(maki_commands::CommandError::StaleTarget)
+    );
+}

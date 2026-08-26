@@ -3710,9 +3710,23 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
             // Clones of the host (`EventHandle`, `LuaTool`) can still hold
             // a live sender, so dropping the receivers alone does not free
             // queued requests. Drain them so their reply channels drop and
-            // no caller blocks on a dead host.
-            for _ in rx.drain() {}
-            for _ in prio_rx.drain() {}
+            // no caller blocks on a dead host. Queued command invocations
+            // are failed explicitly so frontends awaiting their lifecycle
+            // do not hang on a transition that would never come.
+            for msg in rx.drain() {
+                if let Request::ExecuteCommand { invocation, .. } = msg {
+                    invocation.lifecycle.transition(CommandClassification::Failed(
+                        CommandError::Producer(Arc::from("Lua host stopped")),
+                    ));
+                }
+            }
+            for msg in prio_rx.drain() {
+                if let Request::ExecuteCommand { invocation, .. } = msg {
+                    invocation.lifecycle.transition(CommandClassification::Failed(
+                        CommandError::Producer(Arc::from("Lua host stopped")),
+                    ));
+                }
+            }
         })
         .map_err(|e| PluginError::Io {
             path: PathBuf::from("lua-thread"),
