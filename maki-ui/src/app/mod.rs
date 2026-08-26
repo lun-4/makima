@@ -2106,7 +2106,7 @@ impl App {
             images: Vec::new(),
         }) {
             SubmitOutcome::Started(actions) => RouteOutcome::accepted(actions),
-            SubmitOutcome::Queued => RouteOutcome::completed(Vec::new()),
+            SubmitOutcome::Queued => RouteOutcome::accepted(Vec::new()),
             SubmitOutcome::Rejected(error) => {
                 self.flash(error.clone());
                 RouteOutcome::failed(error)

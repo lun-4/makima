@@ -3598,6 +3598,38 @@ fn direct_custom_command_renders_args_and_starts_run() {
 }
 
 #[test]
+fn queued_custom_command_is_an_accepted_turn() {
+    let mut app = app_with_custom_commands(&[CustomCommand {
+        name: "review".into(),
+        description: "Code review".into(),
+        content: "Review $ARGUMENTS".into(),
+        scope: CommandScope::Project,
+        accepts_args: true,
+    }]);
+    app.status = Status::Streaming;
+    let lifecycle = maki_commands::InvocationLifecycle::detached();
+    let classification = lifecycle.classification();
+
+    app.command_runtime
+        .command_tx()
+        .send(crate::command_runtime::RoutedCommand {
+            target: app.command_target,
+            route: crate::command_runtime::CommandRoute::Prompt("Review src/lib.rs".into()),
+            arguments: String::new(),
+            depth: 0,
+            lifecycle,
+        })
+        .unwrap();
+
+    assert!(app.execute_pending_commands().is_empty());
+    assert_eq!(app.queue.len(), 1);
+    assert_eq!(
+        smol::block_on(classification),
+        maki_commands::CommandClassification::AgentTurnAccepted
+    );
+}
+
+#[test]
 fn run_cmdline_dispatches_custom_command() {
     let mut app = app_with_custom_commands(&[CustomCommand {
         name: "review".into(),
