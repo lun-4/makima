@@ -95,6 +95,14 @@ pub fn is_ctrl(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// True when the cursor key should move word-wise in the prompt buffer
+/// instead of navigating an open menu (ctrl, alt, and super all have
+/// buffer-level bindings for Left/Right).
+pub fn menu_navigation_blocked(key: &KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
 pub(crate) struct ModalScroll {
     offset: u16,
     max_offset: u16,

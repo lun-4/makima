@@ -268,9 +268,8 @@ impl FileCompletionMenu {
             }
             KeyCode::Up => move_selection(s, -1),
             KeyCode::Down => move_selection(s, 1),
-            KeyCode::Left if !super::is_ctrl(&key) => move_column(s, -1),
-            KeyCode::Right if !super::is_ctrl(&key) => move_column(s, 1),
-            _ if super::is_ctrl(&key) => return CompletionAction::Passthrough,
+            KeyCode::Left if !super::menu_navigation_blocked(&key) => move_column(s, -1),
+            KeyCode::Right if !super::menu_navigation_blocked(&key) => move_column(s, 1),
             _ => return CompletionAction::Passthrough,
         }
         CompletionAction::Consumed
@@ -675,9 +674,13 @@ mod tests {
     }
 
     fn key(code: KeyCode) -> KeyEvent {
+        key_with(code, KeyModifiers::NONE)
+    }
+
+    fn key_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
@@ -1006,6 +1009,31 @@ mod tests {
             CompletionAction::Consumed
         ));
         assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn modified_left_right_pass_through_to_buffer() {
+        let word_motion_mods = [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ];
+        for mods in word_motion_mods {
+            let mut menu = menu_with_matches(5);
+            let s = menu.session.as_mut().unwrap();
+            s.visible = true;
+            s.cols = 2;
+            for code in [KeyCode::Left, KeyCode::Right] {
+                assert!(
+                    matches!(
+                        menu.handle_key(key_with(code, mods)),
+                        CompletionAction::Passthrough
+                    ),
+                    "{mods:?}+{code:?} should reach the prompt buffer"
+                );
+                assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+            }
+        }
     }
 
     #[test]
