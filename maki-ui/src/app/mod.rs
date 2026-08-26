@@ -514,6 +514,10 @@ impl App {
         &mut self.chats[0]
     }
 
+    pub(crate) fn set_splash_debug_overlay(&mut self, enabled: bool) {
+        self.main_chat().set_splash_debug_overlay(enabled);
+    }
+
     fn is_main_chat(&self) -> bool {
         self.active_chat == 0
     }

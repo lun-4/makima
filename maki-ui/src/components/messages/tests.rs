@@ -616,6 +616,50 @@ fn splash_frame(width: u16, height: u16) -> maki_lua::SplashFrame {
     }
 }
 
+#[test]
+fn splash_debug_overlay_reads_fps_from_frame_arrivals() {
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        handle,
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    render(&mut panel, 80, 20);
+    panel.set_splash_debug_overlay(true);
+    assert!(
+        panel.splash_debug_line().is_some(),
+        "enabled overlay owes a readout"
+    );
+
+    let _ = panel.tick();
+    assert_eq!(
+        probe.try_finish_splash_frame(Some(splash_frame(80, 20))),
+        Some((80, 20))
+    );
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    let line = panel.splash_debug_line().expect("overlay readout");
+    assert!(
+        line.to_string().contains("fps"),
+        "readout after a frame: {line:?}"
+    );
+}
+
+#[test]
+fn splash_debug_overlay_disabled_renders_no_line() {
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        handle,
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    render(&mut panel, 80, 20);
+    assert!(panel.splash_debug_line().is_none(), "overlay starts off");
+    panel.set_splash_debug_overlay(true);
+    assert!(panel.splash_debug_line().is_some());
+    panel.set_splash_debug_overlay(false);
+    assert!(panel.splash_debug_line().is_none(), "overlay off owes none");
+}
+
 /// `drain_highlights` moved out of `view`, so `tick` is the only thing feeding
 /// the worker now. The wait is the worker's own round trip, not a sleep: the
 /// loop ends the moment the result lands, and the deadline only turns a broken

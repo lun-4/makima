@@ -3,6 +3,7 @@ pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
 pub(crate) mod completion;
+pub(crate) mod debug;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
@@ -93,7 +94,7 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "fn",
-        r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx)?,
+        r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx.clone())?,
     )?;
     split::split__register(&maki, lua)?;
     maki.set("async", r#async::create_async_table(lua)?)?;
@@ -111,6 +112,10 @@ pub(crate) fn create_maki_global(
         timer::create_timer_table(lua, Arc::clone(&plugin))?,
     )?;
     maki.set("time", time::create_time_table(lua)?)?;
+    maki.set(
+        "debug",
+        debug::create_debug_table(lua, ui_action_tx.clone())?,
+    )?;
     crate::splash::register_version_api(lua, &maki)?;
 
     Ok(maki)

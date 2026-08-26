@@ -943,6 +943,9 @@ impl<'t> EventLoop<'t> {
                 let actions = self.focused_app().run_builtin(action);
                 self.dispatch(self.focused, actions);
             }
+            UiAction::SplashFpsOverlay { enabled } => {
+                self.focused_app().set_splash_debug_overlay(enabled);
+            }
             UiAction::RunCommand {
                 cmdline,
                 depth,

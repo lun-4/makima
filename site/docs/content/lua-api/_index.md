@@ -85,6 +85,7 @@ The rules:
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
 | [`maki.api`](#maki-api) | Plugin registration. |
+| [`maki.debug`](#maki-debug) | Debug helpers for the interactive UI. |
 | [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -838,6 +839,60 @@ which plugins own or wrap each slot.
 for name, info in pairs(maki.api.get_slots()) do
   print(name, info.owner, info.declared)
 end
+```
+
+
+## maki.debug {#maki-debug}
+
+Debug helpers for the interactive UI. Each function turns an opt-in
+readout or overlay on and off; none of them run on their own.
+
+---
+
+### `maki.debug.enable_splash_fps_overlay()` {#maki-debug-enable_splash_fps_overlay}
+
+```lua
+maki.debug.enable_splash_fps_overlay()
+```
+
+Turns on the splash fps overlay: a live readout drawn into the top of
+the input bar showing the current splash's frame rate and the UI-side
+round-trip time per frame (from request to arrived frame, smoothed).
+
+The numbers come from actual frame arrivals, so a renderer that claims
+smooth animation but delivers few frames shows up as low fps, and a slow
+`splash.render` shows up as a high round-trip. A still splash settles to
+`0 fps` once nothing animates, which is the point: it proves the splash is
+not burning CPU. The overlay also refreshes the readout about four times
+a second while enabled, so disable it once you are done measuring.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` once the UI accepted the toggle,
+or nil and an error without an interactive UI attached.
+
+**Example:**
+
+```lua
+maki.debug.enable_splash_fps_overlay()
+```
+
+---
+
+### `maki.debug.disable_splash_fps_overlay()` {#maki-debug-disable_splash_fps_overlay}
+
+```lua
+maki.debug.disable_splash_fps_overlay()
+```
+
+Turns the splash fps overlay back off, hiding the fps readout and
+stopping its periodic refreshes.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` once the UI accepted the toggle,
+or nil and an error without an interactive UI attached.
+
+**Example:**
+
+```lua
+maki.debug.disable_splash_fps_overlay()
 ```
 
 

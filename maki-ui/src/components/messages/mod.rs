@@ -27,7 +27,7 @@ use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
@@ -47,6 +47,9 @@ use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
+/// While the splash debug overlay is on, re-aim the loop this often so the
+/// fps readout keeps decaying (a settled still splash visibly drops to 0).
+const SPLASH_DEBUG_REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -59,6 +62,44 @@ struct PendingSplashFrame {
     receiver: flume::Receiver<Option<maki_lua::SplashFrame>>,
     area: Rect,
     latest: Option<&'static str>,
+    /// When the request was sent; the arrival delta feeds the debug readout.
+    requested_at: Instant,
+}
+
+/// Live readout behind the splash fps overlay (`maki.debug`). FPS is the
+/// count of frame arrivals in the trailing second, so it measures what the
+/// renderer actually delivers, not what it claims. The round-trip smooths the
+/// request-to-arrival lag the UI sees.
+#[derive(Default)]
+struct SplashDebug {
+    enabled: bool,
+    arrivals: VecDeque<Instant>,
+    render_ms: f32,
+}
+
+impl SplashDebug {
+    fn record(&mut self, round_trip: Duration) {
+        let now = Instant::now();
+        self.arrivals.push_back(now);
+        while self
+            .arrivals
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(1))
+        {
+            self.arrivals.pop_front();
+        }
+        let ms = round_trip.as_secs_f32() * 1000.0;
+        self.render_ms = if self.render_ms == 0.0 {
+            ms
+        } else {
+            self.render_ms * 0.7 + ms * 0.3
+        };
+    }
+
+    fn fps(&self) -> f32 {
+        let cutoff = Instant::now() - Duration::from_secs(1);
+        self.arrivals.iter().filter(|t| **t > cutoff).count() as f32
+    }
 }
 
 pub struct MessagesPanel {
@@ -112,6 +153,7 @@ pub struct MessagesPanel {
     splash_shown: bool,
     pending_splash_event: Option<bool>,
     last_splash_area: Rect,
+    splash_debug: SplashDebug,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
@@ -173,6 +215,7 @@ impl MessagesPanel {
             splash_shown: false,
             pending_splash_event: None,
             last_splash_area: Rect::default(),
+            splash_debug: SplashDebug::default(),
             rebake_requested: HashMap::new(),
             prompt_progress: None,
         }
@@ -752,6 +795,9 @@ impl MessagesPanel {
         if self.show_idle_splash() {
             dirty |= self.pull_splash_frame();
         }
+        // The overlay readout ages even when no frames arrive (fps decays),
+        // so while it is on the panel owes a repaint on every wake.
+        dirty |= Dirty::from(self.splash_debug.enabled);
         dirty
     }
 
@@ -777,6 +823,7 @@ impl MessagesPanel {
                         self.force_pull_once = false;
                         match frame {
                             Some(frame) => {
+                                self.splash_debug.record(pending.requested_at.elapsed());
                                 self.idle_splash.set_frame(Some(frame));
                                 self.splash_pull_suppressed = false;
                                 dirty = Dirty::YES;
@@ -809,6 +856,7 @@ impl MessagesPanel {
                     receiver,
                     area,
                     latest,
+                    requested_at: Instant::now(),
                 });
         }
         dirty
@@ -826,6 +874,32 @@ impl MessagesPanel {
 
     pub(crate) fn set_splash_frame(&mut self, frame: Option<maki_lua::SplashFrame>) {
         self.idle_splash.set_frame(frame);
+    }
+
+    pub(crate) fn set_splash_debug_overlay(&mut self, enabled: bool) {
+        // Reset the measurement window on every toggle so the readout starts
+        // fresh instead of decaying from a previous investigation.
+        self.splash_debug = SplashDebug {
+            enabled,
+            ..SplashDebug::default()
+        };
+    }
+
+    /// The input-bar hint while the debug overlay is on: fps + smoothed
+    /// per-frame round-trip, `None` once the overlay is off.
+    pub(crate) fn splash_debug_line(&self) -> Option<Line<'static>> {
+        if !self.splash_debug.enabled {
+            return None;
+        }
+        let t = theme::current();
+        Some(Line::from(Span::styled(
+            format!(
+                "splash {:.0} fps · {:.1} ms",
+                self.splash_debug.fps(),
+                self.splash_debug.render_ms
+            ),
+            t.tool_dim,
+        )))
     }
 
     #[doc(hidden)]
@@ -860,6 +934,12 @@ impl MessagesPanel {
             Cadence::when(
                 self.show_idle_splash() && self.pending_splash_frame.is_some(),
                 Cadence::PENDING,
+            ),
+            // Keep the debug readout ticking down to 0 when a still splash stops
+            // delivering frames; otherwise the fps would freeze at its last value.
+            Cadence::when(
+                self.splash_debug.enabled,
+                Cadence::after(SPLASH_DEBUG_REFRESH),
             ),
         ])
     }

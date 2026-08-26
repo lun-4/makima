@@ -6270,6 +6270,33 @@ fn test_splash_lifecycle_events() {
 }
 
 #[test]
+fn splash_debug_overlay_renders_fps_in_input_bar() {
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let dir = StateDir::from_path(env::temp_dir());
+    let writer = Arc::new(test_writer(dir.clone()));
+    let mut app = build_app_with_handle(dir, writer, handle);
+    rendered(&mut app); // assigns the splash area in view
+
+    app.set_splash_debug_overlay(true);
+    let _ = app.tick();
+    probe.try_finish_splash_frame(Some(splash_frame(80, 20)));
+    let _ = app.tick();
+    let out = rendered(&mut app);
+    assert!(
+        out.contains("fps"),
+        "debug overlay fps missing from the input bar:\n{out}"
+    );
+}
+
+fn splash_frame(width: u16, height: u16) -> maki_lua::SplashFrame {
+    maki_lua::SplashFrame {
+        width,
+        height,
+        rows: Vec::new(),
+    }
+}
+
+#[test]
 fn test_splash_survives_reset_to_empty_session() {
     // Regression: a reset (or a switch to an empty session) swaps in a fresh
     // chat with a fresh splash clock and `splash_shown: false`. The reported
