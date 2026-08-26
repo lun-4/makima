@@ -82,6 +82,7 @@ pub(crate) struct CommandEntry {
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
+pub(crate) type RetiredCommandHandlerMap = Vec<(Arc<str>, HashMap<Arc<str>, CommandEntry>)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dimension {

@@ -177,6 +177,9 @@ pub enum Request {
         plugin: Arc<str>,
         reply: flume::Sender<()>,
     },
+    DropCommandKeys {
+        plugin: Arc<str>,
+    },
     RunInitLua {
         source: String,
         source_name: String,
@@ -1838,6 +1841,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(crate::api::util::command::RetiredCommandHandlerMap::new());
         lua.set_app_data(JobStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(PromptHintCallbacks::default());
@@ -1934,32 +1938,6 @@ impl LuaRuntime {
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
-        // Drop the Lua completion/handler keys before removing the producer,
-        // so invalidation callbacks from Producer::remove can still reach live
-        // handlers.
-        if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>()
-            && let Some(cmds) = cmd_map.remove(name)
-        {
-            for (_, entry) in cmds {
-                if let Err(e) = self.lua.remove_registry_value(entry.handler) {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop command handler key");
-                }
-                for key in [
-                    entry.argument_completion,
-                    entry.completion_on_highlight,
-                    entry.completion_on_accept,
-                    entry.completion_on_cancel,
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if let Err(e) = self.lua.remove_registry_value(key) {
-                        tracing::warn!(plugin = name, error = %e, "failed to drop command completion key");
-                    }
-                }
-            }
-            drop(cmd_map);
-        }
         if let Some(producer) = self
             .command_producers
             .lock()
@@ -1967,6 +1945,21 @@ impl LuaRuntime {
             .remove(name)
         {
             producer.remove();
+        }
+        let retired = self
+            .lua
+            .app_data_mut::<CommandHandlerMap>()
+            .and_then(|mut commands| commands.remove(name));
+        if let Some(entries) = retired {
+            if let Some(mut retired) = self
+                .lua
+                .app_data_mut::<crate::api::util::command::RetiredCommandHandlerMap>()
+            {
+                retired.push((Arc::from(name), entries));
+            }
+            let _ = self.tx.send(Request::DropCommandKeys {
+                plugin: Arc::from(name),
+            });
         }
         self.warm_tools.borrow_mut().clear();
         with_jobs(&self.lua, |store| {
@@ -2412,14 +2405,6 @@ impl LuaRuntime {
 
     fn clear_plugin(&mut self, plugin: &str) {
         self.registry.clear_plugin(plugin);
-        if let Some(producer) = self
-            .command_producers
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(plugin)
-        {
-            producer.remove();
-        }
         self.plugin_rules.remove(plugin);
         self.drop_plugin_keys(plugin);
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
@@ -3372,6 +3357,36 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
+                        }
+                        Request::DropCommandKeys { plugin } => {
+                            let entries = rt
+                                .lua
+                                .app_data_mut::<crate::api::util::command::RetiredCommandHandlerMap>()
+                                .and_then(|mut retired| {
+                                    retired
+                                        .iter()
+                                        .position(|(owner, _)| owner == &plugin)
+                                        .map(|index| retired.remove(index).1)
+                                })
+                                .unwrap_or_default();
+                            for (_, entry) in entries {
+                                if let Err(error) = rt.lua.remove_registry_value(entry.handler) {
+                                    tracing::warn!(%plugin, %error, "failed to drop command handler key");
+                                }
+                                for key in [
+                                    entry.argument_completion,
+                                    entry.completion_on_highlight,
+                                    entry.completion_on_accept,
+                                    entry.completion_on_cancel,
+                                ]
+                                .into_iter()
+                                .flatten()
+                                {
+                                    if let Err(error) = rt.lua.remove_registry_value(key) {
+                                        tracing::warn!(%plugin, %error, "failed to drop command completion key");
+                                    }
+                                }
+                            }
                         }
                         Request::RunCommand {
                             plugin,

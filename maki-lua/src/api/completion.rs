@@ -402,23 +402,38 @@ pub(crate) async fn collect_command_argument_items(
         .collect()
 }
 
+fn lifecycle_function(
+    lua: &Lua,
+    commands: Option<&HashMap<Arc<str>, crate::api::util::command::CommandEntry>>,
+    request: &CommandArgumentLifecycleRequest,
+) -> Option<Function> {
+    let entry = commands?.get(&request.context.command)?;
+    let key = match request.event {
+        CommandArgumentLifecycle::Highlight => &entry.completion_on_highlight,
+        CommandArgumentLifecycle::Accept => &entry.completion_on_accept,
+        CommandArgumentLifecycle::Cancel => &entry.completion_on_cancel,
+    };
+    key.as_ref()
+        .and_then(|key| lua.registry_value::<Function>(key).ok())
+}
+
 pub(crate) async fn run_command_argument_lifecycle(
     lua: &Lua,
     request: &CommandArgumentLifecycleRequest,
 ) {
-    let function = lua.app_data_ref::<CommandHandlerMap>().and_then(|map| {
-        map.get(&request.context.plugin).and_then(|commands| {
-            commands.get(&request.context.command).and_then(|entry| {
-                let key = match request.event {
-                    CommandArgumentLifecycle::Highlight => &entry.completion_on_highlight,
-                    CommandArgumentLifecycle::Accept => &entry.completion_on_accept,
-                    CommandArgumentLifecycle::Cancel => &entry.completion_on_cancel,
-                };
-                key.as_ref()
-                    .and_then(|key| lua.registry_value::<Function>(key).ok())
-            })
-        })
-    });
+    let function = lua
+        .app_data_ref::<CommandHandlerMap>()
+        .and_then(|map| lifecycle_function(lua, map.get(&request.context.plugin), request))
+        .or_else(|| {
+            lua.app_data_ref::<crate::api::util::command::RetiredCommandHandlerMap>()
+                .and_then(|retired| {
+                    retired
+                        .iter()
+                        .rev()
+                        .find(|(plugin, _)| plugin == &request.context.plugin)
+                        .and_then(|(_, commands)| lifecycle_function(lua, Some(commands), request))
+                })
+        });
     let Some(function) = function else { return };
     let ctx = match command_argument_ctx(lua, &request.context) {
         Ok(ctx) => ctx,
