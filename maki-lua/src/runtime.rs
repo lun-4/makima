@@ -1576,24 +1576,27 @@ impl LuaCommandCompletion {
         &self,
         context: &CompletionContext,
         trigger: maki_agent::CancelTrigger,
+        terminal: bool,
     ) -> CommandArgumentContext {
         let mut sessions = self
             .sessions
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        // Ids come from a counter rather than the map size so that adding
-        // entry removal later cannot reintroduce collisions.
-        let id = sessions.get(&context.session_id).map_or_else(
-            || self.next_session_id.fetch_add(1, Ordering::Relaxed),
-            |session| session.id,
-        );
-        sessions.insert(
-            context.session_id,
-            LuaCompletionSession {
-                id,
-                _trigger: trigger,
-            },
-        );
+        let id = sessions
+            .get(&context.session_id)
+            .map(|session| session.id)
+            .unwrap_or_else(|| self.next_session_id.fetch_add(1, Ordering::Relaxed));
+        if terminal {
+            sessions.remove(&context.session_id);
+        } else {
+            sessions.insert(
+                context.session_id,
+                LuaCompletionSession {
+                    id,
+                    _trigger: trigger,
+                },
+            );
+        }
         CommandArgumentContext {
             command: Arc::clone(&context.invoked_name),
             plugin: Arc::clone(&self.plugin),
@@ -1614,7 +1617,7 @@ impl CommandCompletion for LuaCommandCompletion {
         cancellation: maki_commands::CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
         let (trigger, cancel) = CancelToken::new();
-        let context = self.context(&context, trigger);
+        let context = self.context(&context, trigger, false);
         let (reply, rx) = flume::bounded(1);
         if !self.command_arguments.submit(CommandArgumentRequest {
             context,
@@ -1647,7 +1650,11 @@ impl CommandCompletion for LuaCommandCompletion {
         _cancellation: &maki_commands::CancellationToken,
     ) -> Result<(), CompletionError> {
         let (trigger, cancel) = CancelToken::new();
-        let context = self.context(context, trigger);
+        let terminal = matches!(
+            event,
+            CompletionLifecycleEvent::Accept(_) | CompletionLifecycleEvent::Cancel
+        );
+        let context = self.context(context, trigger, terminal);
         let (event, item) = match event {
             CompletionLifecycleEvent::Highlight(item) => (
                 CommandArgumentLifecycle::Highlight,
