@@ -92,7 +92,20 @@ end)
 
    It asserts `rows == h`, exact per-row cell width (UTF-8 aware), no blank
    frames across sizes and time steps, and reports ms/frame.
-4. **Look at it as text** before running maki:
+4. **Bench it before and after perf work** with the bundled script (same
+   lua5.1 stub): `lua5.1 scripts/bench.lua --dir <dir> <name>...`. It reports
+   ms/frame at 80x24 and 200x79 (a tall terminal). Real maki renders compile
+   to native (plugin envs are marked safe via `lua_setsafeenv`, so luau
+   codegen applies), so expect ~lua5.1/5 in the app, plus a Rust-side parse
+   that scales with segment count. The per-cell output path (quantize + ramp
+   + segment coalescing) is the common floor; sampled-grid bilinear rendering
+   (caustics-style, `SAMPLE_STEP`) cuts shade cost ~4x for smooth fields but
+   smears steep gradients (metaballs kept full-res for this reason). Run
+   merging within one 5-bit color step (`MERGE_TOL`) can cut segment count
+   several-fold — the parse pays per segment — but keep it at 0 for
+   high-frequency fields (kaleidoscope: tolerance merging flattened the
+   fractal's color grain and read as bad quality).
+5. **Look at it as text** before running maki:
 
    ```bash
    lua5.1 scripts/dump_frame.lua ~/.config/maki/lua/voronoi.lua 60 20 2.0
