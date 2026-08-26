@@ -69,11 +69,9 @@ end
 
 -- 5-bit keyed style: quantize to 0..31 per channel (so a `31`-step grid maps
 -- back to 8-bit hex on cache miss) and key on the components directly. This
--- drops the per-cell *255/31 round-trip, and `MERGE_TOL` (one step ~= 8/255)
--- lets the row builder merge runs whose colors drift by a step; that cuts
--- segment count (and Rust-side parse cost) several-fold with no visible
--- banding.
-local MERGE_TOL = 1
+-- drops the per-cell *255/31 round-trip. Metaballs keeps exact-key runs because
+-- its thin gridlines are high-frequency details that tolerance merging drops.
+local MERGE_TOL = 0
 
 local function quantize5(v)
   if v < 0 then
