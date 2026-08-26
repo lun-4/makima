@@ -517,7 +517,7 @@ pub enum UiAction {
         scroll_top: u16,
     },
     /// Toggles the splash fps overlay: a live fps/round-trip readout drawn
-    /// into the top of the input bar. Set from Lua (`maki.debug`); the UI
+    /// into the top of the input bar. Set from Lua (`maki.perf`); the UI
     /// measures frame arrivals itself, so the flag only rides the channel.
     SplashFpsOverlay {
         enabled: bool,

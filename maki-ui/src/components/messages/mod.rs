@@ -66,7 +66,7 @@ struct PendingSplashFrame {
     requested_at: Instant,
 }
 
-/// Live readout behind the splash fps overlay (`maki.debug`). FPS is the
+/// Live readout behind the splash fps overlay (`maki.perf`). FPS is the
 /// count of frame arrivals in the trailing second, so it measures what the
 /// renderer actually delivers, not what it claims. The round-trip smooths the
 /// request-to-arrival lag the UI sees.

@@ -3,7 +3,6 @@ pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
 pub(crate) mod completion;
-pub(crate) mod debug;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
@@ -17,6 +16,7 @@ pub(crate) mod mode;
 pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
+pub(crate) mod perf;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;
@@ -112,10 +112,7 @@ pub(crate) fn create_maki_global(
         timer::create_timer_table(lua, Arc::clone(&plugin))?,
     )?;
     maki.set("time", time::create_time_table(lua)?)?;
-    maki.set(
-        "debug",
-        debug::create_debug_table(lua, ui_action_tx.clone())?,
-    )?;
+    maki.set("perf", perf::create_perf_table(lua, ui_action_tx.clone())?)?;
     crate::splash::register_version_api(lua, &maki)?;
 
     Ok(maki)

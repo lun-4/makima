@@ -85,7 +85,7 @@ The rules:
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
 | [`maki.api`](#maki-api) | Plugin registration. |
-| [`maki.debug`](#maki-debug) | Debug helpers for the interactive UI. |
+| [`maki.perf`](#maki-perf) | Performance readouts for splashes and the UI. |
 | [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -842,17 +842,17 @@ end
 ```
 
 
-## maki.debug {#maki-debug}
+## maki.perf {#maki-perf}
 
-Debug helpers for the interactive UI. Each function turns an opt-in
-readout or overlay on and off; none of them run on their own.
+Performance readouts for splashes and the UI. Each function turns an
+opt-in instrument on and off; none of them run on their own.
 
 ---
 
-### `maki.debug.enable_splash_fps_overlay()` {#maki-debug-enable_splash_fps_overlay}
+### `maki.perf.enable_splash_fps_overlay()` {#maki-perf-enable_splash_fps_overlay}
 
 ```lua
-maki.debug.enable_splash_fps_overlay()
+maki.perf.enable_splash_fps_overlay()
 ```
 
 Turns on the splash fps overlay: a live readout drawn into the top of
@@ -872,15 +872,15 @@ or nil and an error without an interactive UI attached.
 **Example:**
 
 ```lua
-maki.debug.enable_splash_fps_overlay()
+maki.perf.enable_splash_fps_overlay()
 ```
 
 ---
 
-### `maki.debug.disable_splash_fps_overlay()` {#maki-debug-disable_splash_fps_overlay}
+### `maki.perf.disable_splash_fps_overlay()` {#maki-perf-disable_splash_fps_overlay}
 
 ```lua
-maki.debug.disable_splash_fps_overlay()
+maki.perf.disable_splash_fps_overlay()
 ```
 
 Turns the splash fps overlay back off, hiding the fps readout and
@@ -892,7 +892,7 @@ or nil and an error without an interactive UI attached.
 **Example:**
 
 ```lua
-maki.debug.disable_splash_fps_overlay()
+maki.perf.disable_splash_fps_overlay()
 ```
 
 

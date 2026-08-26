@@ -1,6 +1,6 @@
-//! `maki.debug`: opt-in debug helpers for the interactive UI. Nothing here
-//! runs unless a plugin calls it; every helper is a readout or overlay that
-//! the plugin turns on and off itself.
+//! `maki.perf`: opt-in performance instrumentation for the interactive UI.
+//! Nothing here runs unless a plugin calls it; every helper is a readout or
+//! overlay that the plugin turns on and off itself.
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult};
@@ -22,7 +22,7 @@ use crate::api::util::pair::{Pair, try_pair};
 /// @return (boolean|nil, string|nil) `true` once the UI accepted the toggle,
 /// or nil and an error without an interactive UI attached.
 /// @example
-/// maki.debug.enable_splash_fps_overlay()
+/// maki.perf.enable_splash_fps_overlay()
 #[lua_fn]
 fn enable_splash_fps_overlay(
     _lua: &Lua,
@@ -41,7 +41,7 @@ fn enable_splash_fps_overlay(
 /// @return (boolean|nil, string|nil) `true` once the UI accepted the toggle,
 /// or nil and an error without an interactive UI attached.
 /// @example
-/// maki.debug.disable_splash_fps_overlay()
+/// maki.perf.disable_splash_fps_overlay()
 #[lua_fn]
 fn disable_splash_fps_overlay(
     _lua: &Lua,
@@ -55,9 +55,9 @@ fn disable_splash_fps_overlay(
 }
 
 lua_table! {
-    /// Debug helpers for the interactive UI. Each function turns an opt-in
-    /// readout or overlay on and off; none of them run on their own.
-    "maki.debug" => pub(crate) fn create_debug_table(tx: Option<flume::Sender<UiAction>>),
+    /// Performance readouts for splashes and the UI. Each function turns an
+    /// opt-in instrument on and off; none of them run on their own.
+    "maki.perf" => pub(crate) fn create_perf_table(tx: Option<flume::Sender<UiAction>>),
     DOCS [enable_splash_fps_overlay(tx), disable_splash_fps_overlay(tx)]
 }
 
@@ -67,17 +67,17 @@ mod tests {
     use crate::api::util::command::NO_UI_ERR;
     use mlua::Value;
 
-    fn debug_table(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn perf_table(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_debug_table(&lua, tx).unwrap();
-        lua.globals().set("debug", t).unwrap();
+        let t = create_perf_table(&lua, tx).unwrap();
+        lua.globals().set("perf", t).unwrap();
         lua
     }
 
     #[test]
     fn splash_fps_overlay_without_ui_returns_error_pair() {
-        let (val, err): (Value, Option<String>) = debug_table(None)
-            .load("return debug.enable_splash_fps_overlay()")
+        let (val, err): (Value, Option<String>) = perf_table(None)
+            .load("return perf.enable_splash_fps_overlay()")
             .eval()
             .unwrap();
         assert!(val.is_nil());
@@ -87,11 +87,9 @@ mod tests {
     #[test]
     fn splash_fps_overlay_roundtrips_toggle_through_ui_channel() {
         let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = debug_table(Some(tx));
-        lua.load("debug.enable_splash_fps_overlay()")
-            .exec()
-            .unwrap();
-        lua.load("debug.disable_splash_fps_overlay()")
+        let lua = perf_table(Some(tx));
+        lua.load("perf.enable_splash_fps_overlay()").exec().unwrap();
+        lua.load("perf.disable_splash_fps_overlay()")
             .exec()
             .unwrap();
         let (a, b) = (rx.recv().unwrap(), rx.recv().unwrap());
