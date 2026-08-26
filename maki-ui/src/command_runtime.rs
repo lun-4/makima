@@ -326,7 +326,6 @@ mod tests {
 
     #[test]
     fn overlapping_theme_previews_restore_deterministically() {
-        let _guard = crate::theme::theme_test_guard();
         let provider = Arc::new(crate::theme::InMemoryThemesProvider::bundled());
         let baseline = provider.current_theme_name();
         let (runtime, _) = runtime_with_themes(Arc::clone(&provider));
@@ -338,12 +337,9 @@ mod tests {
         first.highlight(&first_item).unwrap();
         second.highlight(&second_item).unwrap();
         first.cancel().unwrap();
-        assert_eq!(
-            **crate::theme::current(),
-            provider.load("tokyonight").unwrap()
-        );
+        assert_eq!(provider.current_theme_name(), "tokyonight");
         second.cancel().unwrap();
-        assert_eq!(**crate::theme::current(), provider.load(&baseline).unwrap());
+        assert_eq!(provider.current_theme_name(), baseline);
     }
 
     #[test]

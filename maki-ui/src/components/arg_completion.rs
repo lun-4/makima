@@ -194,12 +194,7 @@ mod tests {
         }
     }
 
-    fn theme_fixture() -> (
-        std::sync::MutexGuard<'static, ()>,
-        Arc<ThemeArgSource>,
-        CommandRegistry,
-    ) {
-        let guard = crate::theme::theme_test_guard();
+    fn theme_fixture() -> (Arc<ThemeArgSource>, CommandRegistry) {
         let provider = Arc::new(InMemoryThemesProvider::bundled());
         let source = Arc::new(ThemeArgSource::new(provider));
         let registry = CommandRegistry::new();
@@ -219,7 +214,7 @@ mod tests {
                 completion: Some(source.clone()),
             }])
             .unwrap();
-        (guard, source, registry)
+        (source, registry)
     }
 
     fn accepted_preview(
@@ -250,25 +245,23 @@ mod tests {
 
     #[test]
     fn bare_theme_invocation_reverts_stale_accepted_preview() {
-        let (_guard, source, registry) = theme_fixture();
-        source.provider.install(BASE_THEME).unwrap();
-        let original = crate::theme::current().clone();
+        let (source, registry) = theme_fixture();
+        source.provider.select(BASE_THEME);
         let target = accepted_preview(&registry, &source, SELECTED_THEME);
 
         // Opening the picker (empty arguments) must not commit the abandoned
         // selection.
         source.finish(target, false);
-        assert_eq!(*crate::theme::current(), original);
+        assert_eq!(source.provider.current_theme_name(), BASE_THEME);
     }
 
     #[test]
     fn executing_a_selection_commits_its_preview() {
-        let (_guard, source, registry) = theme_fixture();
-        source.provider.install(BASE_THEME).unwrap();
+        let (source, registry) = theme_fixture();
+        source.provider.select(BASE_THEME);
         let target = accepted_preview(&registry, &source, SELECTED_THEME);
 
         source.finish(target, true);
-        let selected = source.provider.load(SELECTED_THEME).unwrap();
-        assert_eq!(**crate::theme::current(), selected);
+        assert_eq!(source.provider.current_theme_name(), SELECTED_THEME);
     }
 }
