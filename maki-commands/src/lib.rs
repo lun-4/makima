@@ -533,6 +533,9 @@ impl CommandRegistry {
         let Ok(command) = self.resolve(parsed.name) else {
             return Box::pin(async { Ok(InputDispatch::UnknownCommandInput) });
         };
+        if target_id.0 != self.0.id {
+            return Box::pin(async { Err(CommandError::StaleTarget) });
+        }
         if depth > MAX_COMMAND_DEPTH {
             return Box::pin(async { Err(CommandError::MaximumDepth) });
         }
@@ -631,6 +634,17 @@ impl CommandRegistry {
         target_id: InvocationTargetId,
         lifecycle: InvocationLifecycle,
     ) -> CommandFuture<Result<CommandDispatch, CommandError>> {
+        let ownership_error = if command.registry_id != self.0.id {
+            Some(CommandError::StaleCommand)
+        } else if target_id.0 != self.0.id {
+            Some(CommandError::StaleTarget)
+        } else {
+            None
+        };
+        if let Some(error) = ownership_error {
+            lifecycle.transition(CommandClassification::Failed(error.clone()));
+            return Box::pin(async move { Err(error) });
+        }
         let count = arguments.split_whitespace().count();
         if depth > MAX_COMMAND_DEPTH {
             lifecycle.transition(CommandClassification::Failed(CommandError::MaximumDepth));
@@ -1193,6 +1207,8 @@ pub enum CommandError {
     },
     #[error("command is not supported by this frontend: {0}")]
     UnsupportedFrontend(Arc<str>),
+    #[error("the resolved command belongs to another registry")]
+    StaleCommand,
     #[error("the command target is no longer available")]
     StaleTarget,
     #[error("maximum command recursion depth exceeded")]
@@ -2851,6 +2867,43 @@ mod tests {
             first.resolve("/run").unwrap().command_id(),
             second.resolve("/run").unwrap().command_id()
         );
+    }
+
+    #[test]
+    fn dispatch_rejects_foreign_command_and_target() {
+        let first = super::CommandRegistry::new();
+        let producer = first.create_producer(super::ProducerPrecedence::Builtin);
+        producer
+            .replace(vec![registration("/run", &[], ArgumentArity::NONE)])
+            .unwrap();
+        let second = super::CommandRegistry::new();
+
+        let error =
+            futures_lite::future::block_on(first.dispatch_input("/run", 0, second.create_target()))
+                .unwrap_err();
+        assert_eq!(error, super::CommandError::StaleTarget);
+
+        let dispatch = first.dispatch_command(
+            first.resolve("/run").unwrap(),
+            "",
+            0,
+            second.create_target(),
+        );
+        let Err(error) = futures_lite::future::block_on(dispatch) else {
+            panic!("foreign target dispatched");
+        };
+        assert_eq!(error, super::CommandError::StaleTarget);
+
+        let dispatch = second.dispatch_command(
+            first.resolve("/run").unwrap(),
+            "",
+            0,
+            second.create_target(),
+        );
+        let Err(error) = futures_lite::future::block_on(dispatch) else {
+            panic!("foreign command dispatched");
+        };
+        assert_eq!(error, super::CommandError::StaleCommand);
     }
 
     #[test]
