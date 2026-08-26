@@ -5625,6 +5625,20 @@ fn enter_inserts_skill() {
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.input_box.buffer.value(), "@skill:review");
+    assert!(!app.file_completion.is_active());
+}
+
+#[test_case(KeyModifiers::ALT ; "alt_left")]
+#[test_case(KeyModifiers::CONTROL ; "ctrl_left")]
+fn word_motion_left_with_completion_open_reaches_input(mods: KeyModifiers) {
+    let (_tmp, mut app, backend) = completion_app();
+    seed_skill(&backend, "review");
+    for c in "@skill:rev".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Left, mods)));
+    assert_eq!(app.input_box.buffer.x(), 0);
 }
 
 #[test]

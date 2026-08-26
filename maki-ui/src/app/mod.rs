@@ -800,6 +800,7 @@ impl App {
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
+            self.sync_file_completion();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
                     return Some(self.handle_cancel());
@@ -1232,7 +1233,12 @@ impl App {
             .command_palette
             .handle_key(key, &self.input_box.buffer.value())
         {
-            CommandAction::Consumed => return vec![],
+            CommandAction::Consumed => {
+                if key.code == KeyCode::Esc {
+                    self.sync_file_completion();
+                }
+                return vec![];
+            }
             CommandAction::SelectionChanged => {
                 let input = self.input_box.buffer.value();
                 self.command_palette.sync_arguments(
@@ -1289,6 +1295,16 @@ impl App {
             }
             InputAction::PaletteSync(val) => {
                 self.command_palette.sync(&val);
+                self.command_palette.sync_arguments(
+                    &val,
+                    self.input_box.buffer.cursor_byte_offset(),
+                    &self.state.mode.id_key(),
+                );
+                self.sync_file_completion();
+                vec![]
+            }
+            InputAction::CursorMoved => {
+                let val = self.input_box.buffer.value();
                 self.command_palette.sync_arguments(
                     &val,
                     self.input_box.buffer.cursor_byte_offset(),
@@ -2499,6 +2515,7 @@ impl App {
 
     pub fn close_all_overlays(&mut self) {
         self.command_palette.close();
+        self.file_completion.close();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
 
