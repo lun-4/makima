@@ -1865,12 +1865,17 @@ impl App {
             CommandRoute::Mcp(prompt) => self.execute_mcp(prompt),
         };
         if matches!(command.route, CommandRoute::Builtin(BuiltinRoute::Theme)) {
+            // Only an execution that actually selected a theme commits its
+            // preview. Opening the picker (empty arguments) must not commit a
+            // stale accepted preview from an abandoned edit, so it reverts.
+            let selected_a_theme = !command.arguments.trim().is_empty();
             self.command_runtime.finish_theme_preview(
                 command.target,
-                !matches!(
-                    outcome.classification,
-                    maki_commands::CommandClassification::Failed(_)
-                ),
+                selected_a_theme
+                    && !matches!(
+                        outcome.classification,
+                        maki_commands::CommandClassification::Failed(_)
+                    ),
             );
         }
         complete(&command, outcome.classification);

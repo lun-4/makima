@@ -168,3 +168,107 @@ impl CommandCompletion for ThemeArgSource {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use maki_commands::{
+        ArgumentArity, CommandBehavior, CommandDocs, CommandError, CommandFuture,
+        CommandInvocation, CommandRegistry, CommandSpec, CompletionResult, ProducerPrecedence,
+        Registration,
+    };
+
+    use crate::theme::InMemoryThemesProvider;
+
+    use super::*;
+
+    struct NoBehavior;
+
+    impl CommandBehavior for NoBehavior {
+        fn execute(
+            &self,
+            _invocation: CommandInvocation,
+        ) -> CommandFuture<Result<(), CommandError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn theme_fixture() -> (
+        std::sync::MutexGuard<'static, ()>,
+        Arc<ThemeArgSource>,
+        CommandRegistry,
+    ) {
+        let guard = crate::theme::theme_test_guard();
+        let provider = Arc::new(InMemoryThemesProvider::bundled());
+        let source = Arc::new(ThemeArgSource::new(provider));
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/theme"),
+                    aliases: Vec::new().into(),
+                    arguments: ArgumentArity::unbounded(0),
+                    docs: CommandDocs {
+                        summary: Arc::from("pick a theme"),
+                        argument_hint: None,
+                    },
+                },
+                behavior: Arc::new(NoBehavior),
+                completion: Some(source.clone()),
+            }])
+            .unwrap();
+        (guard, source, registry)
+    }
+
+    fn accepted_preview(
+        registry: &CommandRegistry,
+        _source: &ThemeArgSource,
+        theme: &str,
+    ) -> InvocationTargetId {
+        let target = registry.create_target();
+        let command = registry.resolve("/theme").unwrap();
+        let session = registry.open_completion(command, target).unwrap();
+
+        let result =
+            smol::block_on(session.complete(Arc::from(""), Arc::from(""), 0, Arc::from("insert")));
+        let CompletionResult::Items(candidates) = result else {
+            panic!("expected completion items");
+        };
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.item().insertion.as_ref() == theme)
+            .unwrap_or_else(|| panic!("{theme} not in completion items"));
+        session.highlight(candidate).unwrap();
+        session.accept(candidate.clone()).unwrap();
+        target
+    }
+
+    const BASE_THEME: &str = "dracula";
+    const SELECTED_THEME: &str = "tokyonight";
+
+    #[test]
+    fn bare_theme_invocation_reverts_stale_accepted_preview() {
+        let (_guard, source, registry) = theme_fixture();
+        source.provider.install(BASE_THEME).unwrap();
+        let original = crate::theme::current().clone();
+        let target = accepted_preview(&registry, &source, SELECTED_THEME);
+
+        // Opening the picker (empty arguments) must not commit the abandoned
+        // selection.
+        source.finish(target, false);
+        assert_eq!(*crate::theme::current(), original);
+    }
+
+    #[test]
+    fn executing_a_selection_commits_its_preview() {
+        let (_guard, source, registry) = theme_fixture();
+        source.provider.install(BASE_THEME).unwrap();
+        let target = accepted_preview(&registry, &source, SELECTED_THEME);
+
+        source.finish(target, true);
+        let selected = source.provider.load(SELECTED_THEME).unwrap();
+        assert_eq!(**crate::theme::current(), selected);
+    }
+}
