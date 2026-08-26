@@ -173,33 +173,36 @@ impl CommandRuntime {
             .replace(
                 BUILTIN_COMMANDS
                     .iter()
-                    .map(|command| Registration {
-                        spec: CommandSpec {
-                            name: Arc::from(command.name),
-                            aliases: command.aliases.iter().copied().map(Arc::from).collect(),
-                            arguments: if command.max_args == usize::MAX {
-                                ArgumentArity::unbounded(0)
-                            } else {
-                                ArgumentArity::bounded(0, command.max_args)
+                    .map(|command| {
+                        let route = CommandRoute::Builtin(BuiltinRoute::from_name(command.name));
+                        Registration {
+                            spec: CommandSpec {
+                                name: Arc::from(command.name),
+                                aliases: command.aliases.iter().copied().map(Arc::from).collect(),
+                                arguments: if command.max_args == usize::MAX {
+                                    ArgumentArity::unbounded(0)
+                                } else {
+                                    ArgumentArity::bounded(0, command.max_args)
+                                },
+                                docs: CommandDocs {
+                                    summary: Arc::from(command.description),
+                                    argument_hint: None,
+                                },
                             },
-                            docs: CommandDocs {
-                                summary: Arc::from(command.description),
-                                argument_hint: None,
+                            behavior: Arc::new(RouteBehavior {
+                                route: route.clone(),
+                                command_tx: command_tx.clone(),
+                            }),
+                            completion: match route {
+                                CommandRoute::Builtin(BuiltinRoute::Model) => {
+                                    Some(Arc::clone(&model_completion) as Arc<dyn CommandCompletion>)
+                                }
+                                CommandRoute::Builtin(BuiltinRoute::Theme) => {
+                                    Some(Arc::clone(&theme_completion) as Arc<dyn CommandCompletion>)
+                                }
+                                _ => None,
                             },
-                        },
-                        behavior: Arc::new(RouteBehavior {
-                            route: CommandRoute::Builtin(BuiltinRoute::from_name(command.name)),
-                            command_tx: command_tx.clone(),
-                        }),
-                        completion: match BuiltinRoute::from_name(command.name) {
-                            BuiltinRoute::Model => {
-                                Some(Arc::clone(&model_completion) as Arc<dyn CommandCompletion>)
-                            }
-                            BuiltinRoute::Theme => {
-                                Some(Arc::clone(&theme_completion) as Arc<dyn CommandCompletion>)
-                            }
-                            _ => None,
-                        },
+                        }
                     })
                     .collect(),
             )
@@ -245,7 +248,7 @@ mod tests {
     use std::sync::Arc;
 
     use arc_swap::ArcSwapOption;
-    use maki_commands::{CommandClassification, CommandError, InputDispatch};
+    use maki_commands::{BUILTIN_COMMANDS, CommandClassification, CommandError, InputDispatch};
 
     use super::{CommandRuntime, RoutedCommand};
     use crate::{
@@ -353,5 +356,15 @@ mod tests {
             smol::block_on(dispatch.classification()),
             CommandClassification::Failed(CommandError::StaleTarget)
         );
+    }
+    /// Every built-in in the shared metadata must map to a TUI route: a
+    /// missing arm here panics at startup instead of failing this test, so
+    /// pin the pairing explicitly.
+    #[test]
+    fn every_builtin_command_maps_to_a_route() {
+        for command in BUILTIN_COMMANDS {
+            let _route = super::BuiltinRoute::from_name(command.name);
+        }
+        assert_eq!(BUILTIN_COMMANDS.len(), 18);
     }
 }

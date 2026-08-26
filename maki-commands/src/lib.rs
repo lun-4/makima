@@ -143,6 +143,9 @@ pub struct CommandSpec {
     pub docs: CommandDocs,
 }
 
+/// Argument count bounds. Arguments are counted by splitting the raw
+/// remainder on whitespace, with no shell-like quoting: `/cd "my dir"` counts
+/// as two arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArgumentArity {
     pub min: usize,
@@ -1414,6 +1417,9 @@ impl CompletionSession {
         self.core.lifecycle(candidate, false)
     }
 
+    /// Accepts a candidate and closes the session. Fire-once: the session is
+    /// closed before the provider's lifecycle callback runs, so a provider
+    /// error here cannot be retried or rolled back.
     pub fn accept(&self, candidate: CompletionCandidate) -> Result<(), CompletionError> {
         self.core.lifecycle(&candidate, true)
     }
@@ -1783,6 +1789,27 @@ mod tests {
             },
             behavior: Arc::new(Behavior),
             completion: None,
+        }
+    }
+
+    #[test]
+    fn slash_input_parse_edge_cases_do_not_dispatch() {
+        let registry = super::CommandRegistry::new();
+        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
+        producer
+            .replace(vec![registration("/run", &[], ArgumentArity::ANY)])
+            .unwrap();
+        let target = registry.create_target();
+        for input in ["/", "/ cmd", "   ", "\t\n"] {
+            let dispatch =
+                futures_lite::future::block_on(registry.dispatch_input(input, 0, target)).unwrap();
+            assert!(
+                matches!(
+                    dispatch,
+                    super::InputDispatch::NotCommand | super::InputDispatch::UnknownCommandInput
+                ),
+                "input {input:?} unexpectedly dispatched"
+            );
         }
     }
 
