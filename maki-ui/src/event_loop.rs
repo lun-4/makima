@@ -1636,7 +1636,7 @@ impl<'t> EventLoop<'t> {
             model: new_model,
             provider: Arc::from(new_provider),
         }));
-        self.refresh_usage(self.focused);
+        self.refresh_usage(idx);
         Ok(())
     }
 
