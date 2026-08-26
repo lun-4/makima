@@ -400,7 +400,7 @@ impl CommandRegistry {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let id = ProducerId::new(self.0.id, state.take_id());
-        let creation_order = state.producers.len() as u64;
+        let creation_order = state.next_id;
         state.producers.push(ProducerSlot {
             id,
             precedence,
@@ -1273,7 +1273,6 @@ impl CancellationToken {
         self.0.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
@@ -1420,7 +1419,7 @@ impl CompletionSession {
     }
 
     pub fn cancel(&self) -> Result<(), CompletionError> {
-        self.core.close(true)
+        self.core.close()
     }
 }
 
@@ -1483,17 +1482,14 @@ impl CompletionSessionCore {
         self.invoke_lifecycle(callback)
     }
 
-    fn close(&self, notify: bool) -> Result<(), CompletionError> {
+    fn close(&self) -> Result<(), CompletionError> {
         let callback = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.closed {
                 return Err(CompletionError::StaleSession);
             }
             state.closed = true;
-            let callback = take_cancel_callback(&mut state);
-            notify
-                .then_some(callback)
-                .flatten()
+            take_cancel_callback(&mut state)
                 .and_then(|callback| start_or_queue_callback(&mut state, callback))
         };
         self.unregister();
@@ -1612,12 +1608,6 @@ fn invoke_invalidated_sessions(sessions: Vec<InvalidatedSession>) {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PendingCompletionRequest {
-    pub context: CompletionContext,
-    pub cancellation: CancellationToken,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionResult {
     Items(Vec<CompletionCandidate>),
@@ -1628,10 +1618,6 @@ pub enum CompletionResult {
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum CompletionError {
-    #[error("completion provider failed: {0}")]
-    Producer(Arc<str>),
-    #[error("the completion target is no longer available")]
-    StaleTarget,
     #[error("the command has no completion provider")]
     Unavailable,
     #[error("the resolved command is no longer registered")]
@@ -1798,6 +1784,37 @@ mod tests {
             behavior: Arc::new(Behavior),
             completion: None,
         }
+    }
+
+    #[test]
+    fn alias_tie_break_survives_producer_removal() {
+        let registry = super::CommandRegistry::new();
+        let canonical = registry.create_producer(super::ProducerPrecedence::Builtin);
+        canonical
+            .replace(vec![registration("/dup", &[], ArgumentArity::ANY)])
+            .unwrap();
+        let alias = registry.create_producer(super::ProducerPrecedence::Builtin);
+        alias
+            .replace(vec![registration("/other", &["/dup"], ArgumentArity::ANY)])
+            .unwrap();
+
+        // Canonical beats alias regardless of producer age.
+        let winner = registry.resolve("/DUP").unwrap();
+        assert_eq!(winner.spec().name.as_ref(), "/dup");
+
+        // After the canonical holder is removed, the older alias producer
+        // wins over a same-precedence latecomer.
+        canonical.remove();
+        let latecomer = registry.create_producer(super::ProducerPrecedence::Builtin);
+        latecomer
+            .replace(vec![registration("/third", &["/dup"], ArgumentArity::ANY)])
+            .unwrap();
+        let winner = registry.resolve("/DUP").unwrap();
+        assert_eq!(winner.spec().name.as_ref(), "/other");
+
+        alias.remove();
+        let winner = registry.resolve("/DUP").unwrap();
+        assert_eq!(winner.spec().name.as_ref(), "/third");
     }
 
     #[test]
