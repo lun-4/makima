@@ -415,6 +415,7 @@ fn env_d_late_codegen() {
 }
 
 #[test]
+#[ignore = "bench meter, not a CI gate: it spawns real hosts and pulls frames at 200x79 for seconds; under parallel CI load a render can exceed the splash deadline and wedge a host, flaking the suite. Run manually with cargo test -p maki-lua --test splash_bench pull_roundtrip_200x79 -- --ignored --nocapture"]
 fn pull_roundtrip_200x79() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
