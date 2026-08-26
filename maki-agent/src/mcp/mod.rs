@@ -277,7 +277,6 @@ struct McpPromptBehavior {
     identity: Arc<()>,
     sink: Arc<dyn McpPromptSink>,
     published: Arc<ArcSwap<McpPublishedState>>,
-    state: Arc<McpPublishedState>,
 }
 
 impl CommandBehavior for McpPromptBehavior {
@@ -294,13 +293,12 @@ impl CommandBehavior for McpPromptBehavior {
             let message = format!("Usage: /{} {}", self.prompt.display_name, missing.join(" "));
             return Box::pin(async move { Err(CommandError::Producer(Arc::from(message))) });
         }
-        let live = self.published.load_full();
-        if !Arc::ptr_eq(&live, &self.state)
-            || !live
-                .index
-                .prompts
-                .get(&self.prompt.qualified_name)
-                .is_some_and(|prompt| Arc::ptr_eq(&prompt.identity, &self.identity))
+        let live = self.published.load();
+        if !live
+            .index
+            .prompts
+            .get(&self.prompt.qualified_name)
+            .is_some_and(|prompt| Arc::ptr_eq(&prompt.identity, &self.identity))
         {
             return Box::pin(async {
                 Err(CommandError::Producer(Arc::from(
@@ -1169,7 +1167,6 @@ fn prompt_registration(
     entry: &ServerEntry,
     prompt: &McpPromptDef,
     context: &McpCommandContext,
-    state: &Arc<McpPublishedState>,
 ) -> Registration {
     let info = prompt.to_info(&entry.name);
     Registration {
@@ -1187,7 +1184,6 @@ fn prompt_registration(
             identity: Arc::clone(&prompt.identity),
             sink: Arc::clone(&context.sink),
             published: Arc::clone(&context.published),
-            state: Arc::clone(state),
         }),
         completion: None,
     }
@@ -1283,19 +1279,17 @@ fn publish(inner: &McpManagerInner, published: &ArcSwap<McpPublishedState>) {
                 entry
                     .prompts
                     .iter()
-                    .map(|prompt| prompt_registration(entry, prompt, context, &state))
+                    .map(|prompt| prompt_registration(entry, prompt, context))
             })
             .collect()
     });
+    published.store(Arc::clone(&state));
     if let (Some(producer), Some(registrations)) = (&inner.command_producer, registrations)
         && let Err(error) = producer.replace(registrations)
     {
-        // Drop only the prompt-command projection; tools and server state
-        // stay live until the next republish fixes the registrations.
         producer.replace(Vec::new()).ok();
         warn!(%error, "failed to publish MCP prompt commands");
     }
-    published.store(state);
 }
 
 /// Session for dispatch-level tests outside this module, built through the
