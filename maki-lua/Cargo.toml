@@ -92,7 +92,12 @@ image = { workspace = true }
 maki-agent = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "luau_perf"
+harness = false
+
+[[bench]]
+name = "splash_perf"
 harness = false

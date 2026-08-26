@@ -79,6 +79,14 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Lua dispatcher for more than a couple of frame intervals.
 const SPLASH_RENDER_DEADLINE: Duration = Duration::from_millis(100);
 const SPLASH_RENDER_KILL_GRACE: Duration = Duration::from_millis(100);
+/// Native codegen budget spent inside each splash frame pull. The idle-only
+/// drain in the dispatcher loop starves under a continuous frame stream (the
+/// home screen never leaves the channels empty), so the queue would never
+/// reach the splash chunks. Spending a few ms per frame during the entry fade
+/// pays the queue down in a handful of frames; afterwards renders run
+/// compiled (~5x faster per benches/luau_perf.rs) at zero cost.
+const SPLASH_CODEGEN_BUDGET: Duration = Duration::from_millis(2);
+const SPLASH_CODEGEN_MAX_STEPS: usize = 8;
 const COMMAND_COMPLETION_DEADLINE: Duration = Duration::from_secs(2);
 /// How long a doomed task may run without yielding before the watchdog
 /// shoots it. Cleanup after a cancel or a timeout (batch marking its
@@ -1553,6 +1561,7 @@ impl LuaRuntime {
         lua.set_app_data(Store::default());
         lua.set_app_data(SlotStore::default());
         lua.set_app_data(crate::splash::VersionInfo::default());
+        lua.set_app_data(crate::splash::PerfInfo::default());
         lua.set_app_data(KeymapStore::new());
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
@@ -1625,6 +1634,21 @@ impl LuaRuntime {
             tracing::debug!(error = %e, "native codegen failed");
         }
         true
+    }
+
+    /// Drains a few queued chunks per call, bounded by wall time. Called from
+    /// the splash frame pull so codegen progresses even when the dispatcher
+    /// never sees an empty channel set.
+    fn codegen_budgeted(&self) {
+        if self.codegen_queue.is_none() {
+            return;
+        }
+        let deadline = Instant::now() + SPLASH_CODEGEN_BUDGET;
+        for _ in 0..SPLASH_CODEGEN_MAX_STEPS {
+            if Instant::now() >= deadline || !self.codegen_step() {
+                return;
+            }
+        }
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
@@ -1868,6 +1892,12 @@ impl LuaRuntime {
         require_root: Option<PathBuf>,
     ) -> Result<mlua::Table, mlua::Error> {
         let env = self.lua.create_table()?;
+        // Mark the env safe so Luau's native codegen applies to plugin code:
+        // the VM only enters compiled code when the function's env is a safe
+        // table (CHECK_SAFE_ENV at native entry), and every plugin chunk loads
+        // with this env. Without it WarmJit compiles chunks that never run
+        // natively; see maki-lua/benches/splash_perf.rs env_codegen_200x79.
+        env.set_safeenv(true);
         env.set("maki", maki)?;
 
         if require_root.is_some() || !self.bundled.dirs.is_empty() {
@@ -2748,6 +2778,7 @@ fn splash_frame(
     )
     .with_kill_grace(SPLASH_RENDER_KILL_GRACE);
     let scope = TaskScope::new(lua, cell);
+    let started = Instant::now();
     let frame: Option<crate::splash::SplashFrame> =
         match crate::api::slot::invoke_slot_from_host(lua, "splash.render", args) {
             Err(e) => {
@@ -2768,6 +2799,9 @@ fn splash_frame(
             }),
         };
     drop(scope);
+    if let Some(mut perf) = lua.app_data_mut::<crate::splash::PerfInfo>() {
+        perf.record_render(started.elapsed());
+    }
     frame
 }
 
@@ -3139,6 +3173,7 @@ pub fn spawn(
                             }
                         }
                         Request::SplashFrame(work) => {
+                            rt.codegen_budgeted();
                             let request = work.value();
                             let frame = splash_frame(
                                 &rt.lua,

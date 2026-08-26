@@ -16,6 +16,7 @@ pub(crate) mod mode;
 pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
+pub(crate) mod perf;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;
@@ -93,7 +94,7 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "fn",
-        r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx)?,
+        r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx.clone())?,
     )?;
     split::split__register(&maki, lua)?;
     maki.set("async", r#async::create_async_table(lua)?)?;
@@ -111,6 +112,7 @@ pub(crate) fn create_maki_global(
         timer::create_timer_table(lua, Arc::clone(&plugin))?,
     )?;
     maki.set("time", time::create_time_table(lua)?)?;
+    maki.set("perf", perf::create_perf_table(lua)?)?;
     crate::splash::register_version_api(lua, &maki)?;
 
     Ok(maki)

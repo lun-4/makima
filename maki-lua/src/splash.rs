@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
@@ -54,6 +55,41 @@ impl SplashFrame {
 pub struct VersionInfo {
     pub current: String,
     pub latest: Option<String>,
+}
+
+/// Splash render timings the host measures and plugins read via
+/// `maki.perf.timings()`. Cached on the Lua thread like [`VersionInfo`]: the
+/// frame request handler records, plugins read, no locking needed.
+#[derive(Debug, Clone, Default)]
+pub struct PerfInfo {
+    /// Duration of the most recent `splash.render` invocation, in ms.
+    pub render_ms: f32,
+    /// Completion timestamps of recent renders; [`Self::fps`] counts the
+    /// ones inside the trailing second.
+    renders: VecDeque<Instant>,
+}
+
+impl PerfInfo {
+    /// Register one completed render. The elapsed time becomes `render_ms`;
+    /// the completion timestamp feeds the fps window.
+    pub fn record_render(&mut self, render_elapsed: Duration) {
+        let now = Instant::now();
+        self.render_ms = render_elapsed.as_secs_f32() * 1000.0;
+        self.renders.push_back(now);
+        while self
+            .renders
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(1))
+        {
+            self.renders.pop_front();
+        }
+    }
+
+    /// Renders completed in the trailing second.
+    pub fn fps(&self) -> f32 {
+        let cutoff = Instant::now() - Duration::from_secs(1);
+        self.renders.iter().filter(|t| **t > cutoff).count() as f32
+    }
 }
 
 fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {

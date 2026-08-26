@@ -39,6 +39,7 @@ Type `/` in the input box to open the command palette.
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
 | `/splash` | Preview and select a splash renderer |
+| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |
 | `/thinking` | Set thinking effort (bare opens a selector) |
 
 ### Command arguments
