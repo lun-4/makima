@@ -199,6 +199,21 @@ maki.api.register_tool({
     },
   },
 
+  mutable_path = function(input)
+    if input.command ~= "write" and input.command ~= "delete" then
+      return nil
+    end
+    local dir, dir_err = resolve_dir(false)
+    if not dir then
+      return nil
+    end
+    local file_path, err = helpers.safe_resolve(dir, input.path)
+    if not file_path then
+      return nil
+    end
+    return file_path
+  end,
+
   header = function(input)
     local parts = { input.command or "" }
     if input.path then

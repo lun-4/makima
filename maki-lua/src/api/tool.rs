@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -50,6 +50,10 @@ const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or 
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Upper bound for the synchronous `mutable_path` callback round trip. On
+/// timeout the invocation reports no mutable path and dispatch skips the
+/// lock, degrading to today's behavior instead of blocking the agent.
+const MUTABLE_PATH_TIMEOUT: Duration = Duration::from_secs(3);
 const PLAIN_HEADER_STYLE: &str = "tool";
 
 type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
@@ -113,6 +117,35 @@ pub(crate) enum PermissionScopeSpec {
     Callback(RegistryKey),
 }
 
+/// How a tool declares the primary path it mutates when dispatched. A
+/// schema field name reads the raw input value; a callback computes the
+/// resolved target from the full input and the plugin environment (e.g. a
+/// path relative to a tool-specific directory). The callback receives the
+/// input table and returns the path string, or nil when the call does not
+/// mutate.
+pub(crate) enum MutablePathSpec {
+    Field(Arc<str>),
+    Callback(RegistryKey),
+}
+
+/// Cloneable projection of `MutablePathSpec`. The callback's registry key
+/// lives in the runtime plugin map; tool and invocation copies only need the
+/// marker to trigger the round trip.
+#[derive(Clone)]
+pub(crate) enum MutablePathKind {
+    Field(Arc<str>),
+    Callback,
+}
+
+impl MutablePathSpec {
+    pub(crate) fn kind(&self) -> MutablePathKind {
+        match self {
+            Self::Field(f) => MutablePathKind::Field(Arc::clone(f)),
+            Self::Callback(_) => MutablePathKind::Callback,
+        }
+    }
+}
+
 impl PermissionScopeSpec {
     pub(crate) fn kind(&self) -> PermissionScopeKind {
         match self {
@@ -133,7 +166,7 @@ pub(crate) struct PendingTool {
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) start_key: Option<RegistryKey>,
     pub(crate) permission_scopes: Option<PermissionScopeSpec>,
-    pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) mutable_path: Option<MutablePathSpec>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
@@ -155,7 +188,7 @@ pub(crate) struct LuaTool {
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
-    pub(crate) mutable_path_field: Option<Arc<str>>,
+    pub(crate) mutable_path: Option<MutablePathKind>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
@@ -239,7 +272,8 @@ impl Tool for LuaTool {
             input: validated,
             tx: self.tx.clone(),
             permission_state,
-            mutable_path_field: self.mutable_path_field.clone(),
+            mutable_path: self.mutable_path.clone(),
+            mutable_path_once: OnceLock::new(),
             timeout: self.timeout,
             start_annotation: self.start_annotation.clone(),
         }))
@@ -259,7 +293,10 @@ struct LuaToolInvocation {
     input: Value,
     tx: Sender<Request>,
     permission_state: PermissionState,
-    mutable_path_field: Option<Arc<str>>,
+    mutable_path: Option<MutablePathKind>,
+    /// Cache for the registry-key callback form: the per-invocation Lua
+    /// round trip runs at most once.
+    mutable_path_once: OnceLock<Option<PathBuf>>,
     timeout: Option<Duration>,
     start_annotation: Option<StartAnnotation>,
 }
@@ -378,9 +415,16 @@ impl ToolInvocation for LuaToolInvocation {
     }
 
     fn mutable_path(&self) -> Option<&Path> {
-        let field = self.mutable_path_field.as_deref()?;
-        let val = self.input.get(field)?.as_str()?;
-        Some(Path::new(val))
+        match &self.mutable_path {
+            Some(MutablePathKind::Field(field)) => {
+                self.input.get(field.as_ref())?.as_str().map(Path::new)
+            }
+            Some(MutablePathKind::Callback) => self
+                .mutable_path_once
+                .get_or_init(|| self.compute_callback_mutable_path())
+                .as_deref(),
+            None => None,
+        }
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
@@ -629,7 +673,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
-///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
+///   mutable_path    (string|function) Schema field name (type: string) for the primary path the tool writes, or `function(input)` returning the resolved target path (nil when the call does not mutate). When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
 /// @example
@@ -1239,14 +1283,6 @@ fn check_schema_field(schema: &Value, key: &str, field: &str, expected: &str) ->
     }
 }
 
-fn require_schema_field(spec: &Table, key: &str, schema: &Value) -> LuaResult<Option<Arc<str>>> {
-    let Some(field) = spec_opt::<String>(spec, key, "a string")? else {
-        return Ok(None);
-    };
-    check_schema_field(schema, key, &field, "string")?;
-    Ok(Some(Arc::from(field.as_str())))
-}
-
 fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<StartAnnotation>> {
     match spec.get::<Option<LuaValue>>("start_annotation")? {
         None => Ok(None),
@@ -1304,7 +1340,22 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             "register_tool: 'permission_scope' was removed; use permission_scopes = \"<field>\" or permission_scopes = function(input) ... end",
         ));
     }
-    let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
+    let mutable_path = match spec.get::<Option<LuaValue>>("mutable_path")? {
+        None => None,
+        Some(LuaValue::String(s)) => {
+            let field = s.to_str()?.to_owned();
+            check_schema_field(&schema_val, "mutable_path", &field, "string")?;
+            Some(MutablePathSpec::Field(Arc::from(field.as_str())))
+        }
+        Some(LuaValue::Function(f)) => {
+            Some(MutablePathSpec::Callback(lua.create_registry_value(f)?))
+        }
+        Some(_) => {
+            return Err(mlua::Error::runtime(
+                "register_tool: 'mutable_path' must be a string field name or a function",
+            ));
+        }
+    };
 
     let permission_scopes = match spec.get::<LuaValue>("permission_scopes")? {
         LuaValue::Nil => None,
@@ -1367,7 +1418,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             restore_key,
             start_key,
             permission_scopes,
-            mutable_path_field,
+            mutable_path,
             timeout,
             start_annotation,
             examples,
@@ -1700,6 +1751,40 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     }
 }
 
+impl LuaToolInvocation {
+    /// Synchronous round trip to the plugin host for a computed `mutable_path`
+    /// callback. Mirrors the `describe` round trip: same timeout, and on any
+    /// failure the invocation reports no mutable path so dispatch skips the
+    /// lock rather than stalling the agent.
+    fn compute_callback_mutable_path(&self) -> Option<PathBuf> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let sent = self
+            .tx
+            .send(Request::MutablePath {
+                plugin: Arc::clone(&self.plugin),
+                tool: Arc::clone(&self.tool),
+                input: self.input.clone(),
+                reply: reply_tx,
+            })
+            .is_ok();
+        if !sent {
+            return None;
+        }
+        match reply_rx.recv_timeout(MUTABLE_PATH_TIMEOUT) {
+            Ok(Some(path)) => Some(PathBuf::from(path)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    tool = %self.tool,
+                    error = %e,
+                    "mutable_path callback timed out; dispatch proceeds without a lock"
+                );
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1759,7 +1844,8 @@ mod tests {
             input,
             tx,
             permission_state: PermissionState::Ready(None),
-            mutable_path_field: None,
+            mutable_path: None,
+            mutable_path_once: OnceLock::new(),
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
             has_start_fn: false,
@@ -1812,7 +1898,7 @@ mod tests {
             plugin: Arc::from("test"),
             has_header_fn: false,
             permission_scope_kind,
-            mutable_path_field: None,
+            mutable_path: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
             has_start_fn: false,
@@ -1916,7 +2002,8 @@ mod tests {
             input: serde_json::json!({"command": "ls"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
-            mutable_path_field: None,
+            mutable_path: None,
+            mutable_path_once: OnceLock::new(),
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
@@ -1934,7 +2021,8 @@ mod tests {
             input: serde_json::json!({"command": "echo hi"}),
             tx: tx2,
             permission_state: PermissionState::NeedsCompute,
-            mutable_path_field: None,
+            mutable_path: None,
+            mutable_path_once: OnceLock::new(),
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
@@ -1958,7 +2046,8 @@ mod tests {
             input: serde_json::json!({"command": "cargo test"}),
             tx,
             permission_state: PermissionState::NeedsCompute,
-            mutable_path_field: None,
+            mutable_path: None,
+            mutable_path_once: OnceLock::new(),
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
