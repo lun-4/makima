@@ -316,6 +316,17 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
         if git.is_dir() {
             return Some(git);
         }
+        if git.is_file() {
+            // Linked worktrees store a pointer here instead of a Git directory.
+            let contents = std::fs::read_to_string(git).ok()?;
+            let path = contents.trim().strip_prefix("gitdir: ")?;
+            let path = Path::new(path);
+            return Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                dir.join(path)
+            });
+        }
         dir = dir.parent()?;
     }
 }
@@ -458,6 +469,27 @@ mod tests {
         assert_eq!(
             detect_branch(&sub.to_string_lossy()),
             Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_branch_from_worktree_gitfile() {
+        let (_main, main_path) = tmp_with_head(None);
+        let worktree = TempDir::new().unwrap();
+        let git_dir = Path::new(&main_path).join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        let worktree_git = git_dir.join("worktrees/feature");
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(worktree_git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_branch(&worktree.path().to_string_lossy()),
+            Some("feature".to_string())
         );
     }
 
