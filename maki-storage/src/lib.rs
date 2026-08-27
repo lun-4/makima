@@ -70,6 +70,19 @@ pub enum StorageError {
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+    atomic_write_at(&atomic_destination(path)?, data)
+}
+
+fn atomic_destination(path: &Path) -> Result<PathBuf, StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(fs::canonicalize(path)?),
+        Ok(_) => Ok(path.to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_owned()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn atomic_write_at(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(data)?;
@@ -87,6 +100,7 @@ pub(crate) fn atomic_write_permissions(
     data: &[u8],
     mode: u32,
 ) -> Result<(), StorageError> {
+    let path = atomic_destination(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(data)?;

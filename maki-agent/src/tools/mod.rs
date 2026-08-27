@@ -152,6 +152,13 @@ impl Deadline {
         Self::At(Instant::now() + duration)
     }
 
+    pub fn min(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::None, deadline) | (deadline, Self::None) => deadline,
+            (Self::At(left), Self::At(right)) => Self::At(left.min(right)),
+        }
+    }
+
     pub fn check(self) -> Result<(), String> {
         match self {
             Self::None => Ok(()),

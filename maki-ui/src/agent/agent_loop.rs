@@ -52,6 +52,7 @@ pub(super) struct AgentLoop {
     subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
+    file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
 }
 
 impl AgentLoop {
@@ -77,6 +78,7 @@ impl AgentLoop {
         subagent_cancels: Arc<CancelMap<String>>,
         model_policy: Arc<ModelPolicy>,
         system_prompt: SystemPromptOverride,
+        file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
         Self {
@@ -104,6 +106,7 @@ impl AgentLoop {
             subagent_cancels,
             model_policy,
             system_prompt,
+            file_write_locks,
         }
     }
 
@@ -287,7 +290,7 @@ impl AgentLoop {
                 audience: ToolAudience::MAIN,
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
-                file_write_locks: Arc::new(maki_agent::tools::FileWriteLocks::new()),
+                file_write_locks: Arc::clone(&self.file_write_locks),
             },
             AgentRunParams {
                 history: &mut self.history,

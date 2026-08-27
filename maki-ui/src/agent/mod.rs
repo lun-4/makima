@@ -281,6 +281,7 @@ fn spawn_agent_internal(
         subagent_cancels,
         Arc::clone(&model_policy),
         system_prompt.clone(),
+        Arc::new(maki_agent::tools::FileWriteLocks::new()),
     );
 
     let task = smol::spawn(agent_loop.run());
