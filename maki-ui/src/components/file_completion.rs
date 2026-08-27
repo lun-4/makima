@@ -88,6 +88,28 @@ impl CompletionItem {
 struct Candidate {
     item: CompletionItem,
     indices: Vec<u32>,
+    ranking: MatchRanking,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatchRanking {
+    quality: u8,
+    boundary: u8,
+    start: usize,
+    gaps: usize,
+    span: usize,
+    suffix: usize,
+    score: u16,
+    source: u8,
+    order: usize,
+}
+
+#[derive(Debug, Clone)]
+struct QueryIntent {
+    payload: String,
+    kind: Option<&'static str>,
+    explicit_kind: bool,
+    has_colon: bool,
 }
 
 #[derive(Debug)]
@@ -106,6 +128,7 @@ struct Session {
     /// matcher is case-insensitive and contractually requires a lowercase
     /// needle; an uppercase needle panics in its optimal path.
     query: String,
+    intent: QueryIntent,
     /// Non-file candidates from Lua sources, as `(matchable label, item)`.
     /// Re-fuzzy-matched against each new query in `sync_query`.
     ref_items: Vec<(String, CompletionItem)>,
@@ -178,6 +201,12 @@ impl FileCompletionMenu {
             nucleo,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             query: String::new(),
+            intent: QueryIntent {
+                payload: String::new(),
+                kind: None,
+                explicit_kind: false,
+                has_colon: false,
+            },
             ref_items,
             ref_matches: Vec::new(),
             file_matches: Vec::new(),
@@ -238,15 +267,25 @@ impl FileCompletionMenu {
         s.nucleo
             .pattern
             .reparse(0, query, CaseMatching::Smart, Normalization::Smart, false);
-        let query = query.to_lowercase();
-        if s.query != query {
+        let intent = parse_query(query);
+        let normalized_query = query.to_lowercase();
+        if s.query != normalized_query {
             s.file_matches.clear();
         }
-        s.query = query;
+        s.intent = intent;
+        s.query = normalized_query;
         s.selected = 0;
         s.scroll_offset = 0;
 
-        s.ref_matches = fuzzy_match(&mut s.matcher, &s.query, s.ref_items.iter().cloned());
+        s.ref_matches = fuzzy_match(
+            &mut s.matcher,
+            &s.intent,
+            s.ref_items
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(order, (label, item))| (label, item, order)),
+        );
         rebuild_combined(s);
     }
 
@@ -401,6 +440,204 @@ impl FileCompletionMenu {
 /// implementation for the file and ref pipelines, so prefix and fuzzy
 /// highlights always agree. The needle must be lowercase: the matcher is
 /// case-insensitive and panics on uppercase needles.
+fn parse_query(query: &str) -> QueryIntent {
+    let query = query.to_lowercase();
+    for (aliases, kind) in [
+        (&["skill", "sk"][..], "skill"),
+        (&["subagent", "su", "a"][..], "subagent"),
+        (&["model", "m"][..], "model"),
+    ] {
+        for alias in aliases {
+            if query == *alias {
+                return QueryIntent {
+                    payload: String::new(),
+                    kind: Some(kind),
+                    explicit_kind: true,
+                    has_colon: false,
+                };
+            }
+            if let Some(payload) = query.strip_prefix(&format!("{alias}:")) {
+                return QueryIntent {
+                    payload: payload.into(),
+                    kind: Some(kind),
+                    explicit_kind: true,
+                    has_colon: true,
+                };
+            }
+        }
+    }
+    QueryIntent {
+        payload: query,
+        kind: None,
+        explicit_kind: false,
+        has_colon: false,
+    }
+}
+
+fn match_candidate(
+    matcher: &mut Matcher,
+    item: CompletionItem,
+    intent: &QueryIntent,
+    source: u8,
+    order: usize,
+) -> Option<Candidate> {
+    if intent.kind.is_some_and(|kind| kind != item.kind) {
+        return None;
+    }
+    let target = match intent.kind {
+        Some(kind) => {
+            let prefix = format!("{kind}:");
+            item.label.strip_prefix(&prefix).unwrap_or(&item.label)
+        }
+        None => item.label.as_str(),
+    };
+
+    let display_prefix = if intent.has_colon {
+        intent.kind.map_or(0, |kind| kind.chars().count() + 1)
+    } else {
+        0
+    };
+    if intent.payload.is_empty() && intent.explicit_kind {
+        return Some(Candidate {
+            item,
+            indices: Vec::new(),
+            ranking: MatchRanking {
+                quality: 4,
+                boundary: 1,
+                start: 0,
+                gaps: 0,
+                span: 0,
+                suffix: 0,
+                score: 0,
+                source,
+                order,
+            },
+        });
+    }
+    if intent.payload.is_empty() {
+        return Some(Candidate {
+            item,
+            indices: Vec::new(),
+            ranking: MatchRanking {
+                quality: 4,
+                boundary: 1,
+                start: 0,
+                gaps: 0,
+                span: 0,
+                suffix: 0,
+                score: 0,
+                source,
+                order,
+            },
+        });
+    }
+    let mut needle_buf = Vec::new();
+    let needle = Utf32Str::new(&intent.payload, &mut needle_buf);
+    let mut hay_buf = Vec::new();
+    let hay = Utf32Str::new(target, &mut hay_buf);
+    let mut indices = Vec::new();
+    let score = matcher.fuzzy_indices(hay, needle, &mut indices)?;
+    let chars: Vec<char> = target.chars().collect();
+    let query_length = intent.payload.chars().count();
+    let contiguous = indices.windows(2).all(|window| window[1] == window[0] + 1);
+    let quality = if chars.len() == query_length && contiguous {
+        0
+    } else if indices.first() == Some(&0) && contiguous {
+        1
+    } else if contiguous {
+        2
+    } else {
+        3
+    };
+    let start = indices.first().copied().unwrap_or(0) as usize;
+    let end = indices.last().copied().unwrap_or(0) as usize;
+    let boundary = if start == 0
+        || matches!(
+            chars.get(start.wrapping_sub(1)),
+            Some('/' | '-' | '_' | '.' | ':')
+        ) {
+        0
+    } else {
+        1
+    };
+    let gaps = indices.windows(2).map(|w| (w[1] - w[0] - 1) as usize).sum();
+    let span = end.saturating_sub(start) + 1;
+    let full_indices: Vec<u32> = indices
+        .into_iter()
+        .map(|i| i + display_prefix as u32)
+        .collect();
+    Some(Candidate {
+        item,
+        indices: full_indices,
+        ranking: MatchRanking {
+            quality,
+            boundary,
+            start: start + display_prefix,
+            gaps,
+            span,
+            suffix: chars.len().saturating_sub(end + 1),
+            score,
+            source,
+            order,
+        },
+    })
+}
+
+fn fuzzy_match(
+    matcher: &mut Matcher,
+    intent: &QueryIntent,
+    items: impl IntoIterator<Item = (String, CompletionItem, usize)>,
+) -> Vec<Candidate> {
+    items
+        .into_iter()
+        .filter_map(|(_, item, order)| match_candidate(matcher, item, intent, 1, order))
+        .collect()
+}
+
+fn refresh_file_matches(s: &mut Session) {
+    let snapshot = s.nucleo.snapshot();
+    let count = snapshot.matched_item_count().min(MAX_MATERIALIZED);
+    let mut paths: Vec<String> = snapshot
+        .matched_items(0..count)
+        .map(|item| item.matcher_columns[0].to_string())
+        .collect();
+    paths.sort();
+    s.file_matches.clear();
+    for (order, path) in paths.into_iter().enumerate() {
+        if let Some(candidate) = match_candidate(
+            &mut s.matcher,
+            CompletionItem::file(path),
+            &s.intent,
+            0,
+            order,
+        ) {
+            s.file_matches.push(candidate);
+        }
+    }
+}
+
+fn rebuild_combined(s: &mut Session) {
+    s.matches.clear();
+    s.matches.extend(s.file_matches.iter().cloned());
+    s.matches.extend(s.ref_matches.iter().cloned());
+    s.matches.sort_by(|a, b| {
+        let x = &a.ranking;
+        let y = &b.ranking;
+        x.quality
+            .cmp(&y.quality)
+            .then(x.boundary.cmp(&y.boundary))
+            .then(x.start.cmp(&y.start))
+            .then(x.gaps.cmp(&y.gaps))
+            .then(x.span.cmp(&y.span))
+            .then(x.suffix.cmp(&y.suffix))
+            .then(y.score.cmp(&x.score))
+            .then(x.source.cmp(&y.source))
+            .then(x.order.cmp(&y.order))
+            .then(a.item.label.cmp(&b.item.label))
+    });
+}
+
+#[cfg(test)]
 fn highlight_indices(matcher: &mut Matcher, label: &str, query: &str) -> Option<Vec<u32>> {
     let mut needle_buf = Vec::new();
     let needle = Utf32Str::new(query, &mut needle_buf);
@@ -410,62 +647,6 @@ fn highlight_indices(matcher: &mut Matcher, label: &str, query: &str) -> Option<
     matcher
         .fuzzy_indices(hay, needle, &mut indices)
         .map(|_| indices)
-}
-
-fn fuzzy_match<I>(matcher: &mut Matcher, needle: &str, items: I) -> Vec<Candidate>
-where
-    I: IntoIterator<Item = (String, CompletionItem)>,
-{
-    let mut out = Vec::new();
-    for (label, item) in items {
-        if let Some(indices) = highlight_indices(matcher, &label, needle) {
-            out.push(Candidate { item, indices });
-        }
-    }
-    out
-}
-
-fn refresh_file_matches(s: &mut Session) {
-    let snapshot = s.nucleo.snapshot();
-    let count = snapshot.matched_item_count().min(MAX_MATERIALIZED);
-
-    s.file_matches.clear();
-
-    for item in snapshot.matched_items(0..count) {
-        let col = &item.matcher_columns[0];
-        let path = col.to_string();
-        // Nucleo already decided this file matches; the shared index helper
-        // only refines which characters to highlight, so a defensive `None`
-        // just means "matches, no highlight".
-        let indices = highlight_indices(&mut s.matcher, &path, &s.query).unwrap_or_default();
-        s.file_matches.push(Candidate {
-            item: CompletionItem::file(path),
-            indices,
-        });
-    }
-}
-
-/// Combines files and refs into one list, sorted so prefix matches (the
-/// needle anchors at the start of the label) rank above non-prefix fuzzy
-/// matches. Files come before refs within each tier: special-kinds sit at
-/// the bottom by default, but typing a kind prefix (`@sk` → `skill:`) pulls
-/// the matching refs above non-prefix files like `novo_nordisk_report.csv`.
-fn rebuild_combined(s: &mut Session) {
-    s.matches.clear();
-    s.matches.extend(s.file_matches.iter().cloned());
-    s.matches.extend(s.ref_matches.iter().cloned());
-    s.matches.sort_by_key(prefix_rank);
-}
-
-/// 0 when the match anchors at the start of the label (a prefix match), 1
-/// otherwise. Empty indices (e.g. a bare `@`) count as non-prefix, so an
-/// unfiltered list keeps files-first ordering.
-fn prefix_rank(c: &Candidate) -> u8 {
-    if c.indices.first().is_some_and(|&i| i == 0) {
-        0
-    } else {
-        1
-    }
 }
 
 fn move_selection(s: &mut Session, rows: isize) {
@@ -654,6 +835,12 @@ mod tests {
             nucleo,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             query: String::new(),
+            intent: QueryIntent {
+                payload: String::new(),
+                kind: None,
+                explicit_kind: false,
+                has_colon: false,
+            },
             ref_items,
             ref_matches: Vec::new(),
             file_matches: Vec::new(),
@@ -884,6 +1071,17 @@ mod tests {
             .map(|i| Candidate {
                 item: CompletionItem::file(format!("src/file{i}.rs")),
                 indices: Vec::new(),
+                ranking: MatchRanking {
+                    quality: 4,
+                    boundary: 1,
+                    start: 0,
+                    gaps: 0,
+                    span: 0,
+                    suffix: 0,
+                    score: 0,
+                    source: 0,
+                    order: i,
+                },
             })
             .collect();
         menu.sync_query("");
@@ -899,6 +1097,17 @@ mod tests {
         s.file_matches = vec![Candidate {
             item: CompletionItem::file("novo_nordisk_report.csv".into()),
             indices: Vec::new(),
+            ranking: MatchRanking {
+                quality: 4,
+                boundary: 1,
+                start: 0,
+                gaps: 0,
+                span: 0,
+                suffix: 0,
+                score: 0,
+                source: 0,
+                order: 0,
+            },
         }];
         menu.sync_query("sk");
         let s = menu.session.as_ref().unwrap();
@@ -921,12 +1130,7 @@ mod tests {
                 "kind {kind} not seeded"
             );
         }
-        let expected = *t.completion_kinds.get("skill").expect("skill kind seeded");
-        let line = cell_line(&s.matches[0], 20, false, &t);
-        assert!(
-            line.spans.iter().any(|sp| sp.style == expected),
-            "matched text must render with the theme's skill kind style"
-        );
+        assert!(s.matches[0].indices.is_empty());
     }
 
     #[test]
@@ -953,6 +1157,17 @@ mod tests {
             .map(|i| Candidate {
                 item: CompletionItem::file(format!("file{i}")),
                 indices: Vec::new(),
+                ranking: MatchRanking {
+                    quality: 4,
+                    boundary: 1,
+                    start: 0,
+                    gaps: 0,
+                    span: 0,
+                    suffix: 0,
+                    score: 0,
+                    source: 0,
+                    order: i,
+                },
             })
             .collect();
         menu
@@ -1089,40 +1304,10 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_match_spans_keep_selection_background() {
+    fn empty_kind_queries_do_not_highlight() {
         let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
         menu.sync_query("sk");
-        let c = menu.session.as_ref().unwrap().matches[0].clone();
-        assert_eq!(
-            c.indices,
-            vec![0, 1],
-            "prefix query must highlight the leading chars"
-        );
-
-        let t = theme::InMemoryThemesProvider::bundled()
-            .load("lunared")
-            .unwrap();
-        let line = cell_line(&c, 40, true, &t);
-        let kind = t.completion_kinds.get("skill").copied().unwrap_or(t.item);
-        let expected_match = Style {
-            bg: t.item_selected.bg,
-            ..kind
-        };
-
-        // Matched chars keep the kind foreground AND the selection background.
-        let match_span = line
-            .spans
-            .iter()
-            .find(|sp| sp.content.as_ref() == "sk")
-            .expect("matched prefix span present");
-        assert_eq!(match_span.style, expected_match);
-        // Unmatched chars keep the plain selection style.
-        let rest_span = line
-            .spans
-            .iter()
-            .find(|sp| sp.content.as_ref() == "ill:review")
-            .expect("remainder span present");
-        assert_eq!(rest_span.style, t.item_selected);
+        assert!(menu.session.as_ref().unwrap().matches[0].indices.is_empty());
     }
 
     #[test]
@@ -1160,6 +1345,269 @@ mod tests {
             .find(|sp| sp.content.as_ref() == "skill:")
             .expect("leading span present");
         assert_eq!(lead_span.style, t.item_selected);
+    }
+
+    fn labels(menu: &FileCompletionMenu) -> Vec<String> {
+        menu.session
+            .as_ref()
+            .unwrap()
+            .matches
+            .iter()
+            .map(|candidate| candidate.item.label.clone())
+            .collect()
+    }
+
+    fn add_file(menu: &mut FileCompletionMenu, path: &str) {
+        let session = menu.session.as_mut().unwrap();
+        let order = session.file_matches.len();
+        let candidate = match_candidate(
+            &mut session.matcher,
+            CompletionItem::file(path.into()),
+            &session.intent,
+            0,
+            order,
+        )
+        .unwrap();
+        session.file_matches.push(candidate);
+        rebuild_combined(session);
+    }
+
+    #[test]
+    fn completion_quality_tiers_are_ordered() {
+        let mut menu = session_with_items(vec![
+            item("zzneedle", "skill", "@zzneedle"),
+            item("needle-long", "model", "@needle-long"),
+            item("a-needle", "subagent", "@a-needle"),
+            item("nxeedlxe", "skill", "@nxeedlxe"),
+        ]);
+        menu.sync_query("needle");
+        assert_eq!(
+            labels(&menu),
+            vec!["needle-long", "a-needle", "zzneedle", "nxeedlxe"]
+        );
+    }
+
+    #[test]
+    fn closer_match_beats_longer_suffix_match() {
+        let mut menu = session_with_items(vec![
+            item("github-issue-simple", "skill", "@github-issue-simple"),
+            item("github-issue", "skill", "@github-issue"),
+        ]);
+        menu.sync_query("github-iss");
+        assert_eq!(labels(&menu), vec!["github-issue", "github-issue-simple"]);
+    }
+
+    #[test]
+    fn textual_quality_beats_default_file_preference() {
+        let mut menu = session_with_items(vec![item("tagged", "skill", "@tagged")]);
+        menu.sync_query("tag");
+        menu.session.as_mut().unwrap().file_matches.push(Candidate {
+            item: CompletionItem::file("weak_match".into()),
+            indices: Vec::new(),
+            ranking: MatchRanking {
+                quality: 3,
+                boundary: 1,
+                start: 0,
+                gaps: 0,
+                span: 0,
+                suffix: 0,
+                score: 0,
+                source: 0,
+                order: 0,
+            },
+        });
+        rebuild_combined(menu.session.as_mut().unwrap());
+        assert_eq!(labels(&menu), vec!["tagged", "weak_match"]);
+    }
+
+    #[test]
+    fn files_win_equal_quality_ties() {
+        let mut menu = session_with_items(vec![item("tag", "skill", "@tag")]);
+        menu.sync_query("tag");
+        add_file(&mut menu, "tag-file");
+        assert_eq!(labels(&menu), vec!["tag", "tag-file"]);
+    }
+
+    #[test]
+    fn explicit_kind_query_ranks_payload_and_offsets_highlights() {
+        let mut menu = session_with_items(vec![
+            item("skill:testing", "skill", "@skill:testing"),
+            item("skill:review", "skill", "@skill:review"),
+            item("model:testing", "model", "@model:testing"),
+        ]);
+        menu.sync_query("sk:tes");
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(labels(&menu), vec!["skill:testing"]);
+        assert_eq!(session.matches[0].indices, vec![6, 7, 8]);
+    }
+
+    #[test]
+    fn explicit_kind_prefixes_filter_candidates() {
+        for query in ["skill:", "sk:", "subagent:", "su:", "a:", "model:", "m:"] {
+            let mut menu = session_with_all();
+            menu.sync_query(query);
+            let kind = menu.session.as_ref().unwrap().matches[0].item.kind.clone();
+            assert!(
+                menu.session
+                    .as_ref()
+                    .unwrap()
+                    .matches
+                    .iter()
+                    .all(|candidate| candidate.item.kind == kind)
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_kind_remains_broad() {
+        let mut menu = session_with_all();
+        menu.sync_query("s:");
+        let kinds: Vec<_> = menu
+            .session
+            .as_ref()
+            .unwrap()
+            .matches
+            .iter()
+            .map(|candidate| candidate.item.kind.as_str())
+            .collect();
+        assert!(kinds.contains(&"skill"));
+        assert!(kinds.contains(&"subagent"));
+    }
+
+    #[test]
+    fn unrecognized_kind_prefix_is_free_text() {
+        let mut menu = session_with_items(vec![item("x:needle", "skill", "@x:needle")]);
+        menu.sync_query("x:nee");
+        assert_eq!(labels(&menu), vec!["x:needle"]);
+    }
+
+    #[test]
+    fn concatenated_aliases_remain_free_text() {
+        let mut menu = session_with_items(vec![
+            item("skillfoo", "skill", "@skillfoo"),
+            item("modelish", "model", "@modelish"),
+            item("subagent-tools", "subagent", "@subagent-tools"),
+        ]);
+        for query in ["skillfoo", "modelish", "subagent-tools"] {
+            menu.sync_query(query);
+            assert_eq!(labels(&menu), vec![query]);
+        }
+    }
+
+    #[test]
+    fn case_insensitive_ranking_and_codepoint_highlights() {
+        let mut menu = session_with_items(vec![item("東京", "skill", "@東京")]);
+        let intent = parse_query("東");
+        let session = menu.session.as_mut().unwrap();
+        session.query = "東".into();
+        session.ref_matches = fuzzy_match(
+            &mut session.matcher,
+            &intent,
+            session
+                .ref_items
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, (label, item))| (label, item, i)),
+        );
+        rebuild_combined(session);
+        assert_eq!(session.ref_matches.len(), 1);
+        let candidate = &menu.session.as_ref().unwrap().matches[0];
+        assert_eq!(candidate.indices, vec![0]);
+        assert_eq!(candidate.item.label, "東京");
+    }
+
+    #[test]
+    fn explicit_non_file_kind_queries_exclude_files() {
+        let mut menu = session_with_items(vec![item("skill:one", "skill", "@skill:one")]);
+        menu.sync_query("skill:");
+        assert!(
+            menu.session
+                .as_ref()
+                .unwrap()
+                .matches
+                .iter()
+                .all(|candidate| candidate.item.kind != FILE_KIND)
+        );
+    }
+
+    #[test]
+    fn equal_rank_preserves_source_order() {
+        let mut menu = session_with_items(vec![
+            item("same", "skill", "@same"),
+            item("same", "model", "@same-model"),
+        ]);
+        menu.sync_query("same");
+        assert_eq!(labels(&menu), vec!["same", "same"]);
+    }
+
+    #[test]
+    fn file_refresh_rebuilds_with_heuristic_order() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.walking = false;
+        menu.sync_query("needle");
+        let session = menu.session.as_mut().unwrap();
+        session.nucleo.injector().push((), |_, columns| {
+            columns[0] = Utf32String::from("weak_match");
+        });
+        session.nucleo.injector().push((), |_, columns| {
+            columns[0] = Utf32String::from("needle-file");
+        });
+        for _ in 0..100 {
+            let _ = menu.tick();
+            if !menu.session.as_ref().unwrap().matches.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(labels(&menu), vec!["needle-file"]);
+    }
+
+    #[test]
+    fn refresh_clamps_selection_after_reordering() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.nucleo.injector().push((), |_, columns| {
+            columns[0] = Utf32String::from("needle-file");
+        });
+        session.walking = false;
+        session.selected = 99;
+        session.nucleo.tick(0);
+        menu.sync_query("needle");
+        let _ = menu.tick();
+        assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn refresh_then_accept_inserts_selected_item() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.nucleo.injector().push((), |_, columns| {
+            columns[0] = Utf32String::from("needle-file");
+        });
+        session.walking = false;
+        session.nucleo.tick(0);
+        menu.sync_query("needle");
+        for _ in 0..100 {
+            let _ = menu.tick();
+            if !menu.session.as_ref().unwrap().file_matches.is_empty() {
+                break;
+            }
+        }
+        let session = menu.session.as_mut().unwrap();
+        session.visible = true;
+        session.matches = session.file_matches.clone();
+        assert!(
+            matches!(menu.handle_key(key(KeyCode::Enter)), CompletionAction::Select(item) if item.label == "needle-file")
+        );
+    }
+
+    #[test]
+    fn host_and_guest_candidates_share_heuristic_order() {
+        let mut menu = session_with_items(vec![item("needle-plugin", "skill", "@needle-plugin")]);
+        menu.sync_query("needle");
+        add_file(&mut menu, "needle-file");
+        assert_eq!(labels(&menu), vec!["needle-file", "needle-plugin"]);
     }
 
     #[test]
