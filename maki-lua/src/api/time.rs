@@ -117,7 +117,7 @@ fn ago(_lua: &Lua, instant: Table, reference: Option<Table>) -> LuaResult<String
 }
 
 /// Shared relative-age formatter. Consumed by `maki.time.ago` for plugins and
-/// by maki's own pickers (they feed it `Instant::elapsed().as_secs()`, the
+/// by makima's own pickers (they feed it `Instant::elapsed().as_secs()`, the
 /// same whole-second duration).
 pub fn format_ago(secs: u64) -> String {
     if secs < 60 {

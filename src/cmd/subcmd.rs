@@ -26,7 +26,7 @@ use maki_storage::model::persist_model;
 use maki_ui::AppSession;
 
 const SESSIONS_JSON_ONLY_ERR: &str =
-    "the sessions command only supports --json; use `maki sessions --json`";
+    "the sessions command only supports --json; use `makima sessions --json`";
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {

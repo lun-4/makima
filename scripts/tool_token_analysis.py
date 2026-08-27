@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze tool token usage from ~/.maki/sessions to identify optimization targets."""
+"""Analyze tool token usage from ~/.makima/sessions to identify optimization targets."""
 
 import json
 import sys
@@ -7,7 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-SESSION_DIR = Path.home() / ".maki" / "sessions"
+SESSION_DIR = Path.home() / ".makima" / "sessions"
 CHARS_PER_TOKEN = 4  # rough estimate for token counting from char length
 
 

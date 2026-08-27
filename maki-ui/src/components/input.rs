@@ -370,7 +370,7 @@ impl InputBox {
             let placeholder_base = theme::current().input_placeholder;
             let (head, tail) = match placeholder {
                 Placeholder::Suggestion => (
-                    "Ask maki to ",
+                    "Ask makima to ",
                     vec![
                         Span::styled(
                             self.placeholder_hint,

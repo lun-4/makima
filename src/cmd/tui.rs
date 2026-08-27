@@ -614,14 +614,14 @@ mod tests {
     fn session_picker_requested_requires_bare_resume() {
         use clap::Parser;
 
-        assert!(!session_picker_requested(&Cli::parse_from(["maki"])));
-        assert!(session_picker_requested(&Cli::parse_from(["maki", "-c"])));
+        assert!(!session_picker_requested(&Cli::parse_from(["makima"])));
+        assert!(session_picker_requested(&Cli::parse_from(["makima", "-c"])));
         assert!(session_picker_requested(&Cli::parse_from([
-            "maki",
+            "makima",
             "--continue"
         ])));
         assert!(!session_picker_requested(&Cli::parse_from([
-            "maki", "-c", "abc"
+            "makima", "-c", "abc"
         ])));
     }
 
@@ -629,7 +629,7 @@ mod tests {
     fn print_mode_bare_continue_errors() {
         use clap::Parser;
 
-        let err = run(Cli::parse_from(["maki", "--print", "-c"]))
+        let err = run(Cli::parse_from(["makima", "--print", "-c"]))
             .expect_err("bare -c under --print fails before any stack work");
         assert!(err.to_string().contains(PICKER_NEEDS_TUI_ERR));
     }

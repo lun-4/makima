@@ -156,7 +156,7 @@ fn kind_supports_thinking(kind: ProviderKind) -> bool {
     manifest_for_kind(kind).is_some_and(|m| m.supports_thinking)
 }
 
-/// Path prefix maki sends to the gateway, which appends the whole incoming
+/// Path prefix makima sends to the gateway, which appends the whole incoming
 /// request path to the upstream's configured base url. The prefix therefore
 /// follows the API format the request uses: `/v1` for OpenAI chat (and for the
 /// generic gateway path), `/v1beta` for Gemini. Anthropic gets none because its

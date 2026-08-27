@@ -1,5 +1,5 @@
 """
-Harbor agent wrapper for running maki on Terminal-Bench with analytics collection.
+Harbor agent wrapper for running makima on Terminal-Bench with analytics collection.
 
 Requires: uv tool install harbor
 
@@ -7,7 +7,7 @@ Setup:
     harbor dataset download terminal-bench/terminal-bench-2
 
 Run a single task:
-    MOUNTS='["/usr/local/bin/maki:/mnt/maki:ro", "~/.maki/auth:/mnt/maki-auth:ro", "~/.maki/providers:/mnt/maki-providers:ro"]'
+    MOUNTS='["/usr/local/bin/makima:/mnt/makima:ro", "~/.makima/auth:/mnt/makima-auth:ro", "~/.makima/providers:/mnt/makima-providers:ro"]'
 
     harbor run \
       -t terminal-bench/fix-git \
@@ -50,12 +50,12 @@ from harbor.agents.installed.base import (  # ty: ignore[unresolved-import]
 from harbor.environments.base import BaseEnvironment  # ty: ignore[unresolved-import]
 from harbor.models.agent.context import AgentContext  # ty: ignore[unresolved-import]
 
-AGENT_LOG_FILE = "maki.txt"
+AGENT_LOG_FILE = "makima.txt"
 AGENT_LOG_PATH = f"/logs/agent/{AGENT_LOG_FILE}"
 
 
 def parse_stream_json(log_text: str) -> tuple[dict, dict[int, dict], list[dict]]:
-    """Parse maki --verbose --output-format stream-json output.
+    """Parse makima --verbose --output-format stream-json output.
 
     Returns (result_summary, per_turn_usage, tool_calls) matching collect.py's format.
     """
@@ -130,23 +130,23 @@ class MakiAgent(BaseInstalledAgent):
 
     @staticmethod
     def name() -> str:
-        return "maki"
+        return "makima"
 
     def get_version_command(self) -> str | None:
-        return "maki --version"
+        return "makima --version"
 
     async def install(self, environment: BaseEnvironment) -> None:
         await self.exec_as_root(
             environment,
-            command="cp /mnt/maki /usr/local/bin/maki && chmod +x /usr/local/bin/maki && maki --version",
+            command="cp /mnt/makima /usr/local/bin/makima && chmod +x /usr/local/bin/makima && makima --version",
         )
         await self.exec_as_root(
             environment,
-            command="if [ -d /mnt/maki-auth ]; then mkdir -p /root/.maki/auth && cp /mnt/maki-auth/* /root/.maki/auth/; fi",
+            command="if [ -d /mnt/makima-auth ]; then mkdir -p /root/.makima/auth && cp /mnt/makima-auth/* /root/.makima/auth/; fi",
         )
         await self.exec_as_root(
             environment,
-            command="if [ -d /mnt/maki-providers ]; then mkdir -p /root/.maki/providers && cp /mnt/maki-providers/* /root/.maki/providers/ && chmod +x /root/.maki/providers/*; fi",
+            command="if [ -d /mnt/makima-providers ]; then mkdir -p /root/.makima/providers && cp /mnt/makima-providers/* /root/.makima/providers/ && chmod +x /root/.makima/providers/*; fi",
         )
 
     @with_prompt_template
@@ -164,7 +164,7 @@ class MakiAgent(BaseInstalledAgent):
         await self.exec_as_agent(
             environment,
             command=(
-                f"maki --print --yolo --verbose --output-format stream-json --model {self.model_name} "
+                f"makima --print --yolo --verbose --output-format stream-json --model {self.model_name} "
                 f"-- {escaped} 2>&1 </dev/null | tee {AGENT_LOG_PATH}"
             ),
         )
@@ -172,12 +172,12 @@ class MakiAgent(BaseInstalledAgent):
     def populate_context_post_run(self, context: AgentContext) -> None:
         log_path = self.logs_dir / AGENT_LOG_FILE
         if not log_path.exists():
-            print(f"No maki log found at {log_path}")
+            print(f"No makima log found at {log_path}")
             return
 
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
         if not log_text.strip():
-            print("Maki log is empty")
+            print("Makima log is empty")
             return
 
         result, turn_usage, tool_calls = parse_stream_json(log_text)
@@ -209,7 +209,7 @@ class MakiAgent(BaseInstalledAgent):
         csv_path = Path(os.environ.get("TBENCH_CSV", "tbench_runs.csv"))
         meta = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "agent": "maki",
+            "agent": "makima",
             "session_id": result.get("session_id", ""),
             "tag": "tbench",
             "model": result.get("model", ""),

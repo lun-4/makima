@@ -58,10 +58,10 @@ const MAX_DEVICE_CODE_LEN: usize = 4096;
 const MAX_VERIFICATION_URI_LEN: usize = 2048;
 const MAX_DEVICE_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
-const NOT_AUTHENTICATED: &str = "not authenticated, run `maki auth login xai` or set XAI_API_KEY";
+const NOT_AUTHENTICATED: &str = "not authenticated, run `makima auth login xai` or set XAI_API_KEY";
 const DEVICE_TIMEOUT: &str = "xAI device authorization timed out";
 const DEVICE_DENIED: &str = "xAI device authorization was denied";
-const DEVICE_EXPIRED: &str = "xAI device authorization expired; run `maki auth login xai` again";
+const DEVICE_EXPIRED: &str = "xAI device authorization expired; run `makima auth login xai` again";
 const CALLBACK_TIMEOUT_MSG: &str = "timed out waiting for xAI OAuth callback";
 const STATE_MISMATCH: &str = "xAI authorization failed: state mismatch";
 const RAW_CODE_MSG: &str = "raw xAI authorization codes are not accepted; paste the complete redirect URL containing both code and state";
@@ -633,7 +633,7 @@ fn wait_for_callback(
                             &mut stream,
                             400,
                             "text/html; charset=utf-8",
-                            "<html><body><h1>xAI authorization state mismatch.</h1>Please return to maki and try again.</body></html>",
+                            "<html><body><h1>xAI authorization state mismatch.</h1>Please return to makima and try again.</body></html>",
                         );
                     }
                 }

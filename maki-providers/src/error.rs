@@ -100,7 +100,7 @@ impl AgentError {
             Self::Api { status: 529, .. } => "provider is overloaded, try again later".into(),
             Self::Api { status, .. } if *status >= 500 => format!("server error ({status})"),
             Self::Api { status: 401, .. } => {
-                "authentication failed, run `maki auth login` or check your API key".into()
+                "authentication failed, run `makima auth login` or check your API key".into()
             }
             Self::Api { status, message } => format!("API error ({status}): {message}"),
             Self::Tool { tool, message } => format!("{tool}: {message}"),
@@ -199,7 +199,7 @@ mod tests {
     #[test_case(429, "rate limited, try again in a moment"                              ; "user_msg_429")]
     #[test_case(529, "provider is overloaded, try again later"                           ; "user_msg_529")]
     #[test_case(500, "server error (500)"                                                 ; "user_msg_500")]
-    #[test_case(401, "authentication failed, run `maki auth login` or check your API key" ; "user_msg_401")]
+    #[test_case(401, "authentication failed, run `makima auth login` or check your API key" ; "user_msg_401")]
     #[test_case(400, "API error (400): bad input"                                         ; "user_msg_400")]
     fn user_message_api(status: u16, expected: &str) {
         let err = AgentError::Api {

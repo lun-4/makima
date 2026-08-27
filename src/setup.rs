@@ -60,7 +60,7 @@ pub fn resolve_model(
             ""
         };
         color_eyre::eyre::eyre!(
-            "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `maki auth login`, or use -m to specify a model{policy_note}\n\nSee https://maki.sh/docs/providers/ for setup instructions"
+            "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `makima auth login`, or use -m to specify a model{policy_note}\n\nSee https://makima.ln4.net/docs/providers/ for setup instructions"
         )
     })
 }
