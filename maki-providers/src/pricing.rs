@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::fmt;
 
 use jiff::Timestamp;
+use jiff::civil::Weekday;
+use jiff::tz::Offset;
 use maki_storage::sessions::StoredTokenUsage;
 
 use crate::model::{Model, TokenUsage};
 
 const HOURS_PER_DAY: u8 = 24;
-const SECONDS_PER_HOUR: i64 = 3_600;
-const SECONDS_PER_DAY: i64 = HOURS_PER_DAY as i64 * SECONDS_PER_HOUR;
 /// Multiplier of a provider that bills the same rate around the clock.
 pub(crate) const FLAT_RATE: f64 = 1.0;
 
@@ -29,6 +29,7 @@ pub(crate) const FLAT_RATE: f64 = 1.0;
 #[derive(Debug)]
 pub struct PricingSchedule {
     windows: &'static [PricingWindow],
+    weekdays_only: bool,
     multiplier: f64,
 }
 
@@ -78,13 +79,36 @@ impl PricingSchedule {
         );
         Self {
             windows,
+            weekdays_only: false,
             multiplier,
         }
     }
 
+    /// Keeps the surcharge off Saturday and Sunday, the way DeepSeek words its
+    /// peak hours.
+    pub const fn weekdays_only(mut self) -> Self {
+        let mut i = 0;
+        while i < self.windows.len() {
+            assert!(
+                self.windows[i].start < self.windows[i].end,
+                "a wrapping window leaves its tail on the next day, which no run of weekdays can bill"
+            );
+            i += 1;
+        }
+        self.weekdays_only = true;
+        self
+    }
+
+    /// DeepSeek publishes the days in UTC next to the hours, so the UTC weekday
+    /// is the rule itself and not an approximation. Their Chinese page words it
+    /// as Monday to Friday 09:00-18:00 Beijing, the same instants on the same
+    /// days, because the windows sit inside one Beijing date.
     pub(crate) fn multiplier_at(&self, at: Timestamp) -> f64 {
-        let hour = (at.as_second().rem_euclid(SECONDS_PER_DAY) / SECONDS_PER_HOUR) as u8;
-        if self.windows.iter().any(|w| w.contains(hour)) {
+        let at = Offset::UTC.to_datetime(at);
+        if self.weekdays_only && matches!(at.weekday(), Weekday::Saturday | Weekday::Sunday) {
+            return FLAT_RATE;
+        }
+        if self.windows.iter().any(|w| w.contains(at.hour() as u8)) {
             self.multiplier
         } else {
             FLAT_RATE
@@ -92,8 +116,8 @@ impl PricingSchedule {
     }
 }
 
-/// `2x during 01:00-04:00, 06:00-10:00 UTC`. Docs and hints render this rather
-/// than restate the hours in prose that drifts.
+/// `2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri`. Docs and hints render
+/// this rather than restate the hours in prose that drifts.
 impl fmt::Display for PricingSchedule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}x during ", self.multiplier)?;
@@ -103,7 +127,11 @@ impl fmt::Display for PricingSchedule {
             }
             write!(f, "{window}")?;
         }
-        f.write_str(" UTC")
+        f.write_str(" UTC")?;
+        if self.weekdays_only {
+            f.write_str(", Mon-Fri")?;
+        }
+        Ok(())
     }
 }
 
@@ -162,6 +190,8 @@ mod tests {
     use test_case::test_case;
 
     const SECONDS_PER_MINUTE: i64 = 60;
+    const SECONDS_PER_HOUR: i64 = 60 * SECONDS_PER_MINUTE;
+    const SECONDS_PER_DAY: i64 = HOURS_PER_DAY as i64 * SECONDS_PER_HOUR;
     const PEAK: f64 = 2.0;
     const DAYS_SINCE_EPOCH: i64 = 20_000;
     const PEAK_WINDOWS: &[PricingWindow] =
@@ -263,11 +293,30 @@ mod tests {
         }
     }
 
+    /// The weekend bills the very same hour a second way, so the day has to be
+    /// read before the clock. `07:00` sits inside [`PEAK_WINDOWS`], `12:00`
+    /// outside every one of them.
+    #[test_case("2024-01-01T07:00:00Z", PEAK      ; "monday_inside_a_window")]
+    #[test_case("2024-01-06T07:00:00Z", FLAT_RATE ; "saturday_inside_the_same_window")]
+    #[test_case("2024-01-07T07:00:00Z", FLAT_RATE ; "sunday_inside_the_same_window")]
+    #[test_case("2024-01-01T12:00:00Z", FLAT_RATE ; "monday_outside_every_window")]
+    fn a_weekdays_only_schedule_leaves_the_weekend_alone(at: &str, expected: f64) {
+        let schedule = PricingSchedule::new(PEAK_WINDOWS, PEAK).weekdays_only();
+        let at = at.parse().expect("a valid timestamp");
+        assert_eq!(schedule.multiplier_at(at), expected);
+    }
+
     #[test]
-    fn schedules_render_the_hours_they_bill() {
+    fn schedules_render_the_hours_and_days_they_bill() {
         assert_eq!(
             PricingSchedule::new(PEAK_WINDOWS, PEAK).to_string(),
             "2x during 01:00-04:00, 06:00-10:00 UTC"
+        );
+        assert_eq!(
+            PricingSchedule::new(PEAK_WINDOWS, PEAK)
+                .weekdays_only()
+                .to_string(),
+            "2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri"
         );
         assert_eq!(
             PricingSchedule::new(WRAPPING_WINDOW, PEAK).to_string(),
