@@ -680,7 +680,9 @@ mod tests {
                         .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
                         .unwrap(),
                     description: Arc::from("deploy"),
+                    argument_hint: None,
                     max_args: 1,
+                    tui_only: false,
                     argument_completion: Some(key),
                     completion_on_highlight: None,
                     completion_on_accept: None,

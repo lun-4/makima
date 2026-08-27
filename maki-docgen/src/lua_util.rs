@@ -30,6 +30,18 @@ pub fn extract_lua_field(s: &str, field: &str) -> Option<String> {
     }
 }
 
+pub fn extract_lua_bool(s: &str, field: &str) -> Option<bool> {
+    let marker = format!("{field} = ");
+    let value = s.get(s.find(&marker)? + marker.len()..)?;
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn unescape_lua_string(s: &str) -> String {
     s.replace("\\n", "\n")
 }
@@ -37,6 +49,7 @@ fn unescape_lua_string(s: &str) -> String {
 pub struct LuaPluginCommand {
     pub name: String,
     pub description: String,
+    pub tui_only: bool,
 }
 
 pub fn parse_lua_commands(source: &str) -> Vec<LuaPluginCommand> {
@@ -49,8 +62,16 @@ pub fn parse_lua_commands(source: &str) -> Vec<LuaPluginCommand> {
             let inner = &block[1..end];
             let name = extract_lua_field(inner, "name");
             let desc = extract_lua_field(inner, "description");
+            let Some(tui_only) = extract_lua_bool(inner, "tui_only") else {
+                search = &block[end..];
+                continue;
+            };
             if let (Some(name), Some(description)) = (name, desc) {
-                commands.push(LuaPluginCommand { name, description });
+                commands.push(LuaPluginCommand {
+                    name,
+                    description,
+                    tui_only,
+                });
             }
             search = &block[end..];
         } else {

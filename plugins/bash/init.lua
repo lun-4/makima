@@ -275,6 +275,7 @@ bh.set_auto_mode(opts.auto_mode)
 maki.api.register_command({
   name = "/automode",
   description = "Toggle bash auto mode (classifier gates every bash command)",
+  tui_only = true,
   handler = function()
     bh.set_auto_mode(not bh.auto_mode_on)
     maki.ui.flash("auto mode: " .. (bh.auto_mode_on and "on" or "off"))

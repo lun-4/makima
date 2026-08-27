@@ -1244,6 +1244,7 @@ mod tests {
             maki.api.register_command({
                 name = "/alpha",
                 description = "from a",
+                tui_only = false,
                 handler = function() end,
             })
             "#,
@@ -1255,6 +1256,7 @@ mod tests {
             maki.api.register_command({
                 name = "/beta",
                 description = "from b",
+                tui_only = false,
                 handler = function() end,
             })
             "#,
@@ -1281,6 +1283,7 @@ mod tests {
             maki.api.register_command({
                 name = "hello",
                 description = "no slash",
+                tui_only = false,
                 handler = function() end,
             })
             "#,
@@ -1308,6 +1311,7 @@ mod tests {
                 maki.api.register_command({
                     name = "/fired",
                     description = "callback ran",
+                    tui_only = false,
                     handler = function() end,
                 })
             end, { desc = "test override" })

@@ -1178,6 +1178,7 @@ fn prompt_registration(
                 summary: Arc::from(info.description.as_str()),
                 argument_hint: None,
             },
+            tui_only: false,
         },
         behavior: Arc::new(McpPromptBehavior {
             prompt: info,

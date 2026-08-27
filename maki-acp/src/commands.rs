@@ -8,10 +8,9 @@ use maki_agent::{
     command::{self, PromptSink},
 };
 use maki_commands::{
-    ArgumentArity, BUILTIN_COMMANDS, CommandBehavior, CommandClassification, CommandDocs,
-    CommandError, CommandFuture, CommandInvocation, CommandRegistry, CommandSpec,
-    InvocationLifecycle, InvocationTargetId, Producer, ProducerId, ProducerPrecedence,
-    Registration,
+    BUILTIN_COMMANDS, CommandBehavior, CommandClassification, CommandError, CommandFuture,
+    CommandInvocation, CommandRegistry, InvocationLifecycle, InvocationTargetId, Producer,
+    ProducerId, ProducerPrecedence, Registration,
 };
 
 #[derive(Clone)]
@@ -19,7 +18,7 @@ pub enum CommandRoute {
     Prompt(String),
     Mcp(McpPromptRequest),
     Model(String),
-    Unsupported(Arc<str>),
+    Builtin { name: Arc<str>, arguments: String },
 }
 
 pub struct RoutedCommand {
@@ -111,22 +110,10 @@ impl CommandDispatcher {
                         let route = if command.name == "/model" {
                             BuiltinRoute::Model
                         } else {
-                            BuiltinRoute::Unsupported(Arc::clone(&name))
+                            BuiltinRoute::Builtin(Arc::clone(&name))
                         };
                         Registration {
-                            spec: CommandSpec {
-                                name,
-                                aliases: command.aliases.iter().copied().map(Arc::from).collect(),
-                                arguments: if command.max_args == usize::MAX {
-                                    ArgumentArity::unbounded(0)
-                                } else {
-                                    ArgumentArity::bounded(0, command.max_args)
-                                },
-                                docs: CommandDocs {
-                                    summary: Arc::from(command.description),
-                                    argument_hint: None,
-                                },
-                            },
+                            spec: command.spec(),
                             behavior: Arc::new(BuiltinBehavior {
                                 route,
                                 mailboxes: Arc::clone(&self.mailboxes),
@@ -143,7 +130,7 @@ impl CommandDispatcher {
 #[derive(Clone)]
 enum BuiltinRoute {
     Model,
-    Unsupported(Arc<str>),
+    Builtin(Arc<str>),
 }
 
 struct BuiltinBehavior {
@@ -154,11 +141,11 @@ struct BuiltinBehavior {
 impl CommandBehavior for BuiltinBehavior {
     fn execute(&self, invocation: CommandInvocation) -> CommandFuture<Result<(), CommandError>> {
         let route = match &self.route {
-            BuiltinRoute::Model if invocation.arguments.trim().is_empty() => {
-                CommandRoute::Unsupported(Arc::from("/model without an argument"))
-            }
             BuiltinRoute::Model => CommandRoute::Model(invocation.arguments.to_string()),
-            BuiltinRoute::Unsupported(name) => CommandRoute::Unsupported(Arc::clone(name)),
+            BuiltinRoute::Builtin(name) => CommandRoute::Builtin {
+                name: Arc::clone(name),
+                arguments: invocation.arguments.to_string(),
+            },
         };
         route_command(&self.mailboxes, invocation, route)
     }

@@ -20,6 +20,7 @@ pub struct BuiltinCommand {
     pub description: &'static str,
     pub max_args: usize,
     pub aliases: &'static [&'static str],
+    pub tui_only: bool,
 }
 
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
@@ -28,108 +29,126 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Browse and search tasks",
         max_args: 0,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/compact",
         description: "Summarize and compact conversation history",
         max_args: 0,
         aliases: &[],
+        tui_only: false,
     },
     BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,
         aliases: &["/clear"],
+        tui_only: false,
     },
     BuiltinCommand {
         name: "/help",
         description: "Show keybindings",
         max_args: 0,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/usage",
         description: "Show token usage breakdown",
         max_args: 0,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/queue",
         description: "Remove items from queue",
         max_args: 0,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/model",
         description: "Switch model",
         max_args: 1,
         aliases: &[],
+        tui_only: false,
     },
     BuiltinCommand {
         name: "/theme",
         description: "Switch color theme",
         max_args: 1,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/mcp",
         description: "Configure MCP servers",
         max_args: 0,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/login",
         description: "Authenticate with an LLM provider",
         max_args: 0,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/cd",
         description: "Change working directory",
         max_args: 1,
         aliases: &[],
+        tui_only: false,
     },
     BuiltinCommand {
         name: "/btw",
         description: "Ask a quick question (no tools, no history pollution)",
         max_args: usize::MAX,
         aliases: &[],
+        tui_only: false,
     },
     BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,
         aliases: &[],
+        tui_only: false,
     },
     BuiltinCommand {
         name: "/thinking",
         description: "Toggle extended thinking (off, adaptive, effort level, or budget)",
         max_args: 1,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/fast",
         description: "Toggle Anthropic fast mode (Opus only)",
         max_args: 0,
         aliases: &[],
+        tui_only: false,
     },
     BuiltinCommand {
         name: "/workflow",
         description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,
         aliases: &[],
+        tui_only: false,
     },
     BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,
         aliases: &[],
+        tui_only: true,
     },
     BuiltinCommand {
         name: "/reload",
         description: "Reload plugins and config",
         max_args: 0,
         aliases: &[],
+        tui_only: true,
     },
 ];
 
@@ -141,6 +160,31 @@ pub struct CommandSpec {
     pub aliases: Arc<[Arc<str>]>,
     pub arguments: ArgumentArity,
     pub docs: CommandDocs,
+    pub tui_only: bool,
+}
+
+impl BuiltinCommand {
+    pub fn spec(&self) -> CommandSpec {
+        CommandSpec {
+            name: Arc::from(self.name),
+            aliases: self.aliases.iter().copied().map(Arc::from).collect(),
+            arguments: if self.max_args == usize::MAX {
+                ArgumentArity::unbounded(0)
+            } else {
+                ArgumentArity::bounded(0, self.max_args)
+            },
+            docs: CommandDocs {
+                summary: Arc::from(self.description),
+                argument_hint: match self.name {
+                    "/model" => Some(Arc::from("<model>")),
+                    "/cd" => Some(Arc::from("<path>")),
+                    "/btw" => Some(Arc::from("<question>")),
+                    _ => None,
+                },
+            },
+            tui_only: self.tui_only,
+        }
+    }
 }
 
 /// Argument count bounds. Arguments are counted by splitting the raw
@@ -1659,7 +1703,7 @@ mod tests {
     use super::{
         ArgumentArity, BUILTIN_COMMANDS, CancellationToken, CommandBehavior, CommandClassification,
         CommandCompletion, CommandDocs, CommandFuture, CommandInvocation, CommandSpec,
-        CompletionContext, CompletionItem, InvocationLifecycle, Registration,
+        CompletionContext, CompletionItem, InvocationLifecycle, ProducerPrecedence, Registration,
     };
 
     struct WakeCounter(AtomicUsize);
@@ -1744,6 +1788,103 @@ mod tests {
     }
 
     #[test]
+    fn builtin_specs_match_portability_plan() {
+        let expected = [
+            ("/tasks", true, None),
+            ("/compact", false, None),
+            ("/new", false, None),
+            ("/help", true, None),
+            ("/usage", true, None),
+            ("/queue", true, None),
+            ("/model", false, Some("<model>")),
+            ("/theme", true, None),
+            ("/mcp", true, None),
+            ("/login", true, None),
+            ("/cd", false, Some("<path>")),
+            ("/btw", false, Some("<question>")),
+            ("/yolo", false, None),
+            ("/thinking", true, None),
+            ("/fast", false, None),
+            ("/workflow", false, None),
+            ("/exit", true, None),
+            ("/reload", true, None),
+        ];
+
+        assert_eq!(BUILTIN_COMMANDS.len(), expected.len());
+        for (command, (name, tui_only, argument_hint)) in BUILTIN_COMMANDS.iter().zip(expected) {
+            let spec = command.spec();
+            assert_eq!(spec.name.as_ref(), name);
+            assert_eq!(spec.tui_only, tui_only);
+            assert_eq!(spec.docs.argument_hint.as_deref(), argument_hint);
+        }
+    }
+
+    #[test]
+    fn builtin_registration_projection_contains_each_canonical_command_and_alias() {
+        let registry = super::CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Builtin);
+        producer
+            .replace(
+                BUILTIN_COMMANDS
+                    .iter()
+                    .map(|command| Registration {
+                        spec: command.spec(),
+                        behavior: Arc::new(Behavior),
+                        completion: None,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        let snapshot = registry.snapshot();
+        let projected: Vec<_> = snapshot
+            .commands()
+            .iter()
+            .map(|command| command.spec().name.as_ref())
+            .collect();
+        let expected: Vec<_> = BUILTIN_COMMANDS
+            .iter()
+            .flat_map(|command| {
+                std::iter::once(command.name).chain(command.aliases.iter().map(|_| command.name))
+            })
+            .collect();
+        assert_eq!(projected, expected);
+        assert_eq!(
+            registry.resolve("/clear").unwrap().spec().name.as_ref(),
+            "/new"
+        );
+    }
+
+    #[test]
+    fn plugin_wins_over_builtin_for_thinking() {
+        let registry = super::CommandRegistry::new();
+        let builtin = registry.create_producer(ProducerPrecedence::Builtin);
+        builtin
+            .replace(vec![Registration {
+                spec: BUILTIN_COMMANDS
+                    .iter()
+                    .find(|command| command.name == "/thinking")
+                    .unwrap()
+                    .spec(),
+                behavior: Arc::new(Behavior),
+                completion: None,
+            }])
+            .unwrap();
+        let plugin = registry.create_producer(ProducerPrecedence::Plugin);
+        plugin
+            .replace(vec![registration(
+                "/thinking",
+                &[],
+                ArgumentArity::OPTIONAL,
+            )])
+            .unwrap();
+
+        let resolved = registry.resolve("/thinking").unwrap();
+        assert_eq!(resolved.producer_id(), plugin.id());
+        assert!(!resolved.spec().tui_only);
+    }
+
+    #[test]
     fn standard_arities_accept_expected_counts() {
         assert!(ArgumentArity::NONE.accepts(0));
         assert!(!ArgumentArity::NONE.accepts(1));
@@ -1765,6 +1906,7 @@ mod tests {
                     summary: Arc::from("Test command"),
                     argument_hint: Some(Arc::from("[value]")),
                 },
+                tui_only: false,
             },
             behavior: Arc::new(Behavior),
             completion: Some(Arc::new(Completion)),
@@ -1802,6 +1944,7 @@ mod tests {
                     summary: Arc::from("test"),
                     argument_hint: None,
                 },
+                tui_only: false,
             },
             behavior: Arc::new(Behavior),
             completion: None,

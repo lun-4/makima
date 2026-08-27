@@ -881,6 +881,7 @@ maki.api.register_tool({{
 }})
 maki.api.register_command({{
     name = "/doomed",
+    tui_only = false,
     handler = function() end,
 }})
 error("plugin blew up after register")
@@ -1007,6 +1008,93 @@ maki.api.register_tool({
             .tool
             .parse(&serde_json::json!({"name": "alice"}))
             .is_ok()
+    );
+}
+
+#[test]
+fn bundled_commands_project_complete_metadata() {
+    let (_reg, host) = builtins_host();
+    let snapshot = host.command_registry().snapshot();
+    let mut commands: Vec<_> = snapshot
+        .commands()
+        .iter()
+        .map(|command| {
+            (
+                command.spec().name.to_string(),
+                command.spec().docs.summary.to_string(),
+                command
+                    .spec()
+                    .docs
+                    .argument_hint
+                    .as_deref()
+                    .map(str::to_owned),
+                command.spec().arguments,
+                command.spec().tui_only,
+            )
+        })
+        .collect();
+    commands.sort_by(|left, right| left.0.cmp(&right.0));
+
+    assert_eq!(
+        commands,
+        [
+            (
+                "/automode".into(),
+                "Toggle bash auto mode (classifier gates every bash command)".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
+            (
+                "/build".into(),
+                "Switch to build mode (full tool access)".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
+            (
+                "/memory".into(),
+                "View, edit, and delete memory files".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
+            (
+                "/plan".into(),
+                "Switch to plan mode (analyse and write only the plan file)".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
+            (
+                "/rename".into(),
+                "Rename the current session".into(),
+                Some("<title>".into()),
+                maki_commands::ArgumentArity::unbounded(0),
+                true
+            ),
+            (
+                "/sessions".into(),
+                "Browse and switch sessions".into(),
+                Some("[query]".into()),
+                maki_commands::ArgumentArity::OPTIONAL,
+                true
+            ),
+            (
+                "/splash".into(),
+                "Preview and select a splash renderer".into(),
+                Some("[splash]".into()),
+                maki_commands::ArgumentArity::OPTIONAL,
+                true
+            ),
+            (
+                "/thinking".into(),
+                "Set thinking effort (bare opens a selector)".into(),
+                Some("[effort]".into()),
+                maki_commands::ArgumentArity::OPTIONAL,
+                true
+            ),
+        ]
     );
 }
 
@@ -2575,7 +2663,10 @@ fn register_command_happy_path() {
         maki.api.register_command({
             name = "/hello",
             description = "says hello",
+            argument_hint = "[name]",
+            tui_only = true,
             handler = function(opts) end,
+
         })
         "#,
     )
@@ -2588,6 +2679,11 @@ fn register_command_happy_path() {
         snapshot.commands()[0].spec().docs.summary.as_ref(),
         "says hello"
     );
+    assert_eq!(
+        snapshot.commands()[0].spec().docs.argument_hint.as_deref(),
+        Some("[name]")
+    );
+    assert!(snapshot.commands()[0].spec().tui_only);
 }
 
 #[test]
@@ -2598,6 +2694,7 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
         r#"
         maki.api.register_command({
             name = "/deploy",
+            tui_only = false,
             nargs = 1,
             completion = {
                 get_items = function(ctx)
@@ -2613,6 +2710,7 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
         })
         maki.api.register_command({
             name = "/static",
+            tui_only = false,
             nargs = 1,
             completion = { items = {{ label = "prod", insertion = "production" }} },
             handler = function() end,
@@ -2778,6 +2876,7 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
         r#"
         maki.api.register_command({
             name = "/echo",
+            tui_only = false,
             nargs = "*",
             handler = function(opts)
                 maki.ui.flash(opts.args .. "|" .. table.concat(opts.fargs, ","))
@@ -2811,6 +2910,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         r#"
         maki.api.register_command({
             name = "/go",
+            tui_only = false,
             handler = function()
                 local ok, err = maki.api.run_command("/cd ~/src")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
@@ -2846,20 +2946,32 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     "non-empty" ; "empty_name"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", description = "no handler" })"#,
+    r#"maki.api.register_command({ name = "/test", tui_only = false, description = "no handler" })"#,
     "handler" ; "missing_handler"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", nargs = -1, handler = function() end })"#,
+    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = -1, handler = function() end })"#,
     NARGS_ERR ; "negative_nargs"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", nargs = 2, handler = function() end })"#,
+    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = 2, handler = function() end })"#,
     NARGS_ERR ; "nargs_two"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", nargs = "!", handler = function() end })"#,
+    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = "!", handler = function() end })"#,
     NARGS_ERR ; "unknown_string_nargs"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", handler = function() end })"#,
+    "tui_only" ; "missing_tui_only"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", tui_only = "yes", handler = function() end })"#,
+    "tui_only" ; "invalid_tui_only"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", argument_hint = true, handler = function() end })"#,
+    "argument_hint" ; "invalid_argument_hint"
 )]
 fn register_command_validation_rejects(src: &str, expected_err: &str) {
     let reg = fresh_registry();
@@ -2897,7 +3009,7 @@ fn unload_clears_commands() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(
         "cmd_only",
-        r#"maki.api.register_command({ name = "/bye", handler = function() end })"#,
+        r#"maki.api.register_command({ name = "/bye", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
     assert_eq!(host.command_registry().snapshot().commands().len(), 1);
@@ -4334,6 +4446,7 @@ fn host_list_picker_ui_drop_drains_callbacks() {
         maki.api.register_command({
             name = "/pick",
             description = "host list picker drop path",
+            tui_only = false,
             handler = function()
                 local result = maki.ui.open_list_picker({ "alpha" }, {
                     on_change = function(item, index)

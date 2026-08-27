@@ -206,9 +206,10 @@ mod tests {
                     aliases: Vec::new().into(),
                     arguments: ArgumentArity::unbounded(0),
                     docs: CommandDocs {
-                        summary: Arc::from("pick a theme"),
+                        summary: Arc::from("test"),
                         argument_hint: None,
                     },
+                    tui_only: false,
                 },
                 behavior: Arc::new(NoBehavior),
                 completion: Some(source.clone()),

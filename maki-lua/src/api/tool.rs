@@ -46,6 +46,8 @@ const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
+const TUI_ONLY_ERR: &str = "register_command: 'tui_only' must be a boolean";
+const ARGUMENT_HINT_ERR: &str = "register_command: 'argument_hint' must be a string";
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -751,6 +753,8 @@ fn register_permission_rule(
 ///   name        (string)   Required. The command name (e.g. "/hello"; a leading
 ///                            slash is added when missing).
 ///   description (string)   Optional. Short description shown in the command palette.
+///   tui_only    (boolean)   Required. If true, the command is available only in the interactive TUI.
+///   argument_hint (string)  Optional. Short hint describing the command arguments.
 ///   nargs       (integer|string) Optional. How many arguments the command
 ///                          takes, spelled like nvim's nargs: 0 (default),
 ///                          1, "?" (zero or one), "*" (any number), or "+"
@@ -1417,6 +1421,15 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         name.insert(0, '/');
     }
     let description: String = spec.get("description").unwrap_or_default();
+    let argument_hint = match spec.get::<LuaValue>("argument_hint")? {
+        LuaValue::Nil => None,
+        LuaValue::String(value) => Some(Arc::<str>::from(value.to_string_lossy().as_ref())),
+        _ => return Err(mlua::Error::runtime(ARGUMENT_HINT_ERR)),
+    };
+    let tui_only = match spec.get::<LuaValue>("tui_only")? {
+        LuaValue::Boolean(value) => value,
+        _ => return Err(mlua::Error::runtime(TUI_ONLY_ERR)),
+    };
     let max_args = parse_nargs(spec)?;
     let handler: Function = spec
         .get("handler")
@@ -1474,7 +1487,9 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
             CommandEntry {
                 handler: handler_key,
                 description,
+                argument_hint,
                 max_args,
+                tui_only,
                 argument_completion: completion_key,
                 completion_on_highlight,
                 completion_on_accept,

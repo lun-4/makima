@@ -796,6 +796,7 @@ mod tests {
                     summary: Arc::from(summary),
                     argument_hint: None,
                 },
+                tui_only: false,
             },
             behavior: Arc::new(Noop),
             completion: None,

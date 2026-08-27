@@ -27,6 +27,7 @@ A small plugin looks like this:
 maki.api.register_command({
   name = "greet",
   description = "Say hello from Lua",
+  tui_only = false,
   handler = function()
     maki.ui.flash("hello from a plugin!")
   end,
@@ -349,6 +350,8 @@ browsing memory files or toggling settings.
   - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
     slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
+  - `tui_only` (`boolean`) Required. If true, the command is available only in the interactive TUI.
+  - `argument_hint` (`string`) Optional. Short hint describing the command arguments.
   - `nargs` (`integer|string`) Optional. How many arguments the command
     takes, spelled like nvim's nargs: 0 (default),
     1, "?" (zero or one), "*" (any number), or "+"

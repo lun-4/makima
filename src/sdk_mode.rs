@@ -578,17 +578,11 @@ impl SdkCommands {
                 .iter()
                 .map(|command| Registration {
                     spec: CommandSpec {
-                        name: Arc::from(command.name),
-                        aliases: command.aliases.iter().copied().map(Arc::from).collect(),
-                        arguments: if command.max_args == usize::MAX {
-                            ArgumentArity::unbounded(0)
-                        } else {
-                            ArgumentArity::bounded(0, command.max_args)
-                        },
                         docs: CommandDocs {
                             summary: Arc::from(command.description),
                             argument_hint: (command.name == "/model").then(|| Arc::from("<model>")),
                         },
+                        ..command.spec()
                     },
                     behavior: Arc::new(BuiltinBehavior {
                         name: command.name,
@@ -1608,6 +1602,7 @@ mod tests {
                     summary: Arc::from(format!("{name} description")),
                     argument_hint: Some(Arc::from("<arg>")),
                 },
+                tui_only: false,
             },
             behavior: Arc::new(ClassifiedBehavior(classification)),
             completion: None,

@@ -44,7 +44,7 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 - **Images and context.** Prompts can include images and editor-attached files.
 - **Slash commands.** The editor receives the active command list and updates when plugin or MCP registrations change. A known leading slash command runs before model input. Unknown slash-prefixed text remains a model prompt. Known commands cannot include images.
 
-ACP supports `/model <spec>` through its model-control path. TUI-only built-ins remain visible but return an unsupported-frontend error when invoked. Custom Markdown commands, MCP prompts, and Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
+ACP advertises this exact portable built-in set: `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. `/model` accepts an explicit model spec and appears with an argument hint. TUI-only built-ins are omitted from ACP's advertised command list. If a TUI-only command is invoked anyway, ACP forwards the complete prompt as ordinary model input instead of trying to run the command. Custom Markdown commands, MCP prompts, and Lua commands use the same registry and collision rules as the TUI, except commands marked `tui_only` are also omitted and forwarded. See [Commands](/docs/commands/).
 
 Authentication, providers, and permissions come from your normal Makima config. Set up [providers](/docs/providers/) first and ACP sessions just work.
 

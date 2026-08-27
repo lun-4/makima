@@ -94,6 +94,7 @@ end
 maki.api.register_command({
   name = "/plan",
   description = "Switch to plan mode (analyse and write only the plan file)",
+  tui_only = true,
   handler = function(_args)
     set_mode("plan")
   end,
@@ -102,6 +103,7 @@ maki.api.register_command({
 maki.api.register_command({
   name = "/build",
   description = "Switch to build mode (full tool access)",
+  tui_only = true,
   handler = function(_args)
     set_mode("build")
   end,

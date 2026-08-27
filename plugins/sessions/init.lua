@@ -542,7 +542,9 @@ maki.api.create_autocmd("SessionStatusChanged", {
 maki.api.register_command({
   name = "/sessions",
   description = "Browse and switch sessions",
+  argument_hint = "[query]",
   nargs = "?",
+  tui_only = true,
   handler = open,
 })
 
@@ -551,7 +553,9 @@ maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
 maki.api.register_command({
   name = "/rename",
   description = "Rename the current session",
+  argument_hint = "<title>",
   nargs = "+",
+  tui_only = true,
   handler = function(opts)
     local title = opts.args:match("^%s*(.-)%s*$")
     if title == "" then

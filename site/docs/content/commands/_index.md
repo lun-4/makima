@@ -13,38 +13,37 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 
 ## Built-in commands
 
-| Command | Description |
-|---------|-------------|
-| `/tasks` | Browse and search tasks |
-| `/compact` | Summarize and compact conversation history |
-| `/new` | Start a new session |
-| `/clear` | Alias for `/new` |
-| `/help` | Show keybindings |
-| `/usage` | Show token usage breakdown |
-| `/queue` | Remove items from queue |
-| `/model` | Switch model |
-| `/theme` | Switch color theme |
-| `/mcp` | Configure MCP servers |
-| `/login` | Authenticate with an LLM provider |
-| `/cd` | Change working directory |
-| `/btw` | Ask a quick question (no tools, no history pollution) |
-| `/yolo` | Toggle YOLO mode (skip all permission prompts) |
-| `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) |
-| `/fast` | Toggle Anthropic fast mode (Opus only) |
-| `/workflow` | Toggle workflow mode (task callable inside code_execution) |
-| `/exit` | Exit the application |
-| `/reload` | Reload plugins and config |
-| `/automode` | Toggle bash auto mode (classifier gates every bash command) |
-| `/build` | Switch to build mode (full tool access) |
-| `/memory` | View, edit, and delete memory files |
-| `/plan` | Switch to plan mode (analyse and write only the plan file) |
-| `/rename` | Rename the current session |
-| `/sessions` | Browse and switch sessions |
-| `/splash` | Preview and select a splash renderer |
-| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |
-| `/thinking` | Set thinking effort (bare opens a selector) |
+| Command | Description | TUI-only |
+|---------|-------------|----------|
+| `/tasks` | Browse and search tasks | yes |
+| `/compact` | Summarize and compact conversation history | no |
+| `/new` | Start a new session | no |
+| `/clear` | Alias for `/new` | no |
+| `/help` | Show keybindings | yes |
+| `/usage` | Show token usage breakdown | yes |
+| `/queue` | Remove items from queue | yes |
+| `/model` | Switch model | no |
+| `/theme` | Switch color theme | yes |
+| `/mcp` | Configure MCP servers | yes |
+| `/login` | Authenticate with an LLM provider | yes |
+| `/cd` | Change working directory | no |
+| `/btw` | Ask a quick question (no tools, no history pollution) | no |
+| `/yolo` | Toggle YOLO mode (skip all permission prompts) | no |
+| `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) | yes |
+| `/fast` | Toggle Anthropic fast mode (Opus only) | no |
+| `/workflow` | Toggle workflow mode (task callable inside code_execution) | no |
+| `/exit` | Exit the application | yes |
+| `/reload` | Reload plugins and config | yes |
+| `/automode` | Toggle bash auto mode (classifier gates every bash command) | yes |
+| `/build` | Switch to build mode (full tool access) | yes |
+| `/memory` | View, edit, and delete memory files | yes |
+| `/plan` | Switch to plan mode (analyse and write only the plan file) | yes |
+| `/rename` | Rename the current session | yes |
+| `/sessions` | Browse and switch sessions | yes |
+| `/splash` | Preview and select a splash renderer | yes |
+| `/thinking` | Set thinking effort (bare opens a selector) | yes |
 
-Built-ins outside the TUI: SDK stream mode and ACP support `/model <spec>` with an explicit model; `--print` supports `/exit`. Every other built-in still resolves, but returns an unsupported-frontend error instead of running.
+The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises only these built-ins, plus registered custom, MCP, and Lua commands that are not TUI-only. In ACP, a TUI-only command is omitted from the advertised list and forwarded as literal prompt text if invoked. Other frontends recognize TUI-only commands but report an unsupported-frontend error.
 
 ### Command arguments
 

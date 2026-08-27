@@ -1743,8 +1743,9 @@ fn command_registrations(
                 },
                 docs: CommandDocs {
                     summary: Arc::clone(&entry.description),
-                    argument_hint: None,
+                    argument_hint: entry.argument_hint.clone(),
                 },
+                tui_only: entry.tui_only,
             },
             behavior: Arc::new(LuaCommandBehavior {
                 plugin: Arc::clone(plugin),

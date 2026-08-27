@@ -244,19 +244,7 @@ fn register_print_commands(
         BUILTIN_COMMANDS
             .iter()
             .map(|command| Registration {
-                spec: CommandSpec {
-                    name: Arc::from(command.name),
-                    aliases: command.aliases.iter().copied().map(Arc::from).collect(),
-                    arguments: if command.max_args == usize::MAX {
-                        ArgumentArity::unbounded(0)
-                    } else {
-                        ArgumentArity::bounded(0, command.max_args)
-                    },
-                    docs: CommandDocs {
-                        summary: Arc::from(command.description),
-                        argument_hint: None,
-                    },
-                },
+                spec: command.spec(),
                 behavior: if command.name == "/exit" {
                     Arc::new(CompletedBuiltin)
                 } else {
@@ -654,6 +642,7 @@ mod tests {
             r#"
             maki.api.register_command({
                 name = "/outer",
+                tui_only = false,
                 handler = function()
                     local ok, err = maki.api.run_command("/project:inner nested")
                     if not ok then error(err) end
@@ -710,6 +699,7 @@ mod tests {
                         summary: Arc::from("done"),
                         argument_hint: None,
                     },
+                    tui_only: false,
                 },
                 behavior: Arc::new(Completed),
                 completion: None,

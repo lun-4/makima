@@ -31,8 +31,14 @@ end
 
 Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
 
-fn write_row(out: &mut String, name: &str, description: &str) {
-    writeln!(out, "| `{name}` | {} |", description.replace('|', "\\|")).unwrap();
+fn write_row(out: &mut String, name: &str, description: &str, tui_only: bool) {
+    writeln!(
+        out,
+        "| `{name}` | {} | {} |",
+        description.replace('|', "\\|"),
+        if tui_only { "yes" } else { "no" }
+    )
+    .unwrap();
 }
 
 pub fn generate() -> String {
@@ -61,22 +67,27 @@ pub fn generate() -> String {
 
     writeln!(out, "## Built-in commands").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description |").unwrap();
-    writeln!(out, "|---------|-------------|").unwrap();
+    writeln!(out, "| Command | Description | TUI-only |").unwrap();
+    writeln!(out, "|---------|-------------|----------|").unwrap();
     for cmd in BUILTIN_COMMANDS {
-        write_row(&mut out, cmd.name, cmd.description);
+        write_row(&mut out, cmd.name, cmd.description, cmd.tui_only);
         for alias in cmd.aliases {
-            write_row(&mut out, alias, &format!("Alias for `{}`", cmd.name));
+            write_row(
+                &mut out,
+                alias,
+                &format!("Alias for `{}`", cmd.name),
+                cmd.tui_only,
+            );
         }
     }
     for cmd in &lua_util::load_builtin_plugin_commands() {
-        write_row(&mut out, &cmd.name, &cmd.description);
+        write_row(&mut out, &cmd.name, &cmd.description, cmd.tui_only);
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Built-ins outside the TUI: SDK stream mode and ACP support `/model <spec>` with an explicit model; `--print` supports `/exit`. Every other built-in still resolves, but returns an unsupported-frontend error instead of running."
+        "The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises only these built-ins, plus registered custom, MCP, and Lua commands that are not TUI-only. In ACP, a TUI-only command is omitted from the advertised list and forwarded as literal prompt text if invoked. Other frontends recognize TUI-only commands but report an unsupported-frontend error."
     )
     .unwrap();
 

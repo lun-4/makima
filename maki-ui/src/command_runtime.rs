@@ -6,9 +6,9 @@ use maki_agent::{
     command::{self, PromptSink},
 };
 use maki_commands::{
-    ArgumentArity, BUILTIN_COMMANDS, CommandBehavior, CommandClassification, CommandCompletion,
-    CommandDocs, CommandError, CommandFuture, CommandInvocation, CommandRegistry, CommandSpec,
-    InvocationLifecycle, InvocationTargetId, ProducerPrecedence, Registration,
+    BUILTIN_COMMANDS, CommandBehavior, CommandClassification, CommandCompletion, CommandError,
+    CommandFuture, CommandInvocation, CommandRegistry, InvocationLifecycle, InvocationTargetId,
+    ProducerPrecedence, Registration,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,19 +176,7 @@ impl CommandRuntime {
                     .map(|command| {
                         let route = CommandRoute::Builtin(BuiltinRoute::from_name(command.name));
                         Registration {
-                            spec: CommandSpec {
-                                name: Arc::from(command.name),
-                                aliases: command.aliases.iter().copied().map(Arc::from).collect(),
-                                arguments: if command.max_args == usize::MAX {
-                                    ArgumentArity::unbounded(0)
-                                } else {
-                                    ArgumentArity::bounded(0, command.max_args)
-                                },
-                                docs: CommandDocs {
-                                    summary: Arc::from(command.description),
-                                    argument_hint: None,
-                                },
-                            },
+                            spec: command.spec(),
                             behavior: Arc::new(RouteBehavior {
                                 route: route.clone(),
                                 command_tx: command_tx.clone(),

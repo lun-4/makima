@@ -74,7 +74,9 @@ impl HintWriter {
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
+    pub argument_hint: Option<Arc<str>>,
     pub max_args: usize,
+    pub tui_only: bool,
     pub argument_completion: Option<RegistryKey>,
     pub completion_on_highlight: Option<RegistryKey>,
     pub completion_on_accept: Option<RegistryKey>,

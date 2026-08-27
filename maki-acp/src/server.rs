@@ -103,6 +103,7 @@ struct SessionState {
     current_model: String,
     pending: PendingState,
     command_registry: maki_commands::CommandRegistry,
+    builtin_producer: ProducerId,
     command_mailbox: commands::CommandMailbox,
     command_projection_task: smol::Task<()>,
     lock: Option<SessionLock>,
@@ -496,17 +497,11 @@ fn install_session(
     let command_mailbox = params.command_dispatcher.create_mailbox();
     let session_id = SessionId::from(handle.session_id.to_string());
     let snapshot = params.command_dispatcher.projection();
-    emit_available_commands(
-        &srv.out_tx,
-        &session_id,
-        &snapshot,
-        params.command_dispatcher.builtin_producer(),
-    );
+    emit_available_commands(&srv.out_tx, &session_id, &snapshot);
     let command_projection_task = watch_available_commands(
         srv.out_tx.clone(),
         session_id,
         command_registry.clone(),
-        params.command_dispatcher.builtin_producer(),
         snapshot.generation(),
     );
     // Claim-if-free heartbeat: beats every interval while the session is
@@ -556,22 +551,20 @@ fn install_session(
         current_model,
         pending,
         command_registry,
+        builtin_producer: params.command_dispatcher.builtin_producer(),
         command_mailbox,
         command_projection_task,
         lock,
     });
 }
 
-fn available_commands(
-    snapshot: &RegistrySnapshot,
-    builtin_producer: ProducerId,
-) -> Vec<AvailableCommand> {
+fn available_commands(snapshot: &RegistrySnapshot) -> Vec<AvailableCommand> {
+    let mut names = std::collections::HashSet::new();
     snapshot
         .commands()
         .iter()
-        .filter(|command| {
-            command.producer_id() != builtin_producer || command.spec().name.as_ref() == "/model"
-        })
+        .filter(|command| !command.spec().tui_only)
+        .filter(|command| names.insert(command.spec().name.clone()))
         .map(|command| {
             let mut available = AvailableCommand::new(
                 command.spec().name.trim_start_matches('/'),
@@ -591,14 +584,12 @@ fn emit_available_commands(
     out_tx: &Sender<Value>,
     session_id: &SessionId,
     snapshot: &RegistrySnapshot,
-    builtin_producer: ProducerId,
 ) {
     session_update(
         out_tx,
         session_id,
         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands(
             snapshot,
-            builtin_producer,
         ))),
     );
 }
@@ -607,7 +598,6 @@ fn watch_available_commands(
     out_tx: Sender<Value>,
     session_id: SessionId,
     registry: maki_commands::CommandRegistry,
-    builtin_producer: ProducerId,
     mut generation: u64,
 ) -> smol::Task<()> {
     smol::spawn(async move {
@@ -616,7 +606,7 @@ fn watch_available_commands(
             let snapshot = registry.snapshot();
             if snapshot.generation() != generation {
                 generation = snapshot.generation();
-                emit_available_commands(&out_tx, &session_id, &snapshot, builtin_producer);
+                emit_available_commands(&out_tx, &session_id, &snapshot);
             }
         }
     })
@@ -672,19 +662,41 @@ fn load_history_from(
 
 async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
-    let (message, images) = extract_prompt_content(&req.prompt);
     let session = srv.session.as_ref().ok_or_else(no_session)?;
-    let command_name = message
-        .split_whitespace()
-        .next()
-        .filter(|name| name.starts_with('/'));
-    let known_command = command_name
-        .and_then(|name| srv_command_registry(srv).resolve(name).ok())
-        .is_some();
+    let command_name = req.prompt.iter().find_map(|block| match block {
+        ContentBlock::Text(TextContent { text, .. }) => text
+            .split_whitespace()
+            .next()
+            .filter(|name| name.starts_with('/')),
+        _ => None,
+    });
+    let resolved_command =
+        command_name.and_then(|name| srv_command_registry(srv).resolve(name).ok());
+    let known_command = resolved_command.is_some();
 
-    if known_command && !images.is_empty() {
-        return Err(
-            AcpError::invalid_params().data(json_str(&"slash commands cannot include images"))
+    let tui_only = resolved_command
+        .as_ref()
+        .is_some_and(|command| command.spec().tui_only);
+    let local_command = resolved_command
+        .as_ref()
+        .is_some_and(|command| command.producer_id() == session.builtin_producer);
+
+    if local_command
+        && req
+            .prompt
+            .iter()
+            .any(|block| !matches!(block, ContentBlock::Text(_)))
+    {
+        return Err(AcpError::invalid_params().data(json_str(&NON_TEXT_LOCAL_COMMAND)));
+    }
+
+    let (message, images) = extract_prompt_content(&req.prompt)?;
+
+    if tui_only {
+        return send_agent_input(
+            session,
+            id,
+            agent_input(message, images, session.current_mode.clone(), None),
         );
     }
 
@@ -704,7 +716,7 @@ async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<
                 agent_input(message, images, session.current_mode.clone(), None),
             );
         };
-        return handle_command(srv, id, dispatch).await;
+        return handle_command(srv, id, dispatch, images).await;
     }
 
     send_agent_input(
@@ -718,12 +730,13 @@ async fn handle_command(
     srv: &mut Server,
     id: &RequestId,
     dispatch: maki_commands::CommandDispatch,
+    images: Vec<ImageSource>,
 ) -> Result<(), AcpError> {
     let lifecycle = dispatch.lifecycle().clone();
     // Synchronous behaviors queue their route during dispatch_input, so an
     // already-routed command takes priority over awaiting classification.
     if let Some(command) = next_routed_command(srv, &lifecycle, false).await? {
-        return execute_command(srv, id, command);
+        return execute_command(srv, id, command, images);
     }
     match dispatch.classification().await {
         CommandClassification::Completed => {
@@ -735,7 +748,7 @@ async fn handle_command(
             let command = next_routed_command(srv, &lifecycle, true)
                 .await?
                 .ok_or_else(|| AcpError::new(-32603, "command dispatcher ended"))?;
-            execute_command(srv, id, command)
+            execute_command(srv, id, command, images)
         }
     }
 }
@@ -780,6 +793,7 @@ fn execute_command(
     srv: &mut Server,
     id: &RequestId,
     command: RoutedCommand,
+    images: Vec<ImageSource>,
 ) -> Result<(), AcpError> {
     let session = srv.session.as_mut().ok_or_else(no_session)?;
     match &command.route {
@@ -789,7 +803,7 @@ fn execute_command(
                 id,
                 agent_input(
                     prompt.clone(),
-                    Vec::new(),
+                    images.clone(),
                     session.current_mode.clone(),
                     None,
                 ),
@@ -805,7 +819,7 @@ fn execute_command(
                 id,
                 agent_input(
                     prompt.display_text.clone(),
-                    Vec::new(),
+                    images.clone(),
                     session.current_mode.clone(),
                     Some(prompt_ref),
                 ),
@@ -835,10 +849,18 @@ fn execute_command(
             commands::complete(&command, CommandClassification::Completed);
             respond_prompt(&srv.out_tx, id.clone(), StopReason::EndTurn);
         }
-        CommandRoute::Unsupported(name) => {
-            let error = maki_commands::CommandError::UnsupportedFrontend(Arc::clone(name));
-            commands::complete(&command, CommandClassification::Failed(error.clone()));
-            return Err(command_error(error));
+        CommandRoute::Builtin { name, arguments } => {
+            let message = if arguments.trim().is_empty() {
+                name.to_string()
+            } else {
+                format!("{name} {arguments}")
+            };
+            send_agent_input(
+                session,
+                id,
+                agent_input(message, images, session.current_mode.clone(), None),
+            )?;
+            commands::complete(&command, CommandClassification::AgentTurnAccepted);
         }
     }
     Ok(())
@@ -1017,7 +1039,10 @@ fn permission_answer(raw: &Value) -> PermissionAnswer {
     }
 }
 
-fn extract_prompt_content(blocks: &[ContentBlock]) -> (String, Vec<ImageSource>) {
+const UNSUPPORTED_CONTENT_BLOCK: &str = "unsupported content block in command prompt";
+const NON_TEXT_LOCAL_COMMAND: &str = "local commands cannot include non-text content";
+
+fn extract_prompt_content(blocks: &[ContentBlock]) -> Result<(String, Vec<ImageSource>), AcpError> {
     let mut text = String::new();
     let mut images = Vec::new();
 
@@ -1030,17 +1055,25 @@ fn extract_prompt_content(blocks: &[ContentBlock]) -> (String, Vec<ImageSource>)
                 media_type: image_media_type(mime_type),
                 data: Arc::from(data.as_str()),
             }),
-            ContentBlock::Resource(res) => {
-                if let EmbeddedResourceResource::TextResourceContents(trc) = &res.resource {
-                    append(&mut text, &format!("--- {} ---\n{}", trc.uri, trc.text));
+            ContentBlock::Resource(res) => match &res.resource {
+                EmbeddedResourceResource::TextResourceContents(trc) => {
+                    append(&mut text, &format!("--- {} ---\\n{}", trc.uri, trc.text));
                 }
-            }
+                EmbeddedResourceResource::BlobResourceContents(_) | _ => {
+                    return Err(
+                        AcpError::invalid_params().data(json_str(&UNSUPPORTED_CONTENT_BLOCK))
+                    );
+                }
+            },
             ContentBlock::ResourceLink(rl) => append(&mut text, &format!("[Resource: {}]", rl.uri)),
-            _ => {}
+            ContentBlock::Audio(_) => {
+                return Err(AcpError::invalid_params().data(json_str(&UNSUPPORTED_CONTENT_BLOCK)));
+            }
+            _ => return Err(AcpError::invalid_params().data(json_str(&UNSUPPORTED_CONTENT_BLOCK))),
         }
     }
 
-    (text, images)
+    Ok((text, images))
 }
 
 fn append(text: &mut String, part: &str) {
@@ -1272,6 +1305,7 @@ mod tests {
                     ..Default::default()
                 })),
                 command_registry,
+                builtin_producer: dispatcher.builtin_producer(),
                 command_mailbox,
                 command_projection_task: smol::spawn(async {}),
                 lock: None,
@@ -1422,13 +1456,15 @@ mod tests {
         let dispatcher =
             crate::commands::CommandDispatcher::new(maki_commands::CommandRegistry::new(), &[]);
         let initial = dispatcher.projection();
-        let commands = available_commands(&initial, dispatcher.builtin_producer());
+        let commands = available_commands(&initial);
         assert_eq!(
             commands
                 .iter()
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
-            ["model"]
+            [
+                "compact", "new", "model", "cd", "btw", "yolo", "fast", "workflow"
+            ]
         );
 
         let producer = dispatcher
@@ -1444,6 +1480,7 @@ mod tests {
                         summary: Arc::from("Review code"),
                         argument_hint: Some(Arc::from("<path>")),
                     },
+                    tui_only: false,
                 },
                 behavior: Arc::new(CompletedCommand),
                 completion: None,
@@ -1451,7 +1488,7 @@ mod tests {
             .unwrap();
         let updated = dispatcher.projection();
         assert!(updated.generation() > initial.generation());
-        let commands = available_commands(&updated, dispatcher.builtin_producer());
+        let commands = available_commands(&updated);
         let review = commands
             .iter()
             .find(|command| command.name == "review")
@@ -1502,6 +1539,7 @@ mod tests {
     fn install_dispatcher(srv: &mut Server, dispatcher: &crate::commands::CommandDispatcher) {
         let session = srv.session.as_mut().unwrap();
         session.command_registry = dispatcher.registry();
+        session.builtin_producer = dispatcher.builtin_producer();
         session.command_mailbox = dispatcher.create_mailbox();
     }
 
@@ -1545,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn known_slash_prompt_with_image_is_rejected_before_agent_input() {
+    fn tui_only_slash_prompt_with_non_text_content_is_rejected() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
         let dispatcher =
             crate::commands::CommandDispatcher::new(maki_commands::CommandRegistry::new(), &[]);
@@ -1557,8 +1595,90 @@ mod tests {
             &RequestId::Number(3),
         ))
         .unwrap_err();
-        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(
+            error.data,
+            Some(Value::String(NON_TEXT_LOCAL_COMMAND.to_owned()))
+        );
         assert!(input_rx.is_empty());
+    }
+
+    #[test]
+    fn local_command_rejects_non_text_content_with_exact_error() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let dispatcher =
+            crate::commands::CommandDispatcher::new(maki_commands::CommandRegistry::new(), &[]);
+        install_dispatcher(&mut srv, &dispatcher);
+
+        let error = smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/compact", true),
+            &RequestId::Number(3),
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(
+            error.data,
+            Some(Value::String(NON_TEXT_LOCAL_COMMAND.to_owned()))
+        );
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
+    fn agent_turn_preserves_image_content() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let dispatcher = crate::commands::CommandDispatcher::new(
+            maki_commands::CommandRegistry::new(),
+            &[maki_agent::command::CustomCommand {
+                name: "review".into(),
+                description: "review code".into(),
+                content: "Review $ARGUMENTS".into(),
+                scope: maki_agent::command::CommandScope::Project,
+                accepts_args: true,
+            }],
+        );
+        install_dispatcher(&mut srv, &dispatcher);
+
+        smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/project:review src", true),
+            &RequestId::Number(3),
+        ))
+        .unwrap();
+        let input = input_rx.try_recv().unwrap();
+        assert_eq!(input.message, "Review src");
+        assert_eq!(input.images.len(), 1);
+    }
+
+    #[test]
+    fn custom_command_with_unsupported_content_has_exact_error() {
+        let (mut srv, _, _, _) = server_awaiting_answer();
+        let dispatcher = crate::commands::CommandDispatcher::new(
+            maki_commands::CommandRegistry::new(),
+            &[maki_agent::command::CustomCommand {
+                name: "review".into(),
+                description: "review code".into(),
+                content: "Review $ARGUMENTS".into(),
+                scope: maki_agent::command::CommandScope::Project,
+                accepts_args: true,
+            }],
+        );
+        install_dispatcher(&mut srv, &dispatcher);
+        let raw = serde_json::json!({
+            "params": {
+                "sessionId": MakiId::generate().to_string(),
+                "prompt": [
+                    { "type": "text", "text": "/project:review src" },
+                    { "type": "audio", "data": "aGVsbG8=", "mimeType": "audio/wav" }
+                ]
+            }
+        });
+        let error =
+            smol::block_on(handle_prompt(&mut srv, &raw, &RequestId::Number(5))).unwrap_err();
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(
+            error.data,
+            Some(Value::String(UNSUPPORTED_CONTENT_BLOCK.to_owned()))
+        );
     }
 
     struct CompletedCommand;
@@ -1593,6 +1713,7 @@ mod tests {
                         summary: Arc::from("complete without a turn"),
                         argument_hint: None,
                     },
+                    tui_only: false,
                 },
                 behavior: Arc::new(CompletedCommand),
                 completion: None,
@@ -1612,20 +1733,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_builtin_slash_prompt_returns_prompt_error() {
+    fn portable_builtin_slash_prompt_is_forwarded_to_agent() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
         let dispatcher =
             crate::commands::CommandDispatcher::new(maki_commands::CommandRegistry::new(), &[]);
         install_dispatcher(&mut srv, &dispatcher);
 
-        let error = smol::block_on(handle_prompt(
+        smol::block_on(handle_prompt(
             &mut srv,
-            &prompt_request("/help", false),
+            &prompt_request("/compact", false),
             &RequestId::Number(4),
         ))
-        .unwrap_err();
-        assert!(error.message.contains("not supported"));
-        assert!(input_rx.is_empty());
+        .unwrap();
+        assert_eq!(input_rx.try_recv().unwrap().message, "/compact");
     }
 
     #[test]

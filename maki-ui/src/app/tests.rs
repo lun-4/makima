@@ -230,6 +230,7 @@ fn register_test_lua_command(
                     summary: Arc::from("Lua test command"),
                     argument_hint: None,
                 },
+                tui_only: false,
             },
             behavior: Arc::new(TestLuaBehavior {
                 handle: command.handle,
@@ -6018,6 +6019,7 @@ fn at_completion_insertion_synchronizes_argument_completion() {
                     summary: Arc::from("Deploy"),
                     argument_hint: None,
                 },
+                tui_only: false,
             },
             behavior: Arc::new(TestLuaBehavior {
                 handle: maki_lua::EventHandle::disconnected_for_test(),

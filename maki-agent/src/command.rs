@@ -112,6 +112,7 @@ pub fn register_commands(
                         summary: Arc::from(command.description.clone()),
                         argument_hint: None,
                     },
+                    tui_only: false,
                 },
                 behavior: Arc::new(CustomCommandBehavior {
                     command,
