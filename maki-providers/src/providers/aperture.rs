@@ -182,7 +182,6 @@ fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
             | ProviderKind::OpenAi
             | ProviderKind::Copilot
             | ProviderKind::Opencode
-            | ProviderKind::Xai
             | ProviderKind::Aperture,
         )
         | None => DEFAULT_PATH_PREFIX,
