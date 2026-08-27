@@ -11,6 +11,7 @@ use maki_lua::{
     CommandArgumentContext, CommandArgumentItem, CommandArgumentLifecycle, LuaCommandInfo,
     LuaCommandReader,
 };
+use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
@@ -240,6 +241,8 @@ pub struct CommandPalette {
 struct ArgumentMatch {
     item: CommandArgumentItem,
     indices: Vec<u32>,
+    ranking: maki_match::CompletionRanking,
+    order: usize,
 }
 
 struct PendingArguments {
@@ -489,9 +492,21 @@ impl CommandPalette {
         item: CommandArgumentItem,
     ) {
         self.argument_range = Some(range);
+        let ranking = completion_match(
+            "",
+            &item.label,
+            CompletionMatchOptions {
+                case_matching: CaseMatching::Ignore,
+                normalization: Normalization::Smart,
+            },
+        )
+        .unwrap()
+        .ranking;
         self.argument_items = vec![ArgumentMatch {
             item,
             indices: Vec::new(),
+            ranking,
+            order: 0,
         }];
         self.selected = 0;
     }
@@ -631,26 +646,42 @@ impl CommandPalette {
         }
         self.argument_items.clear();
         self.selected = 0;
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let pattern = nucleo::pattern::Pattern::parse(
-            &pending.query,
-            CaseMatching::Ignore,
-            Normalization::Smart,
-        );
-        for item in items {
-            let mut indices = Vec::new();
-            if pattern
-                .indices(
-                    Utf32String::from(item.label.as_str()).slice(..),
-                    &mut matcher,
-                    &mut indices,
-                )
-                .is_none()
-            {
+        for (order, item) in items.into_iter().enumerate() {
+            let Some(matched) = completion_match(
+                &pending.query,
+                &item.label,
+                CompletionMatchOptions {
+                    case_matching: CaseMatching::Ignore,
+                    normalization: Normalization::Smart,
+                },
+            ) else {
                 continue;
-            }
-            self.argument_items.push(ArgumentMatch { item, indices });
+            };
+            self.argument_items.push(ArgumentMatch {
+                item,
+                indices: matched.indices,
+                ranking: matched.ranking,
+                order,
+            });
         }
+        self.argument_items.sort_by(|a, b| {
+            maki_match::compare_completion_matches(
+                &maki_match::CompletionMatch {
+                    indices: a.indices.clone(),
+                    ranking: a.ranking,
+                },
+                &maki_match::CompletionMatch {
+                    indices: b.indices.clone(),
+                    ranking: b.ranking,
+                },
+                0,
+                0,
+                a.order,
+                b.order,
+                &a.item.label,
+                &b.item.label,
+            )
+        });
         self.argument_range = Some(pending.range);
         self.pending_cancel = None;
         if !self.argument_items.is_empty() {
@@ -1972,6 +2003,17 @@ mod tests {
                 description: None,
             },
             indices: Vec::new(),
+            ranking: completion_match(
+                "",
+                "final",
+                CompletionMatchOptions {
+                    case_matching: CaseMatching::Ignore,
+                    normalization: Normalization::Smart,
+                },
+            )
+            .unwrap()
+            .ranking,
+            order: 0,
         });
         palette.argument_range = Some((12, 17));
 

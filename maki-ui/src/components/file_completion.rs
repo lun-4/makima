@@ -5,8 +5,11 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_lua::ItemSpec;
+use maki_match::{CompletionMatchOptions, completion_match};
+#[cfg(test)]
+use nucleo::Utf32Str;
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Matcher, Nucleo, Utf32Str};
+use nucleo::{Config, Matcher, Nucleo};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -475,7 +478,7 @@ fn parse_query(query: &str) -> QueryIntent {
 }
 
 fn match_candidate(
-    matcher: &mut Matcher,
+    _matcher: &mut Matcher,
     item: CompletionItem,
     intent: &QueryIntent,
     source: u8,
@@ -531,52 +534,31 @@ fn match_candidate(
             },
         });
     }
-    let mut needle_buf = Vec::new();
-    let needle = Utf32Str::new(&intent.payload, &mut needle_buf);
-    let mut hay_buf = Vec::new();
-    let hay = Utf32Str::new(target, &mut hay_buf);
-    let mut indices = Vec::new();
-    let score = matcher.fuzzy_indices(hay, needle, &mut indices)?;
-    let chars: Vec<char> = target.chars().collect();
-    let query_length = intent.payload.chars().count();
-    let contiguous = indices.windows(2).all(|window| window[1] == window[0] + 1);
-    let quality = if chars.len() == query_length && contiguous {
-        0
-    } else if indices.first() == Some(&0) && contiguous {
-        1
-    } else if contiguous {
-        2
-    } else {
-        3
-    };
-    let start = indices.first().copied().unwrap_or(0) as usize;
-    let end = indices.last().copied().unwrap_or(0) as usize;
-    let boundary = if start == 0
-        || matches!(
-            chars.get(start.wrapping_sub(1)),
-            Some('/' | '-' | '_' | '.' | ':')
-        ) {
-        0
-    } else {
-        1
-    };
-    let gaps = indices.windows(2).map(|w| (w[1] - w[0] - 1) as usize).sum();
-    let span = end.saturating_sub(start) + 1;
-    let full_indices: Vec<u32> = indices
+    let matched = completion_match(
+        &intent.payload,
+        target,
+        CompletionMatchOptions {
+            case_matching: CaseMatching::Smart,
+            normalization: Normalization::Smart,
+        },
+    )?;
+    let full_indices: Vec<u32> = matched
+        .indices
         .into_iter()
         .map(|i| i + display_prefix as u32)
         .collect();
+    let ranking = matched.ranking;
     Some(Candidate {
         item,
         indices: full_indices,
         ranking: MatchRanking {
-            quality,
-            boundary,
-            start: start + display_prefix,
-            gaps,
-            span,
-            suffix: chars.len().saturating_sub(end + 1),
-            score,
+            quality: ranking.quality_rank,
+            boundary: ranking.boundary_rank,
+            start: ranking.start_index + display_prefix,
+            gaps: ranking.gap_count,
+            span: ranking.span_length,
+            suffix: ranking.unmatched_suffix,
+            score: ranking.fuzzy_score as u16,
             source,
             order,
         },
