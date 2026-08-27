@@ -41,6 +41,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
 | `/splash` | Preview and select a splash renderer |
+| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |
 | `/thinking` | Set thinking effort (bare opens a selector) |
 
 Built-ins outside the TUI: SDK stream mode and ACP support `/model <spec>` with an explicit model; `--print` supports `/exit`. Every other built-in still resolves, but returns an unsupported-frontend error instead of running.

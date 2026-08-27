@@ -67,6 +67,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "memory",
     "mode_plan_override",
     "model",
+    "perf",
     "plan_submit_tool",
     "question",
     "read",

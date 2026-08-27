@@ -115,6 +115,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mode_plan_override"),
     },
     BundledPlugin {
+        name: "perf",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/perf"),
+    },
+    BundledPlugin {
         name: "plan_submit_tool",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/plan_submit_tool"),
     },

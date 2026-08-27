@@ -85,6 +85,7 @@ The rules:
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
 | [`maki.api`](#maki-api) | Plugin registration. |
+| [`maki.perf`](#maki-perf) | Performance instrumentation for splashes and the UI. |
 | [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -838,6 +839,38 @@ which plugins own or wrap each slot.
 for name, info in pairs(maki.api.get_slots()) do
   print(name, info.owner, info.declared)
 end
+```
+
+
+## maki.perf {#maki-perf}
+
+Performance instrumentation for splashes and the UI. The host
+measures splash renders; plugins read the timings and draw their own
+readouts.
+
+---
+
+### `maki.perf.timings()` {#maki-perf-timings}
+
+```lua
+maki.perf.timings()
+```
+
+Read the splash render timings the host measured: how long the most
+recent `splash.render` invocation took and how many renders completed in
+the trailing second. The numbers come from the host that drives the
+render, so they include the whole call (queue wait, warm-up, deadline)
+and need no instrumentation inside the splash itself.
+
+A still splash settles to `0 fps` once nothing animates, which is the
+point: it proves the splash is not burning CPU.
+
+**Returns:** (`table`) `{ render_ms = number, fps = number }`.
+
+**Example:**
+
+```lua
+local t = maki.perf.timings()
 ```
 
 
