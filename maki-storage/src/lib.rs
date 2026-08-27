@@ -109,7 +109,7 @@ pub(crate) fn atomic_write_permissions(
     #[cfg(not(unix))]
     let _ = mode;
     tmp.as_file().sync_all()?;
-    persist(tmp, path)
+    persist(tmp, &path)
 }
 
 /// Right before the atomic rename, so a test can park the writer with the
