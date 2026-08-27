@@ -33,6 +33,12 @@ use crate::cancel::CancelToken;
 pub const SAME_PATH_MUTATION_IN_PROGRESS: &str = "same-path mutation is already in progress";
 pub(crate) const CANCELLED: &str = "cancelled";
 
+/// How often `entry` sweeps idle entries. Quiescent keys (no waiter or
+/// guard holds their `Arc`) are dropped so a long session touching many
+/// generated paths does not grow the registry monotonically; entries that
+/// are held are never removed, so there is no remove-after-unlock race.
+const RETAIN_INTERVAL: usize = 128;
+
 /// A keyed write-lock registry. Entries are retained for the lifetime of
 /// the registry (`Arc<FileWriteLocks>` lives as long as any cloned tool
 /// context can), so one key always maps to one gate with no
@@ -75,6 +81,12 @@ impl FileWriteLocks {
 
     fn entry(&self, key: PathBuf) -> Arc<KeyEntry> {
         let mut entries = self.inner.entries.lock().expect("lock registry poisoned");
+        if entries.len().is_multiple_of(RETAIN_INTERVAL) {
+            // A count of 1 means only the map holds the entry: no waiter or
+            // guard can hold it, so dropping it is safe under the same mutex
+            // that `entry` uses for insertion. The next acquire recreates it.
+            entries.retain(|_, entry| Arc::strong_count(entry) > 1);
+        }
         entries
             .entry(key)
             .or_insert_with(|| {
@@ -224,6 +236,44 @@ mod tests {
         // A relative path resolves against the cwd; the key must be absolute.
         let k = key("some_relative_target");
         assert!(k.is_absolute());
+    }
+
+    #[test]
+    fn idle_entries_are_reclaimed_while_held_ones_survive() {
+        smol::block_on(async {
+            let locks = Arc::new(FileWriteLocks::new());
+            let (_trigger, cancel) = CancelToken::new();
+            let held = PathBuf::from("/reclaim/held");
+            let guard = locks
+                .acquire(held.clone(), &[], &cancel, Deadline::None)
+                .await
+                .unwrap();
+            for i in 0..RETAIN_INTERVAL + 8 {
+                let k = PathBuf::from(format!("/reclaim/idle/{i}"));
+                let _ = locks
+                    .acquire(k, &[], &cancel, Deadline::None)
+                    .await
+                    .unwrap();
+            }
+            drop(guard);
+            // The next insert crosses the retain boundary and sweeps the
+            // quiescent entries; the held entry must survive.
+            let k = PathBuf::from("/reclaim/new");
+            let _ = locks
+                .acquire(k, &[], &cancel, Deadline::None)
+                .await
+                .unwrap();
+            let entries = locks.inner.entries.lock().expect("lock registry poisoned");
+            assert!(
+                entries.len() < RETAIN_INTERVAL,
+                "idle entries must be reclaimed, got {} retained",
+                entries.len()
+            );
+            assert!(
+                entries.contains_key(&held),
+                "the held entry must survive reclamation"
+            );
+        });
     }
 
     #[test]
