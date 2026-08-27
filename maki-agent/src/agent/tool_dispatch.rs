@@ -22,7 +22,6 @@ pub enum Emit {
 
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
-const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 const UNAVAILABLE_TOOL_PREFIX: &str = "tool not available for this agent";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
@@ -402,10 +401,6 @@ async fn execute_mcp_tool(
         annotation: None,
         written_path: None,
     };
-
-    if ctx.mode.plan_path().is_some() {
-        return done(MCP_BLOCKED_IN_PLAN.into(), true);
-    }
 
     let perm_tool = match ToolKey::parse(tool_name) {
         Ok(k) => k,
@@ -1000,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_tool_blocked_in_plan_mode() {
+    fn mcp_tool_allowed_in_plan_mode() {
         smol::block_on(async {
             let result = dispatch_mcp(
                 &crate::tools::test_support::stub_ctx(&AgentMode::Plan(PathBuf::from(
@@ -1011,8 +1006,40 @@ mod tests {
                 &serde_json::json!({}),
             )
             .await;
+            // It reaches the MCP manager check (not blocked by plan mode check)
             assert!(result.is_error);
-            assert_eq!(result.output.as_text(), MCP_BLOCKED_IN_PLAN);
+            assert!(result.output.as_text().contains("not available"));
+        });
+    }
+
+    #[test]
+    fn mcp_tool_denied_by_rule_in_plan_mode() {
+        smol::block_on(async {
+            let deny_cfg = PermissionsConfig {
+                rules: vec![PermissionRule {
+                    tool: ToolKey::parse("myserver.mytool").unwrap(),
+                    scope: None,
+                    effect: Effect::Deny,
+                }],
+                ..Default::default()
+            };
+            let dir = TempDir::new().unwrap();
+            let permissions = Arc::new(PermissionManager::new(
+                deny_cfg,
+                dir.path().to_path_buf(),
+                Arc::default(),
+            ));
+            let ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Plan(PathBuf::from("/tmp/plan.md")),
+                permissions,
+            );
+            let result = dispatch_mcp(&ctx, "t1", "myserver.mytool", &serde_json::json!({})).await;
+            assert!(result.is_error, "plan mode must not bypass deny rules");
+            assert!(
+                result.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
+                "got: {}",
+                result.output.as_text()
+            );
         });
     }
 
