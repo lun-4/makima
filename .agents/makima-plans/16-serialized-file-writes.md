@@ -1,6 +1,6 @@
 ## Status: IMPLEMENTED (2026-08-27)
 
-Implemented as planned with the deltas recorded in “Implementation Deltas” below. Verified by the full remote `just ci`: fmt-check, clippy `-D warnings`, pylint, `cargo nextest run --workspace` (4612/4612 passed), gen-docs-check, machete.
+Implemented as planned with the deltas recorded in “Implementation Deltas” below, plus a review-revision round (adversarial review 5.6-Sol) recorded in “Review revisions” under the deltas. Verified by the full remote `just ci`: fmt-check, clippy `-D warnings`, pylint, `cargo nextest run --workspace` (4616/4616 passed), gen-docs-check, machete.
 
 ## Goal
 
@@ -240,3 +240,125 @@ test, and a `useless_conversion` in the reentry test helper.
   `batch_policy` (26/26) + `in_memory_host` (22/22).
 - Full `.ssh/remote-ci.sh` (`just ci`) on the build box: all stages green,
   workspace suite 4612 tests / 4612 passed.
+
+### Review revisions (2026-08-27, adversarial review 5.6-Sol)
+
+The review's four high findings and three medium findings were addressed in a
+follow-up round. Committed work fixed the first two highs; this session fixed
+the third high and the mediums. The plan text above is the original intent;
+the deltas below are the record of the revision.
+
+#### High: registry lifetime is now session/agent-loop scoped (committed fix)
+
+`FileWriteLocks` is created once per `AgentLoop` (`maki-ui/src/agent/mod.rs`)
+and once per headless session task (`maki-agent/src/headless.rs`,
+`spawn`/`spawn_interactive`), then cloned into every main-agent run of that
+session. `AgentLoop` carries it as a field; the loop-level constructor accepts
+it. `maki-lua`'s `SubagentDriver` already clones the parent's registry into
+child `AgentParams`, so detached subagents share the session registry even
+after the parent run ends. Two runs of the same session can no longer acquire
+different locks for the same path.
+
+#### High: atomic writes preserve symlink targets (committed fix)
+
+`maki-storage::atomic_write` (and `atomic_write_permissions`) resolve an
+existing symlink destination to its target before the same-directory rename
+(`atomic_destination`), so a write through `link.txt` modifies `target.txt`
+and leaves the symlink in place instead of renaming over it. `atomic_write`
+delegates to the shared `atomic_write_at` with the resolved destination.
+
+#### High: `memory` mutations participate via a computed `mutable_path` callback
+
+A plain field-form `mutable_path = "path"` would key on the raw relative input
+(against the agent cwd), not the note's real location under the state dir.
+`register_tool` now accepts `mutable_path` as a string field name **or** a
+`function(input)` that returns the resolved target path (nil when the call
+does not mutate), mirroring the `permission_scopes` callback pattern:
+
+- `api/tool.rs`: new `MutablePathSpec` (Field/Callback) + cloneable
+  `MutablePathKind` projection, exactly like `PermissionScopeSpec`/`Kind`.
+  The callback's `RegistryKey` lives in the runtime `ToolKeys` map; tool and
+  invocation copies carry only the kind. The invocation's sync
+  `mutable_path()` round-trips `Request::MutablePath` to the plugin host with
+  a `MUTABLE_PATH_TIMEOUT` (3s, same as describe) and fails open to no-lock.
+- `runtime.rs`: `Request::MutablePath` arm answers via `compute_mutable_path`,
+  which calls the registered callback with the json input and returns the
+  string or nil.
+- `plugins/memory/init.lua`: registers
+  `mutable_path = function(input)` that returns
+  `helpers.safe_resolve(resolve_dir(false), input.path)` for `write`/`delete`
+  and nil for `list`/`read`, so a memory mutation's lock key is byte-identical
+  to an `edit`/`write` targeting the same note file.
+- Docs: `mutable_path` API doc and generated `lua-api/_index.md` document both
+  forms; the `generated_docs_contain_mutable_path_reentry_contract` phrases
+  are preserved.
+
+#### Medium: the green tests now deterministically exercise the lock
+
+Two new dispatch-level tests with a gated backend prove the lock itself:
+
+- `dispatched_handlers_serialize_on_the_lock`: two real `edit` dispatches via
+  `tool_dispatch::run` against a backend whose first read parks. While the
+  first handler is parked mid-read (holding the lock), the second same-path
+  dispatch is asserted to not reach its read and not complete; after release
+  the event log must be exactly `[read, write, read, write]` and both edits
+  survive. Fails if lock acquisition is removed.
+- `memory_write_and_delete_serialize_on_shared_lock`: the memory delete's
+  existence `stat` parks; a concurrent same-note `memory write` must stay
+  blocked, and after release the `rm` lands strictly before the write so the
+  fresh note survives. Without the shared lock the write lands first and the
+  `rm` deletes it. This doubles as the regression for the computed-path key.
+- `memory_computed_mutable_path_locks_the_real_note`: parses a memory write
+  invocation and asserts `mutable_path()` resolves to the absolute
+  `.../memories/notes.md` key while `read` declares none.
+
+The `ProbeFs` backend records backend operation order and gates the first
+`read` or first `stat` behind a release token. The gate uses **separate**
+arrival and release channels: sharing one channel made the parked handler
+consume its own arrival token and hang the test (one channel, two receivers).
+
+The `mutable_tools_share_path_lock` and `batch_edits_same_file_preserve_all_replacements`
+cases remain as sequential/concurrent real-plugin coverage; the two new tests
+supply the deterministic lock-behavior proof the review asked for.
+
+#### Medium: nested `call_tool` preserves and caps the parent deadline
+
+`AgentContext::from(&ToolContext)` previously reset `deadline = None`, so a
+nested `maki.agent.call_tool` discarded the parent's deadline and could extend
+a timed-out handler's lifetime. It now inherits the parent deadline untouched;
+`call_tool`'s optional `timeout` still caps it via `Deadline::min`. The
+unit test now asserts the deadline is inherited rather than reset. Interrupting
+a holder that ignores cancellation stays out of scope (Lua handlers cannot be
+preempted mid-function); the guard still drops whenever dispatch returns.
+
+#### Medium: idle lock entries are reclaimed
+
+`FileWriteLocks::entry` sweeps entries whose `Arc::strong_count == 1` (only
+the map holds them; no waiter or guard) every `RETAIN_INTERVAL` insertions,
+under the same mutex used for insertion, so there is no remove-after-unlock
+race and a waiting acquire can never observe a removed gate. A long session
+touching generated paths no longer grows the registry monotonically.
+`idle_entries_are_reclaimed_while_held_ones_survive` covers both properties.
+
+#### Low: plan file line endings
+
+The plan was written with CRLF line endings, which `git diff --check` reports
+as trailing whitespace on every line. Converted to LF; the diff is clean.
+
+#### Validation (revision round)
+
+- Local `cargo check --workspace` surfaced one genuinely CI-breaking compile
+  error from the symlink commit: `atomic_write_permissions` passed a `PathBuf`
+  where `persist` expects `&Path` (`persist(tmp, &path)`). Fixed.
+- `.ssh/remote-ci.sh` full green: fmt-check (incl. stylua on the new Lua
+  callback), clippy `-D warnings` (incl. `items_after_test_module` from a
+  misplaced inherent impl, `manual_is_multiple_of`, dead-code),
+  pylint, 4616/4616 nextest (9 write_lock_regression cases incl. the 3 new,
+  plus the file_locks reclamation test), gen-docs-check, machete.
+  `maki-ui::file_completion::uppercase_file_query_does_not_panic` flaked once
+  under full parallel load (nucleo tick budget) and passes standalone and on
+  re-run; it is unrelated to this change.
+- Debugging used the build box directly (`.ssh/remote-ci.sh` + scp to the
+  mirror) because the local VM's virtiofs mount served stale directory
+  listings to `include_dir!` (intermittent ENOENT on existing files); the
+  same code builds and tests cleanly on the box's real filesystem.
