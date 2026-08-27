@@ -302,12 +302,6 @@ impl RawConfig {
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
         self.validate_plugin_tables()?;
-        let disabled_tools: Vec<String> = self
-            .plugins
-            .iter()
-            .filter(|(_, cfg)| cfg.enabled == Some(false))
-            .map(|(name, _)| name.clone())
-            .collect();
         let net = NetConfig::from_file(self.net);
         maki_lua::set_allowed_private_hosts(&net.allowed_private_hosts);
         Ok(Config {
@@ -320,7 +314,7 @@ impl RawConfig {
                 .map(AlwaysThinking::resolve)
                 .transpose()?,
             ui: UiConfig::from_file(self.ui),
-            agent: AgentConfig::from_file(self.agent, no_rtk, disabled_tools),
+            agent: AgentConfig::from_file(self.agent, no_rtk),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             net,
@@ -1216,12 +1210,14 @@ pub struct AgentConfig {
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
+    /// Only from the CLI's `--disallowed-tools`. A disabled plugin never
+    /// registers its tool, so its name stays free for another plugin to claim.
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
 }
 
 impl AgentConfig {
-    fn from_file(file: AgentFileConfig, no_rtk: bool, disabled_tools: Vec<String>) -> Self {
+    fn from_file(file: AgentFileConfig, no_rtk: bool) -> Self {
         Self {
             no_rtk,
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
@@ -1243,7 +1239,7 @@ impl AgentConfig {
             stale_read_check: file.stale_read_check.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
-            disabled_tools,
+            disabled_tools: Vec::new(),
         }
     }
 }
@@ -3284,6 +3280,17 @@ mod tests {
         assert!(
             msg.contains("no bundled plugin is named \"gerp\"") && msg.contains("grep"),
             "error should name the typo and list bundled plugins, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn disabling_a_plugin_leaves_its_tool_name_free() {
+        let raw: RawConfig =
+            toml::from_str("[plugins.grep]\nenabled = false\n").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(
+            config.agent.disabled_tools.is_empty(),
+            "a disabled plugin never registers, so nothing may filter its name away"
         );
     }
 

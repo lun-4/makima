@@ -7,10 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use maki_agent::template::Vars;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
-    ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
-    timeout_annotation,
+    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
+    ToolSource, timeout_annotation,
 };
 use maki_agent::{AgentMode, SharedBuf, ToolOutput};
 use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
@@ -18,8 +19,10 @@ use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
-    PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP, WinCommand, WinEvent,
+    PERMISSION_NAME_WARNING, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
+    WinCommand, WinEvent,
 };
+use maki_providers::Model;
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
@@ -38,6 +41,12 @@ const PICKER_LOADING_HINT: &str = "Loading sessions…";
 const PICKER_ACTION_TIMEOUT: &str = "sessions picker did not send the expected UI action";
 const PICKER_RENDER_TIMEOUT: &str = "sessions picker did not render the expected content";
 const PICKER_CLOSE_TIMEOUT: &str = "sessions picker did not close";
+const SHADOWED_TOOL: &str = "skill";
+const REPLACEMENT_PLUGIN: &str = "my_skill";
+const REPLACEMENT_DESC: &str = "took the builtin name over";
+const PERMISSION_KEYED_TOOL: &str = "task";
+const OTHER_PERMISSION_KEYED_TOOL: &str = "write";
+const PLAIN_TOOL: &str = "plain_helper";
 
 struct FakeCommandHost;
 
@@ -2868,6 +2877,69 @@ fn unknown_plugin_name_fails_load_builtins() {
         .expect_err("load_builtins should fail");
     assert!(
         err.to_string().contains("no bundled plugin named \"gerp\""),
+        "got: {err}"
+    );
+}
+
+fn shadow_src() -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{SHADOWED_TOOL}",
+            description = "{REPLACEMENT_DESC}",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "replaced" end
+        }})"#
+    )
+}
+
+/// Turning a builtin off used to copy its name into `agent.disabled_tools`,
+/// the name filter every request runs over the tool array, so a replacement
+/// could load and still stay invisible to the model. That is why this walks
+/// the whole path: init.lua, config, builtins, then the definitions a request
+/// is built from.
+#[test]
+fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            format!("maki.setup({{ plugins = {{ {SHADOWED_TOOL} = {{ enabled = false }} }} }})"),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("setup returns a config");
+    let config = raw.into_config(&[]).unwrap();
+    host.load_builtins(&config.plugins).unwrap();
+    host.load_source(REPLACEMENT_PLUGIN, &shadow_src())
+        .expect("a disabled builtin leaves its tool name free");
+
+    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+    let defs = reg.definitions(&Vars::new(), &ctx, false);
+    let shadowed = defs
+        .as_array()
+        .expect("definitions returns an array")
+        .iter()
+        .find(|def| def["name"] == SHADOWED_TOOL)
+        .expect("the replacement must reach the model, not just `maki prompt --tools`");
+    assert_eq!(shadowed["description"], REPLACEMENT_DESC);
+}
+
+#[test]
+fn enabled_builtin_still_rejects_a_shadowing_plugin() {
+    let (_reg, host) = builtins_host();
+    let err = host
+        .load_source(REPLACEMENT_PLUGIN, &shadow_src())
+        .expect_err("an enabled builtin owns its tool name");
+    assert!(
+        matches!(err, PluginError::NameConflict { .. }),
         "got: {err}"
     );
 }

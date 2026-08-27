@@ -6,9 +6,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
-use maki_agent::permissions::PluginRuleStore;
+use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::session_coordinator::SessionOptionCatalog;
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_commands::CommandRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
@@ -32,6 +32,10 @@ use maki_agent::prompt::ResolvedSlots;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const GLOBAL_INIT_OWNER: &str = "maki_init.global";
 const PROJECT_INIT_OWNER: &str = "maki_init.project";
+pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
+/// Tests assert on this exact text, so a wording tweak here updates them too.
+pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
+     tool of the same name, together with any \"always allow\" you saved";
 
 struct BundledPlugin {
     name: &'static str,
@@ -364,6 +368,9 @@ impl PluginHost {
                 None => *merged = Some(raw),
             }
         }
+        if let Some(warning) = self.permission_name_warning(owner) {
+            tracing::warn!("{warning}");
+        }
         Ok(())
     }
 
@@ -604,6 +611,27 @@ impl PluginHost {
         )
     }
 
+    /// The names the plugin registered that maki's own permission defaults are
+    /// keyed on. Taking such a name is allowed, and a drop-in replacement may
+    /// want the builtin's rules, but the user has to be told which rules the
+    /// plugin just inherited. One warning lists them all, because the TUI
+    /// flashes a single warning and a per-tool one would drop the rest.
+    pub fn permission_name_warning(&self, plugin: &str) -> Option<String> {
+        let snapshot = self.registry.iter();
+        let names: Vec<String> = snapshot
+            .iter()
+            .filter(|t| matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin))
+            .filter(|t| carries_builtin_defaults(t.name()))
+            .map(|t| format!("`{}`", t.name()))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{plugin}: registered {}, so it {PERMISSION_NAME_WARNING}",
+            names.join(", ")
+        ))
+    }
     pub fn event_handle(&self) -> EventHandle {
         EventHandle {
             tx: self.inner.tx.clone(),

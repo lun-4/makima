@@ -24,7 +24,7 @@ pub use api::util::command::{
 pub use api::util::picker::{PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::{PluginError, SessionOptionMutationError};
-pub use loader::{EventHandle, PluginHost, TestCompletionBackend};
+pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, TestCompletionBackend};
 pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{CommandArgumentContext, CommandArgumentLifecycle};
 pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
