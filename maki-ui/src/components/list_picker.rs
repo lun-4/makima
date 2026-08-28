@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_search_with_nucleo_matcher() {
+    fn fuzzy_search_uses_shared_matcher() {
         let mut p = ListPicker::new();
         p.open(
             entries(&["claude-sonnet", "claude-opus", "gemini-pro", "gpt-4"]),
