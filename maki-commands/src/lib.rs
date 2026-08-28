@@ -516,6 +516,7 @@ pub struct CommandRegistry(Arc<RegistryInner>);
 
 struct RegistryInner {
     id: RegistryId,
+    publication: Mutex<()>,
     state: Mutex<RegistryState>,
 }
 
@@ -605,16 +606,12 @@ impl CompletionCallback {
 }
 
 impl CompletionInvalidation {
-    fn finish(self) {
-        let callback = self
-            .session
+    fn prepare(self) -> Option<CompletionCallback> {
+        self.session
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .close();
-        if let Some(callback) = callback {
-            let _ = callback.call();
-        }
+            .close()
     }
 }
 
@@ -705,6 +702,7 @@ impl CommandRegistry {
     pub fn new() -> Self {
         Self(Arc::new(RegistryInner {
             id: RegistryId(NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed)),
+            publication: Mutex::new(()),
             state: Mutex::new(RegistryState {
                 next_id: 1,
                 generation: 0,
@@ -814,6 +812,7 @@ impl CommandRegistry {
             .iter()
             .find(|producer| {
                 producer.id == command.producer_id()
+                    && producer.generation.is_multiple_of(2)
                     && producer
                         .records
                         .iter()
@@ -1130,6 +1129,10 @@ impl Producer {
             .registry
             .upgrade()
             .ok_or(RegistrationError::StaleProducer)?;
+        let publication = registry
+            .publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut state = registry
             .state
             .lock()
@@ -1149,18 +1152,29 @@ impl Producer {
                 })
             })
             .collect();
+        state.producers[position].generation += 1;
+        let invalidations = state.invalidate_completion_sessions(self.id);
+        drop(state);
+        let callbacks = invalidations
+            .into_iter()
+            .filter_map(CompletionInvalidation::prepare)
+            .collect::<Vec<_>>();
+        let mut state = registry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.producers[position].records = records;
         state.producers[position].generation += 1;
         state.generation += 1;
         state.rebuild();
         let wakers = state.take_subscriber_wakers();
-        let invalidations = state.invalidate_completion_sessions(self.id);
         drop(state);
+        drop(publication);
+        for callback in callbacks {
+            let _ = callback.call();
+        }
         for waker in wakers {
             waker.wake();
-        }
-        for invalidation in invalidations {
-            invalidation.finish();
         }
         Ok(())
     }
@@ -1169,6 +1183,10 @@ impl Producer {
         let Some(registry) = self.registry.upgrade() else {
             return false;
         };
+        let publication = registry
+            .publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut state = registry
             .state
             .lock()
@@ -1180,17 +1198,28 @@ impl Producer {
         else {
             return false;
         };
+        state.producers[position].generation += 1;
+        let invalidations = state.invalidate_completion_sessions(self.id);
+        drop(state);
+        let callbacks = invalidations
+            .into_iter()
+            .filter_map(CompletionInvalidation::prepare)
+            .collect::<Vec<_>>();
+        let mut state = registry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.producers.remove(position);
         state.generation += 1;
         state.rebuild();
         let wakers = state.take_subscriber_wakers();
-        let invalidations = state.invalidate_completion_sessions(self.id);
         drop(state);
+        drop(publication);
+        for callback in callbacks {
+            let _ = callback.call();
+        }
         for waker in wakers {
             waker.wake();
-        }
-        for invalidation in invalidations {
-            invalidation.finish();
         }
         true
     }
@@ -1960,10 +1989,27 @@ mod tests {
         woke: mpsc::SyncSender<()>,
     }
 
+    struct CompletionSessionWaker {
+        session: CompletionSession,
+        result: mpsc::SyncSender<CompletionResult>,
+    }
+
     impl Wake for ReentrantRegistryWaker {
         fn wake(self: Arc<Self>) {
             drop(self.registry.subscribe());
             self.woke.send(()).unwrap();
+        }
+    }
+
+    impl Wake for CompletionSessionWaker {
+        fn wake(self: Arc<Self>) {
+            let result = futures_lite::future::block_on(self.session.complete(
+                Arc::from(""),
+                Arc::from(""),
+                0,
+                Arc::from("insert"),
+            ));
+            self.result.send(result).unwrap();
         }
     }
 
@@ -2417,6 +2463,92 @@ mod tests {
     }
 
     #[test]
+    fn replacement_publishes_only_after_sessions_are_stale() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let session =
+            completion_session(&registry, &producer, Arc::new(CompletionProbe::default()));
+        let command = session.command().clone();
+        let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+        let initial = registry.snapshot_for(&target).unwrap();
+        let session_lock = session
+            .owner
+            .core
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let producer_for_thread = producer.clone();
+        let worker = thread::spawn(move || producer_for_thread.replace(Vec::new()));
+
+        let deadline = std::time::Instant::now() + LOCK_RELEASE_TIMEOUT;
+        loop {
+            let state = registry
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.producers[0].generation % 2 == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replacement did not enter its invalidation phase"
+            );
+            drop(state);
+            thread::yield_now();
+        }
+        let snapshot = registry.snapshot_for(&target).unwrap();
+        assert_eq!(snapshot.generation(), initial.generation());
+        assert_eq!(snapshot.commands()[0].command_id(), command.command_id());
+        let late_subscription = registry.subscribe();
+        assert_eq!(late_subscription.generation(), initial.generation());
+        assert!(matches!(
+            registry.open_completion(command, target.id()),
+            Err(CompletionError::StaleCommand)
+        ));
+
+        drop(session_lock);
+        worker.join().unwrap().unwrap();
+        assert!(late_subscription.generation() > initial.generation());
+        assert!(
+            registry
+                .snapshot_for(&target)
+                .unwrap()
+                .commands()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn subscriber_observes_stale_session_at_new_generation() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let session =
+            completion_session(&registry, &producer, Arc::new(CompletionProbe::default()));
+        let subscription = registry.subscribe();
+        let initial = subscription.generation();
+        let mut changed = subscription.changed(initial);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let waker = Waker::from(Arc::new(CompletionSessionWaker {
+            session,
+            result: result_tx,
+        }));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(changed.as_mut().poll(&mut context), Poll::Pending));
+
+        producer.replace(Vec::new()).unwrap();
+
+        assert_eq!(
+            result_rx.recv_timeout(LOCK_RELEASE_TIMEOUT).unwrap(),
+            CompletionResult::Stale
+        );
+        assert!(matches!(
+            changed.as_mut().poll(&mut context),
+            Poll::Ready(generation) if generation > initial
+        ));
+    }
+
+    #[test]
     fn completion_invalidation_detaches_without_locking_sessions() {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Application);
@@ -2445,8 +2577,11 @@ mod tests {
         let invalidations = detached_rx.recv_timeout(LOCK_RELEASE_TIMEOUT).unwrap();
         drop(session_lock);
         worker.join().unwrap();
-        for invalidation in invalidations {
-            invalidation.finish();
+        for callback in invalidations
+            .into_iter()
+            .filter_map(CompletionInvalidation::prepare)
+        {
+            callback.call().unwrap();
         }
         assert!(matches!(
             futures_lite::future::block_on(session.complete(
