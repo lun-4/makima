@@ -60,7 +60,6 @@ pub struct CommandPalette {
     current_arg_count: usize,
     argument_items: Vec<ArgumentMatch>,
     argument_range: Option<(usize, usize)>,
-    argument_session: u64,
     argument_generation: u64,
     completion_session: Option<CompletionSession>,
     pending_arguments: Option<PendingArguments>,
@@ -104,7 +103,6 @@ impl CommandPalette {
             current_arg_count: 0,
             argument_items: Vec::new(),
             argument_range: None,
-            argument_session: 0,
             argument_generation: 0,
             completion_session: None,
             pending_arguments: None,
@@ -287,7 +285,6 @@ impl CommandPalette {
         });
         if !same_session {
             self.cancel_arguments();
-            self.argument_session = self.argument_session.wrapping_add(1);
             self.completion_session = self
                 .registry
                 .open_completion(command, self.target.id())
