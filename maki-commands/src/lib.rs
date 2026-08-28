@@ -587,8 +587,7 @@ struct CompletionCallback {
 }
 
 struct CompletionInvalidation {
-    _session: Arc<CompletionSessionCore>,
-    callback: Option<CompletionCallback>,
+    session: Arc<CompletionSessionCore>,
 }
 
 impl CompletionCallback {
@@ -600,7 +599,13 @@ impl CompletionCallback {
 
 impl CompletionInvalidation {
     fn finish(self) {
-        if let Some(callback) = self.callback {
+        let callback = self
+            .session
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .close();
+        if let Some(callback) = callback {
             let _ = callback.call();
         }
     }
@@ -1199,15 +1204,7 @@ impl RegistryState {
             .into_iter()
             .map(|(id, session)| {
                 self.completion_sessions.remove(&id);
-                let callback = session
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .close();
-                CompletionInvalidation {
-                    _session: session,
-                    callback,
-                }
+                CompletionInvalidation { session }
             })
             .collect()
     }
@@ -1879,7 +1876,13 @@ pub enum CompletionError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
+
+    const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
     struct OutcomeBehavior(CommandOutcome);
 
@@ -1900,6 +1903,12 @@ mod tests {
         completions: AtomicU64,
         events: Mutex<Vec<CompletionLifecycleEvent>>,
         reenter: Option<CommandRegistry>,
+    }
+
+    struct BlockingCompletion {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        events: Mutex<Vec<CompletionLifecycleEvent>>,
     }
 
     impl CommandCompletion for CompletionProbe {
@@ -1927,6 +1936,41 @@ mod tests {
             if let Some(registry) = &self.reenter {
                 drop(registry.create_producer(ProducerPrecedence::Plugin));
             }
+            self.events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event.clone());
+            Ok(())
+        }
+    }
+
+    impl CommandCompletion for BlockingCompletion {
+        fn complete(
+            &self,
+            _context: CompletionContext,
+            _cancellation: CancellationToken,
+        ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv()
+                .unwrap();
+            Box::pin(async {
+                Ok(vec![CompletionItem {
+                    label: Arc::from("candidate"),
+                    insertion: Arc::from("candidate"),
+                    description: None,
+                }])
+            })
+        }
+
+        fn lifecycle(
+            &self,
+            _context: &CompletionContext,
+            event: &CompletionLifecycleEvent,
+            _cancellation: &CancellationToken,
+        ) -> Result<(), CompletionError> {
             self.events
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1979,6 +2023,18 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
         let command = registry.resolve_for(&target, "/complete").unwrap();
         registry.open_completion(command, target.id()).unwrap()
+    }
+
+    fn complete_once(session: &CompletionSession) -> CompletionCandidate {
+        let CompletionResult::Items(mut items) = futures_lite::future::block_on(session.complete(
+            Arc::from(""),
+            Arc::from(""),
+            0,
+            Arc::from("insert"),
+        )) else {
+            panic!("completion did not return items");
+        };
+        items.pop().unwrap()
     }
 
     #[test]
@@ -2107,21 +2163,54 @@ mod tests {
     }
 
     #[test]
+    fn completion_invalidation_detaches_without_locking_sessions() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let session =
+            completion_session(&registry, &producer, Arc::new(CompletionProbe::default()));
+        let session_lock = session
+            .core
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let registry_for_thread = registry.clone();
+        let producer_id = producer.id();
+        let (detached_tx, detached_rx) = mpsc::sync_channel(1);
+
+        let worker = thread::spawn(move || {
+            let invalidations = registry_for_thread
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .invalidate_completion_sessions(producer_id);
+            detached_tx.send(invalidations).unwrap();
+        });
+
+        let invalidations = detached_rx.recv_timeout(LOCK_RELEASE_TIMEOUT).unwrap();
+        drop(session_lock);
+        worker.join().unwrap();
+        for invalidation in invalidations {
+            invalidation.finish();
+        }
+        assert!(matches!(
+            futures_lite::future::block_on(session.complete(
+                Arc::from(""),
+                Arc::from(""),
+                0,
+                Arc::from("insert"),
+            )),
+            CompletionResult::Stale
+        ));
+    }
+
+    #[test]
     fn producer_replacement_cancels_completion_once_and_rejects_reuse() {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Application);
-        let probe = Arc::new(CompletionProbe {
-            reenter: Some(registry.clone()),
-            ..CompletionProbe::default()
-        });
+        let probe = Arc::new(CompletionProbe::default());
         let session = completion_session(&registry, &producer, probe.clone());
-        let items = futures_lite::future::block_on(session.complete(
-            Arc::from(""),
-            Arc::from(""),
-            0,
-            Arc::from("insert"),
-        ));
-        assert!(matches!(items, CompletionResult::Items(_)));
+        let candidate = complete_once(&session);
 
         producer.replace(Vec::new()).unwrap();
 
@@ -2133,6 +2222,14 @@ mod tests {
                 Arc::from("insert"),
             )),
             CompletionResult::Stale
+        ));
+        assert!(matches!(
+            session.highlight(&candidate),
+            Err(CompletionError::StaleSession)
+        ));
+        assert!(matches!(
+            session.accept(candidate),
+            Err(CompletionError::StaleSession)
         ));
         assert_eq!(probe.completions.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -2146,20 +2243,80 @@ mod tests {
     }
 
     #[test]
+    fn producer_removal_cancels_completion_outside_registry_lock() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let probe = Arc::new(CompletionProbe {
+            reenter: Some(registry.clone()),
+            ..CompletionProbe::default()
+        });
+        let session = completion_session(&registry, &producer, probe.clone());
+        drop(complete_once(&session));
+
+        assert!(producer.remove());
+
+        assert_eq!(
+            *probe
+                .events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            [CompletionLifecycleEvent::Cancel]
+        );
+        assert!(!producer.remove());
+    }
+
+    #[test]
+    fn invalidating_in_flight_completion_returns_cancelled_then_stale() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let completion = Arc::new(BlockingCompletion {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            events: Mutex::new(Vec::new()),
+        });
+        let session = completion_session(&registry, &producer, completion.clone());
+        let session_for_thread = session.clone();
+        let worker = thread::spawn(move || {
+            futures_lite::future::block_on(session_for_thread.complete(
+                Arc::from(""),
+                Arc::from(""),
+                0,
+                Arc::from("insert"),
+            ))
+        });
+        entered_rx.recv_timeout(LOCK_RELEASE_TIMEOUT).unwrap();
+
+        producer.replace(Vec::new()).unwrap();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(worker.join().unwrap(), CompletionResult::Cancelled);
+        assert!(matches!(
+            futures_lite::future::block_on(session.complete(
+                Arc::from(""),
+                Arc::from(""),
+                0,
+                Arc::from("insert"),
+            )),
+            CompletionResult::Stale
+        ));
+        assert_eq!(
+            *completion
+                .events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            [CompletionLifecycleEvent::Cancel]
+        );
+    }
+
+    #[test]
     fn accepting_completion_is_terminal_and_fires_once() {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Application);
         let probe = Arc::new(CompletionProbe::default());
         let session = completion_session(&registry, &producer, probe.clone());
-        let CompletionResult::Items(mut items) = futures_lite::future::block_on(session.complete(
-            Arc::from(""),
-            Arc::from(""),
-            0,
-            Arc::from("insert"),
-        )) else {
-            panic!("completion did not return items");
-        };
-        let candidate = items.pop().unwrap();
+        let candidate = complete_once(&session);
         let duplicate = candidate.clone();
 
         session.accept(candidate).unwrap();
