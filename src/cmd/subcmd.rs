@@ -16,7 +16,7 @@ use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
-use maki_providers::{copilot_auth, dynamic, openai_auth, xai_auth};
+use maki_providers::{copilot_auth, dynamic, openai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
@@ -31,7 +31,6 @@ const SESSIONS_JSON_ONLY_ERR: &str =
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
-        Some("xai") => xai_auth::login(storage)?,
         Some("copilot") => copilot_auth::login(storage)?,
         Some(slug) => {
             let slug = slugify(slug);
@@ -416,7 +415,6 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
     match provider {
         "openai" => openai_auth::logout(storage)?,
-        "xai" => xai_auth::logout(storage)?,
         "copilot" => copilot_auth::logout(storage)?,
         _ => {
             let mut config = ProvidersConfig::load();
