@@ -5,11 +5,14 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_lua::ItemSpec;
-use maki_match::{CompletionMatchOptions, completion_match};
 #[cfg(test)]
-use nucleo::Utf32Str;
+use maki_match::completion_match_default;
+use maki_match::{
+    CompletionMatch, CompletionMatchOptions, CompletionRanking, compare_completion_matches,
+    completion_match,
+};
+use nucleo::Nucleo;
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Matcher, Nucleo};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -90,28 +93,15 @@ impl CompletionItem {
 #[derive(Debug, Clone)]
 struct Candidate {
     item: CompletionItem,
-    indices: Vec<u32>,
-    ranking: MatchRanking,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MatchRanking {
-    quality: u8,
-    boundary: u8,
-    start: usize,
-    gaps: usize,
-    span: usize,
-    suffix: usize,
-    score: u16,
-    source: u8,
-    order: usize,
+    matching: CompletionMatch,
+    source_rank: u8,
+    source_order: usize,
 }
 
 #[derive(Debug, Clone)]
 struct QueryIntent {
     payload: String,
     kind: Option<&'static str>,
-    explicit_kind: bool,
     has_colon: bool,
 }
 
@@ -125,11 +115,6 @@ pub enum CompletionAction {
 
 struct Session {
     nucleo: Nucleo<()>,
-    matcher: Matcher,
-    /// The current query, lowercased. Kept so the file and ref pipelines
-    /// compute highlight indices through one shared implementation. The
-    /// matcher is case-insensitive and contractually requires a lowercase
-    /// needle; an uppercase needle panics in its optimal path.
     query: String,
     intent: QueryIntent,
     /// Non-file candidates from Lua sources, as `(matchable label, item)`.
@@ -202,12 +187,10 @@ impl FileCompletionMenu {
 
         let session = Session {
             nucleo,
-            matcher: Matcher::new(Config::DEFAULT.match_paths()),
             query: String::new(),
             intent: QueryIntent {
                 payload: String::new(),
                 kind: None,
-                explicit_kind: false,
                 has_colon: false,
             },
             ref_items,
@@ -281,7 +264,6 @@ impl FileCompletionMenu {
         s.scroll_offset = 0;
 
         s.ref_matches = fuzzy_match(
-            &mut s.matcher,
             &s.intent,
             s.ref_items
                 .iter()
@@ -439,10 +421,7 @@ impl FileCompletionMenu {
 }
 
 /// Character indices of `query` fuzzy-matched within `label`, for
-/// highlighting. `None` when the query does not match. One shared
-/// implementation for the file and ref pipelines, so prefix and fuzzy
-/// highlights always agree. The needle must be lowercase: the matcher is
-/// case-insensitive and panics on uppercase needles.
+/// highlighting. `None` when the query does not match.
 fn parse_query(query: &str) -> QueryIntent {
     let lowered = query.to_lowercase();
     for (aliases, kind) in [
@@ -455,7 +434,6 @@ fn parse_query(query: &str) -> QueryIntent {
                 return QueryIntent {
                     payload: String::new(),
                     kind: Some(kind),
-                    explicit_kind: true,
                     has_colon: false,
                 };
             }
@@ -465,7 +443,6 @@ fn parse_query(query: &str) -> QueryIntent {
                 return QueryIntent {
                     payload: payload.into(),
                     kind: Some(kind),
-                    explicit_kind: true,
                     has_colon: true,
                 };
             }
@@ -474,13 +451,11 @@ fn parse_query(query: &str) -> QueryIntent {
     QueryIntent {
         payload: query.to_string(),
         kind: None,
-        explicit_kind: false,
         has_colon: false,
     }
 }
 
 fn match_candidate(
-    _matcher: &mut Matcher,
     item: CompletionItem,
     intent: &QueryIntent,
     source: u8,
@@ -502,38 +477,23 @@ fn match_candidate(
     } else {
         0
     };
-    if intent.payload.is_empty() && intent.explicit_kind {
-        return Some(Candidate {
-            item,
-            indices: Vec::new(),
-            ranking: MatchRanking {
-                quality: 4,
-                boundary: 1,
-                start: 0,
-                gaps: 0,
-                span: 0,
-                suffix: 0,
-                score: 0,
-                source,
-                order,
-            },
-        });
-    }
     if intent.payload.is_empty() {
         return Some(Candidate {
             item,
-            indices: Vec::new(),
-            ranking: MatchRanking {
-                quality: 4,
-                boundary: 1,
-                start: 0,
-                gaps: 0,
-                span: 0,
-                suffix: 0,
-                score: 0,
-                source,
-                order,
+            matching: CompletionMatch {
+                indices: Vec::new(),
+                ranking: CompletionRanking {
+                    quality_rank: 4,
+                    boundary_rank: 1,
+                    start_index: 0,
+                    gap_count: 0,
+                    span_length: 0,
+                    unmatched_suffix: 0,
+                    fuzzy_score: 0,
+                },
             },
+            source_rank: source,
+            source_order: order,
         });
     }
     let matched = completion_match(
@@ -544,37 +504,25 @@ fn match_candidate(
             normalization: Normalization::Smart,
         },
     )?;
-    let full_indices: Vec<u32> = matched
-        .indices
-        .into_iter()
-        .map(|i| i + display_prefix as u32)
-        .collect();
-    let ranking = matched.ranking;
+    let mut matching = matched;
+    for index in &mut matching.indices {
+        *index += display_prefix as u32;
+    }
     Some(Candidate {
         item,
-        indices: full_indices,
-        ranking: MatchRanking {
-            quality: ranking.quality_rank,
-            boundary: ranking.boundary_rank,
-            start: ranking.start_index + display_prefix,
-            gaps: ranking.gap_count,
-            span: ranking.span_length,
-            suffix: ranking.unmatched_suffix,
-            score: ranking.fuzzy_score as u16,
-            source,
-            order,
-        },
+        matching,
+        source_rank: source,
+        source_order: order,
     })
 }
 
 fn fuzzy_match(
-    matcher: &mut Matcher,
     intent: &QueryIntent,
     items: impl IntoIterator<Item = (String, CompletionItem, usize)>,
 ) -> Vec<Candidate> {
     items
         .into_iter()
-        .filter_map(|(_, item, order)| match_candidate(matcher, item, intent, 1, order))
+        .filter_map(|(_, item, order)| match_candidate(item, intent, 1, order))
         .collect()
 }
 
@@ -588,13 +536,7 @@ fn refresh_file_matches(s: &mut Session) {
     paths.sort();
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
-        if let Some(candidate) = match_candidate(
-            &mut s.matcher,
-            CompletionItem::file(path),
-            &s.intent,
-            0,
-            order,
-        ) {
+        if let Some(candidate) = match_candidate(CompletionItem::file(path), &s.intent, 0, order) {
             s.file_matches.push(candidate);
         }
     }
@@ -605,32 +547,22 @@ fn rebuild_combined(s: &mut Session) {
     s.matches.extend(s.file_matches.iter().cloned());
     s.matches.extend(s.ref_matches.iter().cloned());
     s.matches.sort_by(|a, b| {
-        let x = &a.ranking;
-        let y = &b.ranking;
-        x.quality
-            .cmp(&y.quality)
-            .then(x.boundary.cmp(&y.boundary))
-            .then(x.start.cmp(&y.start))
-            .then(x.gaps.cmp(&y.gaps))
-            .then(x.span.cmp(&y.span))
-            .then(x.suffix.cmp(&y.suffix))
-            .then(y.score.cmp(&x.score))
-            .then(x.source.cmp(&y.source))
-            .then(x.order.cmp(&y.order))
-            .then(a.item.label.cmp(&b.item.label))
+        compare_completion_matches(
+            &a.matching,
+            &b.matching,
+            a.source_rank,
+            b.source_rank,
+            a.source_order,
+            b.source_order,
+            &a.item.label,
+            &b.item.label,
+        )
     });
 }
 
 #[cfg(test)]
-fn highlight_indices(matcher: &mut Matcher, label: &str, query: &str) -> Option<Vec<u32>> {
-    let mut needle_buf = Vec::new();
-    let needle = Utf32Str::new(query, &mut needle_buf);
-    let mut hay_buf = Vec::new();
-    let hay = Utf32Str::new(label, &mut hay_buf);
-    let mut indices = Vec::new();
-    matcher
-        .fuzzy_indices(hay, needle, &mut indices)
-        .map(|_| indices)
+fn highlight_indices(label: &str, query: &str) -> Option<Vec<u32>> {
+    completion_match_default(query, label).map(|matching| matching.indices)
 }
 
 fn move_selection(s: &mut Session, rows: isize) {
@@ -750,7 +682,7 @@ fn cell_line<'a>(c: &Candidate, width: usize, selected: bool, t: &'a theme::Them
             break;
         }
         used += cw;
-        let is_match = c.indices.binary_search(&(i as u32)).is_ok();
+        let is_match = c.matching.indices.binary_search(&(i as u32)).is_ok();
         if is_match != in_match && !run.is_empty() {
             spans.push(Span::styled(
                 mem::take(&mut run),
@@ -817,12 +749,10 @@ mod tests {
             .collect();
         menu.session = Some(Session {
             nucleo,
-            matcher: Matcher::new(Config::DEFAULT.match_paths()),
             query: String::new(),
             intent: QueryIntent {
                 payload: String::new(),
                 kind: None,
-                explicit_kind: false,
                 has_colon: false,
             },
             ref_items,
@@ -1054,18 +984,20 @@ mod tests {
         s.file_matches = (0..64)
             .map(|i| Candidate {
                 item: CompletionItem::file(format!("src/file{i}.rs")),
-                indices: Vec::new(),
-                ranking: MatchRanking {
-                    quality: 4,
-                    boundary: 1,
-                    start: 0,
-                    gaps: 0,
-                    span: 0,
-                    suffix: 0,
-                    score: 0,
-                    source: 0,
-                    order: i,
+                matching: CompletionMatch {
+                    indices: Vec::new(),
+                    ranking: CompletionRanking {
+                        quality_rank: 4,
+                        boundary_rank: 1,
+                        start_index: 0,
+                        gap_count: 0,
+                        span_length: 0,
+                        unmatched_suffix: 0,
+                        fuzzy_score: 0,
+                    },
                 },
+                source_rank: 0,
+                source_order: i,
             })
             .collect();
         menu.sync_query("");
@@ -1080,18 +1012,20 @@ mod tests {
         let s = menu.session.as_mut().unwrap();
         s.file_matches = vec![Candidate {
             item: CompletionItem::file("novo_nordisk_report.csv".into()),
-            indices: Vec::new(),
-            ranking: MatchRanking {
-                quality: 4,
-                boundary: 1,
-                start: 0,
-                gaps: 0,
-                span: 0,
-                suffix: 0,
-                score: 0,
-                source: 0,
-                order: 0,
+            matching: CompletionMatch {
+                indices: Vec::new(),
+                ranking: CompletionRanking {
+                    quality_rank: 4,
+                    boundary_rank: 1,
+                    start_index: 0,
+                    gap_count: 0,
+                    span_length: 0,
+                    unmatched_suffix: 0,
+                    fuzzy_score: 0,
+                },
             },
+            source_rank: 0,
+            source_order: 0,
         }];
         menu.sync_query("sk");
         let s = menu.session.as_ref().unwrap();
@@ -1114,7 +1048,7 @@ mod tests {
                 "kind {kind} not seeded"
             );
         }
-        assert!(s.matches[0].indices.is_empty());
+        assert!(s.matches[0].matching.indices.is_empty());
     }
 
     #[test]
@@ -1140,18 +1074,20 @@ mod tests {
         s.matches = (0..count)
             .map(|i| Candidate {
                 item: CompletionItem::file(format!("file{i}")),
-                indices: Vec::new(),
-                ranking: MatchRanking {
-                    quality: 4,
-                    boundary: 1,
-                    start: 0,
-                    gaps: 0,
-                    span: 0,
-                    suffix: 0,
-                    score: 0,
-                    source: 0,
-                    order: i,
+                matching: CompletionMatch {
+                    indices: Vec::new(),
+                    ranking: CompletionRanking {
+                        quality_rank: 4,
+                        boundary_rank: 1,
+                        start_index: 0,
+                        gap_count: 0,
+                        span_length: 0,
+                        unmatched_suffix: 0,
+                        fuzzy_score: 0,
+                    },
                 },
+                source_rank: 0,
+                source_order: i,
             })
             .collect();
         menu
@@ -1273,25 +1209,25 @@ mod tests {
 
     #[test]
     fn highlight_indices_shared_for_prefix_and_fuzzy() {
-        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
-        // Prefix: the needle anchors at the start of the label.
-        assert_eq!(
-            highlight_indices(&mut matcher, "skill:review", "sk"),
-            Some(vec![0, 1])
-        );
+        assert_eq!(highlight_indices("skill:review", "sk"), Some(vec![0, 1]));
         // Fuzzy: the needle is scattered through the label.
         assert_eq!(
-            highlight_indices(&mut matcher, "skill:review", "rev"),
+            highlight_indices("skill:review", "rev"),
             Some(vec![6, 7, 8])
         );
-        assert!(highlight_indices(&mut matcher, "skill:review", "zzz").is_none());
+        assert!(highlight_indices("skill:review", "zzz").is_none());
     }
 
     #[test]
     fn empty_kind_queries_do_not_highlight() {
         let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
         menu.sync_query("sk");
-        assert!(menu.session.as_ref().unwrap().matches[0].indices.is_empty());
+        assert!(
+            menu.session.as_ref().unwrap().matches[0]
+                .matching
+                .indices
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1300,7 +1236,7 @@ mod tests {
         menu.sync_query("rev");
         let c = menu.session.as_ref().unwrap().matches[0].clone();
         assert_eq!(
-            c.indices,
+            c.matching.indices,
             vec![6, 7, 8],
             "fuzzy query must highlight the scattered chars"
         );
@@ -1344,14 +1280,8 @@ mod tests {
     fn add_file(menu: &mut FileCompletionMenu, path: &str) {
         let session = menu.session.as_mut().unwrap();
         let order = session.file_matches.len();
-        let candidate = match_candidate(
-            &mut session.matcher,
-            CompletionItem::file(path.into()),
-            &session.intent,
-            0,
-            order,
-        )
-        .unwrap();
+        let candidate =
+            match_candidate(CompletionItem::file(path.into()), &session.intent, 0, order).unwrap();
         session.file_matches.push(candidate);
         rebuild_combined(session);
     }
@@ -1387,18 +1317,20 @@ mod tests {
         menu.sync_query("tag");
         menu.session.as_mut().unwrap().file_matches.push(Candidate {
             item: CompletionItem::file("weak_match".into()),
-            indices: Vec::new(),
-            ranking: MatchRanking {
-                quality: 3,
-                boundary: 1,
-                start: 0,
-                gaps: 0,
-                span: 0,
-                suffix: 0,
-                score: 0,
-                source: 0,
-                order: 0,
+            matching: CompletionMatch {
+                indices: Vec::new(),
+                ranking: CompletionRanking {
+                    quality_rank: 3,
+                    boundary_rank: 1,
+                    start_index: 0,
+                    gap_count: 0,
+                    span_length: 0,
+                    unmatched_suffix: 0,
+                    fuzzy_score: 0,
+                },
             },
+            source_rank: 0,
+            source_order: 0,
         });
         rebuild_combined(menu.session.as_mut().unwrap());
         assert_eq!(labels(&menu), vec!["tagged", "weak_match"]);
@@ -1422,7 +1354,7 @@ mod tests {
         menu.sync_query("sk:tes");
         let session = menu.session.as_ref().unwrap();
         assert_eq!(labels(&menu), vec!["skill:testing"]);
-        assert_eq!(session.matches[0].indices, vec![6, 7, 8]);
+        assert_eq!(session.matches[0].matching.indices, vec![6, 7, 8]);
     }
 
     #[test]
@@ -1485,7 +1417,6 @@ mod tests {
         let session = menu.session.as_mut().unwrap();
         session.query = "東".into();
         session.ref_matches = fuzzy_match(
-            &mut session.matcher,
             &intent,
             session
                 .ref_items
@@ -1497,7 +1428,7 @@ mod tests {
         rebuild_combined(session);
         assert_eq!(session.ref_matches.len(), 1);
         let candidate = &menu.session.as_ref().unwrap().matches[0];
-        assert_eq!(candidate.indices, vec![0]);
+        assert_eq!(candidate.matching.indices, vec![0]);
         assert_eq!(candidate.item.label, "東京");
     }
 
@@ -1648,7 +1579,7 @@ mod tests {
             .iter()
             .find(|c| c.item.label == "Cargo.lock")
             .expect("Cargo.lock matches the Cargo query");
-        assert_eq!(c.indices, vec![0, 1, 2, 3, 4]);
+        assert_eq!(c.matching.indices, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
