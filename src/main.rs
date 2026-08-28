@@ -13,7 +13,8 @@ mod command_attachments {
 
     use color_eyre::Result;
     use color_eyre::eyre::eyre;
-    use maki_commands::CommandAttachment;
+    use maki_agent::{AgentInput, AgentMode, McpPromptRef};
+    use maki_commands::{AgentTurn, CommandAttachment};
     use maki_providers::{ImageMediaType, ImageSource};
 
     pub(crate) fn from_images(images: &[ImageSource]) -> Arc<[CommandAttachment]> {
@@ -41,6 +42,33 @@ mod command_attachments {
                 Ok(ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect()
+    }
+
+    pub(crate) fn agent_input(
+        turn: AgentTurn,
+        mode: AgentMode,
+        fast: bool,
+        workflow: bool,
+    ) -> Result<AgentInput> {
+        Ok(AgentInput {
+            message: turn.content.text.to_string(),
+            mode,
+            images: into_images(&turn.content.attachments)?,
+            preamble: Vec::new(),
+            thinking: Default::default(),
+            fast,
+            workflow,
+            prompt: turn.prompt.map(|prompt| {
+                Box::new(McpPromptRef {
+                    qualified_name: prompt.qualified_name.to_string(),
+                    arguments: prompt
+                        .arguments
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                })
+            }),
+        })
     }
 }
 

@@ -21,7 +21,7 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, ImageSource,
-    McpPromptRef, ModeRegistry, PermissionsConfig,
+    ModeRegistry, PermissionsConfig,
 };
 use maki_commands::{
     BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome,
@@ -188,31 +188,6 @@ impl CommandHost for PrintCommandHost {
     }
 }
 
-fn agent_input_from_turn(
-    turn: maki_commands::AgentTurn,
-    literal: &AgentInput,
-) -> Result<AgentInput> {
-    Ok(AgentInput {
-        message: turn.content.text.to_string(),
-        mode: literal.mode.clone(),
-        images: command_attachments::into_images(&turn.content.attachments)?,
-        preamble: Vec::new(),
-        thinking: Default::default(),
-        fast: literal.fast,
-        workflow: literal.workflow,
-        prompt: turn.prompt.map(|prompt| {
-            Box::new(McpPromptRef {
-                qualified_name: prompt.qualified_name.to_string(),
-                arguments: prompt
-                    .arguments
-                    .iter()
-                    .map(|(key, value)| (key.to_string(), value.to_string()))
-                    .collect(),
-            })
-        }),
-    })
-}
-
 fn drive_print(
     registry: &CommandRegistry,
     target: &maki_commands::TargetHandle,
@@ -226,7 +201,12 @@ fn drive_print(
     };
     let input = match smol::block_on(registry.dispatch_input(target, content)) {
         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-            agent_input_from_turn(turn, &literal)?
+            command_attachments::agent_input(
+                turn,
+                literal.mode.clone(),
+                literal.fast,
+                literal.workflow,
+            )?
         }
         InputDispatch::Dispatched(CommandOutcome::Completed) => return Ok(()),
         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => return Err(error.into()),
@@ -317,8 +297,6 @@ pub fn run(
             excluded_tools: vec![QUESTION_TOOL_NAME],
             mcp_handle,
             initial_wd: cwd,
-            fast,
-            workflow,
             model_policy,
             system_prompt_override,
             append_system_prompt,

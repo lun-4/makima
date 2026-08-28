@@ -24,8 +24,8 @@ use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, McpPromptRef,
-    PermissionsConfig, ToolOutput,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
+    ToolOutput,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost,
@@ -858,8 +858,12 @@ pub fn run(params: SdkParams) -> Result<()> {
                     };
                     match sdk_commands.dispatch_input(&prompt, &images) {
                         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-                            let input =
-                                agent_input_from_turn(turn, mode.agent_mode(&cwd), fast, workflow)?;
+                            let input = command_attachments::agent_input(
+                                turn,
+                                mode.agent_mode(&cwd),
+                                fast,
+                                workflow,
+                            )?;
                             if handle.input_tx.send(input).is_err() {
                                 break;
                             }
@@ -1159,33 +1163,6 @@ fn content_text(content: &Value) -> Option<String> {
         ),
         _ => None,
     }
-}
-
-fn agent_input_from_turn(
-    turn: AgentTurn,
-    mode: AgentMode,
-    fast: bool,
-    workflow: bool,
-) -> Result<AgentInput> {
-    Ok(AgentInput {
-        message: turn.content.text.to_string(),
-        mode,
-        images: command_attachments::into_images(&turn.content.attachments)?,
-        preamble: Vec::new(),
-        thinking: Default::default(),
-        fast,
-        workflow,
-        prompt: turn.prompt.map(|prompt| {
-            Box::new(McpPromptRef {
-                qualified_name: prompt.qualified_name.to_string(),
-                arguments: prompt
-                    .arguments
-                    .iter()
-                    .map(|(key, value)| (key.to_string(), value.to_string()))
-                    .collect(),
-            })
-        }),
-    })
 }
 
 // Claude Code stream-json block shape:
@@ -1811,7 +1788,7 @@ mod tests {
         else {
             panic!("attachment-aware command did not return an agent turn");
         };
-        let input = agent_input_from_turn(turn, AgentMode::Build, false, false).unwrap();
+        let input = command_attachments::agent_input(turn, AgentMode::Build, false, false).unwrap();
         assert_eq!(input.message, "inspected");
         assert_eq!(input.images.len(), 1);
         assert_eq!(
