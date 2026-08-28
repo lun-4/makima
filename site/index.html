@@ -258,16 +258,9 @@
     /* ── HERO CARDS ── */
     .hero-cards {
       position: relative;
-      width: clamp(7.25rem, 10.5vw, 9.75rem);
+      width: clamp(9rem, 13vw, 13rem);
       aspect-ratio: 5 / 7;
       justify-self: center;
-    }
-    .hero-cards::before {
-      content: '';
-      position: absolute;
-      inset: -20% -140%;
-      background: radial-gradient(ellipse at 50% 60%, rgb(255 69 69 / 0.07), transparent 62%);
-      pointer-events: none;
     }
     .card {
       --r: var(--r0, 0deg);
@@ -276,86 +269,61 @@
       color: var(--c, var(--rose));
       transform: rotate(var(--r));
       transform-origin: 50% 148%;
-      transition: opacity 0.55s cubic-bezier(0.16, 1, 0.3, 1), translate 0.7s cubic-bezier(0.16, 1, 0.3, 1), transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), translate 0.6s cubic-bezier(0.16, 1, 0.3, 1), transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s cubic-bezier(0.16, 1, 0.3, 1);
     }
     .card-float {
       position: absolute;
       inset: 0;
-      border-radius: 14px;
-      background: linear-gradient(165deg, var(--surface-2), var(--surface) 62%);
-      border: 1px solid var(--border-2);
-      box-shadow: 0 16px 34px rgb(0 0 0 / 0.5);
-      animation: cardFloat 7.5s ease-in-out infinite;
+      background: var(--surface-2);
+      border: 1.5px solid color-mix(in srgb, var(--c, var(--rose)) 45%, transparent);
+      box-shadow: 0.5rem 0.5rem 0 color-mix(in srgb, var(--c, var(--rose)) 26%, #000);
     }
-    .card:nth-of-type(2) .card-float { animation-duration: 8.5s; animation-delay: -3.1s; }
-    .card:nth-of-type(3) .card-float { animation-duration: 7s; animation-delay: -5.6s; }
-    .card-float::before {
-      content: '';
-      position: absolute;
-      inset: 6px;
-      border-radius: 9px;
-      border: 1px solid color-mix(in srgb, var(--c, var(--rose)) 22%, transparent);
-      transition: border-color 0.3s ease;
-    }
-    .card-pulse .card-float::after {
-      content: '';
-      position: absolute;
-      inset: -1px;
-      border-radius: 15px;
-      box-shadow: 0 0 44px color-mix(in srgb, var(--c, var(--accent)) 20%, transparent);
-      animation: cardPulse 3.6s ease-in-out infinite;
-      pointer-events: none;
-    }
+    .card-lead .card-float { border-color: var(--c, var(--accent)); }
     .card-corner {
       position: absolute;
-      top: 10px;
-      left: 11px;
+      top: 12px;
+      left: 14px;
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 3px;
+      gap: 4px;
       font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
+      font-size: 1rem;
       font-weight: 800;
       line-height: 1;
       letter-spacing: -0.04em;
       z-index: 1;
     }
-    .card-corner svg { width: 8px; height: 8px; opacity: 0.85; }
+    .card-corner svg { width: 9px; height: 9px; stroke: currentColor; stroke-width: 14; stroke-linejoin: miter; }
     .card-corner.br {
       top: auto;
       left: auto;
-      bottom: 10px;
-      right: 11px;
+      bottom: 12px;
+      right: 14px;
       transform: rotate(180deg);
     }
     .card-sigil {
       position: absolute;
       top: 53%;
       left: 50%;
-      width: 64%;
+      width: 70%;
       aspect-ratio: 1;
       translate: -50% -50%;
     }
-    .card-sigil > svg { position: absolute; inset: 0; width: 100%; height: 100%; transition: filter 0.3s ease; }
+    .card-sigil > svg { position: absolute; inset: 0; width: 100%; height: 100%; stroke: currentColor; stroke-width: 4; stroke-linejoin: miter; }
     .hero-anim .hero-cards .card { opacity: 0; translate: 0 3.5rem; }
     .hero-anim .hero-cards .card.dealt { opacity: 1; translate: 0 0; }
-    .hero-cards:hover .card:nth-of-type(1) { --r: calc(var(--r0) - 5deg); }
-    .hero-cards:hover .card:nth-of-type(3) { --r: calc(var(--r0) + 5deg); }
-    .card:hover { transform: rotate(var(--r)) translateY(-0.9rem); z-index: 9; }
-    .card:hover .card-float { border-color: color-mix(in srgb, var(--c, var(--rose)) 60%, transparent); }
-    .card:hover .card-float::before { border-color: color-mix(in srgb, var(--c, var(--rose)) 45%, transparent); }
-    .card:hover .card-sigil > svg { filter: drop-shadow(0 0 7px color-mix(in srgb, var(--c, var(--rose)) 70%, transparent)); }
-    .hero-cards:hover .card:not(:hover) { opacity: 0.7; }
-
-    @keyframes cardFloat {
-      0%, 100% { translate: 0 0; }
-      50% { translate: 0 -0.45rem; }
+    .hero-cards:hover .card-1 { --r: -29deg; translate: -0.6rem 0; }
+    .hero-cards:hover .card-3 { --r: 17deg; translate: 0.6rem 0; }
+    .card:hover {
+      transform: rotate(var(--r)) translateY(-1.2rem);
+      z-index: 9;
     }
-    @keyframes cardPulse {
-      0%, 100% { opacity: 0.3; }
-      50% { opacity: 1; }
+    .card:hover .card-float {
+      border-color: var(--c, var(--rose));
+      box-shadow: 0.9rem 0.9rem 0 color-mix(in srgb, var(--c, var(--rose)) 40%, #000);
     }
+    .hero-cards:hover .card:not(:hover) { opacity: 0.72; }
 
     /* ── MAIN ── */
     .content {
@@ -783,7 +751,6 @@
       }
       .hero-anim .hero-intro > * { opacity: 1; transform: none; }
       .hero-anim .hero-cards .card { opacity: 1; translate: 0 0; }
-      .card-float, .card-pulse .card-float::after { animation: none; }
       .reveal { opacity: 1; transform: none; }
       .pitch-item { opacity: 1; transform: none; }
       .provider-chip { opacity: 1; transform: none; }
@@ -800,7 +767,7 @@
       .adds-grid { grid-template-columns: 1fr; }
       .index-split { grid-template-columns: 1fr; }
       .index-divider { width: auto; height: 1px; }
-      .hero-cards { margin-top: 1rem; margin-bottom: 2rem; }
+      .hero-cards { width: 8.5rem; margin-top: 1rem; margin-bottom: 2rem; }
       .exec-body { grid-template-columns: 1fr; }
       .exec-divider { width: auto; height: 1px; }
       .exec-duo { grid-template-columns: 1fr; }
@@ -846,35 +813,35 @@
     <div class="hero-cards" aria-hidden="true">
       <svg width="0" height="0" style="position:absolute" focusable="false">
         <symbol id="card-pentagram" viewBox="0 0 100 100">
-          <circle cx="50" cy="50" r="45" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="3"/>
-          <path d="M50 86 L28.84 20.88 L84.24 61.12 L15.76 61.12 L71.16 20.88 Z" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"/>
+          <circle cx="50" cy="50" r="45" fill="currentColor" fill-opacity="0.07"/>
+          <path d="M50 86 L28.84 20.88 L84.24 61.12 L15.76 61.12 L71.16 20.88 Z" fill="none"/>
         </symbol>
         <symbol id="card-pip" viewBox="0 0 100 100">
-          <path d="M50 86 L28.84 20.88 L84.24 61.12 L15.76 61.12 L71.16 20.88 Z" fill="none" stroke="currentColor" stroke-width="10" stroke-linejoin="round"/>
+          <path d="M50 86 L28.84 20.88 L84.24 61.12 L15.76 61.12 L71.16 20.88 Z" fill="none"/>
         </symbol>
       </svg>
-      <div class="card" style="--c: var(--rose); --r0: -16deg">
+      <div class="card card-1" style="--c: var(--rose); --r0: -22deg">
         <div class="card-float">
-          <div class="card-corner tl"><span>ma</span><svg><use href="#card-pip"/></svg></div>
-          <div class="card-corner br"><span>ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner tl"><span class="corner-syllable">ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span class="corner-syllable">ma</span><svg><use href="#card-pip"/></svg></div>
           <div class="card-sigil">
             <svg><use href="#card-pentagram"/></svg>
           </div>
         </div>
       </div>
-      <div class="card" style="--c: var(--accent); --r0: -5deg">
+      <div class="card card-2" style="--c: var(--accent); --r0: -8deg">
         <div class="card-float">
-          <div class="card-corner tl"><span>ki</span><svg><use href="#card-pip"/></svg></div>
-          <div class="card-corner br"><span>ki</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner tl"><span class="corner-syllable">ki</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span class="corner-syllable">ki</span><svg><use href="#card-pip"/></svg></div>
           <div class="card-sigil">
             <svg><use href="#card-pentagram"/></svg>
           </div>
         </div>
       </div>
-      <div class="card card-pulse" style="--c: var(--peach); --r0: 6deg">
+      <div class="card card-3 card-lead" style="--c: var(--peach); --r0: 10deg">
         <div class="card-float">
-          <div class="card-corner tl"><span>ma</span><svg><use href="#card-pip"/></svg></div>
-          <div class="card-corner br"><span>ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner tl"><span class="corner-syllable">ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span class="corner-syllable">ma</span><svg><use href="#card-pip"/></svg></div>
           <div class="card-sigil">
             <svg><use href="#card-pentagram"/></svg>
           </div>
