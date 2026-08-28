@@ -65,7 +65,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      background: var(--bg / 0.85);
+      background: color-mix(in srgb, var(--bg) 85%, transparent);
       backdrop-filter: blur(16px);
       -webkit-backdrop-filter: blur(16px);
       border-bottom: 1px solid var(--border);
@@ -171,7 +171,7 @@
     .hero-sub {
       font-size: 1rem;
       color: var(--ink-dim);
-      max-width: 46ch;
+      max-width: min(46ch, 100%);
       margin-bottom: 1.5rem;
     }
     .hero-actions {
@@ -254,6 +254,108 @@
       white-space: nowrap;
     }
     .copy-toast.show { opacity: 1; transform: translateY(-50%) translateX(0); }
+
+    /* ── HERO CARDS ── */
+    .hero-cards {
+      position: relative;
+      width: clamp(7.25rem, 10.5vw, 9.75rem);
+      aspect-ratio: 5 / 7;
+      justify-self: center;
+    }
+    .hero-cards::before {
+      content: '';
+      position: absolute;
+      inset: -20% -140%;
+      background: radial-gradient(ellipse at 50% 60%, rgb(255 69 69 / 0.07), transparent 62%);
+      pointer-events: none;
+    }
+    .card {
+      --r: var(--r0, 0deg);
+      position: absolute;
+      inset: 0;
+      color: var(--c, var(--rose));
+      transform: rotate(var(--r));
+      transform-origin: 50% 148%;
+      transition: opacity 0.55s cubic-bezier(0.16, 1, 0.3, 1), translate 0.7s cubic-bezier(0.16, 1, 0.3, 1), transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .card-float {
+      position: absolute;
+      inset: 0;
+      border-radius: 14px;
+      background: linear-gradient(165deg, var(--surface-2), var(--surface) 62%);
+      border: 1px solid var(--border-2);
+      box-shadow: 0 16px 34px rgb(0 0 0 / 0.5);
+      animation: cardFloat 7.5s ease-in-out infinite;
+    }
+    .card:nth-of-type(2) .card-float { animation-duration: 8.5s; animation-delay: -3.1s; }
+    .card:nth-of-type(3) .card-float { animation-duration: 7s; animation-delay: -5.6s; }
+    .card-float::before {
+      content: '';
+      position: absolute;
+      inset: 6px;
+      border-radius: 9px;
+      border: 1px solid color-mix(in srgb, var(--c, var(--rose)) 22%, transparent);
+      transition: border-color 0.3s ease;
+    }
+    .card-pulse .card-float::after {
+      content: '';
+      position: absolute;
+      inset: -1px;
+      border-radius: 15px;
+      box-shadow: 0 0 44px color-mix(in srgb, var(--c, var(--accent)) 20%, transparent);
+      animation: cardPulse 3.6s ease-in-out infinite;
+      pointer-events: none;
+    }
+    .card-corner {
+      position: absolute;
+      top: 10px;
+      left: 11px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: -0.04em;
+      z-index: 1;
+    }
+    .card-corner svg { width: 8px; height: 8px; opacity: 0.85; }
+    .card-corner.br {
+      top: auto;
+      left: auto;
+      bottom: 10px;
+      right: 11px;
+      transform: rotate(180deg);
+    }
+    .card-sigil {
+      position: absolute;
+      top: 53%;
+      left: 50%;
+      width: 64%;
+      aspect-ratio: 1;
+      translate: -50% -50%;
+    }
+    .card-sigil > svg { position: absolute; inset: 0; width: 100%; height: 100%; transition: filter 0.3s ease; }
+    .hero-anim .hero-cards .card { opacity: 0; translate: 0 3.5rem; }
+    .hero-anim .hero-cards .card.dealt { opacity: 1; translate: 0 0; }
+    .hero-cards:hover .card:nth-of-type(1) { --r: calc(var(--r0) - 5deg); }
+    .hero-cards:hover .card:nth-of-type(3) { --r: calc(var(--r0) + 5deg); }
+    .card:hover { transform: rotate(var(--r)) translateY(-0.9rem); z-index: 9; }
+    .card:hover .card-float { border-color: color-mix(in srgb, var(--c, var(--rose)) 60%, transparent); }
+    .card:hover .card-float::before { border-color: color-mix(in srgb, var(--c, var(--rose)) 45%, transparent); }
+    .card:hover .card-sigil > svg { filter: drop-shadow(0 0 7px color-mix(in srgb, var(--c, var(--rose)) 70%, transparent)); }
+    .hero-cards:hover .card:not(:hover) { opacity: 0.7; }
+
+    @keyframes cardFloat {
+      0%, 100% { translate: 0 0; }
+      50% { translate: 0 -0.45rem; }
+    }
+    @keyframes cardPulse {
+      0%, 100% { opacity: 0.3; }
+      50% { opacity: 1; }
+    }
 
     /* ── MAIN ── */
     .content {
@@ -680,6 +782,8 @@
         scroll-behavior: auto !important;
       }
       .hero-anim .hero-intro > * { opacity: 1; transform: none; }
+      .hero-anim .hero-cards .card { opacity: 1; translate: 0 0; }
+      .card-float, .card-pulse .card-float::after { animation: none; }
       .reveal { opacity: 1; transform: none; }
       .pitch-item { opacity: 1; transform: none; }
       .provider-chip { opacity: 1; transform: none; }
@@ -689,13 +793,14 @@
     @media (max-width: 768px) {
       .nav-right a:not(.nav-cta):not([href="/docs/"]) { display: none; }
       .hero { padding-inline: 1rem; }
-      .hero-grid { grid-template-columns: 1fr; text-align: center; }
+      .hero-grid { grid-template-columns: minmax(0, 1fr); text-align: center; }
       .hero-intro { display: flex; flex-direction: column; align-items: center; }
       .hero-actions { justify-content: center; }
       .pitch { grid-template-columns: 1fr; }
       .adds-grid { grid-template-columns: 1fr; }
       .index-split { grid-template-columns: 1fr; }
       .index-divider { width: auto; height: 1px; }
+      .hero-cards { margin-top: 1rem; margin-bottom: 2rem; }
       .exec-body { grid-template-columns: 1fr; }
       .exec-divider { width: auto; height: 1px; }
       .exec-duo { grid-template-columns: 1fr; }
@@ -736,6 +841,44 @@
       <div class="install-line">
         <code onclick="navigator.clipboard.writeText('curl -fsSL https://makima.ln4.net/install.sh | sh');showCopyToast(this)"><span class="sh-cmd">curl</span> <span class="sh-flag">-fsSL</span> <span class="sh-url">https://makima.ln4.net/install.sh</span> <span class="sh-pipe">|</span> <span class="sh-cmd">sh</span></code>
         <span class="copy-toast">copied!</span>
+      </div>
+    </div>
+    <div class="hero-cards" aria-hidden="true">
+      <svg width="0" height="0" style="position:absolute" focusable="false">
+        <symbol id="card-pentagram" viewBox="0 0 100 100">
+          <circle cx="50" cy="50" r="45" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="3"/>
+          <path d="M50 86 L28.84 20.88 L84.24 61.12 L15.76 61.12 L71.16 20.88 Z" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"/>
+        </symbol>
+        <symbol id="card-pip" viewBox="0 0 100 100">
+          <path d="M50 86 L28.84 20.88 L84.24 61.12 L15.76 61.12 L71.16 20.88 Z" fill="none" stroke="currentColor" stroke-width="10" stroke-linejoin="round"/>
+        </symbol>
+      </svg>
+      <div class="card" style="--c: var(--rose); --r0: -16deg">
+        <div class="card-float">
+          <div class="card-corner tl"><span>ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span>ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-sigil">
+            <svg><use href="#card-pentagram"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="--c: var(--accent); --r0: -5deg">
+        <div class="card-float">
+          <div class="card-corner tl"><span>ki</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span>ki</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-sigil">
+            <svg><use href="#card-pentagram"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="card card-pulse" style="--c: var(--peach); --r0: 6deg">
+        <div class="card-float">
+          <div class="card-corner tl"><span>ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span>ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-sigil">
+            <svg><use href="#card-pentagram"/></svg>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -1098,6 +1241,9 @@ imports = <span class="fn">set</span>()
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       document.querySelector('.hero-intro').classList.add('entered');
+      document.querySelectorAll('.hero-cards .card').forEach((card, i) => {
+        setTimeout(() => card.classList.add('dealt'), 420 + i * 150);
+      });
     });
   });
 
