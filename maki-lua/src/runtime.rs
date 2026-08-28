@@ -326,6 +326,11 @@ pub(crate) struct CommandArgumentLifecycleRequest {
     pub(crate) event: CommandArgumentLifecycle,
     pub(crate) item: Option<crate::api::util::command::CommandArgumentItem>,
     pub(crate) cancel: CancelToken,
+    pub(crate) _lifecycle_owner: Option<LifecycleOwner>,
+}
+
+pub(crate) struct LifecycleOwner {
+    _trigger: maki_agent::CancelTrigger,
 }
 
 pub(crate) struct SplashFrameRequest {
@@ -1586,7 +1591,7 @@ impl LuaCommandCompletion {
         context: &CompletionContext,
         trigger: maki_agent::CancelTrigger,
         terminal: bool,
-    ) -> CommandArgumentContext {
+    ) -> (CommandArgumentContext, Option<maki_agent::CancelTrigger>) {
         let mut sessions = self
             .sessions
             .lock()
@@ -1595,8 +1600,9 @@ impl LuaCommandCompletion {
             .get(&context.session_id)
             .map(|session| session.id)
             .unwrap_or_else(|| self.next_session_id.fetch_add(1, Ordering::Relaxed));
-        if terminal {
+        let request_trigger = if terminal {
             sessions.remove(&context.session_id);
+            Some(trigger)
         } else {
             sessions.insert(
                 context.session_id,
@@ -1605,8 +1611,9 @@ impl LuaCommandCompletion {
                     _trigger: trigger,
                 },
             );
-        }
-        CommandArgumentContext {
+            None
+        };
+        let context = CommandArgumentContext {
             command: Arc::clone(&context.invoked_name),
             plugin: Arc::clone(&self.plugin),
             args: context.arguments.to_string(),
@@ -1615,7 +1622,8 @@ impl LuaCommandCompletion {
             mode: context.mode.to_string(),
             session: id,
             generation: 0,
-        }
+        };
+        (context, request_trigger)
     }
 }
 
@@ -1626,7 +1634,7 @@ impl CommandCompletion for LuaCommandCompletion {
         cancellation: maki_commands::CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
         let (trigger, cancel) = CancelToken::new();
-        let context = self.context(&context, trigger, false);
+        let (context, _) = self.context(&context, trigger, false);
         let (reply, rx) = flume::bounded(1);
         if !self.command_arguments.submit(CommandArgumentRequest {
             context,
@@ -1663,7 +1671,7 @@ impl CommandCompletion for LuaCommandCompletion {
             event,
             CompletionLifecycleEvent::Accept(_) | CompletionLifecycleEvent::Cancel
         );
-        let context = self.context(context, trigger, terminal);
+        let (context, trigger) = self.context(context, trigger, terminal);
         let (event, item) = match event {
             CompletionLifecycleEvent::Highlight(item) => (
                 CommandArgumentLifecycle::Highlight,
@@ -1681,6 +1689,7 @@ impl CommandCompletion for LuaCommandCompletion {
                 event,
                 item,
                 cancel,
+                _lifecycle_owner: trigger.map(|trigger| LifecycleOwner { _trigger: trigger }),
             });
         Ok(())
     }
@@ -3819,6 +3828,7 @@ mod tests {
             event,
             item: None,
             cancel: CancelToken::none(),
+            _lifecycle_owner: None,
         }
     }
 

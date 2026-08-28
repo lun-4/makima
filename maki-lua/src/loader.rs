@@ -814,6 +814,7 @@ impl EventHandle {
                 event,
                 item,
                 cancel,
+                _lifecycle_owner: None,
             });
     }
 

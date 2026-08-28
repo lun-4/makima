@@ -2821,6 +2821,46 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
 }
 
 #[test]
+fn dropping_command_completion_session_runs_lua_cancel_hook() {
+    const CANCEL_FLASH: &str = "cancelled:/deploy";
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "completion_drop_plugin",
+        r#"
+        maki.api.register_command({
+            name = "/deploy",
+            tui_only = false,
+            nargs = 1,
+            completion = {
+                get_items = function() return {{ label = "stage", insertion = "staging" }} end,
+                on_cancel = function(ctx) maki.ui.flash("cancelled:" .. ctx.command) end,
+            },
+            handler = function() end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let command = registry.resolve_for(&target, "/deploy").unwrap();
+    let session = registry.open_completion(command, target.id()).unwrap();
+    let result =
+        smol::block_on(session.complete(Arc::from("sta"), Arc::from("sta"), 0, Arc::from("build")));
+    assert!(matches!(result, maki_commands::CompletionResult::Items(_)));
+    let flashes = host.ui_action_rx();
+
+    drop(session);
+
+    assert!(matches!(
+        flashes.recv_timeout(Duration::from_secs(5)).unwrap(),
+        maki_lua::UiAction::Flash(message) if message == CANCEL_FLASH
+    ));
+}
+
+#[test]
 fn command_completion_timeout_returns_empty_and_keeps_host_live() {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(

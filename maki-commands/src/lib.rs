@@ -567,6 +567,10 @@ struct CompletionSessionCore {
     state: Mutex<CompletionSessionState>,
 }
 
+struct CompletionSessionOwner {
+    core: Arc<CompletionSessionCore>,
+}
+
 struct CompletionSessionState {
     command: ResolvedCommand,
     provider: Arc<dyn CommandCompletion>,
@@ -834,7 +838,7 @@ impl CommandRegistry {
         Ok(CompletionSession {
             command,
             target_id,
-            core,
+            owner: Arc::new(CompletionSessionOwner { core }),
         })
     }
 
@@ -1695,12 +1699,12 @@ impl CancellationToken {
 pub struct CompletionSession {
     command: ResolvedCommand,
     target_id: InvocationTargetId,
-    core: Arc<CompletionSessionCore>,
+    owner: Arc<CompletionSessionOwner>,
 }
 
 impl CompletionSession {
     pub fn id(&self) -> CompletionSessionId {
-        self.core.id
+        self.owner.core.id
     }
     pub fn command(&self) -> &ResolvedCommand {
         &self.command
@@ -1716,7 +1720,7 @@ impl CompletionSession {
         argument_index: usize,
         mode: Arc<str>,
     ) -> CommandFuture<CompletionResult> {
-        let core = Arc::clone(&self.core);
+        let core = Arc::clone(&self.owner.core);
         Box::pin(async move {
             let (provider, context, cancellation, request_id) = {
                 let mut state = core.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1784,11 +1788,12 @@ impl CompletionSession {
     pub fn accept(&self, candidate: CompletionCandidate) -> Result<(), CompletionError> {
         let callback = {
             let mut state = self
+                .owner
                 .core
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if state.closed || candidate.session_id != self.core.id {
+            if state.closed || candidate.session_id != self.owner.core.id {
                 return Err(CompletionError::StaleSession);
             }
             let current = state
@@ -1812,6 +1817,7 @@ impl CompletionSession {
 
     pub fn cancel(&self) -> Result<(), CompletionError> {
         let callback = self
+            .owner
             .core
             .state
             .lock()
@@ -1827,11 +1833,12 @@ impl CompletionSession {
     ) -> Result<(), CompletionError> {
         let callback = {
             let state = self
+                .owner
                 .core
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if state.closed || candidate.session_id != self.core.id {
+            if state.closed || candidate.session_id != self.owner.core.id {
                 return Err(CompletionError::StaleSession);
             }
             let current = state
@@ -1849,6 +1856,20 @@ impl CompletionSession {
             }
         };
         callback.call()
+    }
+}
+
+impl Drop for CompletionSessionOwner {
+    fn drop(&mut self) {
+        let callback = self
+            .core
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .close();
+        if let Some(callback) = callback {
+            let _ = callback.call();
+        }
     }
 }
 
@@ -2402,6 +2423,7 @@ mod tests {
         let session =
             completion_session(&registry, &producer, Arc::new(CompletionProbe::default()));
         let session_lock = session
+            .owner
             .core
             .state
             .lock()
@@ -2540,6 +2562,63 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()),
             [CompletionLifecycleEvent::Cancel]
+        );
+    }
+
+    #[test]
+    fn final_session_owner_drop_cancels_once() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let probe = Arc::new(CompletionProbe::default());
+        let session = completion_session(&registry, &producer, probe.clone());
+        let clone = session.clone();
+        complete_once(&session);
+
+        drop(session);
+        assert!(
+            probe
+                .events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        drop(clone);
+
+        assert_eq!(
+            *probe
+                .events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec![CompletionLifecycleEvent::Cancel]
+        );
+    }
+
+    #[test]
+    fn final_owner_drop_cancels_in_flight_completion() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let completion = Arc::new(BlockingCompletion {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            events: Mutex::new(Vec::new()),
+        });
+        let session = completion_session(&registry, &producer, completion.clone());
+        let future = session.complete(Arc::from(""), Arc::from(""), 0, Arc::from("insert"));
+        let worker = thread::spawn(move || futures_lite::future::block_on(future));
+        entered_rx.recv_timeout(LOCK_RELEASE_TIMEOUT).unwrap();
+
+        drop(session);
+        release_tx.send(()).unwrap();
+
+        assert_eq!(worker.join().unwrap(), CompletionResult::Cancelled);
+        assert_eq!(
+            *completion
+                .events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec![CompletionLifecycleEvent::Cancel]
         );
     }
 
