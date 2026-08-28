@@ -108,7 +108,7 @@ case("builtin_plugin_dev_skill_loads", function()
   local builtin = require("plugin_dev")
   eq(builtin.name, "maki-plugin-dev")
   assert(#builtin.description > 0, "description should not be empty")
-  assert(builtin.content:find("# Writing maki plugins", 1, true), "content should contain the authoring guide")
+  assert(builtin.content:find("# Writing makima plugins", 1, true), "content should contain the authoring guide")
   assert(#builtin.reference_placeholder > 0, "reference_placeholder should not be empty")
   assert(
     builtin.content:find(builtin.reference_placeholder, 1, true),

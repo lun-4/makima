@@ -19,7 +19,7 @@ pub enum MakiIdParseError {
     InvalidByteLen(usize),
 }
 
-/// The canonical unique id for anything in maki (sessions, and message
+/// The canonical unique id for anything in makima (sessions, and message
 /// nodes once history is a tree): time-ordered, base58-encoded, backed by a
 /// UUIDv7.
 ///
@@ -30,7 +30,7 @@ pub enum MakiIdParseError {
 /// Note: base58 encoding is variable-length (21-22 chars for 16 bytes).
 /// New v7 ids encode to a stable 21 chars, so lexical sort orders them
 /// chronologically; legacy v4 ids (no embedded timestamp) mix 21-22 chars
-/// and don't sort by time regardless. Nothing in maki sorts by the string
+/// and don't sort by time regardless. Nothing in makima sorts by the string
 /// form today; storage uses the embedded timestamp directly. See issue
 /// #264 for future tree-ordered history work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

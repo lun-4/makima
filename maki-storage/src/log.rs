@@ -120,7 +120,7 @@ impl RotatingFileWriter {
                 if src.exists() {
                     let dst = file_path(&self.dir, i + 1);
                     if let Err(e) = fs::rename(&src, &dst) {
-                        eprintln!("maki: log rotate rename {src:?} -> {dst:?}: {e}");
+                        eprintln!("makima: log rotate rename {src:?} -> {dst:?}: {e}");
                     }
                 }
             }
@@ -141,7 +141,7 @@ impl Write for RotatingFileWriter {
         if self.written >= self.max_bytes
             && let Err(e) = self.rotate()
         {
-            eprintln!("maki: log rotation failed: {e}");
+            eprintln!("makima: log rotation failed: {e}");
         }
         let n = self.file.write(buf)?;
         self.written += n as u64;

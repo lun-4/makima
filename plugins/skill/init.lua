@@ -9,7 +9,7 @@ local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 
 local PROJECT_SKILL_DIRS = {
-  ".maki/skills",
+  ".makima/skills",
   ".claude/skills",
   ".opencode/skills",
   ".agents/skills",

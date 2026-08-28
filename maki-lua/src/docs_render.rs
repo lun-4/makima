@@ -59,23 +59,23 @@ The rules:
         .replace("{KEYS}", &keys.map(|k| format!("{k} = true\n")).concat())
 }
 
-const GUIDE: &str = r#"# Writing maki plugins
+const GUIDE: &str = r#"# Writing makima plugins
 
-Maki plugins are plain Lua files (Luau) that run inside maki. A plugin can
+Makima plugins are plain Lua files (Luau) that run inside makima. A plugin can
 register tools the LLM calls, slash commands, keymaps, prompt hints, and
 custom UI. Everything lives under the global `maki` table. The full API
 reference is at the end of this document.
 
 ## Where plugin code goes
 
-Plugins live in the maki config dir. There are two of them, same layout:
+Plugins live in the makima config dir. There are two of them, same layout:
 
 - `~/.config/makima/` - global, every project (if `~/.makima/` exists, makima reads
   that one instead)
 - `<project>/.makima/` - this project only
 
 ```
-init.lua        the only file maki runs; require()s plugins, calls maki.setup()
+init.lua        the only file makima runs; require()s plugins, calls maki.setup()
 lua/<name>.lua  plugin modules, loaded by require("<name>")
 plugin.toml     permission grants for every Lua file in the dir
 ```
@@ -141,7 +141,7 @@ the interpreter, with full debug info.
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
-- Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
+- Reusable helpers ship with makima; see "Shared helper modules" in the API reference.
 
 ## A complete real example
 
@@ -159,9 +159,9 @@ so it opens with `register_options`, which your own plugin skips:
 const AGENT_NOTES: &str = r#"## Notes for the agent
 
 - Never write a plugin into maki's own source tree. The `plugins/` directory
-  of the maki repo holds the plugins that ship with maki, compiled into the
-  binary, so a file dropped there does nothing until maki is rebuilt. That
-  holds even when the project you have open is a maki checkout.
+  of the makima repo holds the plugins that ship with makima, compiled into the
+  binary, so a file dropped there does nothing until makima is rebuilt. That
+  holds even when the project you have open is a makima checkout.
 - Both global config dirs can exist, and `~/.makima/` wins, so look before you
   write.
 - The config dir sits outside the project, but it is an ordinary directory:
@@ -234,7 +234,7 @@ Signatures use Neovim notation: `{path}` is required, `{opts?}` is optional,
 passing a number where a string belongs.
 "#;
 
-const HELPERS_INTRO: &str = "## Shared helper modules\n\nThese ship inside maki; `require` them from any plugin. Small modules are\nshown as full source, larger ones as their public interface.\n\n";
+const HELPERS_INTRO: &str = "## Shared helper modules\n\nThese ship inside makima; `require` them from any plugin. Small modules are\nshown as full source, larger ones as their public interface.\n\n";
 
 const FULL_SOURCE_MAX_BYTES: usize = 1024;
 
