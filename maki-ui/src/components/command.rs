@@ -197,10 +197,12 @@ enum CommandType {
     Lua(usize),
 }
 
+#[derive(Clone)]
 struct CommandItem {
     name: String,
     max_args: usize,
     command_type: CommandType,
+    source_order: usize,
 }
 
 struct Match {
@@ -311,6 +313,7 @@ impl CommandPalette {
                     name: name.to_string(),
                     max_args: cmd.max_args,
                     command_type: CommandType::Builtin(cmd),
+                    source_order: 0,
                 })
         });
         let custom = custom_commands
@@ -320,6 +323,7 @@ impl CommandPalette {
                 name: cmd.display_name(),
                 max_args: if cmd.has_args() { usize::MAX } else { 0 },
                 command_type: CommandType::Custom(i),
+                source_order: 0,
             });
         let prompts = mcp_prompts.iter().enumerate().map(|(i, p)| CommandItem {
             name: format!("/{}", p.display_name),
@@ -329,11 +333,13 @@ impl CommandPalette {
                 usize::MAX
             },
             command_type: CommandType::McpPrompt(i),
+            source_order: 0,
         });
         let lua = lua_commands.iter().enumerate().map(|(i, cmd)| CommandItem {
             name: cmd.name.to_string(),
             max_args: cmd.max_args,
             command_type: CommandType::Lua(i),
+            source_order: 0,
         });
         builtins.chain(custom).chain(prompts).chain(lua)
     }
@@ -354,12 +360,15 @@ impl CommandPalette {
                 .chain(mcp_prompts.iter().map(|p| format!("/{}", p.display_name))),
         );
 
-        for item in Self::items(custom_commands, mcp_prompts, lua_commands) {
+        for (source_order, mut item) in
+            Self::items(custom_commands, mcp_prompts, lua_commands).enumerate()
+        {
             if matches!(item.command_type, CommandType::Builtin(_))
                 && overridden.contains(&item.name)
             {
                 continue;
             }
+            item.source_order = source_order;
             injector.push(item, |item, cols| {
                 cols[0] = Utf32String::from(item.name.as_str());
             });
@@ -802,9 +811,8 @@ impl CommandPalette {
                         .map(|p| format!("/{}", p.display_name)),
                 ),
         );
-        for (source_order, cmd_item) in
-            Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands).enumerate()
-        {
+        let snapshot = self.nucleo.snapshot();
+        for cmd_item in snapshot.matched_items(..).map(|item| item.data.clone()) {
             if matches!(cmd_item.command_type, CommandType::Builtin(_))
                 && overridden.contains(&cmd_item.name)
             {
@@ -816,7 +824,7 @@ impl CommandPalette {
             let Some(completion) = completion_match(query, &cmd_item.name, options) else {
                 continue;
             };
-            matches.push((source_order, cmd_item, completion));
+            matches.push((cmd_item.source_order, cmd_item, completion));
         }
         matches.sort_by(
             |(left_order, left, left_match), (right_order, right, right_match)| {
@@ -835,8 +843,8 @@ impl CommandPalette {
         self.filtered = matches
             .into_iter()
             .map(|(_, item, completion)| Match {
-                display: item.name,
-                command_type: item.command_type,
+                display: item.name.clone(),
+                command_type: item.command_type.clone(),
                 indices: completion.indices,
             })
             .collect();

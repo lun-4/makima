@@ -250,16 +250,20 @@ impl FileCompletionMenu {
         let Some(s) = &mut self.session else {
             return;
         };
-        s.nucleo
-            .pattern
-            .reparse(0, query, CaseMatching::Smart, Normalization::Smart, false);
+        let retrieval_query = query.to_lowercase();
+        s.nucleo.pattern.reparse(
+            0,
+            &retrieval_query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+            false,
+        );
         let intent = parse_query(query);
-        let normalized_query = query.to_lowercase();
-        if s.query != normalized_query {
+        if s.query != query {
             s.file_matches.clear();
         }
         s.intent = intent;
-        s.query = normalized_query;
+        s.query = query.to_string();
         s.selected = 0;
         s.scroll_offset = 0;
 
@@ -1461,14 +1465,13 @@ mod tests {
         let mut menu = session_with_items(Vec::new());
         let session = menu.session.as_mut().unwrap();
         session.walking = false;
-        menu.sync_query("needle");
-        let session = menu.session.as_mut().unwrap();
         session.nucleo.injector().push((), |_, columns| {
             columns[0] = Utf32String::from("weak_match");
         });
         session.nucleo.injector().push((), |_, columns| {
             columns[0] = Utf32String::from("needle-file");
         });
+        menu.sync_query("needle");
         for _ in 0..100 {
             let _ = menu.tick();
             if !menu.session.as_ref().unwrap().matches.is_empty() {
@@ -1501,7 +1504,6 @@ mod tests {
             columns[0] = Utf32String::from("needle-file");
         });
         session.walking = false;
-        session.nucleo.tick(0);
         menu.sync_query("needle");
         for _ in 0..100 {
             let _ = menu.tick();
@@ -1550,11 +1552,8 @@ mod tests {
 
     #[test]
     fn uppercase_file_query_does_not_panic() {
-        // The ignore_case matcher panics on an uppercase needle (its prefilter
-        // is case-insensitive, the optimal matrix is not), so the session must
-        // store a lowercased query. Backspacing `@Cargo.lock` is the original
-        // crash: query `Cargo` matched `Cargo.lock` case-sensitively, then the
-        // highlight pass ran with the raw uppercase needle.
+        // Nucleo uses a normalized retrieval query, while final matching and
+        // highlighting use the original query.
         let mut menu = session_with_items(Vec::new());
         let s = menu.session.as_mut().unwrap();
         for path in ["Cargo.lock", "justfile", "maki-ui/src/app/mod.rs"] {
@@ -1573,7 +1572,7 @@ mod tests {
             }
         }
         let s = menu.session.as_ref().unwrap();
-        assert_eq!(s.query, "cargo");
+        assert_eq!(s.query, "Cargo");
         let c = s
             .file_matches
             .iter()
@@ -1589,7 +1588,7 @@ mod tests {
         let mut menu = session_with_all();
         menu.sync_query("Model:");
         let s = menu.session.as_ref().unwrap();
-        assert_eq!(s.query, "model:");
+        assert_eq!(s.query, "Model:");
         let labels: Vec<&str> = s.matches.iter().map(|c| c.item.label.as_str()).collect();
         assert_eq!(labels, vec!["model:zai/glm-5", "model:anthropic/claude"]);
     }
