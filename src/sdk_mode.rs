@@ -40,7 +40,7 @@ use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
 use maki_storage::sessions::{SESSIONS_DIR, Session};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
@@ -228,10 +228,32 @@ struct ControlRequestInner {
     tool_use_id: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
+enum InboundMessageType {
+    User,
+    ControlRequest,
+    ControlResponse,
+    ControlCancelRequest,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for InboundMessageType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "user" => Self::User,
+            "control_request" => Self::ControlRequest,
+            "control_response" => Self::ControlResponse,
+            "control_cancel_request" => Self::ControlCancelRequest,
+            _ => Self::Unknown(value),
+        })
+    }
+}
+
+#[derive(Deserialize)]
 struct InboundMessage {
     #[serde(rename = "type")]
-    msg_type: String,
+    msg_type: InboundMessageType,
     #[serde(flatten)]
     payload: Value,
 }
@@ -252,9 +274,31 @@ struct InboundControlRequest {
     request: InboundControlRequestInner,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
+enum InboundControlRequestType {
+    Initialize,
+    Interrupt,
+    SetPermissionMode,
+    SetModel,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for InboundControlRequestType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "initialize" => Self::Initialize,
+            "interrupt" => Self::Interrupt,
+            "set_permission_mode" => Self::SetPermissionMode,
+            "set_model" => Self::SetModel,
+            _ => Self::Unknown(value),
+        })
+    }
+}
+
+#[derive(Deserialize)]
 struct InboundControlRequestInner {
-    subtype: String,
+    subtype: InboundControlRequestType,
     #[serde(flatten)]
     extra: Value,
 }
@@ -798,8 +842,8 @@ pub fn run(params: SdkParams) -> Result<()> {
                 }
             };
 
-            match msg.msg_type.as_str() {
-                "user" => {
+            match msg.msg_type {
+                InboundMessageType::User => {
                     let Some(user) = parse_or_warn::<InboundUser>(msg.payload, "user message")
                     else {
                         continue;
@@ -843,7 +887,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                         }
                     }
                 }
-                "control_request" => {
+                InboundMessageType::ControlRequest => {
                     let Some(cr) =
                         parse_or_warn::<InboundControlRequest>(msg.payload, "control_request")
                     else {
@@ -859,7 +903,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                         &sdk_commands,
                     )?;
                 }
-                "control_response" => {
+                InboundMessageType::ControlResponse => {
                     let Some(cr) =
                         parse_or_warn::<InboundControlResponse>(msg.payload, "control_response")
                     else {
@@ -874,7 +918,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                             .send(decode_permission_response(&data).encode());
                     }
                 }
-                "control_cancel_request" => {
+                InboundMessageType::ControlCancelRequest => {
                     let Some(ccr) = parse_or_warn::<InboundControlCancelRequest>(
                         msg.payload,
                         "control_cancel_request",
@@ -885,7 +929,9 @@ pub fn run(params: SdkParams) -> Result<()> {
                         let _ = handle.answer_tx.send(PermissionAnswer::Deny.encode());
                     }
                 }
-                other => warn!("unknown inbound message type: {other}"),
+                InboundMessageType::Unknown(message_type) => {
+                    warn!("unknown inbound message type: {message_type}")
+                }
             }
         }
         Ok(())
@@ -1167,8 +1213,8 @@ fn handle_control_request(
     commands: &SdkCommands,
 ) -> Result<()> {
     let ok = Some(Value::Object(Default::default()));
-    match cr.request.subtype.as_str() {
-        "initialize" => {
+    match &cr.request.subtype {
+        InboundControlRequestType::Initialize => {
             if let Some(extra) = cr.request.extra.as_object()
                 && (extra.contains_key("hooks") || extra.contains_key("agents"))
             {
@@ -1180,11 +1226,11 @@ fn handle_control_request(
                 None,
             )
         }
-        "interrupt" => {
+        InboundControlRequestType::Interrupt => {
             let _ = handle.cancel_tx.try_send(());
             writer.emit_control_response(&cr.request_id, ok, None)
         }
-        "set_permission_mode" => {
+        InboundControlRequestType::SetPermissionMode => {
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
@@ -1201,7 +1247,7 @@ fn handle_control_request(
                 ),
             }
         }
-        "set_model" => {
+        InboundControlRequestType::SetModel => {
             match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
                 Some(model) => {
                     let _ = handle.model_tx.send(model.clone());
@@ -1215,10 +1261,10 @@ fn handle_control_request(
                 ),
             }
         }
-        other => writer.emit_control_response(
+        InboundControlRequestType::Unknown(subtype) => writer.emit_control_response(
             &cr.request_id,
             None,
-            Some(format!("unsupported: {other}")),
+            Some(format!("unsupported: {subtype}")),
         ),
     }
 }
@@ -1974,6 +2020,52 @@ mod tests {
             .position(|e| e["type"] == "content_block_stop")
             .unwrap();
         assert!(stop_pos > start_pos);
+    }
+
+    #[test_case("user", InboundMessageType::User)]
+    #[test_case("control_request", InboundMessageType::ControlRequest)]
+    #[test_case("control_response", InboundMessageType::ControlResponse)]
+    #[test_case("control_cancel_request", InboundMessageType::ControlCancelRequest)]
+    fn inbound_message_type_deserializes(value: &str, expected: InboundMessageType) {
+        let message: InboundMessage =
+            serde_json::from_value(serde_json::json!({"type": value})).unwrap();
+        assert_eq!(message.msg_type, expected);
+    }
+
+    #[test]
+    fn unknown_inbound_message_type_is_preserved() {
+        let message: InboundMessage =
+            serde_json::from_value(serde_json::json!({"type": "future"})).unwrap();
+        assert!(matches!(
+            message.msg_type,
+            InboundMessageType::Unknown(value) if value == "future"
+        ));
+    }
+
+    #[test_case("initialize", InboundControlRequestType::Initialize)]
+    #[test_case("interrupt", InboundControlRequestType::Interrupt)]
+    #[test_case("set_permission_mode", InboundControlRequestType::SetPermissionMode)]
+    #[test_case("set_model", InboundControlRequestType::SetModel)]
+    fn inbound_control_request_type_deserializes(value: &str, expected: InboundControlRequestType) {
+        let request: InboundControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "request",
+            "request": {"subtype": value}
+        }))
+        .unwrap();
+        assert_eq!(request.request.subtype, expected);
+    }
+
+    #[test]
+    fn unknown_inbound_control_request_type_is_preserved() {
+        let request: InboundControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "request",
+            "request": {"subtype": "future"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.request.subtype,
+            InboundControlRequestType::Unknown(value) if value == "future"
+        ));
     }
 
     #[test_case("default", PermissionMode::Default)]
