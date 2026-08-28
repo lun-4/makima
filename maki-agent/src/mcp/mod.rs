@@ -851,6 +851,9 @@ async fn run(
     shutdown_all(&mut inner).await;
     inner.generation += 1;
     publish(&inner, &published);
+    if let Some(producer) = inner.command_producer.take() {
+        producer.remove();
+    }
     if let Some(tx) = ack {
         let _ = tx.try_send(());
     }
@@ -2157,6 +2160,42 @@ mod tests {
                     .iter()
                     .all(|i| i.tool_count == 0)
             );
+        });
+    }
+
+    #[test]
+    fn command_producer_is_removed_on_every_loop_exit() {
+        smol::block_on(async {
+            let registry = CommandRegistry::new();
+            for explicit_shutdown in [true, false, true, false] {
+                let published = Arc::new(ArcSwap::from_pointee(McpPublishedState::default()));
+                let producer = registry.create_producer(ProducerPrecedence::Mcp);
+                let retained = producer.clone();
+                let inner = McpManagerInner {
+                    entries: Vec::new(),
+                    generation: 0,
+                    command_context: Some(McpCommandContext {
+                        published: Arc::clone(&published),
+                    }),
+                    command_producer: Some(producer),
+                };
+                let (cmd_tx, cmd_rx) = flume::unbounded();
+                let loop_task = smol::spawn(run(inner, published, cmd_rx, flume::bounded(0).0));
+
+                if explicit_shutdown {
+                    let (ack_tx, ack_rx) = flume::bounded(1);
+                    cmd_tx.send(McpCommand::Shutdown { ack: ack_tx }).unwrap();
+                    ack_rx.recv_async().await.unwrap();
+                } else {
+                    drop(cmd_tx);
+                }
+                loop_task.await;
+
+                assert!(matches!(
+                    retained.replace(Vec::new()),
+                    Err(maki_commands::RegistrationError::StaleProducer)
+                ));
+            }
         });
     }
 
