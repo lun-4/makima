@@ -681,7 +681,7 @@ mod tests {
                         .unwrap(),
                     description: Arc::from("deploy"),
                     argument_hint: None,
-                    max_args: 1,
+                    arguments: maki_commands::ArgumentArity::ONE,
                     tui_only: false,
                     argument_completion: Some(key),
                     completion_on_highlight: None,

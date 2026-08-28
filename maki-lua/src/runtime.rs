@@ -28,8 +28,10 @@ use crate::coalesced_latest::{CoalescedLatest, CoalescedWork};
 use crate::splash::SplashFrame;
 use serde_json::Value;
 
+#[cfg(test)]
+use maki_commands::ArgumentArity;
 use maki_commands::{
-    ArgumentArity, CommandBehavior, CommandCompletion, CommandDocs, CommandError, CommandFuture,
+    CommandBehavior, CommandCompletion, CommandDocs, CommandError, CommandFuture,
     CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionContext,
     CompletionError, CompletionItem, CompletionLifecycleEvent, CompletionSessionId, Producer,
     ProducerPrecedence, Registration, TargetCapabilities, TargetCapability,
@@ -1732,11 +1734,7 @@ fn command_registrations(
             spec: CommandSpec {
                 name: Arc::clone(name),
                 aliases: Arc::from([]),
-                arguments: if entry.max_args == usize::MAX {
-                    ArgumentArity::unbounded(0)
-                } else {
-                    ArgumentArity::bounded(0, entry.max_args)
-                },
+                arguments: entry.arguments,
                 docs: CommandDocs {
                     summary: Arc::clone(&entry.description),
                     argument_hint: entry.argument_hint.clone(),

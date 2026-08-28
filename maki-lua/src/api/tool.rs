@@ -20,7 +20,7 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
     TextOutput, ToolOutput,
 };
-use maki_commands::{CommandContent, InputDispatch};
+use maki_commands::{ArgumentArity, CommandContent, InputDispatch};
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
@@ -1391,15 +1391,14 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     Ok(())
 }
 
-/// Matching only needs an upper bound, so "+" and "*" both become MAX;
-/// minimums ("+" vs "*") are left for handlers to enforce.
-fn parse_nargs(spec: &Table) -> LuaResult<usize> {
+fn parse_nargs(spec: &Table) -> LuaResult<ArgumentArity> {
     match spec.get::<LuaValue>("nargs")? {
-        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(0),
-        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(1),
+        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(ArgumentArity::NONE),
+        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(ArgumentArity::ONE),
         LuaValue::String(s) => match s.to_string_lossy().as_ref() {
-            "?" => Ok(1),
-            "*" | "+" => Ok(usize::MAX),
+            "?" => Ok(ArgumentArity::OPTIONAL),
+            "*" => Ok(ArgumentArity::ANY),
+            "+" => Ok(ArgumentArity::ONE_OR_MORE),
             _ => Err(mlua::Error::runtime(NARGS_ERR)),
         },
         _ => Err(mlua::Error::runtime(NARGS_ERR)),
@@ -1428,7 +1427,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         LuaValue::Boolean(value) => value,
         _ => return Err(mlua::Error::runtime(TUI_ONLY_ERR)),
     };
-    let max_args = parse_nargs(spec)?;
+    let arguments = parse_nargs(spec)?;
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
@@ -1486,7 +1485,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
                 handler: handler_key,
                 description,
                 argument_hint,
-                max_args,
+                arguments,
                 tui_only,
                 argument_completion: completion_key,
                 completion_on_highlight,

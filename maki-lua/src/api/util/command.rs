@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
+use maki_commands::ArgumentArity;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
@@ -75,7 +76,7 @@ pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
     pub argument_hint: Option<Arc<str>>,
-    pub max_args: usize,
+    pub arguments: ArgumentArity,
     pub tui_only: bool,
     pub argument_completion: Option<RegistryKey>,
     pub completion_on_highlight: Option<RegistryKey>,

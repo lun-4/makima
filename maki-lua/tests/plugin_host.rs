@@ -1095,7 +1095,7 @@ fn bundled_commands_project_complete_metadata() {
                 "/rename".into(),
                 "Rename the current session".into(),
                 Some("<title>".into()),
-                maki_commands::ArgumentArity::unbounded(0),
+                maki_commands::ArgumentArity::ONE_OR_MORE,
                 true
             ),
             (
@@ -2881,13 +2881,13 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
     ));
 }
 
-#[test_case::test_case("" => 0 ; "default_zero")]
-#[test_case::test_case("nargs = 0," => 0 ; "zero")]
-#[test_case::test_case("nargs = 1," => 1 ; "one")]
-#[test_case::test_case(r#"nargs = "?","# => 1 ; "zero_or_one")]
-#[test_case::test_case(r#"nargs = "*","# => usize::MAX ; "any")]
-#[test_case::test_case(r#"nargs = "+","# => usize::MAX ; "one_or_more")]
-fn register_command_nargs_values(nargs_field: &str) -> usize {
+#[test_case::test_case("" => maki_commands::ArgumentArity::NONE ; "default_zero")]
+#[test_case::test_case("nargs = 0," => maki_commands::ArgumentArity::NONE ; "zero")]
+#[test_case::test_case("nargs = 1," => maki_commands::ArgumentArity::ONE ; "one")]
+#[test_case::test_case(r#"nargs = "?","# => maki_commands::ArgumentArity::OPTIONAL ; "zero_or_one")]
+#[test_case::test_case(r#"nargs = "*","# => maki_commands::ArgumentArity::ANY ; "any")]
+#[test_case::test_case(r#"nargs = "+","# => maki_commands::ArgumentArity::ONE_OR_MORE ; "one_or_more")]
+fn register_command_nargs_values(nargs_field: &str) -> maki_commands::ArgumentArity {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(
@@ -2898,11 +2898,35 @@ fn register_command_nargs_values(nargs_field: &str) -> usize {
     )
     .unwrap();
 
-    command_snapshot(&host).commands()[0]
-        .spec()
-        .arguments
-        .max
-        .unwrap_or(usize::MAX)
+    command_snapshot(&host).commands()[0].spec().arguments
+}
+
+#[test_case::test_case("nargs = 1," ; "exactly_one")]
+#[test_case::test_case(r#"nargs = "+","# ; "one_or_more")]
+fn required_nargs_rejects_empty_dispatch(nargs_field: &str) {
+    let registry = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    host.load_source(
+        "required_nargs",
+        &format!(
+            r#"maki.api.register_command({{ name = "/required", tui_only = false, {nargs_field} handler = function() end }})"#
+        ),
+    )
+    .unwrap();
+    let commands = host.command_registry();
+    let target = commands.bind_target(
+        maki_commands::TargetCapabilities::NONE,
+        Arc::new(FakeCommandHost),
+    );
+
+    let outcome = smol::block_on(commands.dispatch_input(&target, "/required".into()));
+
+    assert!(matches!(
+        outcome,
+        maki_commands::InputDispatch::Dispatched(maki_commands::CommandOutcome::Failed(
+            maki_commands::CommandError::InvalidArguments { actual: 0, .. }
+        ))
+    ));
 }
 
 #[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
