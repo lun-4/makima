@@ -34,15 +34,22 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |  | no |
 | `/exit` | Exit the application |  | no |
 | `/reload` | Reload plugins and config |  | no |
+
+## Bundled plugin commands
+
+Bundled Lua plugins register these commands at startup. Plugin commands have higher collision priority than built-ins, so a bundled plugin can replace a built-in implementation for the targets it supports.
+
+| Command | Description | Arguments | TUI-only |
+|---------|-------------|-----------|----------|
 | `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | no |
 | `/build` | Switch to build mode (full tool access) |  | no |
 | `/memory` | View, edit, and delete memory files |  | yes |
 | `/plan` | Switch to plan mode (analyse and write only the plan file) |  | no |
-| `/rename` | Rename the current session |  | yes |
-| `/sessions` | Browse and switch sessions |  | yes |
-| `/splash` | Preview and select a splash renderer |  | yes |
+| `/rename` | Rename the current session | <title> | yes |
+| `/sessions` | Browse and switch sessions | [query] | yes |
+| `/splash` | Preview and select a splash renderer | [splash] | yes |
 | `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | yes |
-| `/thinking` | Set thinking effort (bare opens a selector) |  | yes |
+| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |
 
 The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text.
 

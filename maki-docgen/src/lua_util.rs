@@ -49,6 +49,7 @@ fn unescape_lua_string(s: &str) -> String {
 pub struct LuaPluginCommand {
     pub name: String,
     pub description: String,
+    pub argument_hint: Option<String>,
     pub tui_only: bool,
 }
 
@@ -70,6 +71,7 @@ pub fn parse_lua_commands(source: &str) -> Vec<LuaPluginCommand> {
                 commands.push(LuaPluginCommand {
                     name,
                     description,
+                    argument_hint: extract_lua_field(inner, "argument_hint"),
                     tui_only,
                 });
             }
@@ -82,7 +84,8 @@ pub fn parse_lua_commands(source: &str) -> Vec<LuaPluginCommand> {
 }
 
 pub fn load_builtin_plugin_commands() -> Vec<LuaPluginCommand> {
-    let Ok(entries) = std::fs::read_dir("plugins") else {
+    let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+    let Ok(entries) = std::fs::read_dir(plugin_dir) else {
         return Vec::new();
     };
     let mut commands: Vec<LuaPluginCommand> = entries

@@ -97,8 +97,26 @@ pub fn generate() -> String {
             );
         }
     }
+
+    writeln!(out).unwrap();
+    writeln!(out, "## Bundled plugin commands").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Bundled Lua plugins register these commands at startup. Plugin commands have higher collision priority than built-ins, so a bundled plugin can replace a built-in implementation for the targets it supports."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "| Command | Description | Arguments | TUI-only |").unwrap();
+    writeln!(out, "|---------|-------------|-----------|----------|").unwrap();
     for cmd in &lua_util::load_builtin_plugin_commands() {
-        write_row(&mut out, &cmd.name, &cmd.description, None, cmd.tui_only);
+        write_row(
+            &mut out,
+            &cmd.name,
+            &cmd.description,
+            cmd.argument_hint.as_deref(),
+            cmd.tui_only,
+        );
     }
 
     writeln!(out).unwrap();
@@ -277,22 +295,22 @@ mod tests {
     use super::generate;
 
     #[test]
-    fn doc_projection_matches_builtin_specs() {
+    fn doc_projection_separates_builtins_and_bundled_plugins() {
         let generated = generate();
-        let mut previous = 0;
+        let (builtins, plugins) = generated
+            .split_once("## Bundled plugin commands")
+            .expect("bundled plugin command section");
         for command in BUILTIN_COMMANDS {
             let row = format!("| `{}` | {} |", command.name, command.description);
-            let position = generated[previous..]
-                .find(&row)
-                .map(|position| previous + position)
-                .unwrap_or_else(|| panic!("missing command row: {row}"));
-            assert!(position >= previous);
-            previous = position + row.len();
+            assert!(builtins.contains(&row), "{row}");
             for alias in command.aliases {
                 assert!(
-                    generated.contains(&format!("| `{alias}` | Alias for `{}` |", command.name))
+                    builtins.contains(&format!("| `{alias}` | Alias for `{}` |", command.name))
                 );
             }
         }
+        assert!(plugins.contains(
+            "| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |"
+        ));
     }
 }
