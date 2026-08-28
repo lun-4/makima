@@ -1666,6 +1666,7 @@ pub struct CompletionContext {
     pub mode: Arc<str>,
     pub target_id: InvocationTargetId,
     pub session_id: CompletionSessionId,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1772,6 +1773,7 @@ impl CompletionSession {
                     mode,
                     target_id: state.target_id,
                     session_id: core.id,
+                    generation: request_id,
                 };
                 state.current_request = Some(CurrentCompletionRequest {
                     id: request_id,

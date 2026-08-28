@@ -1627,7 +1627,7 @@ impl LuaCommandCompletion {
             index: context.argument_index,
             mode: context.mode.to_string(),
             session: id,
-            generation: 0,
+            generation: context.generation,
         };
         (context, request_trigger)
     }
@@ -3804,6 +3804,23 @@ mod tests {
 
     struct FakeCommandHost;
 
+    #[derive(Default)]
+    struct CompletionContextProbe(Mutex<Vec<CompletionContext>>);
+
+    impl CommandCompletion for CompletionContextProbe {
+        fn complete(
+            &self,
+            context: CompletionContext,
+            _cancellation: maki_commands::CancellationToken,
+        ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(context);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
     impl maki_commands::CommandHost for FakeCommandHost {
         fn request(
             &self,
@@ -4161,6 +4178,67 @@ mod tests {
             queued.cancel.is_cancelled(),
             "async task should inherit parent cancel"
         );
+    }
+
+    #[test]
+    fn lua_completion_uses_registry_request_generations() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let probe = Arc::new(CompletionContextProbe::default());
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/complete"),
+                    aliases: Arc::from([]),
+                    arguments: ArgumentArity::ANY,
+                    docs: CommandDocs {
+                        summary: Arc::from("Complete"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(LuaCommandBehavior {
+                    plugin: Arc::from("test-plugin"),
+                    command: Arc::from("/complete"),
+                    tx: flume::unbounded().0,
+                }),
+                completion: Some(probe.clone()),
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
+        let command = registry.resolve_for(&target, "/complete").unwrap();
+        let session = registry.open_completion(command, target.id()).unwrap();
+        for argument in ["a", "ab"] {
+            assert!(matches!(
+                smol::block_on(session.complete(
+                    Arc::from(argument),
+                    Arc::from(argument),
+                    0,
+                    Arc::from("build"),
+                )),
+                maki_commands::CompletionResult::Items(_)
+            ));
+        }
+        let contexts = probe
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let adapter = LuaCommandCompletion {
+            plugin: Arc::from("test-plugin"),
+            command_arguments: CoalescedLatest::new(|_| false),
+            command_argument_lifecycle: CoalescedLatest::new(|_| false),
+            sessions: Mutex::new(HashMap::new()),
+            next_session_id: AtomicU64::new(1),
+        };
+        let (first, _) = adapter.context(&contexts[0], CancelToken::new().0, false);
+        let (second, _) = adapter.context(&contexts[1], CancelToken::new().0, false);
+        let (terminal, _) = adapter.context(&contexts[1], CancelToken::new().0, true);
+
+        assert_eq!(first.session, second.session);
+        assert!(second.generation > first.generation);
+        assert_eq!(terminal.session, second.session);
+        assert_eq!(terminal.generation, second.generation);
     }
 
     #[test]
