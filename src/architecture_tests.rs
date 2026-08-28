@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
 const FRONTEND_ROOTS: &[&str] = &["maki-ui/src", "maki-acp/src", "src"];
+const SOURCE_SCAN_ERROR: &str = "failed to scan production Rust sources";
 const FORBIDDEN_FRONTEND_CALLS: &[&str] = &["create_producer", "register_commands"];
 const FORBIDDEN_FRONTEND_IDENTIFIERS: &[&str] = &[
     "BUILTIN_COMMANDS",
@@ -44,7 +45,7 @@ const FORBIDDEN_ACP_COMMANDS: &[&str] = &[
 
 #[test]
 fn frontends_cannot_register_standard_commands() {
-    for source in production_sources(FRONTEND_ROOTS) {
+    for source in production_sources(FRONTEND_ROOTS).expect(SOURCE_SCAN_ERROR) {
         let path = source.path.to_string_lossy();
         for call in FORBIDDEN_FRONTEND_CALLS {
             assert!(
@@ -63,7 +64,7 @@ fn frontends_cannot_register_standard_commands() {
 
 #[test]
 fn acp_is_command_agnostic_proxy() {
-    for source in production_sources(&["maki-acp/src"]) {
+    for source in production_sources(&["maki-acp/src"]).expect(SOURCE_SCAN_ERROR) {
         let path = source.path.to_string_lossy();
         for identifier in FORBIDDEN_ACP_IDENTIFIERS {
             assert!(
@@ -109,23 +110,28 @@ struct Source {
     strings: Vec<String>,
 }
 
-fn production_sources(roots: &[&str]) -> Vec<Source> {
-    roots
-        .iter()
-        .flat_map(|root| rust_files(Path::new(root)))
-        .filter_map(parse_source)
-        .collect()
+fn production_sources(roots: &[&str]) -> Result<Vec<Source>, String> {
+    let mut sources = Vec::new();
+    for root in roots {
+        for path in rust_files(Path::new(root))? {
+            sources.push(parse_source(path)?);
+        }
+    }
+    Ok(sources)
 }
 
-fn rust_files(root: &Path) -> Vec<PathBuf> {
+fn rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(root)
+        .map_err(|error| format!("failed to read {}: {error}", root.display()))?;
     let mut files = Vec::new();
-    let Ok(entries) = fs::read_dir(root) else {
-        return files;
-    };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("failed to read an entry in {}: {error}", root.display()))?;
         let path = entry.path();
-        if path.is_dir() {
-            files.extend(rust_files(&path));
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if metadata.is_dir() {
+            files.extend(rust_files(&path)?);
         } else if path.extension().is_some_and(|extension| extension == "rs")
             && path
                 .file_name()
@@ -134,16 +140,26 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
             files.push(path);
         }
     }
-    files
+    Ok(files)
 }
 
-fn parse_source(path: PathBuf) -> Option<Source> {
-    let text = fs::read_to_string(&path).ok()?;
+fn parse_source(path: PathBuf) -> Result<Source, String> {
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    parse_source_text(path, &text)
+}
+
+fn parse_source_text(path: PathBuf, text: &str) -> Result<Source, String> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(&text, None)?;
+        .map_err(|error| format!("failed to initialize Rust parser: {error}"))?;
+    let tree = parser
+        .parse(text, None)
+        .ok_or_else(|| format!("failed to parse {}", path.display()))?;
+    if tree.root_node().has_error() {
+        return Err(format!("syntax error while parsing {}", path.display()));
+    }
     let mut source = Source {
         path,
         identifiers: Vec::new(),
@@ -151,7 +167,7 @@ fn parse_source(path: PathBuf) -> Option<Source> {
         strings: Vec::new(),
     };
     collect(tree.root_node(), text.as_bytes(), false, &mut source);
-    Some(source)
+    Ok(source)
 }
 
 fn collect(node: Node<'_>, text: &[u8], in_test: bool, source: &mut Source) {
@@ -215,4 +231,23 @@ fn terminal_identifier(node: Node<'_>, text: &[u8]) -> Option<String> {
     node.named_children(&mut cursor)
         .filter_map(|child| terminal_identifier(child, text))
         .last()
+}
+
+#[test]
+fn source_scan_rejects_missing_roots() {
+    let Err(error) = production_sources(&["missing-architecture-test-root"]) else {
+        panic!("missing root was silently skipped");
+    };
+
+    assert!(error.contains("missing-architecture-test-root"), "{error}");
+}
+
+#[test]
+fn source_scan_rejects_syntax_errors() {
+    let path = PathBuf::from("broken.rs");
+    let Err(error) = parse_source_text(path.clone(), "fn broken(") else {
+        panic!("syntax error was silently accepted");
+    };
+
+    assert!(error.contains(path.to_str().unwrap()), "{error}");
 }
