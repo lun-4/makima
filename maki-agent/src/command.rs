@@ -30,6 +30,7 @@ const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 const STANDARD_COMMANDS_ALREADY_REGISTERED: &str = "standard commands are already registered";
 const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text content";
 const NONINTERACTIVE_MODEL_USAGE: &str = "Usage: /model <model>";
+pub const FAST_UNSUPPORTED: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 
 pub fn portable_capabilities() -> TargetCapabilities {
     TargetCapabilities::from_slice(&[
@@ -164,6 +165,20 @@ impl maki_commands::CommandHost for SessionCommandHost {
             HostRequest::Context(HostContextRequest::ThinkingConfig) => {
                 return Box::pin(async {
                     Ok(HostResponse::Context(HostContextResponse::Unavailable))
+                });
+            }
+            HostRequest::Context(HostContextRequest::FastModeSupported) => {
+                let model = self
+                    .state
+                    .current_model
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let supported = Model::from_spec(&model).is_ok_and(|model| model.supports_fast());
+                return Box::pin(async move {
+                    Ok(HostResponse::Context(
+                        HostContextResponse::FastModeSupported(supported),
+                    ))
                 });
             }
             HostRequest::Builtin(operation) => operation,
@@ -498,7 +513,14 @@ impl CommandBehavior for BuiltinBehavior {
                         config: parse_thinking(&arguments, current)?,
                     }
                 }
-                maki_commands::BuiltinId::Fast => BuiltinOperation::ToggleFast,
+                maki_commands::BuiltinId::Fast => {
+                    let HostContextResponse::FastModeSupported(true) =
+                        host_context(&invocation, HostContextRequest::FastModeSupported).await?
+                    else {
+                        return Err(CommandError::Producer(Arc::from(FAST_UNSUPPORTED)));
+                    };
+                    BuiltinOperation::ToggleFast
+                }
                 maki_commands::BuiltinId::Workflow => BuiltinOperation::ToggleWorkflow,
                 maki_commands::BuiltinId::Exit => BuiltinOperation::Exit,
                 maki_commands::BuiltinId::Reload => BuiltinOperation::Reload,
@@ -812,6 +834,9 @@ mod tests {
                         HostContextRequest::ThinkingConfig => {
                             HostContextResponse::ThinkingConfig(ThinkingConfig::Off)
                         }
+                        HostContextRequest::FastModeSupported => {
+                            HostContextResponse::FastModeSupported(true)
+                        }
                     };
                     Ok(HostResponse::Context(response))
                 }),
@@ -914,6 +939,7 @@ mod tests {
             "/theme",
             "/theme dark",
             "/btw explain this",
+            "/fast",
         ] {
             let result = smol::block_on(registry.dispatch_input(&target, input.into()));
             assert!(matches!(
@@ -937,6 +963,7 @@ mod tests {
                     question: Arc::from("explain this"),
                     attachments: Arc::from([]),
                 },
+                maki_commands::BuiltinOperation::ToggleFast,
             ]
         );
 
@@ -1045,6 +1072,42 @@ mod tests {
     }
 
     const OFFLINE_MODEL: &str = "openai/gpt-5";
+
+    #[test]
+    fn portable_fast_rejects_ineligible_model_before_host_operation() {
+        let registry = maki_commands::CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let state = Arc::new(SessionCommandState::new(
+            OFFLINE_MODEL.into(),
+            Arc::from([]),
+            PathBuf::from("/project"),
+            false,
+            false,
+        ));
+        let host = Arc::new(SessionCommandHost::new(
+            Arc::new(ModelPolicy::default()),
+            flume::unbounded().0,
+            flume::unbounded().0,
+            Arc::clone(&state),
+            Arc::new(PermissionManager::new(
+                maki_config::PermissionsConfig::default(),
+                PathBuf::from("/project"),
+                Arc::default(),
+            )),
+        ));
+        let target = registry.bind_target(portable_capabilities(), host);
+
+        let result = smol::block_on(registry.dispatch_input(&target, "/fast".into()));
+
+        assert!(matches!(
+            result,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
+                CommandError::Producer(message)
+            )) if message.as_ref() == FAST_UNSUPPORTED
+        ));
+        assert!(!state.fast());
+    }
 
     #[test]
     fn local_builtin_rejects_attachments() {

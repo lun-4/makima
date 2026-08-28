@@ -146,6 +146,7 @@ pub enum HostContextRequest {
     ThemeNames,
     WorkingDirectory,
     ThinkingConfig,
+    FastModeSupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +154,7 @@ pub enum HostContextResponse {
     Values(Arc<[Arc<str>]>),
     WorkingDirectory(PathBuf),
     ThinkingConfig(ThinkingConfig),
+    FastModeSupported(bool),
     Unavailable,
 }
 

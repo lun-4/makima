@@ -135,7 +135,7 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
 const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
-const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const FAST_UNSUPPORTED_MSG: &str = maki_agent::command::FAST_UNSUPPORTED;
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
@@ -2041,6 +2041,9 @@ impl App {
                     HostContextRequest::ThinkingConfig => {
                         HostContextResponse::ThinkingConfig(command_thinking(self.state.thinking))
                     }
+                    HostContextRequest::FastModeSupported => {
+                        HostContextResponse::FastModeSupported(self.state.model.supports_fast())
+                    }
                 };
                 return Ok((HostResponse::Context(response), vec![]));
             }
@@ -2153,19 +2156,15 @@ impl App {
                 vec![]
             }
             BuiltinOperation::ToggleFast => {
-                if !self.state.model.supports_fast() {
-                    self.flash(FAST_UNSUPPORTED_MSG.into());
-                } else {
-                    self.state.fast = !self.state.fast;
-                    self.flash(
-                        if self.state.fast {
-                            FAST_ON_MSG
-                        } else {
-                            FAST_OFF_MSG
-                        }
-                        .into(),
-                    );
-                }
+                self.state.fast = !self.state.fast;
+                self.flash(
+                    if self.state.fast {
+                        FAST_ON_MSG
+                    } else {
+                        FAST_OFF_MSG
+                    }
+                    .into(),
+                );
                 vec![]
             }
             BuiltinOperation::ToggleWorkflow => {

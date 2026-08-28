@@ -49,6 +49,8 @@ const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_IMAGE_DATA: &str = "dGVzdA==";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
     "command failed: local commands cannot include non-text content";
+const FAST_UNSUPPORTED_COMMAND_ERROR: &str =
+    "command failed: Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -5103,7 +5105,10 @@ fn fast_flashes_error_on_ineligible_model(spec: &str) {
 
     app.execute_command(cmd("/fast"), 0);
     assert!(!app.state.fast);
-    assert_eq!(app.status_bar.flash_text(), Some(FAST_UNSUPPORTED_MSG));
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FAST_UNSUPPORTED_COMMAND_ERROR)
+    );
 }
 
 #[test]
