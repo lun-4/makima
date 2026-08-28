@@ -154,11 +154,6 @@ const SUBAGENT_REPLY_SUFFIX: &str = "] ";
 /// Length cap for the `/tasks` row message snippet (AC.10).
 const SNIPPET_CHARS: usize = 64;
 
-/// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
-/// in practice; the cap only exists so a command aliasing itself reports an
-/// error instead of ping-ponging with the Lua thread forever.
-pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
-pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
 const NOTIFICATION_PREVIEW_CHARS: usize = 120;
 
 /// A tool-call demand that needs the user's input is held this long after the
@@ -1928,9 +1923,6 @@ impl App {
         idx
     }
 
-    /// Entry point for `maki.api.run_command`: splits a command line into the
-    /// name and args the input bar would hand over, leading slash optional.
-    /// `Err` means nothing ran at all, so the Lua caller can say why.
     /// Resolves and enqueues `cmdline` against this session. The caller only
     /// waits on resolution; the command's effects are applied by the event
     /// loop on a later iteration, so state inspected immediately after this
@@ -1938,12 +1930,32 @@ impl App {
     pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
         let trimmed = cmdline.trim();
         let input = format!("/{}", trimmed.trim_start_matches('/'));
-        self.dispatch_command_line(&input, depth)
+        let resolved = self
+            .command_runtime
+            .registry
+            .resolve_input_for(&self.command_target, &input)
+            .map_err(|error| match error {
+                maki_commands::ResolutionError::UnknownCommand(name) => {
+                    format!("unknown command '{name}'")
+                }
+                maki_commands::ResolutionError::StaleTarget => error.to_string(),
+            })?;
+        self.command_runtime.dispatch_command(
+            &self.command_target,
+            resolved.command,
+            resolved.arguments,
+            CommandContent::default(),
+            depth.into(),
+        );
+        #[cfg(test)]
+        return Ok(self.execute_pending_commands());
+        #[cfg(not(test))]
+        Ok(Vec::new())
     }
 
     #[cfg(test)]
     fn execute_command(&mut self, command: ParsedCommand, depth: u8) -> Vec<Action> {
-        self.dispatch_command_line(&format!("{} {}", command.name, command.args), depth)
+        self.run_cmdline(&format!("{} {}", command.name, command.args), depth)
             .unwrap_or_default()
     }
 
@@ -1957,29 +1969,6 @@ impl App {
             command.command,
             Arc::from(command.args),
             CommandContent::default(),
-            depth.into(),
-        );
-        #[cfg(test)]
-        return Ok(self.execute_pending_commands());
-        #[cfg(not(test))]
-        Ok(Vec::new())
-    }
-
-    fn dispatch_command_line(&mut self, input: &str, depth: u8) -> Result<Vec<Action>, String> {
-        if depth > MAX_COMMAND_DEPTH {
-            return Err(COMMAND_DEPTH_MSG.to_string());
-        }
-        if !self
-            .command_runtime
-            .registry
-            .resolves_input_for(&self.command_target, input)
-        {
-            let name = input.split_whitespace().next().unwrap_or(input);
-            return Err(format!("unknown command '{name}'"));
-        }
-        self.command_runtime.dispatch_input(
-            &self.command_target,
-            CommandContent::from(input),
             depth.into(),
         );
         #[cfg(test)]

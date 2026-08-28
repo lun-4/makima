@@ -3526,6 +3526,7 @@ fn typed_lua_command_with_args_executes() {
 }
 
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
+const MAX_COMMAND_DEPTH_ERROR: &str = "maximum command recursion depth exceeded";
 
 #[test_case("/new" ; "plain")]
 #[test_case("/NEW" ; "uppercase")]
@@ -3651,16 +3652,17 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
 }
 
 #[test]
-fn run_cmdline_rejects_past_max_depth() {
+fn run_cmdline_uses_registry_depth_limit() {
     let mut app = test_app();
 
-    let Err(err) = app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH + 1) else {
-        panic!("{RUN_CMDLINE_REJECTED}");
-    };
-
-    assert_eq!(err, crate::app::COMMAND_DEPTH_MSG);
     assert!(
-        app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH)
+        app.run_cmdline("/new", (maki_commands::MAX_COMMAND_DEPTH + 1) as u8)
+            .is_ok(),
+        "resolution succeeds before the command outcome arrives"
+    );
+    assert_eq!(app.status_bar.flash_text(), Some(MAX_COMMAND_DEPTH_ERROR));
+    assert!(
+        app.run_cmdline("/new", maki_commands::MAX_COMMAND_DEPTH as u8)
             .is_ok(),
         "the cap itself must still run"
     );

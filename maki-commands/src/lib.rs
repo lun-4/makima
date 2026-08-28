@@ -890,8 +890,20 @@ impl CommandRegistry {
     }
 
     pub fn resolves_input_for(&self, target: &TargetHandle, input: &str) -> bool {
-        ParsedInput::parse(input)
-            .is_some_and(|parsed| self.resolve_for(target, parsed.name).is_ok())
+        self.resolve_input_for(target, input).is_ok()
+    }
+
+    pub fn resolve_input_for(
+        &self,
+        target: &TargetHandle,
+        input: &str,
+    ) -> Result<ResolvedInput, ResolutionError> {
+        let parsed = ParsedInput::parse(input)
+            .ok_or_else(|| ResolutionError::UnknownCommand(Arc::from(input.trim())))?;
+        Ok(ResolvedInput {
+            command: self.resolve_for(target, parsed.name)?,
+            arguments: Arc::from(parsed.arguments),
+        })
     }
 
     pub fn dispatch_input(
@@ -917,18 +929,14 @@ impl CommandRegistry {
         content: CommandContent,
         depth: usize,
     ) -> CommandFuture<InputDispatch> {
-        let Some(parsed) = ParsedInput::parse(&content.text) else {
+        let Ok(resolved) = self.resolve_input_for(&target, &content.text) else {
             return Box::pin(async move { InputDispatch::LiteralInput(content) });
         };
-        let Ok(command) = self.resolve_for(&target, parsed.name) else {
-            return Box::pin(async move { InputDispatch::LiteralInput(content) });
-        };
-        let arguments = Arc::from(parsed.arguments);
         let registry = self.clone();
         Box::pin(async move {
             InputDispatch::Dispatched(
                 registry
-                    .dispatch_resolved(command, arguments, content, target, depth)
+                    .dispatch_resolved(resolved.command, resolved.arguments, content, target, depth)
                     .await,
             )
         })
@@ -1369,6 +1377,12 @@ impl<'a> ParsedInput<'a> {
             arguments: trimmed[name_end..].trim(),
         })
     }
+}
+
+#[derive(Clone)]
+pub struct ResolvedInput {
+    pub command: ResolvedCommand,
+    pub arguments: Arc<str>,
 }
 
 #[derive(Clone)]
@@ -1965,6 +1979,27 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
         let command = registry.resolve_for(&target, "/complete").unwrap();
         registry.open_completion(command, target.id()).unwrap()
+    }
+
+    #[test]
+    fn resolve_input_uses_shared_parser_and_preserves_arguments() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![registration("/test", TargetCapabilities::NONE)])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+
+        let resolved = registry
+            .resolve_input_for(&target, "  /TeSt alpha  beta ")
+            .unwrap();
+
+        assert_eq!(resolved.command.invoked_name(), "/TeSt");
+        assert_eq!(resolved.arguments.as_ref(), "alpha  beta");
+        assert!(matches!(
+            registry.resolve_input_for(&target, "literal input"),
+            Err(ResolutionError::UnknownCommand(name)) if name.as_ref() == "literal input"
+        ));
     }
 
     #[test]
