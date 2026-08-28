@@ -1218,7 +1218,7 @@ mod tests {
         session.save(&storage).unwrap();
         let id = session.id.to_string();
         for flags in [vec!["-c".to_string()], vec!["--session-id".to_string()]] {
-            let mut args = vec!["maki".to_string()];
+            let mut args = vec!["makima".to_string()];
             args.extend(flags);
             args.push(id.clone());
             let cli = Cli::parse_from(args.iter().map(String::as_str));
@@ -1242,7 +1242,7 @@ mod tests {
         session.save(&storage).unwrap();
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
 
-        let mut args = vec!["maki".to_string()];
+        let mut args = vec!["makima".to_string()];
         args.push(flag.to_string());
         if flag != "-l" {
             args.push(session.id.to_string());

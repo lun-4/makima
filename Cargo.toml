@@ -64,7 +64,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.11-luna"
+version = "0.4.11-makima"
 edition = "2024"
 authors = ["Luna <luna@l4.pm", "Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"

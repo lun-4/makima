@@ -16,7 +16,7 @@ def _ts():
     return datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
 
 
-DEFAULT_AGENTS = ["claude-code", "maki", "opencode"]
+DEFAULT_AGENTS = ["claude-code", "makima", "opencode"]
 DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
 COLLECT_SCRIPT = Path(__file__).parent / "collect.py"
 ANALYZE_SCRIPT = Path(__file__).parent / "analyze.py"
@@ -25,7 +25,7 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 AGENT_COLORS = {
     "claude-code": "\033[38;5;172m",  # orange / light brown
-    "maki": "\033[35m",  # magenta
+    "makima": "\033[35m",  # magenta
     "opencode": "\033[34m",  # blue
 }
 DEFAULT_COLOR = "\033[37m"

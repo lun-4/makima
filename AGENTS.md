@@ -1,4 +1,4 @@
-Maki is an AI coding agent (like Claude Code and opencode), that is built bottom up to optimize costs and number of tokens used, while not sacrificing performance too much.
+Makima is an AI coding agent (like Claude Code and opencode), that is built bottom up to optimize costs and number of tokens used, while not sacrificing performance too much.
 
 ## Code guidelines
 

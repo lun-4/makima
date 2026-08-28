@@ -534,7 +534,7 @@ struct ApiModelInfo {
 /// Append `text` to the last block when it is already a `Text`, else push a new
 /// `Text` block. Gemini streams a single assistant message as many small text
 /// parts across SSE chunks; coalescing keeps them as one content block so
-/// session restore renders one `maki>` block instead of one per delta.
+/// session restore renders one `makima>` block instead of one per delta.
 fn push_or_extend_text(blocks: &mut Vec<ContentBlock>, text: String) {
     if let Some(ContentBlock::Text { text: prev }) = blocks.last_mut() {
         prev.push_str(&text);

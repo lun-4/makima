@@ -7,7 +7,7 @@ use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
 const INSTALL_SCRIPT_URL: &str = "https://makima.ln4.net/install.sh";
-const BACKUP_FILENAME: &str = "maki_backup";
+const BACKUP_FILENAME: &str = "makima_backup";
 const INSTALL_DIR_ENV: &str = "MAKIMA_INSTALL_DIR";
 
 #[derive(Debug, thiserror::Error)]
@@ -125,7 +125,7 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
         source: e,
     };
 
-    let tmp = exe_path.with_extension("maki_tmp");
+    let tmp = exe_path.with_extension("makima_tmp");
     if needs_sudo(exe_path) {
         println!("Restoring to {} (requires sudo)...", exe_path.display());
         let status = std::process::Command::new("sudo")
@@ -133,7 +133,7 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
                 "sh",
                 "-c",
                 r#"cp -- "$1" "$2" && mv -- "$2" "$3""#,
-                "maki-restore",
+                "makima-restore",
             ])
             .arg(backup_path)
             .arg(&tmp)

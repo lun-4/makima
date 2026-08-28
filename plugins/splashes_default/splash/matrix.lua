@@ -1,4 +1,4 @@
--- Bundled splash, part of the maki distribution.
+-- Bundled splash, part of the makima distribution.
 -- Require from init.lua with:   local splash = require("splash.matrix")
 -- The module returns M with M.description and M.render(w, h, t, fade) and does not activate itself.
 --
