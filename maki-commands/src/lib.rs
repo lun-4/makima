@@ -1886,6 +1886,7 @@ mod tests {
     const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
     struct OutcomeBehavior(CommandOutcome);
+    struct CountingBehavior(Arc<AtomicU64>);
 
     impl CommandBehavior for OutcomeBehavior {
         fn execute(
@@ -1894,6 +1895,16 @@ mod tests {
         ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
             let outcome = self.0.clone();
             Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    impl CommandBehavior for CountingBehavior {
+        fn execute(
+            &self,
+            _invocation: CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(CommandOutcome::Completed) })
         }
     }
 
@@ -1990,10 +2001,24 @@ mod tests {
     }
 
     fn registration(name: &str, capabilities: TargetCapabilities) -> Registration {
+        registration_with(
+            name,
+            &[],
+            Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+            capabilities,
+        )
+    }
+
+    fn registration_with(
+        name: &str,
+        aliases: &[&str],
+        behavior: Arc<dyn CommandBehavior>,
+        capabilities: TargetCapabilities,
+    ) -> Registration {
         Registration {
             spec: CommandSpec {
                 name: Arc::from(name),
-                aliases: Arc::from([]),
+                aliases: aliases.iter().copied().map(Arc::from).collect(),
                 arguments: ArgumentArity::ANY,
                 docs: CommandDocs {
                     summary: Arc::from("test command"),
@@ -2001,7 +2026,7 @@ mod tests {
                 },
                 required_capabilities: capabilities,
             },
-            behavior: Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+            behavior,
             completion: None,
         }
     }
@@ -2143,6 +2168,160 @@ mod tests {
             outcome,
             CommandOutcome::Failed(CommandError::StaleCommand)
         ));
+    }
+
+    #[test]
+    fn producer_replacement_is_atomic_on_validation_failure() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        producer
+            .replace(vec![registration("/old", TargetCapabilities::NONE)])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+        let generation = registry.snapshot_for(&target).unwrap().generation();
+        let mut invalid = registration("/invalid", TargetCapabilities::NONE);
+        invalid.spec.arguments = ArgumentArity::bounded(2, 1);
+
+        assert!(matches!(
+            producer.replace(vec![
+                registration("/new", TargetCapabilities::NONE),
+                invalid
+            ]),
+            Err(RegistrationError::InvalidArgumentArity { min: 2, max: 1 })
+        ));
+
+        let snapshot = registry.snapshot_for(&target).unwrap();
+        assert_eq!(snapshot.generation(), generation);
+        assert_eq!(snapshot.commands().len(), 1);
+        assert_eq!(snapshot.commands()[0].spec().name.as_ref(), "/old");
+        assert!(registry.resolve_for(&target, "/old").is_ok());
+        assert!(registry.resolve_for(&target, "/new").is_err());
+    }
+
+    #[test]
+    fn winner_selection_is_deterministic_and_shared_with_projection() {
+        let precedence_registry = CommandRegistry::new();
+        let precedence_target =
+            precedence_registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+        for precedence in [
+            ProducerPrecedence::Builtin,
+            ProducerPrecedence::Application,
+            ProducerPrecedence::Mcp,
+            ProducerPrecedence::Plugin,
+        ] {
+            let producer = precedence_registry.create_producer(precedence);
+            producer
+                .replace(vec![registration("/precedence", TargetCapabilities::NONE)])
+                .unwrap();
+            assert_eq!(
+                precedence_registry
+                    .resolve_for(&precedence_target, "/precedence")
+                    .unwrap()
+                    .producer_id(),
+                producer.id()
+            );
+        }
+
+        let registry = CommandRegistry::new();
+        let alias = registry.create_producer(ProducerPrecedence::Plugin);
+        alias
+            .replace(vec![registration_with(
+                "/alias-owner",
+                &["/shared"],
+                Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+                TargetCapabilities::NONE,
+            )])
+            .unwrap();
+        let first = registry.create_producer(ProducerPrecedence::Plugin);
+        first
+            .replace(vec![registration("/shared", TargetCapabilities::NONE)])
+            .unwrap();
+        let second = registry.create_producer(ProducerPrecedence::Plugin);
+        second
+            .replace(vec![registration("/shared", TargetCapabilities::NONE)])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+
+        let winner = registry.resolve_for(&target, "/shared").unwrap();
+        assert_eq!(winner.producer_id(), first.id());
+        let projected = registry
+            .snapshot_for(&target)
+            .unwrap()
+            .commands()
+            .iter()
+            .find(|command| command.invoked_name() == "/shared")
+            .unwrap()
+            .clone();
+        assert_eq!(projected.producer_id(), winner.producer_id());
+
+        assert!(first.remove());
+        assert_eq!(
+            registry
+                .resolve_for(&target, "/shared")
+                .unwrap()
+                .producer_id(),
+            second.id()
+        );
+        assert!(second.remove());
+        assert_eq!(
+            registry
+                .resolve_for(&target, "/shared")
+                .unwrap()
+                .producer_id(),
+            alias.id()
+        );
+    }
+
+    #[test]
+    fn dispatch_rejects_foreign_command_and_target_without_execution() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let executions = Arc::new(AtomicU64::new(0));
+        producer
+            .replace(vec![registration_with(
+                "/local",
+                &[],
+                Arc::new(CountingBehavior(Arc::clone(&executions))),
+                TargetCapabilities::NONE,
+            )])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+        let command = registry.resolve_for(&target, "/local").unwrap();
+        let foreign_registry = CommandRegistry::new();
+        let foreign_producer = foreign_registry.create_producer(ProducerPrecedence::Application);
+        foreign_producer
+            .replace(vec![registration("/foreign", TargetCapabilities::NONE)])
+            .unwrap();
+        let foreign_target = foreign_registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+        let foreign_command = foreign_registry
+            .resolve_for(&foreign_target, "/foreign")
+            .unwrap();
+
+        assert!(matches!(
+            futures_lite::future::block_on(
+                registry.dispatch_input(&foreign_target, "/local".into())
+            ),
+            InputDispatch::LiteralInput(_)
+        ));
+        assert!(matches!(
+            futures_lite::future::block_on(registry.dispatch_command(
+                &foreign_target,
+                command,
+                Arc::from(""),
+                "/local".into(),
+            )),
+            CommandOutcome::Failed(CommandError::StaleTarget)
+        ));
+        assert!(matches!(
+            futures_lite::future::block_on(registry.dispatch_command(
+                &target,
+                foreign_command,
+                Arc::from(""),
+                "/foreign".into(),
+            )),
+            CommandOutcome::Failed(CommandError::StaleCommand)
+        ));
+        assert_eq!(executions.load(Ordering::Relaxed), 0);
     }
 
     #[test]
