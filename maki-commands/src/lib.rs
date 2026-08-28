@@ -315,7 +315,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         "/btw",
         &[],
         "Ask a quick question (no tools, no history pollution)",
-        ArgumentArity::ANY,
+        ArgumentArity::ONE_OR_MORE,
         Some("<question>"),
         AGENT,
         None,

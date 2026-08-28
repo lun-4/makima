@@ -1703,6 +1703,14 @@ mod tests {
             panic!("quick question did not return an agent turn");
         };
         assert_eq!(turn.content.text.as_ref(), "explain this");
+        assert!(matches!(
+            commands.dispatch_input("/btw", &[]),
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::InvalidArguments {
+                command,
+                expected: maki_commands::ArgumentArity::ONE_OR_MORE,
+                actual: 0,
+            })) if command.as_ref() == "/btw"
+        ));
         let projection = commands.projection();
         assert_eq!(projection[0]["description"], "/lua description");
         assert_eq!(projection[0]["argumentHint"], "<arg>");

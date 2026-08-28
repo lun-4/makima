@@ -2132,22 +2132,15 @@ impl App {
                 question,
                 attachments,
             } => {
-                if question.is_empty() {
-                    self.flash("Usage: /btw <question>".into());
-                    vec![]
-                } else {
-                    let images = attachments
-                        .iter()
-                        .filter_map(|attachment| {
-                            maki_agent::ImageMediaType::from_mime(&attachment.media_type).map(
-                                |media_type| {
-                                    ImageSource::new(media_type, Arc::clone(&attachment.data))
-                                },
-                            )
-                        })
-                        .collect();
-                    vec![Action::Btw(question.to_string(), images)]
-                }
+                let images = attachments
+                    .iter()
+                    .filter_map(|attachment| {
+                        maki_agent::ImageMediaType::from_mime(&attachment.media_type).map(
+                            |media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)),
+                        )
+                    })
+                    .collect();
+                vec![Action::Btw(question.to_string(), images)]
             }
             BuiltinOperation::ToggleYolo => {
                 let enabled = self.permissions.toggle_yolo();

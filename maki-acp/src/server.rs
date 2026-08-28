@@ -1678,6 +1678,23 @@ mod tests {
     }
 
     #[test]
+    fn portable_bare_btw_is_rejected_by_registry() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let error = smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/btw", false),
+            &RequestId::Number(4),
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(
+            error.message,
+            "invalid arguments for /btw: expected 1 or more"
+        );
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
     fn portable_agent_turn_builtin_is_forwarded_to_agent() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
         smol::block_on(handle_prompt(

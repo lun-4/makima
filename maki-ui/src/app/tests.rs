@@ -4098,7 +4098,7 @@ fn alt_o_opens_editor_for_input() {
 }
 
 #[test]
-fn btw_empty_flashes_error() {
+fn btw_empty_is_rejected_by_registry() {
     let mut app = test_app();
     let actions = app.execute_command(
         ParsedCommand {
@@ -4110,7 +4110,7 @@ fn btw_empty_flashes_error() {
     assert!(actions.is_empty());
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "Usage: /btw <question>"
+        "invalid arguments for /btw: expected 1 or more"
     );
 }
 
