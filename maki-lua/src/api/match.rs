@@ -43,8 +43,8 @@ fn fuzzy(lua: &Lua, query: LuaValue, text: LuaValue) -> LuaResult<Option<Table>>
     Ok(Some(t))
 }
 
-/// Match {query} against a completion {label}, returning zero-based shared
-/// matcher indices and the ranking metadata used by built-in completion.
+/// Match {query} against a completion {label}, returning one-based Lua
+/// indices and the ranking metadata used by built-in completion.
 ///
 /// @param query string Search pattern.
 /// @param label string Completion label.

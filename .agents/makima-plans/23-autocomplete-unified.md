@@ -80,3 +80,9 @@ No user-facing documentation change is expected because autocomplete syntax and 
 - Provider lifecycle and generation state are asynchronous. The shared matcher must remain pure and local to result processing.
 - Existing legacy `maki-match` indices are 1-based. Do not silently change them while introducing zero-based completion indices.
 - Full validation may expose unrelated failures. Record exact failures and do not bypass checks or mix unrelated fixes into this change.
+
+## Expanded scope status
+
+The implementation now also covers command-name completion, the host-side `ListPicker`, the file picker, and the Lua `sessions` picker. `maki.match.completion(query, label)` exposes one-based Lua indices and shared ranking metadata. The generated Lua API reference reflects this API.
+
+The search modal, fuzzy replacement, exact or ambiguous `/model` and `/theme` resolution, grep result handling, and exact memory-tag filtering remain outside the shared completion-ranking contract.

@@ -2919,8 +2919,8 @@ end
 maki.match.completion({query}, {label})
 ```
 
-Match {query} against a completion {label}, returning zero-based shared
-matcher indices and the ranking metadata used by built-in completion.
+Match {query} against a completion {label}, returning one-based Lua
+indices and the ranking metadata used by built-in completion.
 
 **Parameters:**
 

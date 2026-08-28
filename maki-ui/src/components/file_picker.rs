@@ -395,11 +395,15 @@ fn refresh_matches(s: &mut Session) {
         case_matching: CaseMatching::Smart,
         normalization: Normalization::Smart,
     };
-    let mut matches = snapshot
+    let mut paths: Vec<String> = snapshot
         .matched_items(0..snapshot.matched_item_count().min(MAX_MATERIALIZED))
+        .map(|item| item.matcher_columns[0].to_string())
+        .collect();
+    paths.sort();
+    let mut matches = paths
+        .into_iter()
         .enumerate()
-        .filter_map(|(source_order, item)| {
-            let path = item.matcher_columns[0].to_string();
+        .filter_map(|(source_order, path)| {
             completion_match(&query, &path, options).map(|m| (source_order, path, m))
         })
         .collect::<Vec<_>>();

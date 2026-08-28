@@ -444,14 +444,14 @@ impl FileCompletionMenu {
 /// highlights always agree. The needle must be lowercase: the matcher is
 /// case-insensitive and panics on uppercase needles.
 fn parse_query(query: &str) -> QueryIntent {
-    let query = query.to_lowercase();
+    let lowered = query.to_lowercase();
     for (aliases, kind) in [
         (&["skill", "sk"][..], "skill"),
         (&["subagent", "su", "a"][..], "subagent"),
         (&["model", "m"][..], "model"),
     ] {
         for alias in aliases {
-            if query == *alias {
+            if lowered == *alias {
                 return QueryIntent {
                     payload: String::new(),
                     kind: Some(kind),
@@ -459,7 +459,9 @@ fn parse_query(query: &str) -> QueryIntent {
                     has_colon: false,
                 };
             }
-            if let Some(payload) = query.strip_prefix(&format!("{alias}:")) {
+            if let Some(payload_start) = lowered.strip_prefix(&format!("{alias}:")) {
+                let payload_start = payload_start.as_ptr() as usize - lowered.as_ptr() as usize;
+                let payload = &query[payload_start..];
                 return QueryIntent {
                     payload: payload.into(),
                     kind: Some(kind),
@@ -470,7 +472,7 @@ fn parse_query(query: &str) -> QueryIntent {
         }
     }
     QueryIntent {
-        payload: query,
+        payload: query.to_string(),
         kind: None,
         explicit_kind: false,
         has_colon: false,

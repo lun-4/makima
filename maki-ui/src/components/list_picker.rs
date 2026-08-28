@@ -141,6 +141,10 @@ impl<T: PickerItem> State<T> {
         }
         let mut kept = Vec::new();
         for (source_order, item) in self.items.iter().enumerate() {
+            if let Some(completion) = completion_match(&query, item.label(), options) {
+                kept.push((source_order, completion));
+                continue;
+            }
             let mut indices = Vec::new();
             let mut fuzzy_score: u32 = 0;
             let mut matched = true;
@@ -176,12 +180,12 @@ impl<T: PickerItem> State<T> {
                 CompletionMatch {
                     indices: if label_matched { indices } else { Vec::new() },
                     ranking: CompletionRanking {
-                        quality_rank: 0,
-                        boundary_rank: 0,
-                        start_index: 0,
-                        gap_count: 0,
-                        span_length: 0,
-                        unmatched_suffix: 0,
+                        quality_rank: 4,
+                        boundary_rank: 1,
+                        start_index: usize::MAX,
+                        gap_count: usize::MAX,
+                        span_length: usize::MAX,
+                        unmatched_suffix: usize::MAX,
                         fuzzy_score,
                     },
                 },
