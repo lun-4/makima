@@ -99,6 +99,13 @@ pub fn generate() -> String {
     }
 
     writeln!(out).unwrap();
+    writeln!(
+        out,
+        "The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text."
+    )
+    .unwrap();
+
+    writeln!(out).unwrap();
     writeln!(out, "## Bundled plugin commands").unwrap();
     writeln!(out).unwrap();
     writeln!(
@@ -120,14 +127,7 @@ pub fn generate() -> String {
     }
 
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text."
-    )
-    .unwrap();
-
-    writeln!(out).unwrap();
-    writeln!(out, "### Command arguments").unwrap();
+    writeln!(out, "## Command arguments").unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,

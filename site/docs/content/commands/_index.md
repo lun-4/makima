@@ -35,6 +35,8 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/exit` | Exit the application |  | no |
 | `/reload` | Reload plugins and config |  | no |
 
+The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text.
+
 ## Bundled plugin commands
 
 Bundled Lua plugins register these commands at startup. Plugin commands have higher collision priority than built-ins, so a bundled plugin can replace a built-in implementation for the targets it supports.
@@ -51,9 +53,7 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 | `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | yes |
 | `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |
 
-The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text.
-
-### Command arguments
+## Command arguments
 
 `/model` and `/theme` also accept an argument. While you type it, the palette lists the possible values (model specs, theme names), and submitting resolves the argument without opening the picker:
 
