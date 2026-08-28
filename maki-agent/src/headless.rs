@@ -305,19 +305,33 @@ pub enum InteractiveControl {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
+struct InteractiveControlContext<'a> {
+    history: &'a mut History,
+    store: &'a mut Option<SessionStore>,
+    model: &'a Model,
+    provider: &'a dyn Provider,
+    raw_tx: &'a flume::Sender<Envelope>,
+    run_id: u64,
+    config: &'a AgentConfig,
+    working_dir: &'a mut PathBuf,
+    permissions: &'a PermissionManager,
+}
+
 async fn apply_interactive_control(
     control: InteractiveControl,
-    history: &mut History,
-    store: &mut Option<SessionStore>,
-    model: &Model,
-    provider: &dyn Provider,
-    raw_tx: &flume::Sender<Envelope>,
-    run_id: u64,
-    config: &AgentConfig,
-    working_dir: &mut PathBuf,
-    permissions: &Arc<PermissionManager>,
+    context: InteractiveControlContext<'_>,
 ) {
+    let InteractiveControlContext {
+        history,
+        store,
+        model,
+        provider,
+        raw_tx,
+        run_id,
+        config,
+        working_dir,
+        permissions,
+    } = context;
     let result = match &control {
         InteractiveControl::Compact(_) => agent::compact(
             provider,
@@ -447,50 +461,43 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             let permissions = permissions;
             let mut run_id: u64 = 0;
 
+            enum Wake {
+                Input(AgentInput),
+                Control(InteractiveControl),
+            }
+
             loop {
-                while let Ok(control) = control_rx.try_recv() {
-                    apply_interactive_control(
-                        control,
-                        &mut history,
-                        &mut store,
-                        &model,
-                        &*provider,
-                        &raw_tx,
-                        run_id,
-                        &params.config,
-                        &mut working_dir,
-                        &permissions,
+                let wake = if let Ok(control) = control_rx.try_recv() {
+                    Some(Wake::Control(control))
+                } else {
+                    future::or(
+                        async { input_rx.recv_async().await.map(Wake::Input) },
+                        async { control_rx.recv_async().await.map(Wake::Control) },
                     )
-                    .await;
-                }
-                enum Wake {
-                    Input(AgentInput),
-                    Control(InteractiveControl),
-                }
-                let wake = future::or(
-                    async { input_rx.recv_async().await.map(Wake::Input) },
-                    async { control_rx.recv_async().await.map(Wake::Control) },
-                )
-                .await;
+                    .await
+                    .ok()
+                };
                 let input = match wake {
-                    Ok(Wake::Input(input)) => input,
-                    Ok(Wake::Control(control)) => {
+                    Some(Wake::Input(input)) => input,
+                    Some(Wake::Control(control)) => {
                         apply_interactive_control(
                             control,
-                            &mut history,
-                            &mut store,
-                            &model,
-                            &*provider,
-                            &raw_tx,
-                            run_id,
-                            &params.config,
-                            &mut working_dir,
-                            &permissions,
+                            InteractiveControlContext {
+                                history: &mut history,
+                                store: &mut store,
+                                model: &model,
+                                provider: &*provider,
+                                raw_tx: &raw_tx,
+                                run_id,
+                                config: &params.config,
+                                working_dir: &mut working_dir,
+                                permissions: &permissions,
+                            },
                         )
                         .await;
                         continue;
                     }
-                    Err(_) => break,
+                    None => break,
                 };
                 let (trigger, cancel) = CancelToken::new();
                 let cancel_task = smol::spawn({
