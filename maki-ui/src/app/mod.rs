@@ -26,7 +26,7 @@ use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
-use crate::command_runtime::{BuiltinRoute, CommandRoute, CommandRuntime, RoutedCommand, complete};
+use crate::command_runtime::CommandRuntime;
 
 use crate::components::btw_modal::BtwModal;
 #[cfg(test)]
@@ -63,16 +63,18 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptRequest, McpSnapshotReader,
-    SharedBuf, SharedMessages, SubagentInfo,
+    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
+    SharedMessages, SubagentInfo,
 };
-use maki_commands::InvocationTargetId;
+use maki_commands::{
+    AgentTurn, BuiltinOperation, CommandContent, CommandError, HostContextRequest,
+    HostContextResponse, HostRequest, HostResponse, TargetHandle,
+};
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, WinCommand, WinEvent, WinView,
 };
-use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
 use maki_providers::{ContentBlock, Message, Model, Role, ThinkingConfig, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -83,6 +85,36 @@ use crate::theme::ThemesProvider;
 use ratatui::layout::Position;
 
 pub(crate) use crate::agent::QueuedMessage;
+
+fn command_thinking(config: ThinkingConfig) -> maki_commands::ThinkingConfig {
+    use maki_providers::Effort;
+    match config {
+        ThinkingConfig::Off => maki_commands::ThinkingConfig::Off,
+        ThinkingConfig::Adaptive => maki_commands::ThinkingConfig::Adaptive,
+        ThinkingConfig::Effort(Effort::Minimal) => maki_commands::ThinkingConfig::Minimal,
+        ThinkingConfig::Effort(Effort::Low) => maki_commands::ThinkingConfig::Low,
+        ThinkingConfig::Effort(Effort::Medium) => maki_commands::ThinkingConfig::Medium,
+        ThinkingConfig::Effort(Effort::High) => maki_commands::ThinkingConfig::High,
+        ThinkingConfig::Effort(Effort::XHigh) => maki_commands::ThinkingConfig::XHigh,
+        ThinkingConfig::Effort(Effort::Max) => maki_commands::ThinkingConfig::Max,
+        ThinkingConfig::Budget(budget) => maki_commands::ThinkingConfig::Budget(budget),
+    }
+}
+
+fn provider_thinking(config: maki_commands::ThinkingConfig) -> ThinkingConfig {
+    use maki_providers::Effort;
+    match config {
+        maki_commands::ThinkingConfig::Off => ThinkingConfig::Off,
+        maki_commands::ThinkingConfig::Adaptive => ThinkingConfig::Adaptive,
+        maki_commands::ThinkingConfig::Minimal => ThinkingConfig::Effort(Effort::Minimal),
+        maki_commands::ThinkingConfig::Low => ThinkingConfig::Effort(Effort::Low),
+        maki_commands::ThinkingConfig::Medium => ThinkingConfig::Effort(Effort::Medium),
+        maki_commands::ThinkingConfig::High => ThinkingConfig::Effort(Effort::High),
+        maki_commands::ThinkingConfig::XHigh => ThinkingConfig::Effort(Effort::XHigh),
+        maki_commands::ThinkingConfig::Max => ThinkingConfig::Effort(Effort::Max),
+        maki_commands::ThinkingConfig::Budget(budget) => ThinkingConfig::Budget(budget),
+    }
+}
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
@@ -111,17 +143,7 @@ const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
-/// `/model <fragment>` resolution: no discovered spec fuzzy-matches.
-const INVALID_MODEL_MSG: &str = "Invalid model";
-const MODEL_NO_MATCH_MSG: &str = "No model matches";
-/// `/model <fragment>` resolution: two or more specs fuzzy-match.
-const MODEL_AMBIGUOUS_MSG: &str = "Ambiguous model";
-/// `/theme <name>` commit: the resolved theme was applied and persisted.
 const THEME_APPLIED_PREFIX: &str = "Theme";
-/// `/theme <name>`: the name is not in the catalog (mirrors `load`'s error).
-const THEME_UNKNOWN_MSG: &str = "unknown theme";
-/// `/theme <fragment>` resolution: two or more names fuzzy-match.
-const THEME_AMBIGUOUS_MSG: &str = "Ambiguous theme";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
@@ -142,36 +164,6 @@ const NOTIFICATION_PREVIEW_CHARS: usize = 120;
 /// A tool-call demand that needs the user's input is held this long after the
 /// last keystroke before it steals focus, so it does not interrupt mid-typing.
 const INPUT_DEFER: Duration = Duration::from_secs(2);
-
-struct RouteOutcome {
-    actions: Vec<Action>,
-    classification: maki_commands::CommandClassification,
-}
-
-impl RouteOutcome {
-    fn completed(actions: Vec<Action>) -> Self {
-        Self {
-            actions,
-            classification: maki_commands::CommandClassification::Completed,
-        }
-    }
-
-    fn accepted(actions: Vec<Action>) -> Self {
-        Self {
-            actions,
-            classification: maki_commands::CommandClassification::AgentTurnAccepted,
-        }
-    }
-
-    fn failed(error: impl Into<Arc<str>>) -> Self {
-        Self {
-            actions: Vec::new(),
-            classification: maki_commands::CommandClassification::Failed(
-                maki_commands::CommandError::Producer(error.into()),
-            ),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Notification {
@@ -358,7 +350,7 @@ pub struct App {
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(crate) command_runtime: Arc<CommandRuntime>,
-    pub(crate) command_target: InvocationTargetId,
+    pub(crate) command_target: TargetHandle,
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
     pub(super) lua_picker: LuaPicker,
@@ -458,7 +450,7 @@ impl App {
             InputHistory::load(&storage, input_history_size),
             ui_config.max_input_lines,
         );
-        let command_target = command_runtime.registry.create_target();
+        let command_target = command_runtime.bind_target();
         let mut app = Self {
             chats: vec![Chat::new(
                 "Main".into(),
@@ -470,7 +462,7 @@ impl App {
             chat_index: HashMap::new(),
             input_box,
             command_runtime: Arc::clone(&command_runtime),
-            command_target,
+            command_target: command_target.clone(),
             command_palette: CommandPalette::new(command_runtime.registry.clone(), command_target),
             task_picker: ListPicker::new(),
             task_picker_original: None,
@@ -831,24 +823,27 @@ impl App {
             .sync_arguments(input, cursor, &self.state.mode.id_key())
         {
             self.command_runtime
-                .finish_theme_preview(self.command_target, false);
+                .finish_theme_preview(self.command_target.id(), false);
         }
     }
 
     fn close_command_palette(&mut self) {
         if self.command_palette.has_accepted_argument() {
             self.command_runtime
-                .finish_theme_preview(self.command_target, false);
+                .finish_theme_preview(self.command_target.id(), false);
         }
         self.command_palette.close();
     }
 
     fn rotate_command_target(&mut self) {
         self.command_runtime
-            .finish_theme_preview(self.command_target, false);
-        self.command_target = self.command_runtime.registry.create_target();
-        self.command_palette =
-            CommandPalette::new(self.command_runtime.registry.clone(), self.command_target);
+            .finish_theme_preview(self.command_target.id(), false);
+        self.command_palette.close();
+        self.command_target = self.command_runtime.bind_target();
+        self.command_palette = CommandPalette::new(
+            self.command_runtime.registry.clone(),
+            self.command_target.clone(),
+        );
     }
 
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
@@ -875,13 +870,18 @@ impl App {
             return Some(self.run_builtin(BuiltinAction::Tasks));
         }
         if key::SESSIONS.matches(key) {
-            if let Ok(command) = self.command_runtime.registry.resolve(SESSIONS_COMMAND) {
-                let _ = smol::block_on(self.command_runtime.registry.dispatch_command(
+            if let Ok(command) = self
+                .command_runtime
+                .registry
+                .resolve_for(&self.command_target, SESSIONS_COMMAND)
+            {
+                self.command_runtime.dispatch_command(
+                    &self.command_target,
                     command,
-                    "",
+                    Arc::from(""),
+                    CommandContent::default(),
                     0,
-                    self.command_target,
-                ));
+                );
             }
             return Some(vec![]);
         }
@@ -1952,16 +1952,13 @@ impl App {
         command: ConfirmedCommand,
         depth: u8,
     ) -> Result<Vec<Action>, String> {
-        if let Err(error) = smol::block_on(self.command_runtime.registry.dispatch_command(
+        self.command_runtime.dispatch_command(
+            &self.command_target,
             command.command,
-            &command.args,
+            Arc::from(command.args),
+            CommandContent::default(),
             depth.into(),
-            self.command_target,
-        )) {
-            self.command_runtime
-                .finish_theme_preview(self.command_target, false);
-            return Err(error.to_string());
-        }
+        );
         #[cfg(test)]
         return Ok(self.execute_pending_commands());
         #[cfg(not(test))]
@@ -1972,16 +1969,19 @@ impl App {
         if depth > MAX_COMMAND_DEPTH {
             return Err(COMMAND_DEPTH_MSG.to_string());
         }
-        let dispatch = smol::block_on(self.command_runtime.registry.dispatch_input(
-            input,
-            depth.into(),
-            self.command_target,
-        ))
-        .map_err(|error| error.to_string())?;
-        if !matches!(dispatch, maki_commands::InputDispatch::Dispatched(_)) {
+        if !self
+            .command_runtime
+            .registry
+            .resolves_input_for(&self.command_target, input)
+        {
             let name = input.split_whitespace().next().unwrap_or(input);
             return Err(format!("unknown command '{name}'"));
         }
+        self.command_runtime.dispatch_input(
+            &self.command_target,
+            CommandContent::from(input),
+            depth.into(),
+        );
         #[cfg(test)]
         return Ok(self.execute_pending_commands());
         #[cfg(not(test))]
@@ -1991,77 +1991,96 @@ impl App {
     #[cfg(test)]
     fn execute_pending_commands(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
-        while let Some(command) = self.command_runtime.try_recv_for_test() {
-            // Mirror production `EventLoop::handle_command`: a command whose
-            // target is gone fails its lifecycle instead of being dropped.
-            if command.target == self.command_target {
-                actions.extend(self.execute_routed_command(command));
-            } else {
-                complete(
-                    &command,
-                    maki_commands::CommandClassification::Failed(
-                        maki_commands::CommandError::StaleTarget,
-                    ),
-                );
+        loop {
+            let Some(event) = self.command_runtime.recv_for_test() else {
+                break;
+            };
+            match event {
+                crate::command_runtime::CommandEvent::Host { request, reply, .. } => {
+                    match self.execute_host_request(request) {
+                        Ok((response, host_actions)) => {
+                            actions.extend(host_actions);
+                            let _ = reply.send(Ok(response));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
+                crate::command_runtime::CommandEvent::Outcome { outcome, .. } => match outcome {
+                    maki_commands::CommandOutcome::AgentTurn(turn) => {
+                        actions.extend(self.submit_command_turn(turn))
+                    }
+                    maki_commands::CommandOutcome::Failed(error) => self.flash(error.to_string()),
+                    maki_commands::CommandOutcome::Completed => break,
+                },
             }
         }
         actions
     }
 
-    pub(crate) fn execute_routed_command(&mut self, command: RoutedCommand) -> Vec<Action> {
-        let outcome = match &command.route {
-            CommandRoute::Builtin(route) => {
-                self.execute_builtin_route(*route, command.arguments.clone(), command.depth as u8)
-            }
-            CommandRoute::Prompt(prompt) => self.submit_rendered_prompt(prompt),
-            CommandRoute::Mcp(prompt) => self.execute_mcp(prompt),
-        };
-        if matches!(command.route, CommandRoute::Builtin(BuiltinRoute::Theme)) {
-            // Only an execution that actually selected a theme commits its
-            // preview. Opening the picker (empty arguments) must not commit a
-            // stale accepted preview from an abandoned edit, so it reverts.
-            let selected_a_theme = !command.arguments.trim().is_empty();
-            self.command_runtime.finish_theme_preview(
-                command.target,
-                selected_a_theme
-                    && !matches!(
-                        outcome.classification,
-                        maki_commands::CommandClassification::Failed(_)
-                    ),
-            );
-        }
-        complete(&command, outcome.classification);
-        outcome.actions
-    }
-
-    /// {depth} is the `maki.api.run_command` hop count, forwarded to a Lua
-    /// handler so an alias cycle keeps counting. 0 when the user typed it.
-    fn execute_builtin_route(
+    pub(crate) fn execute_host_request(
         &mut self,
-        route: BuiltinRoute,
-        args: String,
-        _depth: u8,
-    ) -> RouteOutcome {
-        let actions = match route {
-            BuiltinRoute::Tasks => {
+        request: HostRequest,
+    ) -> Result<(HostResponse, Vec<Action>), CommandError> {
+        let operation = match request {
+            HostRequest::Context(request) => {
+                let response = match request {
+                    HostContextRequest::ModelSpecs => HostContextResponse::Values(
+                        self.available_models
+                            .load_full()
+                            .map(|models| {
+                                models
+                                    .iter()
+                                    .map(|spec| Arc::from(spec.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .into()
+                            })
+                            .unwrap_or_else(|| Arc::from([])),
+                    ),
+                    HostContextRequest::ThemeNames => HostContextResponse::Values(
+                        self.theme_provider
+                            .names()
+                            .into_iter()
+                            .map(Arc::from)
+                            .collect::<Vec<_>>()
+                            .into(),
+                    ),
+                    HostContextRequest::WorkingDirectory => HostContextResponse::WorkingDirectory(
+                        PathBuf::from(&self.state.session.cwd),
+                    ),
+                    HostContextRequest::ThinkingConfig => {
+                        HostContextResponse::ThinkingConfig(command_thinking(self.state.thinking))
+                    }
+                };
+                return Ok((HostResponse::Context(response), vec![]));
+            }
+            HostRequest::Builtin(operation) => operation,
+        };
+        let actions = match operation {
+            BuiltinOperation::OpenTasks => {
                 self.open_tasks();
                 vec![]
             }
-            BuiltinRoute::Compact => {
+            BuiltinOperation::Compact => {
                 if self.status == Status::Streaming {
                     if !self.queue_compact() {
-                        return RouteOutcome::failed("agent queue is unavailable");
+                        return Err(CommandError::Producer(Arc::from(
+                            "agent queue is unavailable",
+                        )));
                     }
-                    return RouteOutcome::completed(Vec::new());
+                    vec![]
+                } else {
+                    self.status = Status::Streaming;
+                    vec![Action::Compact]
                 }
-                self.status = Status::Streaming;
-                vec![Action::Compact]
             }
-            BuiltinRoute::Help => {
+            BuiltinOperation::ResetSession => self.reset_session(),
+            BuiltinOperation::ToggleHelp => {
                 self.help_modal.toggle();
                 vec![]
             }
-            BuiltinRoute::Usage => {
+            BuiltinOperation::ToggleUsage => {
                 self.usage_modal.toggle();
                 if self.usage_modal.is_open() {
                     vec![Action::RefreshUsage]
@@ -2069,90 +2088,105 @@ impl App {
                     vec![]
                 }
             }
-            BuiltinRoute::Btw => {
-                let question = args.trim().to_string();
+            BuiltinOperation::FocusQueue => {
+                self.queue.set_focus();
+                vec![]
+            }
+            BuiltinOperation::OpenModelPicker => {
+                self.model_picker.open(&self.state.model.spec());
+                vec![Action::RefreshModels]
+            }
+            BuiltinOperation::SetModel { spec } => vec![Action::ChangeModel(spec.to_string())],
+            BuiltinOperation::OpenThemePicker => {
+                self.theme_picker.open();
+                self.command_runtime
+                    .finish_theme_preview(self.command_target.id(), false);
+                vec![]
+            }
+            BuiltinOperation::SetTheme { name } => {
+                let applied = match self.theme_provider.install(&name) {
+                    Ok(()) => {
+                        self.theme_provider.persist(&name);
+                        self.flash(format!("{THEME_APPLIED_PREFIX}: {name}"));
+                        true
+                    }
+                    Err(error) => {
+                        self.flash(error);
+                        false
+                    }
+                };
+                self.command_runtime
+                    .finish_theme_preview(self.command_target.id(), applied);
+                vec![]
+            }
+            BuiltinOperation::OpenMcpPicker => {
+                self.mcp_picker.open();
+                vec![]
+            }
+            BuiltinOperation::OpenLoginPicker => {
+                self.login_picker.open(self.storage.clone());
+                vec![]
+            }
+            BuiltinOperation::ChangeDirectory { path } => self.change_directory(path),
+            BuiltinOperation::QuickQuestion {
+                question,
+                attachments,
+            } => {
                 if question.is_empty() {
                     self.flash("Usage: /btw <question>".into());
                     vec![]
                 } else {
-                    vec![Action::Btw(question)]
+                    let images = attachments
+                        .iter()
+                        .filter_map(|attachment| {
+                            maki_agent::ImageMediaType::from_mime(&attachment.media_type).map(
+                                |media_type| {
+                                    ImageSource::new(media_type, Arc::clone(&attachment.data))
+                                },
+                            )
+                        })
+                        .collect();
+                    vec![Action::Btw(question.to_string(), images)]
                 }
             }
-            BuiltinRoute::New => self.reset_session(),
-            BuiltinRoute::Queue => {
-                self.queue.set_focus();
-                vec![]
-            }
-            BuiltinRoute::Model => {
-                let arg = args.trim();
-                if arg.is_empty() {
-                    self.model_picker.open(&self.state.model.spec());
-                    vec![Action::RefreshModels]
-                } else {
-                    self.resolve_model_arg(arg)
-                }
-            }
-            BuiltinRoute::Theme => {
-                let arg = args.trim();
-                if arg.is_empty() {
-                    self.theme_picker.open();
-                    vec![]
-                } else if !self.resolve_theme_arg(arg) {
-                    return RouteOutcome::failed("theme resolution failed");
-                } else {
-                    vec![]
-                }
-            }
-            BuiltinRoute::Mcp => {
-                self.mcp_picker.open();
-                vec![]
-            }
-            BuiltinRoute::Login => {
-                self.login_picker.open(self.storage.clone());
-                vec![]
-            }
-            BuiltinRoute::Cd => self.cmd_cd(&args),
-            BuiltinRoute::Yolo => {
+            BuiltinOperation::ToggleYolo => {
                 let enabled = self.permissions.toggle_yolo();
-                let msg = if enabled {
-                    "YOLO mode enabled"
-                } else {
-                    "YOLO mode disabled"
-                };
-                self.flash(msg.into());
-                vec![]
-            }
-            BuiltinRoute::Thinking => {
-                if !self.state.model.supports_thinking() {
-                    self.flash("Thinking requires a model that supports it".into());
-                    return RouteOutcome::completed(Vec::new());
-                }
-                match ThinkingConfig::parse(args.trim(), self.state.thinking) {
-                    Ok(thinking) => {
-                        self.state.thinking = thinking;
-                        self.flash(format!("Thinking: {thinking}"));
-                    }
-                    Err(msg) => self.flash(msg.into()),
-                }
-                vec![]
-            }
-            BuiltinRoute::Fast => {
-                if !self.state.model.supports_fast() {
-                    self.flash(FAST_UNSUPPORTED_MSG.into());
-                    return RouteOutcome::completed(Vec::new());
-                }
-                self.state.fast = !self.state.fast;
                 self.flash(
-                    if self.state.fast {
-                        FAST_ON_MSG
+                    if enabled {
+                        "YOLO mode enabled"
                     } else {
-                        FAST_OFF_MSG
+                        "YOLO mode disabled"
                     }
                     .into(),
                 );
                 vec![]
             }
-            BuiltinRoute::Workflow => {
+            BuiltinOperation::SetThinking { config } => {
+                if !self.state.model.supports_thinking() {
+                    self.flash("Thinking requires a model that supports it".into());
+                } else {
+                    self.state.thinking = provider_thinking(config);
+                    self.flash(format!("Thinking: {}", self.state.thinking));
+                }
+                vec![]
+            }
+            BuiltinOperation::ToggleFast => {
+                if !self.state.model.supports_fast() {
+                    self.flash(FAST_UNSUPPORTED_MSG.into());
+                } else {
+                    self.state.fast = !self.state.fast;
+                    self.flash(
+                        if self.state.fast {
+                            FAST_ON_MSG
+                        } else {
+                            FAST_OFF_MSG
+                        }
+                        .into(),
+                    );
+                }
+                vec![]
+            }
+            BuiltinOperation::ToggleWorkflow => {
                 self.state.workflow = !self.state.workflow;
                 self.flash(
                     if self.state.workflow {
@@ -2164,185 +2198,98 @@ impl App {
                 );
                 vec![]
             }
-            BuiltinRoute::Exit => self.quit(),
-            BuiltinRoute::Reload => self.quit_with(ExitRequest::Reload),
+            BuiltinOperation::Exit => self.quit(),
+            BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
         };
-        let classification = match route {
-            BuiltinRoute::Btw if args.trim().is_empty() => {
-                return RouteOutcome::failed("/btw requires a question");
+        Ok((HostResponse::Completed, actions))
+    }
+
+    pub(crate) fn submit_command_turn(&mut self, turn: AgentTurn) -> Vec<Action> {
+        let images = turn
+            .content
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                maki_agent::ImageMediaType::from_mime(&attachment.media_type)
+                    .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
+            })
+            .collect();
+        let message = QueuedMessage {
+            text: turn.content.text.to_string(),
+            images,
+        };
+        if let Some(prompt) = turn.prompt {
+            let display = match self.lua_event_handle.expand_references(&message.text) {
+                Ok(text) => text,
+                Err(error) => {
+                    self.flash(error);
+                    return vec![];
+                }
+            };
+            if self.status == Status::Streaming {
+                self.flash("Agent is busy, try again later".into());
+                return vec![];
             }
-            BuiltinRoute::Btw => maki_commands::CommandClassification::AgentTurnAccepted,
-            BuiltinRoute::Compact
-                if actions
+            let mut input = self.build_agent_input(&QueuedMessage {
+                text: display.clone(),
+                images: message.images,
+            });
+            input.prompt = Some(Box::new(maki_agent::McpPromptRef {
+                qualified_name: prompt.qualified_name.to_string(),
+                arguments: prompt
+                    .arguments
                     .iter()
-                    .any(|action| matches!(action, Action::Compact)) =>
-            {
-                maki_commands::CommandClassification::AgentTurnAccepted
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+            }));
+            self.start_run(input, display)
+        } else {
+            match self.submit_prompt(message) {
+                SubmitOutcome::Started(actions) => actions,
+                SubmitOutcome::Queued => vec![],
+                SubmitOutcome::Rejected(error) => {
+                    self.flash(error);
+                    vec![]
+                }
             }
-            BuiltinRoute::Compact => maki_commands::CommandClassification::Completed,
-            _ => maki_commands::CommandClassification::Completed,
-        };
-        RouteOutcome {
-            actions,
-            classification,
         }
     }
 
     /// Opens the `/sessions` picker for this directory (bare `maki -c`
     /// before the agent starts). Fire-and-forget, same path as the Ctrl+P
     /// binding.
-    pub(crate) fn open_session_picker(&self) {
-        if let Ok(command) = self.command_runtime.registry.resolve(SESSIONS_COMMAND) {
-            let _ = smol::block_on(self.command_runtime.registry.dispatch_command(
+    pub(crate) fn open_session_picker(&mut self) {
+        if let Ok(command) = self
+            .command_runtime
+            .registry
+            .resolve_for(&self.command_target, SESSIONS_COMMAND)
+        {
+            self.command_runtime.dispatch_command(
+                &self.command_target,
                 command,
-                "",
+                Arc::from(""),
+                CommandContent::default(),
                 0,
-                self.command_target,
-            ));
+            );
+            #[cfg(test)]
+            let _ = self.execute_pending_commands();
         }
     }
 
-    fn execute_mcp(&mut self, prompt: &McpPromptRequest) -> RouteOutcome {
-        let prompt_ref = maki_agent::McpPromptRef {
-            qualified_name: prompt.qualified_name.clone(),
-            arguments: prompt.arguments.clone(),
-        };
-        let display_text = prompt.display_text.clone();
-        // Same single-expansion rule as submit_prompt: `@`-references in the
-        // prompt args are rewritten once here, before the agent sees them.
-        let display_text = match self.lua_event_handle.expand_references(&display_text) {
-            Ok(text) => text,
-            Err(e) => {
-                self.flash(e);
-                return RouteOutcome::failed("MCP prompt argument expansion failed");
-            }
-        };
-        let mut input = self.build_agent_input(&QueuedMessage {
-            text: display_text.clone(),
-            images: Vec::new(),
-        });
-        input.prompt = Some(Box::new(prompt_ref));
-
-        if self.status == Status::Streaming {
-            self.flash("Agent is busy, try again later".into());
-            RouteOutcome::failed("agent is busy")
-        } else {
-            RouteOutcome::accepted(self.start_run(input, display_text))
-        }
-    }
-
-    fn submit_rendered_prompt(&mut self, prompt: &str) -> RouteOutcome {
-        match self.submit_prompt(QueuedMessage {
-            text: prompt.to_string(),
-            images: Vec::new(),
+    fn change_directory(&mut self, path: PathBuf) -> Vec<Action> {
+        match path.canonicalize().and_then(|path| {
+            path.is_dir()
+                .then_some(path)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
         }) {
-            SubmitOutcome::Started(actions) => RouteOutcome::accepted(actions),
-            SubmitOutcome::Queued => RouteOutcome::accepted(Vec::new()),
-            SubmitOutcome::Rejected(error) => {
-                self.flash(error.clone());
-                RouteOutcome::failed(error)
-            }
-        }
-    }
-
-    /// Resolve a `/model <arg>` argument without the picker. An explicit
-    /// `provider/id` spec bypasses the discovered list (matching `ChangeModel`
-    /// behaviour); otherwise the argument is fuzzy-resolved against the
-    /// discovered specs. Zero or ambiguous matches flash and emit nothing, so
-    /// the session model is left untouched and the picker stays closed.
-    fn resolve_model_arg(&mut self, arg: &str) -> Vec<Action> {
-        if arg.contains('/') {
-            if let Err(error) = Model::parse_spec(arg) {
-                self.flash(format!("{INVALID_MODEL_MSG}: {error}"));
-                return vec![];
-            }
-            return vec![Action::ChangeModel(arg.to_string())];
-        }
-        let models = self
-            .available_models
-            .load_full()
-            .map(|arc| (*arc).clone())
-            .unwrap_or_default();
-        let candidates: Vec<_> = models
-            .iter()
-            .map(|spec| {
-                let (provider, model_id) = spec.split_once('/').unwrap_or(("", spec));
-                MatchCandidate {
-                    value: spec,
-                    fields: vec![spec, provider, model_id],
-                }
-            })
-            .collect();
-        match fuzzy_resolve_candidates(arg, &candidates) {
-            Resolution::Unique(index) => vec![Action::ChangeModel(models[index].clone())],
-            Resolution::NoMatch => {
-                self.flash(format!("{MODEL_NO_MATCH_MSG}: {arg}"));
-                vec![]
-            }
-            Resolution::Ambiguous => {
-                self.flash(format!("{MODEL_AMBIGUOUS_MSG}: {arg}"));
-                vec![]
-            }
-        }
-    }
-
-    /// Resolve a `/theme <arg>` argument without the picker. A unique match is
-    /// installed (palette store, highlighter refresh, generation bump) and
-    /// persisted under the app's `StateDir`, then flashed; unknown or ambiguous
-    /// arguments flash and change nothing.
-    fn resolve_theme_arg(&mut self, arg: &str) -> bool {
-        let names = self.theme_provider.names();
-        match fuzzy_resolve(arg, &names) {
-            Resolution::Unique(index) => {
-                let name = names[index].clone();
-                match self.theme_provider.install(&name) {
-                    Ok(()) => {
-                        self.theme_provider.persist(&name);
-                        self.flash(format!("{THEME_APPLIED_PREFIX}: {name}"));
-                        return true;
-                    }
-                    Err(error) => self.flash(error),
-                }
-                false
-            }
-            Resolution::NoMatch => {
-                self.flash(format!("{THEME_UNKNOWN_MSG}: {arg}"));
-                false
-            }
-            Resolution::Ambiguous => {
-                self.flash(format!("{THEME_AMBIGUOUS_MSG}: {arg}"));
-                false
-            }
-        }
-    }
-
-    fn cmd_cd(&mut self, args: &str) -> Vec<Action> {
-        let path = if args.is_empty() {
-            maki_storage::paths::home().unwrap_or_default()
-        } else {
-            match args.strip_prefix('~') {
-                Some(rest) => {
-                    let home = maki_storage::paths::home().unwrap_or_default();
-                    if rest.is_empty() {
-                        home
-                    } else {
-                        home.join(rest.trim_start_matches('/'))
-                    }
-                }
-                None => PathBuf::from(args),
-            }
-        };
-        match std::env::set_current_dir(&path) {
-            Ok(()) => {
-                if let Ok(canonical) = std::env::current_dir() {
-                    self.state
-                        .session_mut()
-                        .set_cwd(canonical.to_string_lossy().into_owned());
-                }
-                self.status_bar.refresh_cwd();
+            Ok(path) => {
+                self.state
+                    .session_mut()
+                    .set_cwd(path.to_string_lossy().into_owned());
+                self.status_bar.set_cwd(path.clone());
                 self.flash(format!("cd {}", path.display()))
             }
-            Err(e) => self.flash(format!("cd: {e}")),
+            Err(error) => self.flash(format!("cd: {error}")),
         }
         vec![]
     }

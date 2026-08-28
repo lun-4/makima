@@ -175,8 +175,8 @@ mod tests {
 
     use maki_commands::{
         ArgumentArity, CommandBehavior, CommandDocs, CommandError, CommandFuture,
-        CommandInvocation, CommandRegistry, CommandSpec, CompletionResult, ProducerPrecedence,
-        Registration,
+        CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionResult,
+        HostResponse, ProducerPrecedence, Registration, TargetCapabilities,
     };
 
     use crate::theme::InMemoryThemesProvider;
@@ -189,8 +189,17 @@ mod tests {
         fn execute(
             &self,
             _invocation: CommandInvocation,
-        ) -> CommandFuture<Result<(), CommandError>> {
-            Box::pin(async { Ok(()) })
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            Box::pin(async { Ok(CommandOutcome::Completed) })
+        }
+    }
+
+    impl maki_commands::CommandHost for NoBehavior {
+        fn request(
+            &self,
+            _request: maki_commands::HostRequest,
+        ) -> CommandFuture<Result<HostResponse, CommandError>> {
+            Box::pin(async { Ok(HostResponse::Completed) })
         }
     }
 
@@ -209,7 +218,7 @@ mod tests {
                         summary: Arc::from("test"),
                         argument_hint: None,
                     },
-                    tui_only: false,
+                    required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(NoBehavior),
                 completion: Some(source.clone()),
@@ -223,9 +232,9 @@ mod tests {
         _source: &ThemeArgSource,
         theme: &str,
     ) -> InvocationTargetId {
-        let target = registry.create_target();
-        let command = registry.resolve("/theme").unwrap();
-        let session = registry.open_completion(command, target).unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(NoBehavior));
+        let command = registry.resolve_for(&target, "/theme").unwrap();
+        let session = registry.open_completion(command, target.id()).unwrap();
 
         let result =
             smol::block_on(session.complete(Arc::from(""), Arc::from(""), 0, Arc::from("insert")));
@@ -238,7 +247,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{theme} not in completion items"));
         session.highlight(candidate).unwrap();
         session.accept(candidate.clone()).unwrap();
-        target
+        target.id()
     }
 
     const BASE_THEME: &str = "dracula";

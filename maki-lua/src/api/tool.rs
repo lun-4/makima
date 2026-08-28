@@ -20,7 +20,7 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
     TextOutput, ToolOutput,
 };
-use maki_commands::DispatchRequest;
+use maki_commands::{CommandContent, InputDispatch};
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
@@ -850,15 +850,13 @@ async fn run_command(
     let depth = command_depth(&lua).saturating_add(1);
     if let Some(invocation) = command_invocation(&lua) {
         let result = invocation
-            .dispatcher
-            .dispatch(DispatchRequest {
-                input: Arc::from(cmdline),
-                depth: depth as usize,
-                target_id: invocation.target_id,
-                lifecycle: invocation.lifecycle,
-            })
+            .invocation
+            .dispatch(CommandContent::from(cmdline.as_str()))
             .await;
-        try_pair!(result.map(|_| ()).map_err(|error| error.to_string()));
+        try_pair!(match result {
+            InputDispatch::Dispatched(_) => Ok(()),
+            InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
+        });
     } else {
         let reply = try_pair!(
             ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {

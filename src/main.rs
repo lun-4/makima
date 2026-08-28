@@ -5,6 +5,9 @@ mod sdk_mode;
 mod setup;
 mod update;
 
+#[cfg(test)]
+mod architecture_tests;
+
 use clap::Parser;
 
 use cli::Cli;

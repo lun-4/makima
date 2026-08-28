@@ -1,8 +1,9 @@
 //! Frontend-neutral contracts for slash commands.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::{Future, poll_fn};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -14,142 +15,371 @@ pub type CommandFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub const MAX_COMMAND_DEPTH: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BuiltinCommand {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub max_args: usize,
-    pub aliases: &'static [&'static str],
-    pub tui_only: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TargetCapability {
+    AgentTurns,
+    ModelSelection,
+    SessionControl,
+    WorkingDirectory,
+    PermissionToggles,
+    ConfigToggles,
+    InteractiveUi,
+    ApplicationLifecycle,
+    Reload,
 }
 
-pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
-    BuiltinCommand {
-        name: "/tasks",
-        description: "Browse and search tasks",
-        max_args: 0,
-        aliases: &[],
-        tui_only: true,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TargetCapabilities(u16);
+
+impl TargetCapabilities {
+    pub const NONE: Self = Self(0);
+    pub const ALL: Self = Self((1 << 9) - 1);
+
+    pub const fn from_capability(capability: TargetCapability) -> Self {
+        Self(1 << capability as u8)
+    }
+
+    pub const fn from_slice(capabilities: &[TargetCapability]) -> Self {
+        let mut bits = 0;
+        let mut index = 0;
+        while index < capabilities.len() {
+            bits |= 1 << capabilities[index] as u8;
+            index += 1;
+        }
+        Self(bits)
+    }
+
+    pub const fn contains(self, capability: TargetCapability) -> bool {
+        self.0 & Self::from_capability(capability).0 != 0
+    }
+
+    pub const fn contains_all(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinId {
+    Tasks,
+    Compact,
+    New,
+    Help,
+    Usage,
+    Queue,
+    Model,
+    Theme,
+    Mcp,
+    Login,
+    Cd,
+    Btw,
+    Yolo,
+    Thinking,
+    Fast,
+    Workflow,
+    Exit,
+    Reload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompletionKey {
+    Model,
+    Theme,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuiltinOperation {
+    OpenTasks,
+    Compact,
+    ResetSession,
+    ToggleHelp,
+    ToggleUsage,
+    FocusQueue,
+    OpenModelPicker,
+    SetModel {
+        spec: Arc<str>,
     },
-    BuiltinCommand {
-        name: "/compact",
-        description: "Summarize and compact conversation history",
-        max_args: 0,
-        aliases: &[],
-        tui_only: false,
+    OpenThemePicker,
+    SetTheme {
+        name: Arc<str>,
     },
-    BuiltinCommand {
-        name: "/new",
-        description: "Start a new session",
-        max_args: 0,
-        aliases: &["/clear"],
-        tui_only: false,
+    OpenMcpPicker,
+    OpenLoginPicker,
+    ChangeDirectory {
+        path: PathBuf,
     },
-    BuiltinCommand {
-        name: "/help",
-        description: "Show keybindings",
-        max_args: 0,
-        aliases: &[],
-        tui_only: true,
+    QuickQuestion {
+        question: Arc<str>,
+        attachments: Arc<[CommandAttachment]>,
     },
-    BuiltinCommand {
-        name: "/usage",
-        description: "Show token usage breakdown",
-        max_args: 0,
-        aliases: &[],
-        tui_only: true,
+    ToggleYolo,
+    SetThinking {
+        config: ThinkingConfig,
     },
-    BuiltinCommand {
-        name: "/queue",
-        description: "Remove items from queue",
-        max_args: 0,
-        aliases: &[],
-        tui_only: true,
-    },
-    BuiltinCommand {
-        name: "/model",
-        description: "Switch model",
-        max_args: 1,
-        aliases: &[],
-        tui_only: false,
-    },
-    BuiltinCommand {
-        name: "/theme",
-        description: "Switch color theme",
-        max_args: 1,
-        aliases: &[],
-        tui_only: true,
-    },
-    BuiltinCommand {
-        name: "/mcp",
-        description: "Configure MCP servers",
-        max_args: 0,
-        aliases: &[],
-        tui_only: true,
-    },
-    BuiltinCommand {
-        name: "/login",
-        description: "Authenticate with an LLM provider",
-        max_args: 0,
-        aliases: &[],
-        tui_only: true,
-    },
-    BuiltinCommand {
-        name: "/cd",
-        description: "Change working directory",
-        max_args: 1,
-        aliases: &[],
-        tui_only: false,
-    },
-    BuiltinCommand {
-        name: "/btw",
-        description: "Ask a quick question (no tools, no history pollution)",
-        max_args: usize::MAX,
-        aliases: &[],
-        tui_only: false,
-    },
-    BuiltinCommand {
-        name: "/yolo",
-        description: "Toggle YOLO mode (skip all permission prompts)",
-        max_args: 0,
-        aliases: &[],
-        tui_only: false,
-    },
-    BuiltinCommand {
-        name: "/thinking",
-        description: "Toggle extended thinking (off, adaptive, effort level, or budget)",
-        max_args: 1,
-        aliases: &[],
-        tui_only: true,
-    },
-    BuiltinCommand {
-        name: "/fast",
-        description: "Toggle Anthropic fast mode (Opus only)",
-        max_args: 0,
-        aliases: &[],
-        tui_only: false,
-    },
-    BuiltinCommand {
-        name: "/workflow",
-        description: "Toggle workflow mode (task callable inside code_execution)",
-        max_args: 0,
-        aliases: &[],
-        tui_only: false,
-    },
-    BuiltinCommand {
-        name: "/exit",
-        description: "Exit the application",
-        max_args: 0,
-        aliases: &[],
-        tui_only: true,
-    },
-    BuiltinCommand {
-        name: "/reload",
-        description: "Reload plugins and config",
-        max_args: 0,
-        aliases: &[],
-        tui_only: true,
-    },
+    ToggleFast,
+    ToggleWorkflow,
+    Exit,
+    Reload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingConfig {
+    Off,
+    Adaptive,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Budget(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostContextRequest {
+    ModelSpecs,
+    ThemeNames,
+    WorkingDirectory,
+    ThinkingConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostContextResponse {
+    Values(Arc<[Arc<str>]>),
+    WorkingDirectory(PathBuf),
+    ThinkingConfig(ThinkingConfig),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinDefinition {
+    pub id: BuiltinId,
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    pub description: &'static str,
+    pub arguments: ArgumentArity,
+    pub argument_hint: Option<&'static str>,
+    pub required_capabilities: TargetCapabilities,
+    pub completion: Option<CompletionKey>,
+}
+
+const INTERACTIVE: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::InteractiveUi);
+const SESSION: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::SessionControl);
+const MODEL: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::ModelSelection);
+const CWD: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::WorkingDirectory);
+const AGENT: TargetCapabilities = TargetCapabilities::from_capability(TargetCapability::AgentTurns);
+const PERMISSIONS: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::PermissionToggles);
+const CONFIG: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::ConfigToggles);
+const LIFECYCLE: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::ApplicationLifecycle);
+const RELOAD: TargetCapabilities = TargetCapabilities::from_capability(TargetCapability::Reload);
+
+macro_rules! builtin {
+    ($id:ident, $name:literal, $aliases:expr, $description:literal, $arguments:expr, $hint:expr, $caps:expr, $completion:expr $(,)?) => {
+        BuiltinDefinition {
+            id: BuiltinId::$id,
+            name: $name,
+            aliases: $aliases,
+            description: $description,
+            arguments: $arguments,
+            argument_hint: $hint,
+            required_capabilities: $caps,
+            completion: $completion,
+        }
+    };
+}
+
+pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
+    builtin!(
+        Tasks,
+        "/tasks",
+        &[],
+        "Browse and search tasks",
+        ArgumentArity::NONE,
+        None,
+        INTERACTIVE,
+        None,
+    ),
+    builtin!(
+        Compact,
+        "/compact",
+        &[],
+        "Summarize and compact conversation history",
+        ArgumentArity::NONE,
+        None,
+        SESSION,
+        None,
+    ),
+    builtin!(
+        New,
+        "/new",
+        &["/clear"],
+        "Start a new session",
+        ArgumentArity::NONE,
+        None,
+        SESSION,
+        None,
+    ),
+    builtin!(
+        Help,
+        "/help",
+        &[],
+        "Show keybindings",
+        ArgumentArity::NONE,
+        None,
+        INTERACTIVE,
+        None,
+    ),
+    builtin!(
+        Usage,
+        "/usage",
+        &[],
+        "Show token usage breakdown",
+        ArgumentArity::NONE,
+        None,
+        INTERACTIVE,
+        None,
+    ),
+    builtin!(
+        Queue,
+        "/queue",
+        &[],
+        "Remove items from queue",
+        ArgumentArity::NONE,
+        None,
+        INTERACTIVE,
+        None,
+    ),
+    builtin!(
+        Model,
+        "/model",
+        &[],
+        "Switch model",
+        ArgumentArity::OPTIONAL,
+        Some("<model>"),
+        MODEL,
+        Some(CompletionKey::Model),
+    ),
+    builtin!(
+        Theme,
+        "/theme",
+        &[],
+        "Switch color theme",
+        ArgumentArity::OPTIONAL,
+        Some("<theme>"),
+        INTERACTIVE,
+        Some(CompletionKey::Theme),
+    ),
+    builtin!(
+        Mcp,
+        "/mcp",
+        &[],
+        "Configure MCP servers",
+        ArgumentArity::NONE,
+        None,
+        INTERACTIVE,
+        None,
+    ),
+    builtin!(
+        Login,
+        "/login",
+        &[],
+        "Authenticate with an LLM provider",
+        ArgumentArity::NONE,
+        None,
+        INTERACTIVE,
+        None,
+    ),
+    builtin!(
+        Cd,
+        "/cd",
+        &[],
+        "Change working directory",
+        ArgumentArity::OPTIONAL,
+        Some("<path>"),
+        CWD,
+        None,
+    ),
+    builtin!(
+        Btw,
+        "/btw",
+        &[],
+        "Ask a quick question (no tools, no history pollution)",
+        ArgumentArity::ANY,
+        Some("<question>"),
+        AGENT,
+        None,
+    ),
+    builtin!(
+        Yolo,
+        "/yolo",
+        &[],
+        "Toggle YOLO mode (skip all permission prompts)",
+        ArgumentArity::NONE,
+        None,
+        PERMISSIONS,
+        None,
+    ),
+    builtin!(
+        Thinking,
+        "/thinking",
+        &[],
+        "Toggle extended thinking (off, adaptive, effort level, or budget)",
+        ArgumentArity::OPTIONAL,
+        Some("<mode>"),
+        INTERACTIVE,
+        None,
+    ),
+    builtin!(
+        Fast,
+        "/fast",
+        &[],
+        "Toggle Anthropic fast mode (Opus only)",
+        ArgumentArity::NONE,
+        None,
+        CONFIG,
+        None,
+    ),
+    builtin!(
+        Workflow,
+        "/workflow",
+        &[],
+        "Toggle workflow mode (task callable inside code_execution)",
+        ArgumentArity::NONE,
+        None,
+        CONFIG,
+        None,
+    ),
+    builtin!(
+        Exit,
+        "/exit",
+        &[],
+        "Exit the application",
+        ArgumentArity::NONE,
+        None,
+        LIFECYCLE,
+        None,
+    ),
+    builtin!(
+        Reload,
+        "/reload",
+        &[],
+        "Reload plugins and config",
+        ArgumentArity::NONE,
+        None,
+        RELOAD,
+        None,
+    ),
 ];
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
@@ -160,29 +390,20 @@ pub struct CommandSpec {
     pub aliases: Arc<[Arc<str>]>,
     pub arguments: ArgumentArity,
     pub docs: CommandDocs,
-    pub tui_only: bool,
+    pub required_capabilities: TargetCapabilities,
 }
 
-impl BuiltinCommand {
+impl BuiltinDefinition {
     pub fn spec(&self) -> CommandSpec {
         CommandSpec {
             name: Arc::from(self.name),
             aliases: self.aliases.iter().copied().map(Arc::from).collect(),
-            arguments: if self.max_args == usize::MAX {
-                ArgumentArity::unbounded(0)
-            } else {
-                ArgumentArity::bounded(0, self.max_args)
-            },
+            arguments: self.arguments,
             docs: CommandDocs {
                 summary: Arc::from(self.description),
-                argument_hint: match self.name {
-                    "/model" => Some(Arc::from("<model>")),
-                    "/cd" => Some(Arc::from("<path>")),
-                    "/btw" => Some(Arc::from("<question>")),
-                    _ => None,
-                },
+                argument_hint: self.argument_hint.map(Arc::from),
             },
-            tui_only: self.tui_only,
+            required_capabilities: self.required_capabilities,
         }
     }
 }
@@ -301,10 +522,32 @@ struct RegistryState {
     producers: Vec<ProducerSlot>,
     winners: HashMap<String, Winner>,
     projection: Arc<[ResolvedCommand]>,
+    targets: HashMap<InvocationTargetId, TargetRecord>,
+    subscribers: Vec<Weak<SubscriptionCore>>,
+    standard_commands_registered: bool,
     completion_sessions: HashMap<CompletionSessionId, Weak<CompletionSessionCore>>,
-    #[cfg(test)]
-    invalidation_gate: Option<Arc<TestRaceGate>>,
 }
+
+struct TargetRecord {
+    capabilities: TargetCapabilities,
+    host: Arc<dyn CommandHost>,
+}
+
+struct TargetCore {
+    id: InvocationTargetId,
+    registry: Weak<RegistryInner>,
+}
+
+#[derive(Clone)]
+pub struct TargetHandle(Arc<TargetCore>);
+
+struct SubscriptionCore {
+    generation: AtomicU64,
+    waker: Mutex<Option<Waker>>,
+}
+
+#[derive(Clone)]
+pub struct RegistrySubscription(Arc<SubscriptionCore>);
 
 struct ProducerSlot {
     id: ProducerId,
@@ -319,42 +562,14 @@ struct CompletionSessionCore {
     producer_id: ProducerId,
     registry: Weak<RegistryInner>,
     state: Mutex<CompletionSessionState>,
-    #[cfg(test)]
-    commit_gate: Mutex<Option<Arc<TestRaceGate>>>,
-    #[cfg(test)]
-    lifecycle_gate: Mutex<Option<Arc<TestRaceGate>>>,
-}
-
-#[cfg(test)]
-struct TestRaceGate {
-    reached: std::sync::Barrier,
-    resume: std::sync::Barrier,
-}
-
-#[cfg(test)]
-impl TestRaceGate {
-    fn new() -> Self {
-        Self {
-            reached: std::sync::Barrier::new(2),
-            resume: std::sync::Barrier::new(2),
-        }
-    }
-
-    fn wait(&self) {
-        self.reached.wait();
-        self.resume.wait();
-    }
 }
 
 struct CompletionSessionState {
     command: ResolvedCommand,
     provider: Arc<dyn CommandCompletion>,
     target_id: InvocationTargetId,
-    producer_generation: u64,
     next_request: u64,
     current_request: Option<CurrentCompletionRequest>,
-    callback_in_flight: bool,
-    pending_callbacks: VecDeque<LifecycleCallback>,
     closed: bool,
 }
 
@@ -362,19 +577,6 @@ struct CurrentCompletionRequest {
     id: u64,
     context: CompletionContext,
     cancellation: CancellationToken,
-    items: Option<Vec<CompletionItem>>,
-}
-
-struct LifecycleCallback {
-    provider: Arc<dyn CommandCompletion>,
-    context: CompletionContext,
-    event: CompletionLifecycleEvent,
-    cancellation: CancellationToken,
-}
-
-struct InvalidatedSession {
-    session: Arc<CompletionSessionCore>,
-    callback: Option<LifecycleCallback>,
 }
 
 #[derive(Clone)]
@@ -383,6 +585,23 @@ struct Winner {
     canonical: bool,
     precedence: ProducerPrecedence,
     creation_order: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentedCommand {
+    pub name: Arc<str>,
+    pub description: Arc<str>,
+    pub argument_hint: Option<Arc<str>>,
+}
+
+impl From<&ResolvedCommand> for PresentedCommand {
+    fn from(command: &ResolvedCommand) -> Self {
+        Self {
+            name: Arc::from(command.invoked_name()),
+            description: Arc::clone(&command.spec().docs.summary),
+            argument_hint: command.spec().docs.argument_hint.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -404,17 +623,20 @@ impl RegistrySnapshot {
 impl fmt::Debug for InputDispatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotCommand => formatter.write_str("NotCommand"),
-            Self::UnknownCommandInput => formatter.write_str("UnknownCommandInput"),
-            Self::Dispatched(_) => formatter.write_str("Dispatched(..)"),
+            Self::LiteralInput(content) => formatter
+                .debug_tuple("LiteralInput")
+                .field(content)
+                .finish(),
+            Self::Dispatched(outcome) => {
+                formatter.debug_tuple("Dispatched").field(outcome).finish()
+            }
         }
     }
 }
 
 pub enum InputDispatch {
-    NotCommand,
-    UnknownCommandInput,
-    Dispatched(CommandDispatch),
+    LiteralInput(CommandContent),
+    Dispatched(CommandOutcome),
 }
 
 #[derive(Clone)]
@@ -433,9 +655,10 @@ impl CommandRegistry {
                 producers: Vec::new(),
                 winners: HashMap::new(),
                 projection: Arc::from([]),
+                targets: HashMap::new(),
+                subscribers: Vec::new(),
+                standard_commands_registered: false,
                 completion_sessions: HashMap::new(),
-                #[cfg(test)]
-                invalidation_gate: None,
             }),
         }))
     }
@@ -461,13 +684,59 @@ impl CommandRegistry {
         }
     }
 
-    pub fn create_target(&self) -> InvocationTargetId {
+    pub fn bind_target(
+        &self,
+        capabilities: TargetCapabilities,
+        host: Arc<dyn CommandHost>,
+    ) -> TargetHandle {
         let mut state = self
             .0
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        InvocationTargetId::new(self.0.id, state.take_id())
+        let id = InvocationTargetId::new(self.0.id, state.take_id());
+        state
+            .targets
+            .insert(id, TargetRecord { capabilities, host });
+        TargetHandle(Arc::new(TargetCore {
+            id,
+            registry: Arc::downgrade(&self.0),
+        }))
+    }
+
+    pub fn claim_standard_commands(&self) -> bool {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.standard_commands_registered {
+            return false;
+        }
+        state.standard_commands_registered = true;
+        true
+    }
+
+    pub fn release_standard_commands(&self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .standard_commands_registered = false;
+    }
+
+    pub fn subscribe(&self) -> RegistrySubscription {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let core = Arc::new(SubscriptionCore {
+            generation: AtomicU64::new(state.generation),
+            waker: Mutex::new(None),
+        });
+        state.subscribers.push(Arc::downgrade(&core));
+        RegistrySubscription(core)
     }
 
     pub fn open_completion(
@@ -484,7 +753,7 @@ impl CommandRegistry {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let producer_generation = state
+        state
             .producers
             .iter()
             .find(|producer| {
@@ -494,7 +763,6 @@ impl CommandRegistry {
                         .iter()
                         .any(|record| record.command_id == command.command_id())
             })
-            .map(|producer| producer.generation)
             .ok_or(CompletionError::StaleCommand)?;
         let id = CompletionSessionId::new(self.0.id, state.take_id());
         let core = Arc::new(CompletionSessionCore {
@@ -505,17 +773,10 @@ impl CommandRegistry {
                 command: command.clone(),
                 provider,
                 target_id,
-                producer_generation,
                 next_request: 0,
                 current_request: None,
-                callback_in_flight: false,
-                pending_callbacks: VecDeque::new(),
                 closed: false,
             }),
-            #[cfg(test)]
-            commit_gate: Mutex::new(None),
-            #[cfg(test)]
-            lifecycle_gate: Mutex::new(None),
         });
         state.completion_sessions.insert(id, Arc::downgrade(&core));
         Ok(CompletionSession {
@@ -525,16 +786,25 @@ impl CommandRegistry {
         })
     }
 
-    pub fn resolve(&self, spelling: &str) -> Result<ResolvedCommand, ResolutionError> {
+    pub fn resolve_for(
+        &self,
+        target: &TargetHandle,
+        spelling: &str,
+    ) -> Result<ResolvedCommand, ResolutionError> {
         let normalized = normalize(spelling);
         let state = self
             .0
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let capabilities =
+            target_capabilities(&state, self.0.id, target).ok_or(ResolutionError::StaleTarget)?;
         state
             .winners
             .get(&normalized)
+            .filter(|winner| {
+                capabilities.contains_all(winner.record.registration.spec.required_capabilities)
+            })
             .map(|winner| ResolvedCommand {
                 registry_id: self.0.id,
                 record: Arc::clone(&winner.record),
@@ -543,76 +813,169 @@ impl CommandRegistry {
             .ok_or_else(|| ResolutionError::UnknownCommand(Arc::from(spelling)))
     }
 
-    pub fn snapshot(&self) -> RegistrySnapshot {
+    pub fn snapshot_for(&self, target: &TargetHandle) -> Result<RegistrySnapshot, CommandError> {
         let state = self
             .0
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        RegistrySnapshot {
+        let capabilities =
+            target_capabilities(&state, self.0.id, target).ok_or(CommandError::StaleTarget)?;
+        let commands = state
+            .projection
+            .iter()
+            .filter(|command| capabilities.contains_all(command.spec().required_capabilities))
+            .cloned()
+            .collect();
+        Ok(RegistrySnapshot {
             generation: state.generation,
-            commands: Arc::clone(&state.projection),
-        }
+            commands,
+        })
     }
 
-    /// Whether the first whitespace-delimited token of `input` resolves to a
-    /// registered command, without dispatching it. Frontends use this to
-    /// reject input combinations (such as images on a known command) before
-    /// any behavior runs.
-    pub fn resolves_input(&self, input: &str) -> bool {
-        ParsedInput::parse(input).is_some_and(|parsed| self.resolve(parsed.name).is_ok())
+    pub fn presented_commands(
+        &self,
+        target: &TargetHandle,
+    ) -> Result<Arc<[PresentedCommand]>, CommandError> {
+        Ok(self
+            .snapshot_for(target)?
+            .commands()
+            .iter()
+            .map(PresentedCommand::from)
+            .collect())
+    }
+
+    pub fn resolves_input_for(&self, target: &TargetHandle, input: &str) -> bool {
+        ParsedInput::parse(input)
+            .is_some_and(|parsed| self.resolve_for(target, parsed.name).is_ok())
     }
 
     pub fn dispatch_input(
         &self,
-        input: &str,
+        target: &TargetHandle,
+        content: CommandContent,
+    ) -> CommandFuture<InputDispatch> {
+        self.dispatch_input_at(target.clone(), content, 0)
+    }
+
+    pub fn dispatch_input_with_depth(
+        &self,
+        target: &TargetHandle,
+        content: CommandContent,
         depth: usize,
-        target_id: InvocationTargetId,
-    ) -> CommandFuture<Result<InputDispatch, CommandError>> {
-        let Some(parsed) = ParsedInput::parse(input) else {
-            return Box::pin(async { Ok(InputDispatch::NotCommand) });
+    ) -> CommandFuture<InputDispatch> {
+        self.dispatch_input_at(target.clone(), content, depth)
+    }
+
+    fn dispatch_input_at(
+        &self,
+        target: TargetHandle,
+        content: CommandContent,
+        depth: usize,
+    ) -> CommandFuture<InputDispatch> {
+        let Some(parsed) = ParsedInput::parse(&content.text) else {
+            return Box::pin(async move { InputDispatch::LiteralInput(content) });
         };
-        // Only resolved commands consume dispatch budget: anything else stays
-        // ordinary model text regardless of depth.
-        let Ok(command) = self.resolve(parsed.name) else {
-            return Box::pin(async { Ok(InputDispatch::UnknownCommandInput) });
+        let Ok(command) = self.resolve_for(&target, parsed.name) else {
+            return Box::pin(async move { InputDispatch::LiteralInput(content) });
         };
-        if target_id.0 != self.0.id {
-            return Box::pin(async { Err(CommandError::StaleTarget) });
-        }
-        if depth > MAX_COMMAND_DEPTH {
-            return Box::pin(async { Err(CommandError::MaximumDepth) });
-        }
-        let arguments: Arc<str> = Arc::from(parsed.arguments);
-        let count = arguments.split_whitespace().count();
-        if !command.spec().arguments.accepts(count) {
-            return Box::pin(async move {
-                Err(CommandError::InvalidArguments {
+        let arguments = Arc::from(parsed.arguments);
+        let registry = self.clone();
+        Box::pin(async move {
+            InputDispatch::Dispatched(
+                registry
+                    .dispatch_resolved(command, arguments, content, target, depth)
+                    .await,
+            )
+        })
+    }
+
+    pub fn dispatch_command(
+        &self,
+        target: &TargetHandle,
+        command: ResolvedCommand,
+        arguments: Arc<str>,
+        content: CommandContent,
+    ) -> CommandFuture<CommandOutcome> {
+        self.dispatch_command_with_depth(target, command, arguments, content, 0)
+    }
+
+    pub fn dispatch_command_with_depth(
+        &self,
+        target: &TargetHandle,
+        command: ResolvedCommand,
+        arguments: Arc<str>,
+        content: CommandContent,
+        depth: usize,
+    ) -> CommandFuture<CommandOutcome> {
+        self.dispatch_resolved(command, arguments, content, target.clone(), depth)
+    }
+
+    fn dispatch_resolved(
+        &self,
+        command: ResolvedCommand,
+        arguments: Arc<str>,
+        content: CommandContent,
+        target: TargetHandle,
+        depth: usize,
+    ) -> CommandFuture<CommandOutcome> {
+        let registry = self.clone();
+        Box::pin(async move {
+            if depth > MAX_COMMAND_DEPTH {
+                return CommandOutcome::Failed(CommandError::MaximumDepth);
+            }
+            let (capabilities, host) = {
+                let state = registry
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let Some(record) = target_record(&state, registry.0.id, &target) else {
+                    return CommandOutcome::Failed(CommandError::StaleTarget);
+                };
+                (record.capabilities, Arc::clone(&record.host))
+            };
+            if command.registry_id != registry.0.id {
+                return CommandOutcome::Failed(CommandError::StaleCommand);
+            }
+            {
+                let state = registry
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let Some(winner) = state.winners.get(&normalize(command.invoked_name())) else {
+                    return CommandOutcome::Failed(CommandError::StaleCommand);
+                };
+                if winner.record.command_id != command.command_id() {
+                    return CommandOutcome::Failed(CommandError::StaleCommand);
+                }
+            }
+            if !capabilities.contains_all(command.spec().required_capabilities) {
+                return CommandOutcome::Failed(CommandError::UnavailableCommand(Arc::clone(
+                    &command.spec().name,
+                )));
+            }
+            let count = arguments.split_whitespace().count();
+            if !command.spec().arguments.accepts(count) {
+                return CommandOutcome::Failed(CommandError::InvalidArguments {
                     command: Arc::clone(&command.spec().name),
                     expected: command.spec().arguments,
                     actual: count,
-                })
-            });
-        }
-
-        let registry = self.clone();
-        Box::pin(async move {
-            let (lifecycle, classification) = classification_channel();
+                });
+            }
             let invocation = command.invocation(
                 arguments,
+                content,
                 depth,
-                target_id,
-                InvocationDispatcher::new(Arc::new(registry)),
-                lifecycle.clone(),
+                target,
+                host,
+                InvocationDispatcher { registry },
             );
-            if let Err(error) = command.behavior().execute(invocation).await {
-                lifecycle.transition(CommandClassification::Failed(error.clone()));
-                return Err(error);
+            match command.behavior().execute(invocation).await {
+                Ok(outcome) => outcome,
+                Err(error) => CommandOutcome::Failed(error),
             }
-            Ok(InputDispatch::Dispatched(CommandDispatch::new(
-                classification,
-                lifecycle,
-            )))
         })
     }
 }
@@ -623,106 +986,69 @@ impl Default for CommandRegistry {
     }
 }
 
-impl DispatchCommands for CommandRegistry {
-    fn dispatch(
-        &self,
-        request: DispatchRequest,
-    ) -> CommandFuture<Result<CommandDispatch, CommandError>> {
-        let registry = self.clone();
-        Box::pin(async move {
-            let Some(parsed) = ParsedInput::parse(&request.input) else {
-                return Err(CommandError::Producer(Arc::from(
-                    "input is not a slash command",
-                )));
-            };
-            let command = registry
-                .resolve(parsed.name)
-                .map_err(|_| CommandError::UnknownCommand(Arc::from(parsed.name)))?;
-            registry
-                .dispatch_resolved(
-                    command,
-                    parsed.arguments,
-                    request.depth,
-                    request.target_id,
-                    request.lifecycle,
-                )
-                .await
-        })
+impl TargetHandle {
+    pub fn id(&self) -> InvocationTargetId {
+        self.0.id
     }
 }
 
-impl CommandRegistry {
-    pub fn dispatch_command(
-        &self,
-        command: ResolvedCommand,
-        arguments: &str,
-        depth: usize,
-        target_id: InvocationTargetId,
-    ) -> CommandFuture<Result<CommandDispatch, CommandError>> {
-        let (lifecycle, classification) = classification_channel();
-        let registry = self.clone();
-        let arguments = arguments.to_owned();
-        Box::pin(async move {
-            registry
-                .dispatch_resolved(command, &arguments, depth, target_id, lifecycle.clone())
-                .await?;
-            Ok(CommandDispatch::new(classification, lifecycle))
-        })
+impl Drop for TargetCore {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        registry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .targets
+            .remove(&self.id);
+    }
+}
+
+impl RegistrySubscription {
+    pub fn generation(&self) -> u64 {
+        self.0.generation.load(Ordering::Acquire)
     }
 
-    pub fn dispatch_resolved(
-        &self,
-        command: ResolvedCommand,
-        arguments: &str,
-        depth: usize,
-        target_id: InvocationTargetId,
-        lifecycle: InvocationLifecycle,
-    ) -> CommandFuture<Result<CommandDispatch, CommandError>> {
-        let ownership_error = if command.registry_id != self.0.id {
-            Some(CommandError::StaleCommand)
-        } else if target_id.0 != self.0.id {
-            Some(CommandError::StaleTarget)
-        } else {
-            None
-        };
-        if let Some(error) = ownership_error {
-            lifecycle.transition(CommandClassification::Failed(error.clone()));
-            return Box::pin(async move { Err(error) });
-        }
-        let count = arguments.split_whitespace().count();
-        if depth > MAX_COMMAND_DEPTH {
-            lifecycle.transition(CommandClassification::Failed(CommandError::MaximumDepth));
-            return Box::pin(async { Err(CommandError::MaximumDepth) });
-        }
-        if !command.spec().arguments.accepts(count) {
-            let error = CommandError::InvalidArguments {
-                command: Arc::clone(&command.spec().name),
-                expected: command.spec().arguments,
-                actual: count,
-            };
-            lifecycle.transition(CommandClassification::Failed(error.clone()));
-            return Box::pin(async move { Err(error) });
-        }
-        let registry = self.clone();
-        let arguments: Arc<str> = Arc::from(arguments);
-        Box::pin(async move {
-            let invocation = command.invocation(
-                arguments,
-                depth,
-                target_id,
-                InvocationDispatcher::new(Arc::new(registry)),
-                lifecycle.clone(),
-            );
-            command
-                .behavior()
-                .execute(invocation)
-                .await
-                .inspect_err(|error| {
-                    lifecycle.transition(CommandClassification::Failed(error.clone()));
-                })?;
-            Ok(CommandDispatch::new(lifecycle.classification(), lifecycle))
-        })
+    pub fn changed(&self, generation: u64) -> CommandFuture<u64> {
+        let subscription = self.clone();
+        Box::pin(poll_fn(move |context| {
+            let current = subscription.generation();
+            if current != generation {
+                return Poll::Ready(current);
+            }
+            *subscription
+                .0
+                .waker
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(context.waker().clone());
+            let current = subscription.generation();
+            if current != generation {
+                Poll::Ready(current)
+            } else {
+                Poll::Pending
+            }
+        }))
     }
+}
+
+fn target_record<'a>(
+    state: &'a RegistryState,
+    registry_id: RegistryId,
+    target: &TargetHandle,
+) -> Option<&'a TargetRecord> {
+    (target.0.id.0 == registry_id)
+        .then(|| state.targets.get(&target.0.id))
+        .flatten()
+}
+
+fn target_capabilities(
+    state: &RegistryState,
+    registry_id: RegistryId,
+    target: &TargetHandle,
+) -> Option<TargetCapabilities> {
+    target_record(state, registry_id, target).map(|record| record.capabilities)
 }
 
 impl Producer {
@@ -759,9 +1085,10 @@ impl Producer {
         state.producers[position].generation += 1;
         state.generation += 1;
         state.rebuild();
+        state.notify_subscribers();
         let callbacks = state.invalidate_completion_sessions(self.id);
         drop(state);
-        invoke_invalidated_sessions(callbacks);
+        drop(callbacks);
         Ok(())
     }
 
@@ -783,9 +1110,10 @@ impl Producer {
         state.producers.remove(position);
         state.generation += 1;
         state.rebuild();
+        state.notify_subscribers();
         let callbacks = state.invalidate_completion_sessions(self.id);
         drop(state);
-        invoke_invalidated_sessions(callbacks);
+        drop(callbacks);
         true
     }
 }
@@ -797,39 +1125,45 @@ impl RegistryState {
         id
     }
 
-    fn invalidate_completion_sessions(
-        &mut self,
-        producer_id: ProducerId,
-    ) -> Vec<InvalidatedSession> {
+    fn invalidate_completion_sessions(&mut self, producer_id: ProducerId) -> Vec<()> {
         let sessions = self
             .completion_sessions
             .iter()
             .filter_map(|(id, session)| session.upgrade().map(|session| (*id, session)))
             .filter(|(_, session)| session.producer_id == producer_id)
             .collect::<Vec<_>>();
-        #[cfg(test)]
-        if let Some(gate) = self.invalidation_gate.take() {
-            gate.wait();
+        for (id, session) in &sessions {
+            self.completion_sessions.remove(id);
+            let mut state = session
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.closed = true;
+            if let Some(current) = state.current_request.take() {
+                current.cancellation.cancel();
+            }
         }
-        let mut invalidated = Vec::new();
-        for (id, session) in sessions {
-            self.completion_sessions.remove(&id);
-            let callback = {
-                let mut state = session
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if state.closed {
-                    None
-                } else {
-                    state.closed = true;
-                    take_cancel_callback(&mut state)
-                        .and_then(|callback| start_or_queue_callback(&mut state, callback))
-                }
+        Vec::new()
+    }
+
+    fn notify_subscribers(&mut self) {
+        self.subscribers.retain(|subscriber| {
+            let Some(subscriber) = subscriber.upgrade() else {
+                return false;
             };
-            invalidated.push(InvalidatedSession { session, callback });
-        }
-        invalidated
+            subscriber
+                .generation
+                .store(self.generation, Ordering::Release);
+            if let Some(waker) = subscriber
+                .waker
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                waker.wake();
+            }
+            true
+        });
     }
 
     fn rebuild(&mut self) {
@@ -990,20 +1324,22 @@ impl ResolvedCommand {
     fn invocation(
         &self,
         arguments: Arc<str>,
+        content: CommandContent,
         depth: usize,
-        target_id: InvocationTargetId,
+        target: TargetHandle,
+        host: Arc<dyn CommandHost>,
         dispatcher: InvocationDispatcher,
-        lifecycle: InvocationLifecycle,
     ) -> CommandInvocation {
         CommandInvocation {
             command_id: self.command_id(),
             canonical_name: Arc::clone(&self.spec().name),
             invoked_name: Arc::clone(&self.invoked_name),
             arguments,
+            content,
             depth,
-            target_id,
+            target,
+            host,
             dispatcher,
-            lifecycle,
         }
     }
 
@@ -1043,8 +1379,68 @@ impl fmt::Debug for ResolvedCommand {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandAttachment {
+    pub media_type: Arc<str>,
+    pub data: Arc<str>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandContent {
+    pub text: Arc<str>,
+    pub attachments: Arc<[CommandAttachment]>,
+}
+
+impl From<&str> for CommandContent {
+    fn from(text: &str) -> Self {
+        Self {
+            text: Arc::from(text),
+            attachments: Arc::from([]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptReference {
+    pub qualified_name: Arc<str>,
+    pub arguments: Arc<[(Arc<str>, Arc<str>)]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTurn {
+    pub content: CommandContent,
+    pub prompt: Option<PromptReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Completed,
+    AgentTurn(AgentTurn),
+    Failed(CommandError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRequest {
+    Context(HostContextRequest),
+    Builtin(BuiltinOperation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostResponse {
+    Context(HostContextResponse),
+    Completed,
+    AgentTurn(AgentTurn),
+}
+
+pub trait CommandHost: Send + Sync + 'static {
+    fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>>;
+}
+
 pub trait CommandBehavior: Send + Sync + 'static {
-    fn execute(&self, invocation: CommandInvocation) -> CommandFuture<Result<(), CommandError>>;
+    fn execute(
+        &self,
+        invocation: CommandInvocation,
+    ) -> CommandFuture<Result<CommandOutcome, CommandError>>;
 }
 
 #[derive(Clone)]
@@ -1053,10 +1449,29 @@ pub struct CommandInvocation {
     pub canonical_name: Arc<str>,
     pub invoked_name: Arc<str>,
     pub arguments: Arc<str>,
+    pub content: CommandContent,
     pub depth: usize,
-    pub target_id: InvocationTargetId,
-    pub dispatcher: InvocationDispatcher,
-    pub lifecycle: InvocationLifecycle,
+    target: TargetHandle,
+    host: Arc<dyn CommandHost>,
+    dispatcher: InvocationDispatcher,
+}
+
+impl CommandInvocation {
+    pub fn host_request(
+        &self,
+        request: HostRequest,
+    ) -> CommandFuture<Result<HostResponse, CommandError>> {
+        self.host.request(request)
+    }
+
+    pub fn dispatch(&self, content: CommandContent) -> CommandFuture<InputDispatch> {
+        self.dispatcher
+            .dispatch(self.target.clone(), content, self.depth + 1)
+    }
+
+    pub fn target_id(&self) -> InvocationTargetId {
+        self.target.id()
+    }
 }
 
 impl fmt::Debug for CommandInvocation {
@@ -1067,156 +1482,27 @@ impl fmt::Debug for CommandInvocation {
             .field("canonical_name", &self.canonical_name)
             .field("invoked_name", &self.invoked_name)
             .field("arguments", &self.arguments)
+            .field("content", &self.content)
             .field("depth", &self.depth)
-            .field("target_id", &self.target_id)
+            .field("target_id", &self.target.id())
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Clone)]
-pub struct InvocationDispatcher(Arc<dyn DispatchCommands>);
+struct InvocationDispatcher {
+    registry: CommandRegistry,
+}
 
 impl InvocationDispatcher {
-    pub fn new(dispatcher: Arc<dyn DispatchCommands>) -> Self {
-        Self(dispatcher)
-    }
-
-    pub fn dispatch(
-        &self,
-        request: DispatchRequest,
-    ) -> CommandFuture<Result<CommandDispatch, CommandError>> {
-        self.0.dispatch(request)
-    }
-}
-
-pub trait DispatchCommands: Send + Sync + 'static {
     fn dispatch(
         &self,
-        request: DispatchRequest,
-    ) -> CommandFuture<Result<CommandDispatch, CommandError>>;
-}
-
-#[derive(Clone)]
-pub struct DispatchRequest {
-    pub input: Arc<str>,
-    pub depth: usize,
-    pub target_id: InvocationTargetId,
-    pub lifecycle: InvocationLifecycle,
-}
-
-pub struct CommandDispatch {
-    classification: CommandFuture<CommandClassification>,
-    lifecycle: InvocationLifecycle,
-}
-
-impl CommandDispatch {
-    pub fn new(
-        classification: CommandFuture<CommandClassification>,
-        lifecycle: InvocationLifecycle,
-    ) -> Self {
-        Self {
-            classification,
-            lifecycle,
-        }
+        target: TargetHandle,
+        content: CommandContent,
+        depth: usize,
+    ) -> CommandFuture<InputDispatch> {
+        self.registry.dispatch_input_at(target, content, depth)
     }
-
-    pub fn classification(self) -> CommandFuture<CommandClassification> {
-        self.classification
-    }
-
-    pub fn lifecycle(&self) -> &InvocationLifecycle {
-        &self.lifecycle
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandClassification {
-    Completed,
-    AgentTurnAccepted,
-    Failed(CommandError),
-}
-
-#[derive(Clone)]
-pub struct InvocationLifecycle(Arc<dyn ClassifyInvocation>);
-
-impl PartialEq for InvocationLifecycle {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-struct ClassificationState {
-    inner: Mutex<ClassificationInner>,
-}
-
-struct ClassificationInner {
-    classification: Option<CommandClassification>,
-    waker: Option<Waker>,
-}
-
-impl ClassifyInvocation for ClassificationState {
-    fn transition(&self, classification: CommandClassification) -> bool {
-        let waker = {
-            let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            if inner.classification.is_some() {
-                return false;
-            }
-            inner.classification = Some(classification);
-            inner.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        true
-    }
-
-    fn poll_classification(&self, waker: &Waker) -> Poll<CommandClassification> {
-        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        match inner.classification.clone() {
-            Some(classification) => Poll::Ready(classification),
-            None => {
-                inner.waker = Some(waker.clone());
-                Poll::Pending
-            }
-        }
-    }
-}
-
-fn classification_channel() -> (InvocationLifecycle, CommandFuture<CommandClassification>) {
-    let lifecycle = InvocationLifecycle(Arc::new(ClassificationState {
-        inner: Mutex::new(ClassificationInner {
-            classification: None,
-            waker: None,
-        }),
-    }));
-    let classification = lifecycle.classification();
-    (lifecycle, classification)
-}
-
-impl InvocationLifecycle {
-    pub fn new(lifecycle: Arc<dyn ClassifyInvocation>) -> Self {
-        Self(lifecycle)
-    }
-
-    pub fn detached() -> Self {
-        classification_channel().0
-    }
-
-    pub fn transition(&self, classification: CommandClassification) -> bool {
-        self.0.transition(classification)
-    }
-
-    pub fn classification(&self) -> CommandFuture<CommandClassification> {
-        let lifecycle = self.clone();
-        Box::pin(poll_fn(move |context| {
-            lifecycle.0.poll_classification(context.waker())
-        }))
-    }
-}
-
-pub trait ClassifyInvocation: Send + Sync + 'static {
-    fn transition(&self, classification: CommandClassification) -> bool;
-    fn poll_classification(&self, waker: &Waker) -> Poll<CommandClassification>;
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -1227,33 +1513,35 @@ pub enum RegistrationError {
     InvalidName(Arc<str>),
     #[error("command alias is invalid: {0}")]
     InvalidAlias(Arc<str>),
-    #[error("command argument range {min}..={max} is invalid")]
+    #[error("command argument arity is invalid")]
     InvalidArgumentArity { min: usize, max: usize },
-    #[error("command spelling is registered more than once: {0}")]
+    #[error("duplicate command spelling: {0}")]
     DuplicateSpelling(Arc<str>),
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ResolutionError {
-    #[error("unknown command: {0}")]
+    #[error("unknown command")]
     UnknownCommand(Arc<str>),
+    #[error("the command target is stale")]
+    StaleTarget,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum CommandError {
-    #[error("unknown command: {0}")]
-    UnknownCommand(Arc<str>),
-    #[error("invalid arguments for {command}: expected {expected}, got {actual}")]
+    #[error("unknown command")]
+    UnknownCommand,
+    #[error("invalid arguments for {command}: expected {expected}")]
     InvalidArguments {
         command: Arc<str>,
         expected: ArgumentArity,
         actual: usize,
     },
-    #[error("command is not supported by this frontend: {0}")]
-    UnsupportedFrontend(Arc<str>),
-    #[error("the resolved command belongs to another registry")]
+    #[error("command is unavailable: {0}")]
+    UnavailableCommand(Arc<str>),
+    #[error("the resolved command is stale")]
     StaleCommand,
-    #[error("the command target is no longer available")]
+    #[error("the command target is stale")]
     StaleTarget,
     #[error("maximum command recursion depth exceeded")]
     MaximumDepth,
@@ -1268,23 +1556,6 @@ impl fmt::Display for ArgumentArity {
             Some(max) => write!(formatter, "{}..={max}", self.min),
             None => write!(formatter, "{} or more", self.min),
         }
-    }
-}
-
-pub trait CommandCompletion: Send + Sync + 'static {
-    fn complete(
-        &self,
-        context: CompletionContext,
-        cancellation: CancellationToken,
-    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>>;
-
-    fn lifecycle(
-        &self,
-        _context: &CompletionContext,
-        _event: &CompletionLifecycleEvent,
-        _cancellation: &CancellationToken,
-    ) -> Result<(), CompletionError> {
-        Ok(())
     }
 }
 
@@ -1306,6 +1577,23 @@ pub struct CompletionItem {
     pub label: Arc<str>,
     pub insertion: Arc<str>,
     pub description: Option<Arc<str>>,
+}
+
+pub trait CommandCompletion: Send + Sync + 'static {
+    fn complete(
+        &self,
+        context: CompletionContext,
+        cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>>;
+
+    fn lifecycle(
+        &self,
+        _context: &CompletionContext,
+        _event: &CompletionLifecycleEvent,
+        _cancellation: &CancellationToken,
+    ) -> Result<(), CompletionError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1335,8 +1623,7 @@ impl CancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
-
-    pub(crate) fn cancel(&self) {
+    fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
 }
@@ -1352,11 +1639,9 @@ impl CompletionSession {
     pub fn id(&self) -> CompletionSessionId {
         self.core.id
     }
-
     pub fn command(&self) -> &ResolvedCommand {
         &self.command
     }
-
     pub fn target_id(&self) -> InvocationTargetId {
         self.target_id
     }
@@ -1368,224 +1653,125 @@ impl CompletionSession {
         argument_index: usize,
         mode: Arc<str>,
     ) -> CommandFuture<CompletionResult> {
-        let (provider, context, cancellation, request_id, producer_generation) = {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move {
+            let (provider, context, cancellation, request_id) = {
+                let mut state = core.state.lock().unwrap_or_else(|error| error.into_inner());
+                let request_id = state.next_request;
+                state.next_request += 1;
+                if let Some(current) = state.current_request.take() {
+                    current.cancellation.cancel();
+                }
+                let cancellation = CancellationToken::default();
+                let context = CompletionContext {
+                    command_id: state.command.command_id(),
+                    canonical_name: Arc::clone(&state.command.spec().name),
+                    invoked_name: Arc::from(state.command.invoked_name()),
+                    arguments,
+                    argument,
+                    argument_index,
+                    mode,
+                    target_id: state.target_id,
+                    session_id: core.id,
+                };
+                state.current_request = Some(CurrentCompletionRequest {
+                    id: request_id,
+                    context: context.clone(),
+                    cancellation: cancellation.clone(),
+                });
+                (
+                    Arc::clone(&state.provider),
+                    context,
+                    cancellation,
+                    request_id,
+                )
+            };
+            match provider.complete(context, cancellation.clone()).await {
+                Ok(items) if !cancellation.is_cancelled() => {
+                    let candidates = items
+                        .into_iter()
+                        .map(|item| CompletionCandidate {
+                            item,
+                            session_id: core.id,
+                            request_id,
+                        })
+                        .collect();
+                    CompletionResult::Items(candidates)
+                }
+                Ok(_) => CompletionResult::Cancelled,
+                Err(
+                    CompletionError::StaleCommand
+                    | CompletionError::StaleSession
+                    | CompletionError::StaleRequest,
+                ) => CompletionResult::Stale,
+                Err(CompletionError::Unavailable) => CompletionResult::Failed,
+            }
+        })
+    }
+
+    pub fn highlight(&self, candidate: &CompletionCandidate) -> Result<(), CompletionError> {
+        self.lifecycle(
+            candidate,
+            CompletionLifecycleEvent::Highlight(candidate.item.clone()),
+        )
+    }
+    pub fn accept(&self, candidate: CompletionCandidate) -> Result<(), CompletionError> {
+        self.lifecycle(
+            &candidate,
+            CompletionLifecycleEvent::Accept(candidate.item.clone()),
+        )
+    }
+    pub fn cancel(&self) -> Result<(), CompletionError> {
+        let (provider, context, cancellation) = {
             let mut state = self
                 .core
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if state.closed {
-                return Box::pin(async { CompletionResult::Stale });
+                return Err(CompletionError::StaleSession);
             }
-            let superseded = take_cancel_callback(&mut state);
-            state.next_request += 1;
-            let request_id = state.next_request;
-            let cancellation = CancellationToken::default();
-            let context = CompletionContext {
-                command_id: state.command.command_id(),
-                canonical_name: Arc::clone(&state.command.spec().name),
-                invoked_name: Arc::from(state.command.invoked_name()),
-                arguments,
-                argument,
-                argument_index,
-                mode,
-                target_id: state.target_id,
-                session_id: self.core.id,
+            let Some(current) = state.current_request.take() else {
+                return Ok(());
             };
-            state.current_request = Some(CurrentCompletionRequest {
-                id: request_id,
-                context: context.clone(),
-                cancellation: cancellation.clone(),
-                items: None,
-            });
-            let request = (
+            current.cancellation.cancel();
+            (
                 Arc::clone(&state.provider),
-                context,
-                cancellation,
-                request_id,
-                state.producer_generation,
-            );
-            let superseded =
-                superseded.and_then(|callback| start_or_queue_callback(&mut state, callback));
-            drop(state);
-            let _ = self.core.invoke_lifecycle(superseded);
-            request
+                current.context,
+                current.cancellation,
+            )
         };
-        let core = Arc::clone(&self.core);
-        let request = provider.complete(context, cancellation.clone());
-        let guard = PendingRequestGuard {
-            core: Arc::clone(&core),
-            request_id,
-            active: true,
-        };
-        Box::pin(async move {
-            let mut guard = guard;
-            let result = request.await;
-            #[cfg(test)]
-            if let Some(gate) = core.commit_gate.lock().unwrap().take() {
-                gate.wait();
-            }
-            let Some(registry) = core.registry.upgrade() else {
-                return CompletionResult::Stale;
-            };
-            let registry_state = registry
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let generation_matches = registry_state.producers.iter().any(|producer| {
-                producer.id == core.producer_id && producer.generation == producer_generation
-            });
-            let registered = registry_state
-                .completion_sessions
-                .get(&core.id)
-                .and_then(Weak::upgrade)
-                .is_some_and(|session| Arc::ptr_eq(&session, &core));
-            let mut state = core.state.lock().unwrap_or_else(|error| error.into_inner());
-            if state.closed || !generation_matches || !registered {
-                return CompletionResult::Stale;
-            }
-            let Some(current) = state.current_request.as_mut() else {
-                return CompletionResult::Stale;
-            };
-            if current.id != request_id {
-                return CompletionResult::Stale;
-            }
-            if cancellation.is_cancelled() {
-                return CompletionResult::Cancelled;
-            }
-            guard.active = false;
-            match result {
-                Ok(items) => {
-                    current.items = Some(items.clone());
-                    CompletionResult::Items(
-                        items
-                            .into_iter()
-                            .map(|item| CompletionCandidate {
-                                item,
-                                session_id: core.id,
-                                request_id,
-                            })
-                            .collect(),
-                    )
-                }
-                Err(error) => CompletionResult::Failed(error),
-            }
-        })
+        provider.lifecycle(&context, &CompletionLifecycleEvent::Cancel, &cancellation)
     }
 
-    pub fn highlight(&self, candidate: &CompletionCandidate) -> Result<(), CompletionError> {
-        self.core.lifecycle(candidate, false)
-    }
-
-    /// Accepts a candidate and closes the session. Fire-once: the session is
-    /// closed before the provider's lifecycle callback runs, so a provider
-    /// error here cannot be retried or rolled back.
-    pub fn accept(&self, candidate: CompletionCandidate) -> Result<(), CompletionError> {
-        self.core.lifecycle(&candidate, true)
-    }
-
-    pub fn cancel(&self) -> Result<(), CompletionError> {
-        self.core.close()
-    }
-}
-
-impl CompletionSessionCore {
     fn lifecycle(
         &self,
         candidate: &CompletionCandidate,
-        terminal: bool,
+        event: CompletionLifecycleEvent,
     ) -> Result<(), CompletionError> {
-        #[cfg(test)]
-        if let Some(gate) = self.lifecycle_gate.lock().unwrap().take() {
-            gate.wait();
-        }
-        let registry = self
-            .registry
-            .upgrade()
-            .ok_or(CompletionError::StaleSession)?;
-        let mut registry_state = registry
+        let state = self
+            .core
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let registered = registry_state
-            .completion_sessions
-            .get(&self.id)
-            .and_then(Weak::upgrade)
-            .is_some_and(|session| std::ptr::eq(session.as_ref(), self));
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let generation_matches = registry_state.producers.iter().any(|producer| {
-            producer.id == self.producer_id && producer.generation == state.producer_generation
-        });
-        if !registered || !generation_matches {
+        if candidate.session_id != self.core.id {
             return Err(CompletionError::StaleSession);
         }
-        if state.closed || candidate.session_id != self.id {
-            return Err(CompletionError::StaleSession);
-        }
-        let request = state
+        let current = state
             .current_request
             .as_ref()
-            .filter(|request| request.id == candidate.request_id)
             .ok_or(CompletionError::StaleRequest)?;
-        let callback = LifecycleCallback {
-            provider: Arc::clone(&state.provider),
-            context: request.context.clone(),
-            event: if terminal {
-                CompletionLifecycleEvent::Accept(candidate.item.clone())
-            } else {
-                CompletionLifecycleEvent::Highlight(candidate.item.clone())
-            },
-            cancellation: request.cancellation.clone(),
-        };
-        if terminal {
-            state.closed = true;
-            state.current_request = None;
-            registry_state.completion_sessions.remove(&self.id);
+        if current.id != candidate.request_id {
+            return Err(CompletionError::StaleRequest);
         }
-        let callback = start_or_queue_callback(&mut state, callback);
-        drop(state);
-        drop(registry_state);
-        self.invoke_lifecycle(callback)
+        state
+            .provider
+            .lifecycle(&current.context, &event, &current.cancellation)
     }
+}
 
-    fn close(&self) -> Result<(), CompletionError> {
-        let callback = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            if state.closed {
-                return Err(CompletionError::StaleSession);
-            }
-            state.closed = true;
-            take_cancel_callback(&mut state)
-                .and_then(|callback| start_or_queue_callback(&mut state, callback))
-        };
-        self.unregister();
-        self.invoke_lifecycle(callback)
-    }
-
-    fn invoke_lifecycle(&self, callback: Option<LifecycleCallback>) -> Result<(), CompletionError> {
-        let Some(mut callback) = callback else {
-            return Ok(());
-        };
-        let mut result = Ok(());
-        loop {
-            let callback_result = callback.provider.lifecycle(
-                &callback.context,
-                &callback.event,
-                &callback.cancellation,
-            );
-            if result.is_ok() {
-                result = callback_result;
-            }
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            let Some(next) = state.pending_callbacks.pop_front() else {
-                state.callback_in_flight = false;
-                return result;
-            };
-            callback = next;
-        }
-    }
-
-    fn unregister(&self) {
+impl Drop for CompletionSessionCore {
+    fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
             registry
                 .state
@@ -1597,94 +1783,17 @@ impl CompletionSessionCore {
     }
 }
 
-impl Drop for CompletionSessionCore {
-    fn drop(&mut self) {
-        self.unregister();
-        let callback = take_cancel_callback(
-            self.state
-                .get_mut()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
-        if let Some(callback) = callback {
-            let _ = callback.provider.lifecycle(
-                &callback.context,
-                &callback.event,
-                &callback.cancellation,
-            );
-        }
-    }
-}
-
-struct PendingRequestGuard {
-    core: Arc<CompletionSessionCore>,
-    request_id: u64,
-    active: bool,
-}
-
-impl Drop for PendingRequestGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let callback = {
-            let mut state = self
-                .core
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            state
-                .current_request
-                .as_ref()
-                .is_some_and(|request| request.id == self.request_id)
-                .then(|| take_cancel_callback(&mut state))
-                .flatten()
-                .and_then(|callback| start_or_queue_callback(&mut state, callback))
-        };
-        let _ = self.core.invoke_lifecycle(callback);
-    }
-}
-
-fn take_cancel_callback(state: &mut CompletionSessionState) -> Option<LifecycleCallback> {
-    let request = state.current_request.take()?;
-    request.cancellation.cancel();
-    Some(LifecycleCallback {
-        provider: Arc::clone(&state.provider),
-        context: request.context,
-        event: CompletionLifecycleEvent::Cancel,
-        cancellation: request.cancellation,
-    })
-}
-
-fn start_or_queue_callback(
-    state: &mut CompletionSessionState,
-    callback: LifecycleCallback,
-) -> Option<LifecycleCallback> {
-    if state.callback_in_flight {
-        state.pending_callbacks.push_back(callback);
-        None
-    } else {
-        state.callback_in_flight = true;
-        Some(callback)
-    }
-}
-
-fn invoke_invalidated_sessions(sessions: Vec<InvalidatedSession>) {
-    for InvalidatedSession { session, callback } in sessions {
-        let _ = session.invoke_lifecycle(callback);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionResult {
     Items(Vec<CompletionCandidate>),
     Stale,
     Cancelled,
-    Failed(CompletionError),
+    Failed,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum CompletionError {
-    #[error("the command has no completion provider")]
+    #[error("completion is unavailable")]
     Unavailable,
     #[error("the resolved command is no longer registered")]
     StaleCommand,
@@ -1696,1428 +1805,149 @@ pub enum CompletionError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, Wake, Waker};
+    use super::*;
 
-    use super::{
-        ArgumentArity, BUILTIN_COMMANDS, CancellationToken, CommandBehavior, CommandClassification,
-        CommandCompletion, CommandDocs, CommandFuture, CommandInvocation, CommandSpec,
-        CompletionContext, CompletionItem, InvocationLifecycle, ProducerPrecedence, Registration,
-    };
+    struct OutcomeBehavior(CommandOutcome);
 
-    struct WakeCounter(AtomicUsize);
-
-    impl Wake for WakeCounter {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn transition_wakes_registered_poller_exactly_once() {
-        let lifecycle = InvocationLifecycle::detached();
-        let mut classification = lifecycle.classification();
-        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
-        let waker = Waker::from(counter.clone());
-        let mut context = Context::from_waker(&waker);
-        assert!(classification.as_mut().poll(&mut context).is_pending());
-
-        assert!(lifecycle.transition(CommandClassification::Completed));
-        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
-        assert!(matches!(
-            classification.as_mut().poll(&mut context),
-            Poll::Ready(CommandClassification::Completed)
-        ));
-        assert!(!lifecycle.transition(CommandClassification::Failed(
-            super::CommandError::Producer(Arc::from("late")),
-        )));
-    }
-
-    struct Behavior;
-
-    impl CommandBehavior for Behavior {
+    impl CommandBehavior for OutcomeBehavior {
         fn execute(
             &self,
             _invocation: CommandInvocation,
-        ) -> CommandFuture<Result<(), super::CommandError>> {
-            Box::pin(async { Ok(()) })
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            let outcome = self.0.clone();
+            Box::pin(async move { Ok(outcome) })
         }
     }
 
-    struct Completion;
+    struct Host;
 
-    impl CommandCompletion for Completion {
-        fn complete(
+    impl CommandHost for Host {
+        fn request(
             &self,
-            _context: CompletionContext,
-            _cancellation: CancellationToken,
-        ) -> CommandFuture<Result<Vec<CompletionItem>, super::CompletionError>> {
-            Box::pin(async { Ok(Vec::new()) })
+            _request: HostRequest,
+        ) -> CommandFuture<Result<HostResponse, CommandError>> {
+            Box::pin(async { Ok(HostResponse::Completed) })
         }
     }
 
-    #[test]
-    fn builtin_metadata_matches_ui_dispatch() {
-        let expected = [
-            ("/tasks", 0),
-            ("/compact", 0),
-            ("/new", 0),
-            ("/help", 0),
-            ("/usage", 0),
-            ("/queue", 0),
-            ("/model", 1),
-            ("/theme", 1),
-            ("/mcp", 0),
-            ("/login", 0),
-            ("/cd", 1),
-            ("/btw", usize::MAX),
-            ("/yolo", 0),
-            ("/thinking", 1),
-            ("/fast", 0),
-            ("/workflow", 0),
-            ("/exit", 0),
-            ("/reload", 0),
-        ];
-
-        assert_eq!(BUILTIN_COMMANDS.len(), expected.len());
-        for (command, expected) in BUILTIN_COMMANDS.iter().zip(expected) {
-            assert_eq!((command.name, command.max_args), expected);
-        }
-        assert_eq!(BUILTIN_COMMANDS[2].aliases, ["/clear"]);
-    }
-
-    #[test]
-    fn builtin_specs_match_portability_plan() {
-        let expected = [
-            ("/tasks", true, None),
-            ("/compact", false, None),
-            ("/new", false, None),
-            ("/help", true, None),
-            ("/usage", true, None),
-            ("/queue", true, None),
-            ("/model", false, Some("<model>")),
-            ("/theme", true, None),
-            ("/mcp", true, None),
-            ("/login", true, None),
-            ("/cd", false, Some("<path>")),
-            ("/btw", false, Some("<question>")),
-            ("/yolo", false, None),
-            ("/thinking", true, None),
-            ("/fast", false, None),
-            ("/workflow", false, None),
-            ("/exit", true, None),
-            ("/reload", true, None),
-        ];
-
-        assert_eq!(BUILTIN_COMMANDS.len(), expected.len());
-        for (command, (name, tui_only, argument_hint)) in BUILTIN_COMMANDS.iter().zip(expected) {
-            let spec = command.spec();
-            assert_eq!(spec.name.as_ref(), name);
-            assert_eq!(spec.tui_only, tui_only);
-            assert_eq!(spec.docs.argument_hint.as_deref(), argument_hint);
-        }
-    }
-
-    #[test]
-    fn builtin_registration_projection_contains_each_canonical_command_and_alias() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(ProducerPrecedence::Builtin);
-        producer
-            .replace(
-                BUILTIN_COMMANDS
-                    .iter()
-                    .map(|command| Registration {
-                        spec: command.spec(),
-                        behavior: Arc::new(Behavior),
-                        completion: None,
-                    })
-                    .collect(),
-            )
-            .unwrap();
-
-        let snapshot = registry.snapshot();
-        let projected: Vec<_> = snapshot
-            .commands()
-            .iter()
-            .map(|command| command.spec().name.as_ref())
-            .collect();
-        let expected: Vec<_> = BUILTIN_COMMANDS
-            .iter()
-            .flat_map(|command| {
-                std::iter::once(command.name).chain(command.aliases.iter().map(|_| command.name))
-            })
-            .collect();
-        assert_eq!(projected, expected);
-        assert_eq!(
-            registry.resolve("/clear").unwrap().spec().name.as_ref(),
-            "/new"
-        );
-    }
-
-    #[test]
-    fn plugin_wins_over_builtin_for_thinking() {
-        let registry = super::CommandRegistry::new();
-        let builtin = registry.create_producer(ProducerPrecedence::Builtin);
-        builtin
-            .replace(vec![Registration {
-                spec: BUILTIN_COMMANDS
-                    .iter()
-                    .find(|command| command.name == "/thinking")
-                    .unwrap()
-                    .spec(),
-                behavior: Arc::new(Behavior),
-                completion: None,
-            }])
-            .unwrap();
-        let plugin = registry.create_producer(ProducerPrecedence::Plugin);
-        plugin
-            .replace(vec![registration(
-                "/thinking",
-                &[],
-                ArgumentArity::OPTIONAL,
-            )])
-            .unwrap();
-
-        let resolved = registry.resolve("/thinking").unwrap();
-        assert_eq!(resolved.producer_id(), plugin.id());
-        assert!(!resolved.spec().tui_only);
-    }
-
-    #[test]
-    fn standard_arities_accept_expected_counts() {
-        assert!(ArgumentArity::NONE.accepts(0));
-        assert!(!ArgumentArity::NONE.accepts(1));
-        assert!(ArgumentArity::OPTIONAL.accepts(0));
-        assert!(ArgumentArity::OPTIONAL.accepts(1));
-        assert!(!ArgumentArity::OPTIONAL.accepts(2));
-        assert!(!ArgumentArity::ONE_OR_MORE.accepts(0));
-        assert!(ArgumentArity::ONE_OR_MORE.accepts(2));
-    }
-
-    #[test]
-    fn registration_contains_behavior_and_completion() {
-        let registration = Registration {
-            spec: CommandSpec {
-                name: Arc::from("/test"),
-                aliases: Arc::from([Arc::from("/alias")]),
-                arguments: ArgumentArity::ANY,
-                docs: CommandDocs {
-                    summary: Arc::from("Test command"),
-                    argument_hint: Some(Arc::from("[value]")),
-                },
-                tui_only: false,
-            },
-            behavior: Arc::new(Behavior),
-            completion: Some(Arc::new(Completion)),
-        };
-
-        assert_eq!(registration.spec.name.as_ref(), "/test");
-        assert!(registration.completion.is_some());
-    }
-
-    #[test]
-    fn cancellation_is_shared_and_idempotent() {
-        let token = CancellationToken::default();
-        let observer = token.clone();
-        token.cancel();
-        token.cancel();
-        assert!(observer.is_cancelled());
-    }
-
-    #[test]
-    fn opaque_ids_are_distinct_types() {
-        let registry = super::RegistryId(1);
-        let producer = super::ProducerId::new(registry, 1);
-        let command = super::CommandId::new(registry, 1);
-        assert_eq!(producer, super::ProducerId::new(registry, 1));
-        assert_eq!(command, super::CommandId::new(registry, 1));
-    }
-
-    fn registration(name: &str, aliases: &[&str], arity: ArgumentArity) -> Registration {
+    fn registration(name: &str, capabilities: TargetCapabilities) -> Registration {
         Registration {
             spec: CommandSpec {
                 name: Arc::from(name),
-                aliases: aliases.iter().map(|alias| Arc::from(*alias)).collect(),
-                arguments: arity,
+                aliases: Arc::from([]),
+                arguments: ArgumentArity::ANY,
                 docs: CommandDocs {
-                    summary: Arc::from("test"),
+                    summary: Arc::from("test command"),
                     argument_hint: None,
                 },
-                tui_only: false,
+                required_capabilities: capabilities,
             },
-            behavior: Arc::new(Behavior),
+            behavior: Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
             completion: None,
         }
     }
 
     #[test]
-    fn slash_input_parse_edge_cases_do_not_dispatch() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
+    fn projection_and_dispatch_share_capability_filter() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Builtin);
+        let required = TargetCapabilities::from_capability(TargetCapability::InteractiveUi);
         producer
-            .replace(vec![registration("/run", &[], ArgumentArity::ANY)])
+            .replace(vec![registration("/picker", required)])
             .unwrap();
-        let target = registry.create_target();
-        for input in ["/", "/ cmd", "   ", "\t\n"] {
-            let dispatch =
-                futures_lite::future::block_on(registry.dispatch_input(input, 0, target)).unwrap();
-            assert!(
-                matches!(
-                    dispatch,
-                    super::InputDispatch::NotCommand | super::InputDispatch::UnknownCommandInput
-                ),
-                "input {input:?} unexpectedly dispatched"
-            );
-        }
-    }
+        let portable = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+        let interactive = registry.bind_target(required, Arc::new(Host));
 
-    #[test]
-    fn alias_tie_break_survives_producer_removal() {
-        let registry = super::CommandRegistry::new();
-        let canonical = registry.create_producer(super::ProducerPrecedence::Builtin);
-        canonical
-            .replace(vec![registration("/dup", &[], ArgumentArity::ANY)])
-            .unwrap();
-        let alias = registry.create_producer(super::ProducerPrecedence::Builtin);
-        alias
-            .replace(vec![registration("/other", &["/dup"], ArgumentArity::ANY)])
-            .unwrap();
-
-        // Canonical beats alias regardless of producer age.
-        let winner = registry.resolve("/DUP").unwrap();
-        assert_eq!(winner.spec().name.as_ref(), "/dup");
-
-        // After the canonical holder is removed, the older alias producer
-        // wins over a same-precedence latecomer.
-        canonical.remove();
-        let latecomer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        latecomer
-            .replace(vec![registration("/third", &["/dup"], ArgumentArity::ANY)])
-            .unwrap();
-        let winner = registry.resolve("/DUP").unwrap();
-        assert_eq!(winner.spec().name.as_ref(), "/other");
-
-        alias.remove();
-        let winner = registry.resolve("/DUP").unwrap();
-        assert_eq!(winner.spec().name.as_ref(), "/third");
-    }
-
-    #[test]
-    fn replacement_is_atomic() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![registration("/old", &[], ArgumentArity::ANY)])
-            .unwrap();
-        let generation = registry.snapshot().generation();
-
-        producer
-            .replace(vec![
-                registration("/new", &[], ArgumentArity::ANY),
-                registration("/other", &[], ArgumentArity::ANY),
-            ])
-            .unwrap();
-
-        assert_eq!(registry.snapshot().generation(), generation + 1);
-        assert!(registry.resolve("/old").is_err());
-        assert!(registry.resolve("/new").is_ok());
-        assert!(registry.resolve("/other").is_ok());
-    }
-
-    #[test]
-    fn invalid_replacement_preserves_generation() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![registration("/valid", &[], ArgumentArity::ANY)])
-            .unwrap();
-        let before = registry.snapshot();
-
-        assert!(
-            producer
-                .replace(vec![registration("invalid", &[], ArgumentArity::ANY)])
-                .is_err()
-        );
-
-        assert_eq!(registry.snapshot().generation(), before.generation());
-        assert!(registry.resolve("/valid").is_ok());
-    }
-
-    #[test]
-    fn duplicate_normalized_spelling_is_rejected() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        let error = producer
-            .replace(vec![registration("/test", &["/TEST"], ArgumentArity::ANY)])
-            .unwrap_err();
+        assert!(registry.resolve_for(&portable, "/picker").is_err());
+        assert!(registry.presented_commands(&portable).unwrap().is_empty());
         assert!(matches!(
-            error,
-            super::RegistrationError::DuplicateSpelling(_)
+            futures_lite::future::block_on(registry.dispatch_input(&portable, "/picker".into())),
+            InputDispatch::LiteralInput(_)
+        ));
+        assert_eq!(registry.presented_commands(&interactive).unwrap().len(), 1);
+        assert!(matches!(
+            futures_lite::future::block_on(registry.dispatch_input(&interactive, "/picker".into())),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
     }
 
     #[test]
-    fn precedence_matrix_uses_one_winner() {
-        let registry = super::CommandRegistry::new();
-        let builtin = registry.create_producer(super::ProducerPrecedence::Builtin);
-        let application = registry.create_producer(super::ProducerPrecedence::Application);
-        let mcp = registry.create_producer(super::ProducerPrecedence::Mcp);
-        let plugin = registry.create_producer(super::ProducerPrecedence::Plugin);
-        for producer in [&builtin, &application, &mcp, &plugin] {
-            producer
-                .replace(vec![registration("/same", &[], ArgumentArity::ANY)])
-                .unwrap();
-        }
-        assert_eq!(
-            registry.resolve("/same").unwrap().producer_id(),
-            plugin.id()
-        );
-    }
-
-    #[test]
-    fn canonical_beats_alias_at_equal_precedence() {
-        let registry = super::CommandRegistry::new();
-        let alias = registry.create_producer(super::ProducerPrecedence::Application);
-        let canonical = registry.create_producer(super::ProducerPrecedence::Application);
-        alias
-            .replace(vec![registration("/other", &["/same"], ArgumentArity::ANY)])
-            .unwrap();
-        canonical
-            .replace(vec![registration("/same", &[], ArgumentArity::ANY)])
-            .unwrap();
-        assert_eq!(
-            registry.resolve("/same").unwrap().producer_id(),
-            canonical.id()
-        );
-    }
-
-    #[test]
-    fn creation_order_breaks_equal_ties() {
-        let registry = super::CommandRegistry::new();
-        let first = registry.create_producer(super::ProducerPrecedence::Application);
-        let second = registry.create_producer(super::ProducerPrecedence::Application);
-        first
-            .replace(vec![registration("/same", &[], ArgumentArity::ANY)])
-            .unwrap();
-        second
-            .replace(vec![registration("/same", &[], ArgumentArity::ANY)])
-            .unwrap();
-        assert_eq!(registry.resolve("/same").unwrap().producer_id(), first.id());
-    }
-
-    #[test]
-    fn palette_and_resolve_share_winners() {
-        let registry = super::CommandRegistry::new();
-        let builtin = registry.create_producer(super::ProducerPrecedence::Builtin);
-        let plugin = registry.create_producer(super::ProducerPrecedence::Plugin);
-        builtin
-            .replace(vec![registration("/same", &[], ArgumentArity::ANY)])
-            .unwrap();
-        plugin
-            .replace(vec![registration("/same", &[], ArgumentArity::ANY)])
-            .unwrap();
-        let resolved = registry.resolve("/same").unwrap();
-        let snapshot = registry.snapshot();
-        assert_eq!(snapshot.commands().len(), 1);
-        assert_eq!(snapshot.commands()[0].command_id(), resolved.command_id());
-    }
-
-    #[test]
-    fn snapshot_contains_each_winning_spelling_in_deterministic_order() {
-        let registry = super::CommandRegistry::new();
-        let builtin = registry.create_producer(super::ProducerPrecedence::Builtin);
-        let plugin = registry.create_producer(super::ProducerPrecedence::Plugin);
+    fn portable_override_wins_over_restricted_builtin() {
+        let registry = CommandRegistry::new();
+        let builtin = registry.create_producer(ProducerPrecedence::Builtin);
         builtin
             .replace(vec![registration(
-                "/builtin",
-                &["/shared", "/builtin-alias"],
-                ArgumentArity::ANY,
-            )])
-            .unwrap();
-        plugin
-            .replace(vec![
-                registration("/plugin", &["/shared", "/plugin-alias"], ArgumentArity::ANY),
-                registration("/second", &["/second-alias"], ArgumentArity::ANY),
-            ])
-            .unwrap();
-
-        let snapshot = registry.snapshot();
-        let spellings = snapshot
-            .commands()
-            .iter()
-            .map(|command| command.invoked_name())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            spellings,
-            [
-                "/plugin",
                 "/shared",
-                "/plugin-alias",
-                "/second",
-                "/second-alias",
-                "/builtin",
-                "/builtin-alias",
-            ]
-        );
-        assert!(
-            snapshot
-                .commands()
-                .iter()
-                .filter(|command| command.invoked_name() == "/shared")
-                .all(|command| command.producer_id() == plugin.id())
-        );
-    }
-
-    #[test]
-    fn removing_winner_restores_colliding_spelling() {
-        let registry = super::CommandRegistry::new();
-        let builtin = registry.create_producer(super::ProducerPrecedence::Builtin);
-        let plugin = registry.create_producer(super::ProducerPrecedence::Plugin);
-        builtin
-            .replace(vec![registration("/shared", &[], ArgumentArity::ANY)])
-            .unwrap();
-        plugin
-            .replace(vec![registration(
-                "/plugin",
-                &["/shared"],
-                ArgumentArity::ANY,
+                TargetCapabilities::from_capability(TargetCapability::InteractiveUi),
             )])
             .unwrap();
-
-        assert_eq!(
-            registry.resolve("/shared").unwrap().producer_id(),
-            plugin.id()
-        );
-        assert!(plugin.remove());
-
-        let resolved = registry.resolve("/shared").unwrap();
-        assert_eq!(resolved.producer_id(), builtin.id());
-        assert_eq!(
-            registry
-                .snapshot()
-                .commands()
-                .iter()
-                .map(|command| command.invoked_name())
-                .collect::<Vec<_>>(),
-            ["/shared"]
-        );
-    }
-
-    #[test]
-    fn owned_resolution_executes_after_replacement() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![registration("/old", &[], ArgumentArity::ANY)])
+        let plugin = registry.create_producer(ProducerPrecedence::Plugin);
+        plugin
+            .replace(vec![registration("/shared", TargetCapabilities::NONE)])
             .unwrap();
-        let resolved = registry.resolve("/old").unwrap();
-        producer.replace(Vec::new()).unwrap();
-        let invocation = CommandInvocation {
-            command_id: resolved.command_id(),
-            canonical_name: Arc::clone(&resolved.spec().name),
-            invoked_name: Arc::from("/old"),
-            arguments: Arc::from(""),
-            depth: 0,
-            target_id: registry.create_target(),
-            dispatcher: super::InvocationDispatcher::new(Arc::new(registry)),
-            lifecycle: super::classification_channel().0,
-        };
-        futures_lite::future::block_on(resolved.behavior().execute(invocation)).unwrap();
-    }
+        let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
 
-    #[test]
-    fn removed_command_is_not_resolved_again() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![registration("/gone", &[], ArgumentArity::ANY)])
-            .unwrap();
-        assert!(producer.remove());
-        assert!(registry.resolve("/gone").is_err());
-        assert!(!producer.remove());
-    }
-
-    #[test]
-    fn input_parsing_preserves_remainder_and_validates_arity() {
-        struct Capture(Arc<std::sync::Mutex<Option<Arc<str>>>>);
-        impl CommandBehavior for Capture {
-            fn execute(
-                &self,
-                invocation: CommandInvocation,
-            ) -> CommandFuture<Result<(), super::CommandError>> {
-                *self.0.lock().unwrap() = Some(invocation.arguments);
-                invocation
-                    .lifecycle
-                    .transition(super::CommandClassification::Completed);
-                Box::pin(async { Ok(()) })
-            }
-        }
-        let captured = Arc::new(std::sync::Mutex::new(None));
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        let mut command = registration("/run", &[], ArgumentArity::ONE);
-        command.behavior = Arc::new(Capture(Arc::clone(&captured)));
-        producer.replace(vec![command]).unwrap();
-        let target = registry.create_target();
-
-        let dispatched =
-            futures_lite::future::block_on(registry.dispatch_input("  /RUN   value  ", 0, target))
-                .unwrap();
-        assert!(matches!(dispatched, super::InputDispatch::Dispatched(_)));
-        assert_eq!(captured.lock().unwrap().as_deref(), Some("value"));
-        let error =
-            futures_lite::future::block_on(registry.dispatch_input("/run one two", 0, target))
-                .unwrap_err();
+        let resolved = registry.resolve_for(&target, "/shared").unwrap();
+        assert_eq!(resolved.producer_id(), plugin.id());
         assert!(matches!(
-            error,
-            super::CommandError::InvalidArguments { actual: 2, .. }
+            futures_lite::future::block_on(registry.dispatch_input(&target, "/shared".into())),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
     }
 
     #[test]
-    fn unknown_and_non_command_inputs_are_distinct() {
-        let registry = super::CommandRegistry::new();
-        let target = registry.create_target();
-        assert!(matches!(
-            futures_lite::future::block_on(registry.dispatch_input("hello", 0, target)).unwrap(),
-            super::InputDispatch::NotCommand
-        ));
-        assert!(matches!(
-            futures_lite::future::block_on(registry.dispatch_input("/unknown text", 0, target))
-                .unwrap(),
-            super::InputDispatch::UnknownCommandInput
-        ));
-    }
-
-    fn completion_item(label: &str) -> CompletionItem {
-        CompletionItem {
-            label: Arc::from(label),
-            insertion: Arc::from(label),
-            description: None,
-        }
-    }
-
-    struct ControlledCompletion {
-        requests: std::sync::mpsc::Sender<(Arc<str>, CancellationToken)>,
-        responses: std::sync::Mutex<
-            std::collections::HashMap<String, std::sync::mpsc::Receiver<Vec<CompletionItem>>>,
-        >,
-        events: std::sync::mpsc::Sender<super::CompletionLifecycleEvent>,
-        on_lifecycle: Option<Arc<dyn Fn() + Send + Sync>>,
-    }
-
-    impl CommandCompletion for ControlledCompletion {
-        fn complete(
-            &self,
-            context: CompletionContext,
-            cancellation: CancellationToken,
-        ) -> CommandFuture<Result<Vec<CompletionItem>, super::CompletionError>> {
-            let response = self
-                .responses
-                .lock()
-                .unwrap()
-                .remove(context.argument.as_ref())
-                .unwrap();
-            self.requests
-                .send((context.argument, cancellation))
-                .unwrap();
-            Box::pin(async move { Ok(response.recv().unwrap()) })
-        }
-
-        fn lifecycle(
-            &self,
-            _context: &CompletionContext,
-            event: &super::CompletionLifecycleEvent,
-            _cancellation: &CancellationToken,
-        ) -> Result<(), super::CompletionError> {
-            self.events.send(event.clone()).unwrap();
-            if let Some(callback) = &self.on_lifecycle {
-                callback();
-            }
-            Ok(())
-        }
-    }
-
-    fn completion_registration(completion: Arc<dyn CommandCompletion>) -> Registration {
-        let mut registration = registration("/complete", &[], ArgumentArity::ANY);
-        registration.completion = Some(completion);
-        registration
-    }
-
-    #[test]
-    fn superseded_completion_is_stale() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let (first_tx, first_rx) = std::sync::mpsc::channel();
-        let (second_tx, second_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([
-                ("first".to_owned(), first_rx),
-                ("second".to_owned(), second_rx),
-            ])),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let first_session = session.clone();
-        let first = std::thread::spawn(move || {
-            futures_lite::future::block_on(first_session.complete(
-                Arc::from("first"),
-                Arc::from("first"),
-                0,
-                Arc::from("test"),
-            ))
-        });
-        let (_, first_cancellation) = requests_rx.recv().unwrap();
-        let second_session = session.clone();
-        let second = std::thread::spawn(move || {
-            futures_lite::future::block_on(second_session.complete(
-                Arc::from("second"),
-                Arc::from("second"),
-                0,
-                Arc::from("test"),
-            ))
-        });
-        requests_rx.recv().unwrap();
-        assert!(first_cancellation.is_cancelled());
-        first_tx.send(vec![completion_item("old")]).unwrap();
-        second_tx.send(vec![completion_item("new")]).unwrap();
-        assert_eq!(first.join().unwrap(), super::CompletionResult::Stale);
-        let super::CompletionResult::Items(items) = second.join().unwrap() else {
-            panic!("expected completion items");
-        };
-        assert_eq!(items[0].item(), &completion_item("new"));
-        assert!(session.accept(items[0].clone()).is_ok());
-    }
-
-    #[test]
-    fn dropping_pending_request_cancels_once() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let (_response_tx, response_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                "value".to_owned(),
-                response_rx,
-            )])),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let request =
-            session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-        let (_, cancellation) = requests_rx.recv().unwrap();
-        drop(request);
-        assert!(cancellation.is_cancelled());
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Cancel
-        );
-        assert!(events_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn superseded_candidate_cannot_be_highlighted() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let (first_tx, first_rx) = std::sync::mpsc::channel();
-        let (_second_tx, second_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([
-                ("first".to_owned(), first_rx),
-                ("second".to_owned(), second_rx),
-            ])),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let first = session.complete(Arc::from("first"), Arc::from("first"), 0, Arc::from("test"));
-        requests_rx.recv().unwrap();
-        first_tx.send(vec![completion_item("same")]).unwrap();
-        let super::CompletionResult::Items(items) = futures_lite::future::block_on(first) else {
-            panic!("expected completion items");
-        };
-        let second = session.complete(
-            Arc::from("second"),
-            Arc::from("second"),
-            0,
-            Arc::from("test"),
-        );
-        requests_rx.recv().unwrap();
-        assert_eq!(
-            session.highlight(&items[0]),
-            Err(super::CompletionError::StaleRequest)
-        );
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Cancel
-        );
-        drop(second);
-    }
-
-    #[test]
-    fn candidate_is_bound_to_its_session() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let (first_tx, first_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                "value".to_owned(),
-                first_rx,
-            )])),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let command = registry.resolve("/complete").unwrap();
-        let first_session = registry
-            .open_completion(command.clone(), registry.create_target())
-            .unwrap();
-        let second_session = registry
-            .open_completion(command, registry.create_target())
-            .unwrap();
-        let request =
-            first_session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-        requests_rx.recv().unwrap();
-        first_tx.send(vec![completion_item("same")]).unwrap();
-        let super::CompletionResult::Items(items) = futures_lite::future::block_on(request) else {
-            panic!("expected completion items");
-        };
-        assert_eq!(
-            second_session.accept(items[0].clone()),
-            Err(super::CompletionError::StaleSession)
-        );
-    }
-
-    #[test]
-    fn dropped_session_does_not_retain_provider() {
-        let (requests_tx, _requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::new()),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider.clone())])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        drop(session);
-        producer.replace(Vec::new()).unwrap();
-        assert_eq!(Arc::strong_count(&provider), 1);
-    }
-
-    #[test]
-    fn replacement_cancels_session_once() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let (response_tx, response_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                "value".to_owned(),
-                response_rx,
-            )])),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let request =
-            session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-        let request_thread = std::thread::spawn(move || futures_lite::future::block_on(request));
-        let (_, cancellation) = requests_rx.recv().unwrap();
-        producer.replace(Vec::new()).unwrap();
-        assert!(cancellation.is_cancelled());
-        response_tx.send(Vec::new()).unwrap();
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Cancel
-        );
-        assert!(events_rx.try_recv().is_err());
-        assert_eq!(
-            request_thread.join().unwrap(),
-            super::CompletionResult::Stale
-        );
-    }
-
-    #[test]
-    fn invalidation_retains_final_session_arc_until_registry_unlock() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        let (requests_tx, _requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::new()),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let gate = Arc::new(super::TestRaceGate::new());
-        registry.0.state.lock().unwrap().invalidation_gate = Some(Arc::clone(&gate));
-        let replacing_producer = producer.clone();
-        let replacement = std::thread::spawn(move || replacing_producer.replace(Vec::new()));
-
-        gate.reached.wait();
-        drop(session);
-        gate.resume.wait();
-
-        replacement.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn replacement_waits_for_started_highlight_before_cancel() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let (response_tx, response_rx) = std::sync::mpsc::channel();
-        let gate = Arc::new(super::TestRaceGate::new());
-        let callback_gate = Arc::clone(&gate);
-        let first_callback = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let callback_first = Arc::clone(&first_callback);
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                "value".to_owned(),
-                response_rx,
-            )])),
-            events: events_tx,
-            on_lifecycle: Some(Arc::new(move || {
-                if callback_first.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                    callback_gate.wait();
-                }
-            })),
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let request =
-            session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-        requests_rx.recv().unwrap();
-        response_tx.send(vec![completion_item("item")]).unwrap();
-        let super::CompletionResult::Items(items) = futures_lite::future::block_on(request) else {
-            panic!("expected completion items");
-        };
-        let highlighting_session = session.clone();
-        let candidate = items[0].clone();
-        let highlight = std::thread::spawn(move || highlighting_session.highlight(&candidate));
-
-        gate.reached.wait();
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Highlight(completion_item("item"))
-        );
-        producer.replace(Vec::new()).unwrap();
-        assert!(events_rx.try_recv().is_err());
-        gate.resume.wait();
-
-        highlight.join().unwrap().unwrap();
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Cancel
-        );
-        assert!(events_rx.try_recv().is_err());
-        assert_eq!(
-            session.highlight(&items[0]),
-            Err(super::CompletionError::StaleSession)
-        );
-    }
-
-    #[test]
-    fn highlight_callback_can_replace_producer_before_queued_cancel() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let (response_tx, response_rx) = std::sync::mpsc::channel();
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        let callback_producer = producer.clone();
-        let replaced = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let callback_replaced = Arc::clone(&replaced);
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                "value".to_owned(),
-                response_rx,
-            )])),
-            events: events_tx,
-            on_lifecycle: Some(Arc::new(move || {
-                if !callback_replaced.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    callback_producer.replace(Vec::new()).unwrap();
-                }
-            })),
-        });
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let request =
-            session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-        requests_rx.recv().unwrap();
-        response_tx.send(vec![completion_item("item")]).unwrap();
-        let super::CompletionResult::Items(items) = futures_lite::future::block_on(request) else {
-            panic!("expected completion items");
-        };
-
-        session.highlight(&items[0]).unwrap();
-
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Highlight(completion_item("item"))
-        );
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Cancel
-        );
-        assert!(events_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn replacement_wins_before_result_commit() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let (response_tx, response_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                "value".to_owned(),
-                response_rx,
-            )])),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let gate = Arc::new(super::TestRaceGate::new());
-        *session.core.commit_gate.lock().unwrap() = Some(Arc::clone(&gate));
-        let request =
-            session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-        let request_thread = std::thread::spawn(move || futures_lite::future::block_on(request));
-        requests_rx.recv().unwrap();
-        response_tx.send(vec![completion_item("old")]).unwrap();
-        gate.reached.wait();
-        producer.replace(Vec::new()).unwrap();
-        gate.resume.wait();
-
-        assert_eq!(
-            request_thread.join().unwrap(),
-            super::CompletionResult::Stale
-        );
-    }
-
-    #[test]
-    fn removal_or_replacement_wins_before_candidate_acceptance() {
-        for remove in [false, true] {
-            let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-            let (events_tx, events_rx) = std::sync::mpsc::channel();
-            let (response_tx, response_rx) = std::sync::mpsc::channel();
-            let provider = Arc::new(ControlledCompletion {
-                requests: requests_tx,
-                responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                    "value".to_owned(),
-                    response_rx,
-                )])),
-                events: events_tx,
-                on_lifecycle: None,
-            });
-            let registry = super::CommandRegistry::new();
-            let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-            producer
-                .replace(vec![completion_registration(provider)])
-                .unwrap();
-            let session = registry
-                .open_completion(
-                    registry.resolve("/complete").unwrap(),
-                    registry.create_target(),
-                )
-                .unwrap();
-            let request =
-                session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-            requests_rx.recv().unwrap();
-            response_tx.send(vec![completion_item("item")]).unwrap();
-            let super::CompletionResult::Items(items) = futures_lite::future::block_on(request)
-            else {
-                panic!("expected completion items");
-            };
-            let gate = Arc::new(super::TestRaceGate::new());
-            *session.core.lifecycle_gate.lock().unwrap() = Some(Arc::clone(&gate));
-            let accepting_session = session.clone();
-            let candidate = items[0].clone();
-            let accept_thread = std::thread::spawn(move || accepting_session.accept(candidate));
-            gate.reached.wait();
-            if remove {
-                assert!(producer.remove());
-            } else {
-                producer.replace(Vec::new()).unwrap();
-            }
-            gate.resume.wait();
-
-            assert_eq!(
-                accept_thread.join().unwrap(),
-                Err(super::CompletionError::StaleSession)
-            );
-            assert_eq!(
-                events_rx.recv().unwrap(),
-                super::CompletionLifecycleEvent::Cancel
-            );
-            assert!(events_rx.try_recv().is_err());
-        }
-    }
-
-    #[test]
-    fn accept_and_cancel_are_terminal() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let (response_tx, response_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                "value".to_owned(),
-                response_rx,
-            )])),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let request =
-            session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-        let request_thread = std::thread::spawn(move || futures_lite::future::block_on(request));
-        requests_rx.recv().unwrap();
-        response_tx.send(vec![completion_item("item")]).unwrap();
-        let super::CompletionResult::Items(items) = request_thread.join().unwrap() else {
-            panic!("expected completion items");
-        };
-        session.highlight(&items[0]).unwrap();
-        session.accept(items[0].clone()).unwrap();
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Highlight(completion_item("item"))
-        );
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Accept(completion_item("item"))
-        );
-        assert!(session.cancel().is_err());
-        assert!(events_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn supersession_callback_can_reenter_session() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let (_first_tx, first_rx) = std::sync::mpsc::channel();
-        let (_second_tx, second_rx) = std::sync::mpsc::channel();
-        let reentrant_session = Arc::new(std::sync::Mutex::new(None::<super::CompletionSession>));
-        let callback_session = Arc::clone(&reentrant_session);
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([
-                ("first".to_owned(), first_rx),
-                ("second".to_owned(), second_rx),
-            ])),
-            events: events_tx,
-            on_lifecycle: Some(Arc::new(move || {
-                let session = callback_session.lock().unwrap().as_ref().unwrap().clone();
-                let _ = session.cancel();
-            })),
-        });
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        *reentrant_session.lock().unwrap() = Some(session.clone());
-        let first = session.complete(Arc::from("first"), Arc::from("first"), 0, Arc::from("test"));
-        requests_rx.recv().unwrap();
-        let second = session.complete(
-            Arc::from("second"),
-            Arc::from("second"),
-            0,
-            Arc::from("test"),
-        );
-
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Cancel
-        );
-        let (_, second_cancellation) = requests_rx.recv().unwrap();
-        assert!(second_cancellation.is_cancelled());
-        drop(second);
-        drop(first);
-    }
-
-    #[test]
-    fn callbacks_run_outside_registry_lock() {
-        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let (response_tx, response_rx) = std::sync::mpsc::channel();
-        let registry = super::CommandRegistry::new();
-        let callback_registry = registry.clone();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::from([(
-                "value".to_owned(),
-                response_rx,
-            )])),
-            events: events_tx,
-            on_lifecycle: Some(Arc::new(move || {
-                callback_registry.snapshot();
-            })),
-        });
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let session = registry
-            .open_completion(
-                registry.resolve("/complete").unwrap(),
-                registry.create_target(),
-            )
-            .unwrap();
-        let request =
-            session.complete(Arc::from("value"), Arc::from("value"), 0, Arc::from("test"));
-        let request_thread = std::thread::spawn(move || futures_lite::future::block_on(request));
-        requests_rx.recv().unwrap();
-        producer.replace(Vec::new()).unwrap();
-        response_tx.send(Vec::new()).unwrap();
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            super::CompletionLifecycleEvent::Cancel
-        );
-        assert_eq!(
-            request_thread.join().unwrap(),
-            super::CompletionResult::Stale
-        );
-    }
-
-    #[test]
-    fn opaque_ids_do_not_collide_across_registries() {
-        let first = super::CommandRegistry::new();
-        let second = super::CommandRegistry::new();
-        let first_producer = first.create_producer(super::ProducerPrecedence::Builtin);
-        let second_producer = second.create_producer(super::ProducerPrecedence::Builtin);
-        first_producer
-            .replace(vec![registration("/run", &[], ArgumentArity::ANY)])
-            .unwrap();
-        second_producer
-            .replace(vec![registration("/run", &[], ArgumentArity::ANY)])
-            .unwrap();
-
-        assert_ne!(first_producer.id(), second_producer.id());
-        assert_ne!(first.create_target(), second.create_target());
-        assert_ne!(
-            first.resolve("/run").unwrap().command_id(),
-            second.resolve("/run").unwrap().command_id()
-        );
-    }
-
-    #[test]
-    fn dispatch_rejects_foreign_command_and_target() {
-        let first = super::CommandRegistry::new();
-        let producer = first.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![registration("/run", &[], ArgumentArity::NONE)])
-            .unwrap();
-        let second = super::CommandRegistry::new();
-
-        let error =
-            futures_lite::future::block_on(first.dispatch_input("/run", 0, second.create_target()))
-                .unwrap_err();
-        assert_eq!(error, super::CommandError::StaleTarget);
-
-        let dispatch = first.dispatch_command(
-            first.resolve("/run").unwrap(),
-            "",
-            0,
-            second.create_target(),
-        );
-        let Err(error) = futures_lite::future::block_on(dispatch) else {
-            panic!("foreign target dispatched");
-        };
-        assert_eq!(error, super::CommandError::StaleTarget);
-
-        let dispatch = second.dispatch_command(
-            first.resolve("/run").unwrap(),
-            "",
-            0,
-            second.create_target(),
-        );
-        let Err(error) = futures_lite::future::block_on(dispatch) else {
-            panic!("foreign command dispatched");
-        };
-        assert_eq!(error, super::CommandError::StaleCommand);
-    }
-
-    #[test]
-    fn foreign_command_cannot_open_completion() {
-        let (requests_tx, _requests_rx) = std::sync::mpsc::channel();
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let provider = Arc::new(ControlledCompletion {
-            requests: requests_tx,
-            responses: std::sync::Mutex::new(std::collections::HashMap::new()),
-            events: events_tx,
-            on_lifecycle: None,
-        });
-        let first = super::CommandRegistry::new();
-        let producer = first.create_producer(super::ProducerPrecedence::Builtin);
-        producer
-            .replace(vec![completion_registration(provider)])
-            .unwrap();
-        let second = super::CommandRegistry::new();
+    fn foreign_target_is_rejected() {
+        let registry = CommandRegistry::new();
+        let foreign_registry = CommandRegistry::new();
+        let foreign = foreign_registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
 
         assert!(matches!(
-            second.open_completion(first.resolve("/complete").unwrap(), second.create_target()),
-            Err(super::CompletionError::StaleCommand)
+            registry.snapshot_for(&foreign),
+            Err(CommandError::StaleTarget)
         ));
     }
 
     #[test]
-    fn depth_limit_is_enforced_for_known_commands() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
+    fn replaced_resolved_command_is_stale() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
         producer
-            .replace(vec![registration("/run", &[], ArgumentArity::ANY)])
+            .replace(vec![registration("/old", TargetCapabilities::NONE)])
             .unwrap();
-        let target = registry.create_target();
-        let error = futures_lite::future::block_on(registry.dispatch_input(
-            "/run",
-            super::MAX_COMMAND_DEPTH + 1,
-            target,
-        ))
-        .unwrap_err();
-        assert_eq!(error, super::CommandError::MaximumDepth);
+        let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+        let resolved = registry.resolve_for(&target, "/old").unwrap();
+        producer
+            .replace(vec![registration("/new", TargetCapabilities::NONE)])
+            .unwrap();
+
+        let outcome = futures_lite::future::block_on(registry.dispatch_command(
+            &target,
+            resolved,
+            Arc::from(""),
+            "/old".into(),
+        ));
+
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Failed(CommandError::StaleCommand)
+        ));
     }
 
     #[test]
-    fn depth_limit_boundary_allows_max_depth() {
-        let registry = super::CommandRegistry::new();
-        let producer = registry.create_producer(super::ProducerPrecedence::Builtin);
+    fn subscription_reports_final_generation() {
+        let registry = CommandRegistry::new();
+        let subscription = registry.subscribe();
+        let initial = subscription.generation();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
         producer
-            .replace(vec![registration("/run", &[], ArgumentArity::ANY)])
+            .replace(vec![registration("/first", TargetCapabilities::NONE)])
             .unwrap();
-        let target = registry.create_target();
-        let dispatch = futures_lite::future::block_on(registry.dispatch_input(
-            "/run",
-            super::MAX_COMMAND_DEPTH,
-            target,
-        ))
-        .unwrap();
-        assert!(matches!(dispatch, super::InputDispatch::Dispatched(_)));
-    }
+        producer
+            .replace(vec![registration("/second", TargetCapabilities::NONE)])
+            .unwrap();
 
-    #[test]
-    fn unknown_commands_fall_through_at_any_depth() {
-        let registry = super::CommandRegistry::new();
-        let target = registry.create_target();
-        for depth in [0, super::MAX_COMMAND_DEPTH, super::MAX_COMMAND_DEPTH + 1] {
-            let dispatch =
-                futures_lite::future::block_on(registry.dispatch_input("/nope", depth, target))
-                    .unwrap();
-            assert!(
-                matches!(dispatch, super::InputDispatch::UnknownCommandInput),
-                "depth {depth} did not fall through"
-            );
-        }
+        let generation = futures_lite::future::block_on(subscription.changed(initial));
+        assert_eq!(generation, subscription.generation());
+        assert!(generation > initial);
     }
 }

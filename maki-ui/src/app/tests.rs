@@ -13,9 +13,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    DoneReason, ImageMediaType, McpConfigErrors, McpPromptRequest, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, ModeDefSpec, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
+    McpSnapshotReader, ModeDefSpec, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -95,17 +94,16 @@ impl maki_commands::CommandBehavior for TestLuaBehavior {
     fn execute(
         &self,
         invocation: maki_commands::CommandInvocation,
-    ) -> maki_commands::CommandFuture<Result<(), maki_commands::CommandError>> {
+    ) -> maki_commands::CommandFuture<
+        Result<maki_commands::CommandOutcome, maki_commands::CommandError>,
+    > {
         self.handle.run_command(
             Arc::clone(&self.plugin),
             Arc::clone(&self.name),
             invocation.arguments.to_string(),
             invocation.depth as u8,
         );
-        invocation
-            .lifecycle
-            .transition(maki_commands::CommandClassification::Completed);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(maki_commands::CommandOutcome::Completed) })
     }
 }
 
@@ -230,7 +228,7 @@ fn register_test_lua_command(
                     summary: Arc::from("Lua test command"),
                     argument_hint: None,
                 },
-                tui_only: false,
+                required_capabilities: maki_commands::TargetCapabilities::default(),
             },
             behavior: Arc::new(TestLuaBehavior {
                 handle: command.handle,
@@ -927,13 +925,17 @@ fn lifecycle_app() -> (
     app.command_palette.sync("/deploy a");
     app.command_palette
         .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
-    probe
-        .try_finish_command_arguments(vec![CommandArgumentItem {
-            label: "alpha".into(),
-            insertion: "alpha".into(),
-            description: None,
-        }])
-        .unwrap();
+    let items = vec![CommandArgumentItem {
+        label: "alpha".into(),
+        insertion: "alpha".into(),
+        description: None,
+    }];
+    for _ in 0..1000 {
+        if probe.try_finish_command_arguments(items.clone()).is_some() {
+            break;
+        }
+        std::thread::yield_now();
+    }
     let _ = app.command_palette.poll_arguments();
     let _ = probe.try_finish_command_argument_lifecycle();
     (app, probe, producer)
@@ -1059,14 +1061,14 @@ fn reset_session_clears_plan() {
 #[test]
 fn replacing_session_rotates_command_target() {
     let mut app = test_app();
-    let reset_target = app.command_target;
+    let reset_target = app.command_target.id();
 
     app.reset_session();
-    assert_ne!(app.command_target, reset_target);
+    assert_ne!(app.command_target.id(), reset_target);
 
-    let load_target = app.command_target;
+    let load_target = app.command_target.id();
     app.apply_loaded_session(AppSession::new("test-model", "/tmp/test"), &test_model());
-    assert_ne!(app.command_target, load_target);
+    assert_ne!(app.command_target.id(), load_target);
 }
 
 #[test]
@@ -2434,7 +2436,7 @@ fn model_arg_ambiguous_flashes() {
     assert_eq!(app.state.model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        format!("{MODEL_AMBIGUOUS_MSG}: glm")
+        "command failed: ambiguous model: glm"
     );
 }
 
@@ -2458,7 +2460,7 @@ fn model_arg_no_match_flashes() {
     assert_eq!(app.state.model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        format!("{MODEL_NO_MATCH_MSG}: xyz")
+        "command failed: no model matches: xyz"
     );
 }
 
@@ -2496,7 +2498,7 @@ fn malformed_model_arg_flashes_invalid_model() {
     assert_eq!(app.state.model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "Invalid model: model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"
+        "command failed: model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"
     );
 }
 
@@ -2588,7 +2590,7 @@ fn theme_arg_unknown_flashes() {
     assert_eq!(app.theme_provider.generation(), gen_before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        format!("{THEME_UNKNOWN_MSG}: nonexistent")
+        "command failed: theme is unknown or ambiguous: nonexistent"
     );
 }
 
@@ -2611,7 +2613,7 @@ fn theme_arg_ambiguous_flashes() {
     assert_eq!(app.theme_provider.generation(), gen_before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        format!("{THEME_AMBIGUOUS_MSG}: catppuccin")
+        "command failed: theme is unknown or ambiguous: catppuccin"
     );
 }
 
@@ -3543,7 +3545,9 @@ fn run_cmdline_splits_args_off_the_name() {
 
     let actions = app.run_cmdline("/btw what is rust?", 0).unwrap();
 
-    assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
+    assert!(
+        matches!(&actions[..], [Action::Btw(q, images)] if q == "what is rust?" && images.is_empty())
+    );
 }
 
 #[test]
@@ -3584,6 +3588,7 @@ fn direct_custom_command_renders_args_and_starts_run() {
         content: "Review $ARGUMENTS".into(),
         scope: CommandScope::Project,
         accepts_args: true,
+        argument_hint: None,
     }]);
 
     let actions = app.execute_command(
@@ -3601,38 +3606,6 @@ fn direct_custom_command_renders_args_and_starts_run() {
 }
 
 #[test]
-fn queued_custom_command_is_an_accepted_turn() {
-    let mut app = app_with_custom_commands(&[CustomCommand {
-        name: "review".into(),
-        description: "Code review".into(),
-        content: "Review $ARGUMENTS".into(),
-        scope: CommandScope::Project,
-        accepts_args: true,
-    }]);
-    app.status = Status::Streaming;
-    let lifecycle = maki_commands::InvocationLifecycle::detached();
-    let classification = lifecycle.classification();
-
-    app.command_runtime
-        .command_tx()
-        .send(crate::command_runtime::RoutedCommand {
-            target: app.command_target,
-            route: crate::command_runtime::CommandRoute::Prompt("Review src/lib.rs".into()),
-            arguments: String::new(),
-            depth: 0,
-            lifecycle,
-        })
-        .unwrap();
-
-    assert!(app.execute_pending_commands().is_empty());
-    assert_eq!(app.queue.len(), 1);
-    assert_eq!(
-        smol::block_on(classification),
-        maki_commands::CommandClassification::AgentTurnAccepted
-    );
-}
-
-#[test]
 fn run_cmdline_dispatches_custom_command() {
     let mut app = app_with_custom_commands(&[CustomCommand {
         name: "review".into(),
@@ -3640,6 +3613,7 @@ fn run_cmdline_dispatches_custom_command() {
         content: "Review $ARGUMENTS".into(),
         scope: CommandScope::Project,
         accepts_args: true,
+        argument_hint: None,
     }]);
 
     let actions = app.run_cmdline("/project:review src/lib.rs", 0).unwrap();
@@ -3648,27 +3622,6 @@ fn run_cmdline_dispatches_custom_command() {
         actions.as_slice(),
         [Action::SendMessage(input)] if input.message == "Review src/lib.rs"
     ));
-}
-
-#[test]
-fn run_cmdline_dispatches_mcp_prompt() {
-    let mut app = test_app();
-    let outcome = app.execute_mcp(&McpPromptRequest {
-        display_name: "review".into(),
-        qualified_name: "server/review".into(),
-        arguments: HashMap::new(),
-        display_text: "/review src/lib.rs".into(),
-    });
-    let actions = outcome.actions;
-
-    let [Action::SendMessage(input)] = actions.as_slice() else {
-        panic!("expected one SendMessage action");
-    };
-    assert_eq!(input.message, "/review src/lib.rs");
-    assert_eq!(
-        input.prompt.as_ref().unwrap().qualified_name,
-        "server/review"
-    );
 }
 
 /// Only the typed path clears the input, so a keybind or autocmd reaching for
@@ -3756,7 +3709,7 @@ fn open_session_picker_sends_no_arg_to_lua() {
         max_args: Some(1),
         completion: false,
     });
-    let app = build_app_with_full(
+    let mut app = build_app_with_full(
         dir.clone(),
         Arc::new(test_writer(dir)),
         registry,
@@ -4090,24 +4043,6 @@ fn mcp_toggle_dispatches_action() {
     ));
 }
 
-#[test]
-fn mcp_prompt_args_expand_references() {
-    let (_tmp, mut app, backend) = completion_app();
-    seed_skill(&backend, "pdf");
-    let outcome = app.execute_mcp(&McpPromptRequest {
-        display_name: "prompt".into(),
-        qualified_name: "srv/prompt".into(),
-        arguments: HashMap::new(),
-        display_text: "/prompt @skill:pdf summarize".into(),
-    });
-    let actions = outcome.actions;
-    let [Action::SendMessage(input)] = actions.as_slice() else {
-        panic!("expected one SendMessage action");
-    };
-    assert_eq!(input.message, "/prompt <skill:pdf> summarize");
-    assert!(input.prompt.is_some());
-}
-
 #[test_case(
     |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
     ""
@@ -4189,7 +4124,9 @@ fn btw_with_question_returns_action() {
         },
         0,
     );
-    assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
+    assert!(
+        matches!(&actions[..], [Action::Btw(q, images)] if q == "what is rust?" && images.is_empty())
+    );
 }
 
 #[test]
@@ -6019,7 +5956,7 @@ fn at_completion_insertion_synchronizes_argument_completion() {
                     summary: Arc::from("Deploy"),
                     argument_hint: None,
                 },
-                tui_only: false,
+                required_capabilities: maki_commands::TargetCapabilities::default(),
             },
             behavior: Arc::new(TestLuaBehavior {
                 handle: maki_lua::EventHandle::disconnected_for_test(),
@@ -6032,8 +5969,10 @@ fn at_completion_insertion_synchronizes_argument_completion() {
             })),
         }])
         .unwrap();
-    app.command_palette =
-        CommandPalette::new(app.command_runtime.registry.clone(), app.command_target);
+    app.command_palette = CommandPalette::new(
+        app.command_runtime.registry.clone(),
+        app.command_target.clone(),
+    );
     app.input_box.set_input("/deploy @rev".into());
     app.command_palette.sync("/deploy @rev");
     app.file_completion
@@ -6832,34 +6771,6 @@ fn alt_m_opens_model_picker() {
     };
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
-}
-
-/// A routed command whose target is gone must fail its lifecycle (mirroring
-/// production `EventLoop::handle_command`) instead of being dropped, so a
-/// frontend awaiting the classification never hangs.
-#[test]
-fn stale_target_command_fails_its_lifecycle() {
-    let mut app = test_app();
-    let other_registry = maki_commands::CommandRegistry::new();
-    let lifecycle = maki_commands::InvocationLifecycle::detached();
-    let classification = lifecycle.classification();
-
-    app.command_runtime
-        .command_tx()
-        .send(crate::command_runtime::RoutedCommand {
-            target: other_registry.create_target(),
-            route: crate::command_runtime::CommandRoute::Prompt("hello".into()),
-            arguments: String::new(),
-            depth: 0,
-            lifecycle,
-        })
-        .unwrap();
-
-    assert!(app.execute_pending_commands().is_empty());
-    assert_eq!(
-        smol::block_on(classification),
-        maki_commands::CommandClassification::Failed(maki_commands::CommandError::StaleTarget)
-    );
 }
 
 // ---- defer + z-order input-demand UI (plan 8) ----

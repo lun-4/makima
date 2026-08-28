@@ -2706,6 +2706,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-rust",
  "uuid",
 ]
 
@@ -2716,7 +2718,6 @@ dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
  "flume 0.11.1",
- "futures-lite",
  "maki-agent",
  "maki-commands",
  "maki-config",
@@ -2754,6 +2755,7 @@ dependencies = [
  "libc",
  "maki-commands",
  "maki-config",
+ "maki-match",
  "maki-providers",
  "maki-storage",
  "open",
@@ -3031,7 +3033,6 @@ dependencies = [
  "maki-highlight",
  "maki-lua",
  "maki-markdown",
- "maki-match",
  "maki-providers",
  "maki-storage",
  "notify",

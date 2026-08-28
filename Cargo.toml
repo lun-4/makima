@@ -44,6 +44,8 @@ open = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
 
 [workspace]
 members = [

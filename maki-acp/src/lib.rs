@@ -1,4 +1,3 @@
-pub mod commands;
 pub mod elicitation;
 pub mod methods;
 pub mod permissions;
@@ -8,10 +7,10 @@ pub mod translate;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use commands::CommandDispatcher;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::{AgentConfig, ModeRegistry, PermissionsConfig};
+use maki_commands::CommandRegistry;
 use maki_config::ModelPolicy;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
@@ -29,7 +28,7 @@ pub struct AcpParams {
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
-    pub command_dispatcher: CommandDispatcher,
+    pub command_registry: CommandRegistry,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

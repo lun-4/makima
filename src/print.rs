@@ -15,18 +15,18 @@ use std::time::{Duration, Instant};
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use maki_agent::command::{self, PromptSink};
+use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_agent::headless::{HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, ImageSource,
-    McpPromptRef, McpPromptRequest, McpPromptSink, ModeRegistry, PermissionsConfig,
+    McpPromptRef, ModeRegistry, PermissionsConfig,
 };
 use maki_commands::{
-    ArgumentArity, BUILTIN_COMMANDS, CommandBehavior, CommandClassification, CommandDocs,
-    CommandError, CommandFuture, CommandInvocation, CommandRegistry, CommandSpec, InputDispatch,
-    ProducerPrecedence, Registration,
+    BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome,
+    CommandRegistry, HostRequest, HostResponse, InputDispatch, TargetCapabilities,
+    TargetCapability,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -148,136 +148,70 @@ where
     }
 }
 
-struct CommandInputSink {
-    input: std::sync::Mutex<Option<AgentInput>>,
-    mode: AgentMode,
-    images: Vec<ImageSource>,
-    fast: bool,
-    workflow: bool,
-}
+#[derive(Default)]
+struct CommandTurnMarker;
 
-impl CommandInputSink {
-    fn input(&self, message: String, prompt: Option<Box<McpPromptRef>>) -> AgentInput {
-        AgentInput {
-            message,
-            mode: self.mode.clone(),
-            images: self.images.clone(),
-            preamble: Vec::new(),
-            thinking: Default::default(),
-            fast: self.fast,
-            workflow: self.workflow,
-            prompt,
-        }
-    }
+struct PrintCommandHost;
 
-    fn set(&self, input: AgentInput, invocation: CommandInvocation) {
-        *self.input.lock().unwrap_or_else(|error| error.into_inner()) = Some(input);
-        invocation
-            .lifecycle
-            .transition(CommandClassification::AgentTurnAccepted);
-    }
-
-    fn take(&self) -> Option<AgentInput> {
-        self.input
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
+impl CommandHost for PrintCommandHost {
+    fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        Box::pin(async move {
+            match request {
+                HostRequest::Context(_) => Ok(HostResponse::Context(
+                    maki_commands::HostContextResponse::Unavailable,
+                )),
+                HostRequest::Builtin(BuiltinOperation::Exit) => Ok(HostResponse::Completed),
+                HostRequest::Builtin(operation) => Err(CommandError::Producer(Arc::from(format!(
+                    "unsupported command operation: {operation:?}"
+                )))),
+            }
+        })
     }
 }
 
-impl PromptSink for CommandInputSink {
-    fn submit(
-        &self,
-        prompt: String,
-        invocation: CommandInvocation,
-    ) -> CommandFuture<Result<(), CommandError>> {
-        self.set(self.input(prompt, None), invocation);
-        Box::pin(async { Ok(()) })
-    }
-}
-
-impl McpPromptSink for CommandInputSink {
-    fn submit(
-        &self,
-        invocation: CommandInvocation,
-        prompt: McpPromptRequest,
-    ) -> CommandFuture<Result<(), CommandError>> {
-        let prompt_ref = McpPromptRef {
-            qualified_name: prompt.qualified_name,
-            arguments: prompt.arguments,
-        };
-        self.set(
-            self.input(prompt.display_text, Some(Box::new(prompt_ref))),
-            invocation,
-        );
-        Box::pin(async { Ok(()) })
-    }
-}
-
-struct CompletedBuiltin;
-
-impl CommandBehavior for CompletedBuiltin {
-    fn execute(&self, invocation: CommandInvocation) -> CommandFuture<Result<(), CommandError>> {
-        invocation
-            .lifecycle
-            .transition(CommandClassification::Completed);
-        Box::pin(async { Ok(()) })
-    }
-}
-
-struct UnsupportedBuiltin(Arc<str>);
-
-impl CommandBehavior for UnsupportedBuiltin {
-    fn execute(&self, _invocation: CommandInvocation) -> CommandFuture<Result<(), CommandError>> {
-        let error = CommandError::UnsupportedFrontend(Arc::clone(&self.0));
-        Box::pin(async move { Err(error) })
-    }
-}
-
-fn register_print_commands(
-    registry: &CommandRegistry,
-    commands: &[command::CustomCommand],
-    sink: Arc<CommandInputSink>,
-) -> Result<()> {
-    let builtin = registry.create_producer(ProducerPrecedence::Builtin);
-    builtin.replace(
-        BUILTIN_COMMANDS
-            .iter()
-            .map(|command| Registration {
-                spec: command.spec(),
-                behavior: if command.name == "/exit" {
-                    Arc::new(CompletedBuiltin)
-                } else {
-                    Arc::new(UnsupportedBuiltin(Arc::from(command.name)))
-                },
-                completion: None,
+fn agent_input_from_turn(turn: maki_commands::AgentTurn, literal: &AgentInput) -> AgentInput {
+    AgentInput {
+        message: turn.content.text.to_string(),
+        mode: literal.mode.clone(),
+        images: literal.images.clone(),
+        preamble: Vec::new(),
+        thinking: Default::default(),
+        fast: literal.fast,
+        workflow: literal.workflow,
+        prompt: turn.prompt.map(|prompt| {
+            Box::new(McpPromptRef {
+                qualified_name: prompt.qualified_name.to_string(),
+                arguments: prompt
+                    .arguments
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
             })
-            .collect(),
-    )?;
-    let application = registry.create_producer(ProducerPrecedence::Application);
-    command::register_commands(&application, commands, sink)?;
-    Ok(())
+        }),
+    }
 }
 
 fn drive_print(
     registry: &CommandRegistry,
-    sink: &CommandInputSink,
+    target: &maki_commands::TargetHandle,
+    _marker: &CommandTurnMarker,
     literal: AgentInput,
     runner: impl PrintRunner,
 ) -> Result<()> {
-    if !literal.images.is_empty() && registry.resolves_input(&literal.message) {
+    if !literal.images.is_empty() && registry.resolves_input_for(target, &literal.message) {
         return Err(eyre!("slash commands cannot include images"));
     }
-    let target = registry.create_target();
-    let input = match smol::block_on(registry.dispatch_input(&literal.message, 0, target))? {
-        InputDispatch::Dispatched(dispatch) => match smol::block_on(dispatch.classification()) {
-            CommandClassification::AgentTurnAccepted => sink
-                .take()
-                .ok_or_else(|| eyre!("command accepted an agent turn without input"))?,
-            CommandClassification::Completed => return Ok(()),
-            CommandClassification::Failed(error) => return Err(error.into()),
-        },
-        InputDispatch::NotCommand | InputDispatch::UnknownCommandInput => literal,
+    let content = CommandContent {
+        text: Arc::from(literal.message.as_str()),
+        attachments: Arc::from([]),
+    };
+    let input = match smol::block_on(registry.dispatch_input(target, content)) {
+        InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
+            agent_input_from_turn(turn, &literal)
+        }
+        InputDispatch::Dispatched(CommandOutcome::Completed) => return Ok(()),
+        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => return Err(error.into()),
+        InputDispatch::LiteralInput(_) => literal,
     };
     runner.run(input)
 }
@@ -333,21 +267,19 @@ pub fn run(
         workflow,
         prompt: None,
     };
-    let sink = Arc::new(CommandInputSink {
-        input: std::sync::Mutex::new(None),
-        mode: AgentMode::Build,
-        images: literal.images.clone(),
-        fast,
-        workflow,
-    });
-    register_print_commands(&command_registry, commands, Arc::clone(&sink))?;
+    let _standard_commands =
+        StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
+    let target = command_registry.bind_target(
+        TargetCapabilities::from_capability(TargetCapability::ApplicationLifecycle),
+        Arc::new(PrintCommandHost),
+    );
+    let command_turn_marker = CommandTurnMarker;
 
     let prompt_slots = lua_handle.collect_prompt_slots();
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_with_commands(
         &cwd,
         command_registry.clone(),
-        Arc::clone(&sink) as Arc<dyn McpPromptSink>,
     ));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
@@ -552,7 +484,13 @@ pub fn run(
             None => Ok(()),
         }
     };
-    let outcome = drive_print(&command_registry, &sink, literal, runner);
+    let outcome = drive_print(
+        &command_registry,
+        &target,
+        &command_turn_marker,
+        literal,
+        runner,
+    );
     if let (Err(error), true, false) = (
         &outcome,
         matches!(format, OutputFormat::Json | OutputFormat::StreamJson),
@@ -578,9 +516,6 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::command::{CommandScope, CustomCommand};
-    use maki_agent::tools::ToolRegistry;
-    use maki_lua::PluginHost;
     use maki_providers::TokenUsage;
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
@@ -618,126 +553,59 @@ mod tests {
         }
     }
 
-    fn sink() -> Arc<CommandInputSink> {
-        Arc::new(CommandInputSink {
-            input: std::sync::Mutex::new(None),
-            mode: AgentMode::Build,
-            images: Vec::new(),
-            fast: false,
-            workflow: false,
-        })
-    }
-
-    #[test]
-    fn nested_lua_agent_turn_accepted_runs_rendered_prompt() {
-        let registry = CommandRegistry::new();
-        let host = PluginHost::with_command_registry(
-            Arc::new(ToolRegistry::new()),
-            registry.clone(),
-            true,
-        )
-        .unwrap();
-        host.load_source(
-            "nested",
-            r#"
-            maki.api.register_command({
-                name = "/outer",
-                tui_only = false,
-                handler = function()
-                    local ok, err = maki.api.run_command("/project:inner nested")
-                    if not ok then error(err) end
-                end,
-            })
-            "#,
-        )
-        .unwrap();
-        let sink = sink();
-        register_print_commands(
-            &registry,
-            &[CustomCommand {
-                name: "inner".into(),
-                description: "inner prompt".into(),
-                content: "rendered $ARGUMENTS".into(),
-                scope: CommandScope::Project,
-                accepts_args: true,
-            }],
-            Arc::clone(&sink),
-        )
-        .unwrap();
-        let mut received = None;
-        drive_print(&registry, &sink, input("/outer"), |input: AgentInput| {
-            received = Some(input.message);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(received.as_deref(), Some("rendered nested"));
+    fn target(registry: &CommandRegistry) -> maki_commands::TargetHandle {
+        registry.bind_target(TargetCapabilities::ALL, Arc::new(PrintCommandHost))
     }
 
     #[test]
     fn completed_command_skips_runner() {
         struct Completed;
-        impl CommandBehavior for Completed {
+        impl maki_commands::CommandBehavior for Completed {
             fn execute(
                 &self,
-                invocation: CommandInvocation,
-            ) -> CommandFuture<Result<(), CommandError>> {
-                invocation
-                    .lifecycle
-                    .transition(CommandClassification::Completed);
-                Box::pin(async { Ok(()) })
+                _invocation: maki_commands::CommandInvocation,
+            ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+                Box::pin(async { Ok(CommandOutcome::Completed) })
             }
         }
         let registry = CommandRegistry::new();
         registry
-            .create_producer(ProducerPrecedence::Plugin)
-            .replace(vec![Registration {
-                spec: CommandSpec {
+            .create_producer(maki_commands::ProducerPrecedence::Plugin)
+            .replace(vec![maki_commands::Registration {
+                spec: maki_commands::CommandSpec {
                     name: Arc::from("/done"),
                     aliases: Arc::from([]),
-                    arguments: ArgumentArity::NONE,
-                    docs: CommandDocs {
+                    arguments: maki_commands::ArgumentArity::NONE,
+                    docs: maki_commands::CommandDocs {
                         summary: Arc::from("done"),
                         argument_hint: None,
                     },
-                    tui_only: false,
+                    required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(Completed),
                 completion: None,
             }])
             .unwrap();
-        let sink = sink();
+        let target = target(&registry);
+        let sink = CommandTurnMarker;
         let mut ran = false;
-        drive_print(&registry, &sink, input("/done"), |_| {
+        drive_print(&registry, &target, &sink, input("/done"), |_| {
             ran = true;
             Ok(())
         })
         .unwrap();
-        assert!(!ran);
-    }
-
-    #[test]
-    fn exit_command_completes_without_runner() {
-        let registry = CommandRegistry::new();
-        let sink = sink();
-        register_print_commands(&registry, &[], Arc::clone(&sink)).unwrap();
-        let mut ran = false;
-
-        drive_print(&registry, &sink, input("/exit"), |_| {
-            ran = true;
-            Ok(())
-        })
-        .unwrap();
-
         assert!(!ran);
     }
 
     #[test]
     fn unknown_command_runs_literal_input() {
         let registry = CommandRegistry::new();
-        let sink = sink();
+        let target = target(&registry);
+        let sink = CommandTurnMarker;
         let mut received = None;
         drive_print(
             &registry,
+            &target,
             &sink,
             input("/unknown literal"),
             |input: AgentInput| {

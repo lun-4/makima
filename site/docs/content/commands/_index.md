@@ -7,43 +7,44 @@ group = "Reference"
 
 # Commands
 
-Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown slash-prefixed text remains a model prompt. A known command with invalid arguments, or an effect unsupported by the current frontend, returns an error instead of becoming a prompt.
+Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text remains a model prompt. A known available command with invalid arguments returns an error instead of becoming a prompt.
 
-The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current winners. Root CLI subcommands such as `maki auth` are separate from slash commands.
+The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. The Lua `tui_only` field maps to the interactive-TUI capability. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands.
 
 ## Built-in commands
 
-| Command | Description | TUI-only |
-|---------|-------------|----------|
-| `/tasks` | Browse and search tasks | yes |
-| `/compact` | Summarize and compact conversation history | no |
-| `/new` | Start a new session | no |
-| `/clear` | Alias for `/new` | no |
-| `/help` | Show keybindings | yes |
-| `/usage` | Show token usage breakdown | yes |
-| `/queue` | Remove items from queue | yes |
-| `/model` | Switch model | no |
-| `/theme` | Switch color theme | yes |
-| `/mcp` | Configure MCP servers | yes |
-| `/login` | Authenticate with an LLM provider | yes |
-| `/cd` | Change working directory | no |
-| `/btw` | Ask a quick question (no tools, no history pollution) | no |
-| `/yolo` | Toggle YOLO mode (skip all permission prompts) | no |
-| `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) | yes |
-| `/fast` | Toggle Anthropic fast mode (Opus only) | no |
-| `/workflow` | Toggle workflow mode (task callable inside code_execution) | no |
-| `/exit` | Exit the application | yes |
-| `/reload` | Reload plugins and config | yes |
-| `/automode` | Toggle bash auto mode (classifier gates every bash command) | yes |
-| `/build` | Switch to build mode (full tool access) | yes |
-| `/memory` | View, edit, and delete memory files | yes |
-| `/plan` | Switch to plan mode (analyse and write only the plan file) | yes |
-| `/rename` | Rename the current session | yes |
-| `/sessions` | Browse and switch sessions | yes |
-| `/splash` | Preview and select a splash renderer | yes |
-| `/thinking` | Set thinking effort (bare opens a selector) | yes |
+| Command | Description | Arguments | TUI-only |
+|---------|-------------|-----------|----------|
+| `/tasks` | Browse and search tasks |  | yes |
+| `/compact` | Summarize and compact conversation history |  | no |
+| `/new` | Start a new session |  | no |
+| `/clear` | Alias for `/new` |  | no |
+| `/help` | Show keybindings |  | yes |
+| `/usage` | Show token usage breakdown |  | yes |
+| `/queue` | Remove items from queue |  | yes |
+| `/model` | Switch model | <model> | no |
+| `/theme` | Switch color theme | <theme> | yes |
+| `/mcp` | Configure MCP servers |  | yes |
+| `/login` | Authenticate with an LLM provider |  | yes |
+| `/cd` | Change working directory | <path> | no |
+| `/btw` | Ask a quick question (no tools, no history pollution) | <question> | no |
+| `/yolo` | Toggle YOLO mode (skip all permission prompts) |  | no |
+| `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) | <mode> | yes |
+| `/fast` | Toggle Anthropic fast mode (Opus only) |  | no |
+| `/workflow` | Toggle workflow mode (task callable inside code_execution) |  | no |
+| `/exit` | Exit the application |  | no |
+| `/reload` | Reload plugins and config |  | no |
+| `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | no |
+| `/build` | Switch to build mode (full tool access) |  | no |
+| `/memory` | View, edit, and delete memory files |  | yes |
+| `/plan` | Switch to plan mode (analyse and write only the plan file) |  | no |
+| `/rename` | Rename the current session |  | yes |
+| `/sessions` | Browse and switch sessions |  | yes |
+| `/splash` | Preview and select a splash renderer |  | yes |
+| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | yes |
+| `/thinking` | Set thinking effort (bare opens a selector) |  | yes |
 
-The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises only these built-ins, plus registered custom, MCP, and Lua commands that are not TUI-only. In ACP, a TUI-only command is omitted from the advertised list and forwarded as literal prompt text if invoked. Other frontends recognize TUI-only commands but report an unsupported-frontend error.
+The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text.
 
 ### Command arguments
 

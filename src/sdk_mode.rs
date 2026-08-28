@@ -17,7 +17,7 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
-use maki_agent::command::{self, CustomCommand, PromptSink};
+use maki_agent::command::{CustomCommand, StandardCommands, StandardCompletions};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
@@ -25,12 +25,12 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, McpPromptRef,
-    McpPromptRequest, McpPromptSink, PermissionsConfig, ToolOutput,
+    PermissionsConfig, ToolOutput,
 };
 use maki_commands::{
-    ArgumentArity, BUILTIN_COMMANDS, CommandBehavior, CommandClassification, CommandDocs,
-    CommandError, CommandFuture, CommandInvocation, CommandRegistry, CommandSpec, InputDispatch,
-    InvocationLifecycle, InvocationTargetId, ProducerId, ProducerPrecedence, Registration,
+    AgentTurn, BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost,
+    CommandOutcome, CommandRegistry, HostRequest, HostResponse, InputDispatch, TargetCapabilities,
+    TargetCapability, TargetHandle,
 };
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
@@ -471,149 +471,83 @@ struct Shared {
 
 struct CommandDriverParams {
     route_rx: Receiver<CommandRoute>,
-    input_tx: Sender<AgentInput>,
     model_tx: Sender<Model>,
     shared: Arc<Mutex<Shared>>,
-    cwd: std::path::PathBuf,
-    startup_model: Model,
     model_policy: Arc<ModelPolicy>,
-    fast: bool,
-    workflow: bool,
 }
 
 enum CommandRoute {
-    Agent {
-        message: String,
-        prompt: Option<Box<McpPromptRef>>,
-    },
     Model {
         argument: String,
-        lifecycle: InvocationLifecycle,
+        response: Sender<Result<HostResponse, CommandError>>,
     },
 }
 
-#[derive(Clone)]
-struct PromptRouteSink {
+struct SdkCommandHost {
     tx: Sender<CommandRoute>,
 }
 
-impl PromptSink for PromptRouteSink {
-    fn submit(
-        &self,
-        prompt: String,
-        invocation: CommandInvocation,
-    ) -> CommandFuture<Result<(), CommandError>> {
-        let lifecycle = invocation.lifecycle.clone();
-        let result = self
-            .tx
-            .send(CommandRoute::Agent {
-                message: prompt,
-                prompt: None,
-            })
-            .inspect(|_| {
-                lifecycle.transition(CommandClassification::AgentTurnAccepted);
-            });
-        Box::pin(async move { result.map_err(|_| CommandError::StaleTarget) })
-    }
-}
-
-impl McpPromptSink for PromptRouteSink {
-    fn submit(
-        &self,
-        invocation: CommandInvocation,
-        prompt: McpPromptRequest,
-    ) -> CommandFuture<Result<(), CommandError>> {
-        let lifecycle = invocation.lifecycle.clone();
-        let result = self
-            .tx
-            .send(CommandRoute::Agent {
-                message: prompt.display_text,
-                prompt: Some(Box::new(McpPromptRef {
-                    qualified_name: prompt.qualified_name,
-                    arguments: prompt.arguments,
-                })),
-            })
-            .inspect(|_| {
-                lifecycle.transition(CommandClassification::AgentTurnAccepted);
-            });
-        Box::pin(async move { result.map_err(|_| CommandError::StaleTarget) })
-    }
-}
-
-struct BuiltinBehavior {
-    name: &'static str,
-    tx: Sender<CommandRoute>,
-}
-
-impl CommandBehavior for BuiltinBehavior {
-    fn execute(&self, invocation: CommandInvocation) -> CommandFuture<Result<(), CommandError>> {
-        if self.name == "/model" && !invocation.arguments.trim().is_empty() {
-            let result = self.tx.send(CommandRoute::Model {
-                argument: invocation.arguments.to_string(),
-                lifecycle: invocation.lifecycle,
-            });
-            return Box::pin(async move { result.map_err(|_| CommandError::StaleTarget) });
-        }
-        let error = CommandError::UnsupportedFrontend(Arc::from(self.name));
-        Box::pin(async move { Err(error) })
+impl CommandHost for SdkCommandHost {
+    fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            match request {
+                HostRequest::Context(maki_commands::HostContextRequest::ModelSpecs) => {
+                    Ok(HostResponse::Context(
+                        maki_commands::HostContextResponse::Values(Arc::from([])),
+                    ))
+                }
+                HostRequest::Context(_) => Ok(HostResponse::Context(
+                    maki_commands::HostContextResponse::Unavailable,
+                )),
+                HostRequest::Builtin(BuiltinOperation::SetModel { spec }) => {
+                    let (response, response_rx) = flume::bounded(1);
+                    tx.send(CommandRoute::Model {
+                        argument: spec.to_string(),
+                        response,
+                    })
+                    .map_err(|_| CommandError::StaleTarget)?;
+                    response_rx
+                        .recv_async()
+                        .await
+                        .map_err(|_| CommandError::StaleTarget)?
+                }
+                HostRequest::Builtin(operation) => Err(CommandError::Producer(Arc::from(format!(
+                    "unsupported command operation: {operation:?}"
+                )))),
+            }
+        })
     }
 }
 
 struct SdkCommands {
     registry: CommandRegistry,
-    target: InvocationTargetId,
-    builtin_producer: ProducerId,
+    target: TargetHandle,
     route_rx: Receiver<CommandRoute>,
+    _standard_commands: StandardCommands,
 }
 
 impl SdkCommands {
-    fn new(
-        registry: CommandRegistry,
-        custom: &[CustomCommand],
-    ) -> Result<(Self, Arc<dyn McpPromptSink>)> {
+    fn new(registry: CommandRegistry, custom: &[CustomCommand]) -> Result<Self> {
         let (route_tx, route_rx) = flume::unbounded();
-        let builtin = registry.create_producer(ProducerPrecedence::Builtin);
-        builtin.replace(
-            BUILTIN_COMMANDS
-                .iter()
-                .map(|command| Registration {
-                    spec: CommandSpec {
-                        docs: CommandDocs {
-                            summary: Arc::from(command.description),
-                            argument_hint: (command.name == "/model").then(|| Arc::from("<model>")),
-                        },
-                        ..command.spec()
-                    },
-                    behavior: Arc::new(BuiltinBehavior {
-                        name: command.name,
-                        tx: route_tx.clone(),
-                    }),
-                    completion: None,
-                })
-                .collect(),
-        )?;
-        let application = registry.create_producer(ProducerPrecedence::Application);
-        command::register_commands(
-            &application,
-            custom,
-            Arc::new(PromptRouteSink {
+        let standard_commands =
+            StandardCommands::register(&registry, custom, StandardCompletions::default())?;
+        let target = registry.bind_target(
+            TargetCapabilities::from_capability(TargetCapability::ModelSelection),
+            Arc::new(SdkCommandHost {
                 tx: route_tx.clone(),
             }),
-        )?;
-        let sink = Arc::new(PromptRouteSink { tx: route_tx }) as Arc<dyn McpPromptSink>;
-        Ok((
-            Self {
-                target: registry.create_target(),
-                registry,
-                builtin_producer: builtin.id(),
-                route_rx,
-            },
-            sink,
-        ))
+        );
+        Ok(Self {
+            target,
+            registry,
+            route_rx,
+            _standard_commands: standard_commands,
+        })
     }
 
     fn projection(&self) -> Vec<Value> {
-        projected_commands(&self.registry, self.builtin_producer)
+        projected_commands(&self.registry, &self.target).unwrap_or_default()
     }
 
     fn slash_commands(&self) -> Vec<String> {
@@ -672,10 +606,9 @@ pub fn run(params: SdkParams) -> Result<()> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let (session_id, initial_history) = resolve_session(&cli, &working_dir, &storage)?;
 
-    let (sdk_commands, mcp_prompt_sink) = SdkCommands::new(command_registry, &commands)?;
+    let sdk_commands = SdkCommands::new(command_registry, &commands)?;
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
-        let (handle, errors) =
-            mcp::start_with_commands(&cwd, sdk_commands.registry.clone(), mcp_prompt_sink).await;
+        let (handle, errors) = mcp::start_with_commands(&cwd, sdk_commands.registry.clone()).await;
         if let Some(handle) = &handle {
             handle.ready().await;
         }
@@ -784,8 +717,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let projection_watcher = watch_command_projection(
         writer.clone(),
         sdk_commands.registry.clone(),
-        sdk_commands.builtin_producer,
-        sdk_commands.registry.snapshot().generation(),
+        sdk_commands.target.clone(),
     );
 
     let shared = Arc::new(Mutex::new(Shared {
@@ -809,14 +741,9 @@ pub fn run(params: SdkParams) -> Result<()> {
     .spawn(handle.event_rx.clone());
     let command_driver = spawn_command_driver(CommandDriverParams {
         route_rx: sdk_commands.route_rx.clone(),
-        input_tx: handle.input_tx.clone(),
         model_tx: handle.model_tx.clone(),
         shared: Arc::clone(&shared),
-        cwd: cwd.clone(),
-        startup_model: startup_model.clone(),
         model_policy: Arc::clone(&model_policy),
-        fast,
-        workflow,
     });
 
     let input_result = (|| -> Result<()> {
@@ -848,7 +775,12 @@ pub fn run(params: SdkParams) -> Result<()> {
                         shared.turn_start = Instant::now();
                         shared.permission_mode
                     };
-                    if known_command_with_images(&sdk_commands.registry, &prompt, &images) {
+                    if known_command_with_images(
+                        &sdk_commands.registry,
+                        &sdk_commands.target,
+                        &prompt,
+                        &images,
+                    ) {
                         emit_command_result(
                             &writer,
                             &shared,
@@ -857,23 +789,34 @@ pub fn run(params: SdkParams) -> Result<()> {
                         )?;
                         continue;
                     }
-                    match smol::block_on(sdk_commands.registry.dispatch_input(
-                        &prompt,
-                        0,
-                        sdk_commands.target,
-                    )) {
-                        Ok(InputDispatch::Dispatched(dispatch)) => {
-                            match smol::block_on(dispatch.classification()) {
-                                CommandClassification::AgentTurnAccepted => {}
-                                CommandClassification::Completed => {
-                                    emit_command_result(&writer, &shared, false, String::new())?
-                                }
-                                CommandClassification::Failed(error) => {
-                                    emit_command_result(&writer, &shared, true, error.to_string())?
-                                }
+                    let content = CommandContent {
+                        text: Arc::from(prompt.as_str()),
+                        attachments: Arc::from([]),
+                    };
+                    match smol::block_on(
+                        sdk_commands
+                            .registry
+                            .dispatch_input(&sdk_commands.target, content),
+                    ) {
+                        InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
+                            let input = agent_input_from_turn(
+                                turn,
+                                mode.agent_mode(&cwd),
+                                images,
+                                fast,
+                                workflow,
+                            );
+                            if handle.input_tx.send(input).is_err() {
+                                break;
                             }
                         }
-                        Ok(InputDispatch::NotCommand | InputDispatch::UnknownCommandInput) => {
+                        InputDispatch::Dispatched(CommandOutcome::Completed) => {
+                            emit_command_result(&writer, &shared, false, String::new())?
+                        }
+                        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => {
+                            emit_command_result(&writer, &shared, true, error.to_string())?
+                        }
+                        InputDispatch::LiteralInput(_) => {
                             let input = AgentInput {
                                 message: prompt,
                                 mode: mode.agent_mode(&cwd),
@@ -887,9 +830,6 @@ pub fn run(params: SdkParams) -> Result<()> {
                             if handle.input_tx.send(input).is_err() {
                                 break;
                             }
-                        }
-                        Err(error) => {
-                            emit_command_result(&writer, &shared, true, error.to_string())?
                         }
                     }
                 }
@@ -955,52 +895,48 @@ pub fn run(params: SdkParams) -> Result<()> {
     input_result
 }
 
-fn projected_commands(registry: &CommandRegistry, builtin_producer: ProducerId) -> Vec<Value> {
-    registry
-        .snapshot()
-        .commands()
+fn projected_commands(registry: &CommandRegistry, target: &TargetHandle) -> Result<Vec<Value>> {
+    Ok(registry
+        .presented_commands(target)?
         .iter()
-        .filter(|command| {
-            command.producer_id() != builtin_producer || command.spec().name.as_ref() == "/model"
-        })
         .map(|command| {
             serde_json::json!({
-                "name": command.spec().name.trim_start_matches('/'),
-                "description": command.spec().docs.summary,
-                "argumentHint": command.spec().docs.argument_hint.as_deref().unwrap_or_default(),
+                "name": command.name.trim_start_matches('/'),
+                "description": command.description,
+                "argumentHint": command.argument_hint.as_deref().unwrap_or_default(),
             })
         })
-        .collect()
+        .collect())
 }
 
 fn watch_command_projection(
     writer: SdkWriter,
     registry: CommandRegistry,
-    builtin_producer: ProducerId,
-    mut generation: u64,
+    target: TargetHandle,
 ) -> smol::Task<()> {
+    let subscription = registry.subscribe();
     smol::spawn(async move {
+        let mut generation = subscription.generation();
         loop {
-            smol::Timer::after(std::time::Duration::from_millis(50)).await;
-            let snapshot = registry.snapshot();
-            if snapshot.generation() != generation {
-                generation = snapshot.generation();
-                let commands = projected_commands(&registry, builtin_producer);
-                if writer
-                    .emit_system(
-                        "commands_update",
-                        serde_json::json!({
-                            "commands": commands,
-                            "slash_commands": projected_commands(&registry, builtin_producer)
-                                .into_iter()
-                                .filter_map(|command| command["name"].as_str().map(str::to_owned))
-                                .collect::<Vec<_>>(),
-                        }),
-                    )
-                    .is_err()
-                {
-                    return;
-                }
+            generation = subscription.changed(generation).await;
+            let Ok(commands) = projected_commands(&registry, &target) else {
+                return;
+            };
+            let slash_commands = commands
+                .iter()
+                .filter_map(|command| command["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            if writer
+                .emit_system(
+                    "commands_update",
+                    serde_json::json!({
+                        "commands": commands,
+                        "slash_commands": slash_commands,
+                    }),
+                )
+                .is_err()
+            {
+                return;
             }
         }
     })
@@ -1015,50 +951,27 @@ fn spawn_command_driver(params: CommandDriverParams) -> smol::Task<()> {
     smol::spawn(async move {
         let CommandDriverParams {
             route_rx,
-            input_tx,
             model_tx,
             shared,
-            cwd,
-            startup_model,
             model_policy,
-            fast,
-            workflow,
         } = params;
         while let Ok(route) = route_rx.recv_async().await {
             match route {
-                CommandRoute::Agent { message, prompt } => {
-                    let mode = shared.lock().unwrap().permission_mode;
-                    let input = AgentInput {
-                        message,
-                        mode: mode.agent_mode(&cwd),
-                        images: Vec::new(),
-                        preamble: Vec::new(),
-                        thinking: Default::default(),
-                        fast,
-                        workflow,
-                        prompt,
-                    };
-                    let _ = input_tx.send(input);
-                }
-                CommandRoute::Model {
-                    argument,
-                    lifecycle,
-                } => {
-                    let classification = match resolve_set_model(
-                        Some(&Value::String(argument)),
-                        &startup_model,
-                        &model_policy,
-                    ) {
+                CommandRoute::Model { argument, response } => {
+                    let result = match Model::from_spec(&argument)
+                        .ok()
+                        .filter(|model| model_policy.allows(&model.spec()))
+                    {
                         Some(model) if model_tx.send(model.clone()).is_ok() => {
                             shared.lock().unwrap().model = model;
-                            CommandClassification::Completed
+                            Ok(HostResponse::Completed)
                         }
-                        Some(_) => CommandClassification::Failed(CommandError::StaleTarget),
-                        None => CommandClassification::Failed(CommandError::Producer(Arc::from(
+                        Some(_) => Err(CommandError::StaleTarget),
+                        None => Err(CommandError::Producer(Arc::from(
                             "invalid or disallowed model",
                         ))),
                     };
-                    lifecycle.transition(classification);
+                    let _ = response.send(result);
                 }
             }
         }
@@ -1197,15 +1110,39 @@ fn content_text(content: &Value) -> Option<String> {
 // `source` deserializes straight into ImageSource; malformed blocks are skipped.
 fn known_command_with_images(
     registry: &CommandRegistry,
+    target: &TargetHandle,
     prompt: &str,
     images: &[ImageSource],
 ) -> bool {
-    !images.is_empty()
-        && prompt
-            .split_whitespace()
-            .next()
-            .filter(|name| name.starts_with('/'))
-            .is_some_and(|name| registry.resolve(name).is_ok())
+    !images.is_empty() && registry.resolves_input_for(target, prompt)
+}
+
+fn agent_input_from_turn(
+    turn: AgentTurn,
+    mode: AgentMode,
+    images: Vec<ImageSource>,
+    fast: bool,
+    workflow: bool,
+) -> AgentInput {
+    AgentInput {
+        message: turn.content.text.to_string(),
+        mode,
+        images,
+        preamble: Vec::new(),
+        thinking: Default::default(),
+        fast,
+        workflow,
+        prompt: turn.prompt.map(|prompt| {
+            Box::new(McpPromptRef {
+                qualified_name: prompt.qualified_name.to_string(),
+                arguments: prompt
+                    .arguments
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            })
+        }),
+    }
 }
 
 fn content_images(content: &Value) -> Vec<ImageSource> {
@@ -1577,34 +1514,31 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    struct ClassifiedBehavior(CommandClassification);
+    struct OutcomeBehavior(CommandOutcome);
 
-    impl CommandBehavior for ClassifiedBehavior {
+    impl maki_commands::CommandBehavior for OutcomeBehavior {
         fn execute(
             &self,
-            invocation: CommandInvocation,
-        ) -> CommandFuture<Result<(), CommandError>> {
-            let classification = self.0.clone();
-            Box::pin(async move {
-                invocation.lifecycle.transition(classification);
-                Ok(())
-            })
+            _invocation: maki_commands::CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            let outcome = self.0.clone();
+            Box::pin(async move { Ok(outcome) })
         }
     }
 
-    fn registration(name: &str, classification: CommandClassification) -> Registration {
-        Registration {
-            spec: CommandSpec {
+    fn registration(name: &str, outcome: CommandOutcome) -> maki_commands::Registration {
+        maki_commands::Registration {
+            spec: maki_commands::CommandSpec {
                 name: Arc::from(name),
                 aliases: Arc::from([]),
-                arguments: ArgumentArity::ANY,
-                docs: CommandDocs {
+                arguments: maki_commands::ArgumentArity::ANY,
+                docs: maki_commands::CommandDocs {
                     summary: Arc::from(format!("{name} description")),
                     argument_hint: Some(Arc::from("<arg>")),
                 },
-                tui_only: false,
+                required_capabilities: TargetCapabilities::default(),
             },
-            behavior: Arc::new(ClassifiedBehavior(classification)),
+            behavior: Arc::new(OutcomeBehavior(outcome)),
             completion: None,
         }
     }
@@ -1681,17 +1615,14 @@ mod tests {
     #[test]
     fn sdk_commands_projection_includes_shared_producers_and_supported_model_only() {
         let registry = CommandRegistry::new();
-        let plugin = registry.create_producer(ProducerPrecedence::Plugin);
+        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
         plugin
-            .replace(vec![registration("/lua", CommandClassification::Completed)])
+            .replace(vec![registration("/lua", CommandOutcome::Completed)])
             .unwrap();
-        let mcp = registry.create_producer(ProducerPrecedence::Mcp);
-        mcp.replace(vec![registration(
-            "/mcp:prompt",
-            CommandClassification::Completed,
-        )])
-        .unwrap();
-        let (commands, _) = SdkCommands::new(registry, &[]).unwrap();
+        let mcp = registry.create_producer(maki_commands::ProducerPrecedence::Mcp);
+        mcp.replace(vec![registration("/mcp:prompt", CommandOutcome::Completed)])
+            .unwrap();
+        let commands = SdkCommands::new(registry, &[]).unwrap();
 
         assert_eq!(commands.slash_commands(), ["lua", "mcp:prompt", "model"]);
         let projection = commands.projection();
@@ -1702,13 +1633,11 @@ mod tests {
     #[test]
     fn sdk_known_command_with_images_is_rejected_before_dispatch() {
         let registry = CommandRegistry::new();
-        let plugin = registry.create_producer(ProducerPrecedence::Plugin);
+        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
         plugin
-            .replace(vec![registration(
-                "/inspect",
-                CommandClassification::Completed,
-            )])
+            .replace(vec![registration("/inspect", CommandOutcome::Completed)])
             .unwrap();
+        let commands = SdkCommands::new(registry.clone(), &[]).unwrap();
         let images = vec![ImageSource::new(
             maki_providers::ImageMediaType::Png,
             Arc::from("AAAA"),
@@ -1716,210 +1645,58 @@ mod tests {
 
         assert!(known_command_with_images(
             &registry,
+            &commands.target,
             "/inspect now",
             &images
         ));
         assert!(!known_command_with_images(
             &registry,
+            &commands.target,
             "/unknown literal",
             &images
         ));
-        assert!(!known_command_with_images(&registry, "/inspect now", &[]));
+        assert!(!known_command_with_images(
+            &registry,
+            &commands.target,
+            "/inspect now",
+            &[]
+        ));
     }
 
     #[test]
-    fn sdk_command_projection_update_uses_system_control_shape() {
+    fn sdk_dispatch_returns_outcomes_and_preserves_literal_input() {
         let registry = CommandRegistry::new();
-        let builtin = registry.create_producer(ProducerPrecedence::Builtin);
-        let (out_tx, out_rx) = flume::unbounded();
-        let writer = SdkWriter {
-            session_id: SessionRef::from(maki_storage::id::MakiId::generate()),
-            out_tx,
-        };
-        let generation = registry.snapshot().generation();
-        let task = watch_command_projection(writer, registry.clone(), builtin.id(), generation);
-        let plugin = registry.create_producer(ProducerPrecedence::Plugin);
+        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
         plugin
-            .replace(vec![registration(
-                "/dynamic",
-                CommandClassification::Completed,
-            )])
+            .replace(vec![registration("/done", CommandOutcome::Completed)])
             .unwrap();
-
-        let line = out_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        let update: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(update["type"], "system");
-        assert_eq!(update["subtype"], "commands_update");
-        assert_eq!(update["commands"][0]["name"], "dynamic");
-        assert_eq!(update["slash_commands"][0], "dynamic");
-        smol::block_on(task.cancel());
-    }
-
-    #[test]
-    fn sdk_eof_shutdown_joins_background_tasks_and_closes_channels() {
-        let registry = CommandRegistry::new();
-        let (commands, prompt_sink) = SdkCommands::new(registry, &[]).unwrap();
-        let (out_tx, out_rx) = flume::unbounded();
-        let writer = SdkWriter {
-            session_id: SessionRef::from(maki_storage::id::MakiId::generate()),
-            out_tx,
-        };
-        let projection_watcher = watch_command_projection(
-            writer,
-            commands.registry.clone(),
-            commands.builtin_producer,
-            commands.registry.snapshot().generation(),
-        );
-        let (input_tx, input_rx) = flume::unbounded();
-        let (model_tx, _model_rx) = flume::unbounded();
-        let startup_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let shared = Arc::new(Mutex::new(Shared {
-            model: startup_model.clone(),
-            permission_mode: PermissionMode::Default,
-            turn_start: Instant::now(),
-            pending: HashSet::new(),
-        }));
-        let command_driver = spawn_command_driver(CommandDriverParams {
-            route_rx: commands.route_rx.clone(),
-            input_tx,
-            model_tx,
-            shared,
-            cwd: Path::new("/tmp").to_owned(),
-            startup_model,
-            model_policy: Arc::new(ModelPolicy::default()),
-            fast: false,
-            workflow: false,
-        });
-        drop(commands);
-        drop(prompt_sink);
-
-        let (shutdown_tx, shutdown_rx) = flume::bounded(1);
-        let shutdown_thread = std::thread::spawn(move || {
-            smol::block_on(stop_sdk_tasks(projection_watcher, command_driver));
-            shutdown_tx.send(()).unwrap();
-        });
-        shutdown_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("SDK background tasks did not terminate");
-        shutdown_thread.join().unwrap();
+        let commands = SdkCommands::new(registry.clone(), &[]).unwrap();
 
         assert!(matches!(
-            input_rx.try_recv(),
-            Err(flume::TryRecvError::Disconnected)
+            smol::block_on(registry.dispatch_input(&commands.target, "/done now".into())),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
         assert!(matches!(
-            out_rx.try_recv(),
-            Err(flume::TryRecvError::Disconnected)
+            smol::block_on(registry.dispatch_input(&commands.target, "/unknown literal".into())),
+            InputDispatch::LiteralInput(_)
+        ));
+        assert!(matches!(
+            smol::block_on(registry.dispatch_input(&commands.target, "ordinary literal".into())),
+            InputDispatch::LiteralInput(_)
         ));
     }
 
     #[test]
-    fn sdk_dispatch_classifies_known_and_preserves_unknown_slash_input() {
-        let registry = CommandRegistry::new();
-        let plugin = registry.create_producer(ProducerPrecedence::Plugin);
-        plugin
-            .replace(vec![registration(
-                "/done",
-                CommandClassification::Completed,
-            )])
-            .unwrap();
-        let target = registry.create_target();
-
-        let known = smol::block_on(registry.dispatch_input("/done now", 0, target)).unwrap();
-        let InputDispatch::Dispatched(dispatch) = known else {
-            panic!("known command was not dispatched");
-        };
-        assert_eq!(
-            smol::block_on(dispatch.classification()),
-            CommandClassification::Completed
-        );
+    fn sdk_unsupported_builtin_is_literal_input() {
+        let commands = SdkCommands::new(CommandRegistry::new(), &[]).unwrap();
         assert!(matches!(
-            smol::block_on(registry.dispatch_input("/unknown literal", 0, target)).unwrap(),
-            InputDispatch::UnknownCommandInput
+            smol::block_on(
+                commands
+                    .registry
+                    .dispatch_input(&commands.target, "/help".into())
+            ),
+            InputDispatch::LiteralInput(_)
         ));
-        assert!(matches!(
-            smol::block_on(registry.dispatch_input("ordinary literal", 0, target)).unwrap(),
-            InputDispatch::NotCommand
-        ));
-    }
-
-    #[test]
-    fn sdk_custom_command_drives_agent_turn_and_model_command_completes() {
-        let registry = CommandRegistry::new();
-        let custom = CustomCommand {
-            name: "review".into(),
-            description: "Review code".into(),
-            content: "Review $ARGUMENTS".into(),
-            scope: command::CommandScope::Project,
-            accepts_args: true,
-        };
-        let (commands, _) = SdkCommands::new(registry, &[custom]).unwrap();
-        let (input_tx, input_rx) = flume::unbounded();
-        let (model_tx, model_rx) = flume::unbounded();
-        let startup_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let shared = Arc::new(Mutex::new(Shared {
-            model: startup_model.clone(),
-            permission_mode: PermissionMode::Default,
-            turn_start: Instant::now(),
-            pending: HashSet::new(),
-        }));
-        let driver = spawn_command_driver(CommandDriverParams {
-            route_rx: commands.route_rx.clone(),
-            input_tx,
-            model_tx,
-            shared: Arc::clone(&shared),
-            cwd: Path::new("/tmp").to_owned(),
-            startup_model,
-            model_policy: Arc::new(ModelPolicy::default()),
-            fast: false,
-            workflow: false,
-        });
-
-        let custom = smol::block_on(commands.registry.dispatch_input(
-            "/project:review src/lib.rs",
-            0,
-            commands.target,
-        ))
-        .unwrap();
-        let InputDispatch::Dispatched(custom) = custom else {
-            panic!("custom command was not dispatched");
-        };
-        assert_eq!(
-            smol::block_on(custom.classification()),
-            CommandClassification::AgentTurnAccepted
-        );
-        assert_eq!(input_rx.recv().unwrap().message, "Review src/lib.rs");
-
-        let model = smol::block_on(commands.registry.dispatch_input(
-            "/model anthropic/claude-opus-4-6",
-            0,
-            commands.target,
-        ))
-        .unwrap();
-        let InputDispatch::Dispatched(model) = model else {
-            panic!("model command was not dispatched");
-        };
-        assert_eq!(
-            smol::block_on(model.classification()),
-            CommandClassification::Completed
-        );
-        assert_eq!(model_rx.recv().unwrap().spec(), "anthropic/claude-opus-4-6");
-        drop(commands);
-        smol::block_on(driver);
-    }
-
-    #[test]
-    fn sdk_unsupported_builtin_returns_frontend_error() {
-        let (commands, _) = SdkCommands::new(CommandRegistry::new(), &[]).unwrap();
-        let error = smol::block_on(
-            commands
-                .registry
-                .dispatch_input("/help", 0, commands.target),
-        )
-        .unwrap_err();
-        assert_eq!(error, CommandError::UnsupportedFrontend(Arc::from("/help")));
     }
 
     #[test_case("bash", "Bash")]

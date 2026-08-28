@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
@@ -59,6 +59,7 @@ pub struct StatusBarContext<'a> {
 pub struct StatusBar {
     flash: Option<(String, Instant)>,
     started_at: Instant,
+    cwd: PathBuf,
     cwd_branch: String,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
@@ -66,12 +67,14 @@ pub struct StatusBar {
 
 impl StatusBar {
     pub fn new(flash_duration: Duration) -> Self {
+        let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
         Self {
             flash: None,
             started_at: Instant::now(),
-            cwd_branch: cwd_branch_label(),
+            cwd_branch: cwd_branch_label(&cwd),
+            branch_update_rx: spawn_branch_watcher(&cwd),
+            cwd,
             flash_duration,
-            branch_update_rx: spawn_branch_watcher(),
         }
     }
 
@@ -84,8 +87,10 @@ impl StatusBar {
         self.flash.as_ref().map(|(s, _)| s.as_str())
     }
 
-    pub fn refresh_cwd(&mut self) {
-        self.cwd_branch = cwd_branch_label();
+    pub fn set_cwd(&mut self, cwd: PathBuf) {
+        self.cwd_branch = cwd_branch_label(&cwd);
+        self.branch_update_rx = spawn_branch_watcher(&cwd);
+        self.cwd = cwd;
     }
 
     pub(crate) fn cwd_branch(&self) -> &str {
@@ -99,7 +104,7 @@ impl StatusBar {
         if rx.try_iter().next().is_none() {
             return Dirty::NO;
         }
-        let branch = cwd_branch_label();
+        let branch = cwd_branch_label(&self.cwd);
         let changed = branch != self.cwd_branch;
         self.cwd_branch = branch;
         Dirty::from(changed)
@@ -290,10 +295,8 @@ fn collapse_home_with(path: &str, home: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn cwd_branch_label() -> String {
-    let cwd = env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| ".".into());
+fn cwd_branch_label(cwd: &Path) -> String {
+    let cwd = cwd.to_string_lossy();
     let label = collapse_home(&cwd);
     match detect_branch(&cwd) {
         Some(branch) => format!("{label}:{branch}"),
@@ -331,11 +334,10 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-fn spawn_branch_watcher() -> Option<flume::Receiver<()>> {
+fn spawn_branch_watcher(cwd: &Path) -> Option<flume::Receiver<()>> {
     use notify::{RecursiveMode, Watcher};
 
-    let cwd = env::current_dir().ok()?;
-    let git_dir = find_git_dir(&cwd)?;
+    let git_dir = find_git_dir(cwd)?;
     let (tx, rx) = flume::bounded(1);
 
     std::thread::spawn(move || {
@@ -519,7 +521,8 @@ mod tests {
     #[test_case(false => Dirty::NO  ; "unchanged_branch")]
     #[test_case(true  => Dirty::YES ; "switched_branch")]
     fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
-        let label = cwd_branch_label();
+        let cwd = env::current_dir().unwrap();
+        let label = cwd_branch_label(&cwd);
         let (tx, rx) = flume::bounded(1);
         let mut bar = StatusBar::new(FLASH_TTL);
         bar.cwd_branch = if stale {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use flume::Sender;
 use futures_lite::future;
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
+use maki_providers::{ImageSource, Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
@@ -20,8 +20,8 @@ say so; do not offer to look it up.\n</system-reminder>";
 const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
 from the conversation context.";
 
-/// The reminder leads so the model treats the question as a quick aside, not a task to act on.
-pub(crate) fn btw_question(question: &str) -> Message {
+#[cfg(test)]
+fn btw_question(question: &str) -> Message {
     Message::user(format!("{BTW_REMINDER}\n\n{question}"))
 }
 
@@ -29,6 +29,7 @@ impl App {
     pub(crate) fn start_btw(
         &mut self,
         question: String,
+        images: Vec<ImageSource>,
         provider: Arc<dyn Provider>,
         model: Model,
     ) {
@@ -46,7 +47,10 @@ impl App {
             .map(|s| String::clone(&s.load()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| BTW_FALLBACK_SYSTEM.to_string());
-        messages.push(btw_question(&question));
+        messages.push(Message::user_with_images(
+            format!("{BTW_REMINDER}\n\n{question}"),
+            images,
+        ));
 
         let (tx, rx) = flume::bounded(64);
         self.btw_modal.open(&question, rx);

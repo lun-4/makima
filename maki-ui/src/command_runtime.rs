@@ -1,147 +1,58 @@
 use std::sync::Arc;
 
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
-use maki_agent::{
-    McpPromptRequest, McpPromptSink,
-    command::{self, PromptSink},
-};
+use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_commands::{
-    BUILTIN_COMMANDS, CommandBehavior, CommandClassification, CommandCompletion, CommandError,
-    CommandFuture, CommandInvocation, CommandRegistry, InvocationLifecycle, InvocationTargetId,
-    ProducerPrecedence, Registration,
+    CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
+    HostRequest, HostResponse, ResolvedCommand, TargetCapabilities, TargetHandle,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BuiltinRoute {
-    Tasks,
-    Compact,
-    New,
-    Help,
-    Usage,
-    Queue,
-    Model,
-    Theme,
-    Mcp,
-    Login,
-    Cd,
-    Btw,
-    Yolo,
-    Thinking,
-    Fast,
-    Workflow,
-    Exit,
-    Reload,
+pub(crate) enum CommandEvent {
+    Host {
+        target: maki_commands::InvocationTargetId,
+        request: HostRequest,
+        reply: flume::Sender<Result<HostResponse, CommandError>>,
+    },
+    Outcome {
+        target: maki_commands::InvocationTargetId,
+        outcome: CommandOutcome,
+    },
 }
 
-impl BuiltinRoute {
-    fn from_name(name: &str) -> Self {
-        match name {
-            "/tasks" => Self::Tasks,
-            "/compact" => Self::Compact,
-            "/new" => Self::New,
-            "/help" => Self::Help,
-            "/usage" => Self::Usage,
-            "/queue" => Self::Queue,
-            "/model" => Self::Model,
-            "/theme" => Self::Theme,
-            "/mcp" => Self::Mcp,
-            "/login" => Self::Login,
-            "/cd" => Self::Cd,
-            "/btw" => Self::Btw,
-            "/yolo" => Self::Yolo,
-            "/thinking" => Self::Thinking,
-            "/fast" => Self::Fast,
-            "/workflow" => Self::Workflow,
-            "/exit" => Self::Exit,
-            "/reload" => Self::Reload,
-            _ => unreachable!("builtin metadata and route enum diverged"),
-        }
-    }
+struct UiCommandHost {
+    target: std::sync::OnceLock<maki_commands::InvocationTargetId>,
+    tx: flume::Sender<CommandEvent>,
 }
 
-#[derive(Clone)]
-pub(crate) enum CommandRoute {
-    Builtin(BuiltinRoute),
-    Prompt(String),
-    Mcp(McpPromptRequest),
-}
-
-pub(crate) struct RoutedCommand {
-    pub target: InvocationTargetId,
-    pub route: CommandRoute,
-    pub arguments: String,
-    pub depth: usize,
-    pub lifecycle: InvocationLifecycle,
-}
-
-#[derive(Clone)]
-pub(crate) struct McpPromptRouteSink {
-    command_tx: flume::Sender<RoutedCommand>,
-}
-
-impl McpPromptSink for McpPromptRouteSink {
-    fn submit(
-        &self,
-        invocation: CommandInvocation,
-        prompt: McpPromptRequest,
-    ) -> CommandFuture<Result<(), CommandError>> {
-        let result = self.command_tx.send(RoutedCommand {
-            target: invocation.target_id,
-            route: CommandRoute::Mcp(prompt),
-            arguments: invocation.arguments.to_string(),
-            depth: invocation.depth,
-            lifecycle: invocation.lifecycle,
-        });
-        Box::pin(async move { result.map_err(|_| CommandError::StaleTarget) })
-    }
-}
-
-#[derive(Clone)]
-struct PromptRouteSink {
-    command_tx: flume::Sender<RoutedCommand>,
-}
-
-impl PromptSink for PromptRouteSink {
-    fn submit(
-        &self,
-        prompt: String,
-        invocation: CommandInvocation,
-    ) -> CommandFuture<Result<(), CommandError>> {
-        let result = self.command_tx.send(RoutedCommand {
-            target: invocation.target_id,
-            route: CommandRoute::Prompt(prompt),
-            arguments: String::new(),
-            depth: invocation.depth,
-            lifecycle: invocation.lifecycle,
-        });
-        Box::pin(async move { result.map_err(|_| CommandError::StaleTarget) })
-    }
-}
-
-struct RouteBehavior {
-    route: CommandRoute,
-    command_tx: flume::Sender<RoutedCommand>,
-}
-
-impl CommandBehavior for RouteBehavior {
-    fn execute(&self, invocation: CommandInvocation) -> CommandFuture<Result<(), CommandError>> {
-        let result = self.command_tx.send(RoutedCommand {
-            target: invocation.target_id,
-            route: self.route.clone(),
-            arguments: invocation.arguments.to_string(),
-            depth: invocation.depth,
-            lifecycle: invocation.lifecycle,
-        });
-        Box::pin(async move { result.map_err(|_| CommandError::StaleTarget) })
+impl CommandHost for UiCommandHost {
+    fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        let Some(target) = self.target.get().copied() else {
+            return Box::pin(async { Err(CommandError::StaleTarget) });
+        };
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            let (reply, rx) = flume::bounded(1);
+            tx.send_async(CommandEvent::Host {
+                target,
+                request,
+                reply,
+            })
+            .await
+            .map_err(|_| CommandError::StaleTarget)?;
+            rx.recv_async()
+                .await
+                .unwrap_or(Err(CommandError::StaleTarget))
+        })
     }
 }
 
 pub(crate) struct CommandRuntime {
     pub registry: CommandRegistry,
-    command_tx: flume::Sender<RoutedCommand>,
-    theme_completion: Arc<ThemeArgSource>,
+    event_tx: flume::Sender<CommandEvent>,
     #[cfg(test)]
-    command_rx: flume::Receiver<RoutedCommand>,
+    event_rx: flume::Receiver<CommandEvent>,
+    theme_completion: Arc<ThemeArgSource>,
+    _standard_commands: StandardCommands,
 }
 
 impl CommandRuntime {
@@ -166,196 +77,106 @@ impl CommandRuntime {
         registry: CommandRegistry,
         model_completion: Arc<ModelArgSource>,
         theme_completion: Arc<ThemeArgSource>,
-    ) -> (Self, flume::Receiver<RoutedCommand>, Arc<dyn McpPromptSink>) {
-        let (command_tx, command_rx) = flume::unbounded();
-        let builtin = registry.create_producer(ProducerPrecedence::Builtin);
-        builtin
-            .replace(
-                BUILTIN_COMMANDS
-                    .iter()
-                    .map(|command| {
-                        let route = CommandRoute::Builtin(BuiltinRoute::from_name(command.name));
-                        Registration {
-                            spec: command.spec(),
-                            behavior: Arc::new(RouteBehavior {
-                                route: route.clone(),
-                                command_tx: command_tx.clone(),
-                            }),
-                            completion: match route {
-                                CommandRoute::Builtin(BuiltinRoute::Model) => {
-                                    Some(Arc::clone(&model_completion) as Arc<dyn CommandCompletion>)
-                                }
-                                CommandRoute::Builtin(BuiltinRoute::Theme) => {
-                                    Some(Arc::clone(&theme_completion) as Arc<dyn CommandCompletion>)
-                                }
-                                _ => None,
-                            },
-                        }
-                    })
-                    .collect(),
-            )
-            .expect("static builtin registrations are valid");
-        let application = registry.create_producer(ProducerPrecedence::Application);
-        command::register_commands(
-            &application,
+    ) -> (Self, flume::Receiver<CommandEvent>) {
+        let (event_tx, event_rx) = flume::unbounded();
+        let standard_commands = StandardCommands::register(
+            &registry,
             custom_commands,
-            Arc::new(PromptRouteSink {
-                command_tx: command_tx.clone(),
-            }),
+            StandardCompletions {
+                model: Some(model_completion),
+                theme: Some(Arc::clone(&theme_completion) as Arc<_>),
+            },
         )
-        .expect("custom command metadata is valid");
-        let runtime = Self {
-            registry,
-            command_tx,
-            theme_completion,
-            #[cfg(test)]
-            command_rx: command_rx.clone(),
-        };
-        let mcp_prompt_sink = Arc::new(McpPromptRouteSink {
-            command_tx: runtime.command_tx.clone(),
+        .expect("static and configured command metadata is valid");
+        (
+            Self {
+                registry,
+                event_tx,
+                #[cfg(test)]
+                event_rx: event_rx.clone(),
+                theme_completion,
+                _standard_commands: standard_commands,
+            },
+            event_rx,
+        )
+    }
+
+    pub(crate) fn bind_target(&self) -> TargetHandle {
+        let host = Arc::new(UiCommandHost {
+            target: std::sync::OnceLock::new(),
+            tx: self.event_tx.clone(),
         });
-        (runtime, command_rx, mcp_prompt_sink)
+        let target = self
+            .registry
+            .bind_target(TargetCapabilities::ALL, host.clone());
+        host.target
+            .set(target.id())
+            .expect("new command host target is unset");
+        target
+    }
+
+    pub(crate) fn dispatch_command(
+        &self,
+        target: &TargetHandle,
+        command: ResolvedCommand,
+        arguments: Arc<str>,
+        content: CommandContent,
+        depth: usize,
+    ) {
+        let future = self
+            .registry
+            .dispatch_command_with_depth(target, command, arguments, content, depth);
+        self.send_outcome(target.id(), future);
+    }
+
+    pub(crate) fn dispatch_input(
+        &self,
+        target: &TargetHandle,
+        content: CommandContent,
+        depth: usize,
+    ) {
+        let future = self
+            .registry
+            .dispatch_input_with_depth(target, content, depth);
+        let tx = self.event_tx.clone();
+        let target = target.id();
+        smol::spawn(async move {
+            if let maki_commands::InputDispatch::Dispatched(outcome) = future.await {
+                let _ = tx
+                    .send_async(CommandEvent::Outcome { target, outcome })
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn send_outcome(
+        &self,
+        target: maki_commands::InvocationTargetId,
+        future: CommandFuture<CommandOutcome>,
+    ) {
+        let tx = self.event_tx.clone();
+        smol::spawn(async move {
+            let outcome = future.await;
+            let _ = tx
+                .send_async(CommandEvent::Outcome { target, outcome })
+                .await;
+        })
+        .detach();
     }
 
     #[cfg(test)]
-    pub fn try_recv_for_test(&self) -> Option<RoutedCommand> {
-        self.command_rx.try_recv().ok()
+    pub(crate) fn recv_for_test(&self) -> Option<CommandEvent> {
+        self.event_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .ok()
     }
 
-    pub(crate) fn finish_theme_preview(&self, target: InvocationTargetId, commit: bool) {
-        self.theme_completion.finish(target, commit);
-    }
-}
-
-pub(crate) fn complete(command: &RoutedCommand, classification: CommandClassification) {
-    command.lifecycle.transition(classification);
-}
-
-#[cfg(test)]
-impl CommandRuntime {
-    pub(crate) fn command_tx(&self) -> flume::Sender<RoutedCommand> {
-        self.command_tx.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arc_swap::ArcSwapOption;
-    use maki_commands::{BUILTIN_COMMANDS, CommandClassification, CommandError, InputDispatch};
-
-    use super::{CommandRuntime, RoutedCommand};
-    use crate::{
-        components::arg_completion::{ModelArgSource, ThemeArgSource},
-        theme::ThemesProvider,
-    };
-
-    fn runtime() -> (CommandRuntime, flume::Receiver<RoutedCommand>) {
-        runtime_with_themes(Arc::new(crate::theme::InMemoryThemesProvider::bundled()))
-    }
-
-    fn runtime_with_themes(
-        provider: Arc<crate::theme::InMemoryThemesProvider>,
-    ) -> (CommandRuntime, flume::Receiver<RoutedCommand>) {
-        let (runtime, rx, _) = CommandRuntime::new(
-            &[],
-            maki_commands::CommandRegistry::new(),
-            Arc::new(ModelArgSource::new(Arc::new(ArcSwapOption::empty()))),
-            Arc::new(ThemeArgSource::new(provider)),
-        );
-        (runtime, rx)
-    }
-
-    #[test]
-    fn routed_command_preserves_target_and_terminal_lifecycle() {
-        let (runtime, rx) = runtime();
-        let target = runtime.registry.create_target();
-        let InputDispatch::Dispatched(dispatch) =
-            smol::block_on(runtime.registry.dispatch_input("/help", 0, target)).unwrap()
-        else {
-            panic!("expected dispatch");
-        };
-        let routed = rx.recv().unwrap();
-        assert_eq!(routed.target, target);
-        super::complete(&routed, CommandClassification::Completed);
-        assert_eq!(
-            smol::block_on(dispatch.classification()),
-            CommandClassification::Completed
-        );
-    }
-
-    fn theme_context(
-        runtime: &CommandRuntime,
+    pub(crate) fn finish_theme_preview(
+        &self,
         target: maki_commands::InvocationTargetId,
-        theme: &str,
-    ) -> (
-        maki_commands::CompletionSession,
-        maki_commands::CompletionCandidate,
+        commit: bool,
     ) {
-        let session = runtime
-            .registry
-            .open_completion(runtime.registry.resolve("/theme").unwrap(), target)
-            .unwrap();
-        let maki_commands::CompletionResult::Items(mut items) = smol::block_on(session.complete(
-            Arc::from(theme),
-            Arc::from(theme),
-            0,
-            Arc::from("build"),
-        )) else {
-            panic!("expected theme items");
-        };
-        let candidate = items
-            .drain(..)
-            .find(|item| item.item().insertion.as_ref() == theme)
-            .unwrap();
-        (session, candidate)
-    }
-
-    #[test]
-    fn overlapping_theme_previews_restore_deterministically() {
-        let provider = Arc::new(crate::theme::InMemoryThemesProvider::bundled());
-        let baseline = provider.current_theme_name();
-        let (runtime, _) = runtime_with_themes(Arc::clone(&provider));
-        let first_target = runtime.registry.create_target();
-        let second_target = runtime.registry.create_target();
-        let (first, first_item) = theme_context(&runtime, first_target, "dracula");
-        let (second, second_item) = theme_context(&runtime, second_target, "tokyonight");
-
-        first.highlight(&first_item).unwrap();
-        second.highlight(&second_item).unwrap();
-        first.cancel().unwrap();
-        assert_eq!(provider.current_theme_name(), "tokyonight");
-        second.cancel().unwrap();
-        assert_eq!(provider.current_theme_name(), baseline);
-    }
-
-    #[test]
-    fn dropped_target_is_classified_stale() {
-        let (runtime, rx) = runtime();
-        let target = runtime.registry.create_target();
-        let InputDispatch::Dispatched(dispatch) =
-            smol::block_on(runtime.registry.dispatch_input("/help", 0, target)).unwrap()
-        else {
-            panic!("expected dispatch");
-        };
-        let routed = rx.recv().unwrap();
-        routed
-            .lifecycle
-            .transition(CommandClassification::Failed(CommandError::StaleTarget));
-        assert_eq!(
-            smol::block_on(dispatch.classification()),
-            CommandClassification::Failed(CommandError::StaleTarget)
-        );
-    }
-    /// Every built-in in the shared metadata must map to a TUI route: a
-    /// missing arm here panics at startup instead of failing this test, so
-    /// pin the pairing explicitly.
-    #[test]
-    fn every_builtin_command_maps_to_a_route() {
-        for command in BUILTIN_COMMANDS {
-            let _route = super::BuiltinRoute::from_name(command.name);
-        }
-        assert_eq!(BUILTIN_COMMANDS.len(), 18);
+        self.theme_completion.finish(target, commit);
     }
 }

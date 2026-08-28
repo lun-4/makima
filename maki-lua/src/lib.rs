@@ -133,7 +133,10 @@ pub mod test_support {
             &self,
         ) -> Option<(&'static str, Option<String>, bool)> {
             use crate::runtime::{CommandArgumentLifecycle, Request};
-            while let Ok(req) = self.0.try_recv() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+                let req = self.0.recv_timeout(remaining).ok()?;
                 if let Request::CommandArgumentLifecycle(work) = req {
                     let latest = !work.is_superseded();
                     let event = match work.value().event {
@@ -150,7 +153,6 @@ pub mod test_support {
                     return Some((event, insertion, latest));
                 }
             }
-            None
         }
 
         pub fn try_finish_splash_frame(

@@ -31,11 +31,18 @@ end
 
 Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
 
-fn write_row(out: &mut String, name: &str, description: &str, tui_only: bool) {
+fn write_row(
+    out: &mut String,
+    name: &str,
+    description: &str,
+    argument_hint: Option<&str>,
+    tui_only: bool,
+) {
     writeln!(
         out,
-        "| `{name}` | {} | {} |",
+        "| `{name}` | {} | {} | {} |",
         description.replace('|', "\\|"),
+        argument_hint.unwrap_or(""),
         if tui_only { "yes" } else { "no" }
     )
     .unwrap();
@@ -54,40 +61,50 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown slash-prefixed text remains a model prompt. A known command with invalid arguments, or an effect unsupported by the current frontend, returns an error instead of becoming a prompt."
+        "Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text remains a model prompt. A known available command with invalid arguments returns an error instead of becoming a prompt."
     )
     .unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
-        "The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current winners. Root CLI subcommands such as `maki auth` are separate from slash commands."
+        "The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. The Lua `tui_only` field maps to the interactive-TUI capability. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands."
     )
     .unwrap();
     writeln!(out).unwrap();
 
     writeln!(out, "## Built-in commands").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description | TUI-only |").unwrap();
-    writeln!(out, "|---------|-------------|----------|").unwrap();
+    writeln!(out, "| Command | Description | Arguments | TUI-only |").unwrap();
+    writeln!(out, "|---------|-------------|-----------|----------|").unwrap();
     for cmd in BUILTIN_COMMANDS {
-        write_row(&mut out, cmd.name, cmd.description, cmd.tui_only);
+        let spec = cmd.spec();
+        write_row(
+            &mut out,
+            cmd.name,
+            cmd.description,
+            spec.docs.argument_hint.as_deref(),
+            cmd.required_capabilities
+                .contains(maki_commands::TargetCapability::InteractiveUi),
+        );
         for alias in cmd.aliases {
             write_row(
                 &mut out,
                 alias,
                 &format!("Alias for `{}`", cmd.name),
-                cmd.tui_only,
+                spec.docs.argument_hint.as_deref(),
+                cmd.required_capabilities
+                    .contains(maki_commands::TargetCapability::InteractiveUi),
             );
         }
     }
     for cmd in &lua_util::load_builtin_plugin_commands() {
-        write_row(&mut out, &cmd.name, &cmd.description, cmd.tui_only);
+        write_row(&mut out, &cmd.name, &cmd.description, None, cmd.tui_only);
     }
 
     writeln!(out).unwrap();
     writeln!(
         out,
-        "The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises only these built-ins, plus registered custom, MCP, and Lua commands that are not TUI-only. In ACP, a TUI-only command is omitted from the advertised list and forwarded as literal prompt text if invoked. Other frontends recognize TUI-only commands but report an unsupported-frontend error."
+        "The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text."
     )
     .unwrap();
 

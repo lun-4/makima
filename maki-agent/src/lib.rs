@@ -11,8 +11,7 @@ pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerS
 pub use mcp::protocol::PromptRole;
 pub mod modes;
 pub use mcp::{
-    McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpPromptRequest, McpPromptSink,
-    McpSession, McpSnapshot, McpSnapshotReader,
+    McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
 };
 pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 pub(crate) mod task_set;

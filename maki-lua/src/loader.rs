@@ -1001,6 +1001,28 @@ mod tests {
     use std::time::Instant;
     use test_case::test_case;
 
+    struct FakeCommandHost;
+
+    impl maki_commands::CommandHost for FakeCommandHost {
+        fn request(
+            &self,
+            _request: maki_commands::HostRequest,
+        ) -> maki_commands::CommandFuture<
+            Result<maki_commands::HostResponse, maki_commands::CommandError>,
+        > {
+            Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
+        }
+    }
+
+    fn command_snapshot(host: &PluginHost) -> maki_commands::RegistrySnapshot {
+        let registry = host.command_registry();
+        let target = registry.bind_target(
+            maki_commands::TargetCapabilities::ALL,
+            Arc::new(FakeCommandHost),
+        );
+        registry.snapshot_for(&target).unwrap()
+    }
+
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
     /// interpreter path needs its own coverage.
@@ -1073,7 +1095,7 @@ mod tests {
     fn memory_builtin_registers_command() {
         let reg = Arc::new(ToolRegistry::new());
         let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-        let snap = host.command_registry().snapshot();
+        let snap = command_snapshot(&host);
         let found = snap
             .commands()
             .iter()
@@ -1263,7 +1285,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap = host.command_registry().snapshot();
+        let snap = command_snapshot(&host);
         assert_eq!(snap.commands().len(), 2);
         let names: Vec<&str> = snap
             .commands()
@@ -1290,7 +1312,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap = host.command_registry().snapshot();
+        let snap = command_snapshot(&host);
         assert_eq!(snap.commands().len(), 1);
         assert_eq!(snap.commands()[0].spec().name.as_ref(), "/hello");
     }
@@ -1324,7 +1346,7 @@ mod tests {
         let entry = &snap.entries[0];
         assert_eq!(entry.desc, "test override");
         assert!(
-            host.command_registry().snapshot().commands().is_empty(),
+            command_snapshot(&host).commands().is_empty(),
             "callback has not fired yet"
         );
 
@@ -1333,7 +1355,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let snapshot = host.command_registry().snapshot();
+            let snapshot = command_snapshot(&host);
             if snapshot
                 .commands()
                 .iter()

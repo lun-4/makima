@@ -32,8 +32,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_commands::{
-    ArgumentArity, CommandBehavior, CommandDocs, CommandError, CommandFuture, CommandInvocation,
-    CommandRegistry, CommandSpec, Producer, ProducerPrecedence, Registration,
+    AgentTurn, ArgumentArity, CommandBehavior, CommandContent, CommandDocs, CommandError,
+    CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, Producer,
+    ProducerPrecedence, PromptReference, Registration, TargetCapabilities, TargetCapability,
 };
 use maki_providers::{ContentBlock, Message};
 use serde_json::{Value, json};
@@ -250,24 +251,7 @@ pub struct McpPromptArg {
 }
 
 #[derive(Clone)]
-pub struct McpPromptRequest {
-    pub display_name: String,
-    pub qualified_name: String,
-    pub arguments: HashMap<String, String>,
-    pub display_text: String,
-}
-
-pub trait McpPromptSink: Send + Sync {
-    fn submit(
-        &self,
-        invocation: CommandInvocation,
-        prompt: McpPromptRequest,
-    ) -> CommandFuture<Result<(), CommandError>>;
-}
-
-#[derive(Clone)]
 struct McpCommandContext {
-    sink: Arc<dyn McpPromptSink>,
     published: Arc<ArcSwap<McpPublishedState>>,
 }
 
@@ -275,12 +259,14 @@ struct McpCommandContext {
 struct McpPromptBehavior {
     prompt: McpPromptInfo,
     identity: Arc<()>,
-    sink: Arc<dyn McpPromptSink>,
     published: Arc<ArcSwap<McpPublishedState>>,
 }
 
 impl CommandBehavior for McpPromptBehavior {
-    fn execute(&self, invocation: CommandInvocation) -> CommandFuture<Result<(), CommandError>> {
+    fn execute(
+        &self,
+        invocation: CommandInvocation,
+    ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
         let arguments = parse_prompt_args(&self.prompt, &invocation.arguments);
         let missing: Vec<_> = self
             .prompt
@@ -312,15 +298,22 @@ impl CommandBehavior for McpPromptBehavior {
         } else {
             format!("{name} {}", invocation.arguments)
         };
-        self.sink.submit(
-            invocation,
-            McpPromptRequest {
-                display_name: self.prompt.display_name.clone(),
-                qualified_name: self.prompt.qualified_name.clone(),
-                arguments,
-                display_text,
+        let mut arguments: Vec<(Arc<str>, Arc<str>)> = arguments
+            .into_iter()
+            .map(|(name, value)| (Arc::from(name), Arc::from(value)))
+            .collect();
+        arguments.sort_by(|left, right| left.0.cmp(&right.0));
+        let turn = AgentTurn {
+            content: CommandContent {
+                text: Arc::from(display_text),
+                attachments: invocation.content.attachments,
             },
-        )
+            prompt: Some(PromptReference {
+                qualified_name: Arc::from(self.prompt.qualified_name.clone()),
+                arguments: arguments.into(),
+            }),
+        };
+        Box::pin(async move { Ok(CommandOutcome::AgentTurn(turn)) })
     }
 }
 
@@ -687,14 +680,13 @@ pub async fn start(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
 pub async fn start_with_commands(
     cwd: &Path,
     registry: CommandRegistry,
-    sink: Arc<dyn McpPromptSink>,
 ) -> (Option<McpHandle>, McpConfigErrors) {
-    start_inner(cwd, Some((registry, sink))).await
+    start_inner(cwd, Some(registry)).await
 }
 
 async fn start_inner(
     cwd: &Path,
-    commands: Option<(CommandRegistry, Arc<dyn McpPromptSink>)>,
+    commands: Option<CommandRegistry>,
 ) -> (Option<McpHandle>, McpConfigErrors) {
     tracing::info!(cwd = %cwd.display(), "starting MCP");
     let cwd = cwd.to_owned();
@@ -725,15 +717,14 @@ pub async fn start_with_extra_and_commands(
     cwd: &Path,
     extra: Vec<(String, RawTransport)>,
     registry: CommandRegistry,
-    sink: Arc<dyn McpPromptSink>,
 ) -> (Option<McpHandle>, McpConfigErrors) {
-    start_with_extra_inner(cwd, extra, Some((registry, sink))).await
+    start_with_extra_inner(cwd, extra, Some(registry)).await
 }
 
 async fn start_with_extra_inner(
     cwd: &Path,
     extra: Vec<(String, RawTransport)>,
-    commands: Option<(CommandRegistry, Arc<dyn McpPromptSink>)>,
+    commands: Option<CommandRegistry>,
 ) -> (Option<McpHandle>, McpConfigErrors) {
     let owned_cwd = cwd.to_owned();
     let (mut config, config_errors) = smol::unblock(move || load_config(&owned_cwd)).await;
@@ -756,7 +747,7 @@ pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
 
 fn start_with_config_inner(
     config: McpConfig,
-    commands: Option<(CommandRegistry, Arc<dyn McpPromptSink>)>,
+    commands: Option<CommandRegistry>,
 ) -> Option<McpHandle> {
     if config.is_empty() {
         tracing::info!("no MCP servers configured, skipping");
@@ -765,10 +756,9 @@ fn start_with_config_inner(
 
     let defer_tools = config.defer_tools.unwrap_or(DEFAULT_DEFER_TOOLS);
     let published = Arc::new(ArcSwap::from_pointee(McpPublishedState::default()));
-    let (command_context, command_producer) = commands.map_or((None, None), |(registry, sink)| {
+    let (command_context, command_producer) = commands.map_or((None, None), |registry| {
         (
             Some(McpCommandContext {
-                sink,
                 published: Arc::clone(&published),
             }),
             Some(registry.create_producer(ProducerPrecedence::Mcp)),
@@ -1163,6 +1153,23 @@ fn apply_start_result(
     }
 }
 
+fn prompt_argument_hint(arguments: &[McpPromptArg]) -> Option<Arc<str>> {
+    (!arguments.is_empty()).then(|| {
+        arguments
+            .iter()
+            .map(|argument| {
+                if argument.required {
+                    format!("<{}>", argument.name)
+                } else {
+                    format!("[<{}>]", argument.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .into()
+    })
+}
+
 fn prompt_registration(
     entry: &ServerEntry,
     prompt: &McpPromptDef,
@@ -1176,14 +1183,15 @@ fn prompt_registration(
             arguments: ArgumentArity::unbounded(0),
             docs: CommandDocs {
                 summary: Arc::from(info.description.as_str()),
-                argument_hint: None,
+                argument_hint: prompt_argument_hint(&info.arguments),
             },
-            tui_only: false,
+            required_capabilities: TargetCapabilities::from_capability(
+                TargetCapability::AgentTurns,
+            ),
         },
         behavior: Arc::new(McpPromptBehavior {
             prompt: info,
             identity: Arc::clone(&prompt.identity),
-            sink: Arc::clone(&context.sink),
             published: Arc::clone(&context.published),
         }),
         completion: None,

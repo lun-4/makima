@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_commands::{
     CommandRegistry, CompletionCandidate, CompletionItem, CompletionResult, CompletionSession,
-    InvocationTargetId, RegistrySnapshot, ResolvedCommand,
+    RegistrySnapshot, ResolvedCommand, TargetHandle,
 };
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
@@ -53,7 +53,7 @@ pub struct CommandPalette {
     selected: usize,
     filtered: Vec<Match>,
     registry: CommandRegistry,
-    target: InvocationTargetId,
+    target: TargetHandle,
     snapshot: RegistrySnapshot,
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
@@ -88,8 +88,10 @@ struct PendingArguments {
 }
 
 impl CommandPalette {
-    pub fn new(registry: CommandRegistry, target: InvocationTargetId) -> Self {
-        let snapshot = registry.snapshot();
+    pub fn new(registry: CommandRegistry, target: TargetHandle) -> Self {
+        let snapshot = registry
+            .snapshot_for(&target)
+            .expect("new command target is live");
         let nucleo = Self::build_nucleo(&snapshot);
         Self {
             selected: 0,
@@ -281,7 +283,10 @@ impl CommandPalette {
         if !same_session {
             self.cancel_arguments();
             self.argument_session = self.argument_session.wrapping_add(1);
-            self.completion_session = self.registry.open_completion(command, self.target).ok();
+            self.completion_session = self
+                .registry
+                .open_completion(command, self.target.id())
+                .ok();
         }
         let Some(session) = self.completion_session.clone() else {
             self.argument_items.clear();
@@ -401,7 +406,10 @@ impl CommandPalette {
     }
 
     pub fn sync(&mut self, input: &str) {
-        let snapshot = self.registry.snapshot();
+        let Ok(snapshot) = self.registry.snapshot_for(&self.target) else {
+            self.close();
+            return;
+        };
         if snapshot.generation() != self.snapshot.generation() {
             self.snapshot = snapshot;
             self.nucleo = Self::build_nucleo(&self.snapshot);
@@ -770,7 +778,8 @@ mod tests {
 
     use maki_commands::{
         ArgumentArity, CommandBehavior, CommandDocs, CommandError, CommandFuture,
-        CommandInvocation, CommandRegistry, CommandSpec, ProducerPrecedence, Registration,
+        CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, HostResponse,
+        ProducerPrecedence, Registration, TargetCapabilities,
     };
 
     use super::CommandPalette;
@@ -781,8 +790,17 @@ mod tests {
         fn execute(
             &self,
             _invocation: CommandInvocation,
-        ) -> CommandFuture<Result<(), CommandError>> {
-            Box::pin(async { Ok(()) })
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            Box::pin(async { Ok(CommandOutcome::Completed) })
+        }
+    }
+
+    impl maki_commands::CommandHost for Noop {
+        fn request(
+            &self,
+            _request: maki_commands::HostRequest,
+        ) -> CommandFuture<Result<HostResponse, CommandError>> {
+            Box::pin(async { Ok(HostResponse::Completed) })
         }
     }
 
@@ -796,7 +814,7 @@ mod tests {
                     summary: Arc::from(summary),
                     argument_hint: None,
                 },
-                tui_only: false,
+                required_capabilities: TargetCapabilities::default(),
             },
             behavior: Arc::new(Noop),
             completion: None,
@@ -810,7 +828,7 @@ mod tests {
         producer
             .replace(vec![registration("/dynamic", "Dynamic command")])
             .unwrap();
-        let target = registry.create_target();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
 
         palette.sync("/");
@@ -826,7 +844,7 @@ mod tests {
         producer
             .replace(vec![registration("/dynamic", "First")])
             .unwrap();
-        let target = registry.create_target();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
         palette.sync("/dynamic arg");
         let confirmed = palette.confirm("/dynamic arg").unwrap();

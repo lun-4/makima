@@ -56,7 +56,7 @@ use crate::agent::{
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
-use crate::command_runtime::{CommandRuntime, RoutedCommand};
+use crate::command_runtime::{CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
@@ -405,7 +405,7 @@ pub(crate) struct EventLoop<'t> {
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
-    command_rx: flume::Receiver<RoutedCommand>,
+    command_rx: flume::Receiver<CommandEvent>,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -418,7 +418,7 @@ enum Wake {
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
-    Command(RoutedCommand),
+    Command(CommandEvent),
 }
 
 struct BackgroundModels {
@@ -573,18 +573,14 @@ impl<'t> EventLoop<'t> {
         let theme_completion = Arc::new(ThemeArgSource::new(
             crate::theme::default_provider().clone(),
         ));
-        let (command_runtime, command_rx, mcp_prompt_sink) = CommandRuntime::new(
+        let (command_runtime, command_rx) = CommandRuntime::new(
             &commands,
             command_registry,
             model_completion,
             theme_completion,
         );
         let command_runtime = Arc::new(command_runtime);
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_with_commands(
-            &cwd,
-            command_runtime.registry.clone(),
-            mcp_prompt_sink,
-        ));
+        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
         let ctx = SpawnCtx {
             storage,
             config,
@@ -774,22 +770,45 @@ impl<'t> EventLoop<'t> {
     /// The one save trigger. A checkpoint writes only on a real change, so
     /// every tool result reaches disk within a frame while an idle session
     /// writes nothing.
-    fn handle_command(&mut self, command: RoutedCommand) {
+    fn handle_command(&mut self, event: CommandEvent) {
+        let target = match &event {
+            CommandEvent::Host { target, .. } | CommandEvent::Outcome { target, .. } => *target,
+        };
         let Some(index) = command_target_index(
             self.sessions
                 .iter()
-                .map(|runtime| runtime.app.command_target),
-            command.target,
+                .map(|runtime| runtime.app.command_target.id()),
+            target,
         ) else {
-            command
-                .lifecycle
-                .transition(maki_commands::CommandClassification::Failed(
-                    maki_commands::CommandError::StaleTarget,
-                ));
+            if let CommandEvent::Host { reply, .. } = event {
+                let _ = reply.send(Err(maki_commands::CommandError::StaleTarget));
+            }
             return;
         };
-        let actions = self.sessions[index].app.execute_routed_command(command);
-        self.dispatch(index, actions);
+        match event {
+            CommandEvent::Host { request, reply, .. } => {
+                let result = self.sessions[index].app.execute_host_request(request);
+                match result {
+                    Ok((response, actions)) => {
+                        self.dispatch(index, actions);
+                        let _ = reply.send(Ok(response));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            CommandEvent::Outcome { outcome, .. } => match outcome {
+                maki_commands::CommandOutcome::AgentTurn(turn) => {
+                    let actions = self.sessions[index].app.submit_command_turn(turn);
+                    self.dispatch(index, actions);
+                }
+                maki_commands::CommandOutcome::Failed(error) => {
+                    self.sessions[index].app.flash(error.to_string());
+                }
+                maki_commands::CommandOutcome::Completed => {}
+            },
+        }
     }
 
     fn checkpoint_all(&mut self) {
@@ -1608,10 +1627,11 @@ impl<'t> EventLoop<'t> {
                     Err(e) => self.sessions[idx].app.flash(e),
                 }
             }
-            Action::Btw(question) => {
+            Action::Btw(question, images) => {
                 let slot = self.ctx.model_slot.load();
                 self.sessions[idx].app.start_btw(
                     question,
+                    images,
                     Arc::clone(&slot.provider),
                     slot.model.clone(),
                 );
@@ -1799,6 +1819,19 @@ mod tests {
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
 
+    struct FakeHost;
+
+    impl maki_commands::CommandHost for FakeHost {
+        fn request(
+            &self,
+            _request: maki_commands::HostRequest,
+        ) -> maki_commands::CommandFuture<
+            Result<maki_commands::HostResponse, maki_commands::CommandError>,
+        > {
+            Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
+        }
+    }
+
     fn done_event() -> AgentEvent {
         AgentEvent::Done {
             usage: TokenUsage::default(),
@@ -1817,8 +1850,18 @@ mod tests {
     #[test]
     fn command_routing_rejects_retired_target_after_session_replacement() {
         let registry = maki_commands::CommandRegistry::new();
-        let retired = registry.create_target();
-        let live = registry.create_target();
+        let retired = registry
+            .bind_target(
+                maki_commands::TargetCapabilities::default(),
+                Arc::new(FakeHost),
+            )
+            .id();
+        let live = registry
+            .bind_target(
+                maki_commands::TargetCapabilities::default(),
+                Arc::new(FakeHost),
+            )
+            .id();
 
         assert_eq!(command_target_index([live], retired), None);
         assert_eq!(command_target_index([live], live), Some(0));

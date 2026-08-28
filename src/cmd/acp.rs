@@ -27,13 +27,15 @@ pub fn run(
     load_env_files(&cwd);
 
     let command_registry = maki_commands::CommandRegistry::new();
-    let command_dispatcher = maki_acp::commands::CommandDispatcher::new(
-        command_registry.clone(),
+    let standard_commands = command::StandardCommands::register(
+        &command_registry,
         &command::discover_commands(&cwd),
-    );
+        command::StandardCompletions::default(),
+    )
+    .context("register standard commands")?;
     let mut plugin_host = PluginHost::with_command_registry(
         Arc::clone(ToolRegistry::global_arc()),
-        command_registry,
+        command_registry.clone(),
         !no_jit,
     )
     .context("initialize lua plugin host")?;
@@ -74,7 +76,7 @@ pub fn run(
     let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
     let modes = plugin_host.event_handle().mode_registry();
 
-    maki_acp::run(maki_acp::AcpParams {
+    let result = maki_acp::run(maki_acp::AcpParams {
         model,
         config: config.agent,
         permissions_config: config.permissions,
@@ -87,6 +89,8 @@ pub fn run(
         append_system_prompt,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
-        command_dispatcher,
-    })
+        command_registry,
+    });
+    drop(standard_commands);
+    result
 }

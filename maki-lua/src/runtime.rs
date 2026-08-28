@@ -29,11 +29,10 @@ use crate::splash::SplashFrame;
 use serde_json::Value;
 
 use maki_commands::{
-    ArgumentArity, CommandBehavior, CommandClassification, CommandCompletion, CommandDocs,
-    CommandError, CommandFuture, CommandInvocation, CommandRegistry, CommandSpec,
-    CompletionContext, CompletionError, CompletionItem, CompletionLifecycleEvent,
-    CompletionSessionId, InvocationDispatcher, InvocationTargetId, Producer, ProducerPrecedence,
-    Registration,
+    ArgumentArity, CommandBehavior, CommandCompletion, CommandDocs, CommandError, CommandFuture,
+    CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionContext,
+    CompletionError, CompletionItem, CompletionLifecycleEvent, CompletionSessionId, Producer,
+    ProducerPrecedence, Registration, TargetCapabilities, TargetCapability,
 };
 use maki_config::RawConfig;
 
@@ -550,9 +549,7 @@ impl TaskCell {
 
 #[derive(Clone)]
 pub(crate) struct CommandTaskInvocation {
-    pub(crate) dispatcher: InvocationDispatcher,
-    pub(crate) target_id: InvocationTargetId,
-    pub(crate) lifecycle: maki_commands::InvocationLifecycle,
+    pub(crate) invocation: CommandInvocation,
 }
 
 pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
@@ -986,11 +983,7 @@ pub(crate) async fn run_command_scoped<F: Future>(
     {
         let mut cell = lock_cell(scope.handle());
         cell.command_depth = invocation.depth as u8;
-        cell.command_invocation = Some(CommandTaskInvocation {
-            dispatcher: invocation.dispatcher,
-            target_id: invocation.target_id,
-            lifecycle: invocation.lifecycle,
-        });
+        cell.command_invocation = Some(CommandTaskInvocation { invocation });
     }
     run_scoped(lua, scope, fut).await
 }
@@ -1556,15 +1549,18 @@ struct LuaCommandBehavior {
 }
 
 impl CommandBehavior for LuaCommandBehavior {
-    fn execute(&self, invocation: CommandInvocation) -> CommandFuture<Result<(), CommandError>> {
+    fn execute(
+        &self,
+        invocation: CommandInvocation,
+    ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
         let result = self.tx.send(Request::ExecuteCommand {
             plugin: Arc::clone(&self.plugin),
             command: Arc::clone(&self.command),
-            invocation: invocation.clone(),
+            invocation,
         });
         Box::pin(async move {
             result.map_err(|_| CommandError::Producer(Arc::from("Lua host stopped")))?;
-            Ok(())
+            Ok(CommandOutcome::Completed)
         })
     }
 }
@@ -1745,7 +1741,11 @@ fn command_registrations(
                     summary: Arc::clone(&entry.description),
                     argument_hint: entry.argument_hint.clone(),
                 },
-                tui_only: entry.tui_only,
+                required_capabilities: if entry.tui_only {
+                    TargetCapabilities::from_capability(TargetCapability::InteractiveUi)
+                } else {
+                    TargetCapabilities::NONE
+                },
             },
             behavior: Arc::new(LuaCommandBehavior {
                 plugin: Arc::clone(plugin),
@@ -3470,8 +3470,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             if let Some(func) = handler_fn {
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
-                                    let lifecycle = invocation.lifecycle.clone();
-                                    let is_root = invocation.depth == 0;
                                     let arguments = invocation.arguments.to_string();
                                     let run = async {
                                         let opts = lua.create_table()?;
@@ -3483,28 +3481,13 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>(opts)?.await
                                     };
-                                    match run_command_scoped(&lua, invocation, run).await {
-                                        Ok(()) => {
-                                            if is_root {
-                                                lifecycle
-                                                    .transition(CommandClassification::Completed);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
-                                            if is_root {
-                                                lifecycle.transition(CommandClassification::Failed(
-                                                    CommandError::Producer(Arc::from(strip_traceback(&e))),
-                                                ));
-                                            }
-                                        }
+                                    if let Err(e) = run_command_scoped(&lua, invocation, run).await {
+                                        tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
                                     }
                                 })
                                 .detach();
-                            } else if invocation.depth == 0 {
-                                invocation.lifecycle.transition(CommandClassification::Failed(
-                                    CommandError::Producer(Arc::from("Lua command handler is unavailable")),
-                                ));
+                            } else {
+                                tracing::warn!(plugin = %plugin, command = %command, "command handler is unavailable");
                             }
                         }
                         Request::ComputeHeader {
@@ -3767,24 +3750,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
             }
             // Clones of the host (`EventHandle`, `LuaTool`) can still hold
             // a live sender, so dropping the receivers alone does not free
-            // queued requests. Drain them so their reply channels drop and
-            // no caller blocks on a dead host. Queued command invocations
-            // are failed explicitly so frontends awaiting their lifecycle
-            // do not hang on a transition that would never come.
-            for msg in rx.drain() {
-                if let Request::ExecuteCommand { invocation, .. } = msg {
-                    invocation.lifecycle.transition(CommandClassification::Failed(
-                        CommandError::Producer(Arc::from("Lua host stopped")),
-                    ));
-                }
-            }
-            for msg in prio_rx.drain() {
-                if let Request::ExecuteCommand { invocation, .. } = msg {
-                    invocation.lifecycle.transition(CommandClassification::Failed(
-                        CommandError::Producer(Arc::from("Lua host stopped")),
-                    ));
-                }
-            }
+            // queued requests. Drain them so queued command work is dropped.
+            for _ in rx.drain() {}
+            for _ in prio_rx.drain() {}
         })
         .map_err(|e| PluginError::Io {
             path: PathBuf::from("lua-thread"),
@@ -4174,17 +4142,53 @@ mod tests {
     /// and start over at depth 0, so the cap would never trip.
     #[test]
     fn enqueue_async_task_inherits_command_invocation() {
+        struct CaptureBehavior(flume::Sender<CommandInvocation>);
+        impl CommandBehavior for CaptureBehavior {
+            fn execute(
+                &self,
+                invocation: CommandInvocation,
+            ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+                self.0.send(invocation).unwrap();
+                Box::pin(async { Ok(CommandOutcome::Completed) })
+            }
+        }
+        struct FakeHost;
+        impl maki_commands::CommandHost for FakeHost {
+            fn request(
+                &self,
+                _request: maki_commands::HostRequest,
+            ) -> CommandFuture<Result<maki_commands::HostResponse, CommandError>> {
+                Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
+            }
+        }
+
         let lua = enqueue_test_lua();
         let registry = CommandRegistry::new();
-        let target_id = registry.create_target();
-        let lifecycle = maki_commands::InvocationLifecycle::detached();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let (tx, rx) = flume::bounded(1);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/capture"),
+                    aliases: Arc::from([]),
+                    arguments: ArgumentArity::NONE,
+                    docs: CommandDocs {
+                        summary: Arc::from("capture"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(CaptureBehavior(tx)),
+                completion: None,
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeHost));
+        smol::block_on(registry.dispatch_input(&target, "/capture".into()));
+        let invocation = rx.recv().unwrap();
+        let target_id = invocation.target_id();
         let mut cell = TaskCell::new(CancelToken::none(), None, None);
         cell.command_depth = 3;
-        cell.command_invocation = Some(CommandTaskInvocation {
-            dispatcher: InvocationDispatcher::new(Arc::new(registry)),
-            target_id,
-            lifecycle: lifecycle.clone(),
-        });
+        cell.command_invocation = Some(CommandTaskInvocation { invocation });
         let _h = set_active(&lua, cell);
         enqueue_async_task(&lua, enqueue_dummy(&lua)).unwrap();
 
@@ -4192,14 +4196,7 @@ mod tests {
         let queued = queue.rx.try_recv().unwrap();
         let invocation = queued.command_invocation.unwrap();
         assert_eq!(queued.command_depth, 3);
-        assert_eq!(invocation.target_id, target_id);
-        invocation
-            .lifecycle
-            .transition(CommandClassification::Completed);
-        assert_eq!(
-            smol::block_on(lifecycle.classification()),
-            CommandClassification::Completed
-        );
+        assert_eq!(invocation.invocation.target_id(), target_id);
     }
 
     #[test]
