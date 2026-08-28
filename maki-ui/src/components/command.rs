@@ -238,6 +238,11 @@ impl CommandPalette {
     }
 
     #[cfg(test)]
+    pub(crate) fn completion_session_id(&self) -> Option<maki_commands::CompletionSessionId> {
+        self.completion_session.as_ref().map(CompletionSession::id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_argument_completion(
         &mut self,
         range: (usize, usize),
@@ -328,6 +333,10 @@ impl CommandPalette {
         let CompletionResult::Items(items) = result else {
             return Dirty::NO;
         };
+        if items.is_empty() {
+            self.cancel_arguments();
+            return Dirty::YES;
+        }
         self.argument_items.clear();
         self.selected = 0;
         let mut matcher = Matcher::new(Config::DEFAULT);

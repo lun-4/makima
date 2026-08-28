@@ -983,6 +983,73 @@ fn lifecycle_app() -> (
 }
 
 #[test]
+fn empty_completion_cancels_once_and_next_request_uses_new_session() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let registry = maki_commands::CommandRegistry::new();
+    let _producer = register_test_lua_command(
+        &registry,
+        TestLuaCommand {
+            handle: handle.clone(),
+            name: Arc::from("/deploy"),
+            plugin: Arc::from("deploy"),
+            max_args: Some(1),
+            completion: true,
+        },
+    );
+    let mut app = build_app_with_full(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        registry,
+        handle,
+        UiConfig::default(),
+    );
+    app.input_box.set_input("/deploy a".into());
+    app.command_palette.sync("/deploy a");
+    app.command_palette
+        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
+    let first_session = app.command_palette.completion_session_id().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if probe.try_finish_command_arguments(Vec::new()).is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "completion request was not sent");
+        std::thread::yield_now();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if app.command_palette.poll_arguments() == Dirty::YES {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "completion result was not applied"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        probe.try_finish_command_argument_lifecycle(),
+        Some(("cancel", None, true))
+    );
+    assert!(probe.try_finish_command_argument_lifecycle().is_none());
+
+    app.command_palette
+        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
+    let second_session = app.command_palette.completion_session_id().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if probe.try_finish_command_arguments(Vec::new()).is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "completion request was not sent");
+        std::thread::yield_now();
+    }
+    assert_ne!(second_session, first_session);
+}
+
+#[test]
 fn ctrl_c_closes_palette_and_cancels_lifecycle() {
     let (mut app, probe, _producer) = lifecycle_app();
 
