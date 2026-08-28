@@ -30,7 +30,6 @@ use crate::providers::opencode::Opencode;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
-use crate::providers::xai::Xai;
 use crate::providers::zai::Zai;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -55,8 +54,6 @@ pub enum ProviderKind {
     TensorX,
     #[strum(serialize = "opencode")]
     Opencode,
-    #[strum(serialize = "xai")]
-    Xai,
     Aperture,
 }
 
@@ -76,7 +73,6 @@ impl ProviderKind {
             Self::Synthetic => "Synthetic",
             Self::TensorX => "TensorX",
             Self::Opencode => "Opencode Zen",
-            Self::Xai => "xAI",
             Self::Aperture => "Aperture",
         }
     }
@@ -96,7 +92,6 @@ impl ProviderKind {
             Self::Synthetic => "SYNTHETIC_API_KEY",
             Self::TensorX => "TENSORX_API_KEY",
             Self::Opencode => "OPENCODE_API_KEY",
-            Self::Xai => "XAI_API_KEY",
             Self::Aperture => "",
         }
     }
@@ -118,7 +113,6 @@ impl ProviderKind {
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
             Self::TensorX => "https://api.tensorx.ai/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
-            Self::Xai => "https://api.x.ai/v1",
             Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
         }
     }
@@ -147,9 +141,6 @@ impl ProviderKind {
             Self::Opencode => Some(
                 "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
             ),
-            Self::Xai => Some(
-                "OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)",
-            ),
             Self::Aperture => Some(
                 "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
             ),
@@ -172,7 +163,6 @@ impl ProviderKind {
             Self::Synthetic => ModelFamily::Synthetic,
             Self::TensorX => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
-            Self::Xai => ModelFamily::Generic,
             Self::Aperture => ModelFamily::Generic,
         }
     }
@@ -197,7 +187,6 @@ impl ProviderKind {
             Self::Synthetic => Some(32_000),
             Self::TensorX => None,
             Self::Opencode => Some(128_000),
-            Self::Xai => Some(131_072),
             Self::Aperture => Some(16_384),
         }
     }
@@ -217,7 +206,6 @@ impl ProviderKind {
             Self::Synthetic => 128_000,
             Self::TensorX => 200_000,
             Self::Opencode => 256_000,
-            Self::Xai => 500_000,
             Self::Aperture => 128_000,
         }
     }
@@ -243,7 +231,6 @@ impl ProviderKind {
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
             Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
-            Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
         }
     }
@@ -355,7 +342,7 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
 
 struct UnconfiguredProvider;
 
-const NOT_CONFIGURED: &str = "no provider configured — run /login or `maki auth login`";
+const NOT_CONFIGURED: &str = "no provider configured — run /login or `makima auth login`";
 
 impl Provider for UnconfiguredProvider {
     fn stream_message<'a>(

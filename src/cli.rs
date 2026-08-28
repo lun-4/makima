@@ -222,7 +222,7 @@ pub enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
-    /// Update maki to the latest version
+    /// Update makima to the latest version
     Update {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
@@ -291,12 +291,12 @@ pub enum McpAction {
 pub enum AuthAction {
     /// Authenticate with a provider (interactive if no provider specified)
     Login {
-        /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection.
+        /// Provider slug (e.g. zai, openai, deepseek). Omit for interactive selection.
         provider: Option<String>,
     },
     /// Remove stored credentials for a provider
     Logout {
-        /// Provider slug (e.g. openai, xai)
+        /// Provider slug (e.g. openai, deepseek)
         provider: String,
     },
     /// Show authentication status for all providers
@@ -352,29 +352,29 @@ mod tests {
 
     #[test]
     fn no_continue_flags_parse_as_absent() {
-        let cli = Cli::parse_from(["maki"]);
+        let cli = Cli::parse_from(["makima"]);
         assert_eq!(cli.continue_session, None);
         assert!(!cli.last_session);
     }
 
-    #[test_case(&["maki", "-c"]; "short_bare")]
-    #[test_case(&["maki", "--continue"]; "long_bare")]
+    #[test_case(&["makima", "-c"]; "short_bare")]
+    #[test_case(&["makima", "--continue"]; "long_bare")]
     fn bare_continue_parses_as_picker_request(args: &[&str]) {
         let cli = Cli::parse_from(args);
         assert_eq!(cli.continue_session, Some(None));
         assert!(!cli.last_session);
     }
 
-    #[test_case(&["maki", "-c", "abc"]; "short")]
-    #[test_case(&["maki", "--continue", "abc"]; "long")]
+    #[test_case(&["makima", "-c", "abc"]; "short")]
+    #[test_case(&["makima", "--continue", "abc"]; "long")]
     fn valued_continue_parses_the_id(args: &[&str]) {
         let cli = Cli::parse_from(args);
         assert_eq!(cli.continue_session, Some(Some("abc".into())));
         assert!(!cli.last_session);
     }
 
-    #[test_case(&["maki", "-l"]; "short")]
-    #[test_case(&["maki", "--last"]; "long")]
+    #[test_case(&["makima", "-l"]; "short")]
+    #[test_case(&["makima", "--last"]; "long")]
     fn last_flag_parsing(args: &[&str]) {
         let cli = Cli::parse_from(args);
         assert!(cli.last_session);
@@ -383,15 +383,15 @@ mod tests {
 
     #[test]
     fn bare_continue_does_not_swallow_a_following_flag() {
-        let cli = Cli::parse_from(["maki", "-c", "--yolo"]);
+        let cli = Cli::parse_from(["makima", "-c", "--yolo"]);
         assert_eq!(cli.continue_session, Some(None));
         assert!(cli.yolo);
     }
 
-    #[test_case(&["maki", "--resume"]; "resume")]
-    #[test_case(&["maki", "--session"]; "session")]
-    #[test_case(&["maki", "--continue-last"]; "continue_last")]
-    #[test_case(&["maki", "-s"]; "short_s")]
+    #[test_case(&["makima", "--resume"]; "resume")]
+    #[test_case(&["makima", "--session"]; "session")]
+    #[test_case(&["makima", "--continue-last"]; "continue_last")]
+    #[test_case(&["makima", "-s"]; "short_s")]
     fn legacy_resume_flags_are_rejected(args: &[&str]) {
         assert!(
             Cli::try_parse_from(args).is_err(),

@@ -130,7 +130,7 @@ pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
-    "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
+    "Token expired. Run `makima auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
@@ -2255,7 +2255,7 @@ impl App {
         }
     }
 
-    /// Opens the `/sessions` picker for this directory (bare `maki -c`
+    /// Opens the `/sessions` picker for this directory (bare `makima -c`
     /// before the agent starts). Fire-and-forget, same path as the Ctrl+P
     /// binding.
     pub(crate) fn open_session_picker(&mut self) {

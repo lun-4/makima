@@ -34,7 +34,6 @@ use super::opencode::Opencode;
 use super::openrouter::OpenRouter;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
-use super::xai::Xai;
 use super::zai::Zai;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -585,9 +584,6 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
             Opencode::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
-        ProviderKind::Xai => Box::new(
-            Xai::with_auth(auth.clone(), timeouts).with_system_prefix(meta.system_prefix.clone()),
-        ),
         ProviderKind::Aperture => Box::new(
             Aperture::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
@@ -1088,7 +1084,6 @@ esac
     #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
     #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
     #[test_case("opencode", ProviderKind::Opencode ; "base_opencode")]
-    #[test_case("xai", ProviderKind::Xai ; "base_xai")]
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);

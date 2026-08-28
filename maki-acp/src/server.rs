@@ -419,7 +419,7 @@ fn injected_servers(servers: &[McpServer]) -> Vec<(String, RawTransport)> {
         .collect()
 }
 
-/// Clients name their servers freely, maki names them like `mcp.toml` does.
+/// Clients name their servers freely, makima names them like `mcp.toml` does.
 fn server_name(name: &str) -> String {
     name.chars()
         .take(MAX_SERVER_NAME_LEN)
