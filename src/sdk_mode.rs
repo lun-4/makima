@@ -44,6 +44,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
+use crate::command_attachments;
 
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
@@ -556,6 +557,14 @@ impl SdkCommands {
             .filter_map(|command| command["name"].as_str().map(str::to_owned))
             .collect()
     }
+
+    fn dispatch_input(&self, prompt: &str, images: &[ImageSource]) -> InputDispatch {
+        let content = CommandContent {
+            text: Arc::from(prompt),
+            attachments: command_attachments::from_images(images),
+        };
+        smol::block_on(self.registry.dispatch_input(&self.target, content))
+    }
 }
 
 /// Stops the session's heartbeat thread and releases its lock on drop, so
@@ -775,37 +784,10 @@ pub fn run(params: SdkParams) -> Result<()> {
                         shared.turn_start = Instant::now();
                         shared.permission_mode
                     };
-                    if known_command_with_images(
-                        &sdk_commands.registry,
-                        &sdk_commands.target,
-                        &prompt,
-                        &images,
-                    ) {
-                        emit_command_result(
-                            &writer,
-                            &shared,
-                            true,
-                            "slash commands cannot include images".to_string(),
-                        )?;
-                        continue;
-                    }
-                    let content = CommandContent {
-                        text: Arc::from(prompt.as_str()),
-                        attachments: Arc::from([]),
-                    };
-                    match smol::block_on(
-                        sdk_commands
-                            .registry
-                            .dispatch_input(&sdk_commands.target, content),
-                    ) {
+                    match sdk_commands.dispatch_input(&prompt, &images) {
                         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-                            let input = agent_input_from_turn(
-                                turn,
-                                mode.agent_mode(&cwd),
-                                images,
-                                fast,
-                                workflow,
-                            );
+                            let input =
+                                agent_input_from_turn(turn, mode.agent_mode(&cwd), fast, workflow)?;
                             if handle.input_tx.send(input).is_err() {
                                 break;
                             }
@@ -1105,29 +1087,16 @@ fn content_text(content: &Value) -> Option<String> {
     }
 }
 
-// Claude Code stream-json block shape:
-// {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
-// `source` deserializes straight into ImageSource; malformed blocks are skipped.
-fn known_command_with_images(
-    registry: &CommandRegistry,
-    target: &TargetHandle,
-    prompt: &str,
-    images: &[ImageSource],
-) -> bool {
-    !images.is_empty() && registry.resolves_input_for(target, prompt)
-}
-
 fn agent_input_from_turn(
     turn: AgentTurn,
     mode: AgentMode,
-    images: Vec<ImageSource>,
     fast: bool,
     workflow: bool,
-) -> AgentInput {
-    AgentInput {
+) -> Result<AgentInput> {
+    Ok(AgentInput {
         message: turn.content.text.to_string(),
         mode,
-        images,
+        images: command_attachments::into_images(&turn.content.attachments)?,
         preamble: Vec::new(),
         thinking: Default::default(),
         fast,
@@ -1142,8 +1111,12 @@ fn agent_input_from_turn(
                     .collect(),
             })
         }),
-    }
+    })
 }
+
+// Claude Code stream-json block shape:
+// {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+// `source` deserializes straight into ImageSource; malformed blocks are skipped.
 
 fn content_images(content: &Value) -> Vec<ImageSource> {
     let Value::Array(blocks) = content else {
@@ -1514,7 +1487,60 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const REJECTED_ATTACHMENT: &str = "command rejected attachment";
+
     struct OutcomeBehavior(CommandOutcome);
+
+    struct ReplaceAttachment;
+    struct RejectAttachment;
+
+    impl maki_commands::CommandBehavior for RejectAttachment {
+        fn execute(
+            &self,
+            invocation: maki_commands::CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            let has_attachment = !invocation.content.attachments.is_empty();
+            Box::pin(async move {
+                if has_attachment {
+                    Err(CommandError::Producer(Arc::from(REJECTED_ATTACHMENT)))
+                } else {
+                    Ok(CommandOutcome::Completed)
+                }
+            })
+        }
+    }
+
+    impl maki_commands::CommandBehavior for ReplaceAttachment {
+        fn execute(
+            &self,
+            invocation: maki_commands::CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            Box::pin(async move {
+                let Some(attachment) = invocation.content.attachments.first() else {
+                    return Err(CommandError::Producer(Arc::from(
+                        "missing command attachment",
+                    )));
+                };
+                if attachment.media_type.as_ref() != "image/png"
+                    || attachment.data.as_ref() != "AAAA"
+                {
+                    return Err(CommandError::Producer(Arc::from(
+                        "command attachment changed before dispatch",
+                    )));
+                }
+                Ok(CommandOutcome::AgentTurn(AgentTurn {
+                    content: CommandContent {
+                        text: Arc::from("inspected"),
+                        attachments: Arc::from([maki_commands::CommandAttachment {
+                            media_type: Arc::from("image/jpeg"),
+                            data: Arc::from("BBBB"),
+                        }]),
+                    },
+                    prompt: None,
+                }))
+            })
+        }
+    }
 
     impl maki_commands::CommandBehavior for OutcomeBehavior {
         fn execute(
@@ -1631,35 +1657,38 @@ mod tests {
     }
 
     #[test]
-    fn sdk_known_command_with_images_is_rejected_before_dispatch() {
+    fn sdk_command_behavior_owns_attachment_policy() {
         let registry = CommandRegistry::new();
         let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
-        plugin
-            .replace(vec![registration("/inspect", CommandOutcome::Completed)])
-            .unwrap();
-        let commands = SdkCommands::new(registry.clone(), &[]).unwrap();
+        let mut inspect = registration("/inspect", CommandOutcome::Completed);
+        inspect.behavior = Arc::new(ReplaceAttachment);
+        let mut reject = registration("/reject", CommandOutcome::Completed);
+        reject.behavior = Arc::new(RejectAttachment);
+        plugin.replace(vec![inspect, reject]).unwrap();
+        let commands = SdkCommands::new(registry, &[]).unwrap();
         let images = vec![ImageSource::new(
             maki_providers::ImageMediaType::Png,
             Arc::from("AAAA"),
         )];
 
-        assert!(known_command_with_images(
-            &registry,
-            &commands.target,
-            "/inspect now",
-            &images
-        ));
-        assert!(!known_command_with_images(
-            &registry,
-            &commands.target,
-            "/unknown literal",
-            &images
-        ));
-        assert!(!known_command_with_images(
-            &registry,
-            &commands.target,
-            "/inspect now",
-            &[]
+        let InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) =
+            commands.dispatch_input("/inspect now", &images)
+        else {
+            panic!("attachment-aware command did not return an agent turn");
+        };
+        let input = agent_input_from_turn(turn, AgentMode::Build, false, false).unwrap();
+        assert_eq!(input.message, "inspected");
+        assert_eq!(input.images.len(), 1);
+        assert_eq!(
+            input.images[0].media_type,
+            maki_providers::ImageMediaType::Jpeg
+        );
+        assert_eq!(input.images[0].data.as_ref(), "BBBB");
+
+        assert!(matches!(
+            commands.dispatch_input("/reject", &images),
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
+                if message.as_ref() == REJECTED_ATTACHMENT
         ));
     }
 
@@ -1676,12 +1705,21 @@ mod tests {
             smol::block_on(registry.dispatch_input(&commands.target, "/done now".into())),
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
+        let images = vec![ImageSource::new(
+            maki_providers::ImageMediaType::Gif,
+            Arc::from("AAAA"),
+        )];
+        let InputDispatch::LiteralInput(content) =
+            commands.dispatch_input("/unknown literal", &images)
+        else {
+            panic!("unknown command did not remain literal input");
+        };
+        assert_eq!(content.text.as_ref(), "/unknown literal");
+        assert_eq!(content.attachments.len(), 1);
+        assert_eq!(content.attachments[0].media_type.as_ref(), "image/gif");
+        assert_eq!(content.attachments[0].data.as_ref(), "AAAA");
         assert!(matches!(
-            smol::block_on(registry.dispatch_input(&commands.target, "/unknown literal".into())),
-            InputDispatch::LiteralInput(_)
-        ));
-        assert!(matches!(
-            smol::block_on(registry.dispatch_input(&commands.target, "ordinary literal".into())),
+            commands.dispatch_input("ordinary literal", &[]),
             InputDispatch::LiteralInput(_)
         ));
     }

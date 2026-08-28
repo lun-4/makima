@@ -36,6 +36,8 @@ use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::command_attachments;
+
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Fails fast: silently dropping an image the caller explicitly attached
@@ -169,11 +171,14 @@ impl CommandHost for PrintCommandHost {
     }
 }
 
-fn agent_input_from_turn(turn: maki_commands::AgentTurn, literal: &AgentInput) -> AgentInput {
-    AgentInput {
+fn agent_input_from_turn(
+    turn: maki_commands::AgentTurn,
+    literal: &AgentInput,
+) -> Result<AgentInput> {
+    Ok(AgentInput {
         message: turn.content.text.to_string(),
         mode: literal.mode.clone(),
-        images: literal.images.clone(),
+        images: command_attachments::into_images(&turn.content.attachments)?,
         preamble: Vec::new(),
         thinking: Default::default(),
         fast: literal.fast,
@@ -188,7 +193,7 @@ fn agent_input_from_turn(turn: maki_commands::AgentTurn, literal: &AgentInput) -
                     .collect(),
             })
         }),
-    }
+    })
 }
 
 fn drive_print(
@@ -198,16 +203,13 @@ fn drive_print(
     literal: AgentInput,
     runner: impl PrintRunner,
 ) -> Result<()> {
-    if !literal.images.is_empty() && registry.resolves_input_for(target, &literal.message) {
-        return Err(eyre!("slash commands cannot include images"));
-    }
     let content = CommandContent {
         text: Arc::from(literal.message.as_str()),
-        attachments: Arc::from([]),
+        attachments: command_attachments::from_images(&literal.images),
     };
     let input = match smol::block_on(registry.dispatch_input(target, content)) {
         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-            agent_input_from_turn(turn, &literal)
+            agent_input_from_turn(turn, &literal)?
         }
         InputDispatch::Dispatched(CommandOutcome::Completed) => return Ok(()),
         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => return Err(error.into()),
@@ -557,6 +559,85 @@ mod tests {
         registry.bind_target(TargetCapabilities::ALL, Arc::new(PrintCommandHost))
     }
 
+    struct ReplaceAttachment;
+
+    impl maki_commands::CommandBehavior for ReplaceAttachment {
+        fn execute(
+            &self,
+            invocation: maki_commands::CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            Box::pin(async move {
+                let Some(attachment) = invocation.content.attachments.first() else {
+                    return Err(CommandError::Producer(Arc::from(
+                        "missing command attachment",
+                    )));
+                };
+                if attachment.media_type.as_ref() != "image/png"
+                    || attachment.data.as_ref() != "AAAA"
+                {
+                    return Err(CommandError::Producer(Arc::from(
+                        "command attachment changed before dispatch",
+                    )));
+                }
+                Ok(CommandOutcome::AgentTurn(maki_commands::AgentTurn {
+                    content: CommandContent {
+                        text: Arc::from("inspected"),
+                        attachments: Arc::from([maki_commands::CommandAttachment {
+                            media_type: Arc::from("image/jpeg"),
+                            data: Arc::from("BBBB"),
+                        }]),
+                    },
+                    prompt: None,
+                }))
+            })
+        }
+    }
+
+    #[test]
+    fn command_behavior_owns_attachment_policy() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![maki_commands::Registration {
+                spec: maki_commands::CommandSpec {
+                    name: Arc::from("/inspect"),
+                    aliases: Arc::from([]),
+                    arguments: maki_commands::ArgumentArity::NONE,
+                    docs: maki_commands::CommandDocs {
+                        summary: Arc::from("inspect"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(ReplaceAttachment),
+                completion: None,
+            }])
+            .unwrap();
+        let target = target(&registry);
+        let sink = CommandTurnMarker;
+        let mut literal = input("/inspect");
+        literal.images.push(ImageSource::new(
+            maki_agent::ImageMediaType::Png,
+            Arc::from("AAAA"),
+        ));
+        let mut received = None;
+
+        drive_print(&registry, &target, &sink, literal, |input| {
+            received = Some(input);
+            Ok(())
+        })
+        .unwrap();
+
+        let received = received.unwrap();
+        assert_eq!(received.message, "inspected");
+        assert_eq!(received.images.len(), 1);
+        assert_eq!(
+            received.images[0].media_type,
+            maki_agent::ImageMediaType::Jpeg
+        );
+        assert_eq!(received.images[0].data.as_ref(), "BBBB");
+    }
+
     #[test]
     fn completed_command_skips_runner() {
         struct Completed;
@@ -602,19 +683,25 @@ mod tests {
         let registry = CommandRegistry::new();
         let target = target(&registry);
         let sink = CommandTurnMarker;
+        let mut literal = input("/unknown literal");
+        literal.images.push(ImageSource::new(
+            maki_agent::ImageMediaType::Webp,
+            Arc::from("AAAA"),
+        ));
         let mut received = None;
-        drive_print(
-            &registry,
-            &target,
-            &sink,
-            input("/unknown literal"),
-            |input: AgentInput| {
-                received = Some(input.message);
-                Ok(())
-            },
-        )
+        drive_print(&registry, &target, &sink, literal, |input: AgentInput| {
+            received = Some(input);
+            Ok(())
+        })
         .unwrap();
-        assert_eq!(received.as_deref(), Some("/unknown literal"));
+        let received = received.unwrap();
+        assert_eq!(received.message, "/unknown literal");
+        assert_eq!(received.images.len(), 1);
+        assert_eq!(
+            received.images[0].media_type,
+            maki_agent::ImageMediaType::Webp
+        );
+        assert_eq!(received.images[0].data.as_ref(), "AAAA");
     }
 
     #[test]
