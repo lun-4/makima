@@ -4604,7 +4604,10 @@ fn test_splash_slot_default() {
     // A newer version pushed into the Lua store surfaces as the update notice.
     handle.set_version("0.4.8-makima", Some("9.9.9"));
     let frame = wait_for_splash_text(&handle, "run makima update to get v9.9.9");
-    assert!(frame_has_text(&frame, "0.4.8-makima"), "still shows current");
+    assert!(
+        frame_has_text(&frame, "0.4.8-makima"),
+        "still shows current"
+    );
 }
 
 #[test]
