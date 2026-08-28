@@ -81,8 +81,6 @@ pub struct HeadlessParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub fast: bool,
-    pub workflow: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,
@@ -160,6 +158,7 @@ fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String>
 pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = params.input.mode.clone();
+    let workflow = params.input.workflow;
     let AgentSetup {
         vars,
         instructions,
@@ -168,7 +167,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.workflow,
+        workflow,
     );
 
     let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
@@ -391,15 +390,13 @@ pub struct InteractiveHandle {
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
-    let AgentSetup {
-        vars: _,
-        instructions: _,
-        tools: initial_tools,
-    } = setup(
+    let initial_tools = tool_definitions(
+        &template::env_vars(),
         &params.model,
         &params.config,
         &params.excluded_tools,
         params.workflow,
+        ToolRegistry::global(),
     );
 
     let mcp = params
