@@ -1787,8 +1787,17 @@ impl CompletionSession {
                     request_id,
                 )
             };
-            match provider.complete(context, cancellation.clone()).await {
-                Ok(items) if !cancellation.is_cancelled() => {
+            match provider.complete(context, cancellation).await {
+                Ok(items) => {
+                    let state = core.state.lock().unwrap_or_else(|error| error.into_inner());
+                    if state.closed
+                        || state
+                            .current_request
+                            .as_ref()
+                            .is_none_or(|current| current.id != request_id)
+                    {
+                        return CompletionResult::Cancelled;
+                    }
                     let candidates = items
                         .into_iter()
                         .map(|item| CompletionCandidate {
@@ -1799,7 +1808,6 @@ impl CompletionSession {
                         .collect();
                     CompletionResult::Items(candidates)
                 }
-                Ok(_) => CompletionResult::Cancelled,
                 Err(
                     CompletionError::StaleCommand
                     | CompletionError::StaleSession
@@ -1986,6 +1994,11 @@ mod tests {
         events: Mutex<Vec<CompletionLifecycleEvent>>,
     }
 
+    struct FirstRequestBlockingCompletion {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
     struct ReentrantRegistryWaker {
         registry: CommandRegistry,
         woke: mpsc::SyncSender<()>,
@@ -2045,6 +2058,30 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .push(event.clone());
             Ok(())
+        }
+    }
+
+    impl CommandCompletion for FirstRequestBlockingCompletion {
+        fn complete(
+            &self,
+            context: CompletionContext,
+            _cancellation: CancellationToken,
+        ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+            if context.generation == 0 {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv()
+                    .unwrap();
+            }
+            Box::pin(async {
+                Ok(vec![CompletionItem {
+                    label: Arc::from("candidate"),
+                    insertion: Arc::from("candidate"),
+                    description: None,
+                }])
+            })
         }
     }
 
@@ -2655,6 +2692,43 @@ mod tests {
             [CompletionLifecycleEvent::Cancel]
         );
         assert!(!producer.remove());
+    }
+
+    #[test]
+    fn superseded_completion_cannot_return_items() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let session = completion_session(
+            &registry,
+            &producer,
+            Arc::new(FirstRequestBlockingCompletion {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+        );
+        let first_session = session.clone();
+        let first = thread::spawn(move || {
+            futures_lite::future::block_on(first_session.complete(
+                Arc::from("a"),
+                Arc::from("a"),
+                0,
+                Arc::from("insert"),
+            ))
+        });
+        entered_rx.recv_timeout(LOCK_RELEASE_TIMEOUT).unwrap();
+
+        let second = futures_lite::future::block_on(session.complete(
+            Arc::from("ab"),
+            Arc::from("ab"),
+            0,
+            Arc::from("insert"),
+        ));
+        release_tx.send(()).unwrap();
+
+        assert!(matches!(second, CompletionResult::Items(_)));
+        assert_eq!(first.join().unwrap(), CompletionResult::Cancelled);
     }
 
     #[test]
