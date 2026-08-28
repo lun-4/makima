@@ -114,7 +114,7 @@ local function apply_filter()
   local query = board.input:value()
   board.items = {}
   for _, s in ipairs(board.all) do
-    s._match = maki.match.fuzzy(query, s.title)
+    s._match = maki.match.completion(query, s.title)
     if s._match then
       board.items[#board.items + 1] = s
     end

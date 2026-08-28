@@ -2911,6 +2911,25 @@ if m then
 end
 ```
 
+---
+
+### `maki.match.completion()` {#maki-match-completion}
+
+```lua
+maki.match.completion({query}, {label})
+```
+
+Match {query} against a completion {label}, returning zero-based shared
+matcher indices and the ranking metadata used by built-in completion.
+
+**Parameters:**
+
+- `{query}` (`string`) Search pattern.
+- `{label}` (`string`) Completion label.
+
+**Returns:** (`table|nil`) A match with one-based codepoint `indices` and a
+`ranking` table, or nil when the label does not match.
+
 
 ## maki.api.mode {#maki-api-mode}
 

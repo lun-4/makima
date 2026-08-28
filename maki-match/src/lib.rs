@@ -29,6 +29,19 @@ pub struct CompletionMatchOptions {
     pub normalization: Normalization,
 }
 
+impl Default for CompletionMatchOptions {
+    fn default() -> Self {
+        Self {
+            case_matching: CaseMatching::Smart,
+            normalization: Normalization::Smart,
+        }
+    }
+}
+
+pub fn completion_match_default(query: &str, label: &str) -> Option<CompletionMatch> {
+    completion_match(query, label, CompletionMatchOptions::default())
+}
+
 pub fn completion_match(
     query: &str,
     label: &str,
@@ -47,9 +60,7 @@ pub fn completion_match(
     let mut positive_atoms = 0;
     for atom in &pattern.atoms {
         if atom.negative {
-            if atom.score(haystack, &mut matcher).is_some() {
-                return None;
-            }
+            atom.score(haystack, &mut matcher)?;
             continue;
         }
         let mut atom_indices = Vec::new();
@@ -289,7 +300,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Resolution, fuzzy_match, fuzzy_resolve};
+    use super::{
+        CompletionMatchOptions, Resolution, completion_match, completion_match_default,
+        fuzzy_match, fuzzy_resolve,
+    };
+    use nucleo_matcher::pattern::{CaseMatching, Normalization};
     use test_case::test_case;
 
     #[test_case("", "hello world" ; "empty_query")]
@@ -401,5 +416,28 @@ mod tests {
     #[test_case("   " ; "whitespace_only")]
     fn fuzzy_resolve_empty_query(query: &str) {
         assert_eq!(resolve(query, &["dracula"]), Resolution::NoMatch);
+    }
+
+    #[test]
+    fn completion_match_returns_zero_based_indices() {
+        let matched = completion_match_default("ap", "apple").unwrap();
+        assert_eq!(matched.indices, vec![0, 1]);
+        assert_eq!(matched.ranking.quality_rank, 1);
+    }
+
+    #[test]
+    fn completion_match_requires_all_positive_atoms_and_excludes_negative_indices() {
+        assert!(completion_match_default("!pie", "pie").is_none());
+        let matched = completion_match_default("apple !xyz", "apple").unwrap();
+        assert_eq!(matched.indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn completion_match_options_control_case_matching() {
+        let options = CompletionMatchOptions {
+            case_matching: CaseMatching::Ignore,
+            normalization: Normalization::Smart,
+        };
+        assert!(completion_match("APPLE", "apple", options).is_some());
     }
 }

@@ -8,8 +8,11 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
-use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Matcher, Nucleo, Utf32String};
+use maki_match::{
+    CompletionMatch, CompletionMatchOptions, compare_completion_matches, completion_match,
+};
+use nucleo::{Config, Nucleo, Utf32String};
+use nucleo_matcher::pattern::{CaseMatching, Normalization};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -47,12 +50,11 @@ pub enum FilePickerModalAction {
 
 struct Match {
     path: String,
-    indices: Vec<u32>,
+    completion: CompletionMatch,
 }
 
 struct Session {
     nucleo: Nucleo<()>,
-    matcher: Matcher,
     matches: Vec<Match>,
     total_matches: u32,
 
@@ -159,7 +161,6 @@ impl FilePickerModal {
 
         self.session = Some(Session {
             nucleo,
-            matcher: Matcher::new(Config::DEFAULT.match_paths()),
             matches: Vec::new(),
             total_matches: 0,
             search: TextBuffer::new(String::new()),
@@ -389,31 +390,38 @@ fn reparse_pattern(s: &mut Session) {
 
 fn refresh_matches(s: &mut Session) {
     let snapshot = s.nucleo.snapshot();
+    let query = s.search.value();
+    let options = CompletionMatchOptions {
+        case_matching: CaseMatching::Smart,
+        normalization: Normalization::Smart,
+    };
+    let mut matches = snapshot
+        .matched_items(0..snapshot.matched_item_count().min(MAX_MATERIALIZED))
+        .enumerate()
+        .filter_map(|(source_order, item)| {
+            let path = item.matcher_columns[0].to_string();
+            completion_match(&query, &path, options).map(|m| (source_order, path, m))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(
+        |(left_order, left_path, left), (right_order, right_path, right)| {
+            compare_completion_matches(
+                left,
+                right,
+                0,
+                0,
+                *left_order,
+                *right_order,
+                left_path,
+                right_path,
+            )
+        },
+    );
     s.total_matches = snapshot.matched_item_count();
-    let count = s.total_matches.min(MAX_MATERIALIZED);
-
-    s.matches.clear();
-
-    let pattern = snapshot.pattern();
-    let has_pattern = !pattern.column_pattern(0).atoms.is_empty();
-    let mut indices_buf = Vec::new();
-
-    for item in snapshot.matched_items(0..count) {
-        let col = &item.matcher_columns[0];
-        let path = col.to_string();
-
-        let indices = if has_pattern {
-            indices_buf.clear();
-            pattern
-                .column_pattern(0)
-                .indices(col.slice(..), &mut s.matcher, &mut indices_buf);
-            mem::take(&mut indices_buf)
-        } else {
-            Vec::new()
-        };
-
-        s.matches.push(Match { path, indices });
-    }
+    s.matches = matches
+        .into_iter()
+        .map(|(_, path, completion)| Match { path, completion })
+        .collect();
 }
 
 fn move_selection(s: &mut Session, delta: isize) {
@@ -476,7 +484,13 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
         .enumerate()
         .map(|(i, m)| {
             let selected = s.scroll_offset + i == s.selected;
-            build_highlighted_line(&m.path, &m.indices, max_label_width, selected, &t)
+            build_highlighted_line(
+                &m.path,
+                &m.completion.indices,
+                max_label_width,
+                selected,
+                &t,
+            )
         })
         .collect();
 
@@ -611,7 +625,6 @@ mod tests {
         let (done_tx, done_rx) = flume::bounded(1);
         picker.session = Some(Session {
             nucleo,
-            matcher: Matcher::new(Config::DEFAULT.match_paths()),
             matches: Vec::new(),
             total_matches: 0,
             search: TextBuffer::new(String::new()),
@@ -808,7 +821,12 @@ mod tests {
         s.matches = (0..n)
             .map(|i| Match {
                 path: format!("file_{i:03}.rs"),
-                indices: Vec::new(),
+                completion: completion_match(
+                    "",
+                    &format!("file_{i:03}.rs"),
+                    CompletionMatchOptions::default(),
+                )
+                .unwrap(),
             })
             .collect();
         s.total_matches = n as u32;

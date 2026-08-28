@@ -13,7 +13,7 @@ use maki_lua::{
 };
 use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Matcher, Nucleo, Utf32String};
+use nucleo::{Config, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -220,7 +220,6 @@ pub struct CommandPalette {
     lua_commands: Vec<LuaCommandInfo>,
     lua_generation: u64,
     nucleo: Nucleo<CommandItem>,
-    matcher: Matcher,
     current_arg_count: usize,
     argument_items: Vec<ArgumentMatch>,
     argument_range: Option<(usize, usize)>,
@@ -281,7 +280,6 @@ impl CommandPalette {
             lua_commands,
             lua_generation,
             nucleo,
-            matcher: Matcher::new(Config::DEFAULT),
             current_arg_count: 0,
             argument_items: Vec::new(),
             argument_range: None,
@@ -772,14 +770,14 @@ impl CommandPalette {
             false,
         );
 
-        self.tick();
+        self.tick(cmd_word);
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self, query: &str) {
         loop {
             let status = self.nucleo.tick(TICK_TIMEOUT_MS);
             if status.changed {
-                self.refresh_matches();
+                self.refresh_matches(query);
             }
             if !status.running {
                 break;
@@ -787,39 +785,61 @@ impl CommandPalette {
         }
     }
 
-    fn refresh_matches(&mut self) {
-        let snapshot = self.nucleo.snapshot();
-        let pattern = snapshot.pattern();
-        let has_pattern = !pattern.column_pattern(0).atoms.is_empty();
-
-        self.filtered.clear();
-        let count = snapshot.matched_item_count();
-        for item in snapshot.matched_items(0..count) {
-            let cmd_item = &item.data;
-            let col = &item.matcher_columns[0];
-
+    fn refresh_matches(&mut self, query: &str) {
+        let options = CompletionMatchOptions {
+            case_matching: CaseMatching::Ignore,
+            normalization: Normalization::Smart,
+        };
+        let mut matches = Vec::new();
+        let overridden: HashSet<String> = HashSet::from_iter(
+            self.lua_commands
+                .iter()
+                .map(|c| c.name.to_string())
+                .chain(self.custom.iter().map(CustomCommand::display_name))
+                .chain(
+                    self.mcp_prompts
+                        .iter()
+                        .map(|p| format!("/{}", p.display_name)),
+                ),
+        );
+        for (source_order, cmd_item) in
+            Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands).enumerate()
+        {
+            if matches!(cmd_item.command_type, CommandType::Builtin(_))
+                && overridden.contains(&cmd_item.name)
+            {
+                continue;
+            }
             if self.current_arg_count > cmd_item.max_args {
                 continue;
             }
-
-            let indices = if has_pattern {
-                let mut indices_buf = vec![];
-                pattern.column_pattern(0).indices(
-                    col.slice(..),
-                    &mut self.matcher,
-                    &mut indices_buf,
-                );
-                indices_buf
-            } else {
-                Vec::new()
+            let Some(completion) = completion_match(query, &cmd_item.name, options) else {
+                continue;
             };
-
-            self.filtered.push(Match {
-                display: cmd_item.name.clone(),
-                command_type: cmd_item.command_type.clone(),
-                indices,
-            });
+            matches.push((source_order, cmd_item, completion));
         }
+        matches.sort_by(
+            |(left_order, left, left_match), (right_order, right, right_match)| {
+                maki_match::compare_completion_matches(
+                    left_match,
+                    right_match,
+                    0,
+                    0,
+                    *left_order,
+                    *right_order,
+                    &left.name,
+                    &right.name,
+                )
+            },
+        );
+        self.filtered = matches
+            .into_iter()
+            .map(|(_, item, completion)| Match {
+                display: item.name,
+                command_type: item.command_type,
+                indices: completion.indices,
+            })
+            .collect();
 
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
         // Argument items survive here: sync_arguments follows every sync
