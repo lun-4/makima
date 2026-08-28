@@ -56,7 +56,10 @@ struct Match {
 struct Session {
     nucleo: Nucleo<()>,
     matches: Vec<Match>,
-    total_matches: u32,
+    coarse_match_count: u32,
+    materialized_count: u32,
+    final_match_count: u32,
+    truncated: bool,
 
     search: TextBuffer,
     selected: usize,
@@ -162,7 +165,10 @@ impl FilePickerModal {
         self.session = Some(Session {
             nucleo,
             matches: Vec::new(),
-            total_matches: 0,
+            coarse_match_count: 0,
+            materialized_count: 0,
+            final_match_count: 0,
+            truncated: false,
             search: TextBuffer::new(String::new()),
             selected: 0,
             scroll_offset: 0,
@@ -390,13 +396,15 @@ fn reparse_pattern(s: &mut Session) {
 
 fn refresh_matches(s: &mut Session) {
     let snapshot = s.nucleo.snapshot();
+    let coarse_match_count = snapshot.matched_item_count();
+    let materialized_count = coarse_match_count.min(MAX_MATERIALIZED);
     let query = s.search.value();
     let options = CompletionMatchOptions {
         case_matching: CaseMatching::Smart,
         normalization: Normalization::Smart,
     };
     let mut paths: Vec<String> = snapshot
-        .matched_items(0..snapshot.matched_item_count().min(MAX_MATERIALIZED))
+        .matched_items(0..materialized_count)
         .map(|item| item.matcher_columns[0].to_string())
         .collect();
     paths.sort();
@@ -421,7 +429,10 @@ fn refresh_matches(s: &mut Session) {
             )
         },
     );
-    s.total_matches = snapshot.matched_item_count();
+    s.coarse_match_count = coarse_match_count;
+    s.materialized_count = materialized_count;
+    s.final_match_count = matches.len() as u32;
+    s.truncated = coarse_match_count > materialized_count;
     s.matches = matches
         .into_iter()
         .map(|(_, path, completion)| Match { path, completion })
@@ -475,9 +486,8 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
         return;
     }
 
-    let more = s.total_matches > MAX_MATERIALIZED;
     let at_bottom = s.scroll_offset + s.viewport_height >= s.matches.len();
-    let hint_row = usize::from(more && at_bottom);
+    let hint_row = usize::from(s.truncated && at_bottom);
     let visible_rows = s.viewport_height - hint_row;
 
     let max_label_width = area.width.saturating_sub(LABEL_INDENT.len() as u16) as usize;
@@ -499,9 +509,9 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
         .collect();
 
     if hint_row > 0 {
-        let n = s.total_matches - MAX_MATERIALIZED;
+        let n = s.coarse_match_count - s.materialized_count;
         lines.push(Line::from(Span::styled(
-            format!("{LABEL_INDENT}+{n} more files (not shown)"),
+            format!("{LABEL_INDENT}+{n} more files not ranked"),
             t.item_desc,
         )));
     }
@@ -581,6 +591,8 @@ mod tests {
     use super::*;
     use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::time::Duration;
     use test_case::test_case;
 
@@ -630,7 +642,10 @@ mod tests {
         picker.session = Some(Session {
             nucleo,
             matches: Vec::new(),
-            total_matches: 0,
+            coarse_match_count: 0,
+            materialized_count: 0,
+            final_match_count: 0,
+            truncated: false,
             search: TextBuffer::new(String::new()),
             selected: 0,
             scroll_offset: 0,
@@ -757,10 +772,12 @@ mod tests {
 
         let dirty = tick_until(&mut picker, |s| s.matches.len() == 1).expect(NEVER_CONVERGED);
         assert_eq!(dirty, Dirty::YES, "{OWED}");
-        assert_eq!(
-            picker.session.as_ref().unwrap().matches[0].path,
-            README_PATH
-        );
+        let session = picker.session.as_ref().unwrap();
+        assert_eq!(session.matches[0].path, README_PATH);
+        assert_eq!(session.coarse_match_count, 1);
+        assert_eq!(session.materialized_count, 1);
+        assert_eq!(session.final_match_count, 1);
+        assert!(!session.truncated);
     }
 
     /// Nucleo matches on a worker thread and hands the answer to nobody, long
@@ -808,13 +825,92 @@ mod tests {
     }
 
     #[test]
-    fn matches_capped_at_max_materialized() {
-        let mut picker = picker_with_matches(MAX_MATERIALIZED as usize + 50);
-        let s = picker.session.as_mut().unwrap();
-        s.total_matches = MAX_MATERIALIZED + 50;
-        s.matches.truncate(MAX_MATERIALIZED as usize);
-        assert_eq!(s.total_matches, MAX_MATERIALIZED + 50);
-        assert_eq!(s.matches.len(), MAX_MATERIALIZED as usize);
+    fn refresh_tracks_materialization_boundary() {
+        let (mut picker, _done_tx) = pending_picker();
+        for index in 0..=MAX_MATERIALIZED {
+            inject_file(&picker, &format!("file-{index:03}.rs"));
+        }
+        let session = picker.session.as_mut().unwrap();
+        session.walking = false;
+        while session.nucleo.tick(0).running {}
+        refresh_matches(session);
+
+        assert_eq!(session.coarse_match_count, MAX_MATERIALIZED + 1);
+        assert_eq!(session.materialized_count, MAX_MATERIALIZED);
+        assert_eq!(session.final_match_count, MAX_MATERIALIZED);
+        assert!(session.truncated);
+        assert_eq!(session.matches.len(), MAX_MATERIALIZED as usize);
+    }
+
+    #[test]
+    fn truncated_hint_describes_unranked_files() {
+        let mut picker = picker_with_matches(MAX_MATERIALIZED as usize);
+        let session = picker.session.as_mut().unwrap();
+        session.viewport_height = 10;
+        session.scroll_offset = MAX_MATERIALIZED as usize - session.viewport_height;
+        session.truncated = true;
+        session.coarse_match_count = MAX_MATERIALIZED + 3;
+        session.materialized_count = MAX_MATERIALIZED;
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_list(frame, frame.area(), session))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("+3 more files not ranked"));
+    }
+
+    #[test]
+    fn refresh_uses_lexical_source_order_for_ties() {
+        let (mut picker, _done_tx) = pending_picker();
+        inject_file(&picker, "zeta-file");
+        inject_file(&picker, "alpha-file");
+        let session = picker.session.as_mut().unwrap();
+        session.walking = false;
+        while session.nucleo.tick(0).running {}
+        refresh_matches(session);
+
+        let labels: Vec<_> = session
+            .matches
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect();
+        assert_eq!(labels, vec!["alpha-file", "zeta-file"]);
+        assert_eq!(session.coarse_match_count, 2);
+        assert_eq!(session.materialized_count, 2);
+        assert_eq!(session.final_match_count, 2);
+        assert!(!session.truncated);
+    }
+
+    #[test]
+    fn refresh_tracks_final_matches() {
+        let (mut picker, _done_tx) = pending_picker();
+        inject_file(&picker, "needle-file");
+        let session = picker.session.as_mut().unwrap();
+        session.walking = false;
+        session.nucleo.pattern.reparse(
+            0,
+            "needle",
+            CaseMatching::Smart,
+            Normalization::Smart,
+            false,
+        );
+        while session.nucleo.tick(0).running {}
+        refresh_matches(session);
+
+        assert_eq!(session.coarse_match_count, 1);
+        assert_eq!(session.materialized_count, 1);
+        assert_eq!(session.final_match_count, 1);
+        assert!(!session.truncated);
+        assert_eq!(session.matches.len(), 1);
+        assert_eq!(session.matches[0].path, "needle-file");
     }
 
     fn picker_with_matches(n: usize) -> FilePickerModal {
@@ -833,7 +929,11 @@ mod tests {
                 .unwrap(),
             })
             .collect();
-        s.total_matches = n as u32;
+        s.coarse_match_count = n as u32;
+        let materialized_count = n.min(MAX_MATERIALIZED as usize) as u32;
+        s.materialized_count = materialized_count;
+        s.final_match_count = materialized_count;
+        s.truncated = n > MAX_MATERIALIZED as usize;
         picker
     }
 

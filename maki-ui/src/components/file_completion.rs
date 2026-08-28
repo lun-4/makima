@@ -123,6 +123,10 @@ struct Session {
     ref_matches: Vec<Candidate>,
     file_matches: Vec<Candidate>,
     matches: Vec<Candidate>,
+    coarse_match_count: u32,
+    materialized_count: u32,
+    final_match_count: u32,
+    truncated: bool,
 
     selected: usize,
     /// Grid layout: columns used, and scroll/viewport in whole rows.
@@ -197,6 +201,10 @@ impl FileCompletionMenu {
             ref_matches: Vec::new(),
             file_matches: Vec::new(),
             matches: Vec::new(),
+            coarse_match_count: 0,
+            materialized_count: 0,
+            final_match_count: 0,
+            truncated: false,
             selected: 0,
             cols: 1,
             scroll_offset: 0,
@@ -261,6 +269,10 @@ impl FileCompletionMenu {
         let intent = parse_query(query);
         if s.query != query {
             s.file_matches.clear();
+            s.coarse_match_count = 0;
+            s.materialized_count = 0;
+            s.final_match_count = 0;
+            s.truncated = false;
         }
         s.intent = intent;
         s.query = query.to_string();
@@ -532,18 +544,23 @@ fn fuzzy_match(
 
 fn refresh_file_matches(s: &mut Session) {
     let snapshot = s.nucleo.snapshot();
-    let count = snapshot.matched_item_count().min(MAX_MATERIALIZED);
+    let coarse_match_count = snapshot.matched_item_count();
+    let materialized_count = coarse_match_count.min(MAX_MATERIALIZED);
     let mut paths: Vec<String> = snapshot
-        .matched_items(0..count)
+        .matched_items(0..materialized_count)
         .map(|item| item.matcher_columns[0].to_string())
         .collect();
     paths.sort();
+    s.coarse_match_count = coarse_match_count;
+    s.materialized_count = materialized_count;
+    s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
         if let Some(candidate) = match_candidate(CompletionItem::file(path), &s.intent, 0, order) {
             s.file_matches.push(candidate);
         }
     }
+    s.final_match_count = s.file_matches.len() as u32;
 }
 
 fn rebuild_combined(s: &mut Session) {
@@ -763,6 +780,10 @@ mod tests {
             ref_matches: Vec::new(),
             file_matches: Vec::new(),
             matches: Vec::new(),
+            coarse_match_count: 0,
+            materialized_count: 0,
+            final_match_count: 0,
+            truncated: false,
             selected: 0,
             cols: 1,
             scroll_offset: 0,
@@ -1478,7 +1499,95 @@ mod tests {
                 break;
             }
         }
+        let session = menu.session.as_ref().unwrap();
         assert_eq!(labels(&menu), vec!["needle-file"]);
+        assert_eq!(session.coarse_match_count, 1);
+        assert_eq!(session.materialized_count, 1);
+        assert_eq!(session.final_match_count, 1);
+        assert!(!session.truncated);
+    }
+
+    #[test]
+    fn file_refresh_uses_lexical_source_order_for_ties() {
+        let mut menu = session_with_items(Vec::new());
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.walking = false;
+            session.nucleo.injector().push((), |_, columns| {
+                columns[0] = Utf32String::from("zeta-file");
+            });
+            session.nucleo.injector().push((), |_, columns| {
+                columns[0] = Utf32String::from("alpha-file");
+            });
+        }
+        menu.sync_query("");
+        for _ in 0..100 {
+            let _ = menu.tick();
+            if menu.session.as_ref().unwrap().file_matches.len() == 2 {
+                break;
+            }
+        }
+        let session = menu.session.as_ref().unwrap();
+        let labels: Vec<_> = session
+            .file_matches
+            .iter()
+            .map(|candidate| candidate.item.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["alpha-file", "zeta-file"]);
+        assert_eq!(session.materialized_count, 2);
+        assert!(!session.truncated);
+    }
+
+    #[test]
+    fn file_refresh_rejects_coarse_matches_for_non_file_kind_queries() {
+        let mut menu = session_with_items(Vec::new());
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.walking = false;
+            session.nucleo.injector().push((), |_, columns| {
+                columns[0] = Utf32String::from("skill:example");
+            });
+        }
+        menu.sync_query("skill:");
+        {
+            let session = menu.session.as_mut().unwrap();
+            while session.nucleo.tick(0).running {}
+            refresh_file_matches(session);
+        }
+
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.coarse_match_count, 1);
+        assert_eq!(session.materialized_count, 1);
+        assert_eq!(session.final_match_count, 0);
+        assert!(!session.truncated);
+        assert!(session.file_matches.is_empty());
+    }
+
+    #[test]
+    fn file_refresh_tracks_materialization_boundary() {
+        let mut menu = session_with_items(Vec::new());
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.walking = false;
+            for index in 0..=MAX_MATERIALIZED {
+                session.nucleo.injector().push((), |_, columns| {
+                    columns[0] = Utf32String::from(format!("file-{index:03}.rs").as_str());
+                });
+            }
+            while session.nucleo.tick(0).running {}
+            refresh_file_matches(session);
+        }
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.coarse_match_count, MAX_MATERIALIZED + 1);
+        assert_eq!(session.materialized_count, MAX_MATERIALIZED);
+        assert_eq!(session.final_match_count, MAX_MATERIALIZED);
+        assert!(session.truncated);
+        assert_eq!(session.file_matches.len(), MAX_MATERIALIZED as usize);
+        assert_eq!(session.file_matches[0].item.label, "file-000.rs");
+        assert_eq!(
+            session.file_matches.last().unwrap().item.label,
+            format!("file-{:03}.rs", MAX_MATERIALIZED - 1)
+        );
     }
 
     #[test]
