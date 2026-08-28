@@ -155,6 +155,13 @@ struct CommandTurnMarker;
 
 struct PrintCommandHost;
 
+fn print_capabilities() -> TargetCapabilities {
+    TargetCapabilities::from_slice(&[
+        TargetCapability::AgentTurns,
+        TargetCapability::ApplicationLifecycle,
+    ])
+}
+
 impl CommandHost for PrintCommandHost {
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
         Box::pin(async move {
@@ -163,6 +170,16 @@ impl CommandHost for PrintCommandHost {
                     maki_commands::HostContextResponse::Unavailable,
                 )),
                 HostRequest::Builtin(BuiltinOperation::Exit) => Ok(HostResponse::Completed),
+                HostRequest::Builtin(BuiltinOperation::QuickQuestion {
+                    question,
+                    attachments,
+                }) => Ok(HostResponse::AgentTurn(maki_commands::AgentTurn {
+                    content: CommandContent {
+                        text: question,
+                        attachments,
+                    },
+                    prompt: None,
+                })),
                 HostRequest::Builtin(operation) => Err(CommandError::Producer(Arc::from(format!(
                     "unsupported command operation: {operation:?}"
                 )))),
@@ -271,18 +288,19 @@ pub fn run(
     };
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
-    let target = command_registry.bind_target(
-        TargetCapabilities::from_capability(TargetCapability::ApplicationLifecycle),
-        Arc::new(PrintCommandHost),
-    );
+    let target = command_registry.bind_target(print_capabilities(), Arc::new(PrintCommandHost));
     let command_turn_marker = CommandTurnMarker;
 
     let prompt_slots = lua_handle.collect_prompt_slots();
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_with_commands(
-        &cwd,
-        command_registry.clone(),
-    ));
+    let (mcp_handle, mcp_config_errors) = smol::block_on(async {
+        let (handle, errors) =
+            maki_agent::mcp::start_with_commands(&cwd, command_registry.clone()).await;
+        if let Some(handle) = &handle {
+            handle.ready().await;
+        }
+        (handle, errors)
+    });
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -556,7 +574,7 @@ mod tests {
     }
 
     fn target(registry: &CommandRegistry) -> maki_commands::TargetHandle {
-        registry.bind_target(TargetCapabilities::ALL, Arc::new(PrintCommandHost))
+        registry.bind_target(print_capabilities(), Arc::new(PrintCommandHost))
     }
 
     struct ReplaceAttachment;
@@ -607,7 +625,9 @@ mod tests {
                         summary: Arc::from("inspect"),
                         argument_hint: None,
                     },
-                    required_capabilities: TargetCapabilities::default(),
+                    required_capabilities: TargetCapabilities::from_capability(
+                        TargetCapability::AgentTurns,
+                    ),
                 },
                 behavior: Arc::new(ReplaceAttachment),
                 completion: None,
@@ -636,6 +656,36 @@ mod tests {
             maki_agent::ImageMediaType::Jpeg
         );
         assert_eq!(received.images[0].data.as_ref(), "BBBB");
+    }
+
+    #[test]
+    fn quick_question_runs_as_agent_turn() {
+        let registry = CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let target = target(&registry);
+        let sink = CommandTurnMarker;
+        let mut literal = input("/btw explain this");
+        literal.images.push(ImageSource::new(
+            maki_agent::ImageMediaType::Png,
+            Arc::from("AAAA"),
+        ));
+        let mut received = None;
+
+        drive_print(&registry, &target, &sink, literal, |input| {
+            received = Some(input);
+            Ok(())
+        })
+        .unwrap();
+
+        let received = received.unwrap();
+        assert_eq!(received.message, "explain this");
+        assert_eq!(received.images.len(), 1);
+        assert_eq!(
+            received.images[0].media_type,
+            maki_agent::ImageMediaType::Png
+        );
+        assert_eq!(received.images[0].data.as_ref(), "AAAA");
     }
 
     #[test]

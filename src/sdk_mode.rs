@@ -513,12 +513,29 @@ impl CommandHost for SdkCommandHost {
                         .await
                         .map_err(|_| CommandError::StaleTarget)?
                 }
+                HostRequest::Builtin(BuiltinOperation::QuickQuestion {
+                    question,
+                    attachments,
+                }) => Ok(HostResponse::AgentTurn(AgentTurn {
+                    content: CommandContent {
+                        text: question,
+                        attachments,
+                    },
+                    prompt: None,
+                })),
                 HostRequest::Builtin(operation) => Err(CommandError::Producer(Arc::from(format!(
                     "unsupported command operation: {operation:?}"
                 )))),
             }
         })
     }
+}
+
+fn sdk_capabilities() -> TargetCapabilities {
+    TargetCapabilities::from_slice(&[
+        TargetCapability::AgentTurns,
+        TargetCapability::ModelSelection,
+    ])
 }
 
 struct SdkCommands {
@@ -534,7 +551,7 @@ impl SdkCommands {
         let standard_commands =
             StandardCommands::register(&registry, custom, StandardCompletions::default())?;
         let target = registry.bind_target(
-            TargetCapabilities::from_capability(TargetCapability::ModelSelection),
+            sdk_capabilities(),
             Arc::new(SdkCommandHost {
                 tx: route_tx.clone(),
             }),
@@ -1646,11 +1663,26 @@ mod tests {
             .replace(vec![registration("/lua", CommandOutcome::Completed)])
             .unwrap();
         let mcp = registry.create_producer(maki_commands::ProducerPrecedence::Mcp);
-        mcp.replace(vec![registration("/mcp:prompt", CommandOutcome::Completed)])
-            .unwrap();
+        let mut prompt = registration("/mcp:prompt", CommandOutcome::Completed);
+        prompt.spec.required_capabilities =
+            TargetCapabilities::from_capability(TargetCapability::AgentTurns);
+        mcp.replace(vec![prompt]).unwrap();
         let commands = SdkCommands::new(registry, &[]).unwrap();
 
-        assert_eq!(commands.slash_commands(), ["lua", "mcp:prompt", "model"]);
+        assert_eq!(
+            commands.slash_commands(),
+            ["lua", "mcp:prompt", "model", "btw"]
+        );
+        assert!(matches!(
+            commands.dispatch_input("/mcp:prompt", &[]),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        let InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) =
+            commands.dispatch_input("/btw explain this", &[])
+        else {
+            panic!("quick question did not return an agent turn");
+        };
+        assert_eq!(turn.content.text.as_ref(), "explain this");
         let projection = commands.projection();
         assert_eq!(projection[0]["description"], "/lua description");
         assert_eq!(projection[0]["argumentHint"], "<arg>");
