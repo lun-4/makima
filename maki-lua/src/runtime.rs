@@ -65,6 +65,7 @@ use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
+const LUA_COMMAND_ATTACHMENTS: &str = "Lua commands cannot include non-text content";
 const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
@@ -1560,6 +1561,11 @@ impl CommandBehavior for LuaCommandBehavior {
         &self,
         invocation: CommandInvocation,
     ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+        if !invocation.content.attachments.is_empty() {
+            return Box::pin(async {
+                Err(CommandError::Producer(Arc::from(LUA_COMMAND_ATTACHMENTS)))
+            });
+        }
         let result = self.tx.send(Request::ExecuteCommand {
             plugin: Arc::clone(&self.plugin),
             command: Arc::clone(&self.command),
@@ -3796,6 +3802,17 @@ mod tests {
     use std::task::Poll;
     use test_case::test_case;
 
+    struct FakeCommandHost;
+
+    impl maki_commands::CommandHost for FakeCommandHost {
+        fn request(
+            &self,
+            _request: maki_commands::HostRequest,
+        ) -> CommandFuture<Result<maki_commands::HostResponse, CommandError>> {
+            Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
+        }
+    }
+
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
         buf.append(SnapshotLine {
@@ -4146,6 +4163,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lua_command_rejects_attachments_before_handler_dispatch() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let (tx, rx) = flume::bounded(1);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/lua-command"),
+                    aliases: Arc::from([]),
+                    arguments: ArgumentArity::NONE,
+                    docs: CommandDocs {
+                        summary: Arc::from("Lua command"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(LuaCommandBehavior {
+                    plugin: Arc::from("test-plugin"),
+                    command: Arc::from("/lua-command"),
+                    tx,
+                }),
+                completion: None,
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
+        let content = maki_commands::CommandContent {
+            text: Arc::from("/lua-command"),
+            attachments: Arc::from([maki_commands::CommandAttachment {
+                media_type: Arc::from("image/png"),
+                data: Arc::from("AAAA"),
+            }]),
+        };
+
+        let result = smol::block_on(registry.dispatch_input(&target, content));
+
+        assert!(matches!(
+            result,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
+                CommandError::Producer(message)
+            )) if message.as_ref() == LUA_COMMAND_ATTACHMENTS
+        ));
+        assert!(rx.is_empty());
+    }
+
     /// Without this a `run_command` cycle could hop through `maki.async.run`
     /// and start over at depth 0, so the cap would never trip.
     #[test]
@@ -4158,15 +4220,6 @@ mod tests {
             ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
                 self.0.send(invocation).unwrap();
                 Box::pin(async { Ok(CommandOutcome::Completed) })
-            }
-        }
-        struct FakeHost;
-        impl maki_commands::CommandHost for FakeHost {
-            fn request(
-                &self,
-                _request: maki_commands::HostRequest,
-            ) -> CommandFuture<Result<maki_commands::HostResponse, CommandError>> {
-                Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
             }
         }
 
@@ -4190,7 +4243,7 @@ mod tests {
                 completion: None,
             }])
             .unwrap();
-        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeHost));
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
         smol::block_on(registry.dispatch_input(&target, "/capture".into()));
         let invocation = rx.recv().unwrap();
         let target_id = invocation.target_id();
