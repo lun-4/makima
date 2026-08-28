@@ -67,8 +67,8 @@ use maki_agent::{
     SharedMessages, SubagentInfo,
 };
 use maki_commands::{
-    AgentTurn, BuiltinOperation, CommandContent, CommandError, HostContextRequest,
-    HostContextResponse, HostRequest, HostResponse, TargetHandle,
+    AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
+    HostContextRequest, HostContextResponse, HostRequest, HostResponse, TargetHandle,
 };
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
 use maki_lua::{
@@ -1282,10 +1282,26 @@ impl App {
                 return vec![];
             }
             CommandAction::Execute(cmd) => {
+                let attachments = self
+                    .input_box
+                    .take_pending_images()
+                    .into_iter()
+                    .map(|image| CommandAttachment {
+                        media_type: Arc::from(image.media_type.mime()),
+                        data: image.data,
+                    })
+                    .collect();
                 self.input_box.discard();
                 self.file_completion.close();
                 return self
-                    .dispatch_confirmed_command(cmd, 0)
+                    .dispatch_confirmed_command(
+                        cmd,
+                        CommandContent {
+                            text: Arc::from(""),
+                            attachments,
+                        },
+                        0,
+                    )
                     .unwrap_or_else(|error| {
                         self.flash(error);
                         Vec::new()
@@ -1945,13 +1961,14 @@ impl App {
     fn dispatch_confirmed_command(
         &mut self,
         command: ConfirmedCommand,
+        content: CommandContent,
         depth: u8,
     ) -> Result<Vec<Action>, String> {
         self.command_runtime.dispatch_command(
             &self.command_target,
             command.command,
             Arc::from(command.args),
-            CommandContent::default(),
+            content,
             depth.into(),
         );
         #[cfg(test)]

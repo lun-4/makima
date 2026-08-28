@@ -46,6 +46,9 @@ const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_IMAGE_DATA: &str = "dGVzdA==";
+const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
+    "command failed: local commands cannot include non-text content";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -565,7 +568,7 @@ fn with_text(app: &mut App) {
 }
 
 fn with_image(app: &mut App) {
-    let img = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
+    let img = ImageSource::new(ImageMediaType::Png, Arc::from(TEST_IMAGE_DATA));
     app.input_box.attach_image(img);
 }
 
@@ -894,6 +897,42 @@ fn enter_executes_new_command() {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::NewSession));
     assert!(!app.command_palette.is_active());
+}
+
+#[test]
+fn confirmed_btw_preserves_pending_images() {
+    let mut app = test_app();
+    app.input_box.attach_image(ImageSource::new(
+        ImageMediaType::Webp,
+        Arc::from(TEST_IMAGE_DATA),
+    ));
+
+    let actions = type_and_submit(&mut app, "/btw describe this");
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Btw(question, images)]
+            if question == "describe this"
+                && matches!(images.as_slice(), [image]
+                    if image.media_type == ImageMediaType::Webp
+                        && image.data.as_ref() == TEST_IMAGE_DATA)
+    ));
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn confirmed_local_builtin_rejects_pending_images() {
+    let mut app = test_app();
+    with_image(&mut app);
+
+    let actions = type_and_submit(&mut app, "/new");
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(LOCAL_COMMAND_ATTACHMENTS_ERROR)
+    );
+    assert!(app.input_box.is_empty());
 }
 
 fn lifecycle_app() -> (
