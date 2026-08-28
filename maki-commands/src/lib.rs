@@ -14,6 +14,7 @@ use thiserror::Error;
 pub type CommandFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub const MAX_COMMAND_DEPTH: usize = 8;
+pub const COMPACT_COMMAND_NAME: &str = "/compact";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -185,7 +186,7 @@ const LIFECYCLE: TargetCapabilities =
 const RELOAD: TargetCapabilities = TargetCapabilities::from_capability(TargetCapability::Reload);
 
 macro_rules! builtin {
-    ($id:ident, $name:literal, $aliases:expr, $description:literal, $arguments:expr, $hint:expr, $caps:expr, $completion:expr $(,)?) => {
+    ($id:ident, $name:expr, $aliases:expr, $description:literal, $arguments:expr, $hint:expr, $caps:expr, $completion:expr $(,)?) => {
         BuiltinDefinition {
             id: BuiltinId::$id,
             name: $name,
@@ -212,7 +213,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
     ),
     builtin!(
         Compact,
-        "/compact",
+        COMPACT_COMMAND_NAME,
         &[],
         "Summarize and compact conversation history",
         ArgumentArity::NONE,

@@ -11,12 +11,11 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{AgentInput, ExtractedCommand, ImageSource, InterruptSource};
+use maki_commands::COMPACT_COMMAND_NAME;
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
 use crate::theme;
-
-const COMPACT_LABEL: &str = "/compact";
 
 type Items = Arc<Mutex<VecDeque<QueueItem>>>;
 
@@ -65,7 +64,7 @@ impl QueueItem {
                 color: theme::current().foreground,
             },
             Self::Compact { .. } => QueueEntry {
-                text: Cow::Borrowed(COMPACT_LABEL),
+                text: Cow::Borrowed(COMPACT_COMMAND_NAME),
                 color: theme::current()
                     .queue
                     .fg

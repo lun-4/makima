@@ -548,6 +548,7 @@ maki.api.register_command({
   handler = open,
 })
 
+maki.api.create_autocmd("SessionPickerRequested", { callback = open })
 maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
 
 maki.api.register_command({

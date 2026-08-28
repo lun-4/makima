@@ -60,7 +60,7 @@ use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
@@ -134,7 +134,7 @@ const AUTH_EXPIRED_MSG: &str =
 const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
-const SESSIONS_COMMAND: &str = "/sessions";
+const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
@@ -864,22 +864,6 @@ impl App {
         if key::TASKS.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Tasks));
         }
-        if key::SESSIONS.matches(key) {
-            if let Ok(command) = self
-                .command_runtime
-                .registry
-                .resolve_for(&self.command_target, SESSIONS_COMMAND)
-            {
-                self.command_runtime.dispatch_command(
-                    &self.command_target,
-                    command,
-                    Arc::from(""),
-                    CommandContent::default(),
-                    0,
-                );
-            }
-            return Some(vec![]);
-        }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
             self.active_chat().scroll(half);
@@ -1245,16 +1229,15 @@ impl App {
     }
 
     fn dispatch_override(&self, key: KeyEvent) -> bool {
-        let snap = self.keymap_reader.load();
-        for entry in &snap.entries {
-            if entry.key == key.code
-                && entry.modifiers == key.modifiers
+        self.dispatch_keymap(key.code, key.modifiers)
+    }
+
+    fn dispatch_keymap(&self, key: KeyCode, modifiers: KeyModifiers) -> bool {
+        self.keymap_reader.load().entries.iter().any(|entry| {
+            entry.key == key
+                && entry.modifiers == modifiers
                 && self.lua_event_handle.run_keybind_callback(entry.id)
-            {
-                return true;
-            }
-        }
-        false
+        })
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -2237,25 +2220,9 @@ impl App {
         }
     }
 
-    /// Opens the `/sessions` picker for this directory (bare `makima -c`
-    /// before the agent starts). Fire-and-forget, same path as the Ctrl+P
-    /// binding.
-    pub(crate) fn open_session_picker(&mut self) {
-        if let Ok(command) = self
-            .command_runtime
-            .registry
-            .resolve_for(&self.command_target, SESSIONS_COMMAND)
-        {
-            self.command_runtime.dispatch_command(
-                &self.command_target,
-                command,
-                Arc::from(""),
-                CommandContent::default(),
-                0,
-            );
-            #[cfg(test)]
-            let _ = self.execute_pending_commands();
-        }
+    pub(crate) fn open_startup_session_picker(&self) {
+        self.lua_event_handle
+            .fire_autocmd(SESSION_PICKER_REQUESTED_EVENT, serde_json::json!({}));
     }
 
     fn change_directory(&mut self, path: PathBuf) -> Vec<Action> {

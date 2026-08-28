@@ -665,7 +665,7 @@ impl<'t> EventLoop<'t> {
             let actions = self.focused_app().handle_submit(sub);
             self.dispatch(self.focused, actions);
         } else if self.session_picker {
-            self.focused_app().open_session_picker();
+            self.focused_app().open_startup_session_picker();
         }
         // Populate the inline quota readout without waiting for `/usage` or
         // Ctrl+R; provider/model changes below trigger their own refresh.

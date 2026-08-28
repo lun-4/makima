@@ -2054,7 +2054,7 @@ fn picker_enter_stays_at_navigated() {
 }
 
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
-    kb::SESSIONS.to_key_event(),
+    KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
     kb::SCROLL_HALF_UP.to_key_event(),
     kb::SCROLL_HALF_DOWN.to_key_event(),
     kb::HELP.to_key_event(),
@@ -3698,32 +3698,17 @@ fn run_cmdline_forwards_depth_to_lua_command() {
     );
 }
 
-/// The bare `-c` startup path must reach the picker with no arg, so the
-/// picker lists this directory's sessions only.
 #[test]
-fn open_session_picker_sends_no_arg_to_lua() {
+fn startup_session_picker_emits_plugin_request() {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    let (registry, _producer) = lua_registry(TestLuaCommand {
-        handle: handle.clone(),
-        name: Arc::from("/sessions"),
-        plugin: Arc::from("sessions"),
-        max_args: Some(1),
-        completion: false,
-    });
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let app = build_app_with_handle(dir.clone(), Arc::new(test_writer(dir)), handle);
 
-    app.open_session_picker();
+    app.open_startup_session_picker();
 
     assert_eq!(
-        probe.try_recv_command(),
-        Some(("/sessions".to_string(), String::new(), 0))
+        probe.try_recv_autocmd(),
+        Some(("SessionPickerRequested".to_owned(), serde_json::json!({})))
     );
 }
 
