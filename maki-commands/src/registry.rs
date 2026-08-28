@@ -571,20 +571,14 @@ impl RegistryState {
         for producer in &self.producers {
             for record in &producer.records {
                 let spec = &record.registration.spec;
-                insert_winner(
-                    &mut winners,
-                    record,
-                    &spec.name,
-                    true,
-                    producer.precedence,
-                    producer.creation_order,
-                );
-                for alias in spec.aliases.iter() {
+                for (spelling, canonical) in std::iter::once((&spec.name, true))
+                    .chain(spec.aliases.iter().map(|alias| (alias, false)))
+                {
                     insert_winner(
                         &mut winners,
                         record,
-                        alias,
-                        false,
+                        spelling,
+                        canonical,
                         producer.precedence,
                         producer.creation_order,
                     );
@@ -652,8 +646,6 @@ fn validate_registrations(
 ) -> Result<Vec<Registration>, RegistrationError> {
     let mut spellings = HashSet::new();
     for registration in &registrations {
-        validate_spelling(&registration.spec.name)
-            .map_err(|_| RegistrationError::InvalidName(Arc::clone(&registration.spec.name)))?;
         if registration
             .spec
             .arguments
