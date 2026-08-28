@@ -1149,9 +1149,12 @@ impl Producer {
         state.producers[position].generation += 1;
         state.generation += 1;
         state.rebuild();
-        state.notify_subscribers();
+        let wakers = state.take_subscriber_wakers();
         let invalidations = state.invalidate_completion_sessions(self.id);
         drop(state);
+        for waker in wakers {
+            waker.wake();
+        }
         for invalidation in invalidations {
             invalidation.finish();
         }
@@ -1176,9 +1179,12 @@ impl Producer {
         state.producers.remove(position);
         state.generation += 1;
         state.rebuild();
-        state.notify_subscribers();
+        let wakers = state.take_subscriber_wakers();
         let invalidations = state.invalidate_completion_sessions(self.id);
         drop(state);
+        for waker in wakers {
+            waker.wake();
+        }
         for invalidation in invalidations {
             invalidation.finish();
         }
@@ -1212,7 +1218,8 @@ impl RegistryState {
             .collect()
     }
 
-    fn notify_subscribers(&mut self) {
+    fn take_subscriber_wakers(&mut self) -> Vec<Waker> {
+        let mut wakers = Vec::new();
         self.subscribers.retain(|subscriber| {
             let Some(subscriber) = subscriber.upgrade() else {
                 return false;
@@ -1226,10 +1233,11 @@ impl RegistryState {
                 .unwrap_or_else(|error| error.into_inner())
                 .take()
             {
-                waker.wake();
+                wakers.push(waker);
             }
             true
         });
+        wakers
     }
 
     fn rebuild(&mut self) {
@@ -1880,6 +1888,7 @@ pub enum CompletionError {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
+    use std::task::{Context, Wake};
     use std::thread;
     use std::time::Duration;
 
@@ -1923,6 +1932,18 @@ mod tests {
         entered: mpsc::SyncSender<()>,
         release: Mutex<mpsc::Receiver<()>>,
         events: Mutex<Vec<CompletionLifecycleEvent>>,
+    }
+
+    struct ReentrantRegistryWaker {
+        registry: CommandRegistry,
+        woke: mpsc::SyncSender<()>,
+    }
+
+    impl Wake for ReentrantRegistryWaker {
+        fn wake(self: Arc<Self>) {
+            drop(self.registry.subscribe());
+            self.woke.send(()).unwrap();
+        }
     }
 
     impl CommandCompletion for CompletionProbe {
@@ -2342,6 +2363,36 @@ mod tests {
         let generation = futures_lite::future::block_on(subscription.changed(initial));
         assert_eq!(generation, subscription.generation());
         assert!(generation > initial);
+    }
+
+    #[test]
+    fn subscriber_waker_reenters_registry_after_lock_release() {
+        let registry = CommandRegistry::new();
+        let subscription = registry.subscribe();
+        let initial = subscription.generation();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let (woke_tx, woke_rx) = mpsc::sync_channel(1);
+        let mut changed = subscription.changed(initial);
+        let waker = Waker::from(Arc::new(ReentrantRegistryWaker {
+            registry: registry.clone(),
+            woke: woke_tx,
+        }));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(changed.as_mut().poll(&mut context), Poll::Pending));
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+
+        let worker = thread::spawn(move || {
+            let result = producer.replace(vec![registration("/changed", TargetCapabilities::NONE)]);
+            done_tx.send(result).unwrap();
+        });
+
+        woke_rx.recv_timeout(LOCK_RELEASE_TIMEOUT).unwrap();
+        done_rx.recv_timeout(LOCK_RELEASE_TIMEOUT).unwrap().unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            changed.as_mut().poll(&mut context),
+            Poll::Ready(_)
+        ));
     }
 
     #[test]
