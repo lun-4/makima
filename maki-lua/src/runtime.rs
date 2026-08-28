@@ -34,7 +34,7 @@ use maki_commands::{
     CommandBehavior, CommandCompletion, CommandDocs, CommandError, CommandFuture,
     CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionContext,
     CompletionError, CompletionItem, CompletionLifecycleEvent, CompletionSessionId, Producer,
-    ProducerPrecedence, Registration, TargetCapabilities, TargetCapability,
+    ProducerPrecedence, Registration, RegistrationError, TargetCapabilities, TargetCapability,
 };
 use maki_config::RawConfig;
 
@@ -1721,18 +1721,13 @@ pub(crate) fn publish_registered_commands(lua: &Lua, plugin: &Arc<str>) -> mlua:
         &publisher.command_arguments,
         &publisher.command_argument_lifecycle,
     );
-    let mut producers = publisher
-        .producers
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let producer = producers.entry(Arc::clone(plugin)).or_insert_with(|| {
-        publisher
-            .registry
-            .create_producer(ProducerPrecedence::Plugin)
-    });
-    producer
-        .replace(registrations)
-        .map_err(|error| mlua::Error::runtime(format!("invalid command registration: {error}")))
+    replace_command_producer(
+        &publisher.registry,
+        &publisher.producers,
+        plugin,
+        registrations,
+    )
+    .map_err(|error| mlua::Error::runtime(format!("invalid command registration: {error}")))
 }
 
 fn command_registrations(
@@ -1776,6 +1771,19 @@ fn command_registrations(
             }),
         })
         .collect()
+}
+
+fn replace_command_producer(
+    registry: &CommandRegistry,
+    producers: &Mutex<HashMap<Arc<str>, Producer>>,
+    plugin: &Arc<str>,
+    registrations: Vec<Registration>,
+) -> Result<(), RegistrationError> {
+    let mut producers = producers.lock().unwrap_or_else(|error| error.into_inner());
+    producers
+        .entry(Arc::clone(plugin))
+        .or_insert_with(|| registry.create_producer(ProducerPrecedence::Plugin))
+        .replace(registrations)
 }
 
 fn command_argument_item(item: &CompletionItem) -> crate::CommandArgumentItem {
@@ -2431,20 +2439,16 @@ impl LuaRuntime {
 
     fn publish_commands(&mut self, plugin: &Arc<str>) -> Result<(), PluginError> {
         let registrations = self.command_registrations(plugin)?;
-        let mut producers = self
-            .command_producers
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let producer = producers.entry(Arc::clone(plugin)).or_insert_with(|| {
-            self.command_registry
-                .create_producer(ProducerPrecedence::Plugin)
-        });
-        producer
-            .replace(registrations)
-            .map_err(|error| PluginError::Lua {
-                plugin: plugin.to_string(),
-                source: mlua::Error::runtime(format!("invalid command registration: {error}")),
-            })
+        replace_command_producer(
+            &self.command_registry,
+            &self.command_producers,
+            plugin,
+            registrations,
+        )
+        .map_err(|error| PluginError::Lua {
+            plugin: plugin.to_string(),
+            source: mlua::Error::runtime(format!("invalid command registration: {error}")),
+        })
     }
 
     fn clear_plugin(&mut self, plugin: &str) {
