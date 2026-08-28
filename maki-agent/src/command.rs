@@ -43,11 +43,15 @@ pub fn portable_capabilities() -> TargetCapabilities {
     ])
 }
 
+struct ModelCommandState {
+    current: String,
+    fast: bool,
+}
+
 pub struct SessionCommandState {
-    pub current_model: Mutex<String>,
+    model: Mutex<ModelCommandState>,
     model_specs: Mutex<Arc<[Arc<str>]>>,
     cwd: Mutex<PathBuf>,
-    fast: AtomicBool,
     workflow: AtomicBool,
 }
 
@@ -60,12 +64,28 @@ impl SessionCommandState {
         workflow: bool,
     ) -> Self {
         Self {
-            current_model: Mutex::new(current_model),
+            model: Mutex::new(ModelCommandState {
+                current: current_model,
+                fast,
+            }),
             model_specs: Mutex::new(model_specs),
             cwd: Mutex::new(cwd),
-            fast: AtomicBool::new(fast),
             workflow: AtomicBool::new(workflow),
         }
+    }
+
+    pub fn set_model(&self, model: &Model) {
+        let mut state = self.model.lock().unwrap_or_else(|error| error.into_inner());
+        state.current = model.spec();
+        state.fast &= model.supports_fast();
+    }
+
+    pub fn current_model(&self) -> String {
+        self.model
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current
+            .clone()
     }
 
     pub fn set_model_specs(&self, specs: impl IntoIterator<Item = String>) {
@@ -77,7 +97,17 @@ impl SessionCommandState {
     }
 
     pub fn fast(&self) -> bool {
-        self.fast.load(Ordering::Relaxed)
+        self.model
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .fast
+    }
+
+    fn toggle_fast(&self) {
+        let mut state = self.model.lock().unwrap_or_else(|error| error.into_inner());
+        if Model::from_spec(&state.current).is_ok_and(|model| model.supports_fast()) {
+            state.fast = !state.fast;
+        }
     }
 
     pub fn workflow(&self) -> bool {
@@ -168,12 +198,7 @@ impl maki_commands::CommandHost for SessionCommandHost {
                 });
             }
             HostRequest::Context(HostContextRequest::FastModeSupported) => {
-                let model = self
-                    .state
-                    .current_model
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone();
+                let model = self.state.current_model();
                 let supported = Model::from_spec(&model).is_ok_and(|model| model.supports_fast());
                 return Box::pin(async move {
                     Ok(HostResponse::Context(
@@ -193,7 +218,7 @@ impl maki_commands::CommandHost for SessionCommandHost {
                 Box::pin(async { Ok(HostResponse::Completed) })
             }
             maki_commands::BuiltinOperation::ToggleFast => {
-                self.state.fast.fetch_xor(true, Ordering::Relaxed);
+                self.state.toggle_fast();
                 Box::pin(async { Ok(HostResponse::Completed) })
             }
             maki_commands::BuiltinOperation::ToggleWorkflow => {
@@ -224,13 +249,10 @@ impl maki_commands::CommandHost for SessionCommandHost {
                     }
                     let model = Model::from_spec(&spec)
                         .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-                    model_tx.send(model).map_err(|_| {
+                    model_tx.send(model.clone()).map_err(|_| {
                         CommandError::Producer(Arc::from("session ended before model change"))
                     })?;
-                    *state
-                        .current_model
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = spec.to_string();
+                    state.set_model(&model);
                     Ok(HostResponse::Completed)
                 })
             }
@@ -989,7 +1011,7 @@ mod tests {
         let (model_tx, model_rx) = flume::unbounded();
         let (control_tx, control_rx) = flume::unbounded();
         let state = Arc::new(SessionCommandState::new(
-            OFFLINE_MODEL.into(),
+            FAST_MODEL.into(),
             Arc::from([]),
             PathBuf::from("/project"),
             false,
@@ -1069,8 +1091,11 @@ mod tests {
         )));
         assert!(matches!(result, Ok(HostResponse::Completed)));
         assert_eq!(model_rx.recv().unwrap().spec(), model.spec());
+        assert_eq!(state.current_model(), model.spec());
+        assert!(!state.fast());
     }
 
+    const FAST_MODEL: &str = "anthropic/claude-opus-4-8";
     const OFFLINE_MODEL: &str = "openai/gpt-5";
 
     #[test]

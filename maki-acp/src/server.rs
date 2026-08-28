@@ -207,11 +207,7 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
         return;
     }
     let Some(session) = &srv.session else { return };
-    let current_model = session
-        .command_state
-        .current_model
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let current_model = session.command_state.current_model();
     session
         .command_state
         .set_model_specs(srv.model_specs.clone());
@@ -833,13 +829,9 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
     session
         .handle
         .model_tx
-        .send(model)
+        .send(model.clone())
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    *session
-        .command_state
-        .current_model
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = spec.clone();
+    session.command_state.set_model(&model);
 
     Ok(AgentResponse::SetSessionConfigOptionResponse(
         SetSessionConfigOptionResponse::new(vec![methods::model_config_option(
@@ -1132,6 +1124,7 @@ mod tests {
     const ANSWERED_ID: i64 = 1001;
     const UNKNOWN_ID: i64 = 1002;
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
+    const FAST_SPEC: &str = "anthropic/claude-opus-4-8";
     const OFFLINE_SPEC: &str = "openai/gpt-5";
 
     fn test_registry(
@@ -1244,6 +1237,44 @@ mod tests {
             elicitation: false,
         };
         (server, answer_rx, out_rx, input_rx)
+    }
+
+    #[test]
+    fn config_model_change_clears_ineligible_fast_mode() {
+        let (mut srv, ..) = server_awaiting_answer();
+        let (model_tx, model_rx) = flume::unbounded();
+        let session = srv.session.as_mut().unwrap();
+        session.handle.model_tx = model_tx;
+        session
+            .command_state
+            .set_model(&Model::from_spec(FAST_SPEC).expect("fast-capable test model should parse"));
+        let fast_result = smol::block_on(
+            session
+                .command_registry
+                .dispatch_input(&session.command_target, "/fast".into()),
+        );
+        assert!(matches!(
+            fast_result,
+            maki_commands::InputDispatch::Dispatched(maki_commands::CommandOutcome::Completed)
+        ));
+        assert!(session.command_state.fast());
+
+        let result = handle_set_config(
+            &mut srv,
+            &serde_json::json!({
+                "params": {
+                    "sessionId": MakiId::generate().to_string(),
+                    "configId": methods::MODEL_CONFIG_ID,
+                    "value": OFFLINE_SPEC,
+                }
+            }),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(model_rx.recv().unwrap().spec(), OFFLINE_SPEC);
+        let state = &srv.session.as_ref().unwrap().command_state;
+        assert_eq!(state.current_model(), OFFLINE_SPEC);
+        assert!(!state.fast());
     }
 
     #[test]
