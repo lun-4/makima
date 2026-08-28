@@ -1546,6 +1546,22 @@ mod tests {
     }
 
     #[test]
+    fn portable_bare_model_returns_shared_usage_error() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+
+        let error = smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/model", false),
+            &RequestId::Number(3),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(error.message, "command failed: Usage: /model <model>");
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
     fn portable_local_builtin_rejects_non_text_content() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
 

@@ -29,6 +29,7 @@ const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 const STANDARD_COMMANDS_ALREADY_REGISTERED: &str = "standard commands are already registered";
 const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text content";
+const NONINTERACTIVE_MODEL_USAGE: &str = "Usage: /model <model>";
 
 pub fn portable_capabilities() -> TargetCapabilities {
     TargetCapabilities::from_slice(&[
@@ -407,6 +408,11 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::Usage => BuiltinOperation::ToggleUsage,
                 maki_commands::BuiltinId::Queue => BuiltinOperation::FocusQueue,
                 maki_commands::BuiltinId::Model if arguments.is_empty() => {
+                    if !invocation.target_supports(TargetCapability::InteractiveUi) {
+                        return Err(CommandError::Producer(Arc::from(
+                            NONINTERACTIVE_MODEL_USAGE,
+                        )));
+                    }
                     BuiltinOperation::OpenModelPicker
                 }
                 maki_commands::BuiltinId::Model => {
@@ -932,6 +938,22 @@ mod tests {
                     attachments: Arc::from([]),
                 },
             ]
+        );
+
+        let portable_host = Arc::new(RecordingCommandHost::default());
+        let portable = registry.bind_target(portable_capabilities(), portable_host.clone());
+        assert!(matches!(
+            smol::block_on(registry.dispatch_input(&portable, "/model".into())),
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
+                CommandError::Producer(message)
+            )) if message.as_ref() == NONINTERACTIVE_MODEL_USAGE
+        ));
+        assert!(
+            portable_host
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
         );
     }
 

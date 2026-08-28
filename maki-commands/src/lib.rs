@@ -1008,14 +1008,18 @@ impl CommandRegistry {
                     actual: count,
                 });
             }
-            let invocation = command.invocation(
+            let invocation = CommandInvocation {
+                command_id: command.command_id(),
+                canonical_name: Arc::clone(&command.spec().name),
+                invoked_name: Arc::clone(&command.invoked_name),
                 arguments,
                 content,
                 depth,
                 target,
+                capabilities,
                 host,
-                InvocationDispatcher { registry },
-            );
+                dispatcher: InvocationDispatcher { registry },
+            };
             match command.behavior().execute(invocation).await {
                 Ok(outcome) => outcome,
                 Err(error) => CommandOutcome::Failed(error),
@@ -1375,28 +1379,6 @@ pub struct ResolvedCommand {
 }
 
 impl ResolvedCommand {
-    fn invocation(
-        &self,
-        arguments: Arc<str>,
-        content: CommandContent,
-        depth: usize,
-        target: TargetHandle,
-        host: Arc<dyn CommandHost>,
-        dispatcher: InvocationDispatcher,
-    ) -> CommandInvocation {
-        CommandInvocation {
-            command_id: self.command_id(),
-            canonical_name: Arc::clone(&self.spec().name),
-            invoked_name: Arc::clone(&self.invoked_name),
-            arguments,
-            content,
-            depth,
-            target,
-            host,
-            dispatcher,
-        }
-    }
-
     pub fn producer_id(&self) -> ProducerId {
         self.record.producer_id
     }
@@ -1506,6 +1488,7 @@ pub struct CommandInvocation {
     pub content: CommandContent,
     pub depth: usize,
     target: TargetHandle,
+    capabilities: TargetCapabilities,
     host: Arc<dyn CommandHost>,
     dispatcher: InvocationDispatcher,
 }
@@ -1525,6 +1508,10 @@ impl CommandInvocation {
 
     pub fn target_id(&self) -> InvocationTargetId {
         self.target.id()
+    }
+
+    pub fn target_supports(&self, capability: TargetCapability) -> bool {
+        self.capabilities.contains(capability)
     }
 }
 

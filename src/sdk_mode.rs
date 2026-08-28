@@ -34,6 +34,7 @@ use maki_commands::{
 };
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
+use maki_providers::provider::available_model_specs;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -486,18 +487,18 @@ enum CommandRoute {
 
 struct SdkCommandHost {
     tx: Sender<CommandRoute>,
+    model_specs: Arc<[Arc<str>]>,
 }
 
 impl CommandHost for SdkCommandHost {
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
         let tx = self.tx.clone();
+        let model_specs = Arc::clone(&self.model_specs);
         Box::pin(async move {
             match request {
-                HostRequest::Context(maki_commands::HostContextRequest::ModelSpecs) => {
-                    Ok(HostResponse::Context(
-                        maki_commands::HostContextResponse::Values(Arc::from([])),
-                    ))
-                }
+                HostRequest::Context(maki_commands::HostContextRequest::ModelSpecs) => Ok(
+                    HostResponse::Context(maki_commands::HostContextResponse::Values(model_specs)),
+                ),
                 HostRequest::Context(_) => Ok(HostResponse::Context(
                     maki_commands::HostContextResponse::Unavailable,
                 )),
@@ -546,7 +547,11 @@ struct SdkCommands {
 }
 
 impl SdkCommands {
-    fn new(registry: CommandRegistry, custom: &[CustomCommand]) -> Result<Self> {
+    fn new(
+        registry: CommandRegistry,
+        custom: &[CustomCommand],
+        model_specs: Arc<[Arc<str>]>,
+    ) -> Result<Self> {
         let (route_tx, route_rx) = flume::unbounded();
         let standard_commands =
             StandardCommands::register(&registry, custom, StandardCompletions::default())?;
@@ -554,6 +559,7 @@ impl SdkCommands {
             sdk_capabilities(),
             Arc::new(SdkCommandHost {
                 tx: route_tx.clone(),
+                model_specs,
             }),
         );
         Ok(Self {
@@ -632,7 +638,12 @@ pub fn run(params: SdkParams) -> Result<()> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let (session_id, initial_history) = resolve_session(&cli, &working_dir, &storage)?;
 
-    let sdk_commands = SdkCommands::new(command_registry, &commands)?;
+    let model_specs = available_model_specs(&model_policy)
+        .into_iter()
+        .map(Arc::from)
+        .collect::<Vec<_>>()
+        .into();
+    let sdk_commands = SdkCommands::new(command_registry, &commands, model_specs)?;
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
         let (handle, errors) = mcp::start_with_commands(&cwd, sdk_commands.registry.clone()).await;
         if let Some(handle) = &handle {
@@ -1569,6 +1580,15 @@ mod tests {
         }
     }
 
+    fn sdk_commands(registry: CommandRegistry) -> SdkCommands {
+        SdkCommands::new(
+            registry,
+            &[],
+            Arc::from([Arc::from("openai/gpt-5"), Arc::from("anthropic/claude")]),
+        )
+        .unwrap()
+    }
+
     fn registration(name: &str, outcome: CommandOutcome) -> maki_commands::Registration {
         maki_commands::Registration {
             spec: maki_commands::CommandSpec {
@@ -1667,7 +1687,7 @@ mod tests {
         prompt.spec.required_capabilities =
             TargetCapabilities::from_capability(TargetCapability::AgentTurns);
         mcp.replace(vec![prompt]).unwrap();
-        let commands = SdkCommands::new(registry, &[]).unwrap();
+        let commands = sdk_commands(registry);
 
         assert_eq!(
             commands.slash_commands(),
@@ -1688,6 +1708,35 @@ mod tests {
         assert_eq!(projection[0]["argumentHint"], "<arg>");
     }
 
+    #[test_case("/model gpt-5", "openai/gpt-5"; "shorthand")]
+    #[test_case("/model openai/gpt-5", "openai/gpt-5"; "qualified")]
+    fn sdk_model_command_routes_qualified_spec(input: &str, expected: &str) {
+        let commands = sdk_commands(CommandRegistry::new());
+        let registry = commands.registry.clone();
+        let target = commands.target.clone();
+        let content = CommandContent::from(input);
+        let dispatch = smol::spawn(async move { registry.dispatch_input(&target, content).await });
+
+        let CommandRoute::Model { argument, response } = commands.route_rx.recv().unwrap();
+        assert_eq!(argument, expected);
+        response.send(Ok(HostResponse::Completed)).unwrap();
+        assert!(matches!(
+            smol::block_on(dispatch),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+    }
+
+    #[test]
+    fn sdk_bare_model_returns_shared_usage_error() {
+        let commands = sdk_commands(CommandRegistry::new());
+        assert!(matches!(
+            commands.dispatch_input("/model", &[]),
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
+                if message.as_ref() == "Usage: /model <model>"
+        ));
+        assert!(commands.route_rx.is_empty());
+    }
+
     #[test]
     fn sdk_command_behavior_owns_attachment_policy() {
         let registry = CommandRegistry::new();
@@ -1697,7 +1746,7 @@ mod tests {
         let mut reject = registration("/reject", CommandOutcome::Completed);
         reject.behavior = Arc::new(RejectAttachment);
         plugin.replace(vec![inspect, reject]).unwrap();
-        let commands = SdkCommands::new(registry, &[]).unwrap();
+        let commands = sdk_commands(registry);
         let images = vec![ImageSource::new(
             maki_providers::ImageMediaType::Png,
             Arc::from("AAAA"),
@@ -1731,7 +1780,7 @@ mod tests {
         plugin
             .replace(vec![registration("/done", CommandOutcome::Completed)])
             .unwrap();
-        let commands = SdkCommands::new(registry.clone(), &[]).unwrap();
+        let commands = sdk_commands(registry.clone());
 
         assert!(matches!(
             smol::block_on(registry.dispatch_input(&commands.target, "/done now".into())),
@@ -1758,7 +1807,7 @@ mod tests {
 
     #[test]
     fn sdk_unsupported_builtin_is_literal_input() {
-        let commands = SdkCommands::new(CommandRegistry::new(), &[]).unwrap();
+        let commands = sdk_commands(CommandRegistry::new());
         assert!(matches!(
             smol::block_on(
                 commands
