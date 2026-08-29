@@ -2691,6 +2691,7 @@ dependencies = [
  "libc",
  "maki-acp",
  "maki-agent",
+ "maki-commands",
  "maki-config",
  "maki-lua",
  "maki-providers",
@@ -2705,6 +2706,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-rust",
  "uuid",
 ]
 
@@ -2716,6 +2719,7 @@ dependencies = [
  "color-eyre",
  "flume 0.11.1",
  "maki-agent",
+ "maki-commands",
  "maki-config",
  "maki-providers",
  "maki-storage",
@@ -2749,7 +2753,9 @@ dependencies = [
  "jiff",
  "jsonrepair",
  "libc",
+ "maki-commands",
  "maki-config",
+ "maki-match",
  "maki-providers",
  "maki-storage",
  "open",
@@ -2767,6 +2773,14 @@ dependencies = [
  "toml_edit 0.22.27",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "maki-commands"
+version = "0.4.11-makima"
+dependencies = [
+ "futures-lite",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2802,6 +2816,7 @@ name = "maki-docgen"
 version = "0.4.11-makima"
 dependencies = [
  "maki-agent",
+ "maki-commands",
  "maki-config",
  "maki-lua",
  "maki-providers",
@@ -2856,6 +2871,7 @@ dependencies = [
  "isahc",
  "jsonschema",
  "maki-agent",
+ "maki-commands",
  "maki-config",
  "maki-highlight",
  "maki-interpreter",
@@ -3010,11 +3026,11 @@ dependencies = [
  "jiff",
  "libc",
  "maki-agent",
+ "maki-commands",
  "maki-config",
  "maki-highlight",
  "maki-lua",
  "maki-markdown",
- "maki-match",
  "maki-providers",
  "maki-storage",
  "notify",

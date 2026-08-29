@@ -18,6 +18,7 @@ image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-commands = { workspace = true }
 maki-highlight = { workspace = true }
 maki-interpreter = { workspace = true }
 maki-match = { workspace = true }

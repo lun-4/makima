@@ -26,9 +26,12 @@ use crate::AppSession;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
-use crate::components::arg_completion::{LuaArgumentSource, ModelArgSource, ThemeArgSource};
+use crate::command_runtime::CommandRuntime;
+
 use crate::components::btw_modal::BtwModal;
-use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+#[cfg(test)]
+use crate::components::command::ParsedCommand;
+use crate::components::command::{CommandAction, CommandPalette, ConfirmedCommand};
 use crate::components::file_completion::{
     CompletionAction, CompletionItem, FileCompletionMenu, at_token_range,
 };
@@ -57,18 +60,21 @@ use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedBuf, SharedMessages, SubagentInfo,
+    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
+    SharedMessages, SubagentInfo,
+};
+use maki_commands::{
+    AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
+    HostContextRequest, HostContextResponse, HostRequest, HostResponse, TargetHandle,
 };
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
-    KeymapReader, LuaCommandReader, Split, WinCommand, WinEvent, WinView,
+    KeymapReader, Split, WinCommand, WinEvent, WinView,
 };
-use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
 use maki_providers::{ContentBlock, Message, Model, Role, ThinkingConfig, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
@@ -79,6 +85,36 @@ use crate::theme::ThemesProvider;
 use ratatui::layout::Position;
 
 pub(crate) use crate::agent::QueuedMessage;
+
+fn command_thinking(config: ThinkingConfig) -> maki_commands::ThinkingConfig {
+    use maki_providers::Effort;
+    match config {
+        ThinkingConfig::Off => maki_commands::ThinkingConfig::Off,
+        ThinkingConfig::Adaptive => maki_commands::ThinkingConfig::Adaptive,
+        ThinkingConfig::Effort(Effort::Minimal) => maki_commands::ThinkingConfig::Minimal,
+        ThinkingConfig::Effort(Effort::Low) => maki_commands::ThinkingConfig::Low,
+        ThinkingConfig::Effort(Effort::Medium) => maki_commands::ThinkingConfig::Medium,
+        ThinkingConfig::Effort(Effort::High) => maki_commands::ThinkingConfig::High,
+        ThinkingConfig::Effort(Effort::XHigh) => maki_commands::ThinkingConfig::XHigh,
+        ThinkingConfig::Effort(Effort::Max) => maki_commands::ThinkingConfig::Max,
+        ThinkingConfig::Budget(budget) => maki_commands::ThinkingConfig::Budget(budget),
+    }
+}
+
+fn provider_thinking(config: maki_commands::ThinkingConfig) -> ThinkingConfig {
+    use maki_providers::Effort;
+    match config {
+        maki_commands::ThinkingConfig::Off => ThinkingConfig::Off,
+        maki_commands::ThinkingConfig::Adaptive => ThinkingConfig::Adaptive,
+        maki_commands::ThinkingConfig::Minimal => ThinkingConfig::Effort(Effort::Minimal),
+        maki_commands::ThinkingConfig::Low => ThinkingConfig::Effort(Effort::Low),
+        maki_commands::ThinkingConfig::Medium => ThinkingConfig::Effort(Effort::Medium),
+        maki_commands::ThinkingConfig::High => ThinkingConfig::Effort(Effort::High),
+        maki_commands::ThinkingConfig::XHigh => ThinkingConfig::Effort(Effort::XHigh),
+        maki_commands::ThinkingConfig::Max => ThinkingConfig::Effort(Effort::Max),
+        maki_commands::ThinkingConfig::Budget(budget) => ThinkingConfig::Budget(budget),
+    }
+}
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
@@ -98,8 +134,8 @@ const AUTH_EXPIRED_MSG: &str =
 const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
-const SESSIONS_COMMAND: &str = "/sessions";
-const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
+const FAST_UNSUPPORTED_MSG: &str = maki_agent::command::FAST_UNSUPPORTED;
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
@@ -107,17 +143,7 @@ const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
-/// `/model <fragment>` resolution: no discovered spec fuzzy-matches.
-const INVALID_MODEL_MSG: &str = "Invalid model";
-const MODEL_NO_MATCH_MSG: &str = "No model matches";
-/// `/model <fragment>` resolution: two or more specs fuzzy-match.
-const MODEL_AMBIGUOUS_MSG: &str = "Ambiguous model";
-/// `/theme <name>` commit: the resolved theme was applied and persisted.
 const THEME_APPLIED_PREFIX: &str = "Theme";
-/// `/theme <name>`: the name is not in the catalog (mirrors `load`'s error).
-const THEME_UNKNOWN_MSG: &str = "unknown theme";
-/// `/theme <fragment>` resolution: two or more names fuzzy-match.
-const THEME_AMBIGUOUS_MSG: &str = "Ambiguous theme";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
@@ -128,11 +154,6 @@ const SUBAGENT_REPLY_SUFFIX: &str = "] ";
 /// Length cap for the `/tasks` row message snippet (AC.10).
 const SNIPPET_CHARS: usize = 64;
 
-/// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
-/// in practice; the cap only exists so a command aliasing itself reports an
-/// error instead of ping-ponging with the Lua thread forever.
-pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
-pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
 const NOTIFICATION_PREVIEW_CHARS: usize = 120;
 
 /// A tool-call demand that needs the user's input is held this long after the
@@ -323,6 +344,8 @@ pub struct App {
     pub(super) chat_index: HashMap<String, usize>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
+    pub(crate) command_runtime: Arc<CommandRuntime>,
+    pub(crate) command_target: TargetHandle,
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
     pub(super) lua_picker: LuaPicker,
@@ -403,17 +426,16 @@ impl App {
         available_models: Arc<ArcSwapOption<Vec<String>>>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
-        lua_command_reader: LuaCommandReader,
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
-        custom_commands: Arc<[maki_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
         model_policy: Arc<ModelPolicy>,
         theme_provider: Arc<dyn ThemesProvider>,
+        command_runtime: Arc<CommandRuntime>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage, &model_policy);
@@ -423,6 +445,7 @@ impl App {
             InputHistory::load(&storage, input_history_size),
             ui_config.max_input_lines,
         );
+        let command_target = command_runtime.bind_target();
         let mut app = Self {
             chats: vec![Chat::new(
                 "Main".into(),
@@ -433,14 +456,9 @@ impl App {
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box,
-            command_palette: CommandPalette::new(
-                custom_commands,
-                mcp_reader.clone(),
-                lua_command_reader,
-                ModelArgSource::new(Arc::clone(&available_models)),
-                ThemeArgSource::new(Arc::clone(&theme_provider)),
-                LuaArgumentSource::new(lua_event_handle.clone()),
-            ),
+            command_runtime: Arc::clone(&command_runtime),
+            command_target: command_target.clone(),
+            command_palette: CommandPalette::new(command_runtime.registry.clone(), command_target),
             task_picker: ListPicker::new(),
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
@@ -794,12 +812,41 @@ impl App {
         }
     }
 
+    fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
+        if self
+            .command_palette
+            .sync_arguments(input, cursor, &self.state.mode.id_key())
+        {
+            self.command_runtime
+                .finish_theme_preview(self.command_target.id(), false);
+        }
+    }
+
+    fn close_command_palette(&mut self) {
+        if self.command_palette.has_accepted_argument() {
+            self.command_runtime
+                .finish_theme_preview(self.command_target.id(), false);
+        }
+        self.command_palette.close();
+    }
+
+    fn rotate_command_target(&mut self) {
+        self.command_runtime
+            .finish_theme_preview(self.command_target.id(), false);
+        self.command_palette.close();
+        self.command_target = self.command_runtime.bind_target();
+        self.command_palette = CommandPalette::new(
+            self.command_runtime.registry.clone(),
+            self.command_target.clone(),
+        );
+    }
+
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !is_ctrl(&key) {
             return None;
         }
         if key::QUIT.matches(key) {
-            self.command_palette.close();
+            self.close_command_palette();
             self.sync_file_completion();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
@@ -816,10 +863,6 @@ impl App {
         }
         if key::TASKS.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Tasks));
-        }
-        if key::SESSIONS.matches(key) {
-            self.run_lua_command(SESSIONS_COMMAND, String::new(), 0);
-            return Some(vec![]);
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -942,10 +985,9 @@ impl App {
                         self.input_box.handle_paste_with_spaces(&path)
                     {
                         self.command_palette.sync(&val);
-                        self.command_palette.sync_arguments(
+                        self.sync_command_arguments(
                             &val,
                             self.input_box.buffer.cursor_byte_offset(),
-                            &self.state.mode.id_key(),
                         );
                         self.sync_file_completion();
                     }
@@ -1187,16 +1229,15 @@ impl App {
     }
 
     fn dispatch_override(&self, key: KeyEvent) -> bool {
-        let snap = self.keymap_reader.load();
-        for entry in &snap.entries {
-            if entry.key == key.code
-                && entry.modifiers == key.modifiers
+        self.dispatch_keymap(key.code, key.modifiers)
+    }
+
+    fn dispatch_keymap(&self, key: KeyCode, modifiers: KeyModifiers) -> bool {
+        self.keymap_reader.load().entries.iter().any(|entry| {
+            entry.key == key
+                && entry.modifiers == modifiers
                 && self.lua_event_handle.run_keybind_callback(entry.id)
-            {
-                return true;
-            }
-        }
-        false
+        })
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1219,11 +1260,7 @@ impl App {
                 self.start_image_paste();
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
                 self.command_palette.sync(&val);
-                self.command_palette.sync_arguments(
-                    &val,
-                    self.input_box.buffer.cursor_byte_offset(),
-                    &self.state.mode.id_key(),
-                );
+                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
                 self.sync_file_completion();
             }
             return vec![];
@@ -1241,17 +1278,34 @@ impl App {
             }
             CommandAction::SelectionChanged => {
                 let input = self.input_box.buffer.value();
-                self.command_palette.sync_arguments(
-                    &input,
-                    self.input_box.buffer.cursor_byte_offset(),
-                    &self.state.mode.id_key(),
-                );
+                self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
                 return vec![];
             }
             CommandAction::Execute(cmd) => {
+                let attachments = self
+                    .input_box
+                    .take_pending_images()
+                    .into_iter()
+                    .map(|image| CommandAttachment {
+                        media_type: Arc::from(image.media_type.mime()),
+                        data: image.data,
+                    })
+                    .collect();
                 self.input_box.discard();
                 self.file_completion.close();
-                return self.execute_command(cmd, 0);
+                return self
+                    .dispatch_confirmed_command(
+                        cmd,
+                        CommandContent {
+                            text: Arc::from(""),
+                            attachments,
+                        },
+                        0,
+                    )
+                    .unwrap_or_else(|error| {
+                        self.flash(error);
+                        Vec::new()
+                    });
             }
             CommandAction::AcceptArgument { text, cursor } => {
                 self.command_palette.sync(&text);
@@ -1265,8 +1319,7 @@ impl App {
                 self.refresh_at_ref_labels(&text);
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
-                self.command_palette
-                    .sync_arguments(&text, cursor, &self.state.mode.id_key());
+                self.sync_command_arguments(&text, cursor);
                 return vec![];
             }
             CommandAction::Passthrough => {}
@@ -1295,11 +1348,7 @@ impl App {
             }
             InputAction::PaletteSync(val) => {
                 self.command_palette.sync(&val);
-                self.command_palette.sync_arguments(
-                    &val,
-                    self.input_box.buffer.cursor_byte_offset(),
-                    &self.state.mode.id_key(),
-                );
+                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
                 self.sync_file_completion();
                 vec![]
             }
@@ -1442,11 +1491,7 @@ impl App {
             .replace_range_on_current_line(start, end, &replacement);
         let val = self.input_box.buffer.value();
         self.command_palette.sync(&val);
-        self.command_palette.sync_arguments(
-            &val,
-            self.input_box.buffer.cursor_byte_offset(),
-            &self.state.mode.id_key(),
-        );
+        self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
     }
 
     /// Typing path for a focused subagent tab: characters go into the shared
@@ -1877,51 +1922,157 @@ impl App {
         idx
     }
 
-    /// Entry point for `maki.api.run_command`: splits a command line into the
-    /// name and args the input bar would hand over, leading slash optional.
-    /// `Err` means nothing ran at all, so the Lua caller can say why.
+    /// Resolves and enqueues `cmdline` against this session. The caller only
+    /// waits on resolution; the command's effects are applied by the event
+    /// loop on a later iteration, so state inspected immediately after this
+    /// call may predate them.
     pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
-        if depth > MAX_COMMAND_DEPTH {
-            return Err(COMMAND_DEPTH_MSG.to_string());
-        }
         let trimmed = cmdline.trim();
-        let (name, args) = trimmed
-            .split_once(char::is_whitespace)
-            .unwrap_or((trimmed, ""));
+        let input = format!("/{}", trimmed.trim_start_matches('/'));
         let resolved = self
-            .command_palette
-            .resolve(&format!("/{}", name.trim_start_matches('/')))
-            .ok_or_else(|| format!("unknown command '{name}'"))?;
-        Ok(self.execute_command(
-            ParsedCommand {
-                name: resolved,
-                args: args.trim().to_string(),
-            },
-            depth,
-        ))
+            .command_runtime
+            .registry
+            .resolve_input_for(&self.command_target, &input)
+            .map_err(|error| match error {
+                maki_commands::ResolutionError::UnknownCommand(name) => {
+                    format!("unknown command '{name}'")
+                }
+                maki_commands::ResolutionError::StaleTarget => error.to_string(),
+            })?;
+        self.command_runtime.dispatch_command(
+            &self.command_target,
+            resolved.command,
+            resolved.arguments,
+            CommandContent::default(),
+            depth.into(),
+        );
+        #[cfg(test)]
+        return Ok(self.execute_pending_commands());
+        #[cfg(not(test))]
+        Ok(Vec::new())
     }
 
-    /// {depth} is the `maki.api.run_command` hop count, forwarded to a Lua
-    /// handler so an alias cycle keeps counting. 0 when the user typed it.
-    fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
-        match cmd.name.as_str() {
-            "/tasks" => {
+    #[cfg(test)]
+    fn execute_command(&mut self, command: ParsedCommand, depth: u8) -> Vec<Action> {
+        self.run_cmdline(&format!("{} {}", command.name, command.args), depth)
+            .unwrap_or_default()
+    }
+
+    fn dispatch_confirmed_command(
+        &mut self,
+        command: ConfirmedCommand,
+        content: CommandContent,
+        depth: u8,
+    ) -> Result<Vec<Action>, String> {
+        self.command_runtime.dispatch_command(
+            &self.command_target,
+            command.command,
+            Arc::from(command.args),
+            content,
+            depth.into(),
+        );
+        #[cfg(test)]
+        return Ok(self.execute_pending_commands());
+        #[cfg(not(test))]
+        Ok(Vec::new())
+    }
+
+    #[cfg(test)]
+    fn execute_pending_commands(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        loop {
+            let Some(event) = self.command_runtime.recv_for_test() else {
+                break;
+            };
+            match event {
+                crate::command_runtime::CommandEvent::Host { request, reply, .. } => {
+                    match self.execute_host_request(request) {
+                        Ok((response, host_actions)) => {
+                            actions.extend(host_actions);
+                            let _ = reply.send(Ok(response));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
+                crate::command_runtime::CommandEvent::Outcome { outcome, .. } => match outcome {
+                    maki_commands::CommandOutcome::AgentTurn(turn) => {
+                        actions.extend(self.submit_command_turn(turn))
+                    }
+                    maki_commands::CommandOutcome::Failed(error) => self.flash(error.to_string()),
+                    maki_commands::CommandOutcome::Completed => break,
+                },
+            }
+        }
+        actions
+    }
+
+    pub(crate) fn execute_host_request(
+        &mut self,
+        request: HostRequest,
+    ) -> Result<(HostResponse, Vec<Action>), CommandError> {
+        let operation = match request {
+            HostRequest::Context(request) => {
+                let response = match request {
+                    HostContextRequest::ModelSpecs => HostContextResponse::Values(
+                        self.available_models
+                            .load_full()
+                            .map(|models| {
+                                models
+                                    .iter()
+                                    .map(|spec| Arc::from(spec.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .into()
+                            })
+                            .unwrap_or_else(|| Arc::from([])),
+                    ),
+                    HostContextRequest::ThemeNames => HostContextResponse::Values(
+                        self.theme_provider
+                            .names()
+                            .into_iter()
+                            .map(Arc::from)
+                            .collect::<Vec<_>>()
+                            .into(),
+                    ),
+                    HostContextRequest::WorkingDirectory => HostContextResponse::WorkingDirectory(
+                        PathBuf::from(&self.state.session.cwd),
+                    ),
+                    HostContextRequest::ThinkingConfig => {
+                        HostContextResponse::ThinkingConfig(command_thinking(self.state.thinking))
+                    }
+                    HostContextRequest::FastModeSupported => {
+                        HostContextResponse::FastModeSupported(self.state.model.supports_fast())
+                    }
+                };
+                return Ok((HostResponse::Context(response), vec![]));
+            }
+            HostRequest::Builtin(operation) => operation,
+        };
+        let actions = match operation {
+            BuiltinOperation::OpenTasks => {
                 self.open_tasks();
                 vec![]
             }
-            "/compact" => {
+            BuiltinOperation::Compact => {
                 if self.status == Status::Streaming {
-                    self.queue_compact();
-                    return vec![];
+                    if !self.queue_compact() {
+                        return Err(CommandError::Producer(Arc::from(
+                            "agent queue is unavailable",
+                        )));
+                    }
+                    vec![]
+                } else {
+                    self.status = Status::Streaming;
+                    vec![Action::Compact]
                 }
-                self.status = Status::Streaming;
-                vec![Action::Compact]
             }
-            "/help" => {
+            BuiltinOperation::ResetSession => self.reset_session(),
+            BuiltinOperation::ToggleHelp => {
                 self.help_modal.toggle();
                 vec![]
             }
-            "/usage" => {
+            BuiltinOperation::ToggleUsage => {
                 self.usage_modal.toggle();
                 if self.usage_modal.is_open() {
                     vec![Action::RefreshUsage]
@@ -1929,80 +2080,82 @@ impl App {
                     vec![]
                 }
             }
-            "/btw" => {
-                let question = cmd.args.trim().to_string();
-                if question.is_empty() {
-                    self.flash("Usage: /btw <question>".into());
-                    vec![]
-                } else {
-                    vec![Action::Btw(question)]
-                }
-            }
-            "/new" => self.reset_session(),
-            "/queue" => {
+            BuiltinOperation::FocusQueue => {
                 self.queue.set_focus();
                 vec![]
             }
-            "/model" => {
-                let arg = cmd.args.trim();
-                if arg.is_empty() {
-                    self.model_picker.open(&self.state.model.spec());
-                    vec![Action::RefreshModels]
-                } else {
-                    self.resolve_model_arg(arg)
-                }
+            BuiltinOperation::OpenModelPicker => {
+                self.model_picker.open(&self.state.model.spec());
+                vec![Action::RefreshModels]
             }
-            "/theme" => {
-                let arg = cmd.args.trim();
-                if arg.is_empty() {
-                    self.theme_picker.open();
-                    vec![]
-                } else {
-                    self.resolve_theme_arg(arg)
-                }
+            BuiltinOperation::SetModel { spec } => vec![Action::ChangeModel(spec.to_string())],
+            BuiltinOperation::OpenThemePicker => {
+                self.theme_picker.open();
+                self.command_runtime
+                    .finish_theme_preview(self.command_target.id(), false);
+                vec![]
             }
-            "/mcp" => {
+            BuiltinOperation::SetTheme { name } => {
+                let applied = match self.theme_provider.install(&name) {
+                    Ok(()) => {
+                        self.theme_provider.persist(&name);
+                        self.flash(format!("{THEME_APPLIED_PREFIX}: {name}"));
+                        true
+                    }
+                    Err(error) => {
+                        self.flash(error);
+                        false
+                    }
+                };
+                self.command_runtime
+                    .finish_theme_preview(self.command_target.id(), applied);
+                vec![]
+            }
+            BuiltinOperation::OpenMcpPicker => {
                 self.mcp_picker.open();
                 vec![]
             }
-            "/login" => {
+            BuiltinOperation::OpenLoginPicker => {
                 self.login_picker.open(self.storage.clone());
                 vec![]
             }
-            "/cd" => self.cmd_cd(&cmd.args),
-            "/yolo" => {
+            BuiltinOperation::ChangeDirectory { path } => self.change_directory(path),
+            BuiltinOperation::QuickQuestion {
+                question,
+                attachments,
+            } => {
+                let images = attachments
+                    .iter()
+                    .filter_map(|attachment| {
+                        maki_agent::ImageMediaType::from_mime(&attachment.media_type).map(
+                            |media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)),
+                        )
+                    })
+                    .collect();
+                vec![Action::Btw(question.to_string(), images)]
+            }
+            BuiltinOperation::ToggleYolo => {
                 let enabled = self.permissions.toggle_yolo();
-                let msg = if enabled {
-                    "YOLO mode enabled"
-                } else {
-                    "YOLO mode disabled"
-                };
-                self.flash(msg.into());
+                self.flash(
+                    if enabled {
+                        "YOLO mode enabled"
+                    } else {
+                        "YOLO mode disabled"
+                    }
+                    .into(),
+                );
                 vec![]
             }
-            "/thinking" => {
-                if self.command_palette.find_lua_command("/thinking").is_some() {
-                    self.run_lua_command("/thinking", cmd.args, depth);
-                    return vec![];
-                }
+            BuiltinOperation::SetThinking { config } => {
                 if !self.state.model.supports_thinking() {
                     self.flash("Thinking requires a model that supports it".into());
-                    return vec![];
-                }
-                match ThinkingConfig::parse(cmd.args.trim(), self.state.thinking) {
-                    Ok(thinking) => {
-                        self.state.thinking = thinking;
-                        self.flash(format!("Thinking: {thinking}"));
-                    }
-                    Err(msg) => self.flash(msg.into()),
+                } else {
+                    self.state.thinking = provider_thinking(config);
+                    self.flash(format!("Thinking: {}", self.state.thinking));
                 }
                 vec![]
             }
-            "/fast" => {
-                if !self.state.model.supports_fast() {
-                    self.flash(FAST_UNSUPPORTED_MSG.into());
-                    return vec![];
-                }
+            BuiltinOperation::ToggleFast => {
                 self.state.fast = !self.state.fast;
                 self.flash(
                     if self.state.fast {
@@ -2014,7 +2167,7 @@ impl App {
                 );
                 vec![]
             }
-            "/workflow" => {
+            BuiltinOperation::ToggleWorkflow => {
                 self.state.workflow = !self.state.workflow;
                 self.flash(
                     if self.state.workflow {
@@ -2026,220 +2179,82 @@ impl App {
                 );
                 vec![]
             }
-            "/exit" => self.quit(),
-            "/reload" => self.quit_with(ExitRequest::Reload),
-            name if name.starts_with("/project:") || name.starts_with("/user:") => {
-                self.execute_custom_command(name, &cmd.args)
-            }
-            name if self.command_palette.find_mcp_prompt(name).is_some() => {
-                self.execute_mcp_prompt(name, &cmd.args)
-            }
-            name if self.command_palette.find_lua_command(name).is_some() => {
-                self.run_lua_command(name, cmd.args, depth);
-                vec![]
-            }
-            _ => vec![],
-        }
-    }
-
-    fn run_lua_command(&self, name: &str, args: String, depth: u8) {
-        let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
-            return;
+            BuiltinOperation::Exit => self.quit(),
+            BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
         };
-        self.lua_event_handle.run_command(
-            Arc::clone(&lua_cmd.plugin),
-            Arc::clone(&lua_cmd.name),
-            args,
-            depth,
-        );
+        Ok((HostResponse::Completed, actions))
     }
 
-    /// Opens the `/sessions` picker for this directory (bare `makima -c`
-    /// before the agent starts). Fire-and-forget, same path as the Ctrl+P
-    /// binding.
-    pub(crate) fn open_session_picker(&self) {
-        self.run_lua_command(SESSIONS_COMMAND, String::new(), 0);
-    }
-
-    fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
-        let prompt = self.command_palette.find_mcp_prompt(name).unwrap().clone();
-
-        let arguments = Self::parse_prompt_args(&prompt, args);
-        let missing: Vec<_> = prompt
-            .arguments
+    pub(crate) fn submit_command_turn(&mut self, turn: AgentTurn) -> Vec<Action> {
+        let images = turn
+            .content
+            .attachments
             .iter()
-            .filter(|a| a.required && !arguments.contains_key(&a.name))
-            .map(|a| format!("<{}>", a.name))
-            .collect();
-        if !missing.is_empty() {
-            self.flash(format!("Usage: {} {}", name, missing.join(" ")));
-            return vec![];
-        }
-
-        let prompt_ref = maki_agent::McpPromptRef {
-            qualified_name: prompt.qualified_name.clone(),
-            arguments,
-        };
-        let display_text = if args.trim().is_empty() {
-            name.to_string()
-        } else {
-            format!("{name} {args}")
-        };
-        // Same single-expansion rule as submit_prompt: `@`-references in the
-        // prompt args are rewritten once here, before the agent sees them.
-        let display_text = match self.lua_event_handle.expand_references(&display_text) {
-            Ok(text) => text,
-            Err(e) => {
-                self.flash(e);
-                return vec![];
-            }
-        };
-        let mut input = self.build_agent_input(&QueuedMessage {
-            text: display_text.clone(),
-            images: Vec::new(),
-        });
-        input.prompt = Some(Box::new(prompt_ref));
-
-        if self.status == Status::Streaming {
-            self.flash("Agent is busy, try again later".into());
-            vec![]
-        } else {
-            self.start_run(input, display_text)
-        }
-    }
-
-    fn parse_prompt_args(prompt: &McpPromptInfo, args: &str) -> HashMap<String, String> {
-        let mut result = HashMap::new();
-        let mut remaining = args.trim();
-        if remaining.is_empty() || prompt.arguments.is_empty() {
-            return result;
-        }
-        let last_idx = prompt.arguments.len() - 1;
-        for (i, arg) in prompt.arguments.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-            if i == last_idx {
-                result.insert(arg.name.clone(), remaining.to_string());
-            } else if let Some((word, rest)) = remaining.split_once(char::is_whitespace) {
-                result.insert(arg.name.clone(), word.to_string());
-                remaining = rest.trim_start();
-            } else {
-                result.insert(arg.name.clone(), remaining.to_string());
-                break;
-            }
-        }
-        result
-    }
-
-    fn execute_custom_command(&mut self, name: &str, args: &str) -> Vec<Action> {
-        let Some(cmd) = self.command_palette.find_custom_command(name) else {
-            self.flash(format!("Unknown command: {name}"));
-            return vec![];
-        };
-        self.submit_or_queue(QueuedMessage {
-            text: cmd.render(args),
-            images: Vec::new(),
-        })
-    }
-
-    /// Resolve a `/model <arg>` argument without the picker. An explicit
-    /// `provider/id` spec bypasses the discovered list (matching `ChangeModel`
-    /// behaviour); otherwise the argument is fuzzy-resolved against the
-    /// discovered specs. Zero or ambiguous matches flash and emit nothing, so
-    /// the session model is left untouched and the picker stays closed.
-    fn resolve_model_arg(&mut self, arg: &str) -> Vec<Action> {
-        if arg.contains('/') {
-            if let Err(error) = Model::parse_spec(arg) {
-                self.flash(format!("{INVALID_MODEL_MSG}: {error}"));
-                return vec![];
-            }
-            return vec![Action::ChangeModel(arg.to_string())];
-        }
-        let models = self
-            .available_models
-            .load_full()
-            .map(|arc| (*arc).clone())
-            .unwrap_or_default();
-        let candidates: Vec<_> = models
-            .iter()
-            .map(|spec| {
-                let (provider, model_id) = spec.split_once('/').unwrap_or(("", spec));
-                MatchCandidate {
-                    value: spec,
-                    fields: vec![spec, provider, model_id],
-                }
+            .filter_map(|attachment| {
+                maki_agent::ImageMediaType::from_mime(&attachment.media_type)
+                    .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect();
-        match fuzzy_resolve_candidates(arg, &candidates) {
-            Resolution::Unique(index) => vec![Action::ChangeModel(models[index].clone())],
-            Resolution::NoMatch => {
-                self.flash(format!("{MODEL_NO_MATCH_MSG}: {arg}"));
-                vec![]
-            }
-            Resolution::Ambiguous => {
-                self.flash(format!("{MODEL_AMBIGUOUS_MSG}: {arg}"));
-                vec![]
-            }
-        }
-    }
-
-    /// Resolve a `/theme <arg>` argument without the picker. A unique match is
-    /// installed (palette store, highlighter refresh, generation bump) and
-    /// persisted under the app's `StateDir`, then flashed; unknown or ambiguous
-    /// arguments flash and change nothing.
-    fn resolve_theme_arg(&mut self, arg: &str) -> Vec<Action> {
-        let names = self.theme_provider.names();
-        match fuzzy_resolve(arg, &names) {
-            Resolution::Unique(index) => {
-                let name = names[index].clone();
-                match self.theme_provider.install(&name) {
-                    Ok(()) => {
-                        self.theme_provider.persist(&name);
-                        self.flash(format!("{THEME_APPLIED_PREFIX}: {name}"));
-                    }
-                    Err(error) => self.flash(error),
-                }
-                vec![]
-            }
-            Resolution::NoMatch => {
-                self.flash(format!("{THEME_UNKNOWN_MSG}: {arg}"));
-                vec![]
-            }
-            Resolution::Ambiguous => {
-                self.flash(format!("{THEME_AMBIGUOUS_MSG}: {arg}"));
-                vec![]
-            }
-        }
-    }
-
-    fn cmd_cd(&mut self, args: &str) -> Vec<Action> {
-        let path = if args.is_empty() {
-            maki_storage::paths::home().unwrap_or_default()
-        } else {
-            match args.strip_prefix('~') {
-                Some(rest) => {
-                    let home = maki_storage::paths::home().unwrap_or_default();
-                    if rest.is_empty() {
-                        home
-                    } else {
-                        home.join(rest.trim_start_matches('/'))
-                    }
-                }
-                None => PathBuf::from(args),
-            }
+        let message = QueuedMessage {
+            text: turn.content.text.to_string(),
+            images,
         };
-        match std::env::set_current_dir(&path) {
-            Ok(()) => {
-                if let Ok(canonical) = std::env::current_dir() {
-                    self.state
-                        .session_mut()
-                        .set_cwd(canonical.to_string_lossy().into_owned());
+        if let Some(prompt) = turn.prompt {
+            let display = match self.lua_event_handle.expand_references(&message.text) {
+                Ok(text) => text,
+                Err(error) => {
+                    self.flash(error);
+                    return vec![];
                 }
-                self.status_bar.refresh_cwd();
+            };
+            if self.status == Status::Streaming {
+                self.flash("Agent is busy, try again later".into());
+                return vec![];
+            }
+            let mut input = self.build_agent_input(&QueuedMessage {
+                text: display.clone(),
+                images: message.images,
+            });
+            input.prompt = Some(Box::new(maki_agent::McpPromptRef {
+                qualified_name: prompt.qualified_name.to_string(),
+                arguments: prompt
+                    .arguments
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+            }));
+            self.start_run(input, display)
+        } else {
+            match self.submit_prompt(message) {
+                SubmitOutcome::Started(actions) => actions,
+                SubmitOutcome::Queued => vec![],
+                SubmitOutcome::Rejected(error) => {
+                    self.flash(error);
+                    vec![]
+                }
+            }
+        }
+    }
+
+    pub(crate) fn open_startup_session_picker(&self) {
+        self.lua_event_handle
+            .fire_autocmd(SESSION_PICKER_REQUESTED_EVENT, serde_json::json!({}));
+    }
+
+    fn change_directory(&mut self, path: PathBuf) -> Vec<Action> {
+        match path.canonicalize().and_then(|path| {
+            path.is_dir()
+                .then_some(path)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
+        }) {
+            Ok(path) => {
+                self.state
+                    .session_mut()
+                    .set_cwd(path.to_string_lossy().into_owned());
+                self.status_bar.set_cwd(path.clone());
                 self.flash(format!("cd {}", path.display()))
             }
-            Err(e) => self.flash(format!("cd: {e}")),
+            Err(error) => self.flash(format!("cd: {error}")),
         }
         vec![]
     }
@@ -2514,7 +2529,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
-        self.command_palette.close();
+        self.close_command_palette();
         self.file_completion.close();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
@@ -2675,11 +2690,7 @@ impl App {
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
             self.command_palette.sync(&val);
-            self.command_palette.sync_arguments(
-                &val,
-                self.input_box.buffer.cursor_byte_offset(),
-                &self.state.mode.id_key(),
-            );
+            self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
             self.sync_file_completion();
         }
     }

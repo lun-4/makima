@@ -140,6 +140,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     live_ctx: None,
                     owner: None,
                     command_depth: 0,
+                    command_invocation: None,
                     timer_id: Some(timer_id),
                 }),
                 Err(e) => {

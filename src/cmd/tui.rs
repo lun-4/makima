@@ -145,8 +145,13 @@ fn build_stack(
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings = Vec::new();
 
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    let command_registry = maki_commands::CommandRegistry::new();
+    let mut plugin_host = PluginHost::with_command_registry(
+        Arc::clone(ToolRegistry::global_arc()),
+        command_registry,
+        !cli.no_jit,
+    )
+    .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
     let reloading = fallback_model.is_some();
@@ -298,6 +303,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             workflow: stack.config.always_workflow,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
+            commands: stack.commands,
+            command_registry: stack.plugin_host.command_registry(),
         })
         .context("run sdk mode")?;
         return Ok(());
@@ -321,6 +328,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
             cli.system_prompt,
             cli.append_system_prompt,
             stack.plugin_host.plugin_rules(),
+            &stack.commands,
+            stack.plugin_host.command_registry(),
+            stack.plugin_host.mode_registry(),
         )
         .context("run print mode")?;
         return Ok(());
@@ -386,8 +396,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 )),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
+                command_registry: stack.plugin_host.command_registry(),
                 session_picker,
-                lua_command_reader: stack.plugin_host.command_reader(),
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),

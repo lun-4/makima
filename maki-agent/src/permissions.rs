@@ -189,11 +189,11 @@ impl PluginRuleStore {
 pub struct PermissionManager {
     session_rules: Mutex<Vec<PermissionRule>>,
     config_rules: Vec<PermissionRule>,
-    builtin_rules: Vec<PermissionRule>,
+    builtin_rules: Mutex<Vec<PermissionRule>>,
     yolo: AtomicBool,
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
-    cwd: PathBuf,
+    cwd: Mutex<PathBuf>,
     plugin_rules: Arc<PluginRuleStore>,
 }
 
@@ -230,13 +230,13 @@ impl PermissionManager {
         }
 
         Self {
-            builtin_rules,
+            builtin_rules: Mutex::new(builtin_rules),
             session_rules: Mutex::new(Vec::new()),
             config_rules,
             yolo: AtomicBool::new(config.yolo),
             default: config.default,
             tool_defaults: config.tool_defaults,
-            cwd,
+            cwd: Mutex::new(cwd),
             plugin_rules,
         }
     }
@@ -248,11 +248,21 @@ impl PermissionManager {
         Self {
             session_rules: Mutex::new(Vec::new()),
             config_rules: self.config_rules.clone(),
-            builtin_rules: self.builtin_rules.clone(),
+            builtin_rules: Mutex::new(
+                self.builtin_rules
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone(),
+            ),
             yolo: AtomicBool::new(self.is_yolo()),
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
-            cwd: self.cwd.clone(),
+            cwd: Mutex::new(
+                self.cwd
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone(),
+            ),
             plugin_rules: Arc::clone(&self.plugin_rules),
         }
     }
@@ -273,6 +283,10 @@ impl PermissionManager {
     ) -> PermissionCheck {
         let session = self.session_rules();
         let plugin = self.plugin_rules.snapshot();
+        let builtin = self
+            .builtin_rules
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
 
         // Any matching deny wins. No specificity hierarchy — a Wildcard
         // deny blocks everything, a tool-specific deny blocks that tool.
@@ -287,7 +301,7 @@ impl PermissionManager {
             for r in session
                 .iter()
                 .chain(&self.config_rules)
-                .chain(&self.builtin_rules)
+                .chain(builtin.iter())
                 .chain(&plugin)
             {
                 if !matches_rule(&r.tool, tool) || !rule_matches_scope(r, scope) {
@@ -408,11 +422,20 @@ impl PermissionManager {
         self.yolo.load(Ordering::Relaxed)
     }
 
+    pub fn set_cwd(&self, cwd: PathBuf) {
+        *self.cwd.lock().unwrap_or_else(|error| error.into_inner()) = cwd.clone();
+        *self
+            .builtin_rules
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = builtin_rules(&cwd);
+    }
+
     /// Outside-cwd paths are not blocked here. They flow through the normal
     /// permission prompt (which uses the same canonicalization via
     /// [`scope_matches`]). Only unresolvable boundaries are hard-blocked.
     pub fn boundary_block_reason(&self, path: &Path) -> Option<String> {
-        match physical_boundary_check(&self.cwd, path) {
+        let cwd = self.cwd.lock().unwrap_or_else(|error| error.into_inner());
+        match physical_boundary_check(&cwd, path) {
             Some(_) => None,
             None => Some(format!(
                 "{BOUNDARY_UNVERIFIABLE_PREFIX} {} \
@@ -464,7 +487,12 @@ impl PermissionManager {
                 };
                 let target = match answer {
                     PermissionAnswer::AllowAlwaysLocal | PermissionAnswer::DenyAlwaysLocal => {
-                        PermissionTarget::Project(self.cwd.clone())
+                        PermissionTarget::Project(
+                            self.cwd
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .clone(),
+                        )
                     }
                     _ => PermissionTarget::Global,
                 };

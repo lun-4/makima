@@ -27,6 +27,7 @@ A small plugin looks like this:
 maki.api.register_command({
   name = "greet",
   description = "Say hello from Lua",
+  tui_only = false,
   handler = function()
     maki.ui.flash("hello from a plugin!")
   end,
@@ -349,6 +350,8 @@ browsing memory files or toggling settings.
   - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
     slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
+  - `tui_only` (`boolean`) Required. If true, the command is available only in the interactive TUI.
+  - `argument_hint` (`string`) Optional. Short hint describing the command arguments.
   - `nargs` (`integer|string`) Optional. How many arguments the command
     takes, spelled like nvim's nargs: 0 (default),
     1, "?" (zero or one), "*" (any number), or "+"
@@ -680,12 +683,12 @@ Listen for one or more events. Returns an id you can pass to
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-`"SessionFocusChanged"`, `"SplashShown"`, `"SplashHidden"`, and
-`"StoreChanged"`. Plugins can
+`"SessionFocusChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
+`"SplashHidden"`, and `"StoreChanged"`. Plugins can
 also fire their own events with `exec_autocmds`.
 
-Except `"StoreChanged"`, each host event carries `data.session_id`. For
-`"SessionReset"` that
+Except `"SessionPickerRequested"` and `"StoreChanged"`, each host event
+carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
 running or focused. Tool events also carry `data.tool_id` and `data.tool`.
 `"SessionFocusChanged"` also carries `data.previous_session_id` except on

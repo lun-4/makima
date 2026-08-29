@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_lock::Mutex;
 use flume::Receiver;
+use futures_lite::future;
 use maki_config::ModelPolicy;
 use maki_providers::Message;
 use maki_providers::Timeouts;
@@ -24,9 +25,8 @@ use crate::tools::{
     DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
 };
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
-    ToolOutputLines,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, Envelope, EventSender,
+    McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput, ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -76,18 +76,16 @@ pub struct HeadlessParams {
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
-    pub prompt: String,
-    pub images: Vec<ImageSource>,
+    pub input: AgentInput,
     pub prompt_slots: ResolvedSlots,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub fast: bool,
-    pub workflow: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub modes: Arc<crate::ModeRegistry>,
 }
 
 pub struct HeadlessHandle {
@@ -159,7 +157,8 @@ fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String>
 
 pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
-    let mode = AgentMode::Build;
+    let mode = params.input.mode.clone();
+    let workflow = params.input.workflow;
     let AgentSetup {
         vars,
         instructions,
@@ -168,14 +167,13 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.workflow,
+        workflow,
     );
 
-    let modes = crate::ModeRegistry::builtin();
     let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
         agent::build_system_prompt(
             &vars,
-            &modes,
+            &params.modes,
             &mode,
             &instructions.text,
             &params.prompt_slots,
@@ -196,8 +194,6 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::register(session_id);
-    let fast = params.fast;
-    let workflow = params.workflow;
     let task = smol::spawn({
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
@@ -233,7 +229,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
-                    modes: Arc::new(crate::ModeRegistry::builtin()),
+                    modes: Arc::clone(&params.modes),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
@@ -250,18 +246,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             .with_loaded_instructions(instructions.loaded)
             .with_mcp(mcp);
 
-            let result = agent
-                .run(AgentInput {
-                    message: params.prompt,
-                    mode,
-                    images: params.images,
-                    preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast,
-                    workflow,
-                    prompt: None,
-                })
-                .await;
+            let result = agent.run(params.input).await;
             drop(agent);
 
             if let Err(e) = result {
@@ -310,6 +295,87 @@ pub struct InteractiveParams {
     pub local_tools: LocalTools,
 }
 
+pub enum InteractiveControl {
+    Compact(flume::Sender<Result<(), String>>),
+    Reset(flume::Sender<Result<(), String>>),
+    ChangeDirectory {
+        path: PathBuf,
+        reply: flume::Sender<Result<(), String>>,
+    },
+}
+
+struct InteractiveControlContext<'a> {
+    history: &'a mut History,
+    store: &'a mut Option<SessionStore>,
+    model: &'a Model,
+    provider: &'a dyn Provider,
+    raw_tx: &'a flume::Sender<Envelope>,
+    run_id: u64,
+    config: &'a AgentConfig,
+    working_dir: &'a mut PathBuf,
+    permissions: &'a PermissionManager,
+}
+
+async fn apply_interactive_control(
+    control: InteractiveControl,
+    context: InteractiveControlContext<'_>,
+) {
+    let InteractiveControlContext {
+        history,
+        store,
+        model,
+        provider,
+        raw_tx,
+        run_id,
+        config,
+        working_dir,
+        permissions,
+    } = context;
+    let result = match &control {
+        InteractiveControl::Compact(_) => agent::compact(
+            provider,
+            model,
+            history,
+            &EventSender::new(raw_tx.clone(), run_id),
+            config,
+        )
+        .await
+        .map_err(|error| error.to_string()),
+        InteractiveControl::Reset(_) => {
+            history.replace(Vec::new());
+            if let Some(store) = store {
+                store.record_turn(&[], model.spec());
+            }
+            Ok(())
+        }
+        InteractiveControl::ChangeDirectory { path, .. } => path
+            .canonicalize()
+            .and_then(|path| {
+                if !path.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "path is not a directory",
+                    ));
+                }
+                *working_dir = path;
+                permissions.set_cwd(working_dir.clone());
+                if let Some(store) = store {
+                    store
+                        .session
+                        .set_cwd(working_dir.to_string_lossy().into_owned());
+                    store.save();
+                }
+                Ok(())
+            })
+            .map_err(|error| error.to_string()),
+    };
+    let reply = match control {
+        InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply) => reply,
+        InteractiveControl::ChangeDirectory { reply, .. } => reply,
+    };
+    let _ = reply.send(result);
+}
+
 pub struct InteractiveHandle {
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
@@ -317,34 +383,34 @@ pub struct InteractiveHandle {
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
+    pub control_tx: flume::Sender<InteractiveControl>,
     pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
-    let AgentSetup {
-        vars,
-        instructions,
-        mut tools,
-    } = setup(
+    let initial_tools = tool_definitions(
+        &template::env_vars(),
         &params.model,
         &params.config,
         &params.excluded_tools,
         params.workflow,
+        ToolRegistry::global(),
     );
 
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.initial_history));
-    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
+    let tool_names = advertised_tool_names(&initial_tools, mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
+    let (control_tx, control_rx) = flume::unbounded::<InteractiveControl>();
 
     let (session_id, session_ref) = match params.session_id.clone() {
         Some(w) => (w.id(), w),
@@ -357,7 +423,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
-        params.permissions_config,
+        params.permissions_config.clone(),
         params.initial_wd,
         Arc::clone(&params.plugin_rules),
     ));
@@ -388,9 +454,48 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
             let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
             let mut history = History::restored(params.initial_history);
+            let mut working_dir = PathBuf::from(working_dir);
+            let permissions = permissions;
             let mut run_id: u64 = 0;
 
-            while let Ok(input) = input_rx.recv_async().await {
+            enum Wake {
+                Input(AgentInput),
+                Control(InteractiveControl),
+            }
+
+            loop {
+                let wake = if let Ok(control) = control_rx.try_recv() {
+                    Some(Wake::Control(control))
+                } else {
+                    future::or(
+                        async { input_rx.recv_async().await.map(Wake::Input) },
+                        async { control_rx.recv_async().await.map(Wake::Control) },
+                    )
+                    .await
+                    .ok()
+                };
+                let input = match wake {
+                    Some(Wake::Input(input)) => input,
+                    Some(Wake::Control(control)) => {
+                        apply_interactive_control(
+                            control,
+                            InteractiveControlContext {
+                                history: &mut history,
+                                store: &mut store,
+                                model: &model,
+                                provider: &*provider,
+                                raw_tx: &raw_tx,
+                                run_id,
+                                config: &params.config,
+                                working_dir: &mut working_dir,
+                                permissions: &permissions,
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                    None => break,
+                };
                 let (trigger, cancel) = CancelToken::new();
                 let cancel_task = smol::spawn({
                     let cancel_rx = cancel_rx.clone();
@@ -420,14 +525,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     match provider::from_model_async(&mut new_model, params.timeouts).await {
                         Ok(p) => {
                             provider = Arc::from(p);
-                            tools = tool_definitions(
-                                &vars,
-                                &new_model,
-                                &params.config,
-                                &params.excluded_tools,
-                                params.workflow,
-                                ToolRegistry::global(),
-                            );
                             model = new_model;
                         }
                         Err(e) => {
@@ -441,12 +538,22 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 }
 
+                let turn_vars = template::env_vars_for(&working_dir);
+                let turn_instructions = agent::load_instructions(&working_dir.to_string_lossy());
+                let tools = tool_definitions(
+                    &turn_vars,
+                    &model,
+                    &params.config,
+                    &params.excluded_tools,
+                    input.workflow,
+                    ToolRegistry::global(),
+                );
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
                     agent::build_system_prompt(
-                        &vars,
+                        &turn_vars,
                         &modes,
                         &input.mode,
-                        &instructions.text,
+                        &turn_instructions.text,
                         &params.prompt_slots,
                         &model,
                     )
@@ -484,7 +591,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         tools: tools.clone(),
                     },
                 )
-                .with_loaded_instructions(instructions.loaded.clone())
+                .with_loaded_instructions(turn_instructions.loaded)
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
                 .with_local_tools(Arc::clone(&params.local_tools))
@@ -520,6 +627,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         answer_tx,
         cancel_tx,
         model_tx,
+        control_tx,
         session_id: session_ref,
         permissions,
         task,

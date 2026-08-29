@@ -258,6 +258,10 @@ impl InputBox {
         Some(Submission { text, images })
     }
 
+    pub(crate) fn take_pending_images(&mut self) -> Vec<ImageSource> {
+        mem::take(&mut self.pending_images)
+    }
+
     pub fn discard(&mut self) {
         self.pending_images.clear();
         self.history_index = None;

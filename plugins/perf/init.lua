@@ -36,6 +36,7 @@ end
 maki.api.register_command({
   name = "/splash-fps",
   description = "Toggle the splash fps overlay: live fps and per-frame render time.",
+  tui_only = true,
   handler = function()
     maki.store.register(REGISTRY, FPS_KEY, not is_enabled())
   end,

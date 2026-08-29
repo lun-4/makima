@@ -193,6 +193,7 @@ A small plugin looks like this:
 maki.api.register_command({
   name = "greet",
   description = "Say hello from Lua",
+  tui_only = false,
   handler = function()
     maki.ui.flash("hello from a plugin!")
   end,

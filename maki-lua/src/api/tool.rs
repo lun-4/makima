@@ -20,6 +20,7 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
     TextOutput, ToolOutput,
 };
+use maki_commands::{ArgumentArity, CommandContent, InputDispatch};
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
@@ -31,15 +32,13 @@ use serde_json::{Value, json};
 use crate::api::completion::add_completion_fns;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
-use crate::api::util::command::{
-    CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
-    ui_roundtrip,
-};
+use crate::api::util::command::{CommandEntry, CommandHandlerMap, UiAction, ui_roundtrip};
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
+    command_invocation,
 };
 
 const TOOL_NAME_MAX: usize = 64;
@@ -47,6 +46,8 @@ const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
+const TUI_ONLY_ERR: &str = "register_command: 'tui_only' must be a boolean";
+const ARGUMENT_HINT_ERR: &str = "register_command: 'argument_hint' must be a string";
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -752,6 +753,8 @@ fn register_permission_rule(
 ///   name        (string)   Required. The command name (e.g. "/hello"; a leading
 ///                            slash is added when missing).
 ///   description (string)   Optional. Short description shown in the command palette.
+///   tui_only    (boolean)   Required. If true, the command is available only in the interactive TUI.
+///   argument_hint (string)  Optional. Short hint describing the command arguments.
 ///   nargs       (integer|string) Optional. How many arguments the command
 ///                          takes, spelled like nvim's nargs: 0 (default),
 ///                          1, "?" (zero or one), "*" (any number), or "+"
@@ -845,15 +848,26 @@ async fn run_command(
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
     let depth = command_depth(&lua).saturating_add(1);
-    let reply = try_pair!(
-        ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
-            cmdline,
-            depth,
-            reply_tx,
-        })
-        .await
-    );
-    try_pair!(reply);
+    if let Some(invocation) = command_invocation(&lua) {
+        let result = invocation
+            .invocation
+            .dispatch(CommandContent::from(cmdline.as_str()))
+            .await;
+        try_pair!(match result {
+            InputDispatch::Dispatched(_) => Ok(()),
+            InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
+        });
+    } else {
+        let reply = try_pair!(
+            ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
+                cmdline,
+                depth,
+                reply_tx,
+            })
+            .await
+        );
+        try_pair!(reply);
+    }
     Ok((Some(true), None))
 }
 
@@ -1377,15 +1391,14 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     Ok(())
 }
 
-/// Matching only needs an upper bound, so "+" and "*" both become MAX;
-/// minimums ("+" vs "*") are left for handlers to enforce.
-fn parse_nargs(spec: &Table) -> LuaResult<usize> {
+fn parse_nargs(spec: &Table) -> LuaResult<ArgumentArity> {
     match spec.get::<LuaValue>("nargs")? {
-        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(0),
-        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(1),
+        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(ArgumentArity::NONE),
+        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(ArgumentArity::ONE),
         LuaValue::String(s) => match s.to_string_lossy().as_ref() {
-            "?" => Ok(1),
-            "*" | "+" => Ok(usize::MAX),
+            "?" => Ok(ArgumentArity::OPTIONAL),
+            "*" => Ok(ArgumentArity::ANY),
+            "+" => Ok(ArgumentArity::ONE_OR_MORE),
             _ => Err(mlua::Error::runtime(NARGS_ERR)),
         },
         _ => Err(mlua::Error::runtime(NARGS_ERR)),
@@ -1405,7 +1418,16 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         name.insert(0, '/');
     }
     let description: String = spec.get("description").unwrap_or_default();
-    let max_args = parse_nargs(spec)?;
+    let argument_hint = match spec.get::<LuaValue>("argument_hint")? {
+        LuaValue::Nil => None,
+        LuaValue::String(value) => Some(Arc::<str>::from(value.to_string_lossy().as_ref())),
+        _ => return Err(mlua::Error::runtime(ARGUMENT_HINT_ERR)),
+    };
+    let tui_only = match spec.get::<LuaValue>("tui_only")? {
+        LuaValue::Boolean(value) => value,
+        _ => return Err(mlua::Error::runtime(TUI_ONLY_ERR)),
+    };
+    let arguments = parse_nargs(spec)?;
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
@@ -1462,7 +1484,9 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
             CommandEntry {
                 handler: handler_key,
                 description,
-                max_args,
+                argument_hint,
+                arguments,
+                tui_only,
                 argument_completion: completion_key,
                 completion_on_highlight,
                 completion_on_accept,
@@ -1471,14 +1495,32 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         );
     }
 
-    let map = lua
-        .app_data_ref::<CommandHandlerMap>()
-        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-    let writer = lua
-        .app_data_ref::<LuaCommandWriter>()
-        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-    publish_command_snapshot(&map, &writer);
-
+    if let Err(error) = crate::runtime::publish_registered_commands(lua, &plugin) {
+        // The registry rejected the batch (invalid name, duplicate spelling);
+        // roll the entry back so later registrations from this plugin are not
+        // poisoned by it.
+        if let Some(mut map) = lua.app_data_mut::<CommandHandlerMap>() {
+            let commands = map.entry(Arc::clone(&plugin)).or_default();
+            if let Some(entry) = commands.remove(&name) {
+                let _ = lua.remove_registry_value(entry.handler);
+                for key in [
+                    entry.argument_completion,
+                    entry.completion_on_highlight,
+                    entry.completion_on_accept,
+                    entry.completion_on_cancel,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let _ = lua.remove_registry_value(key);
+                }
+            }
+            if commands.is_empty() {
+                map.remove(&plugin);
+            }
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
