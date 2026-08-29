@@ -43,14 +43,14 @@ Deny rules are checked across all layers before anything else, so a deny cannot 
 
 File-write tools are pre-allowed inside the project working directory (cwd at session start, canonicalized). Paths outside that tree still need a prompt or an explicit allow rule:
 
-| Tool | Scope | Notes |
-|------|-------|-------|
-| `write` | `<cwd>/**` | Outside cwd requires permission |
-| `edit` | `<cwd>/**` | Outside cwd requires permission |
-| `multiedit` | `<cwd>/**` | Outside cwd requires permission |
-| `edit_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
+| Tool           | Scope      | Notes                                 |
+| -------------- | ---------- | ------------------------------------- |
+| `write`        | `<cwd>/**` | Outside cwd requires permission       |
+| `edit`         | `<cwd>/**` | Outside cwd requires permission       |
+| `multiedit`    | `<cwd>/**` | Outside cwd requires permission       |
+| `edit_lines`   | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
-| `task` | `*` | Subagent spawning always allowed |
+| `task`         | `*`        | Subagent spawning always allowed      |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under makima's state dir), so the agent can edit memory notes directly without a prompt.
 
@@ -116,13 +116,13 @@ Project files **cannot** set `default = "allow"` (top-level, per-tool, or MCP). 
 
 ## Scope Patterns
 
-| Pattern | Matches |
-|---------|--------|
-| `*` or `**` | Any value (full wildcard) |
-| `prefix*` | Values starting with prefix |
-| `cmd *` | Bare `cmd` or `cmd` plus args (`pwd *` matches `pwd` and `pwd -L`, not `pwdx`) |
-| `dir/**` | `dir` itself or anything under it (path-aware on Windows and Unix) |
-| `exact` | Exact match only |
+| Pattern     | Matches                                                                        |
+| ----------- | ------------------------------------------------------------------------------ |
+| `*` or `**` | Any value (full wildcard)                                                      |
+| `prefix*`   | Values starting with prefix                                                    |
+| `cmd *`     | Bare `cmd` or `cmd` plus args (`pwd *` matches `pwd` and `pwd -L`, not `pwdx`) |
+| `dir/**`    | `dir` itself or anything under it (path-aware on Windows and Unix)             |
+| `exact`     | Exact match only                                                               |
 
 ## MCP Tool Permissions
 
@@ -146,15 +146,15 @@ Tool names must match `^[a-zA-Z0-9_-]{1,64}$` (no dots, max 64 chars). Server na
 
 When a gated tool needs permission, Makima asks you.
 
-| Key | Action |
-|-----|--------|
-| `y` | Allow once (immediate) |
-| `s` | Allow for this session (confirm with `Enter` or `y`; any other key cancels) |
-| `a` | Always allow for this project (confirm; saved to `.makima/permissions.toml`) |
-| `A` | Always allow globally (confirm; saved to `~/.config/makima/permissions.toml`) |
+| Key | Action                                                                                       |
+| --- | -------------------------------------------------------------------------------------------- |
+| `y` | Allow once (immediate)                                                                       |
+| `s` | Allow for this session (confirm with `Enter` or `y`; any other key cancels)                  |
+| `a` | Always allow for this project (confirm; saved to `.makima/permissions.toml`)                 |
+| `A` | Always allow globally (confirm; saved to `~/.config/makima/permissions.toml`)                |
 | `n` | Open deny guidance editor (type optional guidance, then `Enter` to deny once; `Esc` cancels) |
-| `d` | Deny always for this project (confirm) |
-| `D` | Deny always globally (confirm) |
+| `d` | Deny always for this project (confirm)                                                       |
+| `D` | Deny always globally (confirm)                                                               |
 
 Session and always-allow / always-deny choices need a second key (`Enter` or `y`) so a fat-finger does not rewrite your rules. Deny-once with `n` lets you type a short reason the agent will see.
 
@@ -171,7 +171,7 @@ For MCP tools, both allow and deny decisions generalize to `*` (the entire tool)
 
 ## Auto Mode (bash)
 
-Auto mode puts a separate-context classifier model in front of **every** bash command. A silent, throwaway session (empty history, its own model unless `auto_model` pins one) reviews the command against a safety policy and returns accept or deny with a one-line reason. Approved commands run as usual. A clean deny rejects the command with that reason. Auto mode never asks you for permission: the classifier owns the gate, and if it fails (spawn, timeout, or a malformed verdict) the command is denied fail-closed with the classifier error.
+Auto mode puts a separate-context classifier model in front of **every** bash command. A silent, throwaway session (empty history, its own model unless `auto_model` pins one) reviews the command against a safety policy and returns accept or deny with a one-line reason. Approved commands run as usual. A clean deny asks you for permission first (unless YOLO is on, see below): the normal allow / deny / remember prompt appears and you decide. Auto mode only skips the prompt when the classifier fails (spawn, timeout, or a malformed verdict): the command is denied fail-closed with the classifier error.
 
 The classifier sees only the command and working directory in a silent throwaway session. Its turn is never relayed into your main conversation, so nothing about the main run leaks into its decision and its reasoning does not clutter the thread. The default system prompt is the codex-guardian policy (bundled, `auto_classifier_prompt.lua`).
 
@@ -193,13 +193,17 @@ Or toggle it live with `/automode`, or start the session with `--automode`. The 
 The tri-state verdict is strict:
 
 - **approve** (`approved: true`) runs the command. The tool view shows an `auto-mode: allowed` line so you can see the classifier let it through.
-- **deny** (`approved: false`) rejects it with the reason. The command never executes.
+- **deny** (`approved: false`) asks you for permission first: the same allow / deny / remember prompt as any other gated tool. The command then runs exactly as it would with auto mode off: allow once, allow for the session, or always-allow all work, and your existing permission rules still apply. With YOLO on there is no prompt and the deny rejects the command with the classifier's reason instead.
 - **error** (classifier failure, timeout, or a non-boolean verdict) denies the command fail-closed with the classifier error. No user prompt is involved, and the command never auto-runs.
 
-Two things to watch:
+Things to watch:
 
-- A clean deny rejects the command. If the classifier is too strict, tune the prompt or disable auto mode.
+- A deny asks instead of rejecting, so a stricter classifier means more prompts, not more silent rejections. If the classifier is too strict, tune the prompt or disable auto mode.
+- Permission rules (allow once, allow for the session, always-allow, explicit denies) only enter through the deny prompt. approve and error verdicts are the classifier's call alone, so a session allow will not rescue a command when the classifier errors.
+- YOLO flips the deny behavior to the old one: reject outright with the classifier's reason, no prompt. This is YOLO's "no prompts, gates stay authoritative" reading, consistent with explicit deny rules still applying under YOLO.
 - `auto_model` is optional. Unset, the classifier runs on the same model as the current session; set it to pin a dedicated classifier model (a cheap one keeps the gate fast).
+
+The `/automode` toggle only flips `auto_mode`; it does not change the deny-to-prompt behavior.
 
 ## YOLO Mode
 
