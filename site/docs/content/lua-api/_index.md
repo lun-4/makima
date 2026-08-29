@@ -1107,6 +1107,44 @@ print(out)
 
 ---
 
+### `maki.agent.permission_prompt()` {#maki-agent-permission_prompt}
+
+```lua
+maki.agent.permission_prompt({ctx}, {opts})
+```
+
+Run the normal interactive permission prompt for a tool call, without
+dispatching the tool. This is how a plugin escalates a classifier deny to
+the same allow/deny/remember choices a user would see with automode off.
+Allow and deny rules apply exactly as they do for a plain tool call.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+- `{opts}` (`table`) Required fields:
+  - `tool` (`string`) tool key to prompt for, e.g. `"bash"`.
+  - `scopes` (`string[]`) permission scopes to prompt for.
+
+  Optional fields:
+
+  - `force_prompt` (`boolean?`) prompt even for scopes an allow rule claims.
+
+**Returns:** (`boolean?`, `string?`) `true` when the call is allowed, or
+  `(nil, err)` with the permission-denied message when denied.
+
+**Example:**
+
+```lua
+local ok, err = maki.agent.permission_prompt(ctx, {
+  tool = "bash",
+  scopes = { "echo hello" },
+  force_prompt = false,
+})
+if not ok then return { llm_output = err, is_error = true } end
+```
+
+---
+
 ### `maki.agent.session()` {#maki-agent-session}
 
 ```lua

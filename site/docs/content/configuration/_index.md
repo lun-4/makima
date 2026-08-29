@@ -182,6 +182,7 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `auto_mode` | boolean | `false` | - | Classify every bash command before executing it (accept/deny with reason). |
+| `auto_mode_ask_on_deny` | boolean | `false` | - | When the classifier denies a command, show the permission prompt instead of denying it outright. |
 | `auto_model` | string | - | - | Model spec for the bash auto-mode classifier. Unset: inherits the current session model. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |

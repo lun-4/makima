@@ -171,7 +171,7 @@ For MCP tools, both allow and deny decisions generalize to `*` (the entire tool)
 
 ## Auto Mode (bash)
 
-Auto mode puts a separate-context classifier model in front of **every** bash command. A silent, throwaway session (empty history, its own model unless `auto_model` pins one) reviews the command against a safety policy and returns accept or deny with a one-line reason. Approved commands run as usual. A clean deny rejects the command with that reason. Auto mode never asks you for permission: the classifier owns the gate, and if it fails (spawn, timeout, or a malformed verdict) the command is denied fail-closed with the classifier error.
+Auto mode puts a separate-context classifier model in front of **every** bash command. A silent, throwaway session (empty history, its own model unless `auto_model` pins one) reviews the command against a safety policy and returns accept or deny with a one-line reason. Approved commands run as usual. A clean deny rejects the command with that reason (or, with the opt-in `auto_mode_ask_on_deny` option, asks you for permission first — see below). By default auto mode never asks you for permission: the classifier owns the gate, and if it fails (spawn, timeout, or a malformed verdict) the command is denied fail-closed with the classifier error.
 
 The classifier sees only the command and working directory in a silent throwaway session. Its turn is never relayed into your main conversation, so nothing about the main run leaks into its decision and its reasoning does not clutter the thread. The default system prompt is the codex-guardian policy (bundled, `auto_classifier_prompt.lua`).
 
@@ -193,13 +193,30 @@ Or toggle it live with `/automode`, or start the session with `--automode`. The 
 The tri-state verdict is strict:
 
 - **approve** (`approved: true`) runs the command. The tool view shows an `auto-mode: allowed` line so you can see the classifier let it through.
-- **deny** (`approved: false`) rejects it with the reason. The command never executes.
+- **deny** (`approved: false`) rejects it with the reason. The command never executes, unless `auto_mode_ask_on_deny` is on, in which case it asks you for permission first (see below).
 - **error** (classifier failure, timeout, or a non-boolean verdict) denies the command fail-closed with the classifier error. No user prompt is involved, and the command never auto-runs.
 
-Two things to watch:
+Things to watch:
 
-- A clean deny rejects the command. If the classifier is too strict, tune the prompt or disable auto mode.
+- A clean deny normally rejects the command. If the classifier is too strict, tune the prompt or disable auto mode.
+- With `auto_mode_ask_on_deny = true` on `plugins.bash`, a clean deny escalates to the normal permission prompt instead (allow / deny / remember). The command then runs exactly as it would with auto mode off: allow once, allow for the session, or always-allow all work, and your existing permission rules still apply. A classifier error still fails closed without prompting in both modes.
 - `auto_model` is optional. Unset, the classifier runs on the same model as the current session; set it to pin a dedicated classifier model (a cheap one keeps the gate fast).
+
+Enabling the deny prompt is a config-only option:
+
+```lua
+-- ~/.config/makima/init.lua
+maki.setup({
+    plugins = {
+        bash = {
+            auto_mode = true,
+            auto_mode_ask_on_deny = true,
+        },
+    },
+})
+```
+
+The `/automode` toggle only flips `auto_mode`; `auto_mode_ask_on_deny` stays as configured.
 
 ## YOLO Mode
 
