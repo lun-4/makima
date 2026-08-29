@@ -109,24 +109,14 @@ end
 
 local function apply_filter()
   local prev_pos = sel_index() or 1
-  -- Rows keep their frozen order, so the score is ignored: match/no-match
-  -- plus the indices are what the board needs.
   local query = board.input:value()
-  board.items = {}
-  for _, s in ipairs(board.all) do
-    s._match = maki.match.completion(query, s.title)
-    if s._match then
-      board.items[#board.items + 1] = s
-    end
-  end
-  local idx = sel_index() or math.min(prev_pos, math.max(#board.items, 1))
-  board.sel_id = board.items[idx] and board.items[idx].id or nil
+  board.items = Helpers.filter_rows(board.all, query, maki.match.completion, function(left, right)
+    return maki.match.compare(left, right)
+  end)
+  board.sel_id = Helpers.reconcile_selection(board.sel_id, prev_pos, board.items)
 end
 
--- Selection restarts from the top on every query change, so clearing the
--- filter never leaves the list scrolled to wherever a match happened to sit.
 local function filter_changed()
-  board.sel_id = nil
   board.confirm = nil
   apply_filter()
 end

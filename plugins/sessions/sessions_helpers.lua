@@ -69,6 +69,43 @@ function M.can_open(s)
   return not s.open_elsewhere
 end
 
+function M.filter_rows(rows, query, matcher, compare)
+  local matched = {}
+  for position, row in ipairs(rows) do
+    row._match = matcher(query, row.title)
+    if row._match then
+      matched[#matched + 1] = { row = row, match = row._match, position = position }
+    end
+  end
+  table.sort(matched, function(left, right)
+    local ordering = compare(left.match, right.match)
+    if ordering ~= 0 then
+      return ordering < 0
+    end
+    return left.position < right.position
+  end)
+  local result = {}
+  for _, entry in ipairs(matched) do
+    result[#result + 1] = entry.row
+  end
+  return result
+end
+
+function M.reconcile_selection(previous_id, previous_position, rows)
+  if previous_id then
+    for _, row in ipairs(rows) do
+      if row.id == previous_id then
+        return previous_id
+      end
+    end
+  end
+  if #rows == 0 then
+    return nil
+  end
+  local position = math.min(math.max(previous_position or 1, 1), #rows)
+  return rows[position].id
+end
+
 function M.age(updated_at)
   local secs = math.max(os.time() - (updated_at or 0), 0)
   for _, u in ipairs(AGE_UNITS) do
