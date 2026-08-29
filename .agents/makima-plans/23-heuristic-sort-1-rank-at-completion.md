@@ -73,10 +73,9 @@ Reuse existing session helpers and direct file-match injection. Do not add files
 
 ### Phase 4 — Validation, handoff, and review
 
-1. Copy this completed plan into the repository at `.agents/makima-plans/23-intelligent-autocomplete.md` before implementation handoff, preserving the full plan content.
-2. Run `cargo check -p maki-ui --tests` or equivalent `just check` target.
-2. `just lint`.
-3. Scoped `cargo nextest run -p maki-ui`, then `just test`/workspace tests.
+1. Run `cargo check -p maki-ui --tests` or equivalent `just check` target.
+2. Run `just lint`.
+3. Run scoped `cargo nextest run -p maki-ui`, then `just test`/workspace tests.
 4. Review the final diff against all acceptance criteria and verify every source feeding `FileCompletionMenu` receives the shared ranking policy.
 
 ## Acceptance Criteria
