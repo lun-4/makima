@@ -43,14 +43,14 @@ Deny rules are checked across all layers before anything else, so a deny cannot 
 
 File-write tools are pre-allowed inside the project working directory (cwd at session start, canonicalized). Paths outside that tree still need a prompt or an explicit allow rule:
 
-| Tool | Scope | Notes |
-|------|-------|-------|
-| `write` | `<cwd>/**` | Outside cwd requires permission |
-| `edit` | `<cwd>/**` | Outside cwd requires permission |
-| `multiedit` | `<cwd>/**` | Outside cwd requires permission |
-| `edit_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
+| Tool           | Scope      | Notes                                 |
+| -------------- | ---------- | ------------------------------------- |
+| `write`        | `<cwd>/**` | Outside cwd requires permission       |
+| `edit`         | `<cwd>/**` | Outside cwd requires permission       |
+| `multiedit`    | `<cwd>/**` | Outside cwd requires permission       |
+| `edit_lines`   | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
-| `task` | `*` | Subagent spawning always allowed |
+| `task`         | `*`        | Subagent spawning always allowed      |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under makima's state dir), so the agent can edit memory notes directly without a prompt.
 
@@ -116,13 +116,13 @@ Project files **cannot** set `default = "allow"` (top-level, per-tool, or MCP). 
 
 ## Scope Patterns
 
-| Pattern | Matches |
-|---------|--------|
-| `*` or `**` | Any value (full wildcard) |
-| `prefix*` | Values starting with prefix |
-| `cmd *` | Bare `cmd` or `cmd` plus args (`pwd *` matches `pwd` and `pwd -L`, not `pwdx`) |
-| `dir/**` | `dir` itself or anything under it (path-aware on Windows and Unix) |
-| `exact` | Exact match only |
+| Pattern     | Matches                                                                        |
+| ----------- | ------------------------------------------------------------------------------ |
+| `*` or `**` | Any value (full wildcard)                                                      |
+| `prefix*`   | Values starting with prefix                                                    |
+| `cmd *`     | Bare `cmd` or `cmd` plus args (`pwd *` matches `pwd` and `pwd -L`, not `pwdx`) |
+| `dir/**`    | `dir` itself or anything under it (path-aware on Windows and Unix)             |
+| `exact`     | Exact match only                                                               |
 
 ## MCP Tool Permissions
 
@@ -146,15 +146,15 @@ Tool names must match `^[a-zA-Z0-9_-]{1,64}$` (no dots, max 64 chars). Server na
 
 When a gated tool needs permission, Makima asks you.
 
-| Key | Action |
-|-----|--------|
-| `y` | Allow once (immediate) |
-| `s` | Allow for this session (confirm with `Enter` or `y`; any other key cancels) |
-| `a` | Always allow for this project (confirm; saved to `.makima/permissions.toml`) |
-| `A` | Always allow globally (confirm; saved to `~/.config/makima/permissions.toml`) |
+| Key | Action                                                                                       |
+| --- | -------------------------------------------------------------------------------------------- |
+| `y` | Allow once (immediate)                                                                       |
+| `s` | Allow for this session (confirm with `Enter` or `y`; any other key cancels)                  |
+| `a` | Always allow for this project (confirm; saved to `.makima/permissions.toml`)                 |
+| `A` | Always allow globally (confirm; saved to `~/.config/makima/permissions.toml`)                |
 | `n` | Open deny guidance editor (type optional guidance, then `Enter` to deny once; `Esc` cancels) |
-| `d` | Deny always for this project (confirm) |
-| `D` | Deny always globally (confirm) |
+| `d` | Deny always for this project (confirm)                                                       |
+| `D` | Deny always globally (confirm)                                                               |
 
 Session and always-allow / always-deny choices need a second key (`Enter` or `y`) so a fat-finger does not rewrite your rules. Deny-once with `n` lets you type a short reason the agent will see.
 
