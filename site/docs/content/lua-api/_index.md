@@ -2926,10 +2926,10 @@ end
 maki.match.fuzzy({query}, {text})
 ```
 
-Fuzzy match {query} against {text} with nucleo, the same matcher makima's
-built-in pickers use. Every whitespace-separated word in {query} must
-match somewhere in {text}; word order does not matter. An empty or
-whitespace-only query matches everything.
+Compatibility/raw-score fuzzy matching for {query} against {text} with
+nucleo, the same matcher makima's built-in pickers use. Every
+whitespace-separated word in {query} must match somewhere in {text}; word
+order does not matter. An empty or whitespace-only query matches everything.
 
 **Parameters:**
 
@@ -2946,6 +2946,56 @@ if m then
   print(m.score) -- matched codepoint offsets in m.indices
 end
 ```
+
+---
+
+### `maki.match.completion()` {#maki-match-completion}
+
+```lua
+maki.match.completion({query}, {label}, {opts?})
+```
+
+Match {query} against a completion {label}, returning one-based Lua
+indices and the textual ranking metadata used by built-in completion.
+
+The optional {opts} table accepts `case = "smart" | "ignore" | "respect"`
+and `normalization = "smart" | "never"`; omitted or nil fields use the
+defaults. Indices and `ranking.start_index` are one-based Unicode codepoint
+positions. The other ranking fields are non-negative integers. The result
+shape is `{ indices, ranking = { quality_rank, boundary_rank, start_index,
+gap_count, span_length, unmatched_suffix, fuzzy_score } }`.
+
+**Parameters:**
+
+- `{query}` (`string`) Search pattern.
+- `{label}` (`string`) Completion label.
+- `{opts?}` (`table?`) Optional matching options.
+
+**Returns:** (`table|nil`) A match with one-based codepoint `indices` and a
+`ranking` table, or nil when the label does not match.
+
+---
+
+### `maki.match.compare()` {#maki-match-compare}
+
+```lua
+maki.match.compare({left}, {right})
+```
+
+Compare the textual ranking of two results from {completion}.
+
+Returns -1 when {left} sorts first, 0 for equal textual ranking, and 1
+when {right} sorts first. Source priority, provider order, list grouping,
+and other caller-owned policy are intentionally not compared. Use the
+result as a boolean predicate for `table.sort`:
+`function(a, b) return maki.match.compare(a, b) < 0 end`.
+
+**Parameters:**
+
+- `{left}` (`table`) Match result returned by `maki.match.completion`.
+- `{right}` (`table`) Match result returned by `maki.match.completion`.
+
+**Returns:** (`integer`) -1, 0, or 1.
 
 
 ## maki.api.mode {#maki-api-mode}

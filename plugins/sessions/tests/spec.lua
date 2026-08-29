@@ -96,6 +96,103 @@ case("can_open_blocks_open_sessions", function()
   eq(sh.can_open(live_row({ id = "a1" })), true)
 end)
 
+local function match(rank, indices)
+  return { indices = indices or {}, ranking = rank }
+end
+
+local function rank(quality, start_index)
+  return {
+    quality_rank = quality,
+    boundary_rank = 0,
+    start_index = start_index or 1,
+    gap_count = 0,
+    span_length = 1,
+    unmatched_suffix = 0,
+    fuzzy_score = 0,
+  }
+end
+
+case("sessions_filter_ranks_matches", function()
+  local rows = {
+    stored_row({ id = "weak", title = "weak" }),
+    stored_row({ id = "exact", title = "exact" }),
+  }
+  local ranks = { weak = match(rank(3, 2), { 2 }), exact = match(rank(0), { 1 }) }
+  local filtered = sh.filter_rows(rows, "query", function(_, title)
+    return ranks[title]
+  end, function(left, right)
+    return left.ranking.quality_rank - right.ranking.quality_rank
+  end)
+  eq(filtered[1].id, "exact")
+  eq(filtered[2].id, "weak")
+  eq(filtered[1]._match.indices[1], 1)
+end)
+
+case("sessions_filter_preserves_original_order_for_ties", function()
+  local rows = {
+    stored_row({ id = "first", title = "first" }),
+    stored_row({ id = "second", title = "second" }),
+  }
+  local filtered = sh.filter_rows(rows, "query", function()
+    return match(rank(2, 1), { 1 })
+  end, function()
+    return 0
+  end)
+  eq(filtered[1].id, "first")
+  eq(filtered[2].id, "second")
+end)
+
+case("sessions_filter_orders_exact_prefix_and_fuzzy", function()
+  local rows = {
+    stored_row({ id = "fuzzy", title = "xapyp" }),
+    stored_row({ id = "prefix", title = "apple" }),
+    stored_row({ id = "exact", title = "app" }),
+  }
+  local filtered = sh.filter_rows(rows, "app", maki.match.completion, function(left, right)
+    return maki.match.compare(left, right)
+  end)
+  eq(filtered[1].id, "exact")
+  eq(filtered[2].id, "prefix")
+  eq(filtered[3].id, "fuzzy")
+end)
+
+case("sessions_filter_empty_query_keeps_all_and_highlights_one_based", function()
+  local rows = {
+    stored_row({ id = "first", title = "你好" }),
+    stored_row({ id = "second", title = "👍🏽abc" }),
+  }
+  local filtered = sh.filter_rows(rows, "a", function(_, title)
+    if title == "你好" then
+      return nil
+    end
+    return match(rank(3, 3), { 3 })
+  end, function()
+    return 0
+  end)
+  eq(#filtered, 1)
+  eq(filtered[1].id, "second")
+  eq(filtered[1]._match.indices[1], 3, "rendering consumes one-based codepoint indices")
+
+  local all = sh.filter_rows(rows, "", function()
+    return match(rank(4), {})
+  end, function()
+    return 0
+  end)
+  eq(#all, 2)
+end)
+
+case("sessions_filter_keeps_selected_id", function()
+  local rows = { stored_row({ id = "a1" }), stored_row({ id = "a2" }) }
+  eq(sh.reconcile_selection("a2", 1, rows), "a2")
+end)
+
+case("sessions_filter_clamps_missing_selection", function()
+  local rows = { stored_row({ id = "a1" }), stored_row({ id = "a2" }) }
+  eq(sh.reconcile_selection("gone", 9, rows), "a2")
+  eq(sh.reconcile_selection("gone", 0, rows), "a1")
+  eq(sh.reconcile_selection("gone", 1, {}), nil)
+end)
+
 case("age_buckets", function()
   eq(sh.age(NOW), "just now")
   eq(sh.age(NOW - 5 * MINUTE), "5m ago")

@@ -1,8 +1,10 @@
-use std::cmp::Reverse;
 use std::mem;
 
-use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher, Utf32Str};
+use maki_match::{
+    CompletionMatch, CompletionMatchOptions, CompletionRanking, compare_completion_matches,
+    completion_match,
+};
+use nucleo_matcher::pattern::{CaseMatching, Normalization};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
@@ -101,7 +103,6 @@ struct State<T> {
     viewport_height: usize,
     inner_area: Rect,
     enabled: Option<Vec<bool>>,
-    matcher: Matcher,
 }
 
 impl<T: PickerItem> State<T> {
@@ -118,7 +119,6 @@ impl<T: PickerItem> State<T> {
             viewport_height: 20,
             inner_area: Rect::default(),
             enabled: None,
-            matcher: Matcher::new(Config::DEFAULT),
         }
     }
 
@@ -130,108 +130,96 @@ impl<T: PickerItem> State<T> {
 
     fn rebuild_filter(&mut self) {
         let query = self.search.value();
-        let words: Vec<&str> = query.split_whitespace().collect();
-        if words.is_empty() {
+        let options = CompletionMatchOptions {
+            case_matching: CaseMatching::Smart,
+            normalization: Normalization::Smart,
+        };
+        if query.split_whitespace().next().is_none() {
             self.filtered = (0..self.items.len()).collect();
             self.match_indices = vec![None; self.filtered.len()];
             return;
         }
-        let patterns: Vec<Pattern> = words
-            .iter()
-            .map(|word| {
-                Pattern::new(
-                    word,
-                    CaseMatching::Smart,
-                    Normalization::Smart,
-                    AtomKind::Fuzzy,
-                )
-            })
-            .collect();
-
-        // Kept items with their nucleo score and label-only highlight
-        // indices (a word matched only the section keeps the item but no
-        // label highlight).
-        let mut kept: Vec<(usize, u32, Vec<u32>)> = Vec::new();
-        for (idx, item) in self.items.iter().enumerate() {
-            let label = item.label();
-            let section = item.section();
-            let mut label_chars = Vec::new();
-            // Codepoint haystack (not Utf32Str::new's grapheme segmentation)
-            // so highlight indices stay codepoint offsets, matching
-            // maki.match.fuzzy.
-            let label_hay = if label.is_ascii() {
-                Utf32Str::Ascii(label.as_bytes())
-            } else {
-                label_chars.extend(label.chars());
-                Utf32Str::Unicode(&label_chars)
-            };
-            let mut section_chars = Vec::new();
-            let section_hay = section.map(|sec| {
-                if sec.is_ascii() {
-                    Utf32Str::Ascii(sec.as_bytes())
-                } else {
-                    section_chars.extend(sec.chars());
-                    Utf32Str::Unicode(&section_chars)
-                }
-            });
-
-            let mut score = 0u32;
+        let mut kept = Vec::new();
+        for (source_order, item) in self.items.iter().enumerate() {
+            if let Some(completion) = completion_match(&query, item.label(), options) {
+                kept.push((source_order, completion));
+                continue;
+            }
             let mut indices = Vec::new();
+            let mut fuzzy_score: u32 = 0;
             let mut matched = true;
-            for pattern in &patterns {
-                let mut label_idx = Vec::new();
-                let label_score = pattern.indices(label_hay, &mut self.matcher, &mut label_idx);
-                let mut section_idx = Vec::new();
-                let section_score = section_hay
-                    .as_ref()
-                    .and_then(|hay| pattern.indices(*hay, &mut self.matcher, &mut section_idx));
-                let word_score = match (label_score, section_score) {
-                    (None, None) => {
-                        matched = false;
-                        break;
-                    }
-                    (Some(label), Some(section)) => label.min(section),
-                    (Some(label), None) => label,
-                    (None, Some(section)) => section,
+            let mut label_matched = false;
+            for term in query.split_whitespace() {
+                let label_match = completion_match(term, item.label(), options);
+                let section_match = item
+                    .section()
+                    .and_then(|section| completion_match(term, section, options));
+                let Some(completion) = label_match.as_ref().or(section_match.as_ref()) else {
+                    matched = false;
+                    break;
                 };
-                if label_score.is_some() {
-                    indices.extend(label_idx);
+                let term_score = match (label_match.as_ref(), section_match.as_ref()) {
+                    (Some(label), Some(section)) => {
+                        label.ranking.fuzzy_score.min(section.ranking.fuzzy_score)
+                    }
+                    _ => completion.ranking.fuzzy_score,
+                };
+                fuzzy_score = fuzzy_score.saturating_add(term_score);
+                if let Some(label_match) = label_match {
+                    label_matched = true;
+                    indices.extend(label_match.indices);
                 }
-                score = score.saturating_add(word_score);
             }
-            if matched {
-                indices.sort_unstable();
-                indices.dedup();
-                kept.push((idx, score, indices));
+            if !matched {
+                continue;
             }
+            indices.sort_unstable();
+            indices.dedup();
+            kept.push((
+                source_order,
+                CompletionMatch {
+                    indices: if label_matched { indices } else { Vec::new() },
+                    ranking: CompletionRanking {
+                        quality_rank: 4,
+                        boundary_rank: 1,
+                        start_index: usize::MAX,
+                        gap_count: usize::MAX,
+                        span_length: usize::MAX,
+                        unmatched_suffix: usize::MAX,
+                        fuzzy_score,
+                    },
+                },
+            ));
         }
-
-        // Run-based ordering, a port of the old Lua filter_items: one group
-        // per contiguous section (a None<->Some change starts a new group,
-        // so the login "Custom provider..." tail stays at the bottom),
-        // stable-sorted within a group by score descending (higher is
-        // better in nucleo; ties keep source order).
-        let mut runs: Vec<Vec<(usize, u32, Vec<u32>)>> = Vec::new();
-        let mut last: Option<Option<&str>> = None;
-        let kept_len = kept.len();
-        for (idx, score, indices) in kept {
+        let mut runs: Vec<Vec<(usize, CompletionMatch)>> = Vec::new();
+        let mut last = None;
+        for (idx, completion) in kept {
             let section = self.items[idx].section();
             if last == Some(section) {
-                if let Some(run) = runs.last_mut() {
-                    run.push((idx, score, indices));
-                }
+                runs.last_mut().unwrap().push((idx, completion));
             } else {
                 last = Some(section);
-                runs.push(vec![(idx, score, indices)]);
+                runs.push(vec![(idx, completion)]);
             }
         }
-        self.filtered = Vec::with_capacity(kept_len);
-        self.match_indices = Vec::with_capacity(kept_len);
+        self.filtered.clear();
+        self.match_indices.clear();
         for mut run in runs {
-            run.sort_by_key(|x| Reverse(x.1));
-            self.filtered.extend(run.iter().map(|&(idx, _, _)| idx));
+            run.sort_by(|(left_idx, left), (right_idx, right)| {
+                compare_completion_matches(
+                    left,
+                    right,
+                    0,
+                    0,
+                    *left_idx,
+                    *right_idx,
+                    self.items[*left_idx].label(),
+                    self.items[*right_idx].label(),
+                )
+            });
+            self.filtered.extend(run.iter().map(|(idx, _)| *idx));
             self.match_indices
-                .extend(run.into_iter().map(|(_, _, indices)| Some(indices)));
+                .extend(run.into_iter().map(|(_, m)| Some(m.indices)));
         }
     }
 
@@ -1198,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_search_with_nucleo_matcher() {
+    fn fuzzy_search_uses_shared_matcher() {
         let mut p = ListPicker::new();
         p.open(
             entries(&["claude-sonnet", "claude-opus", "gemini-pro", "gpt-4"]),

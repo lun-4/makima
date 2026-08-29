@@ -6,8 +6,9 @@ use maki_commands::{
     CommandRegistry, CompletionCandidate, CompletionItem, CompletionResult, CompletionSession,
     RegistrySnapshot, ResolvedCommand, TargetHandle,
 };
+use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Matcher, Nucleo, Utf32String};
+use nucleo::{Config, Nucleo, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -42,6 +43,7 @@ pub enum CommandAction {
 
 struct CommandItem {
     command: ResolvedCommand,
+    source_order: usize,
 }
 
 struct Match {
@@ -56,7 +58,6 @@ pub struct CommandPalette {
     target: TargetHandle,
     snapshot: RegistrySnapshot,
     nucleo: Nucleo<CommandItem>,
-    matcher: Matcher,
     current_arg_count: usize,
     argument_items: Vec<ArgumentMatch>,
     argument_range: Option<(usize, usize)>,
@@ -70,6 +71,8 @@ struct ArgumentMatch {
     candidate: Option<CompletionCandidate>,
     item: CompletionItem,
     indices: Vec<u32>,
+    ranking: maki_match::CompletionRanking,
+    order: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -99,7 +102,6 @@ impl CommandPalette {
             target,
             snapshot,
             nucleo,
-            matcher: Matcher::new(Config::DEFAULT),
             current_arg_count: 0,
             argument_items: Vec::new(),
             argument_range: None,
@@ -113,10 +115,11 @@ impl CommandPalette {
     fn build_nucleo(snapshot: &RegistrySnapshot) -> Nucleo<CommandItem> {
         let nucleo = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), None, 1);
         let injector = nucleo.injector();
-        for command in snapshot.commands() {
+        for (source_order, command) in snapshot.commands().iter().enumerate() {
             injector.push(
                 CommandItem {
                     command: command.clone(),
+                    source_order,
                 },
                 |item, cols| {
                     cols[0] = Utf32String::from(item.command.invoked_name());
@@ -247,6 +250,16 @@ impl CommandPalette {
         item: maki_lua::CommandArgumentItem,
     ) {
         self.argument_range = Some(range);
+        let ranking = completion_match(
+            "",
+            &item.label,
+            CompletionMatchOptions {
+                case_matching: CaseMatching::Ignore,
+                normalization: Normalization::Smart,
+            },
+        )
+        .unwrap()
+        .ranking;
         self.argument_items = vec![ArgumentMatch {
             candidate: None,
             item: CompletionItem {
@@ -255,6 +268,8 @@ impl CommandPalette {
                 description: item.description.map(Arc::from),
             },
             indices: Vec::new(),
+            ranking,
+            order: 0,
         }];
         self.selected = 0;
     }
@@ -336,31 +351,44 @@ impl CommandPalette {
         }
         self.argument_items.clear();
         self.selected = 0;
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let pattern = nucleo::pattern::Pattern::parse(
-            &pending.query,
-            CaseMatching::Ignore,
-            Normalization::Smart,
-        );
-        for candidate in items {
+        for (order, candidate) in items.into_iter().enumerate() {
             let item = candidate.item().clone();
-            let mut indices = Vec::new();
-            if pattern
-                .indices(
-                    Utf32String::from(item.label.as_ref()).slice(..),
-                    &mut matcher,
-                    &mut indices,
-                )
-                .is_none()
-            {
+            let Some(matched) = completion_match(
+                &pending.query,
+                &item.label,
+                CompletionMatchOptions {
+                    case_matching: CaseMatching::Ignore,
+                    normalization: Normalization::Smart,
+                },
+            ) else {
                 continue;
-            }
+            };
             self.argument_items.push(ArgumentMatch {
                 candidate: Some(candidate),
                 item,
-                indices,
+                indices: matched.indices,
+                ranking: matched.ranking,
+                order,
             });
         }
+        self.argument_items.sort_by(|a, b| {
+            maki_match::compare_completion_matches(
+                &maki_match::CompletionMatch {
+                    indices: a.indices.clone(),
+                    ranking: a.ranking,
+                },
+                &maki_match::CompletionMatch {
+                    indices: b.indices.clone(),
+                    ranking: b.ranking,
+                },
+                0,
+                0,
+                a.order,
+                b.order,
+                &a.item.label,
+                &b.item.label,
+            )
+        });
         self.argument_range = Some(pending.range);
         self.notify_lifecycle(PaletteLifecycle::Highlight);
         Dirty::YES
@@ -444,14 +472,14 @@ impl CommandPalette {
             false,
         );
 
-        self.tick();
+        self.tick(cmd_word);
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self, query: &str) {
         loop {
             let status = self.nucleo.tick(TICK_TIMEOUT_MS);
             if status.changed {
-                self.refresh_matches();
+                self.refresh_matches(query);
             }
             if !status.running {
                 break;
@@ -459,16 +487,16 @@ impl CommandPalette {
         }
     }
 
-    fn refresh_matches(&mut self) {
+    fn refresh_matches(&mut self, query: &str) {
+        let options = CompletionMatchOptions {
+            case_matching: CaseMatching::Ignore,
+            normalization: Normalization::Smart,
+        };
+        let mut matches = Vec::new();
         let snapshot = self.nucleo.snapshot();
-        let pattern = snapshot.pattern();
-        let has_pattern = !pattern.column_pattern(0).atoms.is_empty();
-
-        self.filtered.clear();
         let count = snapshot.matched_item_count();
         for item in snapshot.matched_items(0..count) {
             let cmd_item = &item.data;
-            let col = &item.matcher_columns[0];
 
             if !cmd_item
                 .command
@@ -478,24 +506,34 @@ impl CommandPalette {
             {
                 continue;
             }
-
-            let indices = if has_pattern {
-                let mut indices_buf = vec![];
-                pattern.column_pattern(0).indices(
-                    col.slice(..),
-                    &mut self.matcher,
-                    &mut indices_buf,
-                );
-                indices_buf
-            } else {
-                Vec::new()
+            let Some(completion) =
+                completion_match(query, cmd_item.command.invoked_name(), options)
+            else {
+                continue;
             };
-
-            self.filtered.push(Match {
-                command: cmd_item.command.clone(),
-                indices,
-            });
+            matches.push((cmd_item.source_order, cmd_item.command.clone(), completion));
         }
+        matches.sort_by(
+            |(left_order, left, left_match), (right_order, right, right_match)| {
+                maki_match::compare_completion_matches(
+                    left_match,
+                    right_match,
+                    0,
+                    0,
+                    *left_order,
+                    *right_order,
+                    left.invoked_name(),
+                    right.invoked_name(),
+                )
+            },
+        );
+        self.filtered = matches
+            .into_iter()
+            .map(|(_, command, completion)| Match {
+                command,
+                indices: completion.indices,
+            })
+            .collect();
 
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
         // Argument items survive here: sync_arguments follows every sync
@@ -861,5 +899,28 @@ mod tests {
 
         assert_eq!(confirmed.command.spec().docs.summary.as_ref(), "First");
         assert_eq!(confirmed.args, "arg");
+    }
+
+    #[test]
+    fn shared_ranking_orders_matches_over_registration_order() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![
+                registration("/remodel", "Remodel"),
+                registration("/model", "Model"),
+            ])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+
+        palette.sync("/mo");
+
+        let names: Vec<&str> = palette
+            .filtered
+            .iter()
+            .map(|item| item.command.invoked_name())
+            .collect();
+        assert_eq!(names, vec!["/model", "/remodel"]);
     }
 }

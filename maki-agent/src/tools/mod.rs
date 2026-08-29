@@ -347,7 +347,6 @@ pub fn walk_builder_opts(
     gitignore: bool,
 ) -> Result<WalkBuilder, String> {
     let mut ob = ignore::overrides::OverrideBuilder::new(root);
-    ob.add("!.git").expect("!.git is a valid glob");
 
     for p in patterns {
         ob.add(p)
@@ -359,7 +358,12 @@ pub fn walk_builder_opts(
         .map_err(|e| format!("invalid glob pattern: {e}"))?;
 
     let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).overrides(overrides);
+    wb.hidden(false)
+        .require_git(false)
+        .filter_entry(|entry| entry.file_name() != ".git");
+    if !patterns.is_empty() {
+        wb.overrides(overrides);
+    }
     if !gitignore {
         wb.ignore(false)
             .git_ignore(false)

@@ -139,6 +139,77 @@ case("match_fuzzy_non_string_args_error", function()
   )
 end)
 
+case("match_completion_default_matches_rust_contract", function()
+  local m = maki.match.completion("ap", "apple")
+  assert(m, "expected completion match")
+  eq(m.indices[1], 1)
+  eq(m.indices[2], 2)
+  eq(m.ranking.quality_rank, 1)
+  eq(m.ranking.boundary_rank, 0)
+  eq(m.ranking.start_index, 1)
+  eq(m.ranking.gap_count, 0)
+  eq(m.ranking.span_length, 2)
+  eq(m.ranking.unmatched_suffix, 3)
+  assert(m.ranking.fuzzy_score >= 0)
+end)
+
+case("match_completion_options_and_compare", function()
+  assert(maki.match.completion("APPLE", "apple", { case = "ignore" }))
+  assert(maki.match.completion("APPLE", "apple", { case = "smart" }) == nil)
+  assert(maki.match.completion("a", "A", { case = "respect" }) == nil)
+  assert(maki.match.completion("e", "bë", { normalization = "smart" }))
+  assert(maki.match.completion("e", "bë", { normalization = "never" }) == nil)
+
+  local exact = maki.match.completion("app", "app")
+  local prefix = maki.match.completion("app", "apple")
+  local substring = maki.match.completion("app", "xapp")
+  assert(maki.match.compare(exact, prefix) < 0)
+  assert(maki.match.compare(prefix, exact) > 0)
+  assert(maki.match.compare(exact, exact) == 0)
+  local results = { substring, exact, prefix }
+  table.sort(results, function(a, b)
+    return maki.match.compare(a, b) < 0
+  end)
+  assert(results[1] == exact and results[2] == prefix and results[3] == substring)
+end)
+
+case("match_completion_unicode_indices_match_rust_contract", function()
+  local cases = {
+    { query = "好世", label = "你好世界", expected = { 2, 3 } },
+    { query = "e", label = "éclair", expected = { 1 } },
+    { query = "b", label = "🇺🇸ab", expected = { 4 } },
+    { query = "a", label = "👍🏽abc", expected = { 3 } },
+  }
+  for _, c in ipairs(cases) do
+    local m = maki.match.completion(c.query, c.label)
+    assert(m, c.label .. " should match")
+    eq(#m.indices, #c.expected, c.label .. " index count")
+    for i, expected in ipairs(c.expected) do
+      eq(m.indices[i], expected, c.label .. " index " .. i)
+    end
+  end
+end)
+
+case("match_compare_rejects_malformed_operands", function()
+  local cases = {
+    { 1, {}, "match.compare: left" },
+    { {}, {}, "left.ranking" },
+    { { ranking = {} }, {}, "left.ranking.quality_rank" },
+    { { ranking = { quality_rank = 1 } }, {}, "left.ranking.boundary_rank" },
+    {
+      { ranking = { quality_rank = 1, boundary_rank = 0, start_index = 0 } },
+      {},
+      "left.ranking.start_index",
+    },
+    { { score = 1, indices = {} }, {}, "left.ranking" },
+  }
+  for _, c in ipairs(cases) do
+    local ok, err = pcall(maki.match.compare, c[1], c[2])
+    assert(not ok, "malformed operand should error")
+    assert(tostring(err):find(c[3], 1, true), tostring(err))
+  end
+end)
+
 -- ToolView tests
 
 case("tool_view_tail_keeps_last_n", function()

@@ -24,6 +24,8 @@ Prefixes are case-insensitive, so `@SKILL:pdf` and `@s:pdf` are the same. A bare
 
 File references are the odd one out. They are never expanded or stripped. Makima does not inject file contents at submit time. The agent gets the path as text and decides when to read it. This keeps big files out of context until they are actually needed.
 
+Filesystem completion and the file picker use Nucleo for coarse retrieval and the shared matcher for final admission, highlighting, and ranking. Each surface materializes at most 640 coarse results for final matching. Additional coarse results are not ranked and are not guaranteed to appear.
+
 ## Subagents
 
 `@subagent:` (short `@a:`) lists the subagent types the `task` plugin's [completion source](/docs/lua-api/#maki-api-register_completion_source) offers:
