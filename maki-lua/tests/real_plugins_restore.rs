@@ -382,29 +382,6 @@ bh.set_auto_mode(true)
     (host, reg)
 }
 
-/// Like [`bash_host_with_classifier`] but with the `auto_mode_ask_on_deny`
-/// option set, so a classifier deny escalates to the permission prompt. The
-/// unknown-option validation at load doubles as the registration check: a
-/// typo here fails `load_source_with_opts`.
-fn bash_host_with_classifier_ask_on_deny(stub_code: &str) -> (PluginHost, Arc<ToolRegistry>) {
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let classifier_setup = format!(
-        r#"local bh = require("bash_helpers")
-bh.set_auto_mode(true)
-{stub_code}
-"#
-    );
-    let mut opts = serde_json::Map::new();
-    opts.insert(
-        "auto_mode_ask_on_deny".to_owned(),
-        serde_json::Value::Bool(true),
-    );
-    host.load_source_with_opts("bash", &format!("{BASH_SRC}\n{classifier_setup}"), opts)
-        .unwrap();
-    (host, reg)
-}
-
 struct Verdict {
     is_error: bool,
     output: String,
@@ -451,6 +428,22 @@ fn prompt_permissions() -> Arc<PermissionManager> {
     Arc::new(PermissionManager::new(
         PermissionsConfig {
             default: DefaultEffect::Prompt,
+            rules: vec![],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        Arc::default(),
+    ))
+}
+
+/// YOLO `PermissionManager`: prompts are skipped, so a classifier deny must
+/// reject outright via `maki.agent.is_yolo` in the plugin (never reaching
+/// `enforce` at all).
+fn yolo_permissions() -> Arc<PermissionManager> {
+    Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            yolo: true,
             rules: vec![],
             ..PermissionsConfig::default()
         },
@@ -514,19 +507,24 @@ const CLASSIFY_ERROR_STUB: &str =
     r#"bh.classify_verdict = function(...) return "error", nil, "stub boom" end"#;
 
 #[test]
-fn auto_mode_deny_rejects_command_without_running_jobstart() {
+fn auto_mode_deny_yolo_rejects_without_running_jobstart() {
     let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
-    let result = exec_verdict(&host, &reg, json!({ "command": "echo denied-side-effect" }));
-    assert!(result.is_error, "a deny must fail the tool");
-    assert!(
-        result.output.contains("denied"),
-        "deny surfaces the classifier reason: {}",
-        result.output
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        json!({ "command": "echo denied-side-effect" }),
+        yolo_permissions(),
+        None,
     );
+    assert!(result.is_error, "a yolo deny must fail the tool");
     assert!(
         result.output.contains("stub deny reason"),
         "deny carries the classifier reason: {}",
         result.output
+    );
+    assert!(
+        permission_requests(&result.events).is_empty(),
+        "a yolo deny must not prompt"
     );
 }
 
@@ -602,9 +600,11 @@ fn exec_bash_real(
     host: &PluginHost,
     reg: &ToolRegistry,
     provider: Arc<common::CannedProvider>,
+    permissions: Arc<PermissionManager>,
     input: Value,
 ) -> Result<ToolOutput, String> {
     let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    ctx.permissions = permissions;
     ctx.tool_output_lines = view_lines();
     let inv = reg
         .get("bash")
@@ -624,9 +624,9 @@ fn bash_output(out: ToolOutput) -> String {
     }
 }
 
-/// Deny blocks the command (carrying the classifier reason); approve falls
-/// through to the real jobstart loop and the command runs. The approve path is
-/// the one the stub suite could not observe.
+/// Deny blocks the command (carrying the classifier reason) under YOLO;
+/// approve falls through to the real jobstart loop and the command runs. The
+/// approve path is the one the stub suite could not observe.
 #[test]
 fn automode_deny_blocks_and_approve_runs() {
     let (host, reg) = bash_host_with_real_classifier();
@@ -639,9 +639,10 @@ fn automode_deny_blocks_and_approve_runs() {
         &host,
         &reg,
         Arc::clone(&deny),
+        yolo_permissions(),
         json!({ "command": "echo denied-side-effect" }),
     )
-    .expect_err("a deny must fail the tool");
+    .expect_err("under yolo a deny must fail the tool");
     assert!(err.contains("denied"), "{err}");
     assert!(
         err.contains("stub deny reason"),
@@ -656,6 +657,7 @@ fn automode_deny_blocks_and_approve_runs() {
         &host,
         &reg,
         Arc::clone(&approve),
+        prompt_permissions(),
         json!({ "command": "echo approved-side-effect" }),
     )
     .expect("an approve must run the command");
@@ -675,6 +677,7 @@ fn automode_error_fails_closed_without_prompting() {
         &host,
         &reg,
         Arc::clone(&provider),
+        prompt_permissions(),
         json!({ "command": "echo never-runs" }),
     )
     .expect_err("a classifier error must deny");
@@ -694,6 +697,7 @@ fn automode_toggle_flows_through_ui() {
         &host_off,
         &reg_off,
         Arc::clone(&idle),
+        prompt_permissions(),
         json!({ "command": "echo auto-off-runs" }),
     )
     .expect("with auto mode off the plain path runs");
@@ -712,17 +716,17 @@ fn automode_toggle_flows_through_ui() {
         &host_on,
         &reg_on,
         Arc::clone(&deny),
+        yolo_permissions(),
         json!({ "command": "echo should-be-denied" }),
     )
-    .expect_err("with auto mode on the classifier gates the command");
+    .expect_err("with auto mode on under yolo the classifier gates the command");
     assert!(err.contains("denied with auto on"), "{err}");
 }
 
-// Phase 4 (ask-on-deny): with `auto_mode_ask_on_deny` the classifier deny
-// escalates to the same permission prompt the automode-off path uses
-// (`PermissionManager::enforce`). The stock stub ctx would silently allow
-// unclaimed scopes, so these tests install a Prompt-default manager and a
-// canned user answer on the response channel.
+// The default deny path: a classifier deny escalates to the same permission
+// prompt the automode-off path uses (`PermissionManager::enforce`). The stock
+// stub ctx would silently allow unclaimed scopes, so these tests install a
+// Prompt-default manager and a canned user answer on the response channel.
 
 /// PermissionRequest scopes plus the event's tool, in emission order.
 fn permission_requests(events: &[AgentEvent]) -> Vec<(String, Vec<String>)> {
@@ -738,8 +742,8 @@ fn permission_requests(events: &[AgentEvent]) -> Vec<(String, Vec<String>)> {
 }
 
 #[test]
-fn auto_mode_ask_on_deny_user_allow_runs() {
-    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+fn auto_mode_deny_user_allow_runs() {
+    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
@@ -764,8 +768,8 @@ fn auto_mode_ask_on_deny_user_allow_runs() {
 }
 
 #[test]
-fn auto_mode_ask_on_deny_user_deny_fails() {
-    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+fn auto_mode_deny_user_deny_fails() {
+    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
@@ -784,8 +788,8 @@ fn auto_mode_ask_on_deny_user_deny_fails() {
 }
 
 #[test]
-fn auto_mode_ask_on_deny_classifier_error_still_fails_closed() {
-    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_ERROR_STUB);
+fn auto_mode_classifier_error_still_fails_closed() {
+    let (host, reg) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
@@ -795,7 +799,7 @@ fn auto_mode_ask_on_deny_classifier_error_still_fails_closed() {
     );
     assert!(
         result.is_error,
-        "a classifier error must fail closed even with ask-on-deny on"
+        "a classifier error must fail closed even when a response channel exists"
     );
     assert!(
         result.output.contains("denied by auto-mode"),
@@ -809,8 +813,8 @@ fn auto_mode_ask_on_deny_classifier_error_still_fails_closed() {
 }
 
 #[test]
-fn auto_mode_ask_on_deny_no_response_channel_fails_closed() {
-    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+fn auto_mode_deny_no_response_channel_fails_closed() {
+    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
@@ -830,7 +834,7 @@ fn auto_mode_ask_on_deny_no_response_channel_fails_closed() {
 }
 
 #[test]
-fn auto_mode_ask_on_deny_allow_rule_skips_prompt() {
+fn auto_mode_deny_allow_rule_skips_prompt() {
     let perms = Arc::new(PermissionManager::new(
         PermissionsConfig {
             default: DefaultEffect::Prompt,
@@ -844,7 +848,7 @@ fn auto_mode_ask_on_deny_allow_rule_skips_prompt() {
         PathBuf::from("/tmp"),
         Arc::default(),
     ));
-    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
@@ -869,8 +873,8 @@ fn auto_mode_ask_on_deny_allow_rule_skips_prompt() {
 /// allowed, the `cd /tmp` segment still prompts; with both segments allowed
 /// the whole call short-circuits like the automode-off path.
 #[test]
-fn auto_mode_ask_on_deny_cd_hint_prompts_on_raw_input_scopes() {
-    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+fn auto_mode_deny_cd_hint_prompts_on_raw_input_scopes() {
+    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
 
     let echo_only = Arc::new(PermissionManager::new(
         PermissionsConfig {
