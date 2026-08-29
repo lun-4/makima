@@ -29,14 +29,21 @@ use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::opencode::{USAGE_PATH, parse_usage};
 use crate::providers::{ResolvedAuth, Timeouts, http_client};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
+};
 
 const MESSAGES_PATH: &str = "/messages";
 
 const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai", "zai-coding-plan", "github-copilot"];
 
 pub(crate) const OPENCODE_FAMILY_SLUGS: &[&str] = &["opencode", "opencode-go"];
+
+/// Go's dollar-value quota lanes are exposed on its own API base; plain Zen has
+/// no usage endpoint, so only this slug reports one.
+const OPENCODE_GO_SLUG: &str = "opencode-go";
 
 const CATALOG_URL: &str = "https://models.dev/api.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
@@ -786,6 +793,21 @@ impl Provider for CatalogProvider {
                 .collect())
         })
     }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        if self.data.slug != OPENCODE_GO_SLUG {
+            return Box::pin(async { Ok(None) });
+        }
+        Box::pin(async move {
+            let auth = match &self.auth {
+                CatalogAuth::Keyed(auth) | CatalogAuth::FreeOnly(auth) => auth,
+                CatalogAuth::Gated => return Ok(None),
+            };
+            let url = format!("{}{}", auth.base_url.as_deref().unwrap_or(""), USAGE_PATH);
+            let body = self.chat_compat.get_text(auth, &url).await?;
+            Ok(Some(parse_usage(&body)?))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -851,6 +873,10 @@ impl Provider for LazyCatalogProvider {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move { self.resolve().await?.list_models().await })
+    }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move { self.resolve().await?.fetch_usage().await })
     }
 }
 
@@ -1069,6 +1095,18 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, ["free-model", "paid-model"]);
         unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_GO_KEY_41827") };
+    }
+
+    #[test]
+    fn fetch_usage_unsupported_outside_opencode_go() {
+        let (_tmp, state_dir) = temp_state_dir();
+        unsafe { std::env::set_var("MAKI_TEST_CATALOG_USAGE_KEY_77103", "real-key") };
+        let mut data = opencode_go_provider_data("MAKI_TEST_CATALOG_USAGE_KEY_77103");
+        data.slug = "other-catalog-slug".into();
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert!(smol::block_on(provider.fetch_usage()).unwrap().is_none());
+        unsafe { std::env::remove_var("MAKI_TEST_CATALOG_USAGE_KEY_77103") };
     }
 
     fn temp_state_dir() -> (tempfile::TempDir, StateDir) {

@@ -789,6 +789,8 @@ pub enum UsageWindow {
     Hours(u64),
     /// A window bounded by whole days (daily or an N-day ticket).
     Days(u64),
+    /// A billing-month window, resetting on the subscription renewal date.
+    Monthly,
     /// The weekly/7-day window, optionally scoped to a model/tier.
     Weekly { model: Option<String> },
     /// A monetary credit / usage allowance.
@@ -806,6 +808,7 @@ impl UsageWindow {
             Self::Hours(n) => format!("{n}-hour usage"),
             Self::Days(1) => "Daily usage".into(),
             Self::Days(n) => format!("{n}-day usage"),
+            Self::Monthly => "Monthly usage".into(),
             Self::Weekly { model: None } => "Weekly usage".into(),
             Self::Weekly { model: Some(m) } => format!("Current week ({m})"),
             Self::Credits => "Usage credits".into(),
@@ -820,6 +823,7 @@ impl UsageWindow {
             Self::Hours(n) => format!("{n}h"),
             Self::Days(1) => "d".into(),
             Self::Days(n) => format!("{n}d"),
+            Self::Monthly => "m".into(),
             Self::Weekly { .. } => "w".into(),
             Self::Credits => "cr".into(),
             Self::Subscription => "sub".into(),
