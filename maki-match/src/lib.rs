@@ -124,6 +124,20 @@ pub fn completion_match(
     })
 }
 
+pub fn compare_completion_rankings(
+    left: &CompletionRanking,
+    right: &CompletionRanking,
+) -> Ordering {
+    left.quality_rank
+        .cmp(&right.quality_rank)
+        .then(left.boundary_rank.cmp(&right.boundary_rank))
+        .then(left.start_index.cmp(&right.start_index))
+        .then(left.gap_count.cmp(&right.gap_count))
+        .then(left.span_length.cmp(&right.span_length))
+        .then(left.unmatched_suffix.cmp(&right.unmatched_suffix))
+        .then(right.fuzzy_score.cmp(&left.fuzzy_score))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compare_completion_matches(
     left: &CompletionMatch,
@@ -135,16 +149,7 @@ pub fn compare_completion_matches(
     left_label: &str,
     right_label: &str,
 ) -> Ordering {
-    let a = left.ranking;
-    let b = right.ranking;
-    a.quality_rank
-        .cmp(&b.quality_rank)
-        .then(a.boundary_rank.cmp(&b.boundary_rank))
-        .then(a.start_index.cmp(&b.start_index))
-        .then(a.gap_count.cmp(&b.gap_count))
-        .then(a.span_length.cmp(&b.span_length))
-        .then(a.unmatched_suffix.cmp(&b.unmatched_suffix))
-        .then(b.fuzzy_score.cmp(&a.fuzzy_score))
+    compare_completion_rankings(&left.ranking, &right.ranking)
         .then(left_source_rank.cmp(&right_source_rank))
         .then(left_source_order.cmp(&right_source_order))
         .then(left_label.cmp(right_label))
@@ -301,10 +306,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionMatchOptions, Resolution, completion_match, completion_match_default,
-        fuzzy_match, fuzzy_resolve,
+        CompletionMatch, CompletionMatchOptions, CompletionRanking, Resolution,
+        compare_completion_matches, compare_completion_rankings, completion_match,
+        completion_match_default, fuzzy_match, fuzzy_resolve,
     };
     use nucleo_matcher::pattern::{CaseMatching, Normalization};
+    use std::cmp::Ordering;
     use test_case::test_case;
 
     #[test_case("", "hello world" ; "empty_query")]
@@ -439,5 +446,76 @@ mod tests {
             normalization: Normalization::Smart,
         };
         assert!(completion_match("APPLE", "apple", options).is_some());
+    }
+
+    fn ranking() -> CompletionRanking {
+        CompletionRanking {
+            quality_rank: 1,
+            boundary_rank: 0,
+            start_index: 2,
+            gap_count: 1,
+            span_length: 4,
+            unmatched_suffix: 3,
+            fuzzy_score: 10,
+        }
+    }
+
+    #[test]
+    fn completion_ranking_comparator_orders_each_field() {
+        fn assert_left_wins(change_right: impl FnOnce(&mut CompletionRanking)) {
+            let left = ranking();
+            let mut right = ranking();
+            change_right(&mut right);
+            assert!(compare_completion_rankings(&left, &right).is_lt());
+        }
+
+        assert_left_wins(|r| r.quality_rank = 2);
+        assert_left_wins(|r| r.boundary_rank = 1);
+        assert_left_wins(|r| r.start_index = 3);
+        assert_left_wins(|r| r.gap_count = 2);
+        assert_left_wins(|r| r.span_length = 5);
+        assert_left_wins(|r| r.unmatched_suffix = 4);
+        assert_left_wins(|r| r.fuzzy_score = 9);
+    }
+
+    #[test]
+    fn completion_ranking_comparator_equal_rank_ignores_caller_policy() {
+        let left = CompletionMatch {
+            indices: vec![0],
+            ranking: ranking(),
+        };
+        let right = CompletionMatch {
+            indices: vec![2],
+            ranking: ranking(),
+        };
+        assert_eq!(
+            compare_completion_rankings(&left.ranking, &right.ranking),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_completion_matches(&left, &right, 0, 1, 0, 1, "z", "a"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn completion_match_comparator_applies_source_policy_after_textual_rank() {
+        let left = CompletionMatch {
+            indices: vec![0],
+            ranking: ranking(),
+        };
+        let right = left.clone();
+        assert_eq!(
+            compare_completion_matches(&left, &right, 1, 0, 1, 0, "z", "a"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_completion_matches(&left, &right, 0, 0, 1, 0, "z", "a"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_completion_matches(&left, &right, 0, 0, 0, 0, "a", "z"),
+            Ordering::Less
+        );
     }
 }
