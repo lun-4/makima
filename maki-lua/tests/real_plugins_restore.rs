@@ -2,12 +2,17 @@
 //! A broken restore silently falls back to raw LLM output, so we assert
 //! things only the real views produce (gutters, command headers, truncation).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::AgentEvent;
 use maki_agent::ToolOutput;
+use maki_agent::permissions::PermissionManager;
+use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
 use maki_agent::tools::ToolRegistry;
-use maki_config::ToolOutputLines;
+use maki_config::{
+    DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey, ToolOutputLines,
+};
 use maki_lua::PluginHost;
 use maki_providers::StreamResponse;
 use serde_json::{Value, json};
@@ -377,9 +382,34 @@ bh.set_auto_mode(true)
     (host, reg)
 }
 
+/// Like [`bash_host_with_classifier`] but with the `auto_mode_ask_on_deny`
+/// option set, so a classifier deny escalates to the permission prompt. The
+/// unknown-option validation at load doubles as the registration check: a
+/// typo here fails `load_source_with_opts`.
+fn bash_host_with_classifier_ask_on_deny(stub_code: &str) -> (PluginHost, Arc<ToolRegistry>) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let classifier_setup = format!(
+        r#"local bh = require("bash_helpers")
+bh.set_auto_mode(true)
+{stub_code}
+"#
+    );
+    let mut opts = serde_json::Map::new();
+    opts.insert(
+        "auto_mode_ask_on_deny".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    host.load_source_with_opts("bash", &format!("{BASH_SRC}\n{classifier_setup}"), opts)
+        .unwrap();
+    (host, reg)
+}
+
 struct Verdict {
     is_error: bool,
     output: String,
+    /// Events emitted during the run (PermissionRequest, tool snapshots).
+    events: Vec<AgentEvent>,
 }
 
 /// Run the bash tool and return whether it produced an error plus the output
@@ -408,7 +438,74 @@ fn exec_verdict(host: &PluginHost, reg: &ToolRegistry, input: Value) -> Verdict 
         Err(e) => (true, e),
         other => panic!("unexpected output: {other:?}"),
     };
-    Verdict { is_error, output }
+    Verdict {
+        is_error,
+        output,
+        events: Vec::new(),
+    }
+}
+
+/// Prompt-default `PermissionManager` so unclaimed scopes produce a real
+/// `NeedsPrompt` (the stock stub ctx silently allows them).
+fn prompt_permissions() -> Arc<PermissionManager> {
+    Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            rules: vec![],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        Arc::default(),
+    ))
+}
+
+/// Like [`exec_verdict`], but with a live event channel (so tests can assert
+/// `AgentEvent::PermissionRequest` was emitted) and an optional canned user
+/// answer pre-loaded on the response channel for the deny→prompt path to
+/// consume. `answer = None` leaves `user_response_rx` unset, modeling a
+/// headless/ACP run without an answerer.
+fn exec_verdict_prompt(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    input: Value,
+    permissions: Arc<PermissionManager>,
+    answer: Option<&str>,
+) -> Verdict {
+    let (tx, rx) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+        &maki_agent::AgentMode::Build,
+        Some(&event_tx),
+        Some("classifier_tool_use_id"),
+    );
+    ctx.permissions = permissions;
+    if let Some(answer) = answer {
+        let (answer_tx, answer_rx) = flume::unbounded::<String>();
+        ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
+        answer_tx.send(answer.to_owned()).unwrap();
+    }
+    ctx.tool_output_lines = view_lines();
+    let inv = reg
+        .get("bash")
+        .expect("bash tool registered")
+        .tool
+        .parse(&input)
+        .expect("parse failed");
+    let result = smol::block_on(async { inv.execute(&ctx).await });
+    host.load_source("auto_barrier", "").unwrap();
+    let (is_error, output) = match result.output {
+        Ok(maki_agent::ToolOutput::Plain(s)) | Ok(maki_agent::ToolOutput::Markdown(s)) => {
+            (false, s.text)
+        }
+        Err(e) => (true, e),
+        other => panic!("unexpected output: {other:?}"),
+    };
+    let events = rx.drain().map(|env| env.event).collect();
+    Verdict {
+        is_error,
+        output,
+        events,
+    }
 }
 
 const CLASSIFY_DENY_STUB: &str =
@@ -619,4 +716,229 @@ fn automode_toggle_flows_through_ui() {
     )
     .expect_err("with auto mode on the classifier gates the command");
     assert!(err.contains("denied with auto on"), "{err}");
+}
+
+// Phase 4 (ask-on-deny): with `auto_mode_ask_on_deny` the classifier deny
+// escalates to the same permission prompt the automode-off path uses
+// (`PermissionManager::enforce`). The stock stub ctx would silently allow
+// unclaimed scopes, so these tests install a Prompt-default manager and a
+// canned user answer on the response channel.
+
+/// PermissionRequest scopes plus the event's tool, in emission order.
+fn permission_requests(events: &[AgentEvent]) -> Vec<(String, Vec<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PermissionRequest { tool, scopes, .. } => {
+                Some((tool.to_string(), scopes.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn auto_mode_ask_on_deny_user_allow_runs() {
+    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        json!({ "command": "echo ask-allow-side-effect" }),
+        prompt_permissions(),
+        Some("allow"),
+    );
+    assert!(
+        !result.is_error,
+        "the user's allow must fall through to the jobstart run: {}",
+        result.output
+    );
+    assert_eq!(result.output, "ask-allow-side-effect");
+    assert_eq!(
+        permission_requests(&result.events),
+        vec![(
+            "bash".to_owned(),
+            vec!["echo ask-allow-side-effect".to_owned()]
+        )],
+        "a PermissionRequest for the command's scopes must be emitted"
+    );
+}
+
+#[test]
+fn auto_mode_ask_on_deny_user_deny_fails() {
+    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        json!({ "command": "echo ask-deny-side-effect" }),
+        prompt_permissions(),
+        Some("deny"),
+    );
+    assert!(result.is_error, "a user deny must fail the tool");
+    assert_eq!(
+        result.output,
+        format!(
+            "{PERMISSION_DENIED_PREFIX} `bash` (echo ask-deny-side-effect). {DEFAULT_DENY_GUIDANCE}"
+        ),
+        "the deny must surface the standard permission message, byte-identical to automode-off"
+    );
+}
+
+#[test]
+fn auto_mode_ask_on_deny_classifier_error_still_fails_closed() {
+    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_ERROR_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        json!({ "command": "echo never-runs-ask" }),
+        prompt_permissions(),
+        Some("allow"),
+    );
+    assert!(
+        result.is_error,
+        "a classifier error must fail closed even with ask-on-deny on"
+    );
+    assert!(
+        result.output.contains("denied by auto-mode"),
+        "a classifier error must never prompt and never auto-run: {}",
+        result.output
+    );
+    assert!(
+        permission_requests(&result.events).is_empty(),
+        "a classifier error must not emit a PermissionRequest"
+    );
+}
+
+#[test]
+fn auto_mode_ask_on_deny_no_response_channel_fails_closed() {
+    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        json!({ "command": "echo no-answerer" }),
+        prompt_permissions(),
+        None,
+    );
+    assert!(
+        result.is_error,
+        "a deny with no answerer must fail closed instead of hanging"
+    );
+    assert!(
+        result.output.contains(PERMISSION_DENIED_PREFIX),
+        "no response channel surfaces the permission message: {}",
+        result.output
+    );
+}
+
+#[test]
+fn auto_mode_ask_on_deny_allow_rule_skips_prompt() {
+    let perms = Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            rules: vec![PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: Some("echo *".to_owned()),
+                effect: Effect::Allow,
+            }],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        Arc::default(),
+    ));
+    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        json!({ "command": "echo allow-rule-side-effect" }),
+        perms,
+        None,
+    );
+    assert!(
+        !result.is_error,
+        "an allow rule matching the command must short-circuit the prompt: {}",
+        result.output
+    );
+    assert_eq!(result.output, "allow-rule-side-effect");
+    assert!(
+        permission_requests(&result.events).is_empty(),
+        "an allow rule must run without prompting"
+    );
+}
+
+/// A `cd`-hint input prompts on the raw `input.command` scopes (the two
+/// segments), not the `parse_cd_hint`-rewritten command. With only `echo *`
+/// allowed, the `cd /tmp` segment still prompts; with both segments allowed
+/// the whole call short-circuits like the automode-off path.
+#[test]
+fn auto_mode_ask_on_deny_cd_hint_prompts_on_raw_input_scopes() {
+    let (host, reg) = bash_host_with_classifier_ask_on_deny(CLASSIFY_DENY_STUB);
+
+    let echo_only = Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            rules: vec![PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: Some("echo *".to_owned()),
+                effect: Effect::Allow,
+            }],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        Arc::default(),
+    ));
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        json!({ "command": "cd /tmp && echo foo" }),
+        Arc::clone(&echo_only),
+        Some("allow"),
+    );
+    assert!(
+        !result.is_error,
+        "the user's allow must run: {}",
+        result.output
+    );
+    assert_eq!(result.output, "foo");
+    assert_eq!(
+        permission_requests(&result.events),
+        vec![("bash".to_owned(), vec!["cd /tmp".to_owned()])],
+        "scopes must come from the raw input.command, not the rewritten command"
+    );
+
+    let both = Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            rules: vec![
+                PermissionRule {
+                    tool: ToolKey::native("bash"),
+                    scope: Some("cd *".to_owned()),
+                    effect: Effect::Allow,
+                },
+                PermissionRule {
+                    tool: ToolKey::native("bash"),
+                    scope: Some("echo *".to_owned()),
+                    effect: Effect::Allow,
+                },
+            ],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        Arc::default(),
+    ));
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        json!({ "command": "cd /tmp && echo foo" }),
+        both,
+        None,
+    );
+    assert!(
+        !result.is_error,
+        "allowing both raw segments must short-circuit: {}",
+        result.output
+    );
+    assert_eq!(result.output, "foo");
+    assert!(
+        permission_requests(&result.events).is_empty(),
+        "both segments allowed means no prompt"
+    );
 }
