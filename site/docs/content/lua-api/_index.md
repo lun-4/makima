@@ -1145,6 +1145,26 @@ if not ok then return { llm_output = err, is_error = true } end
 
 ---
 
+### `maki.agent.is_yolo()` {#maki-agent-is_yolo}
+
+```lua
+maki.agent.is_yolo({ctx})
+```
+
+Whether this session is in YOLO mode, where permission prompts are skipped
+and the bash automode classifier's deny is final (no escalation).
+
+YOLO toggles at runtime (`/yolo`, `--yolo`), so query it per call rather
+than caching it.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`boolean`) `true` when YOLO mode is active.
+
+---
+
 ### `maki.agent.session()` {#maki-agent-session}
 
 ```lua
