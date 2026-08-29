@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>makima - the tuned fork</title>
-  <meta name="description" content="A tuned fork of maki: an AI coding agent for the terminal. Less context, more control. Native Rust TUI, thinking that saves, async subagents you can talk to, plan mode. Anthropic, OpenAI, Google, Z.AI, OpenRouter, or any OpenAI / Anthropic compatible API.">
+  <title>makima</title>
+  <meta name="description" content="gay coding harness">
   <meta name="theme-color" content="#120c0c">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://makima.ln4.net/">
-  <meta property="og:title" content="makima - the tuned fork">
-  <meta property="og:description" content="A tuned fork of maki: an AI coding agent for the terminal. Less context, more control.">
+  <meta property="og:title" content="makima">
+  <meta property="og:description" content="gay harness">
   <meta property="og:image" content="https://makima.ln4.net/android-chrome-512x512.png">
   <meta property="og:site_name" content="makima">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="makima - the tuned fork">
-  <meta name="twitter:description" content="A tuned fork of maki: an AI coding agent for the terminal. Less context, more control.">
+  <meta name="twitter:title" content="makima">
+  <meta name="twitter:description" content="gay harness">
   <meta name="twitter:image" content="https://makima.ln4.net/android-chrome-512x512.png">
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
@@ -65,7 +65,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      background: var(--bg / 0.85);
+      background: color-mix(in srgb, var(--bg) 85%, transparent);
       backdrop-filter: blur(16px);
       -webkit-backdrop-filter: blur(16px);
       border-bottom: 1px solid var(--border);
@@ -171,7 +171,7 @@
     .hero-sub {
       font-size: 1rem;
       color: var(--ink-dim);
-      max-width: 46ch;
+      max-width: min(46ch, 100%);
       margin-bottom: 1.5rem;
     }
     .hero-actions {
@@ -255,6 +255,76 @@
     }
     .copy-toast.show { opacity: 1; transform: translateY(-50%) translateX(0); }
 
+    /* ── HERO CARDS ── */
+    .hero-cards {
+      position: relative;
+      width: clamp(9rem, 13vw, 13rem);
+      aspect-ratio: 5 / 7;
+      justify-self: center;
+    }
+    .card {
+      --r: var(--r0, 0deg);
+      position: absolute;
+      inset: 0;
+      color: var(--c, var(--rose));
+      transform: rotate(var(--r));
+      transform-origin: 50% 148%;
+      transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), translate 0.6s cubic-bezier(0.16, 1, 0.3, 1), transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .card-float {
+      position: absolute;
+      inset: 0;
+      background: var(--surface-2);
+      border: 1.5px solid color-mix(in srgb, var(--c, var(--rose)) 45%, transparent);
+      box-shadow: 0.5rem 0.5rem 0 color-mix(in srgb, var(--c, var(--rose)) 26%, #000);
+    }
+    .card-lead .card-float { border-color: var(--c, var(--accent)); }
+    .card-corner {
+      position: absolute;
+      top: 12px;
+      left: 14px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1rem;
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: -0.04em;
+      z-index: 1;
+    }
+    .card-corner svg { width: 9px; height: 9px; stroke: currentColor; stroke-width: 14; stroke-linejoin: miter; }
+    .card-corner.br {
+      top: auto;
+      left: auto;
+      bottom: 12px;
+      right: 14px;
+      transform: rotate(180deg);
+    }
+    .card-sigil {
+      position: absolute;
+      top: 53%;
+      left: 50%;
+      width: 70%;
+      aspect-ratio: 1;
+      translate: -50% -50%;
+    }
+    .card-sigil > svg { position: absolute; inset: 0; width: 100%; height: 100%; stroke: currentColor; stroke-width: 4; stroke-linejoin: miter; }
+    .hero-anim .hero-cards .card { opacity: 0; translate: 0 3.5rem; }
+    .hero-anim .hero-cards .card.dealt { opacity: 1; translate: 0 0; }
+    .hero-cards:hover .card-1 { --r: -29deg; translate: -0.6rem 0; }
+    .hero-cards:hover .card-3 { --r: 17deg; translate: 0.6rem 0; }
+    .card:hover {
+      transform: rotate(var(--r)) translateY(-1.2rem);
+      z-index: 9;
+    }
+    .card:hover .card-float {
+      border-color: var(--c, var(--rose));
+      box-shadow: 0.9rem 0.9rem 0 color-mix(in srgb, var(--c, var(--rose)) 40%, #000);
+    }
+    .hero-cards:hover .card:not(:hover) { opacity: 0.72; }
+
     /* ── MAIN ── */
     .content {
       max-width: 1060px;
@@ -267,6 +337,36 @@
       height: 1px;
       background: linear-gradient(90deg, transparent, var(--border-2), transparent);
       margin-bottom: clamp(3rem, 6vw, 5rem);
+    }
+
+    .warning {
+      background: #ffd23f;
+      border: 2px solid #000;
+      border-radius: 12px;
+      box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.55);
+      color: #000;
+      padding: 1.4rem 1.6rem;
+      margin-bottom: clamp(2rem, 5vw, 3.5rem);
+    }
+    .warning h2 {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 800;
+      font-size: clamp(1.2rem, 2.5vw, 1.5rem);
+      letter-spacing: -0.02em;
+      margin-bottom: 0.4rem;
+    }
+    .warning h2 .warn-sign {
+      width: 1.15em;
+      height: 1.15em;
+      flex-shrink: 0;
+    }
+    .warning p {
+      color: #000;
+      margin: 0;
+      font-size: 0.95rem;
     }
 
     .pitch {
@@ -680,6 +780,7 @@
         scroll-behavior: auto !important;
       }
       .hero-anim .hero-intro > * { opacity: 1; transform: none; }
+      .hero-anim .hero-cards .card { opacity: 1; translate: 0 0; }
       .reveal { opacity: 1; transform: none; }
       .pitch-item { opacity: 1; transform: none; }
       .provider-chip { opacity: 1; transform: none; }
@@ -689,13 +790,14 @@
     @media (max-width: 768px) {
       .nav-right a:not(.nav-cta):not([href="/docs/"]) { display: none; }
       .hero { padding-inline: 1rem; }
-      .hero-grid { grid-template-columns: 1fr; text-align: center; }
+      .hero-grid { grid-template-columns: minmax(0, 1fr); text-align: center; }
       .hero-intro { display: flex; flex-direction: column; align-items: center; }
       .hero-actions { justify-content: center; }
       .pitch { grid-template-columns: 1fr; }
       .adds-grid { grid-template-columns: 1fr; }
       .index-split { grid-template-columns: 1fr; }
       .index-divider { width: auto; height: 1px; }
+      .hero-cards { width: 8.5rem; margin-top: 1rem; margin-bottom: 2rem; }
       .exec-body { grid-template-columns: 1fr; }
       .exec-divider { width: auto; height: 1px; }
       .exec-duo { grid-template-columns: 1fr; }
@@ -724,8 +826,8 @@
   <div class="hero-grid">
     <div class="hero-intro">
       <h1>makima</h1>
-      <p class="hero-tagline">the tuned fork</p>
-      <p class="hero-sub">A fork of <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" style="color:var(--rose);">maki</a> for people with different opinions: less context, more control. Same minimal-Rust-TUI core, plus thinking that saves, plan mode, async subagents you can talk to, and automode.</p>
+      <p class="hero-tagline">the gay harness</p>
+      <p class="hero-sub">a fork of <a href="https://github.com/tontinton/maki" target="_blank" rel="noopener" style="color:var(--rose);">maki</a> with different a different Vision™: to have the most amount of Lua possible</p>
       <div class="hero-actions">
         <a href="https://github.com/lun-4/makima" target="_blank" rel="noopener" class="btn-primary">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
@@ -738,10 +840,53 @@
         <span class="copy-toast">copied!</span>
       </div>
     </div>
+    <div class="hero-cards" aria-hidden="true">
+      <svg width="0" height="0" style="position:absolute" focusable="false">
+        <symbol id="card-pentagram" viewBox="0 0 100 100">
+          <circle cx="50" cy="50" r="45" fill="currentColor" fill-opacity="0.07"/>
+          <path d="M50 86 L28.84 20.88 L84.24 61.12 L15.76 61.12 L71.16 20.88 Z" fill="none"/>
+        </symbol>
+        <symbol id="card-pip" viewBox="0 0 100 100">
+          <path d="M50 86 L28.84 20.88 L84.24 61.12 L15.76 61.12 L71.16 20.88 Z" fill="none"/>
+        </symbol>
+      </svg>
+      <div class="card card-1" style="--c: var(--rose); --r0: -22deg">
+        <div class="card-float">
+          <div class="card-corner tl"><span class="corner-syllable">ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span class="corner-syllable">ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-sigil">
+            <svg><use href="#card-pentagram"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="card card-2" style="--c: var(--accent); --r0: -8deg">
+        <div class="card-float">
+          <div class="card-corner tl"><span class="corner-syllable">ki</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span class="corner-syllable">ki</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-sigil">
+            <svg><use href="#card-pentagram"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="card card-3 card-lead" style="--c: var(--peach); --r0: 10deg">
+        <div class="card-float">
+          <div class="card-corner tl"><span class="corner-syllable">ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-corner br"><span class="corner-syllable">ma</span><svg><use href="#card-pip"/></svg></div>
+          <div class="card-sigil">
+            <svg><use href="#card-pentagram"/></svg>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </section>
 
 <div class="content" id="features">
+
+  <div class="warning">
+    <h2><svg class="warn-sign" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>Work In Progress!!!!</h2>
+    <p>everything in makima is currently WIP. do not expect this index page to be updated with what the state of the project actually is. everything is in flux.</p>
+  </div>
 
   <div class="pitch reveal">
     <div class="pitch-col">
@@ -1098,6 +1243,9 @@ imports = <span class="fn">set</span>()
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       document.querySelector('.hero-intro').classList.add('entered');
+      document.querySelectorAll('.hero-cards .card').forEach((card, i) => {
+        setTimeout(() => card.classList.add('dealt'), 420 + i * 150);
+      });
     });
   });
 
