@@ -491,20 +491,27 @@ pub(crate) fn col_range(ss: &ScreenSelection, left: u16, right: u16, row: u16) -
     (col_start, col_end)
 }
 
+/// A selection carries the geometry of the frame it was dragged in, and by the
+/// time we read it back that frame can be smaller, after a resize or a split
+/// opening. Clipping once here is what lets the loops below index cells
+/// without testing every one.
+#[inline]
+fn clip(buf: &Buffer, area: Rect) -> Rect {
+    area.intersection(*buf.area())
+}
+
 /// Last column is the scrollbar, so we skip it.
 pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection) {
-    if area.width == 0 || area.height == 0 {
+    let area = clip(buf, area);
+    if area.is_empty() {
         return;
     }
     let row_start = ss.start_row.max(area.y);
     let row_end = ss.end_row.min(area.bottom().saturating_sub(1));
-    let right = area.x + area.width.saturating_sub(1);
+    let right = area.right().saturating_sub(1);
     for row in row_start..=row_end {
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         for col in col_start..=col_end {
-            if col >= buf.area().right() || row >= buf.area().bottom() {
-                continue;
-            }
             let cell = &mut buf[(col, row)];
             cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
         }
@@ -542,22 +549,26 @@ pub(crate) fn append_rows(
     out: &mut String,
     breaks: &LineBreaks,
 ) {
-    if area.width == 0 || area.height == 0 {
+    let top = area.y;
+    let area = clip(buf, area);
+    if area.is_empty() {
         return;
     }
-    let right = area.x + area.width.saturating_sub(1);
+    let right = area.right().saturating_sub(1);
     let row_start = from.max(area.y);
     let row_end = to.min(area.bottom());
     let mut pending_newlines = 0u16;
     let anchor = out.len();
     for row in row_start..row_end {
-        let rel_row = row - area.y;
+        let rel_row = row - top;
         let is_new_line = breaks.is_line_start(rel_row);
 
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         let line_start = out.len();
         // Wide chars (CJK, emoji) leave continuation cells with " "; skip them.
-        let mut skip_next: usize = if col_start > area.x {
+        // An empty column range copies nothing from this row, so there is no
+        // cell to its left worth measuring.
+        let mut skip_next: usize = if col_start > area.x && col_start <= col_end {
             UnicodeWidthStr::width(buf[(col_start - 1, row)].symbol()).saturating_sub(1)
         } else {
             0
@@ -1220,6 +1231,8 @@ mod tests {
 
     #[test_case(Rect::new(0, 0, 0, 5), Rect::new(0, 0, 1, 5), ss(0, 0, 4, 0), 0, 5 ; "zero_width")]
     #[test_case(Rect::new(0, 0, 10, 0), Rect::new(0, 0, 10, 1), ss(0, 0, 0, 9), 0, 1 ; "zero_height")]
+    #[test_case(Rect::new(0, 0, 40, 5), Rect::new(0, 0, 8, 5), ss(0, 20, 4, 30), 0, 5 ; "area_wider_than_buffer")]
+    #[test_case(Rect::new(0, 0, 40, 9), Rect::new(0, 0, 8, 2), ss(0, 39, 8, 39), 0, 9 ; "area_taller_than_buffer")]
     fn append_rows_degenerate_area_no_panic(
         area: Rect,
         buf_area: Rect,
