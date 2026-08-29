@@ -268,6 +268,11 @@ local opts = maki.api.register_options(output_limits.extend({
     type = "string",
     desc = "Model spec for the bash auto-mode classifier. Unset: inherits the current session model.",
   },
+  auto_mode_ask_on_deny = {
+    default = false,
+    type = "boolean",
+    desc = "When the classifier denies a command, show the permission prompt instead of denying it outright.",
+  },
 }))
 
 bh.set_auto_mode(opts.auto_mode)
@@ -281,6 +286,28 @@ maki.api.register_command({
     maki.ui.flash("auto mode: " .. (bh.auto_mode_on and "on" or "off"))
   end,
 })
+
+local function command_scopes(command)
+  if not command or command:match("^%s*$") then
+    return nil
+  end
+
+  local parser = maki.treesitter.get_parser(command, "bash")
+  if not parser then
+    return { scopes = { command }, force_prompt = true }
+  end
+
+  local root = parser:parse()[1]:root()
+  if root:has_error() or is_complex(root) then
+    return { scopes = { command }, force_prompt = true }
+  end
+
+  local segments = collect_commands(root, command)
+  if #segments == 0 then
+    segments = { command }
+  end
+  return { scopes = segments, force_prompt = false }
+end
 
 maki.api.register_tool({
   name = "bash",
@@ -299,26 +326,7 @@ maki.api.register_tool({
     if bh.auto_mode_on then
       return nil
     end
-    local command = input.command
-    if not command or command:match("^%s*$") then
-      return nil
-    end
-
-    local parser = maki.treesitter.get_parser(command, "bash")
-    if not parser then
-      return { scopes = { command }, force_prompt = true }
-    end
-
-    local root = parser:parse()[1]:root()
-    if root:has_error() or is_complex(root) then
-      return { scopes = { command }, force_prompt = true }
-    end
-
-    local segments = collect_commands(root, command)
-    if #segments == 0 then
-      segments = { command }
-    end
-    return { scopes = segments, force_prompt = false }
+    return command_scopes(input.command)
   end,
 
   header = function(input)
@@ -379,11 +387,31 @@ maki.api.register_tool({
         auto_annotation = { { "auto-mode: allowed", "dim" } }
         -- fall through to the jobstart path unchanged
       else
-        return {
-          llm_output = "command denied by auto-mode: "
-            .. ((verdict == "deny" and reason) or err or "no classifier verdict"),
-          is_error = true,
-        }
+        local scopes = (verdict == "deny" and opts.auto_mode_ask_on_deny) and command_scopes(input.command)
+        if scopes then
+          -- Escalate to the normal permission prompt on the raw input text,
+          -- so allow rules and prompt text match the automode-off path.
+          local ok, perr = maki.agent.permission_prompt(ctx, {
+            tool = "bash",
+            scopes = scopes.scopes,
+            force_prompt = scopes.force_prompt,
+          })
+          if ok then
+            auto_annotation = { { "auto-mode: denied, allowed by user", "dim" } }
+            -- fall through to the jobstart path unchanged
+          else
+            return {
+              llm_output = perr or "command denied by auto-mode",
+              is_error = true,
+            }
+          end
+        else
+          return {
+            llm_output = "command denied by auto-mode: "
+              .. ((verdict == "deny" and reason) or err or "no classifier verdict"),
+            is_error = true,
+          }
+        end
       end
     end
 
