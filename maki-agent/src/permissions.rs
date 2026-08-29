@@ -624,6 +624,40 @@ fn rule_matches_scope(rule: &PermissionRule, scope: &str) -> bool {
     }
 }
 
+/// Absolutize first, then resolve symlinks in the leading components that
+/// exist and append the rest as written. The order matters: a relative rule
+/// like `dist/**` has to match before the dir exists, and
+/// `incremental_canonicalize` leaves a relative path relative when the leading
+/// component is missing.
+fn normalize_scope_prefix(path: &str) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));
+    maki_storage::paths::incremental_canonicalize(&abs)
+        .unwrap_or_else(|| maki_storage::paths::normalize_path(&abs))
+}
+
+/// A pattern with nothing left once its trailing glob is taken off covers
+/// every scope: `*` and `**`, but also `/*` and `/**`, which reduce to a
+/// prefix every absolute path starts with. [`scope_matches`] short-circuits on
+/// these and a plugin allow is refused for them, off the same answer.
+///
+/// A `/**` prefix is normalized before the answer, the way the matcher reads
+/// it, not compared as text. `//**`, `/./**` and `/tmp/../**` all name the
+/// root once normalized, and going by their spelling would let a plugin
+/// smuggle in the everything rule this refuses.
+pub fn is_universal_scope(pattern: &str) -> bool {
+    match pattern.strip_suffix("/**") {
+        Some(prefix) => is_root(&normalize_scope_prefix(prefix)),
+        None => {
+            let stem = pattern.trim_end_matches('*');
+            stem.len() < pattern.len() && matches!(stem, "" | "/")
+        }
+    }
+}
+
+fn is_root(path: &Path) -> bool {
+    path.parent().is_none()
+}
+
 /// Glob matcher for permission scopes. The boundary suffixes (`/**`, `" *"`)
 /// must be tried before the bare `*`, otherwise a plain prefix would swallow
 /// them. `" *"` is the bash form `<command> *`: it has to match the bare
@@ -633,23 +667,18 @@ fn rule_matches_scope(rule: &PermissionRule, scope: &str) -> bool {
 /// components rather than characters, which handles both `/` and `\`
 /// transparently on all platforms.
 pub fn scope_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" || pattern == "**" {
-        return true;
-    }
     if let Some(prefix) = pattern.strip_suffix("/**") {
-        // Normalize both sides the same way: absolutize, then resolve symlinks
-        // in existing leading components before appending the lexical tail.
-        // Absolutizing first keeps a relative rule like `dist/**` matching
-        // before the dir exists, since `incremental_canonicalize` leaves a
-        // relative path relative when the leading component is missing.
-        let norm = |p: &str| {
-            let abs = std::path::absolute(p).unwrap_or_else(|_| PathBuf::from(p));
-            maki_storage::paths::incremental_canonicalize(&abs)
-                .unwrap_or_else(|| maki_storage::paths::normalize_path(&abs))
-        };
-        let norm_prefix = norm(prefix);
-        let norm_value = norm(value);
+        let norm_prefix = normalize_scope_prefix(prefix);
+        // A root prefix covers every scope, bash commands included. Those are
+        // not paths, so a plain prefix test would miss them.
+        if is_root(&norm_prefix) {
+            return true;
+        }
+        let norm_value = normalize_scope_prefix(value);
         return norm_value == norm_prefix || norm_value.starts_with(&norm_prefix);
+    }
+    if is_universal_scope(pattern) {
+        return true;
     }
     if let Some(prefix) = pattern.strip_suffix(" *") {
         return value == prefix || value.starts_with(&format!("{prefix} "));
@@ -798,6 +827,21 @@ mod tests {
         scope_matches(pattern, value)
     }
 
+    /// A pattern is universal only when the trailing glob is all it says.
+    #[test_case("*" => true ; "star")]
+    #[test_case("**" => true ; "double_star")]
+    #[test_case("/*" => true ; "root_star")]
+    #[test_case("/**" => true ; "root_double_star")]
+    #[test_case("//**" => true ; "doubled_root_slash")]
+    #[test_case("/./**" => true ; "root_dot")]
+    #[test_case("/tmp/../**" => true ; "root_by_parent")]
+    #[test_case("/tmp/**" => false ; "directory_subtree")]
+    #[test_case("cargo *" => false ; "bash_command")]
+    #[test_case("/" => false ; "root_without_glob")]
+    #[test_case("" => false ; "empty")]
+    fn universal_scope(pattern: &str) -> bool {
+        is_universal_scope(pattern)
+    }
     #[test_case(vec!["cd /tmp", "cargo test"], vec!["cd *", "cargo *"], true ; "all_allowed")]
     #[test_case(vec!["cd /tmp", "cargo test"], vec!["cargo *"], false ; "missing_rule")]
     fn compound_check(scopes: Vec<&str>, rules: Vec<&str>, expect_allowed: bool) {
