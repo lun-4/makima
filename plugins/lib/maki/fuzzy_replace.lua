@@ -103,13 +103,27 @@ end
 -- drift is a widening of the inner levels, which the column test still catches
 -- and reindent has to correct otherwise.
 local function written_in_file_frame(drift, replacement)
-  local file_columns, model_base, file_base = {}, nil, nil
-  for model_indent, file_indent in pairs(drift) do
-    file_columns[file_indent] = true
-    if not model_base or #model_indent < #model_base then
-      model_base, file_base = model_indent, file_indent
-    end
+  local model_indents = {}
+  for model_indent in pairs(drift) do
+    model_indents[#model_indents + 1] = model_indent
   end
+  -- `pairs` walks the table in whatever order it likes, so two columns of equal
+  -- width, easy to hit once tabs and spaces mix, used to leave the hash order
+  -- deciding how the file gets reindented. Shallowest first, then by content so
+  -- a tie always falls the same way.
+  table.sort(model_indents, function(a, b)
+    if #a ~= #b then
+      return #a < #b
+    end
+    return a < b
+  end)
+
+  local file_columns = {}
+  for _, model_indent in ipairs(model_indents) do
+    file_columns[drift[model_indent]] = true
+  end
+  local model_base = model_indents[1]
+  local file_base = model_base and drift[model_base]
 
   local every_column_known, replacement_base = true, nil
   for _, line in ipairs(split_lines(replacement)) do

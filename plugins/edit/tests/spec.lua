@@ -295,6 +295,18 @@ case("exact_match_wins_over_fuzzy", function()
   eq(result, R .. "\nlet  x = 1;")
 end)
 
+-- Two model columns of the same width map to different file columns here, so
+-- the base is a real tie. Without a stable order the same edit can reindent one
+-- way on one run and another way on the next, hence the repeat.
+case("reindent_base_is_deterministic_when_indent_widths_tie", function()
+  local content = "if x:\n    a()\n        b()\n"
+  local old = "\ta()\n b()"
+  local new = "    a()\n      c()"
+  for _ = 1, 8 do
+    eq(fr.replace(content, old, new, false), "if x:\n    a()\n      c()\n")
+  end
+end)
+
 case("cjk_exact_match", function()
   local content = "// こんにちは世界\n// hello"
   local result = fr.replace(content, "// こんにちは世界", R, false)
