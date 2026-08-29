@@ -25,8 +25,7 @@ use maki_agent::{
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
-    UiAction, UiReply,
+    EventHandle, HintReader, KeymapReader, ModelRequest, SessionRequest, UiAction, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -57,6 +56,8 @@ use crate::agent::{
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
+use crate::command_runtime::{CommandEvent, CommandRuntime};
+use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
@@ -98,9 +99,9 @@ pub struct EventLoopParams {
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
+    pub command_registry: maki_commands::CommandRegistry,
     /// One-shot startup request to open the session picker (bare `-c`).
     pub session_picker: bool,
-    pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
@@ -323,8 +324,6 @@ struct SpawnCtx {
     /// rules stay per-session.
     permissions: Arc<PermissionManager>,
     timeouts: Timeouts,
-    custom_commands: Arc<[CustomCommand]>,
-    lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
     lua_event_handle: EventHandle,
@@ -335,6 +334,7 @@ struct SpawnCtx {
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
+    command_runtime: Arc<CommandRuntime>,
 }
 
 impl SpawnCtx {
@@ -362,17 +362,16 @@ impl SpawnCtx {
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
             handles.mcp_config_errors.clone(),
-            self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
             Arc::clone(&self.storage_writer),
             self.ui_config.clone(),
             self.input_history_size,
             permissions,
-            Arc::clone(&self.custom_commands),
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
             crate::theme::default_provider().clone(),
+            Arc::clone(&self.command_runtime),
         );
         handles.apply_to_app(&mut app);
         if resumed {
@@ -406,6 +405,7 @@ pub(crate) struct EventLoop<'t> {
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
+    command_rx: flume::Receiver<CommandEvent>,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -418,6 +418,7 @@ enum Wake {
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
+    Command(CommandEvent),
 }
 
 struct BackgroundModels {
@@ -514,8 +515,8 @@ impl<'t> EventLoop<'t> {
             permissions,
             timeouts,
             exit_on_done,
+            command_registry,
             session_picker,
-            lua_command_reader,
             keymap_reader,
             hint_reader,
             ui_action_rx,
@@ -551,7 +552,6 @@ impl<'t> EventLoop<'t> {
         });
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(
@@ -569,6 +569,18 @@ impl<'t> EventLoop<'t> {
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
+        let model_completion = Arc::new(ModelArgSource::new(Arc::clone(&bg.available)));
+        let theme_completion = Arc::new(ThemeArgSource::new(
+            crate::theme::default_provider().clone(),
+        ));
+        let (command_runtime, command_rx) = CommandRuntime::new(
+            &commands,
+            command_registry,
+            model_completion,
+            theme_completion,
+        );
+        let command_runtime = Arc::new(command_runtime);
+        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
         let ctx = SpawnCtx {
             storage,
             config,
@@ -576,8 +588,6 @@ impl<'t> EventLoop<'t> {
             input_history_size,
             permissions,
             timeouts,
-            custom_commands: Arc::from(commands),
-            lua_command_reader,
             keymap_reader,
             hint_reader,
             lua_event_handle,
@@ -591,6 +601,7 @@ impl<'t> EventLoop<'t> {
                 override_text: system_prompt_override,
                 append_text: append_system_prompt,
             },
+            command_runtime,
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -636,6 +647,7 @@ impl<'t> EventLoop<'t> {
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             ui_action_rx,
+            command_rx,
             _model_fetch_task: bg.task,
         })
     }
@@ -653,11 +665,11 @@ impl<'t> EventLoop<'t> {
             let actions = self.focused_app().handle_submit(sub);
             self.dispatch(self.focused, actions);
         } else if self.session_picker {
-            self.focused_app().open_session_picker();
+            self.focused_app().open_startup_session_picker();
         }
         // Populate the inline quota readout without waiting for `/usage` or
         // Ctrl+R; provider/model changes below trigger their own refresh.
-        self.refresh_usage();
+        self.refresh_usage(self.focused);
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
         let mut dirty = Dirty::YES;
@@ -728,6 +740,7 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
+        sel = sel.recv(&self.command_rx, |res| res.ok().map(Wake::Command));
         for (i, rt) in self.sessions.iter().enumerate() {
             if !rt.handles.agent_rx.is_disconnected() {
                 sel = sel.recv(&rt.handles.agent_rx, move |res| {
@@ -749,6 +762,7 @@ impl<'t> EventLoop<'t> {
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
+            Wake::Command(command) => self.handle_command(command),
         }
         Ok(())
     }
@@ -756,6 +770,47 @@ impl<'t> EventLoop<'t> {
     /// The one save trigger. A checkpoint writes only on a real change, so
     /// every tool result reaches disk within a frame while an idle session
     /// writes nothing.
+    fn handle_command(&mut self, event: CommandEvent) {
+        let target = match &event {
+            CommandEvent::Host { target, .. } | CommandEvent::Outcome { target, .. } => *target,
+        };
+        let Some(index) = command_target_index(
+            self.sessions
+                .iter()
+                .map(|runtime| runtime.app.command_target.id()),
+            target,
+        ) else {
+            if let CommandEvent::Host { reply, .. } = event {
+                let _ = reply.send(Err(maki_commands::CommandError::StaleTarget));
+            }
+            return;
+        };
+        match event {
+            CommandEvent::Host { request, reply, .. } => {
+                let result = self.sessions[index].app.execute_host_request(request);
+                match result {
+                    Ok((response, actions)) => {
+                        self.dispatch(index, actions);
+                        let _ = reply.send(Ok(response));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            CommandEvent::Outcome { outcome, .. } => match outcome {
+                maki_commands::CommandOutcome::AgentTurn(turn) => {
+                    let actions = self.sessions[index].app.submit_command_turn(turn);
+                    self.dispatch(index, actions);
+                }
+                maki_commands::CommandOutcome::Failed(error) => {
+                    self.sessions[index].app.flash(error.to_string());
+                }
+                maki_commands::CommandOutcome::Completed => {}
+            },
+        }
+    }
+
     fn checkpoint_all(&mut self) {
         for rt in &mut self.sessions {
             rt.app.checkpoint();
@@ -1236,7 +1291,7 @@ impl<'t> EventLoop<'t> {
                 fast,
             } => {
                 if let Some(spec) = spec {
-                    self.change_model(&spec)?;
+                    self.change_model(self.focused, &spec)?;
                 }
                 let app = self.focused_app();
                 if let Some(thinking) = thinking {
@@ -1514,8 +1569,8 @@ impl<'t> EventLoop<'t> {
                 self.respawn_agent(idx, loaded.messages);
             }
             Action::ChangeModel(spec) => {
-                if let Err(e) = self.change_model(&spec) {
-                    self.focused_app().flash(e);
+                if let Err(error) = self.change_model(idx, &spec) {
+                    self.sessions[idx].app.flash(error);
                 }
             }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
@@ -1572,10 +1627,11 @@ impl<'t> EventLoop<'t> {
                     Err(e) => self.sessions[idx].app.flash(e),
                 }
             }
-            Action::Btw(question) => {
+            Action::Btw(question, images) => {
                 let slot = self.ctx.model_slot.load();
                 self.sessions[idx].app.start_btw(
                     question,
+                    images,
                     Arc::clone(&slot.provider),
                     slot.model.clone(),
                 );
@@ -1587,12 +1643,12 @@ impl<'t> EventLoop<'t> {
             }
             Action::Bell => ring_bell(),
             Action::RefreshModels => self.refresh_models(),
-            Action::RefreshUsage => self.refresh_usage(),
+            Action::RefreshUsage => self.refresh_usage(idx),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
     }
 
-    fn change_model(&mut self, spec: &str) -> Result<(), String> {
+    fn change_model(&mut self, idx: usize, spec: &str) -> Result<(), String> {
         if !self.ctx.model_policy.allows(spec) {
             return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
         }
@@ -1600,7 +1656,7 @@ impl<'t> EventLoop<'t> {
             Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
         let new_provider = from_model(&mut new_model, self.ctx.timeouts)
             .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
-        let app = self.focused_app();
+        let app = &mut self.sessions[idx].app;
         app.update_model(&new_model);
         app.record_recent_model(spec);
         app.usage_slot.store(None);
@@ -1608,7 +1664,7 @@ impl<'t> EventLoop<'t> {
             model: new_model,
             provider: Arc::from(new_provider),
         }));
-        self.refresh_usage();
+        self.refresh_usage(idx);
         Ok(())
     }
 
@@ -1628,8 +1684,8 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
-    fn refresh_usage(&mut self) {
-        let slot = Arc::clone(&self.focused_app().usage_slot);
+    fn refresh_usage(&mut self, idx: usize) {
+        let slot = Arc::clone(&self.sessions[idx].app.usage_slot);
         self.refresh_usage_into(slot);
     }
 
@@ -1658,10 +1714,10 @@ impl<'t> EventLoop<'t> {
                     model,
                     provider: Arc::from(provider),
                 }));
-                self.refresh_usage();
+                self.refresh_usage(self.focused);
             }
         } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
-            && let Err(e) = self.change_model(builtin.default_model)
+            && let Err(e) = self.change_model(self.focused, builtin.default_model)
         {
             self.focused_app().flash(e);
         }
@@ -1729,6 +1785,15 @@ impl<'t> EventLoop<'t> {
     }
 }
 
+fn command_target_index(
+    targets: impl IntoIterator<Item = maki_commands::InvocationTargetId>,
+    target: maki_commands::InvocationTargetId,
+) -> Option<usize> {
+    targets
+        .into_iter()
+        .position(|candidate| candidate == target)
+}
+
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     if kind == MouseEventKind::ScrollUp {
         lines as i32
@@ -1754,6 +1819,19 @@ mod tests {
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
 
+    struct FakeHost;
+
+    impl maki_commands::CommandHost for FakeHost {
+        fn request(
+            &self,
+            _request: maki_commands::HostRequest,
+        ) -> maki_commands::CommandFuture<
+            Result<maki_commands::HostResponse, maki_commands::CommandError>,
+        > {
+            Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
+        }
+    }
+
     fn done_event() -> AgentEvent {
         AgentEvent::Done {
             usage: TokenUsage::default(),
@@ -1767,6 +1845,26 @@ mod tests {
         state.on_done(&done_event());
         state.on_drain();
         state
+    }
+
+    #[test]
+    fn command_routing_rejects_retired_target_after_session_replacement() {
+        let registry = maki_commands::CommandRegistry::new();
+        let retired = registry
+            .bind_target(
+                maki_commands::TargetCapabilities::default(),
+                Arc::new(FakeHost),
+            )
+            .id();
+        let live = registry
+            .bind_target(
+                maki_commands::TargetCapabilities::default(),
+                Arc::new(FakeHost),
+            )
+            .id();
+
+        assert_eq!(command_target_index([live], retired), None);
+        assert_eq!(command_target_index([live], live), Some(0));
     }
 
     #[test]

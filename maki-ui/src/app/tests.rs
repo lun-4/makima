@@ -10,6 +10,7 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
@@ -17,9 +18,7 @@ use maki_agent::{
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
-use maki_lua::{
-    BuiltinAction, CommandArgumentItem, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader,
-};
+use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use maki_providers::{
     ContentBlock, Effort, Message, ProviderUsage, Role, TokenUsage, UsageLimit, UsageWindow,
 };
@@ -47,13 +46,18 @@ const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_IMAGE_DATA: &str = "dGVzdA==";
+const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
+    "command failed: local commands cannot include non-text content";
+const FAST_UNSUPPORTED_COMMAND_ERROR: &str =
+    "command failed: Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
 }
 
 fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
-    build_app_with_lua(dir, writer, LuaCommandReader::empty())
+    build_app_with_registry(dir, writer, maki_commands::CommandRegistry::new())
 }
 
 fn build_app_with_handle(
@@ -64,34 +68,210 @@ fn build_app_with_handle(
     build_app_with_full(
         dir,
         writer,
-        LuaCommandReader::empty(),
+        maki_commands::CommandRegistry::new(),
         handle,
         UiConfig::default(),
     )
 }
 
-fn build_app_with_lua(
+fn build_app_with_registry(
     dir: StateDir,
     writer: Arc<StorageWriter>,
-    lua_commands: LuaCommandReader,
+    registry: maki_commands::CommandRegistry,
 ) -> App {
     build_app_with_full(
         dir,
         writer,
-        lua_commands,
+        registry,
         maki_lua::EventHandle::disconnected_for_test(),
         UiConfig::default(),
     )
 }
 
+#[derive(Clone)]
+struct TestLuaBehavior {
+    handle: maki_lua::EventHandle,
+    plugin: Arc<str>,
+    name: Arc<str>,
+}
+
+impl maki_commands::CommandBehavior for TestLuaBehavior {
+    fn execute(
+        &self,
+        invocation: maki_commands::CommandInvocation,
+    ) -> maki_commands::CommandFuture<
+        Result<maki_commands::CommandOutcome, maki_commands::CommandError>,
+    > {
+        self.handle.run_command(
+            Arc::clone(&self.plugin),
+            Arc::clone(&self.name),
+            invocation.arguments.to_string(),
+            invocation.depth as u8,
+        );
+        Box::pin(async { Ok(maki_commands::CommandOutcome::Completed) })
+    }
+}
+
+#[derive(Clone)]
+struct TestLuaCompletion {
+    handle: maki_lua::EventHandle,
+    plugin: Arc<str>,
+}
+
+impl maki_commands::CommandCompletion for TestLuaCompletion {
+    fn complete(
+        &self,
+        context: maki_commands::CompletionContext,
+        _cancellation: maki_commands::CancellationToken,
+    ) -> maki_commands::CommandFuture<
+        Result<Vec<maki_commands::CompletionItem>, maki_commands::CompletionError>,
+    > {
+        let (_, cancel) = maki_agent::CancelToken::new();
+        let context = maki_lua::CommandArgumentContext {
+            command: context.invoked_name,
+            plugin: Arc::clone(&self.plugin),
+            args: context.arguments.to_string(),
+            arg: context.argument.to_string(),
+            index: context.argument_index,
+            mode: context.mode.to_string(),
+            session: 1,
+            generation: 0,
+        };
+        let Some(rx) = self.handle.collect_command_argument_items(context, cancel) else {
+            return Box::pin(async { Ok(Vec::new()) });
+        };
+        Box::pin(async move {
+            Ok(rx
+                .recv_async()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| maki_commands::CompletionItem {
+                    label: Arc::from(item.label),
+                    insertion: Arc::from(item.insertion),
+                    description: item.description.map(Arc::from),
+                })
+                .collect())
+        })
+    }
+
+    fn lifecycle(
+        &self,
+        context: &maki_commands::CompletionContext,
+        event: &maki_commands::CompletionLifecycleEvent,
+        _cancellation: &maki_commands::CancellationToken,
+    ) -> Result<(), maki_commands::CompletionError> {
+        let (event, item) = match event {
+            maki_commands::CompletionLifecycleEvent::Highlight(item) => (
+                maki_lua::CommandArgumentLifecycle::Highlight,
+                Some(maki_lua::CommandArgumentItem {
+                    label: item.label.to_string(),
+                    insertion: item.insertion.to_string(),
+                    description: item.description.as_ref().map(ToString::to_string),
+                }),
+            ),
+            maki_commands::CompletionLifecycleEvent::Accept(item) => (
+                maki_lua::CommandArgumentLifecycle::Accept,
+                Some(maki_lua::CommandArgumentItem {
+                    label: item.label.to_string(),
+                    insertion: item.insertion.to_string(),
+                    description: item.description.as_ref().map(ToString::to_string),
+                }),
+            ),
+            maki_commands::CompletionLifecycleEvent::Cancel => {
+                (maki_lua::CommandArgumentLifecycle::Cancel, None)
+            }
+        };
+        self.handle.command_argument_lifecycle(
+            maki_lua::CommandArgumentContext {
+                command: Arc::clone(&context.invoked_name),
+                plugin: Arc::clone(&self.plugin),
+                args: context.arguments.to_string(),
+                arg: context.argument.to_string(),
+                index: context.argument_index,
+                mode: context.mode.to_string(),
+                session: 1,
+                generation: 0,
+            },
+            event,
+            item,
+            maki_agent::CancelToken::none(),
+        );
+        Ok(())
+    }
+}
+
+struct TestLuaCommand {
+    handle: maki_lua::EventHandle,
+    name: Arc<str>,
+    plugin: Arc<str>,
+    max_args: Option<usize>,
+    completion: bool,
+}
+
+fn register_test_lua_command(
+    registry: &maki_commands::CommandRegistry,
+    command: TestLuaCommand,
+) -> maki_commands::Producer {
+    let producer = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+    let completion = command.completion.then(|| {
+        Arc::new(TestLuaCompletion {
+            handle: command.handle.clone(),
+            plugin: Arc::clone(&command.plugin),
+        }) as Arc<dyn maki_commands::CommandCompletion>
+    });
+    producer
+        .replace(vec![maki_commands::Registration {
+            spec: maki_commands::CommandSpec {
+                name: Arc::clone(&command.name),
+                aliases: Arc::from([]),
+                arguments: command
+                    .max_args
+                    .map(|max| maki_commands::ArgumentArity::bounded(0, max))
+                    .unwrap_or_else(|| maki_commands::ArgumentArity::unbounded(0)),
+                docs: maki_commands::CommandDocs {
+                    summary: Arc::from("Lua test command"),
+                    argument_hint: None,
+                },
+                required_capabilities: maki_commands::TargetCapabilities::default(),
+            },
+            behavior: Arc::new(TestLuaBehavior {
+                handle: command.handle,
+                plugin: command.plugin,
+                name: command.name,
+            }),
+            completion,
+        }])
+        .unwrap();
+    producer
+}
+
+fn lua_registry(
+    command: TestLuaCommand,
+) -> (maki_commands::CommandRegistry, maki_commands::Producer) {
+    let registry = maki_commands::CommandRegistry::new();
+    let producer = register_test_lua_command(&registry, command);
+    (registry, producer)
+}
+
 fn build_app_with_full(
     dir: StateDir,
     writer: Arc<StorageWriter>,
-    lua_commands: LuaCommandReader,
+    registry: maki_commands::CommandRegistry,
     handle: maki_lua::EventHandle,
     ui: UiConfig,
 ) -> App {
     let model = test_model();
+    let command_runtime = Arc::new(crate::command_runtime::CommandRuntime::new_for_test(
+        &[],
+        registry,
+        Arc::new(crate::components::arg_completion::ModelArgSource::new(
+            Arc::new(ArcSwapOption::empty()),
+        )),
+        Arc::new(crate::components::arg_completion::ThemeArgSource::new(
+            Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
+        )),
+    ));
     App::new(
         &model,
         AppSession::new("test-model", "/tmp/test"),
@@ -99,7 +279,6 @@ fn build_app_with_full(
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
         McpConfigErrors::new(PathBuf::new()),
-        lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
         writer,
@@ -113,15 +292,60 @@ fn build_app_with_full(
             PathBuf::from("/tmp"),
             Arc::default(),
         )),
-        Arc::from([]),
         handle,
         Arc::new(maki_config::ModelPolicy::default()),
         Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
+        command_runtime,
     )
 }
 
 fn test_writer(dir: StateDir) -> StorageWriter {
     StorageWriter::new(dir, flume::unbounded().0)
+}
+
+fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
+    let dir = StateDir::from_path(env::temp_dir());
+    let writer = Arc::new(test_writer(dir.clone()));
+    let model = test_model();
+    let handle = maki_lua::EventHandle::disconnected_for_test();
+    let command_runtime = Arc::new(crate::command_runtime::CommandRuntime::new_for_test(
+        commands,
+        maki_commands::CommandRegistry::new(),
+        Arc::new(crate::components::arg_completion::ModelArgSource::new(
+            Arc::new(ArcSwapOption::empty()),
+        )),
+        Arc::new(crate::components::arg_completion::ThemeArgSource::new(
+            Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
+        )),
+    ));
+    let mut app = App::new(
+        &model,
+        AppSession::new("test-model", "/tmp/test"),
+        dir,
+        Arc::new(ArcSwapOption::empty()),
+        McpSnapshotReader::empty(),
+        McpConfigErrors::new(PathBuf::new()),
+        KeymapReader::empty(),
+        HintReader::empty(),
+        writer,
+        UiConfig::default(),
+        100,
+        Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                rules: vec![],
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+            Arc::default(),
+        )),
+        handle,
+        Arc::new(ModelPolicy::default()),
+        Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
+        command_runtime,
+    );
+    let (shared_queue, _rx) = shared_queue::queue();
+    app.queue.set_shared(shared_queue);
+    app
 }
 
 pub(crate) fn test_app() -> App {
@@ -346,7 +570,7 @@ fn with_text(app: &mut App) {
 }
 
 fn with_image(app: &mut App) {
-    let img = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
+    let img = ImageSource::new(ImageMediaType::Png, Arc::from(TEST_IMAGE_DATA));
     app.input_box.attach_image(img);
 }
 
@@ -468,17 +692,15 @@ fn paste_works_regardless_of_status(status: Status) {
 #[test]
 fn ordinary_paste_synchronizes_argument_completion() {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_lua(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/deploy".into(),
-            description: "Deploy".into(),
-            plugin: "deploy".into(),
-            max_args: 1,
-            has_argument_completion: true,
-        }]),
-    );
+    let handle = maki_lua::EventHandle::disconnected_for_test();
+    let (registry, _producer) = lua_registry(TestLuaCommand {
+        handle,
+        name: Arc::from("/deploy"),
+        plugin: Arc::from("deploy"),
+        max_args: Some(1),
+        completion: true,
+    });
+    let mut app = build_app_with_registry(dir.clone(), Arc::new(test_writer(dir)), registry);
     let generation = app.command_palette.argument_generation();
 
     app.update(Msg::Paste("/deploy staging".into()));
@@ -679,19 +901,64 @@ fn enter_executes_new_command() {
     assert!(!app.command_palette.is_active());
 }
 
-fn lifecycle_app() -> (App, maki_lua::test_support::RequestProbe) {
+#[test]
+fn confirmed_btw_preserves_pending_images() {
+    let mut app = test_app();
+    app.input_box.attach_image(ImageSource::new(
+        ImageMediaType::Webp,
+        Arc::from(TEST_IMAGE_DATA),
+    ));
+
+    let actions = type_and_submit(&mut app, "/btw describe this");
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Btw(question, images)]
+            if question == "describe this"
+                && matches!(images.as_slice(), [image]
+                    if image.media_type == ImageMediaType::Webp
+                        && image.data.as_ref() == TEST_IMAGE_DATA)
+    ));
+    assert!(app.input_box.is_empty());
+}
+
+#[test]
+fn confirmed_local_builtin_rejects_pending_images() {
+    let mut app = test_app();
+    with_image(&mut app);
+
+    let actions = type_and_submit(&mut app, "/new");
+
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(LOCAL_COMMAND_ATTACHMENTS_ERROR)
+    );
+    assert!(app.input_box.is_empty());
+}
+
+fn lifecycle_app() -> (
+    App,
+    maki_lua::test_support::RequestProbe,
+    maki_commands::Producer,
+) {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let registry = maki_commands::CommandRegistry::new();
+    let producer = register_test_lua_command(
+        &registry,
+        TestLuaCommand {
+            handle: handle.clone(),
+            name: Arc::from("/deploy"),
+            plugin: Arc::from("deploy"),
+            max_args: Some(1),
+            completion: true,
+        },
+    );
     let mut app = build_app_with_full(
         dir.clone(),
         Arc::new(test_writer(dir)),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/deploy".into(),
-            description: "Deploy".into(),
-            plugin: "deploy".into(),
-            max_args: 1,
-            has_argument_completion: true,
-        }]),
+        registry,
         handle,
         UiConfig::default(),
     );
@@ -699,21 +966,92 @@ fn lifecycle_app() -> (App, maki_lua::test_support::RequestProbe) {
     app.command_palette.sync("/deploy a");
     app.command_palette
         .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
-    probe
-        .try_finish_command_arguments(vec![CommandArgumentItem {
-            label: "alpha".into(),
-            insertion: "alpha".into(),
-            description: None,
-        }])
-        .unwrap();
+    let items = vec![CommandArgumentItem {
+        label: "alpha".into(),
+        insertion: "alpha".into(),
+        description: None,
+    }];
+    for _ in 0..1000 {
+        if probe.try_finish_command_arguments(items.clone()).is_some() {
+            break;
+        }
+        std::thread::yield_now();
+    }
     let _ = app.command_palette.poll_arguments();
-    probe.try_finish_command_argument_lifecycle().unwrap();
-    (app, probe)
+    let _ = probe.try_finish_command_argument_lifecycle();
+    (app, probe, producer)
+}
+
+#[test]
+fn empty_completion_cancels_once_and_next_request_uses_new_session() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let registry = maki_commands::CommandRegistry::new();
+    let _producer = register_test_lua_command(
+        &registry,
+        TestLuaCommand {
+            handle: handle.clone(),
+            name: Arc::from("/deploy"),
+            plugin: Arc::from("deploy"),
+            max_args: Some(1),
+            completion: true,
+        },
+    );
+    let mut app = build_app_with_full(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        registry,
+        handle,
+        UiConfig::default(),
+    );
+    app.input_box.set_input("/deploy a".into());
+    app.command_palette.sync("/deploy a");
+    app.command_palette
+        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
+    let first_session = app.command_palette.completion_session_id().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if probe.try_finish_command_arguments(Vec::new()).is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "completion request was not sent");
+        std::thread::yield_now();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if app.command_palette.poll_arguments() == Dirty::YES {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "completion result was not applied"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        probe.try_finish_command_argument_lifecycle(),
+        Some(("cancel", None, true))
+    );
+    assert!(probe.try_finish_command_argument_lifecycle().is_none());
+
+    app.command_palette
+        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
+    let second_session = app.command_palette.completion_session_id().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if probe.try_finish_command_arguments(Vec::new()).is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "completion request was not sent");
+        std::thread::yield_now();
+    }
+    assert_ne!(second_session, first_session);
 }
 
 #[test]
 fn ctrl_c_closes_palette_and_cancels_lifecycle() {
-    let (mut app, probe) = lifecycle_app();
+    let (mut app, probe, _producer) = lifecycle_app();
 
     app.update(Msg::Key(kb::QUIT.to_key_event()));
 
@@ -726,7 +1064,7 @@ fn ctrl_c_closes_palette_and_cancels_lifecycle() {
 
 #[test]
 fn esc_closes_palette_and_cancels_lifecycle() {
-    let (mut app, probe) = lifecycle_app();
+    let (mut app, probe, _producer) = lifecycle_app();
 
     app.update(Msg::Key(key(KeyCode::Esc)));
 
@@ -739,7 +1077,7 @@ fn esc_closes_palette_and_cancels_lifecycle() {
 
 #[test]
 fn reset_session_cancels_completion_lifecycle_once() {
-    let (mut app, probe) = lifecycle_app();
+    let (mut app, probe, _producer) = lifecycle_app();
 
     app.reset_session();
 
@@ -752,7 +1090,7 @@ fn reset_session_cancels_completion_lifecycle_once() {
 
 #[test]
 fn session_switch_cancels_completion_lifecycle_once() {
-    let (mut app, probe) = lifecycle_app();
+    let (mut app, probe, _producer) = lifecycle_app();
     let session = AppSession::new("test-model", "/tmp/test");
 
     app.apply_loaded_session(session, &test_model());
@@ -766,7 +1104,7 @@ fn session_switch_cancels_completion_lifecycle_once() {
 
 #[test]
 fn programmatic_overlay_close_cancels_completion_lifecycle_once() {
-    let (mut app, probe) = lifecycle_app();
+    let (mut app, probe, _producer) = lifecycle_app();
 
     app.close_all_overlays();
 
@@ -826,6 +1164,19 @@ fn reset_session_clears_plan() {
     assert!(app.queue.focus().is_none());
     assert!(!app.help_modal.is_open());
     assert!(!app.btw_modal.is_open());
+}
+
+#[test]
+fn replacing_session_rotates_command_target() {
+    let mut app = test_app();
+    let reset_target = app.command_target.id();
+
+    app.reset_session();
+    assert_ne!(app.command_target.id(), reset_target);
+
+    let load_target = app.command_target.id();
+    app.apply_loaded_session(AppSession::new("test-model", "/tmp/test"), &test_model());
+    assert_ne!(app.command_target.id(), load_target);
 }
 
 #[test]
@@ -902,19 +1253,21 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
 #[test]
 fn argument_completion_enter_fills_then_next_enter_executes() {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_lua(
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let (registry, _producer) = lua_registry(TestLuaCommand {
+        handle: handle.clone(),
+        name: Arc::from("/rename"),
+        plugin: Arc::from("sessions"),
+        max_args: None,
+        completion: true,
+    });
+    let mut app = build_app_with_full(
         dir.clone(),
         Arc::new(test_writer(dir)),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/rename".into(),
-            description: "Rename".into(),
-            plugin: "sessions".into(),
-            max_args: usize::MAX,
-            has_argument_completion: true,
-        }]),
+        registry,
+        handle,
+        UiConfig::default(),
     );
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
     app.input_box.set_input("/rename dråft tail".into());
     app.command_palette.sync("/rename dråft tail");
     app.input_box.buffer.set_cursor(0, 11);
@@ -947,19 +1300,21 @@ fn argument_completion_enter_fills_then_next_enter_executes() {
 #[test]
 fn argument_completion_enter_on_exact_match_executes_immediately() {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_lua(
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let (registry, _producer) = lua_registry(TestLuaCommand {
+        handle: handle.clone(),
+        name: Arc::from("/rename"),
+        plugin: Arc::from("sessions"),
+        max_args: None,
+        completion: true,
+    });
+    let mut app = build_app_with_full(
         dir.clone(),
         Arc::new(test_writer(dir)),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/rename".into(),
-            description: "Rename".into(),
-            plugin: "sessions".into(),
-            max_args: usize::MAX,
-            has_argument_completion: true,
-        }]),
+        registry,
+        handle,
+        UiConfig::default(),
     );
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
     app.input_box.set_input("/rename final".into());
     app.command_palette.sync("/rename final");
     app.command_palette.set_argument_completion(
@@ -1571,11 +1926,13 @@ fn top_bar_shows_active_chat_running_count_and_cwd() {
     // One running subagent besides the main chat.
     assert!(bar.contains("1 tasks"), "running count: {bar}");
     assert!(bar.contains(kb::TASKS.label), "ctrl-x hint: {bar}");
-    // cwd:branch lives on the right, sourced from the status bar's cache.
-    assert!(
-        bar.contains(app.status_bar.cwd_branch()),
-        "cwd shown: {bar}"
-    );
+    // The right side may truncate the cwd, but the branch should remain visible.
+    let branch = app
+        .status_bar
+        .cwd_branch()
+        .rsplit_once(':')
+        .map_or_else(|| app.status_bar.cwd_branch(), |(_, branch)| branch);
+    assert!(bar.contains(branch), "branch shown: {bar}");
     // No per-subagent rows in the bar.
     assert!(!bar.contains("research"), "no name rows: {bar}");
 
@@ -1805,7 +2162,7 @@ fn picker_enter_stays_at_navigated() {
 }
 
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
-    kb::SESSIONS.to_key_event(),
+    KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
     kb::SCROLL_HALF_UP.to_key_event(),
     kb::SCROLL_HALF_DOWN.to_key_event(),
     kb::HELP.to_key_event(),
@@ -2187,7 +2544,7 @@ fn model_arg_ambiguous_flashes() {
     assert_eq!(app.state.model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        format!("{MODEL_AMBIGUOUS_MSG}: glm")
+        "command failed: ambiguous model: glm"
     );
 }
 
@@ -2211,7 +2568,7 @@ fn model_arg_no_match_flashes() {
     assert_eq!(app.state.model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        format!("{MODEL_NO_MATCH_MSG}: xyz")
+        "command failed: no model matches: xyz"
     );
 }
 
@@ -2249,7 +2606,7 @@ fn malformed_model_arg_flashes_invalid_model() {
     assert_eq!(app.state.model.spec(), before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "Invalid model: model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"
+        "command failed: model must be in 'provider/model' format (e.g. anthropic/claude-sonnet-4-20250514)"
     );
 }
 
@@ -2341,7 +2698,7 @@ fn theme_arg_unknown_flashes() {
     assert_eq!(app.theme_provider.generation(), gen_before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        format!("{THEME_UNKNOWN_MSG}: nonexistent")
+        "command failed: theme is unknown or ambiguous: nonexistent"
     );
 }
 
@@ -2364,7 +2721,7 @@ fn theme_arg_ambiguous_flashes() {
     assert_eq!(app.theme_provider.generation(), gen_before);
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        format!("{THEME_AMBIGUOUS_MSG}: catppuccin")
+        "command failed: theme is unknown or ambiguous: catppuccin"
     );
 }
 
@@ -3254,19 +3611,21 @@ const LUA_COMMAND_NOT_SENT: &str = "lua command with args must not reach the mod
 #[test]
 fn typed_lua_command_with_args_executes() {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_lua(
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let (registry, _producer) = lua_registry(TestLuaCommand {
+        handle: handle.clone(),
+        name: Arc::from("/rename"),
+        plugin: Arc::from("sessions"),
+        max_args: None,
+        completion: false,
+    });
+    let mut app = build_app_with_full(
         dir.clone(),
         Arc::new(test_writer(dir)),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/rename".into(),
-            description: "Rename the current session".into(),
-            plugin: "sessions".into(),
-            max_args: usize::MAX,
-            has_argument_completion: false,
-        }]),
+        registry,
+        handle,
+        UiConfig::default(),
     );
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
 
     let actions = type_and_submit(&mut app, "/rename my title");
 
@@ -3275,6 +3634,7 @@ fn typed_lua_command_with_args_executes() {
 }
 
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
+const MAX_COMMAND_DEPTH_ERROR: &str = "maximum command recursion depth exceeded";
 
 #[test_case("/new" ; "plain")]
 #[test_case("/NEW" ; "uppercase")]
@@ -3294,7 +3654,83 @@ fn run_cmdline_splits_args_off_the_name() {
 
     let actions = app.run_cmdline("/btw what is rust?", 0).unwrap();
 
-    assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
+    assert!(
+        matches!(&actions[..], [Action::Btw(q, images)] if q == "what is rust?" && images.is_empty())
+    );
+}
+
+#[test]
+fn direct_tasks_command_opens_picker() {
+    let mut app = test_app();
+
+    let actions = app.execute_command(cmd("/tasks"), 0);
+
+    assert!(actions.is_empty());
+    assert!(app.task_picker.is_open());
+}
+
+#[test]
+fn direct_login_command_opens_picker() {
+    let mut app = test_app();
+
+    let actions = app.execute_command(cmd("/login"), 0);
+
+    assert!(actions.is_empty());
+    assert!(app.login_picker.is_open());
+}
+
+#[test]
+fn direct_exit_command_requests_successful_exit() {
+    let mut app = test_app();
+
+    let actions = app.execute_command(cmd("/exit"), 0);
+
+    assert_eq!(app.exit_request, ExitRequest::Success);
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+}
+
+#[test]
+fn direct_custom_command_renders_args_and_starts_run() {
+    let mut app = app_with_custom_commands(&[CustomCommand {
+        name: "review".into(),
+        description: "Code review".into(),
+        content: "Review $ARGUMENTS".into(),
+        scope: CommandScope::Project,
+        accepts_args: true,
+        argument_hint: None,
+    }]);
+
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/project:review".into(),
+            args: "src/lib.rs".into(),
+        },
+        0,
+    );
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::SendMessage(input)] if input.message == "Review src/lib.rs"
+    ));
+}
+
+#[test]
+fn run_cmdline_dispatches_custom_command() {
+    let mut app = app_with_custom_commands(&[CustomCommand {
+        name: "review".into(),
+        description: "Code review".into(),
+        content: "Review $ARGUMENTS".into(),
+        scope: CommandScope::Project,
+        accepts_args: true,
+        argument_hint: None,
+    }]);
+
+    let actions = app.run_cmdline("/project:review src/lib.rs", 0).unwrap();
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::SendMessage(input)] if input.message == "Review src/lib.rs"
+    ));
 }
 
 /// Only the typed path clears the input, so a keybind or autocmd reaching for
@@ -3324,16 +3760,17 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
 }
 
 #[test]
-fn run_cmdline_rejects_past_max_depth() {
+fn run_cmdline_uses_registry_depth_limit() {
     let mut app = test_app();
 
-    let Err(err) = app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH + 1) else {
-        panic!("{RUN_CMDLINE_REJECTED}");
-    };
-
-    assert_eq!(err, crate::app::COMMAND_DEPTH_MSG);
     assert!(
-        app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH)
+        app.run_cmdline("/new", (maki_commands::MAX_COMMAND_DEPTH + 1) as u8)
+            .is_ok(),
+        "resolution succeeds before the command outcome arrives"
+    );
+    assert_eq!(app.status_bar.flash_text(), Some(MAX_COMMAND_DEPTH_ERROR));
+    assert!(
+        app.run_cmdline("/new", maki_commands::MAX_COMMAND_DEPTH as u8)
             .is_ok(),
         "the cap itself must still run"
     );
@@ -3345,19 +3782,21 @@ fn run_cmdline_rejects_past_max_depth() {
 #[test]
 fn run_cmdline_forwards_depth_to_lua_command() {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_lua(
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let (registry, _producer) = lua_registry(TestLuaCommand {
+        handle: handle.clone(),
+        name: Arc::from("/Sessions"),
+        plugin: Arc::from("sessions"),
+        max_args: Some(0),
+        completion: false,
+    });
+    let mut app = build_app_with_full(
         dir.clone(),
         Arc::new(test_writer(dir)),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/Sessions".into(),
-            description: "Browse sessions".into(),
-            plugin: "sessions".into(),
-            max_args: 0,
-            has_argument_completion: false,
-        }]),
+        registry,
+        handle,
+        UiConfig::default(),
     );
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
 
     app.run_cmdline("/sessions", 3).unwrap();
 
@@ -3367,30 +3806,17 @@ fn run_cmdline_forwards_depth_to_lua_command() {
     );
 }
 
-/// The bare `-c` startup path must reach the picker with no arg, so the
-/// picker lists this directory's sessions only.
 #[test]
-fn open_session_picker_sends_no_arg_to_lua() {
+fn startup_session_picker_emits_plugin_request() {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_lua(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/sessions".into(),
-            description: "Browse sessions".into(),
-            plugin: "sessions".into(),
-            max_args: 1,
-            has_argument_completion: false,
-        }]),
-    );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    app.lua_event_handle = handle;
+    let app = build_app_with_handle(dir.clone(), Arc::new(test_writer(dir)), handle);
 
-    app.open_session_picker();
+    app.open_startup_session_picker();
 
     assert_eq!(
-        probe.try_recv_command(),
-        Some(("/sessions".to_string(), String::new(), 0))
+        probe.try_recv_autocmd(),
+        Some(("SessionPickerRequested".to_owned(), serde_json::json!({})))
     );
 }
 
@@ -3712,41 +4138,6 @@ fn mcp_toggle_dispatches_action() {
     ));
 }
 
-#[test]
-fn mcp_prompt_args_expand_references() {
-    let (_tmp, mut app, backend) = completion_app();
-    seed_skill(&backend, "pdf");
-    app.command_palette = CommandPalette::new(
-        Arc::from([]),
-        McpSnapshotReader::from_snapshot(McpSnapshot {
-            prompts: vec![McpPromptInfo {
-                display_name: "prompt".into(),
-                qualified_name: "srv/prompt".into(),
-                description: "test prompt".into(),
-                arguments: vec![],
-            }],
-            ..Default::default()
-        }),
-        LuaCommandReader::empty(),
-        ModelArgSource::new(Arc::clone(&app.available_models)),
-        ThemeArgSource::new(Arc::clone(&app.theme_provider)),
-        LuaArgumentSource::new(app.lua_event_handle.clone()),
-    );
-
-    let actions = app.execute_command(
-        ParsedCommand {
-            name: "/prompt".into(),
-            args: "@skill:pdf summarize".into(),
-        },
-        0,
-    );
-    let [Action::SendMessage(input)] = actions.as_slice() else {
-        panic!("expected one SendMessage action");
-    };
-    assert_eq!(input.message, "/prompt <skill:pdf> summarize");
-    assert!(input.prompt.is_some());
-}
-
 #[test_case(
     |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); },
     ""
@@ -3802,7 +4193,7 @@ fn alt_o_opens_editor_for_input() {
 }
 
 #[test]
-fn btw_empty_flashes_error() {
+fn btw_empty_is_rejected_by_registry() {
     let mut app = test_app();
     let actions = app.execute_command(
         ParsedCommand {
@@ -3814,7 +4205,7 @@ fn btw_empty_flashes_error() {
     assert!(actions.is_empty());
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "Usage: /btw <question>"
+        "invalid arguments for /btw: expected 1 or more"
     );
 }
 
@@ -3828,7 +4219,9 @@ fn btw_with_question_returns_action() {
         },
         0,
     );
-    assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
+    assert!(
+        matches!(&actions[..], [Action::Btw(q, images)] if q == "what is rust?" && images.is_empty())
+    );
 }
 
 #[test]
@@ -4779,7 +5172,10 @@ fn fast_flashes_error_on_ineligible_model(spec: &str) {
 
     app.execute_command(cmd("/fast"), 0);
     assert!(!app.state.fast);
-    assert_eq!(app.status_bar.flash_text(), Some(FAST_UNSUPPORTED_MSG));
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FAST_UNSUPPORTED_COMMAND_ERROR)
+    );
 }
 
 #[test]
@@ -5644,19 +6040,36 @@ fn word_motion_left_with_completion_open_reaches_input(mods: KeyModifiers) {
 #[test]
 fn at_completion_insertion_synchronizes_argument_completion() {
     let (_tmp, mut app, _backend) = completion_app();
+    let producer = app
+        .command_runtime
+        .registry
+        .create_producer(maki_commands::ProducerPrecedence::Plugin);
+    producer
+        .replace(vec![maki_commands::Registration {
+            spec: maki_commands::CommandSpec {
+                name: Arc::from("/deploy"),
+                aliases: Arc::from([]),
+                arguments: maki_commands::ArgumentArity::bounded(0, 1),
+                docs: maki_commands::CommandDocs {
+                    summary: Arc::from("Deploy"),
+                    argument_hint: None,
+                },
+                required_capabilities: maki_commands::TargetCapabilities::default(),
+            },
+            behavior: Arc::new(TestLuaBehavior {
+                handle: maki_lua::EventHandle::disconnected_for_test(),
+                plugin: Arc::from("deploy"),
+                name: Arc::from("/deploy"),
+            }),
+            completion: Some(Arc::new(TestLuaCompletion {
+                handle: maki_lua::EventHandle::disconnected_for_test(),
+                plugin: Arc::from("deploy"),
+            })),
+        }])
+        .unwrap();
     app.command_palette = CommandPalette::new(
-        Arc::from([]),
-        McpSnapshotReader::empty(),
-        LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/deploy".into(),
-            description: "Deploy".into(),
-            plugin: "deploy".into(),
-            max_args: 1,
-            has_argument_completion: true,
-        }]),
-        ModelArgSource::new(Arc::clone(&app.available_models)),
-        ThemeArgSource::new(Arc::clone(&app.theme_provider)),
-        LuaArgumentSource::new(app.lua_event_handle.clone()),
+        app.command_runtime.registry.clone(),
+        app.command_target.clone(),
     );
     app.input_box.set_input("/deploy @rev".into());
     app.command_palette.sync("/deploy @rev");
@@ -6364,7 +6777,13 @@ fn test_splash_off_settles_idle() {
         splash_animation: false,
         ..Default::default()
     };
-    let mut app = build_app_with_full(dir, writer, LuaCommandReader::empty(), handle, ui);
+    let mut app = build_app_with_full(
+        dir,
+        writer,
+        maki_commands::CommandRegistry::new(),
+        handle,
+        ui,
+    );
     rendered(&mut app); // start the entry fade
     app.main_chat().advance_splash_past_fade();
     let _ = app.tick(); // settle: fade over, still splash is IDLE
@@ -6384,7 +6803,13 @@ fn test_splash_still_repulls_once_on_version_change() {
         splash_animation: false,
         ..Default::default()
     };
-    let mut app = build_app_with_full(dir, writer, LuaCommandReader::empty(), handle.clone(), ui);
+    let mut app = build_app_with_full(
+        dir,
+        writer,
+        maki_commands::CommandRegistry::new(),
+        handle.clone(),
+        ui,
+    );
     // Warm the Lua JIT so the still-splash pull and the forced repull below
     // fit inside the pull timeout even under parallel test load.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

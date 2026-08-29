@@ -22,7 +22,7 @@ pub const OPEN_ELSEWHERE_MSG: &str = "session is open in another terminal; close
 /// Reasons a stored session cannot be continued from this run.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ResumeBlock {
-    #[error("session belongs to {0}; cd there and run `maki -c <ID>` from that directory")]
+    #[error("session belongs to {0}; cd there and run `makima -c <ID>` from that directory")]
     OtherCwd(String),
     #[error("{OPEN_ELSEWHERE_MSG}")]
     OpenElsewhere,

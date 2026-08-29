@@ -27,6 +27,7 @@ A small plugin looks like this:
 maki.api.register_command({
   name = "greet",
   description = "Say hello from Lua",
+  tui_only = false,
   handler = function()
     maki.ui.flash("hello from a plugin!")
   end,
@@ -103,7 +104,7 @@ The rules:
 | [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
-| [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher maki's built-in pickers use. |
+| [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
 | [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override, list, and switch agent modes. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
@@ -349,6 +350,8 @@ browsing memory files or toggling settings.
   - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
     slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
+  - `tui_only` (`boolean`) Required. If true, the command is available only in the interactive TUI.
+  - `argument_hint` (`string`) Optional. Short hint describing the command arguments.
   - `nargs` (`integer|string`) Optional. How many arguments the command
     takes, spelled like nvim's nargs: 0 (default),
     1, "?" (zero or one), "*" (any number), or "+"
@@ -680,12 +683,12 @@ Listen for one or more events. Returns an id you can pass to
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-`"SessionFocusChanged"`, `"SplashShown"`, `"SplashHidden"`, and
-`"StoreChanged"`. Plugins can
+`"SessionFocusChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
+`"SplashHidden"`, and `"StoreChanged"`. Plugins can
 also fire their own events with `exec_autocmds`.
 
-Except `"StoreChanged"`, each host event carries `data.session_id`. For
-`"SessionReset"` that
+Except `"SessionPickerRequested"` and `"StoreChanged"`, each host event
+carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
 running or focused. Tool events also carry `data.tool_id` and `data.tool`.
 `"SessionFocusChanged"` also carries `data.previous_session_id` except on
@@ -2904,7 +2907,7 @@ maki.log.error("failed to connect to API")
 
 ## maki.match {#maki-match}
 
-Fuzzy matching via nucleo, the same matcher maki's built-in pickers use.
+Fuzzy matching via nucleo, the same matcher makima's built-in pickers use.
 
 Use it for type-ahead search over a plugin's own item list.
 
@@ -2923,7 +2926,7 @@ end
 maki.match.fuzzy({query}, {text})
 ```
 
-Fuzzy match {query} against {text} with nucleo, the same matcher maki's
+Fuzzy match {query} against {text} with nucleo, the same matcher makima's
 built-in pickers use. Every whitespace-separated word in {query} must
 match somewhere in {text}; word order does not matter. An empty or
 whitespace-only query matches everything.
@@ -5848,7 +5851,7 @@ print(t.name) -- maki
 
 ## Shared helper modules
 
-These ship inside maki; `require` them from any plugin. Small modules are
+These ship inside makima; `require` them from any plugin. Small modules are
 shown as full source, larger ones as their public interface.
 
 ### `require("maki.color")`

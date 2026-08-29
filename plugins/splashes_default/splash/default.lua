@@ -297,6 +297,6 @@ local function render_splash(w, h, t, fade)
 end
 
 return {
-  description = "The standard Maki splash screen.",
+  description = "The standard Makima splash screen.",
   render = render_splash,
 }

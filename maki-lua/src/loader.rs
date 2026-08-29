@@ -8,13 +8,14 @@ use std::time::Duration;
 use include_dir::{Dir, include_dir};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::ToolRegistry;
+use maki_commands::CommandRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::completion::{CompletionCtx, ItemSpec};
 use crate::api::fs::{FsBackend, RealFs};
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
+use crate::api::util::command::{HintReader, UiAction};
 use crate::api::util::picker::PickerEvent;
 use crate::coalesced_latest::CoalescedLatest;
 use crate::error::PluginError;
@@ -166,6 +167,7 @@ pub struct PluginHost {
     inner: LuaThread,
     plugin_rules: Arc<PluginRuleStore>,
     registry: Arc<ToolRegistry>,
+    command_registry: CommandRegistry,
 }
 
 impl Drop for PluginHost {
@@ -193,11 +195,25 @@ impl PluginHost {
         Self::with_jit(registry, true)
     }
 
+    pub fn with_command_registry(
+        registry: Arc<ToolRegistry>,
+        command_registry: CommandRegistry,
+        jit: bool,
+    ) -> Result<Self, PluginError> {
+        Self::with_jit_and_state_dir(registry, command_registry, jit, Arc::new(RealFs), None)
+    }
+
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
     pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
-        Self::with_jit_and_state_dir(registry, jit, Arc::new(RealFs), None)
+        Self::with_jit_and_state_dir(
+            registry,
+            CommandRegistry::new(),
+            jit,
+            Arc::new(RealFs),
+            None,
+        )
     }
 
     #[cfg(feature = "test-support")]
@@ -206,11 +222,12 @@ impl PluginHost {
         fs: Arc<dyn FsBackend>,
         state_dir: PathBuf,
     ) -> Result<Self, PluginError> {
-        Self::with_jit_and_state_dir(registry, true, fs, Some(state_dir))
+        Self::with_jit_and_state_dir(registry, CommandRegistry::new(), true, fs, Some(state_dir))
     }
 
     fn with_jit_and_state_dir(
         registry: Arc<ToolRegistry>,
+        command_registry: CommandRegistry,
         jit: bool,
         fs: Arc<dyn FsBackend>,
         state_dir: Option<PathBuf>,
@@ -219,17 +236,21 @@ impl PluginHost {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
-            modes,
-            *BUNDLED_DIRS,
-            jit,
-            Arc::clone(&plugin_rules),
-            state_dir,
-            fs,
+            runtime::SpawnConfig {
+                command_registry: command_registry.clone(),
+                modes,
+                bundled_dirs: *BUNDLED_DIRS,
+                jit,
+                plugin_rules: Arc::clone(&plugin_rules),
+                state_dir,
+                fs,
+            },
         )?;
         Ok(Self {
             inner: lua,
             plugin_rules,
             registry,
+            command_registry,
         })
     }
 
@@ -521,8 +542,8 @@ impl PluginHost {
         Arc::clone(&self.inner.modes)
     }
 
-    pub fn command_reader(&self) -> LuaCommandReader {
-        self.inner.command_reader.clone()
+    pub fn command_registry(&self) -> CommandRegistry {
+        self.command_registry.clone()
     }
 
     pub fn keymap_reader(&self) -> KeymapReader {
@@ -793,6 +814,7 @@ impl EventHandle {
                 event,
                 item,
                 cancel,
+                _lifecycle_owner: None,
             });
     }
 
@@ -974,12 +996,33 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
     use std::thread;
     use std::time::Instant;
     use test_case::test_case;
+
+    struct FakeCommandHost;
+
+    impl maki_commands::CommandHost for FakeCommandHost {
+        fn request(
+            &self,
+            _request: maki_commands::HostRequest,
+        ) -> maki_commands::CommandFuture<
+            Result<maki_commands::HostResponse, maki_commands::CommandError>,
+        > {
+            Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
+        }
+    }
+
+    fn command_snapshot(host: &PluginHost) -> maki_commands::RegistrySnapshot {
+        let registry = host.command_registry();
+        let target = registry.bind_target(
+            maki_commands::TargetCapabilities::ALL,
+            Arc::new(FakeCommandHost),
+        );
+        registry.snapshot_for(&target).unwrap()
+    }
 
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
@@ -1050,36 +1093,20 @@ mod tests {
     }
 
     #[test]
-    fn command_writer_reader_pair_works() {
-        let (writer, reader) = LuaCommandWriter::new();
-        let snap = reader.load();
-        assert_eq!(snap.commands.len(), 0);
-
-        writer.publish(vec![LuaCommandInfo {
-            name: Arc::from("/test"),
-            description: Arc::from("desc"),
-            plugin: Arc::from("p"),
-            max_args: 0,
-            has_argument_completion: false,
-        }]);
-        let snap = reader.load();
-        assert_eq!(snap.commands.len(), 1);
-        assert!(snap.generation > 0);
-    }
-
-    #[test]
     fn memory_builtin_registers_command() {
         let reg = Arc::new(ToolRegistry::new());
         let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-        let reader = host.command_reader();
-        let snap = reader.load();
-        let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");
+        let snap = command_snapshot(&host);
+        let found = snap
+            .commands()
+            .iter()
+            .any(|c| c.spec().name.as_ref() == "/memory");
         assert!(
             found,
             "Expected /memory command, found: {:?}",
-            snap.commands
+            snap.commands()
                 .iter()
-                .map(|c| c.name.as_ref())
+                .map(|c| c.spec().name.as_ref())
                 .collect::<Vec<_>>()
         );
     }
@@ -1240,6 +1267,7 @@ mod tests {
             maki.api.register_command({
                 name = "/alpha",
                 description = "from a",
+                tui_only = false,
                 handler = function() end,
             })
             "#,
@@ -1251,15 +1279,20 @@ mod tests {
             maki.api.register_command({
                 name = "/beta",
                 description = "from b",
+                tui_only = false,
                 handler = function() end,
             })
             "#,
         )
         .unwrap();
 
-        let snap = host.command_reader().load();
-        assert_eq!(snap.commands.len(), 2);
-        let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
+        let snap = command_snapshot(&host);
+        assert_eq!(snap.commands().len(), 2);
+        let names: Vec<&str> = snap
+            .commands()
+            .iter()
+            .map(|c| c.spec().name.as_ref())
+            .collect();
         assert!(names.contains(&"/alpha"));
         assert!(names.contains(&"/beta"));
     }
@@ -1273,23 +1306,16 @@ mod tests {
             maki.api.register_command({
                 name = "hello",
                 description = "no slash",
+                tui_only = false,
                 handler = function() end,
             })
             "#,
         )
         .unwrap();
 
-        let snap = host.command_reader().load();
-        assert_eq!(snap.commands.len(), 1);
-        assert_eq!(snap.commands[0].name.as_ref(), "/hello");
-    }
-
-    #[test]
-    fn command_reader_generation_increments_on_publish() {
-        let (writer, reader) = LuaCommandWriter::new();
-        assert_eq!(reader.load().generation, 0);
-        writer.publish(vec![]);
-        assert!(reader.load().generation > 0);
+        let snap = command_snapshot(&host);
+        assert_eq!(snap.commands().len(), 1);
+        assert_eq!(snap.commands()[0].spec().name.as_ref(), "/hello");
     }
 
     /// End-to-end: a plugin registers a keymap override, the override is published
@@ -1308,6 +1334,7 @@ mod tests {
                 maki.api.register_command({
                     name = "/fired",
                     description = "callback ran",
+                    tui_only = false,
                     handler = function() end,
                 })
             end, { desc = "test override" })
@@ -1320,7 +1347,7 @@ mod tests {
         let entry = &snap.entries[0];
         assert_eq!(entry.desc, "test override");
         assert!(
-            host.command_reader().load().commands.is_empty(),
+            command_snapshot(&host).commands().is_empty(),
             "callback has not fired yet"
         );
 
@@ -1329,8 +1356,12 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let cmds = &host.command_reader().load().commands;
-            if cmds.iter().any(|c| c.name.as_ref() == "/fired") {
+            let snapshot = command_snapshot(&host);
+            if snapshot
+                .commands()
+                .iter()
+                .any(|c| c.spec().name.as_ref() == "/fired")
+            {
                 break;
             }
             assert!(

@@ -1,5 +1,5 @@
 base_url = "/docs"
-title = "Maki Docs"
+title = "Makima Docs"
 compile_sass = true
 build_search_index = false
 

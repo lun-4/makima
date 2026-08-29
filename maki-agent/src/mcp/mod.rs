@@ -30,7 +30,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
+use maki_commands::{
+    AgentTurn, ArgumentArity, CommandBehavior, CommandContent, CommandDocs, CommandError,
+    CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, Producer,
+    ProducerPrecedence, PromptReference, Registration, TargetCapabilities, TargetCapability,
+};
 use maki_providers::{ContentBlock, Message};
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -92,6 +97,7 @@ struct McpPromptDef {
     raw_name: String,
     description: String,
     arguments: Vec<protocol::PromptArgument>,
+    identity: Arc<()>,
 }
 
 impl McpPromptDef {
@@ -101,6 +107,7 @@ impl McpPromptDef {
             raw_name: info.name,
             description: info.description.unwrap_or_default(),
             arguments: info.arguments,
+            identity: Arc::new(()),
         }
     }
 
@@ -134,15 +141,10 @@ struct ServerEntry {
 }
 
 impl ServerEntry {
-    async fn clear_connection(&mut self) {
-        if let Some(old) = self.transport.take() {
-            // A live tool call can still be holding an `Arc` to this transport via the
-            // `ToolIndex`, so we cannot rely on `Drop` to reap the child in time.
-            kill_process_groups(&old.child_pids());
-            old.shutdown().await;
-        }
+    fn clear_connection(&mut self) -> Option<Arc<dyn McpTransport>> {
         self.tools.clear();
         self.prompts.clear();
+        self.transport.take()
     }
 
     fn populate(&mut self, result: StartResult) {
@@ -190,6 +192,14 @@ impl ServerEntry {
 struct McpManagerInner {
     entries: Vec<ServerEntry>,
     generation: u64,
+    command_context: Option<McpCommandContext>,
+    command_producer: Option<Producer>,
+}
+
+#[derive(Default)]
+struct McpPublishedState {
+    index: ToolIndex,
+    snapshot: Arc<McpSnapshot>,
 }
 
 #[derive(Default)]
@@ -222,6 +232,7 @@ struct ToolRef {
 struct PromptRef {
     raw_name: String,
     transport: Arc<dyn McpTransport>,
+    identity: Arc<()>,
 }
 
 #[derive(Clone)]
@@ -239,6 +250,96 @@ pub struct McpPromptArg {
     pub required: bool,
 }
 
+#[derive(Clone)]
+struct McpCommandContext {
+    published: Arc<ArcSwap<McpPublishedState>>,
+}
+
+#[derive(Clone)]
+struct McpPromptBehavior {
+    prompt: McpPromptInfo,
+    identity: Arc<()>,
+    published: Arc<ArcSwap<McpPublishedState>>,
+}
+
+impl CommandBehavior for McpPromptBehavior {
+    fn execute(
+        &self,
+        invocation: CommandInvocation,
+    ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+        let arguments = parse_prompt_args(&self.prompt, &invocation.arguments);
+        let missing: Vec<_> = self
+            .prompt
+            .arguments
+            .iter()
+            .filter(|argument| argument.required && !arguments.contains_key(&argument.name))
+            .map(|argument| format!("<{}>", argument.name))
+            .collect();
+        if !missing.is_empty() {
+            let message = format!("Usage: /{} {}", self.prompt.display_name, missing.join(" "));
+            return Box::pin(async move { Err(CommandError::Producer(Arc::from(message))) });
+        }
+        let live = self.published.load();
+        if !live
+            .index
+            .prompts
+            .get(&self.prompt.qualified_name)
+            .is_some_and(|prompt| Arc::ptr_eq(&prompt.identity, &self.identity))
+        {
+            return Box::pin(async {
+                Err(CommandError::Producer(Arc::from(
+                    "MCP prompt is no longer available",
+                )))
+            });
+        }
+        let name = format!("/{}", self.prompt.display_name);
+        let display_text = if invocation.arguments.trim().is_empty() {
+            name
+        } else {
+            format!("{name} {}", invocation.arguments)
+        };
+        let mut arguments: Vec<(Arc<str>, Arc<str>)> = arguments
+            .into_iter()
+            .map(|(name, value)| (Arc::from(name), Arc::from(value)))
+            .collect();
+        arguments.sort_by(|left, right| left.0.cmp(&right.0));
+        let turn = AgentTurn {
+            content: CommandContent {
+                text: Arc::from(display_text),
+                attachments: invocation.content.attachments,
+            },
+            prompt: Some(PromptReference {
+                qualified_name: Arc::from(self.prompt.qualified_name.clone()),
+                arguments: arguments.into(),
+            }),
+        };
+        Box::pin(async move { Ok(CommandOutcome::AgentTurn(turn)) })
+    }
+}
+
+fn parse_prompt_args(prompt: &McpPromptInfo, args: &str) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let mut remaining = args.trim();
+    let Some(last_idx) = prompt.arguments.len().checked_sub(1) else {
+        return result;
+    };
+    for (index, argument) in prompt.arguments.iter().enumerate() {
+        if remaining.is_empty() {
+            break;
+        }
+        if index == last_idx {
+            result.insert(argument.name.clone(), remaining.to_owned());
+        } else if let Some((word, rest)) = remaining.split_once(char::is_whitespace) {
+            result.insert(argument.name.clone(), word.to_owned());
+            remaining = rest.trim_start();
+        } else {
+            result.insert(argument.name.clone(), remaining.to_owned());
+            break;
+        }
+    }
+    result
+}
+
 #[derive(Clone, Default)]
 pub struct McpSnapshot {
     pub infos: Vec<McpServerInfo>,
@@ -250,23 +351,28 @@ pub struct McpSnapshot {
 /// Read-only view of the latest published `McpSnapshot`. Handing this out instead of the
 /// raw `ArcSwap` keeps outside code from publishing snapshots of its own.
 #[derive(Clone)]
-pub struct McpSnapshotReader(Arc<ArcSwap<McpSnapshot>>);
+pub struct McpSnapshotReader(Arc<ArcSwap<McpPublishedState>>);
 
 impl McpSnapshotReader {
     pub fn empty() -> Self {
-        Self::from_snapshot(McpSnapshot::default())
+        Self(Arc::new(
+            ArcSwap::from_pointee(McpPublishedState::default()),
+        ))
     }
 
     pub fn from_snapshot(snapshot: McpSnapshot) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(snapshot)))
+        Self(Arc::new(ArcSwap::from_pointee(McpPublishedState {
+            snapshot: Arc::new(snapshot),
+            ..McpPublishedState::default()
+        })))
     }
 
-    pub fn load(&self) -> Guard<Arc<McpSnapshot>> {
-        self.0.load()
+    pub fn load(&self) -> Arc<McpSnapshot> {
+        Arc::clone(&self.0.load().snapshot)
     }
 
     pub fn load_full(&self) -> Arc<McpSnapshot> {
-        self.0.load_full()
+        self.load()
     }
 }
 
@@ -288,8 +394,7 @@ pub enum McpCommand {
 #[derive(Clone)]
 pub struct McpHandle {
     cmd_tx: flume::Sender<McpCommand>,
-    index: Arc<ArcSwap<ToolIndex>>,
-    snapshot: Arc<ArcSwap<McpSnapshot>>,
+    published: Arc<ArcSwap<McpPublishedState>>,
     /// Never changes after startup, so it lives here instead of being
     /// copied into every republished `ToolIndex`.
     defer_tools: usize,
@@ -359,7 +464,8 @@ impl McpSession {
             .iter()
             .filter_map(|t| t["name"].as_str().map(String::from))
             .collect();
-        let idx = self.handle.index.load();
+        let state = self.handle.published.load();
+        let idx = &state.index;
         let defer =
             idx.descriptors.iter().filter(|d| !d.always_load).count() > self.handle.defer_tools;
         let loaded = self.lock_loaded();
@@ -399,7 +505,8 @@ impl McpSession {
         if tokens.is_empty() {
             return Err(SEARCH_EMPTY_QUERY.into());
         }
-        let idx = self.handle.index.load();
+        let state = self.handle.published.load();
+        let idx = &state.index;
         let mut matches: Vec<(bool, usize, &ToolDescriptor)> = idx
             .descriptors
             .iter()
@@ -497,16 +604,17 @@ impl McpHandle {
     }
 
     pub fn reader(&self) -> McpSnapshotReader {
-        McpSnapshotReader(Arc::clone(&self.snapshot))
+        McpSnapshotReader(Arc::clone(&self.published))
     }
 
     pub fn has_tool(&self, name: &str) -> bool {
-        self.index.load().tools.contains_key(name)
+        self.published.load().index.tools.contains_key(name)
     }
 
     pub fn interned_name(&self, name: &str) -> Arc<str> {
-        self.index
+        self.published
             .load()
+            .index
             .tools
             .get_key_value(name)
             .map(|(k, _)| Arc::clone(k))
@@ -515,8 +623,8 @@ impl McpHandle {
 
     pub async fn call_tool(&self, qualified_name: &str, args: &Value) -> Result<String, McpError> {
         let (raw_name, transport) = {
-            let idx = self.index.load();
-            let Some(t) = idx.tools.get(qualified_name) else {
+            let state = self.published.load();
+            let Some(t) = state.index.tools.get(qualified_name) else {
                 return Err(McpError::UnknownTool {
                     name: qualified_name.into(),
                 });
@@ -532,8 +640,8 @@ impl McpHandle {
         arguments: &HashMap<String, String>,
     ) -> Result<Vec<protocol::PromptMessage>, McpError> {
         let (raw_name, transport) = {
-            let idx = self.index.load();
-            let Some(p) = idx.prompts.get(qualified_name) else {
+            let state = self.published.load();
+            let Some(p) = state.index.prompts.get(qualified_name) else {
                 return Err(McpError::UnknownPrompt {
                     name: qualified_name.into(),
                 });
@@ -566,10 +674,24 @@ impl McpHandle {
 /// Returns as soon as the config is read, so nothing with a screen waits on a
 /// slow `initialize`. Await `McpHandle::ready` before touching the tool index.
 pub async fn start(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
+    start_inner(cwd, None).await
+}
+
+pub async fn start_with_commands(
+    cwd: &Path,
+    registry: CommandRegistry,
+) -> (Option<McpHandle>, McpConfigErrors) {
+    start_inner(cwd, Some(registry)).await
+}
+
+async fn start_inner(
+    cwd: &Path,
+    commands: Option<CommandRegistry>,
+) -> (Option<McpHandle>, McpConfigErrors) {
     tracing::info!(cwd = %cwd.display(), "starting MCP");
     let cwd = cwd.to_owned();
     let (config, config_errors) = smol::unblock(move || load_config(&cwd)).await;
-    (start_with_config(config), config_errors)
+    (start_with_config_inner(config, commands), config_errors)
 }
 
 /// `start` for callers with no frame to protect, who want the tools up front.
@@ -588,6 +710,22 @@ pub async fn start_with_extra(
     cwd: &Path,
     extra: Vec<(String, RawTransport)>,
 ) -> (Option<McpHandle>, McpConfigErrors) {
+    start_with_extra_inner(cwd, extra, None).await
+}
+
+pub async fn start_with_extra_and_commands(
+    cwd: &Path,
+    extra: Vec<(String, RawTransport)>,
+    registry: CommandRegistry,
+) -> (Option<McpHandle>, McpConfigErrors) {
+    start_with_extra_inner(cwd, extra, Some(registry)).await
+}
+
+async fn start_with_extra_inner(
+    cwd: &Path,
+    extra: Vec<(String, RawTransport)>,
+    commands: Option<CommandRegistry>,
+) -> (Option<McpHandle>, McpConfigErrors) {
     let owned_cwd = cwd.to_owned();
     let (mut config, config_errors) = smol::unblock(move || load_config(&owned_cwd)).await;
     for (name, transport) in extra {
@@ -600,35 +738,47 @@ pub async fn start_with_extra(
             }
         }
     }
-    (start_with_config(config), config_errors)
+    (start_with_config_inner(config, commands), config_errors)
 }
 
 pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
+    start_with_config_inner(config, None)
+}
+
+fn start_with_config_inner(
+    config: McpConfig,
+    commands: Option<CommandRegistry>,
+) -> Option<McpHandle> {
     if config.is_empty() {
         tracing::info!("no MCP servers configured, skipping");
         return None;
     }
 
     let defer_tools = config.defer_tools.unwrap_or(DEFAULT_DEFER_TOOLS);
-    let inner = parse_entries(config);
-
-    let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
-    let index: Arc<ArcSwap<ToolIndex>> = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
-    publish(&inner, &index, &snapshot);
+    let published = Arc::new(ArcSwap::from_pointee(McpPublishedState::default()));
+    let (command_context, command_producer) = commands.map_or((None, None), |registry| {
+        (
+            Some(McpCommandContext {
+                published: Arc::clone(&published),
+            }),
+            Some(registry.create_producer(ProducerPrecedence::Mcp)),
+        )
+    });
+    let inner = parse_entries(config, command_context, command_producer);
+    publish(&inner, &published);
 
     let (cmd_tx, cmd_rx) = flume::unbounded();
     let (ready_tx, ready_rx) = flume::bounded(0);
     let handle = McpHandle {
         cmd_tx,
-        index: Arc::clone(&index),
-        snapshot: Arc::clone(&snapshot),
+        published: Arc::clone(&published),
         defer_tools,
         ready_rx,
     };
 
     info!(total = inner.entries.len(), "MCP servers connecting");
 
-    smol::spawn(run(inner, index, snapshot, cmd_rx, ready_tx)).detach();
+    smol::spawn(run(inner, published, cmd_rx, ready_tx)).detach();
     Some(handle)
 }
 
@@ -643,8 +793,7 @@ enum Step {
 
 async fn run(
     mut inner: McpManagerInner,
-    index: Arc<ArcSwap<ToolIndex>>,
-    snapshot: Arc<ArcSwap<McpSnapshot>>,
+    published: Arc<ArcSwap<McpPublishedState>>,
     cmd_rx: flume::Receiver<McpCommand>,
     ready_tx: flume::Sender<Infallible>,
 ) {
@@ -684,10 +833,10 @@ async fn run(
                 }
             }
             Step::Command(McpCommand::Toggle { server, enabled }) => {
-                handle_toggle(&mut inner, &server, enabled).await;
+                handle_toggle(&mut inner, &published, &server, enabled).await;
             }
             Step::Command(McpCommand::Reconnect { server }) => {
-                handle_reconnect(&mut inner, &server).await;
+                handle_reconnect(&mut inner, &published, &server).await;
             }
             Step::Command(McpCommand::Shutdown { ack: tx }) => {
                 ack = Some(tx);
@@ -696,12 +845,15 @@ async fn run(
             Step::Closed => break,
         }
         inner.generation += 1;
-        publish(&inner, &index, &snapshot);
+        publish(&inner, &published);
     }
     drop(connects);
     shutdown_all(&mut inner).await;
     inner.generation += 1;
-    publish(&inner, &index, &snapshot);
+    publish(&inner, &published);
+    if let Some(producer) = inner.command_producer.take() {
+        producer.remove();
+    }
     if let Some(tx) = ack {
         let _ = tx.try_send(());
     }
@@ -730,7 +882,12 @@ fn release_ready(inner: &McpManagerInner, ready: &mut Option<flume::Sender<Infal
     );
 }
 
-async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: bool) {
+async fn handle_toggle(
+    inner: &mut McpManagerInner,
+    published: &ArcSwap<McpPublishedState>,
+    server_name: &str,
+    enabled: bool,
+) {
     if let Some(path) = inner
         .entries
         .iter()
@@ -741,12 +898,14 @@ async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: 
     }
 
     if enabled {
-        if let Err(e) = refresh_server(inner, server_name).await {
+        if let Err(e) = refresh_server(inner, published, server_name).await {
             warn!(server = %server_name, error = %e, "MCP server refresh failed");
         }
     } else if let Some(entry) = inner.entries.iter_mut().find(|e| e.name == server_name) {
-        entry.clear_connection().await;
+        let old = entry.clear_connection();
         entry.status = McpServerStatus::Disabled;
+        publish_next(inner, published);
+        shutdown_transport(old).await;
     }
 
     info!(server = server_name, enabled, "MCP toggle complete");
@@ -754,7 +913,11 @@ async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: 
 
 /// Restart the server with its stored config. Fresh OAuth tokens are picked up
 /// from storage by the transport, so no credentials travel through the command.
-async fn handle_reconnect(inner: &mut McpManagerInner, server_name: &str) {
+async fn handle_reconnect(
+    inner: &mut McpManagerInner,
+    published: &ArcSwap<McpPublishedState>,
+    server_name: &str,
+) {
     let Some(entry) = inner.entries.iter().find(|e| e.name == server_name) else {
         warn!(server = server_name, "reconnect for unknown server");
         return;
@@ -766,18 +929,24 @@ async fn handle_reconnect(inner: &mut McpManagerInner, server_name: &str) {
         );
         return;
     }
-    if let Err(e) = refresh_server(inner, server_name).await {
+    if let Err(e) = refresh_server(inner, published, server_name).await {
         warn!(server = %server_name, error = %e, "reconnect failed");
     }
     info!(server = server_name, "MCP reconnect complete");
 }
 
 async fn shutdown_all(inner: &mut McpManagerInner) {
+    let mut transports = Vec::new();
     for entry in &mut inner.entries {
-        entry.clear_connection().await;
+        if let Some(transport) = entry.clear_connection() {
+            transports.push(transport);
+        }
         if entry.status != McpServerStatus::Disabled {
             entry.status = McpServerStatus::Failed("shutdown".into());
         }
+    }
+    for transport in transports {
+        shutdown_transport(Some(transport)).await;
     }
     info!("MCP command loop shutting down");
 }
@@ -785,7 +954,11 @@ async fn shutdown_all(inner: &mut McpManagerInner) {
 /// Tear the old transport down and wipe tools/prompts *before* starting the new one. That way
 /// a failed start leaves the entry empty instead of holding zombie tool references into a dead
 /// transport.
-async fn refresh_server(inner: &mut McpManagerInner, server_name: &str) -> Result<(), McpError> {
+async fn refresh_server(
+    inner: &mut McpManagerInner,
+    published: &ArcSwap<McpPublishedState>,
+    server_name: &str,
+) -> Result<(), McpError> {
     let Some(idx) = inner.entries.iter().position(|e| e.name == server_name) else {
         return Err(McpError::Config(format!("unknown server '{server_name}'")));
     };
@@ -795,11 +968,13 @@ async fn refresh_server(inner: &mut McpManagerInner, server_name: &str) -> Resul
         .clone()
         .ok_or_else(|| McpError::Config(format!("server '{server_name}' has no config")))?;
 
-    {
+    let old = {
         let entry = &mut inner.entries[idx];
         entry.status = McpServerStatus::Connecting;
-        entry.clear_connection().await;
-    }
+        entry.clear_connection()
+    };
+    publish_next(inner, published);
+    shutdown_transport(old).await;
 
     let result = start_server(&config).await;
     apply_start_result(&mut inner.entries[idx], result, "refresh")?;
@@ -809,6 +984,18 @@ async fn refresh_server(inner: &mut McpManagerInner, server_name: &str) -> Resul
         "MCP server refreshed"
     );
     Ok(())
+}
+
+fn publish_next(inner: &mut McpManagerInner, published: &ArcSwap<McpPublishedState>) {
+    inner.generation += 1;
+    publish(inner, published);
+}
+
+async fn shutdown_transport(transport: Option<Arc<dyn McpTransport>>) {
+    if let Some(transport) = transport {
+        kill_process_groups(&transport.child_pids());
+        transport.shutdown().await;
+    }
 }
 
 fn status_from_err(e: &McpError) -> McpServerStatus {
@@ -884,7 +1071,11 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
     })
 }
 
-fn parse_entries(config: McpConfig) -> McpManagerInner {
+fn parse_entries(
+    config: McpConfig,
+    command_context: Option<McpCommandContext>,
+    command_producer: Option<Producer>,
+) -> McpManagerInner {
     let origins = config.origins;
     let mut entries = Vec::with_capacity(config.mcp.len());
 
@@ -919,6 +1110,8 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
     McpManagerInner {
         entries,
         generation: 0,
+        command_context,
+        command_producer,
     }
 }
 
@@ -963,8 +1156,53 @@ fn apply_start_result(
     }
 }
 
+fn prompt_argument_hint(arguments: &[McpPromptArg]) -> Option<Arc<str>> {
+    (!arguments.is_empty()).then(|| {
+        arguments
+            .iter()
+            .map(|argument| {
+                if argument.required {
+                    format!("<{}>", argument.name)
+                } else {
+                    format!("[<{}>]", argument.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .into()
+    })
+}
+
+fn prompt_registration(
+    entry: &ServerEntry,
+    prompt: &McpPromptDef,
+    context: &McpCommandContext,
+) -> Registration {
+    let info = prompt.to_info(&entry.name);
+    Registration {
+        spec: CommandSpec {
+            name: Arc::from(format!("/{}", info.display_name)),
+            aliases: Arc::from([]),
+            arguments: ArgumentArity::unbounded(0),
+            docs: CommandDocs {
+                summary: Arc::from(info.description.as_str()),
+                argument_hint: prompt_argument_hint(&info.arguments),
+            },
+            required_capabilities: TargetCapabilities::from_capability(
+                TargetCapability::AgentTurns,
+            ),
+        },
+        behavior: Arc::new(McpPromptBehavior {
+            prompt: info,
+            identity: Arc::clone(&prompt.identity),
+            published: Arc::clone(&context.published),
+        }),
+        completion: None,
+    }
+}
+
 /// The only place read-side state is updated. Every mutation in the command loop ends here.
-fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSwap<McpSnapshot>) {
+fn publish(inner: &McpManagerInner, published: &ArcSwap<McpPublishedState>) {
     let mut tools = HashMap::new();
     let mut prompts = HashMap::new();
     let mut descriptors: Vec<ToolDescriptor> = Vec::new();
@@ -1011,6 +1249,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                     PromptRef {
                         raw_name: p.raw_name.clone(),
                         transport: Arc::clone(transport),
+                        identity: Arc::clone(&p.identity),
                     },
                 );
                 prompt_infos.push(p.to_info(&entry.name));
@@ -1030,17 +1269,39 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
         });
     }
 
-    index.store(Arc::new(ToolIndex {
-        tools,
-        prompts,
-        descriptors: descriptors.into(),
-    }));
-    snapshot.store(Arc::new(McpSnapshot {
-        infos: server_infos,
-        prompts: prompt_infos,
-        pids,
-        generation: inner.generation,
-    }));
+    let state = Arc::new(McpPublishedState {
+        index: ToolIndex {
+            tools,
+            prompts,
+            descriptors: descriptors.into(),
+        },
+        snapshot: Arc::new(McpSnapshot {
+            infos: server_infos,
+            prompts: prompt_infos,
+            pids,
+            generation: inner.generation,
+        }),
+    });
+    let registrations = inner.command_context.as_ref().map(|context| {
+        inner
+            .entries
+            .iter()
+            .filter(|entry| entry.status == McpServerStatus::Running)
+            .flat_map(|entry| {
+                entry
+                    .prompts
+                    .iter()
+                    .map(|prompt| prompt_registration(entry, prompt, context))
+            })
+            .collect()
+    });
+    published.store(Arc::clone(&state));
+    if let (Some(producer), Some(registrations)) = (&inner.command_producer, registrations)
+        && let Err(error) = producer.replace(registrations)
+    {
+        producer.replace(Vec::new()).ok();
+        warn!(%error, "failed to publish MCP prompt commands");
+    }
 }
 
 /// Session for dispatch-level tests outside this module, built through the
@@ -1071,15 +1332,15 @@ pub(crate) fn stub_session(tools: &[(&str, &str)]) -> McpSession {
     let inner = McpManagerInner {
         entries: vec![entry],
         generation: 0,
+        command_context: None,
+        command_producer: None,
     };
-    let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
-    let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
-    publish(&inner, &index, &snapshot);
+    let published = Arc::new(ArcSwap::from_pointee(McpPublishedState::default()));
+    publish(&inner, &published);
     McpSession::new(
         McpHandle {
             cmd_tx: flume::unbounded().0,
-            index,
-            snapshot,
+            published,
             defer_tools: 0,
             ready_rx: flume::bounded(0).1,
         },
@@ -1391,14 +1652,14 @@ mod tests {
         let inner = McpManagerInner {
             entries,
             generation: 0,
+            command_context: None,
+            command_producer: None,
         };
-        let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
-        let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
-        publish(&inner, &index, &snapshot);
+        let published = Arc::new(ArcSwap::from_pointee(McpPublishedState::default()));
+        publish(&inner, &published);
         let handle = McpHandle {
             cmd_tx: flume::unbounded().0,
-            index,
-            snapshot,
+            published,
             defer_tools,
             ready_rx: flume::bounded(0).1,
         };
@@ -1412,7 +1673,7 @@ mod tests {
             ("alpha", stdio_raw(&["a"])),
             ("mid", stdio_raw(&["m"])),
         ]);
-        let inner = parse_entries(config);
+        let inner = parse_entries(config, None, None);
         let names: Vec<&str> = inner.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
@@ -1792,10 +2053,14 @@ mod tests {
     fn failed_refresh_clears_entry() {
         smol::block_on(async {
             let t = FakeTransport::new();
-            let (mut inner, _) = setup(vec![fake_entry("srv", Arc::clone(&t) as _)]);
+            let (mut inner, handle) = setup(vec![fake_entry("srv", Arc::clone(&t) as _)]);
             inner.entries[0].config = Some(bad_stdio_config("srv"));
 
-            assert!(refresh_server(&mut inner, "srv").await.is_err());
+            assert!(
+                refresh_server(&mut inner, &handle.published, "srv")
+                    .await
+                    .is_err()
+            );
 
             let entry = &inner.entries[0];
             assert_eq!(t.shutdowns(), 1);
@@ -1817,8 +2082,7 @@ mod tests {
             handle.extend_tools(&mut tools);
             assert_eq!(tools[0]["name"], TOOL_SEARCH_TOOL_NAME);
 
-            handle_toggle(&mut inner, "srv", false).await;
-            publish(&inner, &handle.index, &handle.snapshot);
+            handle_toggle(&mut inner, &handle.published, "srv", false).await;
 
             let entry = &inner.entries[0];
             assert_eq!(t.shutdowns(), 1);
@@ -1851,8 +2115,8 @@ mod tests {
 
             entered.recv_async().await.unwrap();
             inner.generation += 1;
-            publish(&inner, &handle.index, &handle.snapshot);
-            assert_eq!(handle.snapshot.load().generation, 1);
+            publish(&inner, &handle.published);
+            assert_eq!(handle.reader().load().generation, 1);
 
             drop(held);
             call_handle.await;
@@ -1869,14 +2133,14 @@ mod tests {
                     fake_entry("b", Arc::clone(&t2) as _),
                 ],
                 generation: 0,
+                command_context: None,
+                command_producer: None,
             };
-            let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
-            let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
+            let published = Arc::new(ArcSwap::from_pointee(McpPublishedState::default()));
             let (cmd_tx, cmd_rx) = flume::unbounded();
             let loop_task = smol::spawn(run(
                 inner,
-                Arc::clone(&index),
-                Arc::clone(&snapshot),
+                Arc::clone(&published),
                 cmd_rx,
                 flume::bounded(0).0,
             ));
@@ -1888,7 +2152,50 @@ mod tests {
 
             assert_eq!(t1.shutdowns(), 1);
             assert_eq!(t2.shutdowns(), 1);
-            assert!(snapshot.load().infos.iter().all(|i| i.tool_count == 0));
+            assert!(
+                published
+                    .load()
+                    .snapshot
+                    .infos
+                    .iter()
+                    .all(|i| i.tool_count == 0)
+            );
+        });
+    }
+
+    #[test]
+    fn command_producer_is_removed_on_every_loop_exit() {
+        smol::block_on(async {
+            let registry = CommandRegistry::new();
+            for explicit_shutdown in [true, false, true, false] {
+                let published = Arc::new(ArcSwap::from_pointee(McpPublishedState::default()));
+                let producer = registry.create_producer(ProducerPrecedence::Mcp);
+                let retained = producer.clone();
+                let inner = McpManagerInner {
+                    entries: Vec::new(),
+                    generation: 0,
+                    command_context: Some(McpCommandContext {
+                        published: Arc::clone(&published),
+                    }),
+                    command_producer: Some(producer),
+                };
+                let (cmd_tx, cmd_rx) = flume::unbounded();
+                let loop_task = smol::spawn(run(inner, published, cmd_rx, flume::bounded(0).0));
+
+                if explicit_shutdown {
+                    let (ack_tx, ack_rx) = flume::bounded(1);
+                    cmd_tx.send(McpCommand::Shutdown { ack: ack_tx }).unwrap();
+                    ack_rx.recv_async().await.unwrap();
+                } else {
+                    drop(cmd_tx);
+                }
+                loop_task.await;
+
+                assert!(matches!(
+                    retained.replace(Vec::new()),
+                    Err(maki_commands::RegistrationError::StaleProducer)
+                ));
+            }
         });
     }
 

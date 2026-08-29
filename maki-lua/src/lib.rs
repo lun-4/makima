@@ -16,9 +16,8 @@ pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::time::format_ago;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, CommandArgumentItem, Dimension, Edge, FloatConfig,
-    FloatConfigPatch, HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest,
-    SessionReply, SessionRequest, Split, TitlePos, UiAction, UiReply, WinCommand, WinEvent,
-    WinView,
+    FloatConfigPatch, HintReader, HintSnapshot, ModelRequest, SessionReply, SessionRequest, Split,
+    TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use api::util::picker::{PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
@@ -36,23 +35,8 @@ pub use api::completion::{AtToken, CompletionCtx, ItemSpec, at_is_token_start, p
 #[cfg(feature = "test-support")]
 pub mod test_support {
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
-    use crate::api::util::command::{
-        HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
-    };
+    use crate::api::util::command::{HintEntries, HintReader, HintWriter};
     use crate::{EventHandle, KeymapReader, PluginHost, TestCompletionBackend};
-
-    pub struct LuaCommandWriterHandle(LuaCommandWriter);
-
-    impl LuaCommandWriterHandle {
-        pub fn publish(&self, commands: Vec<LuaCommandInfo>) {
-            self.0.publish(commands);
-        }
-    }
-
-    pub fn lua_command_writer_pair() -> (LuaCommandWriterHandle, LuaCommandReader) {
-        let (writer, reader) = LuaCommandWriter::new();
-        (LuaCommandWriterHandle(writer), reader)
-    }
 
     /// Stands in for the Lua thread publishing a plugin's status hints.
     pub struct HintWriterHandle(HintWriter);
@@ -151,7 +135,10 @@ pub mod test_support {
             &self,
         ) -> Option<(&'static str, Option<String>, bool)> {
             use crate::runtime::{CommandArgumentLifecycle, Request};
-            while let Ok(req) = self.0.try_recv() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+                let req = self.0.recv_timeout(remaining).ok()?;
                 if let Request::CommandArgumentLifecycle(work) = req {
                     let latest = !work.is_superseded();
                     let event = match work.value().event {
@@ -168,7 +155,6 @@ pub mod test_support {
                     return Some((event, insertion, latest));
                 }
             }
-            None
         }
 
         pub fn try_finish_splash_frame(

@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
-use maki_providers::{Message, ModelTier};
+use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
 
 pub(crate) const CHEVRON: &str = "❯ ";
@@ -222,7 +222,7 @@ pub enum Action {
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,
-    Btw(String),
+    Btw(String, Vec<ImageSource>),
     Bell,
     Suspend,
 }

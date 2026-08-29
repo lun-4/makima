@@ -5,23 +5,23 @@ weight = 23
 group = "Guides"
 +++
 
-# Writing maki plugins
+# Writing makima plugins
 
-Maki plugins are plain Lua files (Luau) that run inside maki. A plugin can
+Makima plugins are plain Lua files (Luau) that run inside makima. A plugin can
 register tools the LLM calls, slash commands, keymaps, prompt hints, and
 custom UI. Everything lives under the global `maki` table. The full API
 reference is at the end of this document.
 
 ## Where plugin code goes
 
-Plugins live in the maki config dir. There are two of them, same layout:
+Plugins live in the makima config dir. There are two of them, same layout:
 
 - `~/.config/makima/` - global, every project (if `~/.makima/` exists, makima reads
   that one instead)
 - `<project>/.makima/` - this project only
 
 ```
-init.lua        the only file maki runs; require()s plugins, calls maki.setup()
+init.lua        the only file makima runs; require()s plugins, calls maki.setup()
 lua/<name>.lua  plugin modules, loaded by require("<name>")
 plugin.toml     permission grants for every Lua file in the dir
 ```
@@ -91,7 +91,7 @@ the interpreter, with full debug info.
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
-- Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
+- Reusable helpers ship with makima; see "Shared helper modules" in the API reference.
 
 ## A complete real example
 

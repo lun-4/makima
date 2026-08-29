@@ -258,6 +258,10 @@ impl InputBox {
         Some(Submission { text, images })
     }
 
+    pub(crate) fn take_pending_images(&mut self) -> Vec<ImageSource> {
+        mem::take(&mut self.pending_images)
+    }
+
     pub fn discard(&mut self) {
         self.pending_images.clear();
         self.history_index = None;
@@ -370,7 +374,7 @@ impl InputBox {
             let placeholder_base = theme::current().input_placeholder;
             let (head, tail) = match placeholder {
                 Placeholder::Suggestion => (
-                    "Ask maki to ",
+                    "Ask makima to ",
                     vec![
                         Span::styled(
                             self.placeholder_hint,

@@ -968,11 +968,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(root)
-            .status()
-            .unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
         fs::write(root.join(".gitignore"), "*.log\n").unwrap();
         fs::write(root.join("test.log"), "log data").unwrap();
         fs::write(root.join("test.txt"), "text data").unwrap();

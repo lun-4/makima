@@ -1,11 +1,11 @@
--- Bundled splash, part of the maki distribution.
+-- Bundled splash, part of the makima distribution.
 -- Require from init.lua with:   local splash = require("splash.aurora")
 -- The module returns M with M.description and M.render(w, h, t, fade) and does not activate itself.
 --
 -- Aurora splash. Software port of the WGSL "Aurora" shader from
 
 local RAMP = " .:-=+*#%@"
-local SAMPLE_STEP = 4
+local SAMPLE_STEP = 2
 local M = {}
 M.description = "Drifting northern lights over a dark gradient."
 
@@ -58,16 +58,12 @@ local function flat_rows(w, h, st)
   return rows
 end
 
--- 5-bit-per-channel quantized style keyed by number, so string.format only
--- runs on cache miss; keeps the style cache bounded.
-local MERGE_TOL = 1
-
 -- 5-bit keyed style: quantize to 0..31 per channel (so a `31`-step grid maps
--- back to 8-bit hex on cache miss) and key on the components directly. This
--- drops the per-cell *255/31 round-trip, and `MERGE_TOL` (one step ~= 8/255)
--- lets the row builder merge runs whose colors drift by a step; that cuts
--- segment count (and Rust-side parse cost) several-fold with no visible
--- banding.
+-- back to 8-bit hex on cache miss) and key on the components directly. Runs
+-- coalesce only on exact keys: tolerance merging makes the aurora's thin,
+-- bright contours unstable as neighboring color buckets change between frames.
+local MERGE_TOL = 0
+
 local function quantize5(v)
   if v < 0 then
     v = 0

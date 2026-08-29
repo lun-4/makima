@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
@@ -59,6 +59,7 @@ pub struct StatusBarContext<'a> {
 pub struct StatusBar {
     flash: Option<(String, Instant)>,
     started_at: Instant,
+    cwd: PathBuf,
     cwd_branch: String,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
@@ -66,12 +67,14 @@ pub struct StatusBar {
 
 impl StatusBar {
     pub fn new(flash_duration: Duration) -> Self {
+        let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
         Self {
             flash: None,
             started_at: Instant::now(),
-            cwd_branch: cwd_branch_label(),
+            cwd_branch: cwd_branch_label(&cwd),
+            branch_update_rx: spawn_branch_watcher(&cwd),
+            cwd,
             flash_duration,
-            branch_update_rx: spawn_branch_watcher(),
         }
     }
 
@@ -84,8 +87,10 @@ impl StatusBar {
         self.flash.as_ref().map(|(s, _)| s.as_str())
     }
 
-    pub fn refresh_cwd(&mut self) {
-        self.cwd_branch = cwd_branch_label();
+    pub fn set_cwd(&mut self, cwd: PathBuf) {
+        self.cwd_branch = cwd_branch_label(&cwd);
+        self.branch_update_rx = spawn_branch_watcher(&cwd);
+        self.cwd = cwd;
     }
 
     pub(crate) fn cwd_branch(&self) -> &str {
@@ -99,7 +104,7 @@ impl StatusBar {
         if rx.try_iter().next().is_none() {
             return Dirty::NO;
         }
-        let branch = cwd_branch_label();
+        let branch = cwd_branch_label(&self.cwd);
         let changed = branch != self.cwd_branch;
         self.cwd_branch = branch;
         Dirty::from(changed)
@@ -290,10 +295,8 @@ fn collapse_home_with(path: &str, home: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn cwd_branch_label() -> String {
-    let cwd = env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| ".".into());
+fn cwd_branch_label(cwd: &Path) -> String {
+    let cwd = cwd.to_string_lossy();
     let label = collapse_home(&cwd);
     match detect_branch(&cwd) {
         Some(branch) => format!("{label}:{branch}"),
@@ -316,15 +319,25 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
         if git.is_dir() {
             return Some(git);
         }
+        if git.is_file() {
+            // Linked worktrees store a pointer here instead of a Git directory.
+            let contents = std::fs::read_to_string(git).ok()?;
+            let path = contents.trim().strip_prefix("gitdir: ")?;
+            let path = Path::new(path);
+            return Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                dir.join(path)
+            });
+        }
         dir = dir.parent()?;
     }
 }
 
-fn spawn_branch_watcher() -> Option<flume::Receiver<()>> {
+fn spawn_branch_watcher(cwd: &Path) -> Option<flume::Receiver<()>> {
     use notify::{RecursiveMode, Watcher};
 
-    let cwd = env::current_dir().ok()?;
-    let git_dir = find_git_dir(&cwd)?;
+    let git_dir = find_git_dir(cwd)?;
     let (tx, rx) = flume::bounded(1);
 
     std::thread::spawn(move || {
@@ -461,6 +474,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detect_branch_from_worktree_gitfile() {
+        let (_main, main_path) = tmp_with_head(None);
+        let worktree = TempDir::new().unwrap();
+        let git_dir = Path::new(&main_path).join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        let worktree_git = git_dir.join("worktrees/feature");
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(worktree_git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_branch(&worktree.path().to_string_lossy()),
+            Some("feature".to_string())
+        );
+    }
+
     /// Once the flash is gone nothing clears the debt, so only the tick that
     /// removes it may report a change, or the loop never settles. The two
     /// lifetimes stand in for time passing: rewinding an `Instant` by an hour
@@ -487,7 +521,8 @@ mod tests {
     #[test_case(false => Dirty::NO  ; "unchanged_branch")]
     #[test_case(true  => Dirty::YES ; "switched_branch")]
     fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
-        let label = cwd_branch_label();
+        let cwd = env::current_dir().unwrap();
+        let label = cwd_branch_label(&cwd);
         let (tx, rx) = flume::bounded(1);
         let mut bar = StatusBar::new(FLASH_TTL);
         bar.cwd_branch = if stale {

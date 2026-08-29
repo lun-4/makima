@@ -6,9 +6,9 @@ edition.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-commands = { workspace = true }
 maki-highlight = { workspace = true }
 maki-markdown = { workspace = true }
-maki-match = { workspace = true }
 maki-providers = { workspace = true }
 maki-lua = { workspace = true }
 maki-storage = { workspace = true }
