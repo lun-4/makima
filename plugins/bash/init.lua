@@ -268,11 +268,6 @@ local opts = maki.api.register_options(output_limits.extend({
     type = "string",
     desc = "Model spec for the bash auto-mode classifier. Unset: inherits the current session model.",
   },
-  auto_mode_ask_on_deny = {
-    default = false,
-    type = "boolean",
-    desc = "When the classifier denies a command, show the permission prompt instead of denying it outright.",
-  },
 }))
 
 bh.set_auto_mode(opts.auto_mode)
@@ -386,32 +381,42 @@ maki.api.register_tool({
       if verdict == "approve" then
         auto_annotation = { { "auto-mode: allowed", "dim" } }
         -- fall through to the jobstart path unchanged
-      else
-        local scopes = (verdict == "deny" and opts.auto_mode_ask_on_deny) and command_scopes(input.command)
-        if scopes then
-          -- Escalate to the normal permission prompt on the raw input text,
-          -- so allow rules and prompt text match the automode-off path.
-          local ok, perr = maki.agent.permission_prompt(ctx, {
-            tool = "bash",
-            scopes = scopes.scopes,
-            force_prompt = scopes.force_prompt,
-          })
-          if ok then
-            auto_annotation = { { "auto-mode: denied, allowed by user", "dim" } }
-            -- fall through to the jobstart path unchanged
-          else
-            return {
-              llm_output = perr or "command denied by auto-mode",
-              is_error = true,
-            }
-          end
-        else
+      elseif verdict == "deny" then
+        if maki.agent.is_yolo(ctx) then
+          -- YOLO: no prompts, the classifier's deny is final.
           return {
-            llm_output = "command denied by auto-mode: "
-              .. ((verdict == "deny" and reason) or err or "no classifier verdict"),
+            llm_output = "command denied by auto-mode: " .. (reason or "no classifier verdict"),
             is_error = true,
           }
         end
+        local scopes = command_scopes(input.command)
+        if not scopes then
+          return {
+            llm_output = "command denied by auto-mode: " .. (reason or "no classifier verdict"),
+            is_error = true,
+          }
+        end
+        -- Escalate to the normal permission prompt on the raw input text,
+        -- so allow rules and prompt text match the automode-off path.
+        local ok, perr = maki.agent.permission_prompt(ctx, {
+          tool = "bash",
+          scopes = scopes.scopes,
+          force_prompt = scopes.force_prompt,
+        })
+        if ok then
+          auto_annotation = { { "auto-mode: denied, allowed by user", "dim" } }
+          -- fall through to the jobstart path unchanged
+        else
+          return {
+            llm_output = perr or "command denied by auto-mode",
+            is_error = true,
+          }
+        end
+      else
+        return {
+          llm_output = "command denied by auto-mode: " .. (err or "no classifier verdict"),
+          is_error = true,
+        }
       end
     end
 
