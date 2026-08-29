@@ -116,6 +116,7 @@ pub enum CompletionAction {
 struct Session {
     nucleo: Nucleo<()>,
     query: String,
+    query_refresh_pending: bool,
     intent: QueryIntent,
     /// Non-file candidates from Lua sources, as `(matchable label, item)`.
     /// Re-fuzzy-matched against each new query in `sync_query`.
@@ -192,6 +193,7 @@ impl FileCompletionMenu {
         let session = Session {
             nucleo,
             query: String::new(),
+            query_refresh_pending: false,
             intent: QueryIntent {
                 payload: String::new(),
                 kind: None,
@@ -267,8 +269,10 @@ impl FileCompletionMenu {
             false,
         );
         let intent = parse_query(query);
-        if s.query != query {
-            s.file_matches.clear();
+        let query_changed = s.query != query;
+        if query_changed {
+            s.query_refresh_pending =
+                !s.file_matches.is_empty() && s.nucleo.injector().injected_items() > 0;
             s.coarse_match_count = 0;
             s.materialized_count = 0;
             s.final_match_count = 0;
@@ -287,7 +291,9 @@ impl FileCompletionMenu {
                 .enumerate()
                 .map(|(order, (label, item))| (label, item, order)),
         );
-        rebuild_combined(s);
+        if !s.query_refresh_pending {
+            rebuild_combined(s);
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> CompletionAction {
@@ -298,7 +304,7 @@ impl FileCompletionMenu {
         match key.code {
             KeyCode::Esc => return CompletionAction::Close,
             KeyCode::Enter | KeyCode::Tab => {
-                if !s.visible {
+                if !s.visible || s.query_refresh_pending {
                     return CompletionAction::Passthrough;
                 }
                 return match s.matches.get(s.selected).map(|c| c.item.clone()) {
@@ -360,12 +366,18 @@ impl FileCompletionMenu {
             }
         }
 
-        if status.changed
-            && let Some(s) = self.session.as_mut()
-        {
-            refresh_file_matches(s);
-            rebuild_combined(s);
-            clamp_selection(s);
+        if let Some(s) = self.session.as_mut() {
+            let refresh_finished = s.query_refresh_pending && !status.running;
+            if refresh_finished {
+                refresh_file_matches(s);
+                rebuild_combined(s);
+                clamp_selection(s);
+                s.query_refresh_pending = false;
+            } else if !s.query_refresh_pending && status.changed {
+                refresh_file_matches(s);
+                rebuild_combined(s);
+                clamp_selection(s);
+            }
         }
 
         (dirty, None)
@@ -771,6 +783,7 @@ mod tests {
         menu.session = Some(Session {
             nucleo,
             query: String::new(),
+            query_refresh_pending: false,
             intent: QueryIntent {
                 payload: String::new(),
                 kind: None,
@@ -1052,6 +1065,8 @@ mod tests {
             source_rank: 0,
             source_order: 0,
         }];
+        s.nucleo.restart(true);
+        s.file_matches.clear();
         menu.sync_query("sk");
         let s = menu.session.as_ref().unwrap();
         assert!(!s.matches.is_empty());
@@ -1614,15 +1629,15 @@ mod tests {
         });
         session.walking = false;
         menu.sync_query("needle");
-        for _ in 0..100 {
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while menu.session.as_ref().unwrap().query_refresh_pending
+            || menu.session.as_ref().unwrap().file_matches.is_empty()
+        {
             let _ = menu.tick();
-            if !menu.session.as_ref().unwrap().file_matches.is_empty() {
-                break;
-            }
+            assert!(Instant::now() < deadline, "file matcher did not settle");
+            std::thread::yield_now();
         }
-        let session = menu.session.as_mut().unwrap();
-        session.visible = true;
-        session.matches = session.file_matches.clone();
+        menu.session.as_mut().unwrap().visible = true;
         assert!(
             matches!(menu.handle_key(key(KeyCode::Enter)), CompletionAction::Select(item) if item.label == "needle-file")
         );
@@ -1634,6 +1649,41 @@ mod tests {
         menu.sync_query("needle");
         add_file(&mut menu, "needle-file");
         assert_eq!(labels(&menu), vec!["needle-file", "needle-plugin"]);
+    }
+
+    #[test]
+    fn query_refresh_keeps_previous_result_set_until_matching_finishes() {
+        let mut menu = session_with_items(Vec::new());
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.walking = false;
+            for path in ["alpha-file", "beta-file", "gamma-file"] {
+                session.nucleo.injector().push((), |_, columns| {
+                    columns[0] = Utf32String::from(path);
+                });
+            }
+        }
+        menu.sync_query("");
+        for _ in 0..100 {
+            let _ = menu.tick();
+            if menu.session.as_ref().unwrap().file_matches.len() == 3 {
+                break;
+            }
+        }
+        let before = labels(&menu);
+        assert_eq!(before, vec!["alpha-file", "beta-file", "gamma-file"]);
+
+        menu.sync_query("gamma");
+        assert!(menu.session.as_ref().unwrap().query_refresh_pending);
+        assert_eq!(labels(&menu), before);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while menu.session.as_ref().unwrap().query_refresh_pending {
+            let _ = menu.tick();
+            assert!(Instant::now() < deadline, "file matcher did not settle");
+            std::thread::yield_now();
+        }
+        assert_eq!(labels(&menu), vec!["gamma-file"]);
     }
 
     #[test]
