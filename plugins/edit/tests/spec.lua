@@ -316,6 +316,19 @@ end)
 
 local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
+local preserve_line_endings = require("edit_helpers").preserve_line_endings
+
+local function edit_lines(content, start_line, end_line, new_string)
+  return preserve_line_endings(content, function(lf)
+    return replace_lines(lf, start_line, end_line, new_string)
+  end)
+end
+
+local function fuzzy_edit(content, old, new)
+  return preserve_line_endings(content, function(lf)
+    return fr.replace(lf, old, new, false)
+  end)
+end
 
 case("replace_lines_range_replace_and_delete", function()
   local content = "aaa\nbbb\nccc\nddd\neee\n"
@@ -374,6 +387,33 @@ case("insert_after_mode", function()
   has(e1, "out of range")
   local _, e2 = insert_after(content, 4, "x")
   has(e2, "out of range")
+end)
+
+case("edit_lines_keeps_crlf_line_endings", function()
+  local content = "aaa\r\nbbb\r\nccc\r\n"
+  eq(edit_lines(content, 2, 2, "XXX\nYYY"), "aaa\r\nXXX\r\nYYY\r\nccc\r\n")
+  eq(edit_lines(content, 2, 3, ""), "aaa\r\n")
+  eq(edit_lines(content, 1, nil, "TOP"), "TOP\r\naaa\r\nbbb\r\nccc\r\n")
+end)
+
+case("edit_lines_keeps_lf_line_endings", function()
+  eq(edit_lines("aaa\nbbb\nccc\n", 2, 2, "XXX"), "aaa\nXXX\nccc\n")
+end)
+
+case("edit_lines_keeps_a_missing_trailing_newline", function()
+  eq(edit_lines("aaa\r\nbbb", 1, 1, "XXX"), "XXX\r\nbbb")
+  eq(edit_lines("aaa\nbbb", 1, 1, "XXX"), "XXX\nbbb")
+end)
+
+case("fuzzy_edit_keeps_crlf_line_endings", function()
+  local content = "fn f() {\r\n    a();\r\n}\r\n"
+  eq(fuzzy_edit(content, "    a();", "    b();\n    c();"), "fn f() {\r\n    b();\r\n    c();\r\n}\r\n")
+end)
+
+case("line_endings_follow_the_majority_when_mixed", function()
+  eq(edit_lines("a\r\nb\r\nc\r\nd\n", 1, 1, "X"), "X\r\nb\r\nc\r\nd\r\n")
+  eq(edit_lines("a\r\nb\nc\nd\n", 1, 1, "X"), "X\nb\nc\nd\n")
+  eq(edit_lines("a\r\nb\n", 1, 1, "X"), "X\nb\n")
 end)
 
 th.report()

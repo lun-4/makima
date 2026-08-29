@@ -3,6 +3,7 @@ local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
+local preserve_line_endings = require("edit_helpers").preserve_line_endings
 
 local SNIPPET_MAX_CHARS = 32
 local FALLBACK_VIEW_LINES = 10
@@ -208,7 +209,7 @@ local function apply_edit(path, ctx, transform)
     return nil, "read error: " .. tostring(read_err)
   end
 
-  local after, transform_err = transform(before)
+  local after, transform_err = preserve_line_endings(before, transform)
   if transform_err then
     return nil, transform_err
   end
