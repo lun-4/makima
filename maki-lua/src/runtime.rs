@@ -50,7 +50,8 @@ use crate::api::slot::SlotStore;
 use crate::api::store::{self, Store};
 use crate::api::timer::{self, TimerStore};
 use crate::api::tool::{
-    LuaTool, PendingRules, PendingTool, PendingTools, PermissionScopeSpec, ToolCallReply,
+    LuaTool, MutablePathSpec, PendingRules, PendingTool, PendingTools, PermissionScopeSpec,
+    ToolCallReply,
 };
 use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
@@ -182,6 +183,12 @@ pub enum Request {
         tool: Arc<str>,
         input: Value,
         reply: flume::Sender<Option<PermissionScopes>>,
+    },
+    MutablePath {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        input: Value,
+        reply: flume::Sender<Option<String>>,
     },
     ClearPlugin {
         plugin: Arc<str>,
@@ -1544,6 +1551,7 @@ struct ToolKeys {
     restore: Option<RegistryKey>,
     start: Option<RegistryKey>,
     permission_scopes: Option<RegistryKey>,
+    mutable_path: Option<RegistryKey>,
     describe: Option<RegistryKey>,
 }
 
@@ -2366,7 +2374,7 @@ impl LuaRuntime {
                         .permission_scopes
                         .as_ref()
                         .map(PermissionScopeSpec::kind),
-                    mutable_path_field: t.mutable_path_field.clone(),
+                    mutable_path: t.mutable_path.as_ref().map(MutablePathSpec::kind),
                     timeout: t.timeout,
                     start_annotation: t.start_annotation.clone(),
                     examples: t.examples.clone(),
@@ -2411,6 +2419,10 @@ impl LuaRuntime {
                         start: t.start_key,
                         permission_scopes: match t.permission_scopes {
                             Some(PermissionScopeSpec::Callback(k)) => Some(k),
+                            _ => None,
+                        },
+                        mutable_path: match t.mutable_path {
+                            Some(MutablePathSpec::Callback(k)) => Some(k),
                             _ => None,
                         },
                         describe: t.describe_key,
@@ -2526,6 +2538,32 @@ impl LuaRuntime {
             scopes,
             force_prompt,
         })
+    }
+
+    /// Computes the tool's mutable-path callback result. `None` when the
+    /// tool has no callback or the callback returns nil/non-string, meaning
+    /// the invocation does not participate in write serialization.
+    async fn compute_mutable_path(&self, plugin: &str, tool: &str, input: Value) -> Option<String> {
+        let (func, lua_input) = plugin_fn(
+            &self.lua,
+            &self.plugins,
+            plugin,
+            tool,
+            "mutable_path",
+            |tk| tk.mutable_path.as_ref(),
+            &input,
+        )?;
+        let result: LuaValue = match run_detached(&self.lua, func.call_async(lua_input)).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(plugin, tool, error = %e, "mutable_path callback failed");
+                return None;
+            }
+        };
+        match result {
+            LuaValue::String(s) => s.to_str().ok().map(|s| s.to_string()),
+            _ => None,
+        }
     }
 
     async fn run_init_lua(
@@ -3524,6 +3562,15 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             reply,
                         } => {
                             let res = rt.compute_permission_scopes(&plugin, &tool, input).await;
+                            let _ = reply.send(res);
+                        }
+                        Request::MutablePath {
+                            plugin,
+                            tool,
+                            input,
+                            reply,
+                        } => {
+                            let res = rt.compute_mutable_path(&plugin, &tool, input).await;
                             let _ = reply.send(res);
                         }
                         Request::RunInitLua {

@@ -8,6 +8,8 @@ mod loader;
 pub(crate) mod plugin_permissions;
 mod runtime;
 mod splash;
+#[cfg(test)]
+mod write_lock_regression;
 
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};

@@ -362,7 +362,9 @@ async fn call_tool(
     let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
     if let Some(o) = opts {
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
-            tctx.deadline = Deadline::after(Duration::from_secs(secs));
+            tctx.deadline = tctx
+                .deadline
+                .min(Deadline::after(Duration::from_secs(secs)));
         }
         on_buf = o.get::<Option<Function>>("on_live_buf")?;
         on_ann = o.get::<Option<Function>>("on_annotation")?;
@@ -624,6 +626,7 @@ async fn session(
             audience,
             question_mode: agent_ctx.question_mode,
             model_policy: Arc::clone(&agent_ctx.model_policy),
+            file_write_locks: Arc::clone(&agent_ctx.file_write_locks),
         },
         system: system.unwrap_or_default(),
         tools: tools_json,

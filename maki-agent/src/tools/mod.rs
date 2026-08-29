@@ -5,12 +5,14 @@
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
+pub mod file_locks;
 mod file_tracker;
 pub mod grep;
 pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
+pub use file_locks::FileWriteLocks;
 pub use file_tracker::FileReadTracker;
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
@@ -150,6 +152,13 @@ impl Deadline {
         Self::At(Instant::now() + duration)
     }
 
+    pub fn min(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::None, deadline) | (deadline, Self::None) => deadline,
+            (Self::At(left), Self::At(right)) => Self::At(left.min(right)),
+        }
+    }
+
     pub fn check(self) -> Result<(), String> {
         match self {
             Self::None => Ok(()),
@@ -243,6 +252,17 @@ pub struct ToolContext {
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+    /// Shared same-process per-path mutation locks for every context cloned
+    /// from this one (batch siblings, subagents, recursive `call_tool`). See
+    /// [`FileWriteLocks`].
+    pub file_write_locks: Arc<FileWriteLocks>,
+    /// Logical owner chain of the dispatch that produced this context: the
+    /// tokens of every ancestor dispatch, root first. Empty for root agent
+    /// contexts; [`crate::agent::tool_dispatch::run`] appends its own token
+    /// before execution so recursive same-path calls are detected as reentry
+    /// while sibling dispatches stay independent. Serves as the reentry
+    /// check input only and is never used for filesystem access.
+    pub(crate) write_lock_chain: Arc<Vec<u64>>,
 }
 
 impl ToolContext {
@@ -483,6 +503,8 @@ pub fn interpreter_ctx(
         local_tools: LocalTools::default(),
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
+        file_write_locks: Arc::new(FileWriteLocks::new()),
+        write_lock_chain: Arc::new(Vec::new()),
     }
 }
 

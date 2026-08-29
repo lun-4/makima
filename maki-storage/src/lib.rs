@@ -70,6 +70,19 @@ pub enum StorageError {
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+    atomic_write_at(&atomic_destination(path)?, data)
+}
+
+fn atomic_destination(path: &Path) -> Result<PathBuf, StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(fs::canonicalize(path)?),
+        Ok(_) => Ok(path.to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_owned()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn atomic_write_at(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(data)?;
@@ -77,6 +90,8 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
         fs::set_permissions(tmp.path(), metadata.permissions())?;
     }
     tmp.as_file().sync_data()?;
+    #[cfg(test)]
+    atomic_test_hook::wait_at_replacement_boundary();
     persist(tmp, path)
 }
 
@@ -85,6 +100,7 @@ pub(crate) fn atomic_write_permissions(
     data: &[u8],
     mode: u32,
 ) -> Result<(), StorageError> {
+    let path = atomic_destination(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(data)?;
@@ -93,7 +109,54 @@ pub(crate) fn atomic_write_permissions(
     #[cfg(not(unix))]
     let _ = mode;
     tmp.as_file().sync_all()?;
-    persist(tmp, path)
+    persist(tmp, &path)
+}
+
+/// Right before the atomic rename, so a test can park the writer with the
+/// complete temporary file prepared and observe readers around the boundary.
+/// Unarmed (the default) it is a single relaxed atomic load.
+#[cfg(test)]
+pub mod atomic_test_hook {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    type Channels = (flume::Sender<()>, flume::Sender<()>, flume::Receiver<()>);
+    static CHANNELS: Mutex<Option<Channels>> = Mutex::new(None);
+
+    /// Arm once: the writer signals `reached` when the temp file is fully
+    /// prepared, then blocks until released via [`disarm`]. Returns the
+    /// test's `reached` receiver.
+    pub fn arm() -> flume::Receiver<()> {
+        let (reached_tx, reached_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        *CHANNELS.lock().expect("hook poisoned") = Some((reached_tx, release_tx, release_rx));
+        ARMED.store(true, Ordering::SeqCst);
+        reached_rx
+    }
+
+    /// Send the writer past the boundary and disarm the hook.
+    pub fn disarm() {
+        ARMED.store(false, Ordering::SeqCst);
+        if let Some((_, release_tx, _)) = CHANNELS.lock().expect("hook poisoned").take() {
+            release_tx.send(()).ok();
+        }
+    }
+
+    pub fn wait_at_replacement_boundary() {
+        if !ARMED.load(Ordering::SeqCst) {
+            return;
+        }
+        let channels = {
+            let guard = CHANNELS.lock().expect("hook poisoned");
+            match &*guard {
+                Some(ch) => ch.clone(),
+                None => return,
+            }
+        };
+        channels.0.send(()).ok();
+        let _ = channels.2.recv();
+    }
 }
 
 /// `into_parts` drops the auto-cleanup-on-drop guarantee, but we need the
@@ -237,5 +300,46 @@ mod tests {
 
         assert!(atomic_write(&destination, REPLACEMENT).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// Readers racing the replace boundary observe either the complete old
+    /// payload or the complete new one, never a torn mix. The writer parks
+    /// right before rename with the temp file fully prepared.
+    #[test]
+    fn real_atomic_replacement_has_no_torn_reads() {
+        use std::thread;
+
+        const BIG: usize = 1 << 18;
+        const READS: usize = 64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        let old = vec![b'a'; BIG];
+        let new = vec![b'b'; BIG];
+        fs::write(&path, &old).unwrap();
+
+        let reached_rx = atomic_test_hook::arm();
+        let path_writer = path.clone();
+        let new_writer = new.clone();
+        let writer = thread::spawn(move || {
+            atomic_write(&path_writer, &new_writer).expect("atomic write");
+        });
+
+        // The temp file is complete and the rename is about to happen.
+        reached_rx.recv().expect("writer reached the boundary");
+
+        let mut observations = std::collections::HashSet::new();
+        for _ in 0..READS {
+            observations.insert(fs::read(&path).expect("read"));
+        }
+        atomic_test_hook::disarm();
+        writer.join().expect("writer finished");
+
+        observations.insert(fs::read(&path).expect("final read"));
+        assert_eq!(
+            observations,
+            std::collections::HashSet::from([old, new]),
+            "readers must see only complete old or new payloads"
+        );
     }
 }

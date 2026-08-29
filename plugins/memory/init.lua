@@ -127,7 +127,7 @@ local function cmd_write(path, content, tags, dir, ctx)
   end
   local full = helpers.encode_frontmatter(normalized) .. content
   maki.fs.mkdir(dir, { parents = true })
-  local ok, write_err = maki.fs.write(file_path, full)
+  local ok, write_err = maki.fs.atomic_write(file_path, full)
   if not ok then
     return nil, "write error: " .. tostring(write_err)
   end
@@ -198,6 +198,21 @@ maki.api.register_tool({
       },
     },
   },
+
+  mutable_path = function(input)
+    if input.command ~= "write" and input.command ~= "delete" then
+      return nil
+    end
+    local dir, dir_err = resolve_dir(false)
+    if not dir then
+      return nil
+    end
+    local file_path, err = helpers.safe_resolve(dir, input.path)
+    if not file_path then
+      return nil
+    end
+    return file_path
+  end,
 
   header = function(input)
     local parts = { input.command or "" }

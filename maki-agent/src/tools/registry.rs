@@ -198,6 +198,11 @@ pub trait ToolInvocation: Send + Sync {
     fn start_output(&self, _ctx: &ToolContext) -> Option<ToolOutput> {
         None
     }
+    /// The primary path this invocation mutates, if any (e.g. a schema
+    /// `path` field). Dispatch serializes same-process mutations per
+    /// normalized path for invocations that expose one: an advisory
+    /// in-process lock, never protection for shell commands, other
+    /// processes, or paths the tool mutates without declaring them.
     fn mutable_path(&self) -> Option<&Path> {
         None
     }

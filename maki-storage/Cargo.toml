@@ -17,6 +17,7 @@ bs58 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+flume = { workspace = true }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 isahc = { workspace = true }

@@ -194,7 +194,9 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::register(session_id);
+    let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
     let task = smol::spawn({
+        let file_write_locks = Arc::clone(&file_write_locks);
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
         async move {
@@ -235,6 +237,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     audience: ToolAudience::MAIN,
                     question_mode: crate::tools::QuestionMode::Headless,
                     model_policy: Arc::clone(&params.model_policy),
+                    file_write_locks: Arc::clone(&file_write_locks),
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -434,10 +437,12 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
+    let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
 
     let session_ref_clone = session_ref.clone();
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
+        let file_write_locks = Arc::clone(&file_write_locks);
         async move {
             let mut model = params.model;
             let mut provider: Arc<dyn Provider> =
@@ -583,6 +588,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         audience: ToolAudience::MAIN,
                         question_mode: params.question_mode,
                         model_policy: Arc::clone(&params.model_policy),
+                        file_write_locks: Arc::clone(&file_write_locks),
                     },
                     AgentRunParams {
                         history: &mut history,

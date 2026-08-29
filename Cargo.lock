@@ -2995,6 +2995,7 @@ version = "0.4.11-makima"
 dependencies = [
  "bs58",
  "etcetera",
+ "flume 0.11.1",
  "fs2",
  "getrandom 0.3.4",
  "isahc",

@@ -85,7 +85,7 @@ maki.api.register_tool({
       maki.fs.mkdir(parent, { parents = true })
     end
 
-    local _, write_err = maki.fs.write(path, content)
+    local _, write_err = maki.fs.atomic_write(path, content)
     if write_err then
       return { llm_output = "write error: " .. tostring(write_err), is_error = true }
     end
