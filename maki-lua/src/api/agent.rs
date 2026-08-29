@@ -467,6 +467,20 @@ async fn permission_prompt(
     }
 }
 
+/// Whether this session is in YOLO mode, where permission prompts are skipped
+/// and the bash automode classifier's deny is final (no escalation).
+///
+/// YOLO toggles at runtime (`/yolo`, `--yolo`), so query it per call rather
+/// than caching it.
+///
+/// @param ctx LuaCtx Agent context.
+/// @return (boolean) `true` when YOLO mode is active.
+#[lua_fn]
+async fn is_yolo(_lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<bool>> {
+    let agent = try_pair!(dispatch_ctx(&ctx, "is_yolo"));
+    Ok((Some(agent.permissions.is_yolo()), None))
+}
+
 /// Create a new subagent session. The session inherits the parent model and
 /// MCP handle unless you override them. You get back a `Session` object that
 /// you can send messages to with `:prompt()`.
@@ -775,7 +789,7 @@ lua_table! {
     /// sess:close()
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, call_tool, permission_prompt, session,
+        resolve_model, system_prompt, tools, call_tool, permission_prompt, is_yolo, session,
         report_task_result,
     ]
 }
