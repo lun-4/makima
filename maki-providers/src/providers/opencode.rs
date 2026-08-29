@@ -4,6 +4,7 @@ use std::time::Duration;
 use flume::Sender;
 use isahc::{HttpClient, Request};
 use maki_storage::id::SessionRef;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
 
@@ -15,11 +16,15 @@ use crate::providers::catalog::{
 };
 use crate::providers::http_client;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::types::{ProviderUsage, UsageLimit, UsageWindow};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::{ResolvedAuth, user_agent, with_prefix};
 
 const MESSAGES_PATH: &str = "/messages";
+pub(crate) const USAGE_PATH: &str = "/usage";
+const EMPTY_USAGE_ERROR: &str =
+    "Opencode Go usage response contained no usage lanes; the endpoint schema likely changed";
 
 static CATALOG_CHAT_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "opencode",
@@ -221,5 +226,96 @@ impl Provider for Opencode {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Deserialize)]
+struct UsageResponse {
+    usage: UsageLanes,
+}
+
+#[derive(Deserialize)]
+struct UsageLanes {
+    #[serde(default)]
+    rolling: Option<UsageLane>,
+    #[serde(default)]
+    weekly: Option<UsageLane>,
+    #[serde(default)]
+    monthly: Option<UsageLane>,
+}
+
+#[derive(Deserialize)]
+struct UsageLane {
+    #[serde(default)]
+    percent: Option<u32>,
+    #[serde(rename = "resetsAt")]
+    resets_at: Option<String>,
+}
+
+/// `GET {go-base-url}/usage` reports dollar-value quota lanes as percentages.
+pub(crate) fn parse_usage(response: &str) -> Result<ProviderUsage, AgentError> {
+    let resp: UsageResponse = serde_json::from_str(response)?;
+    let lanes = resp.usage;
+    let mut limits = Vec::with_capacity(3);
+    for (kind, lane) in [
+        (UsageWindow::Hours(5), lanes.rolling),
+        (UsageWindow::Weekly { model: None }, lanes.weekly),
+        (UsageWindow::Monthly, lanes.monthly),
+    ] {
+        let Some(lane) = lane else {
+            continue;
+        };
+        limits.push(UsageLimit {
+            kind,
+            percentage: lane.percent,
+            reset_at: lane.resets_at.as_deref().and_then(parse_reset),
+            detail: None,
+        });
+    }
+    if limits.is_empty() {
+        return Err(AgentError::Config {
+            message: EMPTY_USAGE_ERROR.into(),
+        });
+    }
+    Ok(ProviderUsage { plan: None, limits })
+}
+
+/// `/usage` timestamps are RFC 3339; the UI expects epoch milliseconds.
+fn parse_reset(rfc3339: &str) -> Option<u64> {
+    let ts: jiff::Timestamp = rfc3339.parse().ok()?;
+    u64::try_from(ts.as_millisecond()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_USAGE: &str = r#"{"usage":{"rolling":{"status":"ok","percent":1,"resetsAt":"2026-08-29T06:01:16.964Z"},"weekly":{"status":"ok","percent":4,"resetsAt":"2026-08-31T00:00:00.964Z"},"monthly":{"status":"ok","percent":2,"resetsAt":"2026-09-18T15:23:06.964Z"}}}"#;
+    const ROLLING_RESET_MS: u64 = 1_787_983_276_964;
+    const WEEKLY_RESET_MS: u64 = 1_788_134_400_964;
+    const MONTHLY_RESET_MS: u64 = 1_789_744_986_964;
+
+    #[test]
+    fn parse_usage_maps_lanes_to_windows() {
+        let usage = parse_usage(SAMPLE_USAGE).unwrap();
+        assert_eq!(usage.plan, None);
+        assert_eq!(usage.limits.len(), 3);
+        assert_eq!(usage.limits[0].kind, UsageWindow::Hours(5));
+        assert_eq!(usage.limits[0].percentage, Some(1));
+        assert_eq!(usage.limits[0].reset_at, Some(ROLLING_RESET_MS));
+        assert_eq!(usage.limits[1].kind, UsageWindow::Weekly { model: None });
+        assert_eq!(usage.limits[1].percentage, Some(4));
+        assert_eq!(usage.limits[1].reset_at, Some(WEEKLY_RESET_MS));
+        assert_eq!(usage.limits[2].kind, UsageWindow::Monthly);
+        assert_eq!(usage.limits[2].percentage, Some(2));
+        assert_eq!(usage.limits[2].reset_at, Some(MONTHLY_RESET_MS));
+    }
+
+    #[test]
+    fn parse_usage_rejects_empty_lanes() {
+        let parsed = parse_usage(r#"{"usage":{}}"#);
+        assert!(
+            matches!(parsed, Err(AgentError::Config { message }) if message == EMPTY_USAGE_ERROR)
+        );
     }
 }
