@@ -16,13 +16,14 @@ use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
-    ToolContext, ToolFilter, ToolLive,
+    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, PermissionScopes,
+    ToolAudience, ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
     EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, SubagentInfo, ToolDoneEvent,
 };
+use maki_config::ToolKey;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
@@ -401,6 +402,71 @@ async fn call_tool(
     }
 }
 
+/// Run the normal interactive permission prompt for a tool call, without
+/// dispatching the tool. This is how a plugin escalates a classifier deny to
+/// the same allow/deny/remember choices a user would see with automode off.
+/// Allow and deny rules apply exactly as they do for a plain tool call.
+///
+/// @param ctx LuaCtx Agent context.
+/// @param opts table Required fields:
+///   `tool` (string) - tool key to prompt for, e.g. `"bash"`.
+///   `scopes` (string[]) - permission scopes to prompt for.
+/// Optional fields:
+///   `force_prompt` (boolean?) - prompt even for scopes an allow rule claims.
+/// @return (boolean?, string?) `true` when the call is allowed, or
+///   `(nil, err)` with the permission-denied message when denied.
+/// @example
+/// local ok, err = maki.agent.permission_prompt(ctx, {
+///   tool = "bash",
+///   scopes = { "echo hello" },
+///   force_prompt = false,
+/// })
+/// if not ok then return { llm_output = err, is_error = true } end
+#[lua_fn]
+async fn permission_prompt(
+    _lua: Lua,
+    ctx: mlua::UserDataRef<LuaCtx>,
+    opts: Table,
+) -> LuaResult<Pair<bool>> {
+    let agent = try_pair!(dispatch_ctx(&ctx, "permission_prompt"));
+    let tool: String = opts.get("tool")?;
+    if tool.is_empty() || tool.contains('.') {
+        return Err(mlua::Error::runtime(format!(
+            "permission_prompt: tool must be a native tool name, got {tool:?}"
+        )));
+    }
+    let scopes: Vec<String> = opts.get("scopes")?;
+    let force_prompt: bool = opts.get::<Option<bool>>("force_prompt")?.unwrap_or(false);
+    // Clone the ToolContext and drop the ctx borrow before awaiting: the
+    // prompt wait must not hold the LuaCtx userdata's shared lock, or a
+    // cancel hook firing meanwhile would deadlock on `ctx:finish`. A plain
+    // clone (not `to_tool_context`, which clears it) keeps `tool_use_id` so
+    // the TUI/ACP binds the prompt to the outer tool call.
+    let tctx: ToolContext = (**agent).clone();
+    drop(ctx);
+    let tool_key = ToolKey::native(&tool);
+    let perm_scopes = PermissionScopes {
+        scopes,
+        force_prompt,
+    };
+    match tctx
+        .permissions
+        .enforce(
+            &tool_key,
+            &perm_scopes,
+            &tctx.event_tx,
+            tctx.user_response_rx.as_deref(),
+            tctx.tool_use_id.as_deref().unwrap_or(""),
+            &tctx.cancel,
+            tctx.restrict_write_to().as_deref(),
+        )
+        .await
+    {
+        Ok(()) => Ok((Some(true), None)),
+        Err(e) => Ok((None, Some(e.to_string()))),
+    }
+}
+
 /// Create a new subagent session. The session inherits the parent model and
 /// MCP handle unless you override them. You get back a `Session` object that
 /// you can send messages to with `:prompt()`.
@@ -709,7 +775,8 @@ lua_table! {
     /// sess:close()
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, call_tool, session, report_task_result,
+        resolve_model, system_prompt, tools, call_tool, permission_prompt, session,
+        report_task_result,
     ]
 }
 
