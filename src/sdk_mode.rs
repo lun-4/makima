@@ -17,6 +17,7 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
+use maki_agent::command::{CustomCommand, StandardCommands, StandardCompletions};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
@@ -26,18 +27,25 @@ use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
     ToolOutput,
 };
+use maki_commands::{
+    AgentTurn, BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost,
+    CommandOutcome, CommandRegistry, HostRequest, HostResponse, InputDispatch, TargetCapabilities,
+    TargetCapability, TargetHandle,
+};
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
+use maki_providers::provider::available_model_specs;
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
 use maki_storage::sessions::{SESSIONS_DIR, Session};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
 use crate::cli::Cli;
+use crate::command_attachments;
 
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
@@ -220,10 +228,32 @@ struct ControlRequestInner {
     tool_use_id: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
+enum InboundMessageType {
+    User,
+    ControlRequest,
+    ControlResponse,
+    ControlCancelRequest,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for InboundMessageType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "user" => Self::User,
+            "control_request" => Self::ControlRequest,
+            "control_response" => Self::ControlResponse,
+            "control_cancel_request" => Self::ControlCancelRequest,
+            _ => Self::Unknown(value),
+        })
+    }
+}
+
+#[derive(Deserialize)]
 struct InboundMessage {
     #[serde(rename = "type")]
-    msg_type: String,
+    msg_type: InboundMessageType,
     #[serde(flatten)]
     payload: Value,
 }
@@ -244,9 +274,31 @@ struct InboundControlRequest {
     request: InboundControlRequestInner,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
+enum InboundControlRequestType {
+    Initialize,
+    Interrupt,
+    SetPermissionMode,
+    SetModel,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for InboundControlRequestType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "initialize" => Self::Initialize,
+            "interrupt" => Self::Interrupt,
+            "set_permission_mode" => Self::SetPermissionMode,
+            "set_model" => Self::SetModel,
+            _ => Self::Unknown(value),
+        })
+    }
+}
+
+#[derive(Deserialize)]
 struct InboundControlRequestInner {
-    subtype: String,
+    subtype: InboundControlRequestType,
     #[serde(flatten)]
     extra: Value,
 }
@@ -452,6 +504,8 @@ pub struct SdkParams {
     pub workflow: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub commands: Vec<CustomCommand>,
+    pub command_registry: CommandRegistry,
 }
 
 struct Shared {
@@ -459,6 +513,125 @@ struct Shared {
     permission_mode: PermissionMode,
     turn_start: Instant,
     pending: HashSet<String>,
+}
+
+struct CommandDriverParams {
+    route_rx: Receiver<CommandRoute>,
+    model_tx: Sender<Model>,
+    shared: Arc<Mutex<Shared>>,
+    model_policy: Arc<ModelPolicy>,
+}
+
+enum CommandRoute {
+    Model {
+        argument: String,
+        response: Sender<Result<HostResponse, CommandError>>,
+    },
+}
+
+struct SdkCommandHost {
+    tx: Sender<CommandRoute>,
+    model_specs: Arc<[Arc<str>]>,
+}
+
+impl CommandHost for SdkCommandHost {
+    fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        let tx = self.tx.clone();
+        let model_specs = Arc::clone(&self.model_specs);
+        Box::pin(async move {
+            match request {
+                HostRequest::Context(maki_commands::HostContextRequest::ModelSpecs) => Ok(
+                    HostResponse::Context(maki_commands::HostContextResponse::Values(model_specs)),
+                ),
+                HostRequest::Context(_) => Ok(HostResponse::Context(
+                    maki_commands::HostContextResponse::Unavailable,
+                )),
+                HostRequest::Builtin(BuiltinOperation::SetModel { spec }) => {
+                    let (response, response_rx) = flume::bounded(1);
+                    tx.send(CommandRoute::Model {
+                        argument: spec.to_string(),
+                        response,
+                    })
+                    .map_err(|_| CommandError::StaleTarget)?;
+                    response_rx
+                        .recv_async()
+                        .await
+                        .map_err(|_| CommandError::StaleTarget)?
+                }
+                HostRequest::Builtin(BuiltinOperation::QuickQuestion {
+                    question,
+                    attachments,
+                }) => Ok(HostResponse::AgentTurn(AgentTurn {
+                    content: CommandContent {
+                        text: question,
+                        attachments,
+                    },
+                    prompt: None,
+                })),
+                HostRequest::Builtin(operation) => Err(CommandError::Producer(Arc::from(format!(
+                    "unsupported command operation: {operation:?}"
+                )))),
+            }
+        })
+    }
+}
+
+fn sdk_capabilities() -> TargetCapabilities {
+    TargetCapabilities::from_slice(&[
+        TargetCapability::AgentTurns,
+        TargetCapability::ModelSelection,
+    ])
+}
+
+struct SdkCommands {
+    registry: CommandRegistry,
+    target: TargetHandle,
+    route_rx: Receiver<CommandRoute>,
+    _standard_commands: StandardCommands,
+}
+
+impl SdkCommands {
+    fn new(
+        registry: CommandRegistry,
+        custom: &[CustomCommand],
+        model_specs: Arc<[Arc<str>]>,
+    ) -> Result<Self> {
+        let (route_tx, route_rx) = flume::unbounded();
+        let standard_commands =
+            StandardCommands::register(&registry, custom, StandardCompletions::default())?;
+        let target = registry.bind_target(
+            sdk_capabilities(),
+            Arc::new(SdkCommandHost {
+                tx: route_tx.clone(),
+                model_specs,
+            }),
+        );
+        Ok(Self {
+            target,
+            registry,
+            route_rx,
+            _standard_commands: standard_commands,
+        })
+    }
+
+    fn projection(&self) -> Vec<Value> {
+        projected_commands(&self.registry, &self.target).unwrap_or_default()
+    }
+
+    fn slash_commands(&self) -> Vec<String> {
+        self.projection()
+            .into_iter()
+            .filter_map(|command| command["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn dispatch_input(&self, prompt: &str, images: &[ImageSource]) -> InputDispatch {
+        let content = CommandContent {
+            text: Arc::from(prompt),
+            attachments: command_attachments::from_images(images),
+        };
+        smol::block_on(self.registry.dispatch_input(&self.target, content))
+    }
 }
 
 /// Stops the session's heartbeat thread and releases its lock on drop, so
@@ -495,6 +668,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         workflow,
         model_policy,
         plugin_rules,
+        commands,
+        command_registry,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -507,7 +682,19 @@ pub fn run(params: SdkParams) -> Result<()> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let (session_id, initial_history) = resolve_session(&cli, &working_dir, &storage)?;
 
-    let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_connected(&cwd));
+    let model_specs = available_model_specs(&model_policy)
+        .into_iter()
+        .map(Arc::from)
+        .collect::<Vec<_>>()
+        .into();
+    let sdk_commands = SdkCommands::new(command_registry, &commands, model_specs)?;
+    let (mcp_handle, mcp_config_errors) = smol::block_on(async {
+        let (handle, errors) = mcp::start_with_commands(&cwd, sdk_commands.registry.clone()).await;
+        if let Some(handle) = &handle {
+            handle.ready().await;
+        }
+        (handle, errors)
+    });
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -604,10 +791,15 @@ pub fn run(params: SdkParams) -> Result<()> {
             "permissionMode": permission_mode.as_str(),
             "apiKeySource": "none",
             "mcp_servers": [],
-            "slash_commands": [],
+            "slash_commands": sdk_commands.slash_commands(),
             "output_style": "default",
         }),
     )?;
+    let projection_watcher = watch_command_projection(
+        writer.clone(),
+        sdk_commands.registry.clone(),
+        sdk_commands.target.clone(),
+    );
 
     let shared = Arc::new(Mutex::new(Shared {
         model: startup_model.clone(),
@@ -628,93 +820,129 @@ pub fn run(params: SdkParams) -> Result<()> {
         request_counter: 0,
     }
     .spawn(handle.event_rx.clone());
+    let command_driver = spawn_command_driver(CommandDriverParams {
+        route_rx: sdk_commands.route_rx.clone(),
+        model_tx: handle.model_tx.clone(),
+        shared: Arc::clone(&shared),
+        model_policy: Arc::clone(&model_policy),
+    });
 
-    for line in io::stdin().lock().lines() {
-        let line = line.context("read stdin")?;
-        if line.is_empty() {
-            continue;
-        }
-
-        let msg: InboundMessage = match serde_json::from_str(&line) {
-            Ok(msg) => msg,
-            Err(e) => {
-                eprintln!("warning: ignoring malformed input line: {e}");
+    let input_result = (|| -> Result<()> {
+        for line in io::stdin().lock().lines() {
+            let line = line.context("read stdin")?;
+            if line.is_empty() {
                 continue;
             }
-        };
 
-        match msg.msg_type.as_str() {
-            "user" => {
-                let Some(user) = parse_or_warn::<InboundUser>(msg.payload, "user message") else {
+            let msg: InboundMessage = match serde_json::from_str(&line) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    eprintln!("warning: ignoring malformed input line: {e}");
                     continue;
-                };
-                let content = user.message.content;
-                let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
-                let images = content_images(&content);
-                let mode = {
-                    let mut shared = shared.lock().unwrap();
-                    shared.turn_start = Instant::now();
-                    shared.permission_mode
-                };
-                let input = AgentInput {
-                    message: prompt,
-                    mode: mode.agent_mode(&cwd),
-                    images,
-                    preamble: Vec::new(),
-                    thinking: Default::default(),
-                    fast,
-                    workflow,
-                    prompt: None,
-                };
-                if handle.input_tx.send(input).is_err() {
-                    break;
+                }
+            };
+
+            match msg.msg_type {
+                InboundMessageType::User => {
+                    let Some(user) = parse_or_warn::<InboundUser>(msg.payload, "user message")
+                    else {
+                        continue;
+                    };
+                    let content = user.message.content;
+                    let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
+                    let images = content_images(&content);
+                    let mode = {
+                        let mut shared = shared.lock().unwrap();
+                        shared.turn_start = Instant::now();
+                        shared.permission_mode
+                    };
+                    match sdk_commands.dispatch_input(&prompt, &images) {
+                        InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
+                            let input = command_attachments::agent_input(
+                                turn,
+                                mode.agent_mode(&cwd),
+                                fast,
+                                workflow,
+                            )?;
+                            if handle.input_tx.send(input).is_err() {
+                                break;
+                            }
+                        }
+                        InputDispatch::Dispatched(CommandOutcome::Completed) => {
+                            emit_command_result(&writer, &shared, false, String::new())?
+                        }
+                        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => {
+                            emit_command_result(&writer, &shared, true, error.to_string())?
+                        }
+                        InputDispatch::LiteralInput(_) => {
+                            let input = AgentInput {
+                                message: prompt,
+                                mode: mode.agent_mode(&cwd),
+                                images,
+                                preamble: Vec::new(),
+                                thinking: Default::default(),
+                                fast,
+                                workflow,
+                                prompt: None,
+                            };
+                            if handle.input_tx.send(input).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                InboundMessageType::ControlRequest => {
+                    let Some(cr) =
+                        parse_or_warn::<InboundControlRequest>(msg.payload, "control_request")
+                    else {
+                        continue;
+                    };
+                    handle_control_request(
+                        &cr,
+                        &writer,
+                        &handle,
+                        &shared,
+                        &startup_model,
+                        &model_policy,
+                        &sdk_commands,
+                    )?;
+                }
+                InboundMessageType::ControlResponse => {
+                    let Some(cr) =
+                        parse_or_warn::<InboundControlResponse>(msg.payload, "control_response")
+                    else {
+                        continue;
+                    };
+                    let data = cr.response;
+                    if let Some(req_id) = data.get("request_id").and_then(Value::as_str)
+                        && shared.lock().unwrap().pending.remove(req_id)
+                    {
+                        let _ = handle
+                            .answer_tx
+                            .send(decode_permission_response(&data).encode());
+                    }
+                }
+                InboundMessageType::ControlCancelRequest => {
+                    let Some(ccr) = parse_or_warn::<InboundControlCancelRequest>(
+                        msg.payload,
+                        "control_cancel_request",
+                    ) else {
+                        continue;
+                    };
+                    if shared.lock().unwrap().pending.remove(&ccr.request_id) {
+                        let _ = handle.answer_tx.send(PermissionAnswer::Deny.encode());
+                    }
+                }
+                InboundMessageType::Unknown(message_type) => {
+                    warn!("unknown inbound message type: {message_type}")
                 }
             }
-            "control_request" => {
-                let Some(cr) =
-                    parse_or_warn::<InboundControlRequest>(msg.payload, "control_request")
-                else {
-                    continue;
-                };
-                handle_control_request(
-                    &cr,
-                    &writer,
-                    &handle,
-                    &shared,
-                    &startup_model,
-                    &model_policy,
-                )?;
-            }
-            "control_response" => {
-                let Some(cr) =
-                    parse_or_warn::<InboundControlResponse>(msg.payload, "control_response")
-                else {
-                    continue;
-                };
-                let data = cr.response;
-                if let Some(req_id) = data.get("request_id").and_then(Value::as_str)
-                    && shared.lock().unwrap().pending.remove(req_id)
-                {
-                    let _ = handle
-                        .answer_tx
-                        .send(decode_permission_response(&data).encode());
-                }
-            }
-            "control_cancel_request" => {
-                let Some(ccr) = parse_or_warn::<InboundControlCancelRequest>(
-                    msg.payload,
-                    "control_cancel_request",
-                ) else {
-                    continue;
-                };
-                if shared.lock().unwrap().pending.remove(&ccr.request_id) {
-                    let _ = handle.answer_tx.send(PermissionAnswer::Deny.encode());
-                }
-            }
-            other => warn!("unknown inbound message type: {other}"),
         }
-    }
+        Ok(())
+    })();
 
+    drop(sdk_commands);
+    smol::block_on(stop_sdk_tasks(projection_watcher, command_driver));
     let InteractiveHandle { input_tx, task, .. } = handle;
     drop(input_tx);
     smol::block_on(async {
@@ -724,7 +952,113 @@ pub fn run(params: SdkParams) -> Result<()> {
     drop(lock_guard);
     drop(writer);
     let _ = writer_thread.join();
-    Ok(())
+    input_result
+}
+
+fn projected_commands(registry: &CommandRegistry, target: &TargetHandle) -> Result<Vec<Value>> {
+    Ok(registry
+        .presented_commands(target)?
+        .iter()
+        .map(|command| {
+            serde_json::json!({
+                "name": command.name.trim_start_matches('/'),
+                "description": command.description,
+                "argumentHint": command.argument_hint.as_deref().unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
+fn watch_command_projection(
+    writer: SdkWriter,
+    registry: CommandRegistry,
+    target: TargetHandle,
+) -> smol::Task<()> {
+    let subscription = registry.subscribe();
+    smol::spawn(async move {
+        let mut generation = subscription.generation();
+        loop {
+            generation = subscription.changed(generation).await;
+            let Ok(commands) = projected_commands(&registry, &target) else {
+                return;
+            };
+            let slash_commands = commands
+                .iter()
+                .filter_map(|command| command["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            if writer
+                .emit_system(
+                    "commands_update",
+                    serde_json::json!({
+                        "commands": commands,
+                        "slash_commands": slash_commands,
+                    }),
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
+async fn stop_sdk_tasks(projection_watcher: smol::Task<()>, command_driver: smol::Task<()>) {
+    projection_watcher.cancel().await;
+    command_driver.cancel().await;
+}
+
+fn spawn_command_driver(params: CommandDriverParams) -> smol::Task<()> {
+    smol::spawn(async move {
+        let CommandDriverParams {
+            route_rx,
+            model_tx,
+            shared,
+            model_policy,
+        } = params;
+        while let Ok(route) = route_rx.recv_async().await {
+            match route {
+                CommandRoute::Model { argument, response } => {
+                    let result = match Model::from_spec(&argument)
+                        .ok()
+                        .filter(|model| model_policy.allows(&model.spec()))
+                    {
+                        Some(model) if model_tx.send(model.clone()).is_ok() => {
+                            shared.lock().unwrap().model = model;
+                            Ok(HostResponse::Completed)
+                        }
+                        Some(_) => Err(CommandError::StaleTarget),
+                        None => Err(CommandError::Producer(Arc::from(
+                            "invalid or disallowed model",
+                        ))),
+                    };
+                    let _ = response.send(result);
+                }
+            }
+        }
+    })
+}
+
+fn emit_command_result(
+    writer: &SdkWriter,
+    shared: &Mutex<Shared>,
+    is_error: bool,
+    result: String,
+) -> Result<()> {
+    writer.emit(WireInner::Result(ResultPayload {
+        subtype: if is_error {
+            "error_during_execution"
+        } else {
+            "success"
+        },
+        is_error,
+        duration_ms: shared.lock().unwrap().turn_start.elapsed().as_millis(),
+        duration_api_ms: 0,
+        num_turns: 0,
+        result,
+        total_cost_usd: 0.0,
+        usage: TokenUsage::default(),
+        permission_denials: Vec::new(),
+    }))
 }
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -834,6 +1168,7 @@ fn content_text(content: &Value) -> Option<String> {
 // Claude Code stream-json block shape:
 // {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
 // `source` deserializes straight into ImageSource; malformed blocks are skipped.
+
 fn content_images(content: &Value) -> Vec<ImageSource> {
     let Value::Array(blocks) = content else {
         return Vec::new();
@@ -852,10 +1187,11 @@ fn handle_control_request(
     shared: &Mutex<Shared>,
     startup_model: &Model,
     model_policy: &ModelPolicy,
+    commands: &SdkCommands,
 ) -> Result<()> {
     let ok = Some(Value::Object(Default::default()));
-    match cr.request.subtype.as_str() {
-        "initialize" => {
+    match &cr.request.subtype {
+        InboundControlRequestType::Initialize => {
             if let Some(extra) = cr.request.extra.as_object()
                 && (extra.contains_key("hooks") || extra.contains_key("agents"))
             {
@@ -863,15 +1199,15 @@ fn handle_control_request(
             }
             writer.emit_control_response(
                 &cr.request_id,
-                Some(serde_json::json!({"commands": []})),
+                Some(serde_json::json!({"commands": commands.projection()})),
                 None,
             )
         }
-        "interrupt" => {
+        InboundControlRequestType::Interrupt => {
             let _ = handle.cancel_tx.try_send(());
             writer.emit_control_response(&cr.request_id, ok, None)
         }
-        "set_permission_mode" => {
+        InboundControlRequestType::SetPermissionMode => {
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
@@ -888,7 +1224,7 @@ fn handle_control_request(
                 ),
             }
         }
-        "set_model" => {
+        InboundControlRequestType::SetModel => {
             match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
                 Some(model) => {
                     let _ = handle.model_tx.send(model.clone());
@@ -902,10 +1238,10 @@ fn handle_control_request(
                 ),
             }
         }
-        other => writer.emit_control_response(
+        InboundControlRequestType::Unknown(subtype) => writer.emit_control_response(
             &cr.request_id,
             None,
-            Some(format!("unsupported: {other}")),
+            Some(format!("unsupported: {subtype}")),
         ),
     }
 }
@@ -1202,6 +1538,97 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const REJECTED_ATTACHMENT: &str = "command rejected attachment";
+
+    struct OutcomeBehavior(CommandOutcome);
+
+    struct ReplaceAttachment;
+    struct RejectAttachment;
+
+    impl maki_commands::CommandBehavior for RejectAttachment {
+        fn execute(
+            &self,
+            invocation: maki_commands::CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            let has_attachment = !invocation.content.attachments.is_empty();
+            Box::pin(async move {
+                if has_attachment {
+                    Err(CommandError::Producer(Arc::from(REJECTED_ATTACHMENT)))
+                } else {
+                    Ok(CommandOutcome::Completed)
+                }
+            })
+        }
+    }
+
+    impl maki_commands::CommandBehavior for ReplaceAttachment {
+        fn execute(
+            &self,
+            invocation: maki_commands::CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            Box::pin(async move {
+                let Some(attachment) = invocation.content.attachments.first() else {
+                    return Err(CommandError::Producer(Arc::from(
+                        "missing command attachment",
+                    )));
+                };
+                if attachment.media_type.as_ref() != "image/png"
+                    || attachment.data.as_ref() != "AAAA"
+                {
+                    return Err(CommandError::Producer(Arc::from(
+                        "command attachment changed before dispatch",
+                    )));
+                }
+                Ok(CommandOutcome::AgentTurn(AgentTurn {
+                    content: CommandContent {
+                        text: Arc::from("inspected"),
+                        attachments: Arc::from([maki_commands::CommandAttachment {
+                            media_type: Arc::from("image/jpeg"),
+                            data: Arc::from("BBBB"),
+                        }]),
+                    },
+                    prompt: None,
+                }))
+            })
+        }
+    }
+
+    impl maki_commands::CommandBehavior for OutcomeBehavior {
+        fn execute(
+            &self,
+            _invocation: maki_commands::CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            let outcome = self.0.clone();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    fn sdk_commands(registry: CommandRegistry) -> SdkCommands {
+        SdkCommands::new(
+            registry,
+            &[],
+            Arc::from([Arc::from("openai/gpt-5"), Arc::from("anthropic/claude")]),
+        )
+        .unwrap()
+    }
+
+    fn registration(name: &str, outcome: CommandOutcome) -> maki_commands::Registration {
+        maki_commands::Registration {
+            spec: maki_commands::CommandSpec {
+                name: Arc::from(name),
+                aliases: Arc::from([]),
+                arguments: maki_commands::ArgumentArity::ANY,
+                docs: maki_commands::CommandDocs {
+                    summary: Arc::from(format!("{name} description")),
+                    argument_hint: Some(Arc::from("<arg>")),
+                },
+                required_capabilities: TargetCapabilities::default(),
+            },
+            behavior: Arc::new(OutcomeBehavior(outcome)),
+            completion: None,
+        }
+    }
+
     const OTHER_CWD: &str = "/elsewhere";
     const THIS_CWD: &str = "/here";
     /// A pid no live process on this machine has.
@@ -1218,7 +1645,7 @@ mod tests {
         session.save(&storage).unwrap();
         let id = session.id.to_string();
         for flags in [vec!["-c".to_string()], vec!["--session-id".to_string()]] {
-            let mut args = vec!["maki".to_string()];
+            let mut args = vec!["makima".to_string()];
             args.extend(flags);
             args.push(id.clone());
             let cli = Cli::parse_from(args.iter().map(String::as_str));
@@ -1242,7 +1669,7 @@ mod tests {
         session.save(&storage).unwrap();
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
 
-        let mut args = vec!["maki".to_string()];
+        let mut args = vec!["makima".to_string()];
         args.push(flag.to_string());
         if flag != "-l" {
             args.push(session.id.to_string());
@@ -1269,6 +1696,157 @@ mod tests {
             .find(|(_, c)| *c == name)
             .map(|(m, _)| *m)
             .unwrap_or(name)
+    }
+
+    #[test]
+    fn sdk_commands_projection_includes_shared_producers_and_supported_model_only() {
+        let registry = CommandRegistry::new();
+        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        plugin
+            .replace(vec![registration("/lua", CommandOutcome::Completed)])
+            .unwrap();
+        let mcp = registry.create_producer(maki_commands::ProducerPrecedence::Mcp);
+        let mut prompt = registration("/mcp:prompt", CommandOutcome::Completed);
+        prompt.spec.required_capabilities =
+            TargetCapabilities::from_capability(TargetCapability::AgentTurns);
+        mcp.replace(vec![prompt]).unwrap();
+        let commands = sdk_commands(registry);
+
+        assert_eq!(
+            commands.slash_commands(),
+            ["lua", "mcp:prompt", "model", "btw"]
+        );
+        assert!(matches!(
+            commands.dispatch_input("/mcp:prompt", &[]),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        let InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) =
+            commands.dispatch_input("/btw explain this", &[])
+        else {
+            panic!("quick question did not return an agent turn");
+        };
+        assert_eq!(turn.content.text.as_ref(), "explain this");
+        assert!(matches!(
+            commands.dispatch_input("/btw", &[]),
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::InvalidArguments {
+                command,
+                expected: maki_commands::ArgumentArity::ONE_OR_MORE,
+                actual: 0,
+            })) if command.as_ref() == "/btw"
+        ));
+        let projection = commands.projection();
+        assert_eq!(projection[0]["description"], "/lua description");
+        assert_eq!(projection[0]["argumentHint"], "<arg>");
+    }
+
+    #[test_case("/model gpt-5", "openai/gpt-5"; "shorthand")]
+    #[test_case("/model openai/gpt-5", "openai/gpt-5"; "qualified")]
+    fn sdk_model_command_routes_qualified_spec(input: &str, expected: &str) {
+        let commands = sdk_commands(CommandRegistry::new());
+        let registry = commands.registry.clone();
+        let target = commands.target.clone();
+        let content = CommandContent::from(input);
+        let dispatch = smol::spawn(async move { registry.dispatch_input(&target, content).await });
+
+        let CommandRoute::Model { argument, response } = commands.route_rx.recv().unwrap();
+        assert_eq!(argument, expected);
+        response.send(Ok(HostResponse::Completed)).unwrap();
+        assert!(matches!(
+            smol::block_on(dispatch),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+    }
+
+    #[test]
+    fn sdk_bare_model_returns_shared_usage_error() {
+        let commands = sdk_commands(CommandRegistry::new());
+        assert!(matches!(
+            commands.dispatch_input("/model", &[]),
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
+                if message.as_ref() == "Usage: /model <model>"
+        ));
+        assert!(commands.route_rx.is_empty());
+    }
+
+    #[test]
+    fn sdk_command_behavior_owns_attachment_policy() {
+        let registry = CommandRegistry::new();
+        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        let mut inspect = registration("/inspect", CommandOutcome::Completed);
+        inspect.behavior = Arc::new(ReplaceAttachment);
+        let mut reject = registration("/reject", CommandOutcome::Completed);
+        reject.behavior = Arc::new(RejectAttachment);
+        plugin.replace(vec![inspect, reject]).unwrap();
+        let commands = sdk_commands(registry);
+        let images = vec![ImageSource::new(
+            maki_providers::ImageMediaType::Png,
+            Arc::from("AAAA"),
+        )];
+
+        let InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) =
+            commands.dispatch_input("/inspect now", &images)
+        else {
+            panic!("attachment-aware command did not return an agent turn");
+        };
+        let input = command_attachments::agent_input(turn, AgentMode::Build, false, false).unwrap();
+        assert_eq!(input.message, "inspected");
+        assert_eq!(input.images.len(), 1);
+        assert_eq!(
+            input.images[0].media_type,
+            maki_providers::ImageMediaType::Jpeg
+        );
+        assert_eq!(input.images[0].data.as_ref(), "BBBB");
+
+        assert!(matches!(
+            commands.dispatch_input("/reject", &images),
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::Producer(message)))
+                if message.as_ref() == REJECTED_ATTACHMENT
+        ));
+    }
+
+    #[test]
+    fn sdk_dispatch_returns_outcomes_and_preserves_literal_input() {
+        let registry = CommandRegistry::new();
+        let plugin = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        plugin
+            .replace(vec![registration("/done", CommandOutcome::Completed)])
+            .unwrap();
+        let commands = sdk_commands(registry.clone());
+
+        assert!(matches!(
+            smol::block_on(registry.dispatch_input(&commands.target, "/done now".into())),
+            InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        let images = vec![ImageSource::new(
+            maki_providers::ImageMediaType::Gif,
+            Arc::from("AAAA"),
+        )];
+        let InputDispatch::LiteralInput(content) =
+            commands.dispatch_input("/unknown literal", &images)
+        else {
+            panic!("unknown command did not remain literal input");
+        };
+        assert_eq!(content.text.as_ref(), "/unknown literal");
+        assert_eq!(content.attachments.len(), 1);
+        assert_eq!(content.attachments[0].media_type.as_ref(), "image/gif");
+        assert_eq!(content.attachments[0].data.as_ref(), "AAAA");
+        assert!(matches!(
+            commands.dispatch_input("ordinary literal", &[]),
+            InputDispatch::LiteralInput(_)
+        ));
+    }
+
+    #[test]
+    fn sdk_unsupported_builtin_is_literal_input() {
+        let commands = sdk_commands(CommandRegistry::new());
+        assert!(matches!(
+            smol::block_on(
+                commands
+                    .registry
+                    .dispatch_input(&commands.target, "/help".into())
+            ),
+            InputDispatch::LiteralInput(_)
+        ));
     }
 
     #[test_case("bash", "Bash")]
@@ -1419,6 +1997,52 @@ mod tests {
             .position(|e| e["type"] == "content_block_stop")
             .unwrap();
         assert!(stop_pos > start_pos);
+    }
+
+    #[test_case("user", InboundMessageType::User)]
+    #[test_case("control_request", InboundMessageType::ControlRequest)]
+    #[test_case("control_response", InboundMessageType::ControlResponse)]
+    #[test_case("control_cancel_request", InboundMessageType::ControlCancelRequest)]
+    fn inbound_message_type_deserializes(value: &str, expected: InboundMessageType) {
+        let message: InboundMessage =
+            serde_json::from_value(serde_json::json!({"type": value})).unwrap();
+        assert_eq!(message.msg_type, expected);
+    }
+
+    #[test]
+    fn unknown_inbound_message_type_is_preserved() {
+        let message: InboundMessage =
+            serde_json::from_value(serde_json::json!({"type": "future"})).unwrap();
+        assert!(matches!(
+            message.msg_type,
+            InboundMessageType::Unknown(value) if value == "future"
+        ));
+    }
+
+    #[test_case("initialize", InboundControlRequestType::Initialize)]
+    #[test_case("interrupt", InboundControlRequestType::Interrupt)]
+    #[test_case("set_permission_mode", InboundControlRequestType::SetPermissionMode)]
+    #[test_case("set_model", InboundControlRequestType::SetModel)]
+    fn inbound_control_request_type_deserializes(value: &str, expected: InboundControlRequestType) {
+        let request: InboundControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "request",
+            "request": {"subtype": value}
+        }))
+        .unwrap();
+        assert_eq!(request.request.subtype, expected);
+    }
+
+    #[test]
+    fn unknown_inbound_control_request_type_is_preserved() {
+        let request: InboundControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "request",
+            "request": {"subtype": "future"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.request.subtype,
+            InboundControlRequestType::Unknown(value) if value == "future"
+        ));
     }
 
     #[test_case("default", PermissionMode::Default)]

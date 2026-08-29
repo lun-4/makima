@@ -357,7 +357,9 @@ maki.api.create_autocmd("SplashSelect", {
 maki.api.register_command({
   name = "/splash",
   description = "Preview and select a splash renderer",
+  argument_hint = "[splash]",
   nargs = "?",
+  tui_only = true,
   completion = {
     get_items = function()
       local out = {}

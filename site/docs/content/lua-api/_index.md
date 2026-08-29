@@ -27,6 +27,7 @@ A small plugin looks like this:
 maki.api.register_command({
   name = "greet",
   description = "Say hello from Lua",
+  tui_only = false,
   handler = function()
     maki.ui.flash("hello from a plugin!")
   end,
@@ -85,6 +86,7 @@ The rules:
 | --- | --- |
 | [`maki`](#maki) | The global entry point. |
 | [`maki.api`](#maki-api) | Plugin registration. |
+| [`maki.perf`](#maki-perf) | Performance instrumentation for splashes and the UI. |
 | [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
@@ -102,7 +104,7 @@ The rules:
 | [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
-| [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher maki's built-in pickers use. |
+| [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
 | [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override, list, and switch agent modes. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
@@ -269,7 +271,7 @@ string or a table with richer output fields.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
-  - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes.
+  - `mutable_path` (`string|function`) Schema field name (type: string) for the primary path the tool writes, or `function(input)` returning the resolved target path (nil when the call does not mutate). When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
 **Example:**
@@ -348,6 +350,8 @@ browsing memory files or toggling settings.
   - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
     slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
+  - `tui_only` (`boolean`) Required. If true, the command is available only in the interactive TUI.
+  - `argument_hint` (`string`) Optional. Short hint describing the command arguments.
   - `nargs` (`integer|string`) Optional. How many arguments the command
     takes, spelled like nvim's nargs: 0 (default),
     1, "?" (zero or one), "*" (any number), or "+"
@@ -679,12 +683,12 @@ Listen for one or more events. Returns an id you can pass to
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-`"SessionFocusChanged"`, `"SplashShown"`, `"SplashHidden"`, and
-`"StoreChanged"`. Plugins can
+`"SessionFocusChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
+`"SplashHidden"`, and `"StoreChanged"`. Plugins can
 also fire their own events with `exec_autocmds`.
 
-Except `"StoreChanged"`, each host event carries `data.session_id`. For
-`"SessionReset"` that
+Except `"SessionPickerRequested"` and `"StoreChanged"`, each host event
+carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
 running or focused. Tool events also carry `data.tool_id` and `data.tool`.
 `"SessionFocusChanged"` also carries `data.previous_session_id` except on
@@ -838,6 +842,38 @@ which plugins own or wrap each slot.
 for name, info in pairs(maki.api.get_slots()) do
   print(name, info.owner, info.declared)
 end
+```
+
+
+## maki.perf {#maki-perf}
+
+Performance instrumentation for splashes and the UI. The host
+measures splash renders; plugins read the timings and draw their own
+readouts.
+
+---
+
+### `maki.perf.timings()` {#maki-perf-timings}
+
+```lua
+maki.perf.timings()
+```
+
+Read the splash render timings the host measured: how long the most
+recent `splash.render` invocation took and how many renders completed in
+the trailing second. The numbers come from the host that drives the
+render, so they include the whole call (queue wait, warm-up, deadline)
+and need no instrumentation inside the splash itself.
+
+A still splash settles to `0 fps` once nothing animates, which is the
+point: it proves the splash is not burning CPU.
+
+**Returns:** (`table`) `{ render_ms = number, fps = number }`.
+
+**Example:**
+
+```lua
+local t = maki.perf.timings()
 ```
 
 
@@ -2871,7 +2907,7 @@ maki.log.error("failed to connect to API")
 
 ## maki.match {#maki-match}
 
-Fuzzy matching via nucleo, the same matcher maki's built-in pickers use.
+Fuzzy matching via nucleo, the same matcher makima's built-in pickers use.
 
 Use it for type-ahead search over a plugin's own item list.
 
@@ -2890,7 +2926,7 @@ end
 maki.match.fuzzy({query}, {text})
 ```
 
-Fuzzy match {query} against {text} with nucleo, the same matcher maki's
+Fuzzy match {query} against {text} with nucleo, the same matcher makima's
 built-in pickers use. Every whitespace-separated word in {query} must
 match somewhere in {text}; word order does not matter. An empty or
 whitespace-only query matches everything.
@@ -5834,7 +5870,7 @@ print(t.name) -- maki
 
 ## Shared helper modules
 
-These ship inside maki; `require` them from any plugin. Small modules are
+These ship inside makima; `require` them from any plugin. Small modules are
 shown as full source, larger ones as their public interface.
 
 ### `require("maki.color")`

@@ -1674,11 +1674,14 @@ mod tests {
         while s.nucleo.tick(0).running {}
 
         menu.sync_query("Cargo");
-        for _ in 0..100 {
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
             let (_, _) = menu.tick();
-            if !menu.session.as_ref().unwrap().file_matches.is_empty() {
+            if !menu.session.as_ref().unwrap().matching {
                 break;
             }
+            assert!(Instant::now() < deadline, "file matcher did not settle");
+            std::thread::yield_now();
         }
         let s = menu.session.as_ref().unwrap();
         assert_eq!(s.query, "Cargo");

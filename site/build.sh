@@ -72,7 +72,7 @@ body docs/content/_index.md > "$OUT/docs/index.md"
 summary=$(first_paragraph docs/content/_index.md)
 
 {
-  echo "# Maki"
+  echo "# Makima"
   echo
   echo "> $summary"
   echo
@@ -80,7 +80,7 @@ summary=$(first_paragraph docs/content/_index.md)
   echo
   echo "## Docs"
   echo
-  echo "- [Maki Docs]($BASE_URL/docs/index.md): overview and map of the documentation"
+  echo "- [Makima Docs]($BASE_URL/docs/index.md): overview and map of the documentation"
   for f in $pages; do
     slug=$(basename "$(dirname "$f")")
     title=$(sed -n 's/^title = "\(.*\)"$/\1/p' "$f")

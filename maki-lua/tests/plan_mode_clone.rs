@@ -1,5 +1,5 @@
 //! Verifies the plan-mode directive and plan-reviewer prompt are verbatim
-//! clones of pi-luna's polytoken ports, differing only where maki's tool names
+//! clones of pi-luna's polytoken ports, differing only where makima's tool names
 //! or mechanics require a substitution (AC.1, AC.2, AC.3).
 //!
 //! These run on the real plugin sources so a byte-level edit to any of the

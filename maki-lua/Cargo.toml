@@ -18,6 +18,7 @@ image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-commands = { workspace = true }
 maki-highlight = { workspace = true }
 maki-interpreter = { workspace = true }
 maki-match = { workspace = true }
@@ -92,7 +93,12 @@ image = { workspace = true }
 maki-agent = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "luau_perf"
+harness = false
+
+[[bench]]
+name = "splash_perf"
 harness = false

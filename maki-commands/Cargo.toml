@@ -1,0 +1,15 @@
+[package]
+name = "maki-commands"
+description = "Frontend-neutral slash command contracts for maki."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+futures-lite = { workspace = true }

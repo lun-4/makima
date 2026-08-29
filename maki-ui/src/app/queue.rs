@@ -235,13 +235,14 @@ impl App {
         }
     }
 
-    pub(super) fn queue_compact(&mut self) {
+    pub(super) fn queue_compact(&mut self) -> bool {
         let Some(ref shared) = self.queue.shared else {
-            return;
+            return false;
         };
         shared.push(QueueItem::Compact {
             run_id: self.run_id,
         });
+        true
     }
 
     /// Agent reached a deferred message: time to draw the bubble. Restored

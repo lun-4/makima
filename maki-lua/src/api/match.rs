@@ -1,4 +1,4 @@
-//! Fuzzy matching backed by nucleo, the same matcher maki's built-in
+//! Fuzzy matching backed by nucleo, the same matcher makima's built-in
 //! pickers use. Plugins get consistent type-ahead search without
 //! re-implementing subsequence logic.
 
@@ -17,7 +17,7 @@ fn string_arg(val: &LuaValue, what: &str) -> LuaResult<String> {
     }
 }
 
-/// Fuzzy match {query} against {text} with nucleo, the same matcher maki's
+/// Fuzzy match {query} against {text} with nucleo, the same matcher makima's
 /// built-in pickers use. Every whitespace-separated word in {query} must
 /// match somewhere in {text}; word order does not matter. An empty or
 /// whitespace-only query matches everything.
@@ -73,7 +73,7 @@ fn completion(lua: &Lua, query: LuaValue, label: LuaValue) -> LuaResult<Option<T
 }
 
 lua_table! {
-    /// Fuzzy matching via nucleo, the same matcher maki's built-in pickers use.
+    /// Fuzzy matching via nucleo, the same matcher makima's built-in pickers use.
     ///
     /// Use it for type-ahead search over a plugin's own item list.
     ///

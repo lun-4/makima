@@ -1,4 +1,4 @@
-//! Fuzzy matching backed by nucleo, the same matcher maki's built-in
+//! Fuzzy matching backed by nucleo, the same matcher makima's built-in
 //! pickers use. Shared by command-argument resolution and the `maki.match`
 //! Lua API.
 

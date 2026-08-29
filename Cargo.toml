@@ -21,6 +21,7 @@ maki-ui = { workspace = true }
 maki-agent = { workspace = true }
 maki-acp = { workspace = true }
 maki-config = { workspace = true }
+maki-commands = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
@@ -43,12 +44,15 @@ open = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
 
 [workspace]
 members = [
   "maki-acp",
   "maki-agent",
   "maki-config",
+  "maki-commands",
   "maki-docgen",
   "maki-highlight",
   "maki-interpreter",
@@ -64,7 +68,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.11-luna"
+version = "0.4.11-makima"
 edition = "2024"
 authors = ["Luna <luna@l4.pm", "Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -75,6 +79,7 @@ rust-version = "1.88"
 maki-agent = { path = "maki-agent" }
 maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
+maki-commands = { path = "maki-commands" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }

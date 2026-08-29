@@ -156,7 +156,47 @@ pub async fn run(
             return done_error(e);
         }
 
-        let result = invocation.execute(ctx).await;
+        // Serialize mutable-path mutations per normalized key: acquire the
+        // gate immediately before execution so the whole read-modify-write
+        // handler (including the Lua apply_edit read-record-write) is the
+        // critical section, without serializing headers or permission
+        // prompts. The execution context carries this dispatch's owner
+        // appended to the inherited chain, so recursive same-path calls
+        // from inside a locked handler are rejected instead of deadlocking.
+        let locked = match invocation.mutable_path() {
+            Some(target) => {
+                let key = match crate::tools::file_locks::FileWriteLocks::lock_key(
+                    &target.to_string_lossy(),
+                ) {
+                    Ok(key) => key,
+                    Err(e) => return done_error(e),
+                };
+                match ctx
+                    .file_write_locks
+                    .acquire(key, &ctx.write_lock_chain, &ctx.cancel, ctx.deadline)
+                    .await
+                {
+                    Ok(guard) => {
+                        let mut chain = (*ctx.write_lock_chain).clone();
+                        chain.push(guard.owner());
+                        let mut exec_ctx = ctx.clone();
+                        exec_ctx.write_lock_chain = Arc::new(chain);
+                        Some((exec_ctx, guard))
+                    }
+                    Err(msg) => return done_error(msg),
+                }
+            }
+            None => None,
+        };
+
+        let result = match locked {
+            Some((exec_ctx, guard)) => {
+                let result = invocation.execute(&exec_ctx).await;
+                drop(guard);
+                result
+            }
+            None => invocation.execute(ctx).await,
+        };
 
         let elapsed = started.elapsed();
         match result.output {
@@ -1000,6 +1040,783 @@ mod tests {
             assert!(
                 !executed.load(Ordering::SeqCst),
                 "execute must not run after denial"
+            );
+        });
+    }
+
+    // ---- write-lock dispatch tests ----------------------------------------
+
+    use std::path::Path;
+    use std::time::Duration;
+
+    use crate::cancel::CancelToken;
+    use crate::tools::file_locks::SAME_PATH_MUTATION_IN_PROGRESS;
+    use crate::tools::{DEADLINE_EXCEEDED, Deadline};
+
+    struct Gate {
+        entered: flume::Sender<()>,
+        entered_rx: flume::Receiver<()>,
+        release: flume::Sender<()>,
+        release_rx: flume::Receiver<()>,
+        exited: flume::Sender<()>,
+        exited_rx: flume::Receiver<()>,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            let (entered, entered_rx) = flume::unbounded();
+            let (release, release_rx) = flume::unbounded();
+            let (exited, exited_rx) = flume::unbounded();
+            Arc::new(Self {
+                entered,
+                entered_rx,
+                release,
+                release_rx,
+                exited,
+                exited_rx,
+            })
+        }
+
+        async fn entered(&self) {
+            let _ = self.entered_rx.recv_async().await;
+        }
+
+        fn try_entered(&self) -> bool {
+            self.entered_rx.try_recv().is_ok()
+        }
+
+        async fn exited(&self) {
+            let _ = self.exited_rx.recv_async().await;
+        }
+
+        fn release(&self) {
+            self.release.send(()).ok();
+        }
+    }
+
+    /// Mutable-path tool that parks inside its handler on a `Gate` until the
+    /// test releases it, recording entry/exit. `fail` makes the handler
+    /// return an error after release, exercising guard release on error.
+    struct GatedWriteNamed {
+        name: String,
+        gate: Arc<Gate>,
+        fail: bool,
+    }
+
+    struct GatedWriteInvocation {
+        gate: Arc<Gate>,
+        path: String,
+        fail: bool,
+    }
+
+    impl ToolInvocation for GatedWriteInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("gated".into()))
+        }
+        fn mutable_path(&self) -> Option<&Path> {
+            Some(Path::new(&self.path))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                self.gate.entered.send(()).ok();
+                let _ = self.gate.release_rx.recv_async().await;
+                self.gate.exited.send(()).ok();
+                let output: Result<ToolOutput, String> = if self.fail {
+                    Err("boom".into())
+                } else {
+                    Ok(ToolOutput::Plain("ok".into()))
+                };
+                ToolExecResult::from(output)
+            })
+        }
+    }
+
+    impl Tool for GatedWriteNamed {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
+            "gated write".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "additionalProperties": false
+            })
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(GatedWriteInvocation {
+                gate: Arc::clone(&self.gate),
+                path: input["path"].as_str().unwrap_or_default().to_owned(),
+                fail: self.fail,
+            }))
+        }
+    }
+
+    fn register_gated_with(registry: &ToolRegistry, name: &str, gate: Arc<Gate>, fail: bool) {
+        registry
+            .register(
+                Arc::new(GatedWriteNamed {
+                    name: name.to_owned(),
+                    gate,
+                    fail,
+                }),
+                ToolSource::Lua {
+                    plugin: "test".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn register_gated(registry: &ToolRegistry, name: &str, gate: Arc<Gate>) {
+        register_gated_with(registry, name, gate, false);
+    }
+
+    fn register_failing_gated(registry: &ToolRegistry, name: &str, gate: Arc<Gate>) {
+        register_gated_with(registry, name, gate, true);
+    }
+
+    async fn dispatch_gated(
+        registry: Arc<ToolRegistry>,
+        ctx: ToolContext,
+        id: String,
+        name: String,
+        path: String,
+    ) -> ToolDoneEvent {
+        run(
+            &registry,
+            None,
+            id,
+            &name,
+            &serde_json::json!({ "path": path }),
+            &ctx,
+            Emit::Silent,
+        )
+        .await
+    }
+
+    #[test]
+    fn cloned_tool_contexts_share_write_locks() {
+        let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+        let cloned = ctx.clone();
+        assert!(
+            Arc::ptr_eq(&ctx.file_write_locks, &cloned.file_write_locks),
+            "cloned contexts must share one lock registry"
+        );
+        assert_eq!(
+            (*ctx.write_lock_chain).len(),
+            0,
+            "root contexts start with an empty owner chain"
+        );
+    }
+
+    #[test]
+    fn same_path_mutations_are_serialized() {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            let gate_a = Gate::new();
+            let gate_b = Gate::new();
+            register_gated(&registry, "gated_a", Arc::clone(&gate_a));
+            register_gated(&registry, "gated_b", Arc::clone(&gate_b));
+
+            let a = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx.clone(),
+                "a".into(),
+                "gated_a".into(),
+                "/shared".into(),
+            ));
+            gate_a.entered().await;
+
+            let b = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx.clone(),
+                "b".into(),
+                "gated_b".into(),
+                "/shared".into(),
+            ));
+            for _ in 0..10 {
+                smol::future::yield_now().await;
+            }
+            assert!(
+                !gate_b.try_entered(),
+                "second same-path call entered while the first holds the lock"
+            );
+
+            gate_a.release();
+            let done_a = a.await;
+            gate_a.exited().await;
+            assert!(!done_a.is_error, "first call: {}", done_a.output.as_text());
+
+            gate_b.entered().await;
+            gate_b.release();
+            let done_b = b.await;
+            gate_b.exited().await;
+            assert!(!done_b.is_error, "second call: {}", done_b.output.as_text());
+        });
+    }
+
+    #[test]
+    fn different_paths_do_not_share_a_lock() {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            let gate_a = Gate::new();
+            let gate_b = Gate::new();
+            register_gated(&registry, "gated_a", Arc::clone(&gate_a));
+            register_gated(&registry, "gated_b", Arc::clone(&gate_b));
+
+            let a = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx.clone(),
+                "a".into(),
+                "gated_a".into(),
+                "/a".into(),
+            ));
+            let b = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx.clone(),
+                "b".into(),
+                "gated_b".into(),
+                "/b".into(),
+            ));
+            gate_a.entered().await;
+            gate_b.entered().await;
+
+            gate_a.release();
+            gate_b.release();
+            let done_a = a.await;
+            let done_b = b.await;
+            gate_a.exited().await;
+            gate_b.exited().await;
+            assert!(!done_a.is_error);
+            assert!(!done_b.is_error);
+        });
+    }
+
+    #[test]
+    fn path_aliases_share_write_lock() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target.txt");
+            std::fs::write(&target, "payload").unwrap();
+            let target_s = target.to_string_lossy().into_owned();
+            let dot_alias = dir
+                .path()
+                .join(".")
+                .join("target.txt")
+                .to_string_lossy()
+                .into_owned();
+            let dotdot_alias = dir
+                .path()
+                .join("missing")
+                .join("..")
+                .join("target.txt")
+                .to_string_lossy()
+                .into_owned();
+
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            for (i, alias) in [target_s.clone(), dot_alias, dotdot_alias]
+                .iter()
+                .enumerate()
+            {
+                let gate_a = Gate::new();
+                let gate_b = Gate::new();
+                register_gated(
+                    &registry,
+                    &format!("gated_alias_{i}_a"),
+                    Arc::clone(&gate_a),
+                );
+                register_gated(
+                    &registry,
+                    &format!("gated_alias_{i}_b"),
+                    Arc::clone(&gate_b),
+                );
+
+                let a = smol::spawn(dispatch_gated(
+                    Arc::clone(&registry),
+                    ctx.clone(),
+                    format!("a{i}"),
+                    format!("gated_alias_{i}_a"),
+                    alias.to_owned(),
+                ));
+                gate_a.entered().await;
+                let b = smol::spawn(dispatch_gated(
+                    Arc::clone(&registry),
+                    ctx.clone(),
+                    format!("b{i}"),
+                    format!("gated_alias_{i}_b"),
+                    target_s.clone(),
+                ));
+                for _ in 0..10 {
+                    smol::future::yield_now().await;
+                }
+                assert!(
+                    !gate_b.try_entered(),
+                    "alias {alias:?} must share the lock with {target_s:?}"
+                );
+                gate_a.release();
+                let done_a = a.await;
+                gate_a.exited().await;
+                assert!(!done_a.is_error);
+                gate_b.entered().await;
+                gate_b.release();
+                let done_b = b.await;
+                gate_b.exited().await;
+                assert!(!done_b.is_error);
+            }
+
+            #[cfg(unix)]
+            {
+                let alias = dir.path().join("link.txt");
+                if std::os::unix::fs::symlink(&target, &alias).is_ok() {
+                    let alias_s = alias.to_string_lossy().into_owned();
+                    let gate_a = Gate::new();
+                    let gate_b = Gate::new();
+                    register_gated(&registry, "gated_sym_a", Arc::clone(&gate_a));
+                    register_gated(&registry, "gated_sym_b", Arc::clone(&gate_b));
+
+                    let a = smol::spawn(dispatch_gated(
+                        Arc::clone(&registry),
+                        ctx.clone(),
+                        "sym_a".into(),
+                        "gated_sym_a".into(),
+                        alias_s.clone(),
+                    ));
+                    gate_a.entered().await;
+                    let b = smol::spawn(dispatch_gated(
+                        Arc::clone(&registry),
+                        ctx.clone(),
+                        "sym_b".into(),
+                        "gated_sym_b".into(),
+                        target_s.clone(),
+                    ));
+                    for _ in 0..10 {
+                        smol::future::yield_now().await;
+                    }
+                    assert!(
+                        !gate_b.try_entered(),
+                        "symlink alias {alias_s:?} must share the lock with {target_s:?}"
+                    );
+                    gate_a.release();
+                    let done_a = a.await;
+                    gate_a.exited().await;
+                    assert!(!done_a.is_error);
+                    gate_b.entered().await;
+                    gate_b.release();
+                    let done_b = b.await;
+                    gate_b.exited().await;
+                    assert!(!done_b.is_error);
+                } else {
+                    eprintln!("skipping symlink alias case: symlink creation unavailable");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn write_lock_reusable_after_waiter_cancellation() {
+        smol::block_on(async {
+            let base = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            let gate_a = Gate::new();
+            let gate_b = Gate::new();
+            let gate_c = Gate::new();
+            register_gated(&registry, "gated_a", Arc::clone(&gate_a));
+            register_gated(&registry, "gated_b", Arc::clone(&gate_b));
+            register_gated(&registry, "gated_c", Arc::clone(&gate_c));
+
+            let a = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                base.clone(),
+                "a".into(),
+                "gated_a".into(),
+                "/same".into(),
+            ));
+            gate_a.entered().await;
+
+            let (trigger_b, token_b) = CancelToken::new();
+            let mut ctx_b = base.clone();
+            ctx_b.cancel = token_b;
+            let b = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx_b.clone(),
+                "b".into(),
+                "gated_b".into(),
+                "/same".into(),
+            ));
+            for _ in 0..10 {
+                smol::future::yield_now().await;
+            }
+            trigger_b.cancel();
+            let done_b = b.await;
+            assert!(done_b.is_error);
+            assert_eq!(done_b.output.as_text(), "cancelled");
+            assert!(!gate_b.try_entered(), "cancelled waiter must not enter");
+
+            gate_a.release();
+            let done_a = a.await;
+            gate_a.exited().await;
+            assert!(!done_a.is_error);
+
+            let c = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                base.clone(),
+                "c".into(),
+                "gated_c".into(),
+                "/same".into(),
+            ));
+            gate_c.entered().await;
+            gate_c.release();
+            let done_c = c.await;
+            gate_c.exited().await;
+            assert!(!done_c.is_error, "registry must be reusable after cancel");
+        });
+    }
+
+    #[test]
+    fn write_lock_reusable_after_waiter_timeout() {
+        smol::block_on(async {
+            let base = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            let gate_a = Gate::new();
+            let gate_b = Gate::new();
+            let gate_c = Gate::new();
+            register_gated(&registry, "gated_a", Arc::clone(&gate_a));
+            register_gated(&registry, "gated_b", Arc::clone(&gate_b));
+            register_gated(&registry, "gated_c", Arc::clone(&gate_c));
+
+            let a = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                base.clone(),
+                "a".into(),
+                "gated_a".into(),
+                "/same".into(),
+            ));
+            gate_a.entered().await;
+
+            let mut ctx_b = base.clone();
+            ctx_b.deadline = Deadline::after(Duration::from_millis(40));
+            let b = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx_b.clone(),
+                "b".into(),
+                "gated_b".into(),
+                "/same".into(),
+            ));
+            let done_b = b.await;
+            assert!(done_b.is_error);
+            assert_eq!(done_b.output.as_text(), DEADLINE_EXCEEDED);
+            assert!(!gate_b.try_entered(), "timed-out waiter must not enter");
+
+            gate_a.release();
+            let done_a = a.await;
+            gate_a.exited().await;
+            assert!(!done_a.is_error);
+
+            let c = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                base.clone(),
+                "c".into(),
+                "gated_c".into(),
+                "/same".into(),
+            ));
+            gate_c.entered().await;
+            gate_c.release();
+            let done_c = c.await;
+            gate_c.exited().await;
+            assert!(!done_c.is_error, "registry must be reusable after timeout");
+        });
+    }
+
+    #[test]
+    fn write_lock_reusable_after_holder_error_or_existing_execution_cancel() {
+        smol::block_on(async {
+            let base = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            let gate_a = Gate::new();
+            let gate_b = Gate::new();
+            let gate_c = Gate::new();
+            register_gated(&registry, "gated_a", Arc::clone(&gate_a));
+            register_gated(&registry, "gated_b", Arc::clone(&gate_b));
+            register_gated(&registry, "gated_c", Arc::clone(&gate_c));
+
+            // Holder errors: the guard must release on every return path.
+            let gate_fail = Gate::new();
+            register_failing_gated(&registry, "gated_fail", Arc::clone(&gate_fail));
+            let a = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                base.clone(),
+                "a".into(),
+                "gated_fail".into(),
+                "/same".into(),
+            ));
+            gate_fail.entered().await;
+            gate_fail.release();
+            let done_a = a.await;
+            gate_fail.exited().await;
+            assert!(done_a.is_error, "expected the holder to fail");
+            assert_eq!(done_a.output.as_text(), "boom");
+
+            let b = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                base.clone(),
+                "b".into(),
+                "gated_b".into(),
+                "/same".into(),
+            ));
+            gate_b.entered().await;
+            gate_b.release();
+            let done_b = b.await;
+            gate_b.exited().await;
+            assert!(!done_b.is_error);
+
+            // An execution that returns due to cancellation releases too.
+            let (trigger_c, token_c) = CancelToken::new();
+            let mut ctx_c = base.clone();
+            ctx_c.cancel = token_c;
+            let c = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx_c.clone(),
+                "c".into(),
+                "gated_c".into(),
+                "/same".into(),
+            ));
+            gate_c.entered().await;
+            trigger_c.cancel();
+            gate_c.release();
+            let done_c = c.await;
+            gate_c.exited().await;
+            assert!(
+                !done_c.is_error,
+                "cancel during execution is execution-level"
+            );
+
+            let (_trigger_d, token_d) = CancelToken::new();
+            let mut ctx_d = base.clone();
+            ctx_d.cancel = token_d;
+            let d = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx_d.clone(),
+                "d".into(),
+                "gated_c".into(),
+                "/same".into(),
+            ));
+            gate_c.entered().await;
+            gate_c.release();
+            let done_d = d.await;
+            gate_c.exited().await;
+            assert!(
+                !done_d.is_error,
+                "registry reusable after the previous holder"
+            );
+        });
+    }
+
+    const RECURSIVE_WRITE_NAME: &str = "recursive_write";
+    const INNER_WRITE_NAME: &str = "inner_write";
+
+    struct RecursiveWrite;
+
+    struct RecursiveWriteInvocation {
+        input: Value,
+    }
+
+    impl ToolInvocation for RecursiveWriteInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("recursive".into()))
+        }
+        fn mutable_path(&self) -> Option<&Path> {
+            self.input["path"].as_str().map(Path::new)
+        }
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                let inner = run(
+                    &ctx.registry,
+                    None,
+                    "inner".into(),
+                    INNER_WRITE_NAME,
+                    &self.input,
+                    ctx,
+                    Emit::Silent,
+                )
+                .await;
+                let out = if inner.is_error {
+                    Err(inner.output.as_text())
+                } else {
+                    Ok(inner.output)
+                };
+                ToolExecResult::from(out)
+            })
+        }
+    }
+
+    impl Tool for RecursiveWrite {
+        fn name(&self) -> &str {
+            RECURSIVE_WRITE_NAME
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
+            "recursive write".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "additionalProperties": false
+            })
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(RecursiveWriteInvocation {
+                input: input.clone(),
+            }))
+        }
+    }
+
+    /// The inner tool of the reentry probe: a plain mutable-path tool that
+    /// acquires the same key only if the outer lock was released.
+    struct InnerWrite;
+
+    struct SimpleWriteInvocation {
+        path: String,
+    }
+
+    impl ToolInvocation for SimpleWriteInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("inner".into()))
+        }
+        fn mutable_path(&self) -> Option<&Path> {
+            Some(Path::new(&self.path))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async {
+                ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("ok".into())))
+            })
+        }
+    }
+
+    impl Tool for InnerWrite {
+        fn name(&self) -> &str {
+            INNER_WRITE_NAME
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> std::borrow::Cow<'_, str> {
+            "inner write".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "additionalProperties": false
+            })
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(SimpleWriteInvocation {
+                path: input["path"].as_str().unwrap_or_default().to_owned(),
+            }))
+        }
+    }
+
+    /// Two independent root contexts (fresh owner chains) that share one
+    /// registry lock the same way a parent and a subagent do: they must
+    /// serialize, never error.
+    #[test]
+    fn independent_root_contexts_share_write_locks_serialize() {
+        smol::block_on(async {
+            let base = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            let gate_a = Gate::new();
+            let gate_b = Gate::new();
+            register_gated(&registry, "gated_a", Arc::clone(&gate_a));
+            register_gated(&registry, "gated_b", Arc::clone(&gate_b));
+            let mut ctx_a = base.clone();
+            ctx_a.registry = Arc::clone(&registry);
+            let ctx_b = ToolContext {
+                registry: Arc::clone(&registry),
+                file_write_locks: Arc::clone(&ctx_a.file_write_locks),
+                write_lock_chain: Arc::new(Vec::new()),
+                ..ctx_a.clone()
+            };
+
+            let a = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx_a,
+                "a".into(),
+                "gated_a".into(),
+                "/shared".into(),
+            ));
+            gate_a.entered().await;
+
+            let b = smol::spawn(dispatch_gated(
+                Arc::clone(&registry),
+                ctx_b,
+                "b".into(),
+                "gated_b".into(),
+                "/shared".into(),
+            ));
+            for _ in 0..10 {
+                smol::future::yield_now().await;
+            }
+            assert!(
+                !gate_b.try_entered(),
+                "fresh root context must queue behind the other root"
+            );
+
+            gate_a.release();
+            let done_a = a.await;
+            gate_a.exited().await;
+            assert!(!done_a.is_error);
+
+            gate_b.entered().await;
+            gate_b.release();
+            let done_b = b.await;
+            gate_b.exited().await;
+            assert!(!done_b.is_error);
+        });
+    }
+
+    #[test]
+    fn same_path_reentry_returns_error() {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            ctx.registry = Arc::clone(&registry);
+            registry
+                .register(
+                    Arc::new(RecursiveWrite),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                    },
+                )
+                .unwrap();
+            registry
+                .register(
+                    Arc::new(InnerWrite),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                    },
+                )
+                .unwrap();
+
+            let done = run(
+                &registry,
+                None,
+                "outer".into(),
+                RECURSIVE_WRITE_NAME,
+                &serde_json::json!({ "path": "/reentrant" }),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error, "reentry must surface as an error");
+            assert!(
+                done.output
+                    .as_text()
+                    .contains(SAME_PATH_MUTATION_IN_PROGRESS),
+                "got: {}",
+                done.output.as_text()
             );
         });
     }

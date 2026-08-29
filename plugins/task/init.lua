@@ -66,7 +66,7 @@ Notes:
 ]]
 
 -- Read-only plan reviewer directive: a verbatim port of pi-luna's reviewer
--- prompt (subagents.ts), with maki's embedded-spec mechanic.
+-- prompt (subagents.ts), with makima's embedded-spec mechanic.
 -- The mode gate keeps this spawnable only in plan.
 local PLAN_REVIEWER_PROMPT = [[You are the **plan_reviewer** subagent: a read-only plan reviewer spawned by the primary agent. Your only tools are read, grep, glob, list — no shell, no writes, no subagent spawns. Your task message names the plan file path; the plan specification (a markdown document defining the required plan shape) is embedded in your system prompt. Read the plan file yourself and judge it against the embedded specification — the files are the truth. When the caller included the user's original reque...
 
@@ -127,7 +127,7 @@ local schema = {
 if opts.allow_model then
   schema.properties.model = {
     type = "string",
-    description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell maki the model; maki will not guess. Overrides model_tier.',
+    description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell makima the model; makima will not guess. Overrides model_tier.',
   }
 end
 

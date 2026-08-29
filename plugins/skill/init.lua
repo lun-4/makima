@@ -9,7 +9,7 @@ local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 
 local PROJECT_SKILL_DIRS = {
-  ".maki/skills",
+  ".makima/skills",
   ".claude/skills",
   ".opencode/skills",
   ".agents/skills",
@@ -82,7 +82,7 @@ local function resolve_builtin_content()
     local path = maki.fs.joinpath(dir, REFERENCE_FILE)
     local _, err = maki.fs.mkdir(dir, { parents = true })
     if not err then
-      _, err = maki.fs.write(path, reference.content)
+      _, err = maki.fs.atomic_write(path, reference.content)
     end
     if not err then
       return (builtin.content:gsub(builtin.reference_placeholder, function()

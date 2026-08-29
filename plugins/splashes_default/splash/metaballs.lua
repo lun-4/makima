@@ -1,4 +1,4 @@
--- Bundled splash, part of the maki distribution.
+-- Bundled splash, part of the makima distribution.
 -- Require from init.lua with:   local splash = require("splash.metaballs")
 -- The module returns M with M.description and M.render(w, h, t, fade) and does not activate itself.
 --
@@ -49,60 +49,6 @@ local function color(hex)
   return s
 end
 
-local W, H
-
-local function new_grid()
-  local bg = color(BG_HEX)
-  local grid = {}
-  for y = 1, H do
-    local row = {}
-    for x = 1, W do
-      row[x] = { glyph = " ", style = bg }
-    end
-    grid[y] = row
-  end
-  return grid
-end
-
-local function place_text(grid, row, x, text, st)
-  if row < 1 or row > H then
-    return
-  end
-  local r = grid[row]
-  for i = 1, #text do
-    local xx = x + i - 1
-    if xx >= 1 and xx <= W then
-      r[xx] = { glyph = string.sub(text, i, i), style = st }
-    end
-  end
-end
-
-local function build_rows(grid)
-  local rows = {}
-  for y = 1, H do
-    local segs = {}
-    local buf = {}
-    local cur
-    local function flush()
-      if #buf > 0 then
-        segs[#segs + 1] = { glyphs = table.concat(buf), style = cur }
-        buf = {}
-      end
-    end
-    for x = 1, W do
-      local cell = grid[y][x]
-      if cell.style ~= cur then
-        flush()
-        cur = cell.style
-      end
-      buf[#buf + 1] = cell.glyph
-    end
-    flush()
-    rows[y] = segs
-  end
-  return rows
-end
-
 local function flat_rows(w, h, st)
   local rows = {}
   for y = 1, h do
@@ -121,18 +67,41 @@ local function smoothstep(e0, e1, x)
   return u * u * (3.0 - 2.0 * u)
 end
 
-local function shade_style(r, g, b, f)
-  local function q(v)
-    if v < 0 then
-      v = 0
-    elseif v > 1 then
-      v = 1
-    end
-    return math.floor(v * 31 + 0.5) * 255 / 31
+-- 5-bit keyed style: quantize to 0..31 per channel (so a `31`-step grid maps
+-- back to 8-bit hex on cache miss) and key on the components directly. This
+-- drops the per-cell *255/31 round-trip. Metaballs keeps exact-key runs because
+-- its thin gridlines are high-frequency details that tolerance merging drops.
+local MERGE_TOL = 0
+
+local function quantize5(v)
+  if v < 0 then
+    v = 0
+  elseif v > 1 then
+    v = 1
   end
-  return color(
-    string.format("#%02x%02x%02x", math.floor(q(r * f) + 0.5), math.floor(q(g * f) + 0.5), math.floor(q(b * f) + 0.5))
-  )
+  return math.floor(v * 31 + 0.5)
+end
+
+local function cell_style(r, g, b, f)
+  local qr = quantize5(r * f)
+  local qg = quantize5(g * f)
+  local qb = quantize5(b * f)
+  local key = qr * 1024 + qg * 32 + qb
+  local st = style_cache[key]
+  if not st then
+    st = {
+      fg = string.format(
+        "#%02x%02x%02x",
+        math.floor(qr * 255 / 31 + 0.5),
+        math.floor(qg * 255 / 31 + 0.5),
+        math.floor(qb * 255 / 31 + 0.5)
+      ),
+      bg = BG_HEX,
+      bold = false,
+    }
+    style_cache[key] = st
+  end
+  return qr, qg, qb, st
 end
 
 local function ramp_glyph(lum)
@@ -149,19 +118,20 @@ local function fract(x)
   return x - math.floor(x)
 end
 
-local function ball(ux, uy, bx, by, k)
-  local dx = ux - bx
-  local dy = uy - by
+local function ball(nx, ny, bx, by, k)
+  local dx = nx - bx
+  local dy = ny - by
   return k / math.sqrt(dx * dx + dy * dy + 1e-4)
 end
 
--- Fragment shade for isotropic coords (nx, ny); returns r, g, b in [0, 1].
-function M.shade(nx, ny, t)
+-- Smooth metaball field without the gridline overlay; blobs are the four
+-- { bx, by, k } centers hoisted per frame.
+local function field_shade(nx, ny, blobs)
   local v = 0.0
-  v = v + ball(nx, ny, math.sin(t * 0.7) * 0.7, math.cos(t * 0.9) * 0.7, 0.35)
-  v = v + ball(nx, ny, math.cos(t * 1.1) * 0.8, math.sin(t * 0.6) * 0.8, 0.30)
-  v = v + ball(nx, ny, math.sin(t * 0.5 + 2.0) * 0.5, math.cos(t * 0.8 + 1.0) * 0.5, 0.25)
-  v = v + ball(nx, ny, math.sin(t * 0.33 + 4.0) * 0.9, math.cos(t * 0.41 + 2.0) * 0.6, 0.22)
+  for i = 1, 4 do
+    local b = blobs[i]
+    v = v + ball(nx, ny, b[1], b[2], b[3])
+  end
   local edge = smoothstep(1.15, 1.25, v)
   local core = smoothstep(1.25, 2.4, v)
   local r = 0.03 + (0.1 - 0.03) * edge
@@ -171,43 +141,86 @@ function M.shade(nx, ny, t)
   g = g + (0.9 - g) * core
   b = b + (1.0 - b) * core
   local glow = math.exp(-math.abs(v - 1.2) * 3.0) * 0.8
-  r = r + 0.3 * glow
-  g = g + 0.7 * glow
-  b = b + 1.0 * glow
+  return r + 0.3 * glow, g + 0.7 * glow, b + 1.0 * glow
+end
+
+local function gridline(nx, ny)
   local gx = math.abs(fract(nx * 8.0) - 0.5)
   local gy = math.abs(fract(ny * 8.0) - 0.5)
-  local gridline = 0.02 * smoothstep(0.48, 0.5, gx > gy and gx or gy)
-  return r + gridline, g + gridline, b + gridline
+  return 0.02 * smoothstep(0.48, 0.5, gx > gy and gx or gy)
+end
+
+local function blob_positions(t)
+  return {
+    { math.sin(t * 0.7) * 0.7, math.cos(t * 0.9) * 0.7, 0.35 },
+    { math.cos(t * 1.1) * 0.8, math.sin(t * 0.6) * 0.8, 0.30 },
+    { math.sin(t * 0.5 + 2.0) * 0.5, math.cos(t * 0.8 + 1.0) * 0.5, 0.25 },
+    { math.sin(t * 0.33 + 4.0) * 0.9, math.cos(t * 0.41 + 2.0) * 0.6, 0.22 },
+  }
+end
+
+-- Fragment shade for isotropic coords (nx, ny); returns r, g, b in [0, 1].
+function M.shade(nx, ny, t)
+  local r, g, b = field_shade(nx, ny, blob_positions(t))
+  local line = gridline(nx, ny)
+  return r + line, g + line, b + line
 end
 
 function M.render(w, h, t, fade)
   refresh_colors()
-  W, H = w, h
   local f = fade or 1.0
   if w < 8 or h < 6 then
     return flat_rows(w, h, color(BG_HEX))
   end
-  local grid = new_grid()
+  local version = "v" .. maki.version().current
+  local version_x = w - #version + 1
+  local version_style = color(rgb_to_hex(FG, 0.4 * f))
+  local blobs = blob_positions(t)
+  local inv_h = 1 / h
+  local rows = {}
   for y = 1, h do
-    local row = grid[y]
-    local ny = (2 * (y - 0.5) - h) / h
+    local ny = (2 * (y - 0.5) - h) * inv_h
+    local glyphs = {}
+    local segs = {}
+    local current_style
+    local run_qr, run_qg, run_qb
+    local run_start = 1
     for x = 1, w do
-      local nx = ((x - 0.5) - w / 2) / h
-      local r, g, b = M.shade(nx, ny, t)
-      row[x] = {
-        glyph = ramp_glyph(0.2126 * r * f + 0.7152 * g * f + 0.0722 * b * f),
-        style = shade_style(r, g, b, f),
-      }
+      local glyph
+      local qr, qg, qb
+      local style
+      if y == 1 and x >= version_x then
+        glyph = string.sub(version, x - version_x + 1, x - version_x + 1)
+        style = version_style
+      else
+        local nx = ((x - 0.5) - w / 2) * inv_h
+        local r, g, b = field_shade(nx, ny, blobs)
+        local line = gridline(nx, ny)
+        glyph = ramp_glyph((0.2126 * (r + line) + 0.7152 * (g + line) + 0.0722 * (b + line)) * f)
+        qr, qg, qb, style = cell_style(r + line, g + line, b + line, f)
+      end
+      local near = style == current_style
+        or (
+          qr ~= nil
+          and run_qr ~= nil
+          and math.abs(qr - run_qr) <= MERGE_TOL
+          and math.abs(qg - run_qg) <= MERGE_TOL
+          and math.abs(qb - run_qb) <= MERGE_TOL
+        )
+      if not near then
+        if current_style then
+          segs[#segs + 1] = { glyphs = table.concat(glyphs, "", run_start, x - 1), style = current_style }
+        end
+        current_style = style
+        run_qr, run_qg, run_qb = qr, qg, qb
+        run_start = x
+      end
+      glyphs[x] = glyph
     end
+    segs[#segs + 1] = { glyphs = table.concat(glyphs, "", run_start, w), style = current_style }
+    rows[y] = segs
   end
-  place_text(
-    grid,
-    1,
-    W - #("v" .. maki.version().current) + 1,
-    "v" .. maki.version().current,
-    color(rgb_to_hex(FG, 0.4 * f))
-  )
-  return build_rows(grid)
+  return rows
 end
 
 return M

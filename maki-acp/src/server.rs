@@ -6,14 +6,15 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
-    AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
-    CreateElicitationResponse, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError,
-    ImageContent, InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer,
-    NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
-    RequestPermissionRequest, RequestPermissionResponse, Response, SessionId, SessionModeId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    AgentNotification, AgentRequest, AgentResponse, AvailableCommand, AvailableCommandInput,
+    AvailableCommandsUpdate, ConfigOptionUpdate, ContentBlock, CreateElicitationResponse,
+    CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
+    InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, NewSessionRequest,
+    Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
+    RequestPermissionResponse, Response, SessionId, SessionModeId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallId,
+    ToolCallUpdate, ToolCallUpdateFields, UnstructuredCommandInput,
 };
 use flume::{Receiver, Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
@@ -23,6 +24,10 @@ use maki_agent::permissions::PermissionAnswer;
 use maki_agent::tools::QuestionMode;
 use maki_agent::types::AgentEvent;
 use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
+use maki_commands::{
+    AgentTurn, CommandAttachment, CommandContent, CommandOutcome, InputDispatch, PresentedCommand,
+    TargetHandle,
+};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -94,8 +99,11 @@ struct SessionState {
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
-    current_model: String,
+    command_state: Arc<maki_agent::command::SessionCommandState>,
     pending: PendingState,
+    command_registry: maki_commands::CommandRegistry,
+    command_target: TargetHandle,
+    command_projection_task: smol::Task<()>,
     lock: Option<SessionLock>,
 }
 
@@ -199,7 +207,11 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
         return;
     }
     let Some(session) = &srv.session else { return };
-    let option = methods::model_config_option(&session.current_model, &srv.model_specs);
+    let current_model = session.command_state.current_model();
+    session
+        .command_state
+        .set_model_specs(srv.model_specs.clone());
+    let option = methods::model_config_option(&current_model, &srv.model_specs);
     session_update(
         &srv.out_tx,
         &SessionId::from(session.handle.session_id.to_string()),
@@ -258,7 +270,7 @@ async fn handle_request(
         }
         "session/new" => new_session(srv, raw, params).await,
         "session/load" => load_session(srv, raw, params).await,
-        "session/prompt" => match handle_prompt(srv, raw, &id) {
+        "session/prompt" => match handle_prompt(srv, raw, &id).await {
             Ok(()) => return,
             Err(e) => Err(e),
         },
@@ -277,7 +289,7 @@ async fn new_session(
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv).await;
     let cwd = req.cwd.clone();
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers, params).await;
     let handle = spawn_session(
         params,
         req.cwd,
@@ -289,7 +301,7 @@ async fn new_session(
     let spec = params.model.spec();
     let resp = methods::new_session_response(handle.session_id.as_str(), &srv.modes)
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, None, cwd);
+    install_session(srv, handle, mcp, spec, None, cwd, params);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -306,7 +318,7 @@ async fn load_session(
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history(session_ref.id())?;
     close_session(srv).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers, params).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
@@ -332,7 +344,7 @@ async fn load_session(
         &recorded_model,
         RESTORED_FAST,
     );
-    install_session(srv, handle, mcp, spec, restored_cost, session_cwd);
+    install_session(srv, handle, mcp, spec, restored_cost, session_cwd, params);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -403,7 +415,7 @@ fn injected_servers(servers: &[McpServer]) -> Vec<(String, RawTransport)> {
         .collect()
 }
 
-/// Clients name their servers freely, maki names them like `mcp.toml` does.
+/// Clients name their servers freely, makima names them like `mcp.toml` does.
 fn server_name(name: &str) -> String {
     name.chars()
         .take(MAX_SERVER_NAME_LEN)
@@ -423,8 +435,13 @@ fn pairs<T>(items: &[T], split: impl Fn(&T) -> (&String, &String)) -> HashMap<St
 
 /// MCP is per session: the client picks the cwd and may inject its own servers.
 /// Returns as soon as the config is read, the first prompt waits for the tools.
-async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
-    let (handle, errors) = mcp::start_with_extra(cwd, injected_servers(servers)).await;
+async fn start_mcp(cwd: &Path, servers: &[McpServer], params: &AcpParams) -> Option<McpHandle> {
+    let (handle, errors) = mcp::start_with_extra_and_commands(
+        cwd,
+        injected_servers(servers),
+        params.command_registry.clone(),
+    )
+    .await;
     if !errors.is_empty() {
         warn!(%errors, "MCP config errors");
     }
@@ -446,6 +463,7 @@ async fn close_session(srv: &mut Server) {
             Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
         );
     }
+    state.command_projection_task.cancel().await;
     state.handle.task.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
@@ -462,6 +480,7 @@ fn install_session(
     current_model: String,
     initial_cost: Option<f64>,
     cwd: PathBuf,
+    params: &AcpParams,
 ) {
     let pending = PendingState::default();
     start_event_pump(
@@ -471,9 +490,42 @@ fn install_session(
         Arc::clone(&pending),
         srv.elicitation,
         handle.answer_tx.clone(),
-        cwd,
+        cwd.clone(),
         maki_storage::paths::home(),
         initial_cost,
+    );
+    let command_registry = params.command_registry.clone();
+    let command_state = Arc::new(maki_agent::command::SessionCommandState::new(
+        current_model,
+        srv.model_specs
+            .iter()
+            .map(|spec| Arc::from(spec.as_str()))
+            .collect::<Vec<_>>()
+            .into(),
+        cwd.clone(),
+        RESTORED_FAST,
+        false,
+    ));
+    let command_target = command_registry.bind_target(
+        maki_agent::command::portable_capabilities(),
+        Arc::new(maki_agent::command::SessionCommandHost::new(
+            Arc::clone(&params.model_policy),
+            handle.model_tx.clone(),
+            handle.control_tx.clone(),
+            Arc::clone(&command_state),
+            Arc::clone(&handle.permissions),
+        )),
+    );
+    let session_id = SessionId::from(handle.session_id.to_string());
+    let commands = command_registry
+        .presented_commands(&command_target)
+        .unwrap_or_default();
+    emit_available_commands(&srv.out_tx, &session_id, &commands);
+    let command_projection_task = watch_available_commands(
+        srv.out_tx.clone(),
+        session_id,
+        command_registry.clone(),
+        command_target.clone(),
     );
     // Claim-if-free heartbeat: beats every interval while the session is
     // open, so the lock goes stale only when this process stops beating. A
@@ -519,10 +571,64 @@ fn install_session(
         handle,
         mcp,
         current_mode: AgentMode::Build,
-        current_model,
+        command_state,
         pending,
+        command_registry,
+        command_target,
+        command_projection_task,
         lock,
     });
+}
+
+fn available_commands(commands: &[PresentedCommand]) -> Vec<AvailableCommand> {
+    commands
+        .iter()
+        .map(|command| {
+            let mut available = AvailableCommand::new(
+                command.name.trim_start_matches('/'),
+                command.description.to_string(),
+            );
+            if let Some(hint) = &command.argument_hint {
+                available = available.input(AvailableCommandInput::Unstructured(
+                    UnstructuredCommandInput::new(hint.to_string()),
+                ));
+            }
+            available
+        })
+        .collect()
+}
+
+fn emit_available_commands(
+    out_tx: &Sender<Value>,
+    session_id: &SessionId,
+    commands: &[PresentedCommand],
+) {
+    session_update(
+        out_tx,
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands(
+            commands,
+        ))),
+    );
+}
+
+fn watch_available_commands(
+    out_tx: Sender<Value>,
+    session_id: SessionId,
+    registry: maki_commands::CommandRegistry,
+    target: TargetHandle,
+) -> smol::Task<()> {
+    let subscription = registry.subscribe();
+    smol::spawn(async move {
+        let mut generation = subscription.generation();
+        loop {
+            generation = subscription.changed(generation).await;
+            let Ok(commands) = registry.presented_commands(&target) else {
+                return;
+            };
+            emit_available_commands(&out_tx, &session_id, &commands);
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -573,22 +679,95 @@ fn load_history_from(
     })
 }
 
-fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
+async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
     let session = srv.session.as_ref().ok_or_else(no_session)?;
+    let content = extract_prompt_content(&req.prompt)?;
+    let dispatch = session
+        .command_registry
+        .dispatch_input(&session.command_target, content)
+        .await;
+    match dispatch {
+        InputDispatch::LiteralInput(content) => send_command_turn(
+            session,
+            id,
+            AgentTurn {
+                content,
+                prompt: None,
+            },
+        ),
+        InputDispatch::Dispatched(CommandOutcome::Completed) => {
+            respond_prompt(&srv.out_tx, id.clone(), StopReason::EndTurn);
+            Ok(())
+        }
+        InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
+            send_command_turn(session, id, turn)
+        }
+        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(command_error(error)),
+    }
+}
 
-    let (message, images) = extract_prompt_content(&req.prompt);
-    let input = AgentInput {
+fn send_command_turn(
+    session: &SessionState,
+    id: &RequestId,
+    turn: AgentTurn,
+) -> Result<(), AcpError> {
+    let prompt = turn.prompt.map(|prompt| maki_agent::McpPromptRef {
+        qualified_name: prompt.qualified_name.to_string(),
+        arguments: prompt
+            .arguments
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+    });
+    let images = turn
+        .content
+        .attachments
+        .iter()
+        .map(|attachment| ImageSource {
+            media_type: image_media_type(&attachment.media_type),
+            data: Arc::clone(&attachment.data),
+        })
+        .collect();
+    send_agent_input(
+        session,
+        id,
+        agent_input(
+            turn.content.text.to_string(),
+            images,
+            session.current_mode.clone(),
+            session.command_state.fast(),
+            session.command_state.workflow(),
+            prompt,
+        ),
+    )
+}
+
+fn agent_input(
+    message: String,
+    images: Vec<ImageSource>,
+    mode: AgentMode,
+    fast: bool,
+    workflow: bool,
+    prompt: Option<maki_agent::McpPromptRef>,
+) -> AgentInput {
+    AgentInput {
         message,
-        mode: session.current_mode.clone(),
+        mode,
         images,
         preamble: Vec::new(),
         thinking: Default::default(),
-        fast: false,
-        workflow: false,
-        prompt: None,
-    };
+        fast,
+        workflow,
+        prompt: prompt.map(Box::new),
+    }
+}
 
+fn send_agent_input(
+    session: &SessionState,
+    id: &RequestId,
+    input: AgentInput,
+) -> Result<(), AcpError> {
     session
         .handle
         .input_tx
@@ -596,6 +775,20 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
     session.pending.lock().unwrap().prompt = Some(id.clone());
     Ok(())
+}
+
+fn command_error(error: maki_commands::CommandError) -> AcpError {
+    AcpError::new(-32602, error.to_string())
+}
+
+fn respond_prompt(out_tx: &Sender<Value>, id: RequestId, reason: StopReason) {
+    send(
+        out_tx,
+        Response::new(
+            id,
+            Ok(AgentResponse::PromptResponse(PromptResponse::new(reason))),
+        ),
+    );
 }
 
 fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
@@ -636,9 +829,9 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
     session
         .handle
         .model_tx
-        .send(model)
+        .send(model.clone())
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    session.current_model = spec.clone();
+    session.command_state.set_model(&model);
 
     Ok(AgentResponse::SetSessionConfigOptionResponse(
         SetSessionConfigOptionResponse::new(vec![methods::model_config_option(
@@ -717,30 +910,48 @@ fn permission_answer(raw: &Value) -> PermissionAnswer {
     }
 }
 
-fn extract_prompt_content(blocks: &[ContentBlock]) -> (String, Vec<ImageSource>) {
+const UNSUPPORTED_CONTENT_BLOCK: &str = "unsupported content block in command prompt";
+
+fn extract_prompt_content(blocks: &[ContentBlock]) -> Result<CommandContent, AcpError> {
     let mut text = String::new();
-    let mut images = Vec::new();
+    let mut attachments = Vec::new();
 
     for block in blocks {
         match block {
-            ContentBlock::Text(TextContent { text: t, .. }) => append(&mut text, t),
+            ContentBlock::Text(TextContent { text: part, .. }) => append(&mut text, part),
             ContentBlock::Image(ImageContent {
                 data, mime_type, ..
-            }) => images.push(ImageSource {
-                media_type: image_media_type(mime_type),
+            }) => attachments.push(CommandAttachment {
+                media_type: Arc::from(mime_type.as_str()),
                 data: Arc::from(data.as_str()),
             }),
-            ContentBlock::Resource(res) => {
-                if let EmbeddedResourceResource::TextResourceContents(trc) = &res.resource {
-                    append(&mut text, &format!("--- {} ---\n{}", trc.uri, trc.text));
+            ContentBlock::Resource(res) => match &res.resource {
+                EmbeddedResourceResource::TextResourceContents(resource) => {
+                    append(
+                        &mut text,
+                        &format!("--- {} ---\\n{}", resource.uri, resource.text),
+                    );
                 }
+                EmbeddedResourceResource::BlobResourceContents(_) | _ => {
+                    return Err(
+                        AcpError::invalid_params().data(json_str(&UNSUPPORTED_CONTENT_BLOCK))
+                    );
+                }
+            },
+            ContentBlock::ResourceLink(resource) => {
+                append(&mut text, &format!("[Resource: {}]", resource.uri));
             }
-            ContentBlock::ResourceLink(rl) => append(&mut text, &format!("[Resource: {}]", rl.uri)),
-            _ => {}
+            ContentBlock::Audio(_) => {
+                return Err(AcpError::invalid_params().data(json_str(&UNSUPPORTED_CONTENT_BLOCK)));
+            }
+            _ => return Err(AcpError::invalid_params().data(json_str(&UNSUPPORTED_CONTENT_BLOCK))),
         }
     }
 
-    (text, images)
+    Ok(CommandContent {
+        text: Arc::from(text),
+        attachments: Arc::from(attachments),
+    })
 }
 
 fn append(text: &mut String, part: &str) {
@@ -901,6 +1112,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use maki_agent::permissions::PermissionManager;
+    use maki_commands::TargetCapabilities;
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
@@ -912,7 +1124,41 @@ mod tests {
     const ANSWERED_ID: i64 = 1001;
     const UNKNOWN_ID: i64 = 1002;
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
+    const FAST_SPEC: &str = "anthropic/claude-opus-4-8";
     const OFFLINE_SPEC: &str = "openai/gpt-5";
+
+    fn test_registry(
+        custom_commands: &[maki_agent::command::CustomCommand],
+    ) -> maki_commands::CommandRegistry {
+        let registry = maki_commands::CommandRegistry::new();
+        let commands = maki_agent::command::StandardCommands::register(
+            &registry,
+            custom_commands,
+            maki_agent::command::StandardCompletions::default(),
+        )
+        .unwrap();
+        std::mem::forget(commands);
+        registry
+    }
+
+    fn test_target(
+        registry: &maki_commands::CommandRegistry,
+        model_tx: Sender<Model>,
+        control_tx: Sender<maki_agent::headless::InteractiveControl>,
+        command_state: Arc<maki_agent::command::SessionCommandState>,
+        permissions: Arc<PermissionManager>,
+    ) -> TargetHandle {
+        registry.bind_target(
+            maki_agent::command::portable_capabilities(),
+            Arc::new(maki_agent::command::SessionCommandHost::new(
+                Arc::new(maki_config::ModelPolicy::default()),
+                model_tx,
+                control_tx,
+                command_state,
+                permissions,
+            )),
+        )
+    }
 
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
@@ -929,16 +1175,23 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn server_awaiting_answer() -> (Server, Receiver<String>, Receiver<Value>) {
+    fn server_awaiting_answer() -> (
+        Server,
+        Receiver<String>,
+        Receiver<Value>,
+        Receiver<AgentInput>,
+    ) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
+        let (input_tx, input_rx) = flume::unbounded();
         let handle = InteractiveHandle {
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
-            input_tx: flume::unbounded().0,
+            input_tx,
             answer_tx,
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
+            control_tx: flume::unbounded().0,
             session_id: SessionRef::from(MakiId::generate()),
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
@@ -947,6 +1200,21 @@ mod tests {
             )),
             task: smol::spawn(async {}),
         };
+        let command_registry = test_registry(&[]);
+        let command_state = Arc::new(maki_agent::command::SessionCommandState::new(
+            String::new(),
+            Arc::from([]),
+            PathBuf::from("/project"),
+            false,
+            false,
+        ));
+        let command_target = test_target(
+            &command_registry,
+            handle.model_tx.clone(),
+            handle.control_tx.clone(),
+            Arc::clone(&command_state),
+            Arc::clone(&handle.permissions),
+        );
         let server = Server {
             out_tx,
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
@@ -956,21 +1224,62 @@ mod tests {
                 handle,
                 mcp: None,
                 current_mode: AgentMode::Build,
-                current_model: String::new(),
+                command_state,
                 pending: Arc::new(Mutex::new(Pending {
                     permission: Some(ANSWERED_ID),
                     ..Default::default()
                 })),
+                command_registry,
+                command_target,
+                command_projection_task: smol::spawn(async {}),
                 lock: None,
             }),
             elicitation: false,
         };
-        (server, answer_rx, out_rx)
+        (server, answer_rx, out_rx, input_rx)
+    }
+
+    #[test]
+    fn config_model_change_clears_ineligible_fast_mode() {
+        let (mut srv, ..) = server_awaiting_answer();
+        let (model_tx, model_rx) = flume::unbounded();
+        let session = srv.session.as_mut().unwrap();
+        session.handle.model_tx = model_tx;
+        session
+            .command_state
+            .set_model(&Model::from_spec(FAST_SPEC).expect("fast-capable test model should parse"));
+        let fast_result = smol::block_on(
+            session
+                .command_registry
+                .dispatch_input(&session.command_target, "/fast".into()),
+        );
+        assert!(matches!(
+            fast_result,
+            maki_commands::InputDispatch::Dispatched(maki_commands::CommandOutcome::Completed)
+        ));
+        assert!(session.command_state.fast());
+
+        let result = handle_set_config(
+            &mut srv,
+            &serde_json::json!({
+                "params": {
+                    "sessionId": MakiId::generate().to_string(),
+                    "configId": methods::MODEL_CONFIG_ID,
+                    "value": OFFLINE_SPEC,
+                }
+            }),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(model_rx.recv().unwrap().spec(), OFFLINE_SPEC);
+        let state = &srv.session.as_ref().unwrap().command_state;
+        assert_eq!(state.current_model(), OFFLINE_SPEC);
+        assert!(!state.fast());
     }
 
     #[test]
     fn only_the_outstanding_request_id_is_answered() {
-        let (srv, answer_rx, _) = server_awaiting_answer();
+        let (srv, answer_rx, ..) = server_awaiting_answer();
 
         handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
         assert!(answer_rx.is_empty(), "an unknown id is dropped");
@@ -990,7 +1299,7 @@ mod tests {
 
     #[test]
     fn cancel_drops_the_outstanding_permission_request() {
-        let (srv, answer_rx, _) = server_awaiting_answer();
+        let (srv, answer_rx, ..) = server_awaiting_answer();
         handle_notification(&srv, "session/cancel");
 
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
@@ -999,7 +1308,7 @@ mod tests {
 
     #[test]
     fn elicitation_answer_is_routed_by_id_and_decoded() {
-        let (srv, answer_rx, _) = server_awaiting_answer();
+        let (srv, answer_rx, ..) = server_awaiting_answer();
         {
             let mut pending = srv.session.as_ref().unwrap().pending.lock().unwrap();
             pending.permission = None;
@@ -1030,7 +1339,7 @@ mod tests {
 
     #[test]
     fn unparsable_elicitation_result_dismisses_instead_of_hanging() {
-        let (srv, answer_rx, _) = server_awaiting_answer();
+        let (srv, answer_rx, ..) = server_awaiting_answer();
         srv.session
             .as_ref()
             .unwrap()
@@ -1105,8 +1414,71 @@ mod tests {
     }
 
     #[test]
+    fn available_command_projection_tracks_registry_generation() {
+        let registry = test_registry(&[]);
+        let target = test_target(
+            &registry,
+            flume::unbounded().0,
+            flume::unbounded().0,
+            Arc::new(maki_agent::command::SessionCommandState::new(
+                String::new(),
+                Arc::from([]),
+                PathBuf::from("/project"),
+                false,
+                false,
+            )),
+            Arc::new(PermissionManager::new(
+                maki_config::PermissionsConfig::default(),
+                PathBuf::from("/project"),
+                Arc::default(),
+            )),
+        );
+        let initial = registry.snapshot_for(&target).unwrap();
+        let commands = available_commands(&registry.presented_commands(&target).unwrap());
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compact", "new", "clear", "model", "cd", "btw", "yolo", "fast", "workflow"
+            ]
+        );
+
+        let producer = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![maki_commands::Registration {
+                spec: maki_commands::CommandSpec {
+                    name: Arc::from("/review"),
+                    aliases: Arc::from([]),
+                    arguments: maki_commands::ArgumentArity::unbounded(0),
+                    docs: maki_commands::CommandDocs {
+                        summary: Arc::from("Review code"),
+                        argument_hint: Some(Arc::from("<path>")),
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(CompletedCommand),
+                completion: None,
+            }])
+            .unwrap();
+        let updated = registry.snapshot_for(&target).unwrap();
+        assert!(updated.generation() > initial.generation());
+        let commands = available_commands(&registry.presented_commands(&target).unwrap());
+        let review = commands
+            .iter()
+            .find(|command| command.name == "review")
+            .unwrap();
+        assert_eq!(review.description, "Review code");
+        assert!(matches!(
+            review.input,
+            Some(AvailableCommandInput::Unstructured(ref input)) if input.hint == "<path>"
+        ));
+    }
+
+    #[test]
     fn discovered_models_are_pushed_to_the_client() {
-        let (mut srv, .., out_rx) = server_awaiting_answer();
+        let (mut srv, _, out_rx, _) = server_awaiting_answer();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]);
         let update = out_rx.try_recv().expect("the fuller list is announced");
@@ -1121,6 +1493,248 @@ mod tests {
         assert!(selectable.contains(&DISCOVERED_SPEC));
         refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]);
         assert!(out_rx.is_empty());
+    }
+
+    fn prompt_request(text: &str, image: bool) -> Value {
+        let mut prompt = vec![serde_json::json!({ "type": "text", "text": text })];
+        if image {
+            prompt.push(serde_json::json!({
+                "type": "image",
+                "data": "aGVsbG8=",
+                "mimeType": "image/png",
+            }));
+        }
+        serde_json::json!({
+            "params": {
+                "sessionId": MakiId::generate().to_string(),
+                "prompt": prompt,
+            }
+        })
+    }
+
+    fn install_registry(srv: &mut Server, registry: maki_commands::CommandRegistry) {
+        let session = srv.session.as_mut().unwrap();
+        session.command_target = test_target(
+            &registry,
+            session.handle.model_tx.clone(),
+            session.handle.control_tx.clone(),
+            Arc::clone(&session.command_state),
+            Arc::clone(&session.handle.permissions),
+        );
+        session.command_registry = registry;
+    }
+
+    #[test]
+    fn unknown_slash_prompt_is_sent_to_agent_literal() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/does-not-exist value", false),
+            &RequestId::Number(1),
+        ))
+        .unwrap();
+        assert_eq!(
+            input_rx.try_recv().unwrap().message,
+            "/does-not-exist value"
+        );
+    }
+
+    #[test]
+    fn custom_slash_prompt_dispatches_rendered_agent_input() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let registry = test_registry(&[maki_agent::command::CustomCommand {
+            name: "review".into(),
+            description: "review code".into(),
+            content: "Review $ARGUMENTS".into(),
+            scope: maki_agent::command::CommandScope::Project,
+            accepts_args: true,
+            argument_hint: None,
+        }]);
+        install_registry(&mut srv, registry);
+
+        smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/project:review src", false),
+            &RequestId::Number(2),
+        ))
+        .unwrap();
+        assert_eq!(input_rx.try_recv().unwrap().message, "Review src");
+    }
+
+    #[test]
+    fn unavailable_interactive_command_is_sent_to_agent_literal() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+
+        smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/help", true),
+            &RequestId::Number(3),
+        ))
+        .unwrap();
+        let input = input_rx.try_recv().unwrap();
+        assert_eq!(input.message, "/help");
+        assert_eq!(input.images.len(), 1);
+    }
+
+    #[test]
+    fn portable_bare_model_returns_shared_usage_error() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+
+        let error = smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/model", false),
+            &RequestId::Number(3),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(error.message, "command failed: Usage: /model <model>");
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
+    fn portable_local_builtin_rejects_non_text_content() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+
+        let error = smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/compact", true),
+            &RequestId::Number(3),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
+    fn agent_turn_preserves_image_content() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let registry = test_registry(&[maki_agent::command::CustomCommand {
+            name: "review".into(),
+            description: "review code".into(),
+            content: "Review $ARGUMENTS".into(),
+            scope: maki_agent::command::CommandScope::Project,
+            accepts_args: true,
+            argument_hint: None,
+        }]);
+        install_registry(&mut srv, registry);
+
+        smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/project:review src", true),
+            &RequestId::Number(3),
+        ))
+        .unwrap();
+        let input = input_rx.try_recv().unwrap();
+        assert_eq!(input.message, "Review src");
+        assert_eq!(input.images.len(), 1);
+    }
+
+    #[test]
+    fn custom_command_with_unsupported_content_has_exact_error() {
+        let (mut srv, _, _, _) = server_awaiting_answer();
+        let registry = test_registry(&[maki_agent::command::CustomCommand {
+            name: "review".into(),
+            description: "review code".into(),
+            content: "Review $ARGUMENTS".into(),
+            scope: maki_agent::command::CommandScope::Project,
+            accepts_args: true,
+            argument_hint: None,
+        }]);
+        install_registry(&mut srv, registry);
+        let raw = serde_json::json!({
+            "params": {
+                "sessionId": MakiId::generate().to_string(),
+                "prompt": [
+                    { "type": "text", "text": "/project:review src" },
+                    { "type": "audio", "data": "aGVsbG8=", "mimeType": "audio/wav" }
+                ]
+            }
+        });
+        let error =
+            smol::block_on(handle_prompt(&mut srv, &raw, &RequestId::Number(5))).unwrap_err();
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(
+            error.data,
+            Some(Value::String(UNSUPPORTED_CONTENT_BLOCK.to_owned()))
+        );
+    }
+
+    struct CompletedCommand;
+
+    impl maki_commands::CommandBehavior for CompletedCommand {
+        fn execute(
+            &self,
+            invocation: maki_commands::CommandInvocation,
+        ) -> maki_commands::CommandFuture<Result<CommandOutcome, maki_commands::CommandError>>
+        {
+            let _ = invocation;
+            Box::pin(async { Ok(CommandOutcome::Completed) })
+        }
+    }
+
+    #[test]
+    fn completed_lua_slash_prompt_returns_without_agent_input() {
+        let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+        let registry = test_registry(&[]);
+        let producer = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![maki_commands::Registration {
+                spec: maki_commands::CommandSpec {
+                    name: Arc::from("/lua-complete"),
+                    aliases: Arc::from([]),
+                    arguments: maki_commands::ArgumentArity::NONE,
+                    docs: maki_commands::CommandDocs {
+                        summary: Arc::from("complete without a turn"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(CompletedCommand),
+                completion: None,
+            }])
+            .unwrap();
+        install_registry(&mut srv, registry);
+
+        smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/lua-complete", false),
+            &RequestId::Number(4),
+        ))
+        .unwrap();
+        assert!(input_rx.is_empty());
+        let response = out_rx.try_recv().unwrap();
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+    }
+
+    #[test]
+    fn portable_bare_btw_is_rejected_by_registry() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        let error = smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/btw", false),
+            &RequestId::Number(4),
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(
+            error.message,
+            "invalid arguments for /btw: expected 1 or more"
+        );
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
+    fn portable_agent_turn_builtin_is_forwarded_to_agent() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+        smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("/btw explain this", false),
+            &RequestId::Number(4),
+        ))
+        .unwrap();
+        assert_eq!(input_rx.try_recv().unwrap().message, "explain this");
     }
 
     #[test]

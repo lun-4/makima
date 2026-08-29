@@ -22,6 +22,28 @@ const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
 
+struct FakeCommandHost;
+
+impl maki_commands::CommandHost for FakeCommandHost {
+    fn request(
+        &self,
+        _request: maki_commands::HostRequest,
+    ) -> maki_commands::CommandFuture<
+        Result<maki_commands::HostResponse, maki_commands::CommandError>,
+    > {
+        Box::pin(async { Ok(maki_commands::HostResponse::Completed) })
+    }
+}
+
+fn command_snapshot(host: &PluginHost) -> maki_commands::RegistrySnapshot {
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    registry.snapshot_for(&target).unwrap()
+}
+
 /// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
 /// a native stub stands in for one.
 struct UsageTool;
@@ -881,6 +903,7 @@ maki.api.register_tool({{
 }})
 maki.api.register_command({{
     name = "/doomed",
+    tui_only = false,
     handler = function() end,
 }})
 error("plugin blew up after register")
@@ -891,7 +914,7 @@ error("plugin blew up after register")
         .expect_err("expected lua error");
     assert!(matches!(err, PluginError::Lua { .. }));
     assert!(!reg.has("doomed"));
-    assert_eq!(host.command_reader().load().commands.len(), 0);
+    assert!(command_snapshot(&host).commands().is_empty());
 
     host.load_source("broken", ECHO_PLUGIN)
         .expect("retry with good source should succeed");
@@ -1007,6 +1030,103 @@ maki.api.register_tool({
             .tool
             .parse(&serde_json::json!({"name": "alice"}))
             .is_ok()
+    );
+}
+
+#[test]
+fn bundled_commands_project_complete_metadata() {
+    let (_reg, host) = builtins_host();
+    let snapshot = command_snapshot(&host);
+    let mut commands: Vec<_> = snapshot
+        .commands()
+        .iter()
+        .map(|command| {
+            (
+                command.spec().name.to_string(),
+                command.spec().docs.summary.to_string(),
+                command
+                    .spec()
+                    .docs
+                    .argument_hint
+                    .as_deref()
+                    .map(str::to_owned),
+                command.spec().arguments,
+                command
+                    .spec()
+                    .required_capabilities
+                    .contains(maki_commands::TargetCapability::InteractiveUi),
+            )
+        })
+        .collect();
+    commands.sort_by(|left, right| left.0.cmp(&right.0));
+
+    assert_eq!(
+        commands,
+        [
+            (
+                "/automode".into(),
+                "Toggle bash auto mode (classifier gates every bash command)".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                false
+            ),
+            (
+                "/build".into(),
+                "Switch to build mode (full tool access)".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                false
+            ),
+            (
+                "/memory".into(),
+                "View, edit, and delete memory files".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
+            (
+                "/plan".into(),
+                "Switch to plan mode (analyse and write only the plan file)".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                false
+            ),
+            (
+                "/rename".into(),
+                "Rename the current session".into(),
+                Some("<title>".into()),
+                maki_commands::ArgumentArity::ONE_OR_MORE,
+                true
+            ),
+            (
+                "/sessions".into(),
+                "Browse and switch sessions".into(),
+                Some("[query]".into()),
+                maki_commands::ArgumentArity::OPTIONAL,
+                true
+            ),
+            (
+                "/splash".into(),
+                "Preview and select a splash renderer".into(),
+                Some("[splash]".into()),
+                maki_commands::ArgumentArity::OPTIONAL,
+                true
+            ),
+            (
+                "/splash-fps".into(),
+                "Toggle the splash fps overlay: live fps and per-frame render time.".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
+            (
+                "/thinking".into(),
+                "Set thinking effort (bare opens a selector)".into(),
+                Some("[effort]".into()),
+                maki_commands::ArgumentArity::OPTIONAL,
+                true
+            ),
+        ]
     );
 }
 
@@ -2575,18 +2695,32 @@ fn register_command_happy_path() {
         maki.api.register_command({
             name = "/hello",
             description = "says hello",
+            argument_hint = "[name]",
+            tui_only = true,
             handler = function(opts) end,
+
         })
         "#,
     )
     .unwrap();
 
-    let reader = host.command_reader();
-    let snap = reader.load();
-    assert_eq!(snap.commands.len(), 1);
-    assert_eq!(snap.commands[0].name.as_ref(), "/hello");
-    assert_eq!(snap.commands[0].description.as_ref(), "says hello");
-    assert_eq!(snap.commands[0].plugin.as_ref(), "cmd_plugin");
+    let snapshot = command_snapshot(&host);
+    assert_eq!(snapshot.commands().len(), 1);
+    assert_eq!(snapshot.commands()[0].spec().name.as_ref(), "/hello");
+    assert_eq!(
+        snapshot.commands()[0].spec().docs.summary.as_ref(),
+        "says hello"
+    );
+    assert_eq!(
+        snapshot.commands()[0].spec().docs.argument_hint.as_deref(),
+        Some("[name]")
+    );
+    assert!(
+        snapshot.commands()[0]
+            .spec()
+            .required_capabilities
+            .contains(maki_commands::TargetCapability::InteractiveUi)
+    );
 }
 
 #[test]
@@ -2597,6 +2731,7 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
         r#"
         maki.api.register_command({
             name = "/deploy",
+            tui_only = false,
             nargs = 1,
             completion = {
                 get_items = function(ctx)
@@ -2612,6 +2747,7 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
         })
         maki.api.register_command({
             name = "/static",
+            tui_only = false,
             nargs = 1,
             completion = { items = {{ label = "prod", insertion = "production" }} },
             handler = function() end,
@@ -2685,6 +2821,46 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
 }
 
 #[test]
+fn dropping_command_completion_session_runs_lua_cancel_hook() {
+    const CANCEL_FLASH: &str = "cancelled:/deploy";
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "completion_drop_plugin",
+        r#"
+        maki.api.register_command({
+            name = "/deploy",
+            tui_only = false,
+            nargs = 1,
+            completion = {
+                get_items = function() return {{ label = "stage", insertion = "staging" }} end,
+                on_cancel = function(ctx) maki.ui.flash("cancelled:" .. ctx.command) end,
+            },
+            handler = function() end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let command = registry.resolve_for(&target, "/deploy").unwrap();
+    let session = registry.open_completion(command, target.id()).unwrap();
+    let result =
+        smol::block_on(session.complete(Arc::from("sta"), Arc::from("sta"), 0, Arc::from("build")));
+    assert!(matches!(result, maki_commands::CompletionResult::Items(_)));
+    let flashes = host.ui_action_rx();
+
+    drop(session);
+
+    assert!(matches!(
+        flashes.recv_timeout(Duration::from_secs(5)).unwrap(),
+        maki_lua::UiAction::Flash(message) if message == CANCEL_FLASH
+    ));
+}
+
+#[test]
 fn command_completion_timeout_returns_empty_and_keeps_host_live() {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
@@ -2692,6 +2868,7 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
         r#"
         maki.api.register_command({
             name = "/slow",
+            tui_only = false,
             nargs = 1,
             completion = {
                 get_items = function()
@@ -2744,24 +2921,52 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
     ));
 }
 
-#[test_case::test_case("" => 0 ; "default_zero")]
-#[test_case::test_case("nargs = 0," => 0 ; "zero")]
-#[test_case::test_case("nargs = 1," => 1 ; "one")]
-#[test_case::test_case(r#"nargs = "?","# => 1 ; "zero_or_one")]
-#[test_case::test_case(r#"nargs = "*","# => usize::MAX ; "any")]
-#[test_case::test_case(r#"nargs = "+","# => usize::MAX ; "one_or_more")]
-fn register_command_nargs_values(nargs_field: &str) -> usize {
+#[test_case::test_case("" => maki_commands::ArgumentArity::NONE ; "default_zero")]
+#[test_case::test_case("nargs = 0," => maki_commands::ArgumentArity::NONE ; "zero")]
+#[test_case::test_case("nargs = 1," => maki_commands::ArgumentArity::ONE ; "one")]
+#[test_case::test_case(r#"nargs = "?","# => maki_commands::ArgumentArity::OPTIONAL ; "zero_or_one")]
+#[test_case::test_case(r#"nargs = "*","# => maki_commands::ArgumentArity::ANY ; "any")]
+#[test_case::test_case(r#"nargs = "+","# => maki_commands::ArgumentArity::ONE_OR_MORE ; "one_or_more")]
+fn register_command_nargs_values(nargs_field: &str) -> maki_commands::ArgumentArity {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(
         "cmd_nargs",
         &format!(
-            r#"maki.api.register_command({{ name = "/test", {nargs_field} handler = function() end }})"#
+            r#"maki.api.register_command({{ name = "/test", tui_only = false, {nargs_field} handler = function() end }})"#
         ),
     )
     .unwrap();
 
-    host.command_reader().load().commands[0].max_args
+    command_snapshot(&host).commands()[0].spec().arguments
+}
+
+#[test_case::test_case("nargs = 1," ; "exactly_one")]
+#[test_case::test_case(r#"nargs = "+","# ; "one_or_more")]
+fn required_nargs_rejects_empty_dispatch(nargs_field: &str) {
+    let registry = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    host.load_source(
+        "required_nargs",
+        &format!(
+            r#"maki.api.register_command({{ name = "/required", tui_only = false, {nargs_field} handler = function() end }})"#
+        ),
+    )
+    .unwrap();
+    let commands = host.command_registry();
+    let target = commands.bind_target(
+        maki_commands::TargetCapabilities::NONE,
+        Arc::new(FakeCommandHost),
+    );
+
+    let outcome = smol::block_on(commands.dispatch_input(&target, "/required".into()));
+
+    assert!(matches!(
+        outcome,
+        maki_commands::InputDispatch::Dispatched(maki_commands::CommandOutcome::Failed(
+            maki_commands::CommandError::InvalidArguments { actual: 0, .. }
+        ))
+    ));
 }
 
 #[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
@@ -2773,6 +2978,7 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
         r#"
         maki.api.register_command({
             name = "/echo",
+            tui_only = false,
             nargs = "*",
             handler = function(opts)
                 maki.ui.flash(opts.args .. "|" .. table.concat(opts.fargs, ","))
@@ -2806,6 +3012,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         r#"
         maki.api.register_command({
             name = "/go",
+            tui_only = false,
             handler = function()
                 local ok, err = maki.api.run_command("/cd ~/src")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
@@ -2841,20 +3048,32 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     "non-empty" ; "empty_name"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", description = "no handler" })"#,
+    r#"maki.api.register_command({ name = "/test", tui_only = false, description = "no handler" })"#,
     "handler" ; "missing_handler"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", nargs = -1, handler = function() end })"#,
+    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = -1, handler = function() end })"#,
     NARGS_ERR ; "negative_nargs"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", nargs = 2, handler = function() end })"#,
+    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = 2, handler = function() end })"#,
     NARGS_ERR ; "nargs_two"
 )]
 #[test_case::test_case(
-    r#"maki.api.register_command({ name = "/test", nargs = "!", handler = function() end })"#,
+    r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = "!", handler = function() end })"#,
     NARGS_ERR ; "unknown_string_nargs"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", handler = function() end })"#,
+    "tui_only" ; "missing_tui_only"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", tui_only = "yes", handler = function() end })"#,
+    "tui_only" ; "invalid_tui_only"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", argument_hint = true, handler = function() end })"#,
+    "argument_hint" ; "invalid_argument_hint"
 )]
 fn register_command_validation_rejects(src: &str, expected_err: &str) {
     let reg = fresh_registry();
@@ -2872,18 +3091,18 @@ fn reload_replaces_commands() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(
         "reload_cmd",
-        r#"maki.api.register_command({ name = "/v1", handler = function() end })"#,
+        r#"maki.api.register_command({ name = "/v1", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
 
     host.load_source(
         "reload_cmd",
-        r#"maki.api.register_command({ name = "/v2", handler = function() end })"#,
+        r#"maki.api.register_command({ name = "/v2", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
-    let snap = host.command_reader().load();
-    assert_eq!(snap.commands.len(), 1);
-    assert_eq!(snap.commands[0].name.as_ref(), "/v2");
+    let snapshot = command_snapshot(&host);
+    assert_eq!(snapshot.commands().len(), 1);
+    assert_eq!(snapshot.commands()[0].spec().name.as_ref(), "/v2");
 }
 
 #[test]
@@ -2892,20 +3111,24 @@ fn unload_clears_commands() {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(
         "cmd_only",
-        r#"maki.api.register_command({ name = "/bye", handler = function() end })"#,
+        r#"maki.api.register_command({ name = "/bye", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
-    assert_eq!(host.command_reader().load().commands.len(), 1);
+    assert_eq!(command_snapshot(&host).commands().len(), 1);
 
     host.unload("cmd_only").unwrap();
-    assert_eq!(host.command_reader().load().commands.len(), 0);
+    assert!(command_snapshot(&host).commands().is_empty());
 }
 
 #[test]
 fn sessions_plugin_registers_commands() {
     let (_reg, host) = builtins_host();
-    let snap = host.command_reader().load();
-    let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
+    let snapshot = command_snapshot(&host);
+    let names: Vec<&str> = snapshot
+        .commands()
+        .iter()
+        .map(|c| c.spec().name.as_ref())
+        .collect();
     assert!(
         names.contains(&"/sessions"),
         "missing /sessions in {names:?}"
@@ -4147,6 +4370,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
         maki.api.register_command({
             name = "/park",
             description = "parks forever",
+            tui_only = false,
             handler = function()
                 maki.async.run(function()
                     maki.ui.flash("task-ran")
@@ -4178,6 +4402,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
         maki.api.register_command({
             name = "/stream",
             description = "streams job output while parked",
+            tui_only = false,
             handler = function()
                 maki.fn.jobstart("echo hi", {
                     on_stdout = function(_, line) maki.ui.flash("job:" .. line) end,
@@ -4214,6 +4439,7 @@ fn host_list_picker_roundtrip() {
         maki.api.register_command({
             name = "/pick",
             description = "host list picker roundtrip",
+            tui_only = false,
             handler = function()
                 local result = maki.ui.open_list_picker(
                     { "alpha", { label = "beta", detail = "b-d", section = "s" } },
@@ -4325,6 +4551,7 @@ fn host_list_picker_ui_drop_drains_callbacks() {
         maki.api.register_command({
             name = "/pick",
             description = "host list picker drop path",
+            tui_only = false,
             handler = function()
                 local result = maki.ui.open_list_picker({ "alpha" }, {
                     on_change = function(item, index)
@@ -4586,11 +4813,11 @@ fn test_splash_host_boots_and_serves_frames() {
 #[test]
 fn test_splash_slot_default() {
     let (handle, _guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
-    handle.set_version("0.4.8-luna", None);
+    handle.set_version("0.4.8-makima", None);
     let frame = wait_for_splash_text(&handle, "makima");
     assert!(frame_has_text(&frame, "makima"), "{frame:?}");
     assert!(
-        frame_has_text(&frame, "v0.4.8-luna"),
+        frame_has_text(&frame, "v0.4.8-makima"),
         "version current in default rows"
     );
     assert!(
@@ -4602,9 +4829,12 @@ fn test_splash_slot_default() {
     );
 
     // A newer version pushed into the Lua store surfaces as the update notice.
-    handle.set_version("0.4.8-luna", Some("9.9.9"));
+    handle.set_version("0.4.8-makima", Some("9.9.9"));
     let frame = wait_for_splash_text(&handle, "run makima update to get v9.9.9");
-    assert!(frame_has_text(&frame, "0.4.8-luna"), "still shows current");
+    assert!(
+        frame_has_text(&frame, "0.4.8-makima"),
+        "still shows current"
+    );
 }
 
 #[test]

@@ -99,7 +99,9 @@ end
 maki.api.register_command({
   name = "/thinking",
   description = "Set thinking effort (bare opens a selector)",
+  argument_hint = "[effort]",
   nargs = "?",
+  tui_only = true,
   handler = function(opts)
     local args = tostring(opts.args or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if args ~= "" then

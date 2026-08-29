@@ -97,6 +97,9 @@ pub struct AgentParams {
     pub audience: ToolAudience,
     pub question_mode: crate::tools::QuestionMode,
     pub model_policy: Arc<ModelPolicy>,
+    /// Same-process per-path mutation locks, cloned from the parent context
+    /// for subagents so concurrent same-path mutations stay serialized.
+    pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
 }
 
 pub struct AgentRunParams<'h> {
@@ -143,6 +146,7 @@ pub struct Agent<'h> {
     workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
+    file_write_locks: Arc<crate::tools::FileWriteLocks>,
 }
 
 impl<'h> Agent<'h> {
@@ -184,6 +188,7 @@ impl<'h> Agent<'h> {
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
+            file_write_locks: params.file_write_locks,
         }
     }
 
@@ -522,6 +527,8 @@ impl<'h> Agent<'h> {
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
+            file_write_locks: Arc::clone(&self.file_write_locks),
+            write_lock_chain: Arc::new(Vec::new()),
         }
     }
 
@@ -810,6 +817,7 @@ mod tests {
                 audience: ToolAudience::MAIN,
                 question_mode: crate::tools::QuestionMode::Tui,
                 model_policy: Arc::new(ModelPolicy::default()),
+                file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
             },
             AgentRunParams {
                 history,

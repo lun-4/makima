@@ -7,7 +7,7 @@ use maki_agent::AgentEvent;
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
-    Deadline, FileReadTracker, LocalTools, QuestionMode, ToolAudience, ToolContext, ToolLive,
+    FileReadTracker, LocalTools, QuestionMode, ToolAudience, ToolContext, ToolLive,
 };
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -41,8 +41,10 @@ fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
     Ok(())
 }
 
-/// Captured snapshot of the parent `ToolContext`. Per-call state (deadline,
-/// instructions, output lines) is reset so child calls start clean.
+/// Captured snapshot of the parent `ToolContext`. Per-call state that must
+/// not leak across sibling calls (instructions, output lines, local tools) is
+/// reset so child calls start clean. The deadline is preserved: a nested
+/// `call_tool` must cap itself to the parent's deadline, never extend it.
 #[derive(Clone)]
 pub(crate) struct AgentContext(ToolContext);
 
@@ -50,7 +52,6 @@ impl From<&ToolContext> for AgentContext {
     fn from(ctx: &ToolContext) -> Self {
         let mut c = ctx.clone();
         c.loaded_instructions = LoadedInstructions::new();
-        c.deadline = Deadline::None;
         c.tool_output_lines = ToolOutputLines::default();
         c.local_tools = LocalTools::default();
         Self(c)
@@ -452,6 +453,7 @@ mod tests {
     use std::collections::HashMap;
 
     use maki_agent::AgentMode;
+    use maki_agent::tools::Deadline;
     use maki_agent::tools::LocalToolFn;
     use maki_agent::tools::test_support::stub_ctx_with;
 
@@ -498,7 +500,10 @@ mod tests {
             Some(session_ref()),
             "the session owns the whole run, so it is not per-call state"
         );
-        assert!(matches!(agent.deadline, Deadline::None));
+        assert!(
+            matches!(agent.deadline, Deadline::At(_)),
+            "the parent deadline must be inherited, not discarded"
+        );
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
         assert!(agent.local_tools.is_empty());
         assert!(

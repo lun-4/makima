@@ -35,6 +35,14 @@ JSON output includes `type`, `subtype`, `is_error`, `duration_ms`, `num_turns`, 
 
 Add `--verbose` to include full turn-by-turn messages in the output.
 
+## Slash commands
+
+A prompt whose first token is an available slash command runs that command before Maki creates model input. Custom Markdown commands, MCP prompts, and Lua commands can produce a normal agent turn. A side-effect-only command succeeds with empty output. A known available command with invalid arguments exits with an error. Unknown and unavailable slash-prefixed text remains a model prompt.
+
+SDK stream mode and ACP project the built-ins supported by their target capabilities. `/model` accepts an explicit model spec. One-shot print mode supports `/exit`. Commands that require TUI capabilities remain literal input in headless frontends. Local commands reject image attachments, while agent-turn commands preserve them.
+
+See [Commands](/docs/commands/) for matching, collision priority, and the generated command list.
+
 ## Claude Code Compatibility
 
 Makima's `--print` is a drop-in replacement for Claude Code:
@@ -70,7 +78,7 @@ your orchestrator                     makima --print --input-format stream-json
         │  one JSON object per line       (stdout)    │
 ```
 
-Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages match the Claude Code SDK shape. Under the hood it reuses the same driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way.
+Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages match the Claude Code SDK shape. The initialization and control projections list the active slash commands. A `system/commands_update` event reports registry changes after plugin reloads or MCP updates. Under the hood it reuses the same driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way.
 
 SDK-only flags (`--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
 

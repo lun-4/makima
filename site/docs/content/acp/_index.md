@@ -42,6 +42,9 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 - **Questions.** The `question` tool becomes a native form in the editor (ACP elicitation). If the client does not support elicitation, the tool is dropped and the model asks in plain text.
 - **Live tool calls.** Tool progress streams as it happens, including sub-agents and batched calls.
 - **Images and context.** Prompts can include images and editor-attached files.
+- **Slash commands.** The editor receives the target-scoped central command list and updates when plugin or MCP registrations change. An available leading slash command runs before model input. Unknown and unavailable slash-prefixed text remains a model prompt. Agent-turn commands preserve images and text resources; local commands reject non-text content.
+
+ACP maps the target-scoped central registry to ACP command metadata. It does not implement or inspect individual command names. Commands that require TUI capabilities are omitted from ACP's advertised command list. Invoking an unavailable command forwards the complete prompt as ordinary model input. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
 
 Authentication, providers, and permissions come from your normal Makima config. Set up [providers](/docs/providers/) first and ACP sessions just work.
 

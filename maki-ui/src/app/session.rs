@@ -287,6 +287,7 @@ impl App {
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
         self.checkpoint_now();
+        self.rotate_command_target();
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
@@ -350,6 +351,7 @@ impl App {
         fallback_model: &Model,
     ) -> LoadedSession {
         self.checkpoint_now();
+        self.rotate_command_target();
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.state =

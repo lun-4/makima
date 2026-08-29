@@ -209,7 +209,7 @@ local function apply_edit(path, ctx, transform)
     return nil, transform_err
   end
 
-  local _, write_err = maki.fs.write(path, after)
+  local _, write_err = maki.fs.atomic_write(path, after)
   if write_err then
     return nil, "write error: " .. tostring(write_err)
   end

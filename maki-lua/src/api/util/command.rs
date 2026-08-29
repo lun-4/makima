@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
+use maki_commands::ArgumentArity;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
@@ -19,69 +20,6 @@ pub struct CommandArgumentItem {
     pub label: String,
     pub insertion: String,
     pub description: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct LuaCommandInfo {
-    pub name: Arc<str>,
-    pub description: Arc<str>,
-    pub plugin: Arc<str>,
-    pub max_args: usize,
-    pub has_argument_completion: bool,
-}
-
-#[derive(Clone, Default)]
-pub struct LuaCommandSnapshot {
-    pub commands: Vec<LuaCommandInfo>,
-    pub generation: u64,
-}
-
-#[derive(Clone)]
-pub struct LuaCommandReader(Arc<ArcSwap<LuaCommandSnapshot>>);
-
-impl LuaCommandReader {
-    pub fn empty() -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(
-            LuaCommandSnapshot::default(),
-        )))
-    }
-
-    pub fn from_commands(commands: Vec<LuaCommandInfo>) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(LuaCommandSnapshot {
-            commands,
-            generation: 1,
-        })))
-    }
-
-    pub fn load(&self) -> arc_swap::Guard<Arc<LuaCommandSnapshot>> {
-        self.0.load()
-    }
-}
-
-pub(crate) struct LuaCommandWriter {
-    store: Arc<ArcSwap<LuaCommandSnapshot>>,
-    generation: AtomicU64,
-}
-
-impl LuaCommandWriter {
-    pub fn new() -> (Self, LuaCommandReader) {
-        let inner = Arc::new(ArcSwap::from_pointee(LuaCommandSnapshot::default()));
-        (
-            Self {
-                store: Arc::clone(&inner),
-                generation: AtomicU64::new(0),
-            },
-            LuaCommandReader(inner),
-        )
-    }
-
-    pub fn publish(&self, commands: Vec<LuaCommandInfo>) {
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.store.store(Arc::new(LuaCommandSnapshot {
-            commands,
-            generation,
-        }));
-    }
 }
 
 pub type HintEntries = Vec<(Arc<str>, Vec<(String, String)>)>;
@@ -137,7 +75,9 @@ impl HintWriter {
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
-    pub max_args: usize,
+    pub argument_hint: Option<Arc<str>>,
+    pub arguments: ArgumentArity,
+    pub tui_only: bool,
     pub argument_completion: Option<RegistryKey>,
     pub completion_on_highlight: Option<RegistryKey>,
     pub completion_on_accept: Option<RegistryKey>,
@@ -145,22 +85,7 @@ pub(crate) struct CommandEntry {
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
-
-pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaCommandWriter) {
-    let commands = map
-        .iter()
-        .flat_map(|(plugin, cmds)| {
-            cmds.iter().map(move |(name, entry)| LuaCommandInfo {
-                name: Arc::clone(name),
-                description: Arc::clone(&entry.description),
-                plugin: Arc::clone(plugin),
-                max_args: entry.max_args,
-                has_argument_completion: entry.argument_completion.is_some(),
-            })
-        })
-        .collect();
-    writer.publish(commands);
-}
+pub(crate) type RetiredCommandHandlerMap = Vec<(Arc<str>, HashMap<Arc<str>, CommandEntry>)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dimension {
@@ -564,56 +489,7 @@ pub(crate) async fn ui_json_roundtrip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlua::Lua;
     use test_case::test_case;
-
-    fn make_entry(lua: &Lua, desc: &str) -> CommandEntry {
-        let f = lua.create_function(|_, ()| Ok(())).unwrap();
-        let key = lua.create_registry_value(f).unwrap();
-        CommandEntry {
-            handler: key,
-            description: Arc::from(desc),
-            max_args: 0,
-            argument_completion: None,
-            completion_on_highlight: None,
-            completion_on_accept: None,
-            completion_on_cancel: None,
-        }
-    }
-
-    #[test]
-    fn publish_snapshot_from_multiple_plugins() {
-        let lua = Lua::new();
-        let mut map: CommandHandlerMap = HashMap::new();
-        map.entry(Arc::from("plugA"))
-            .or_default()
-            .insert(Arc::from("/cmd1"), make_entry(&lua, "desc1"));
-        map.entry(Arc::from("plugA"))
-            .or_default()
-            .insert(Arc::from("/cmd2"), make_entry(&lua, "desc2"));
-        map.entry(Arc::from("plugB"))
-            .or_default()
-            .insert(Arc::from("/cmd3"), make_entry(&lua, "desc3"));
-
-        let (writer, reader) = LuaCommandWriter::new();
-        publish_command_snapshot(&map, &writer);
-
-        let snap = reader.load();
-        assert_eq!(snap.commands.len(), 3);
-        assert_eq!(snap.generation, 1);
-
-        let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
-        assert!(names.contains(&"/cmd1"));
-        assert!(names.contains(&"/cmd2"));
-        assert!(names.contains(&"/cmd3"));
-
-        let plug_a_cmds: Vec<_> = snap
-            .commands
-            .iter()
-            .filter(|c| c.plugin.as_ref() == "plugA")
-            .collect();
-        assert_eq!(plug_a_cmds.len(), 2);
-    }
 
     #[test]
     fn plan_submit_parses_from_lua_name() {
@@ -631,15 +507,6 @@ mod tests {
                 "lua-facing action name '{name}' is not snake_case"
             );
         }
-    }
-
-    #[test]
-    fn writer_generation_increments() {
-        let (writer, reader) = LuaCommandWriter::new();
-        writer.publish(vec![]);
-        assert_eq!(reader.load().generation, 1);
-        writer.publish(vec![]);
-        assert_eq!(reader.load().generation, 2);
     }
 
     #[test_case(Dimension::Abs(42), 200 => 42 ; "abs_ignores_total")]
