@@ -2,9 +2,8 @@
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -20,8 +19,9 @@ use maki_agent::tools::{
     ToolAudience, ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
+    Agent, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
     EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, SubagentInfo, ToolDoneEvent,
+    TurnCancellationReason, TurnId, TurnOutcome,
 };
 use maki_config::ToolKey;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
@@ -73,7 +73,7 @@ async fn build_session_provider(
 /// Observable phase of a subagent run, read by `status()`.
 enum SubagentStatus {
     Running,
-    Done(SubagentRunResult),
+    Done(Box<SubagentRunResult>),
     Closed,
 }
 
@@ -84,6 +84,78 @@ struct SubagentRunResult {
     captured: Option<JsonValue>,
     usage: TokenUsage,
     error: Option<String>,
+    outcome: TurnOutcome,
+}
+
+struct SessionState {
+    agent_id: AgentId,
+    closed: bool,
+    pending: usize,
+    status: SubagentStatus,
+    waiters: HashMap<TurnId, flume::Sender<SubagentRunResult>>,
+    accepted: HashSet<TurnId>,
+    active: Option<TurnId>,
+    finalized: HashSet<TurnId>,
+}
+
+impl SessionState {
+    fn new(agent_id: AgentId) -> Self {
+        Self {
+            agent_id,
+            closed: false,
+            pending: 0,
+            status: SubagentStatus::Running,
+            waiters: HashMap::new(),
+            accepted: HashSet::new(),
+            active: None,
+            finalized: HashSet::new(),
+        }
+    }
+
+    fn finalize(&mut self, turn_id: TurnId, result: SubagentRunResult) {
+        if !self.accepted.remove(&turn_id) || !self.finalized.insert(turn_id) {
+            return;
+        }
+        if self.active == Some(turn_id) {
+            self.active = None;
+        }
+        self.pending -= 1;
+        if let Some(waiter) = self.waiters.remove(&turn_id) {
+            let _ = waiter.send(result.clone());
+        }
+        self.status = if self.closed {
+            SubagentStatus::Closed
+        } else if self.pending == 0 {
+            SubagentStatus::Done(Box::new(result))
+        } else {
+            SubagentStatus::Running
+        };
+    }
+
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let turn_ids = self
+            .accepted
+            .iter()
+            .copied()
+            .filter(|turn_id| Some(*turn_id) != self.active)
+            .collect::<Vec<_>>();
+        for turn_id in turn_ids {
+            self.finalize(
+                turn_id,
+                cancelled_result(
+                    self.agent_id,
+                    turn_id,
+                    TokenUsage::default(),
+                    TurnCancellationReason::Closed,
+                ),
+            );
+        }
+        self.status = SubagentStatus::Closed;
+    }
 }
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
@@ -122,25 +194,16 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
 }
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
-/// Usage takes two paths: live on the tool header while the run goes on (last
-/// turn's tokens plus the run's summed cost), and one total per run on
-/// `usage_tx`, which `prompt` waits for.
 async fn relay_session_events(
     sub_rx: flume::Receiver<Envelope>,
     parent_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
-    usage_tx: flume::Sender<TokenUsage>,
     live_sink: Option<flume::Sender<ToolLive>>,
     silent: bool,
 ) {
     let mut cost = None;
     while let Ok(mut envelope) = sub_rx.recv_async().await {
         if silent {
-            // Keep the driver's usage barrier satisfied (it waits on usage_rx)
-            // without relaying the subagent's turn into the parent session.
-            if let AgentEvent::Done { usage, .. } = &envelope.event {
-                let _ = usage_tx.send(*usage);
-            }
             continue;
         }
         match &envelope.event {
@@ -150,12 +213,7 @@ async fn relay_session_events(
                     let _ = sink.send(ToolLive::Usage(turn.usage.format_sum_cost(cost)));
                 }
             }
-            AgentEvent::Done { usage, .. } => {
-                let _ = usage_tx.send(*usage);
-                continue;
-            }
-            AgentEvent::Error { .. }
-            | AgentEvent::ToolOutput { .. }
+            AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolPending { .. }
             | AgentEvent::SubagentHistory { .. } => continue,
             _ => {}
@@ -645,13 +703,11 @@ async fn session(
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let (usage_tx, usage_rx) = flume::unbounded();
 
     smol::spawn(relay_session_events(
         sub_rx,
         parent_tx.clone(),
         Arc::clone(&subagent_info),
-        usage_tx,
         agent_ctx.live_sink.clone(),
         silent,
     ))
@@ -683,13 +739,13 @@ async fn session(
 
     let (input_tx, input_rx) = flume::unbounded::<TurnInput>();
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
-    let status = Arc::new(Mutex::new(SubagentStatus::Running));
-    let pending = Arc::new(AtomicUsize::new(0));
-    let closed = Arc::new(AtomicBool::new(false));
-    let admission = Arc::new(Mutex::new(()));
+    let agent_id = AgentId::generate();
+    let state = Arc::new(Mutex::new(SessionState::new(agent_id)));
 
     let driver = SubagentDriver {
+        agent_id,
         params: AgentParams {
+            agent_id,
             provider,
             model: model.clone(),
             config: agent_ctx.config.clone(),
@@ -731,7 +787,6 @@ async fn session(
         local_tools: Arc::new(local_map),
         name: name.clone(),
         usage: TokenUsage::default(),
-        usage_rx,
         start: Instant::now(),
         commit,
         semaphore,
@@ -743,25 +798,15 @@ async fn session(
     smol::spawn(subagent_ui_input_relay(
         ui_input_rx,
         driver_input_tx,
-        Arc::clone(&pending),
+        Arc::clone(&state),
     ))
     .detach();
-    smol::spawn(subagent_driver(
-        driver,
-        input_rx,
-        Arc::clone(&status),
-        Arc::clone(&pending),
-        Arc::clone(&closed),
-    ))
-    .detach();
+    smol::spawn(subagent_driver(driver, input_rx, Arc::clone(&state))).detach();
 
     let sess = lua.create_userdata(LuaSession {
         id: ui_id,
         input_tx,
-        status,
-        pending,
-        closed,
-        admission,
+        state,
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         cancel_slot,
     })?;
@@ -865,11 +910,12 @@ async fn dispatch_racing_live(
 /// The driver lives off the main agent's call stack so the main agent can
 /// keep working while a subagent runs, and can queue more messages to it.
 struct TurnInput {
+    turn_id: TurnId,
     message: String,
-    reply_tx: Option<flume::Sender<SubagentRunResult>>,
 }
 
 struct SubagentDriver {
+    agent_id: AgentId,
     params: AgentParams,
     system: String,
     tools: JsonValue,
@@ -896,7 +942,6 @@ struct SubagentDriver {
     local_tools: LocalTools,
     name: String,
     usage: TokenUsage,
-    usage_rx: flume::Receiver<TokenUsage>,
     start: Instant,
     /// Structured-output commit slot, surfaced as `captured` on completion.
     commit: Arc<Mutex<Option<JsonValue>>>,
@@ -949,7 +994,7 @@ impl SubagentDriver {
     /// Run one user message to completion and surface the result. The
     /// structured-output / summary nudge policy lives in the calling plugin
     /// (which queues nudges via `send`) so `task_policy` can observe it.
-    async fn run_one(&mut self, message: String) -> SubagentRunResult {
+    async fn run_one(&mut self, turn_id: TurnId, message: String) -> SubagentRunResult {
         if self.subagent_info.get().is_none() {
             let _ = self.subagent_info.set(SubagentInfo {
                 parent_tool_use_id: self.ui_id.clone(),
@@ -960,15 +1005,20 @@ impl SubagentDriver {
                 input_tx: Some(self.ui_input_tx.clone()),
             });
         }
-        self.run_agent(message).await
+        self.run_agent(turn_id, message).await
     }
 
-    async fn run_agent(&mut self, message: String) -> SubagentRunResult {
+    async fn run_agent(&mut self, turn_id: TurnId, message: String) -> SubagentRunResult {
         let history_len = self.history.len();
-        self.run_agent_inner(message, history_len).await
+        self.run_agent_inner(turn_id, message, history_len).await
     }
 
-    async fn run_agent_inner(&mut self, message: String, history_len: usize) -> SubagentRunResult {
+    async fn run_agent_inner(
+        &mut self,
+        turn_id: TurnId,
+        message: String,
+        history_len: usize,
+    ) -> SubagentRunResult {
         let mut agent = Agent::new(
             self.params.clone(),
             AgentRunParams {
@@ -993,22 +1043,14 @@ impl SubagentDriver {
             workflow: false,
             prompt: None,
         };
-        let error = match agent.run(input).await {
-            Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
-        };
+        let outcome = agent.run(turn_id, input).await;
         drop(agent);
-        // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
-        // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
-        // live channel before `dispatch_racing_live` drains it for the last time.
-        match self.usage_rx.recv_async().await {
-            Ok(usage) => self.usage += usage,
-            Err(_) => tracing::warn!(
-                name = %self.name,
-                "subagent usage tracker stopped, token counts may lag"
-            ),
-        }
+        self.usage += outcome.usage();
+        let error = match &outcome {
+            TurnOutcome::Completed { .. } => None,
+            TurnOutcome::Failed { failure, .. } => Some(failure.diagnostic.clone()),
+            TurnOutcome::Cancelled { .. } => Some(CANCELLED_MSG.to_owned()),
+        };
 
         let text = self.history.as_slice()[history_len.min(self.history.len())..]
             .iter()
@@ -1028,97 +1070,166 @@ impl SubagentDriver {
             captured: self.commit.lock().unwrap().take(),
             usage: self.usage,
             error,
+            outcome,
         }
     }
+}
+
+fn admit_turn(
+    input_tx: &flume::Sender<TurnInput>,
+    state: &Mutex<SessionState>,
+    message: String,
+    reply_tx: Option<flume::Sender<SubagentRunResult>>,
+) -> Result<(), String> {
+    let mut state = state.lock().unwrap();
+    if state.closed {
+        return Err(SESSION_CLOSED_ERR.to_owned());
+    }
+    let turn_id = TurnId::generate();
+    state.pending += 1;
+    state.accepted.insert(turn_id);
+    state.status = SubagentStatus::Running;
+    if let Some(reply_tx) = reply_tx {
+        state.waiters.insert(turn_id, reply_tx.clone());
+    }
+    if input_tx.send(TurnInput { turn_id, message }).is_err() {
+        let agent_id = state.agent_id;
+        state.finalize(
+            turn_id,
+            cancelled_result(
+                agent_id,
+                turn_id,
+                TokenUsage::default(),
+                TurnCancellationReason::Closed,
+            ),
+        );
+        state.close();
+        return Err(SESSION_CLOSED_ERR.to_owned());
+    }
+    Ok(())
 }
 
 async fn subagent_ui_input_relay(
     input_rx: flume::Receiver<String>,
     input_tx: flume::Sender<TurnInput>,
-    pending: Arc<AtomicUsize>,
+    state: Arc<Mutex<SessionState>>,
 ) {
     while let Ok(message) = input_rx.recv_async().await {
-        pending.fetch_add(1, Ordering::AcqRel);
-        if input_tx
-            .send(TurnInput {
-                message,
-                reply_tx: None,
-            })
-            .is_err()
-        {
-            pending.fetch_sub(1, Ordering::AcqRel);
+        if admit_turn(&input_tx, &state, message, None).is_err() {
             break;
         }
     }
 }
 
+fn cancelled_result(
+    agent_id: AgentId,
+    turn_id: TurnId,
+    usage: TokenUsage,
+    reason: TurnCancellationReason,
+) -> SubagentRunResult {
+    SubagentRunResult {
+        text: String::new(),
+        captured: None,
+        usage,
+        error: Some(CANCELLED_MSG.to_owned()),
+        outcome: TurnOutcome::Cancelled {
+            agent_id,
+            turn_id,
+            usage: TokenUsage::default(),
+            num_turns: 0,
+            reason,
+        },
+    }
+}
+
+fn finalize_input(state: &Mutex<SessionState>, input: TurnInput, result: SubagentRunResult) {
+    state.lock().unwrap().finalize(input.turn_id, result);
+}
+
 /// Background driver: owns the run loop so one message no longer blocks the
-/// main agent. The status slot is the single source of truth for `status()`.
+/// main agent. The state slot is the single source of truth for `status()`.
 async fn subagent_driver(
     mut driver: SubagentDriver,
     input_rx: flume::Receiver<TurnInput>,
-    status: Arc<Mutex<SubagentStatus>>,
-    pending: Arc<AtomicUsize>,
-    closed: Arc<AtomicBool>,
+    state: Arc<Mutex<SessionState>>,
 ) {
     loop {
         let cancel = driver.child_cancel.clone();
-        let recv_fut = input_rx.recv_async();
-        let cancel_fut = async move { cancel.cancelled().await };
-        let next = select(Box::pin(recv_fut), Box::pin(cancel_fut)).await;
+        let next = select(
+            Box::pin(input_rx.recv_async()),
+            Box::pin(async move { cancel.cancelled().await }),
+        )
+        .await;
         let input = match next {
             Either::Left((Ok(input), _)) => input,
             Either::Left((Err(_), _)) | Either::Right(((), _)) => break,
         };
-        if driver.child_cancel.is_cancelled() {
-            break;
+        {
+            let mut shared = state.lock().unwrap();
+            if shared.closed || shared.finalized.contains(&input.turn_id) {
+                continue;
+            }
+            shared.active = Some(input.turn_id);
         }
-        *status.lock().unwrap() = SubagentStatus::Running;
         let permit = match &driver.semaphore {
             Some(semaphore) => {
                 let cancel = driver.child_cancel.clone();
                 match cancel.race(Arc::clone(semaphore).acquire_arc()).await {
                     Ok(permit) => Some(permit),
-                    Err(_) => break,
+                    Err(_) => {
+                        let result = cancelled_result(
+                            driver.agent_id,
+                            input.turn_id,
+                            driver.usage,
+                            TurnCancellationReason::Closed,
+                        );
+                        finalize_input(&state, input, result);
+                        break;
+                    }
                 }
             }
             None => None,
         };
-        let result = driver.run_one(input.message).await;
+        let mut result = driver.run_one(input.turn_id, input.message.clone()).await;
         drop(permit);
+        if state.lock().unwrap().closed
+            && let TurnOutcome::Cancelled { reason, .. } = &mut result.outcome
+        {
+            *reason = TurnCancellationReason::Closed;
+        }
+        finalize_input(&state, input, result);
+        driver.emit_history();
         if driver.child_cancel.is_cancelled() {
             break;
         }
-        if let Some(reply_tx) = input.reply_tx {
-            let _ = reply_tx.send(result.clone());
-        }
-        *status.lock().unwrap() = if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            SubagentStatus::Done(result)
-        } else {
-            SubagentStatus::Running
-        };
-        driver.emit_history();
     }
-    closed.store(true, Ordering::Release);
+
+    {
+        state.lock().unwrap().close();
+    }
+    while let Ok(input) = input_rx.try_recv() {
+        let result = cancelled_result(
+            driver.agent_id,
+            input.turn_id,
+            driver.usage,
+            TurnCancellationReason::Closed,
+        );
+        finalize_input(&state, input, result);
+    }
     driver.close();
-    *status.lock().unwrap() = SubagentStatus::Closed;
 }
 
 struct LuaSession {
     id: String,
     input_tx: flume::Sender<TurnInput>,
-    status: Arc<Mutex<SubagentStatus>>,
-    pending: Arc<AtomicUsize>,
-    closed: Arc<AtomicBool>,
-    admission: Arc<Mutex<()>>,
+    state: Arc<Mutex<SessionState>>,
     parent_cancels: Arc<CancelMap<String>>,
     cancel_slot: CancelSlot,
 }
 
 impl Drop for LuaSession {
     fn drop(&mut self) {
-        let _admission = self.admission.lock().unwrap();
-        self.closed.store(true, Ordering::Release);
+        self.state.lock().unwrap().close();
         self.parent_cancels.retire(&self.id, self.cancel_slot);
     }
 }
@@ -1150,30 +1261,11 @@ async fn prompt(
     message: String,
 ) -> LuaResult<Pair<Table>> {
     let input_tx = this.input_tx.clone();
-    let status = Arc::clone(&this.status);
-    let pending = Arc::clone(&this.pending);
-    let closed = Arc::clone(&this.closed);
-    let admission = Arc::clone(&this.admission);
+    let state = Arc::clone(&this.state);
     drop(this);
     let (reply_tx, reply_rx) = flume::bounded(1);
-    {
-        let _admission = admission.lock().unwrap();
-        if closed.load(Ordering::Acquire) {
-            return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
-        }
-        pending.fetch_add(1, Ordering::AcqRel);
-        *status.lock().unwrap() = SubagentStatus::Running;
-        if input_tx
-            .send(TurnInput {
-                message,
-                reply_tx: Some(reply_tx),
-            })
-            .is_err()
-        {
-            pending.fetch_sub(1, Ordering::AcqRel);
-            *status.lock().unwrap() = SubagentStatus::Closed;
-            return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
-        }
+    if let Err(error) = admit_turn(&input_tx, &state, message, Some(reply_tx)) {
+        return Ok((None, Some(error)));
     }
     match reply_rx.recv_async().await {
         Err(_) => Ok((None, Some(SESSION_CLOSED_ERR.to_owned()))),
@@ -1214,29 +1306,12 @@ async fn send(
     message: String,
 ) -> LuaResult<Pair<bool>> {
     let input_tx = this.input_tx.clone();
-    let status = Arc::clone(&this.status);
-    let pending = Arc::clone(&this.pending);
-    let closed = Arc::clone(&this.closed);
-    let admission = Arc::clone(&this.admission);
+    let state = Arc::clone(&this.state);
     drop(this);
-    let _admission = admission.lock().unwrap();
-    if closed.load(Ordering::Acquire) {
-        return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
+    match admit_turn(&input_tx, &state, message, None) {
+        Ok(()) => Ok((Some(true), None)),
+        Err(error) => Ok((None, Some(error))),
     }
-    pending.fetch_add(1, Ordering::AcqRel);
-    *status.lock().unwrap() = SubagentStatus::Running;
-    if input_tx
-        .send(TurnInput {
-            message,
-            reply_tx: None,
-        })
-        .is_err()
-    {
-        pending.fetch_sub(1, Ordering::AcqRel);
-        *status.lock().unwrap() = SubagentStatus::Closed;
-        return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
-    }
-    Ok((Some(true), None))
 }
 
 /// Read the subagent's current status without blocking.
@@ -1246,10 +1321,10 @@ async fn send(
 ///   and possibly `error`.
 #[lua_fn]
 async fn status(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair<Table>> {
-    let status = Arc::clone(&this.status);
+    let state = Arc::clone(&this.state);
     drop(this);
     let tbl = lua.create_table()?;
-    match &*status.lock().unwrap() {
+    match &state.lock().unwrap().status {
         SubagentStatus::Running => {
             tbl.set("status", "running")?;
         }
@@ -1269,6 +1344,9 @@ async fn status(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair
             if let Some(e) = &result.error {
                 tbl.set("error", e.clone())?;
             }
+            if let TurnOutcome::Failed { failure, .. } = &result.outcome {
+                tbl.set("retryable", failure.retryable)?;
+            }
         }
     }
     Ok((Some(tbl), None))
@@ -1282,9 +1360,7 @@ async fn status(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair
 /// @return
 #[lua_fn]
 async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
-    let _admission = this.admission.lock().unwrap();
-    this.closed.store(true, Ordering::Release);
-    *this.status.lock().unwrap() = SubagentStatus::Closed;
+    this.state.lock().unwrap().close();
     this.parent_cancels.retire(&this.id, this.cancel_slot);
     Ok(())
 }
@@ -1351,7 +1427,9 @@ fn call_local_tool(
 #[cfg(test)]
 mod tests {
     use maki_agent::tools::test_support::stub_ctx;
-    use maki_agent::{DoneReason, TurnCompleteEvent};
+    use maki_agent::{
+        AgentId, DoneReason, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    };
     use maki_providers::Message;
     use serde_json::json;
 
@@ -1422,7 +1500,6 @@ mod tests {
 
     const RUN_ID: u64 = 7;
     const PARENT_ID: &str = "task-1";
-    const IGNORED_ERROR: &str = "handled by the session caller";
     const DONE_USAGE: TokenUsage = tokens(150, 30);
 
     const fn tokens(input: u32, output: u32) -> TokenUsage {
@@ -1453,6 +1530,153 @@ mod tests {
         }))
     }
 
+    fn completed_result(
+        agent_id: AgentId,
+        turn_id: TurnId,
+        usage: TokenUsage,
+    ) -> SubagentRunResult {
+        SubagentRunResult {
+            text: "done".into(),
+            captured: None,
+            usage,
+            error: None,
+            outcome: TurnOutcome::Completed {
+                agent_id,
+                turn_id,
+                usage,
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            },
+        }
+    }
+
+    fn failed_result(agent_id: AgentId, turn_id: TurnId, usage: TokenUsage) -> SubagentRunResult {
+        SubagentRunResult {
+            text: String::new(),
+            captured: None,
+            usage,
+            error: Some("provider failed".into()),
+            outcome: TurnOutcome::Failed {
+                agent_id,
+                turn_id,
+                usage,
+                num_turns: 1,
+                failure: TurnFailure {
+                    kind: TurnFailureKind::Provider,
+                    diagnostic: "provider failed".into(),
+                    user_message: "provider failed".into(),
+                    retryable: true,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn close_rejects_new_admission_and_resolves_blocking_waiter() {
+        let agent_id = AgentId::generate();
+        let state = Arc::new(Mutex::new(SessionState::new(agent_id)));
+        let (input_tx, input_rx) = flume::unbounded();
+        let (reply_tx, reply_rx) = flume::bounded(1);
+
+        admit_turn(&input_tx, &state, "waiting".into(), Some(reply_tx)).unwrap();
+        let input = input_rx.recv().unwrap();
+        state.lock().unwrap().close();
+
+        assert_eq!(
+            admit_turn(&input_tx, &state, "rejected".into(), None),
+            Err(SESSION_CLOSED_ERR.into())
+        );
+        let result = reply_rx.recv().unwrap();
+        assert!(matches!(
+            result.outcome,
+            TurnOutcome::Cancelled {
+                agent_id: id,
+                turn_id,
+                reason: TurnCancellationReason::Closed,
+                ..
+            } if id == agent_id && turn_id == input.turn_id
+        ));
+        assert_eq!(result.error.as_deref(), Some(CANCELLED_MSG));
+    }
+
+    #[test]
+    fn finalization_tracks_pending_turns_and_status() {
+        let agent_id = AgentId::generate();
+        let state = Arc::new(Mutex::new(SessionState::new(agent_id)));
+        let (input_tx, input_rx) = flume::unbounded();
+
+        admit_turn(&input_tx, &state, "first".into(), None).unwrap();
+        admit_turn(&input_tx, &state, "second".into(), None).unwrap();
+        let first = input_rx.recv().unwrap();
+        let second = input_rx.recv().unwrap();
+        let first_turn_id = first.turn_id;
+        let second_turn_id = second.turn_id;
+        finalize_input(
+            &state,
+            first,
+            completed_result(agent_id, first_turn_id, tokens(10, 2)),
+        );
+        let state_guard = state.lock().unwrap();
+        assert_eq!(state_guard.pending, 1);
+        assert!(matches!(state_guard.status, SubagentStatus::Running));
+        drop(state_guard);
+
+        finalize_input(
+            &state,
+            second,
+            completed_result(agent_id, second_turn_id, tokens(30, 4)),
+        );
+        let state_guard = state.lock().unwrap();
+        assert_eq!(state_guard.pending, 0);
+        assert!(matches!(
+            &state_guard.status,
+            SubagentStatus::Done(result) if result.usage == tokens(30, 4)
+        ));
+    }
+
+    #[test]
+    fn failed_finalization_keeps_session_open_for_later_turn() {
+        let agent_id = AgentId::generate();
+        let state = Arc::new(Mutex::new(SessionState::new(agent_id)));
+        let (input_tx, input_rx) = flume::unbounded();
+
+        admit_turn(&input_tx, &state, "fails".into(), None).unwrap();
+        let failed = input_rx.recv().unwrap();
+        let failed_turn_id = failed.turn_id;
+        finalize_input(
+            &state,
+            failed,
+            failed_result(agent_id, failed_turn_id, tokens(8, 1)),
+        );
+        {
+            let state_guard = state.lock().unwrap();
+            assert!(!state_guard.closed);
+            assert!(
+                matches!(&state_guard.status, SubagentStatus::Done(result) if result.error.is_some())
+            );
+        }
+
+        admit_turn(&input_tx, &state, "later".into(), None).unwrap();
+        assert_eq!(state.lock().unwrap().pending, 1);
+    }
+
+    #[test]
+    fn status_done_result_keeps_cumulative_compatibility_usage() {
+        let agent_id = AgentId::generate();
+        let cumulative = tokens(150, 30);
+        let lua = Lua::new();
+        let (result, error) = build_prompt_result(
+            &lua,
+            completed_result(agent_id, TurnId::generate(), cumulative),
+        )
+        .unwrap();
+
+        assert!(error.is_none());
+        let result = result.unwrap();
+        assert_eq!(result.get::<u32>("input_tokens").unwrap(), 150);
+        assert_eq!(result.get::<u32>("output_tokens").unwrap(), 30);
+    }
+
     #[test]
     fn relay_session_events_reports_live_usage_and_done_total() {
         let (sub_tx, sub_rx) = flume::unbounded();
@@ -1468,20 +1692,19 @@ mod tests {
                 input_tx: None,
             })
             .unwrap();
-        let (usage_tx, usage_rx) = flume::unbounded();
         let (live_tx, live_rx) = flume::unbounded();
+        let outcome = TurnOutcome::Completed {
+            agent_id: AgentId::generate(),
+            turn_id: TurnId::generate(),
+            usage: DONE_USAGE,
+            num_turns: 2,
+            reason: DoneReason::EndTurn,
+        };
 
         for event in [
             turn(tokens(100, 20), 0.25),
             turn(tokens(50, 10), 0.5),
-            AgentEvent::Error {
-                message: IGNORED_ERROR.into(),
-            },
-            AgentEvent::Done {
-                usage: DONE_USAGE,
-                num_turns: 2,
-                reason: DoneReason::EndTurn,
-            },
+            AgentEvent::TurnOutcome(outcome.clone()),
         ] {
             sub_tx.send(envelope(event)).unwrap();
         }
@@ -1491,7 +1714,6 @@ mod tests {
             sub_rx,
             EventSender::new(parent_raw_tx, RUN_ID),
             subagent_info,
-            usage_tx,
             Some(live_tx),
             false,
         ));
@@ -1508,16 +1730,18 @@ mod tests {
             tokens(50, 10).format_sum_cost(Some(0.75)),
         ];
         assert_eq!(live, expected);
-        assert_eq!(usage_rx.try_recv(), Ok(DONE_USAGE));
 
         let forwarded = parent_rx.drain().collect::<Vec<_>>();
-        assert_eq!(forwarded.len(), expected.len());
+        assert_eq!(forwarded.len(), expected.len() + 1);
         assert!(forwarded.iter().all(|envelope| {
-            matches!(envelope.event, AgentEvent::TurnComplete(_))
-                && envelope
-                    .subagent
-                    .as_ref()
-                    .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
+            envelope
+                .subagent
+                .as_ref()
+                .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
         }));
+        assert!(matches!(
+            &forwarded.last().unwrap().event,
+            AgentEvent::TurnOutcome(forwarded_outcome) if forwarded_outcome == &outcome
+        ));
     }
 }

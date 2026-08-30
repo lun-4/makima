@@ -21,7 +21,7 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, ImageSource,
-    ModeRegistry, PermissionsConfig,
+    ModeRegistry, PermissionsConfig, TurnOutcome,
 };
 use maki_commands::{
     BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome,
@@ -418,17 +418,23 @@ pub fn run(
                         })?;
                     }
                 }
-                AgentEvent::Done {
-                    usage: u,
-                    num_turns: turns,
-                    reason,
-                } => {
-                    num_turns = *turns;
-                    usage = *u;
-                    stop_reason = Some(*reason);
+                AgentEvent::TurnOutcome(outcome) => {
+                    num_turns = outcome.num_turns();
+                    usage = outcome.usage();
+                    match outcome {
+                        TurnOutcome::Completed { reason, .. } => stop_reason = Some(*reason),
+                        TurnOutcome::Failed { failure, .. } => {
+                            is_error = true;
+                            result_text = failure.user_message.clone();
+                        }
+                        TurnOutcome::Cancelled { .. } => {
+                            is_error = true;
+                        }
+                    }
                     break;
                 }
-                AgentEvent::Error { message } => {
+                AgentEvent::ControlComplete { .. } => break,
+                AgentEvent::ControlError { message } => {
                     is_error = true;
                     result_text = message.clone();
                     break;

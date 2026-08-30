@@ -281,6 +281,7 @@ impl App {
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
         self.run_id += 1;
         self.clear_exit_request();
+        self.stamped_subagent_outcomes.clear();
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;

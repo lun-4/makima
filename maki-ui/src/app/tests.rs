@@ -13,8 +13,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, ModeDefSpec, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    AgentId, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
+    McpSnapshot, McpSnapshotReader, ModeDefSpec, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -419,11 +420,13 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
 }
 
 fn done() -> AgentEvent {
-    AgentEvent::Done {
+    AgentEvent::TurnOutcome(TurnOutcome::Completed {
+        agent_id: AgentId::generate(),
+        turn_id: TurnId::generate(),
         usage: TokenUsage::default(),
         num_turns: 1,
         reason: DoneReason::EndTurn,
-    }
+    })
 }
 
 fn done_event() -> Msg {
@@ -595,7 +598,7 @@ fn ctrl_c_quits_when_input_empty() {
 }
 
 #[test_case(done(), ExitRequest::Success ; "done_exits_success")]
-#[test_case(AgentEvent::Error { message: "boom".into() }, ExitRequest::Error ; "error_exits_error")]
+#[test_case(AgentEvent::ControlError { message: "boom".into() }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
     app.exit_on_done = true;
@@ -603,6 +606,19 @@ fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     app.run_id = 1;
     app.update(agent_msg(event));
     assert_eq!(app.exit_request, expected);
+}
+
+#[test]
+fn standalone_compaction_does_not_exit_or_end_turn() {
+    let mut app = test_app();
+    app.exit_on_done = true;
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::ControlComplete {
+        usage: TokenUsage::default(),
+    }));
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(app.status, Status::Streaming);
 }
 
 #[test]
@@ -864,7 +880,7 @@ fn cancel_app(app: &mut App) {
 }
 
 fn error_app(app: &mut App) {
-    app.update(agent_msg(AgentEvent::Error {
+    app.update(agent_msg(AgentEvent::ControlError {
         message: "boom".into(),
     }));
 }
@@ -4290,7 +4306,7 @@ fn streaming_app_with_history() -> App {
 /// next frame's checkpoint syncs the mirror whatever event arrived.
 #[test_case(done() ; "stale_done")]
 #[test_case(
-    AgentEvent::Error { message: "timeout".into() } ; "stale_error"
+    AgentEvent::ControlError { message: "timeout".into() } ; "stale_error"
 )]
 fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
     let mut app = streaming_app_with_history();
@@ -4385,7 +4401,7 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
     finish_subagent(&mut app, "task3", false);
     open_tasks_picker(&mut app);
 
-    app.update(agent_msg(AgentEvent::Error {
+    app.update(agent_msg(AgentEvent::ControlError {
         message: "boom".into(),
     }));
 
@@ -4471,7 +4487,7 @@ fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
         Some("research"),
     ));
 
-    app.update(agent_msg(AgentEvent::Error {
+    app.update(agent_msg(AgentEvent::ControlError {
         message: "provider overloaded".into(),
     }));
 
@@ -4525,7 +4541,7 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
     let mut app = streaming_app_with_history();
     app.queue_and_notify(queued_msg("next"));
 
-    app.update(agent_msg(AgentEvent::Error {
+    app.update(agent_msg(AgentEvent::ControlError {
         message: "boom".into(),
     }));
     app.checkpoint();
@@ -4545,7 +4561,7 @@ fn error_event_matching_run_id_saves_session_and_queued_messages() {
 fn flush_restored_queue_drops_recovery_snapshot() {
     let mut app = streaming_app_with_history();
     app.queue_and_notify(queued_msg("next"));
-    app.update(agent_msg(AgentEvent::Error {
+    app.update(agent_msg(AgentEvent::ControlError {
         message: "boom".into(),
     }));
     app.checkpoint();
@@ -5164,6 +5180,47 @@ fn subagent_history_finishes_workflow_chat() {
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
+#[test]
+fn stamped_child_failure_wins_over_prior_history_snapshot() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        TASK_ID,
+        Some("worker"),
+    ));
+    app.update(agent_msg_with_run_id(
+        AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![],
+        },
+        1,
+    ));
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+
+    let failure = TurnFailure {
+        kind: TurnFailureKind::Provider,
+        diagnostic: "provider detail".into(),
+        user_message: "provider unavailable".into(),
+        retryable: false,
+    };
+    app.update(subagent_msg_with_run_id(
+        AgentEvent::TurnOutcome(TurnOutcome::Failed {
+            agent_id: AgentId::generate(),
+            turn_id: TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            failure,
+        }),
+        TASK_ID,
+        Some("worker"),
+        1,
+    ));
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
+    assert_eq!(app.chats[1].last_message_text(), "provider unavailable");
+}
+
 #[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
 #[test_case("openai/gpt-5.5" ; "non_anthropic")]
 fn fast_flashes_error_on_ineligible_model(spec: &str) {
@@ -5242,7 +5299,7 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
     assert_eq!(app.main_chat().in_progress_count(), 1);
 
     let error_msg = "Provider is overloaded";
-    app.update(agent_msg(AgentEvent::Error {
+    app.update(agent_msg(AgentEvent::ControlError {
         message: error_msg.into(),
     }));
 

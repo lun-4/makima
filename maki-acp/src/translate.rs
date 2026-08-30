@@ -278,7 +278,6 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
         DoneReason::EndTurn => StopReason::EndTurn,
         DoneReason::MaxTokens => StopReason::MaxTokens,
         DoneReason::MaxTurns => StopReason::MaxTurnRequests,
-        DoneReason::Cancelled => StopReason::Cancelled,
     }
 }
 

@@ -24,8 +24,8 @@ use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
-    ToolOutput,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, PermissionsConfig, ToolOutput,
+    TurnOutcome,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost,
@@ -1493,17 +1493,34 @@ impl EventPump {
                         },
                     }))?;
             }
-            AgentEvent::Done {
-                usage,
-                num_turns,
-                reason,
-            } => {
-                // An interrupted run leaves a partial answer, so it is not a success.
-                let is_error = *reason == DoneReason::Cancelled;
+            AgentEvent::TurnOutcome(outcome) => {
                 let result = mem::take(&mut self.result_text);
-                self.emit_turn_result(is_error, result, *num_turns, *usage)?;
+                match outcome {
+                    TurnOutcome::Completed {
+                        usage, num_turns, ..
+                    } => self.emit_turn_result(false, result, *num_turns, *usage)?,
+                    TurnOutcome::Failed {
+                        usage,
+                        num_turns,
+                        failure,
+                        ..
+                    } => self.emit_turn_result(
+                        true,
+                        if result.is_empty() {
+                            failure.user_message.clone()
+                        } else {
+                            result
+                        },
+                        *num_turns,
+                        *usage,
+                    )?,
+                    TurnOutcome::Cancelled {
+                        usage, num_turns, ..
+                    } => self.emit_turn_result(true, result, *num_turns, *usage)?,
+                }
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::ControlComplete { .. } => {}
+            AgentEvent::ControlError { message } => {
                 self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
             }
         }

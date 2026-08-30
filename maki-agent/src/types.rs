@@ -1,12 +1,14 @@
 use std::any::Any;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_config::ToolKey;
 use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
+use maki_storage::id::{MakiId, MakiIdParseError};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -525,16 +527,87 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     }
 }
 
-/// Why a run ended. The provider's `StopReason` describes one turn, this
-/// describes the whole run, including the endings only the agent knows about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display)]
+macro_rules! lifecycle_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(MakiId);
+
+        impl $name {
+            pub fn generate() -> Self {
+                Self(MakiId::generate())
+            }
+
+            pub fn as_maki_id(self) -> MakiId {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = MakiIdParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                value.parse().map(Self)
+            }
+        }
+    };
+}
+
+lifecycle_id!(AgentId, "Stable identity of one runtime agent instance.");
+/// Stable identity of one accepted agent turn.
+///
+/// Agent and turn identities are nominal and cannot be interchanged:
+///
+/// ```compile_fail
+/// use maki_agent::{AgentId, TurnId};
+///
+/// fn accepts_turn(_: TurnId) {}
+/// accepts_turn(AgentId::generate());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(MakiId);
+
+impl TurnId {
+    pub fn generate() -> Self {
+        Self(MakiId::generate())
+    }
+
+    pub fn as_maki_id(self) -> MakiId {
+        self.0
+    }
+}
+
+impl fmt::Display for TurnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for TurnId {
+    type Err = MakiIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
+/// Why a successfully completed run ended. The provider's `StopReason`
+/// describes one model turn, while this describes the whole agent run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display)]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum DoneReason {
     EndTurn,
     MaxTokens,
     MaxTurns,
-    Cancelled,
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -544,6 +617,129 @@ impl From<Option<StopReason>> for DoneReason {
         match reason {
             Some(StopReason::MaxTokens) => Self::MaxTokens,
             Some(StopReason::EndTurn | StopReason::ToolUse) | None => Self::EndTurn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureKind {
+    Provider,
+    Authentication,
+    Timeout,
+    Tool,
+    Transport,
+    InvalidResponse,
+    Internal,
+    Compaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnFailure {
+    pub kind: TurnFailureKind,
+    pub diagnostic: String,
+    pub user_message: String,
+    pub retryable: bool,
+}
+
+impl TurnFailure {
+    /// Snapshots an agent error into the stable lifecycle error taxonomy.
+    /// `AgentError::Cancelled` is not a failure and must be normalized as a
+    /// [`TurnOutcome::Cancelled`] instead.
+    pub fn from_agent_error(error: &AgentError) -> Self {
+        let kind = match error {
+            AgentError::Api { status: 401, .. } => TurnFailureKind::Authentication,
+            AgentError::Api { .. } => TurnFailureKind::Provider,
+            AgentError::Timeout { .. } => TurnFailureKind::Timeout,
+            AgentError::Tool { .. } => TurnFailureKind::Tool,
+            AgentError::Io(_) | AgentError::Http(_) | AgentError::HttpRequest(_) => {
+                TurnFailureKind::Transport
+            }
+            AgentError::Json(_) | AgentError::Config { .. } => TurnFailureKind::InvalidResponse,
+            AgentError::Channel => TurnFailureKind::Internal,
+            AgentError::EmptySummary => TurnFailureKind::Compaction,
+            AgentError::Cancelled => unreachable!("cancellation is not a turn failure"),
+        };
+        Self {
+            kind,
+            diagnostic: error.to_string(),
+            user_message: error.user_message(),
+            retryable: error.is_retryable(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCancellationReason {
+    User,
+    Closed,
+    Shutdown,
+    Interrupted,
+}
+
+/// The authoritative terminal result of an accepted turn.
+///
+/// `Agent::run` determines one value, makes one correlated event-delivery
+/// attempt, and returns that same value even when delivery fails.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Completed {
+        agent_id: AgentId,
+        turn_id: TurnId,
+        usage: TokenUsage,
+        num_turns: u32,
+        reason: DoneReason,
+    },
+    Failed {
+        agent_id: AgentId,
+        turn_id: TurnId,
+        usage: TokenUsage,
+        num_turns: u32,
+        failure: TurnFailure,
+    },
+    Cancelled {
+        agent_id: AgentId,
+        turn_id: TurnId,
+        usage: TokenUsage,
+        num_turns: u32,
+        reason: TurnCancellationReason,
+    },
+}
+
+impl TurnOutcome {
+    pub fn agent_id(&self) -> AgentId {
+        match self {
+            Self::Completed { agent_id, .. }
+            | Self::Failed { agent_id, .. }
+            | Self::Cancelled { agent_id, .. } => *agent_id,
+        }
+    }
+
+    pub fn turn_id(&self) -> TurnId {
+        match self {
+            Self::Completed { turn_id, .. }
+            | Self::Failed { turn_id, .. }
+            | Self::Cancelled { turn_id, .. } => *turn_id,
+        }
+    }
+
+    pub fn usage(&self) -> TokenUsage {
+        match self {
+            Self::Completed { usage, .. }
+            | Self::Failed { usage, .. }
+            | Self::Cancelled { usage, .. } => *usage,
+        }
+    }
+
+    pub fn num_turns(&self) -> u32 {
+        match self {
+            Self::Completed { num_turns, .. }
+            | Self::Failed { num_turns, .. }
+            | Self::Cancelled { num_turns, .. } => *num_turns,
         }
     }
 }
@@ -578,11 +774,8 @@ pub enum AgentEvent {
         image_count: usize,
     },
     QueueDrained,
-    Done {
-        usage: TokenUsage,
-        num_turns: u32,
-        reason: DoneReason,
-    },
+    /// The sole terminal event for an accepted agent turn.
+    TurnOutcome(TurnOutcome),
     AutoCompacting,
     CompactionDone,
     Retry {
@@ -590,7 +783,12 @@ pub enum AgentEvent {
         message: String,
         delay_ms: u64,
     },
-    Error {
+    /// Successful completion of a standalone control operation.
+    ControlComplete {
+        usage: TokenUsage,
+    },
+    /// A setup or control-operation error outside an accepted turn.
+    ControlError {
         message: String,
     },
     PermissionRequest {
@@ -948,6 +1146,55 @@ mod tests {
     #[test_case(Some(StopReason::ToolUse) ; "tool_use")]
     fn stop_reason_without_its_own_ending_becomes_end_turn(stop: Option<StopReason>) {
         assert_eq!(DoneReason::from(stop), DoneReason::EndTurn);
+    }
+
+    fn assert_id_roundtrip<T>(id: T)
+    where
+        T: Copy
+            + fmt::Display
+            + FromStr<Err = MakiIdParseError>
+            + PartialEq
+            + fmt::Debug
+            + Serialize,
+        for<'de> T: Deserialize<'de>,
+    {
+        assert_eq!(id.to_string().parse::<T>().unwrap(), id);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<T>(&json).unwrap(), id);
+        assert_eq!(json, format!("\"{id}\""));
+    }
+
+    #[test]
+    fn agent_id_roundtrips() {
+        assert_id_roundtrip(AgentId::generate());
+    }
+
+    #[test]
+    fn turn_id_roundtrips() {
+        assert_id_roundtrip(TurnId::generate());
+    }
+
+    #[test_case(AgentError::Api { status: 500, message: "down".into() }, TurnFailureKind::Provider ; "provider")]
+    #[test_case(AgentError::Api { status: 401, message: "bad key".into() }, TurnFailureKind::Authentication ; "authentication")]
+    #[test_case(AgentError::Timeout { secs: 10 }, TurnFailureKind::Timeout ; "timeout")]
+    #[test_case(AgentError::Tool { tool: "read".into(), message: "bad".into() }, TurnFailureKind::Tool ; "tool")]
+    #[test_case(AgentError::Io(std::io::Error::other("disk")), TurnFailureKind::Transport ; "io")]
+    #[test_case(AgentError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()), TurnFailureKind::InvalidResponse ; "json")]
+    #[test_case(AgentError::Config { message: "bad config".into() }, TurnFailureKind::InvalidResponse ; "config")]
+    #[test_case(AgentError::Channel, TurnFailureKind::Internal ; "channel")]
+    #[test_case(AgentError::EmptySummary, TurnFailureKind::Compaction ; "compaction")]
+    fn agent_error_snapshots_to_stable_failure_kind(
+        error: AgentError,
+        expected_kind: TurnFailureKind,
+    ) {
+        let expected_diagnostic = error.to_string();
+        let expected_user_message = error.user_message();
+        let expected_retryable = error.is_retryable();
+        let failure = TurnFailure::from_agent_error(&error);
+        assert_eq!(failure.kind, expected_kind);
+        assert_eq!(failure.diagnostic, expected_diagnostic);
+        assert_eq!(failure.user_message, expected_user_message);
+        assert_eq!(failure.retryable, expected_retryable);
     }
 
     #[test]

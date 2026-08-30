@@ -34,6 +34,7 @@ const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
 pub enum ChatEventResult {
     Continue,
     Done,
+    ControlComplete,
     QueueItemConsumed {
         text: String,
         image_count: usize,
@@ -147,11 +148,21 @@ impl Chat {
             }
             AgentEvent::QueueDrained => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
-            AgentEvent::Done { .. } => {
+            AgentEvent::TurnOutcome(outcome) => {
                 self.messages_panel.flush();
-                return ChatEventResult::Done;
+                return match outcome {
+                    maki_agent::TurnOutcome::Completed { .. }
+                    | maki_agent::TurnOutcome::Cancelled { .. } => ChatEventResult::Done,
+                    maki_agent::TurnOutcome::Failed { failure, .. } => {
+                        ChatEventResult::Error(failure.user_message)
+                    }
+                };
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::ControlComplete { .. } => {
+                self.messages_panel.flush();
+                return ChatEventResult::ControlComplete;
+            }
+            AgentEvent::ControlError { message } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
@@ -363,6 +374,13 @@ impl Chat {
         self.messages_panel.flush();
         self.messages_panel
             .push(DisplayMessage::new(role, text.into()));
+    }
+
+    pub fn mark_failed(&mut self, text: &str) {
+        self.finished = true;
+        self.messages_panel.flush();
+        self.messages_panel
+            .push(DisplayMessage::new(DisplayRole::Error, text.into()));
     }
 
     pub fn is_finished(&self) -> bool {

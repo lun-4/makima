@@ -768,12 +768,11 @@ fn send_agent_input(
     id: &RequestId,
     input: AgentInput,
 ) -> Result<(), AcpError> {
-    session
-        .handle
-        .input_tx
-        .send(input)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
     session.pending.lock().unwrap().prompt = Some(id.clone());
+    if session.handle.input_tx.send(input).is_err() {
+        session.pending.lock().unwrap().prompt.take();
+        return Err(AcpError::new(-32603, "session ended"));
+    }
     Ok(())
 }
 
@@ -1053,9 +1052,35 @@ fn start_event_pump(
                     }
                     continue;
                 }
-                AgentEvent::Done { reason, .. } => {
+                AgentEvent::TurnOutcome(outcome) => {
                     if let Some(id) = pending.lock().unwrap().prompt.take() {
-                        let resp = PromptResponse::new(translate::map_done_reason(reason));
+                        match outcome {
+                            maki_agent::TurnOutcome::Completed { reason, .. } => {
+                                let resp = PromptResponse::new(translate::map_done_reason(reason));
+                                send(
+                                    &out_tx,
+                                    Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+                                );
+                            }
+                            maki_agent::TurnOutcome::Cancelled { .. } => {
+                                let resp = PromptResponse::new(StopReason::Cancelled);
+                                send(
+                                    &out_tx,
+                                    Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+                                );
+                            }
+                            maki_agent::TurnOutcome::Failed { failure, .. } => {
+                                let error = AcpError::internal_error()
+                                    .data(Value::String(failure.user_message));
+                                send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                AgentEvent::ControlComplete { .. } => {
+                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                        let resp = PromptResponse::new(StopReason::EndTurn);
                         send(
                             &out_tx,
                             Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
@@ -1063,7 +1088,7 @@ fn start_event_pump(
                     }
                     continue;
                 }
-                AgentEvent::Error { message } => {
+                AgentEvent::ControlError { message } => {
                     if let Some(id) = pending.lock().unwrap().prompt.take() {
                         let error = AcpError::internal_error().data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
