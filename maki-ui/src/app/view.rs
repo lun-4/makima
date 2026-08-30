@@ -313,7 +313,8 @@ impl App {
             if !streaming && !self.command_palette.is_active() && !self.any_overlay_open() {
                 self.file_completion.view(frame, layout.input_area);
             }
-            self.command_palette.view(frame, layout.input_area);
+            self.command_palette
+                .view(frame, layout.input_area, self.ui_config.autocomplete_height);
         }
     }
 

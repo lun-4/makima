@@ -10,7 +10,9 @@ use maki_agent::tools::{
     ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
     timeout_annotation,
 };
-use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
+use maki_config::{
+    AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
+};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
@@ -2227,6 +2229,26 @@ fn setup_happy_path() {
         .unwrap();
     let raw = raw.expect("expected Some(RawConfig)");
     assert_eq!(raw.agent.max_output_lines, Some(3000));
+}
+
+#[test]
+fn lua_setup_accepts_autocomplete_height() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            format!(
+                "maki.setup({{ ui = {{ autocomplete_height = {DEFAULT_AUTOCOMPLETE_HEIGHT} }} }})"
+            ),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("expected Some(RawConfig)");
+    assert_eq!(
+        raw.ui.autocomplete_height,
+        Some(DEFAULT_AUTOCOMPLETE_HEIGHT)
+    );
 }
 
 #[test_case::test_case(

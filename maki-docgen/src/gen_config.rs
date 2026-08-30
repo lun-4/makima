@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
-    AgentConfig, BellConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
+    AgentConfig, BellConfig, ConfigField, DEFAULT_AUTOCOMPLETE_HEIGHT, DEFAULT_MAX_LOG_FILES,
+    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig,
+    StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -227,6 +227,7 @@ maki.setup({{
     ui = {{
         splash_animation = true,
         mouse_scroll_lines = {mouse_scroll},
+        autocomplete_height = {autocomplete_height},
         theme = \"tokyonight\",
         tool_output_lines = {{
             bash = {tol_bash},
@@ -261,6 +262,7 @@ All fields are optional. Typos in field names cause an error right away.
 ## Full Reference
 ",
         mouse_scroll = DEFAULT_MOUSE_SCROLL_LINES + 2,
+        autocomplete_height = DEFAULT_AUTOCOMPLETE_HEIGHT,
         tol_bash = ToolOutputLines::DEFAULT.bash + 3,
         tol_read = ToolOutputLines::DEFAULT.read + 2,
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
@@ -372,4 +374,22 @@ Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/pro
     .unwrap();
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use maki_config::DEFAULT_AUTOCOMPLETE_HEIGHT;
+
+    use super::generate;
+
+    #[test]
+    fn autocomplete_height_metadata_and_docs() {
+        let page = generate();
+        assert!(page.contains(&format!(
+            "autocomplete_height = {DEFAULT_AUTOCOMPLETE_HEIGHT},"
+        )));
+        assert!(page.contains(&format!(
+            "| `autocomplete_height` | number | `{DEFAULT_AUTOCOMPLETE_HEIGHT}` | - | Fraction of terminal height used for slash command-argument suggestions; must be finite and in (0, 1] |"
+        )));
+    }
 }
