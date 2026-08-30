@@ -154,8 +154,8 @@ fn edit_handlers_bypassing_lock_lose_updates() {
     barrier.release_reads();
     let done = smol::block_on(async { (a.await, b.await) });
 
-    assert!(!done.0.output.as_ref().is_err());
-    assert!(!done.1.output.as_ref().is_err());
+    assert!(done.0.output.as_ref().is_ok());
+    assert!(done.1.output.as_ref().is_ok());
 
     let content = file_content(&barrier.fs, FILE);
     assert_ne!(
