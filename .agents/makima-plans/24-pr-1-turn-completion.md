@@ -225,3 +225,113 @@ Do not write user-facing first-class agent API or mode documentation in PR 1 bec
 - **Compatibility event churn:** Replacing `Done`/`Error` affects many exhaustive matches. Keep the change mechanical at consumers and resist adding manager/graph abstractions before PR 2/3.
 - **Identity persistence:** IDs are generated and propagated now but intentionally not added to the session storage format in PR 1. Stable means stable for the lifetime of the current runtime object; restart durability arrives with graph persistence.
 - **Settled operator decisions:** `TurnOutcome` is authoritative at `Agent::run`; ordinary failures end the turn but leave the agent/session reusable; `AgentId` and `TurnId` are nominal `MakiId`-backed UUIDv7 types.
+
+# Post-Implementation Record
+
+This section records what happened while executing the approved plan. The sections above are retained as the starting context and intended design; this section describes the resulting implementation, review discoveries, verification evidence, and remaining boundaries.
+
+## Result
+
+PR 1 was implemented across the core agent lifecycle and all current compatibility consumers. The implementation commit is `486280d7` (`feat(agent): make turn completion reliable`).
+
+The resulting contract is:
+
+- `AgentId` and `TurnId` are distinct nominal wrappers around `MakiId`, with UUIDv7 generation and canonical base58 display, parse, and serde behavior.
+- `Agent::run` accepts a reserved `TurnId`, returns a typed `TurnOutcome`, and makes one terminal event delivery attempt from its outer boundary.
+- Completed, failed, and cancelled are disjoint terminal states. Cancellation is no longer represented by `DoneReason` or failure.
+- `TurnFailure` snapshots stable kind, diagnostic text, user-facing text, and retryability from `AgentError`.
+- Outcome usage and model-turn counts are invocation-local even when an `Agent` is reused.
+- A failed terminal-event send does not change or retry the authoritative returned outcome.
+- Standalone compaction uses `ControlComplete`/`ControlError`; it does not mint a turn or trigger turn-end behavior.
+
+## Implementation Differences and Additional Touch Points
+
+The plan named the main files correctly, but execution exposed additional compatibility surfaces that also required migration:
+
+- `src/print.rs` and `src/sdk_mode.rs` still matched the removed `AgentEvent::Done`/`Error` variants. They now adapt `TurnOutcome` and control-operation events explicitly.
+- `maki-ui/src/chat.rs`, `maki-ui/src/event_loop.rs`, `maki-ui/src/app/queue.rs`, and `maki-ui/src/app/tests.rs` required changes to keep turn completion, queue progression, exit behavior, and manual compaction separate.
+- `maki-acp/src/server.rs` needed more than mechanical event translation: pending prompt state must be registered before agent input is sent, with rollback on send failure, so a fast terminal outcome cannot race past registration.
+- Post-admission model/provider setup failures existed in both interactive headless and the TUI loop. Each path now reserves a `TurnId` at dequeue and emits a correlated failed outcome if setup fails after acceptance.
+- Child outcome replay was not called out explicitly in the starting implementation steps. The TUI now deduplicates stamped child terminal outcomes before applying task-row, chat, or parent-notification effects.
+
+No PR 2/3 manager, persistent actor, graph storage, first-class Lua `Agent` userdata, or graph navigation was introduced.
+
+## Lua Driver Details Learned During Implementation
+
+The compatibility subagent driver needed stronger state mechanics than the initial high-level “one idempotent finalizer” wording made explicit:
+
+- Every accepted `TurnId` is tracked independently of whether it has a blocking waiter, because asynchronous `send` turns must also be terminalized on close.
+- Finalized IDs are recorded under the shared state lock. This makes finalization, pending decrements, status updates, and waiter delivery idempotent across close/run races.
+- The currently claimed active ID is tracked separately from queued IDs. `close()` synthesizes closed cancellation outcomes only for queued/unclaimed accepted turns; a turn already inside `Agent::run` remains authoritative and is finalized from the outcome returned by that run.
+- Closing retires the existing cancellation trigger to wake an active run. If that run returns cancelled after closure, the compatibility adapter may refine the cancellation reason to closure while retaining its identity, usage, turn count, and terminal variant.
+- Admission send failure is treated as failure of an already accepted turn and passes through the same finalizer rather than manually repairing counters.
+- Session aggregate usage remains separate from each outcome’s local usage.
+- Ordinary failed turns do not close the driver. Already queued and later inputs continue through the same session.
+- `SubagentStatus::Done` boxes its result to avoid making every status value as large as the full typed outcome.
+
+These mechanics fix the original success-only completion wait and the dropped-waiter/pending-count failure modes behind #54 and #55.
+
+## Review Findings Resolved
+
+The required reviews found issues that scoped compilation alone did not expose:
+
+1. TUI and interactive-headless setup failures could consume accepted input without a correlated terminal outcome. Turn reservation and setup-failure terminalization were moved to the admission boundary.
+2. Lua close initially relied on `saturating_sub`, which hid double-finalization rather than preventing it. Accepted/finalized ID tracking replaced that behavior.
+3. A first close fix could synthesize a competing outcome for a turn already running. Active-ID ownership now defers that turn to `Agent::run`.
+4. Manual `ControlComplete` initially still flowed through generic done/turn-end behavior. Chat and app handling now keep control completion non-terminal with respect to accepted turns.
+5. Top-level print and SDK consumers were missed by early crate-scoped checks and were migrated after a workspace-wide review.
+6. ACP pending-prompt registration occurred after sending input, creating a fast-completion race. Registration now occurs first and is rolled back if sending fails.
+7. Duplicate stamped child outcomes could repeat UI and parent effects. The stamped-ID guard now rejects duplicates before those effects.
+
+The final blocker re-review reported no remaining critical or high findings in these areas.
+
+## Test Strategy as Executed
+
+The acceptance behavior is covered by core lifecycle tests, existing cancellation tests updated for typed outcomes, deterministic Lua shared-state tests, TUI/app tests, ACP tests, and the existing Lua integration suite. Coverage includes:
+
+- ID display/parse/serde round trips and a compile-fail Rustdoc example proving nominal IDs cannot be interchanged;
+- completed, failed, and cancelled normalization;
+- exact returned/emitted outcome comparison and one terminal event attempt;
+- terminal channel send failure with the returned outcome retained;
+- per-turn usage and turn-count reset on reused agents;
+- failure metadata mapping across the current `AgentError` taxonomy;
+- cancellation history sanitation;
+- closed-session admission rejection, waiter resolution, queued-turn closure, and pending-count convergence;
+- failed-turn session reuse and outcome-driven Lua completion;
+- child failure presentation and duplicate child outcome suppression;
+- manual compaction completing without root turn-end behavior;
+- ACP completed/cancelled/failed translation and pending-prompt ordering.
+
+Some test coverage landed as focused in-module tests rather than under every exact proposed test name or integration-file location in the starting table. The acceptance properties, not exact test placement, were treated as authoritative. Existing sleep-based integration tests outside the touched lifecycle mechanics were not broadly rewritten when deterministic in-module channels covered the race directly.
+
+## Verification Record
+
+The final implementation tree passed:
+
+- workspace-wide `cargo check --workspace --tests --benches`;
+- affected `maki-agent`, `maki-lua`, `maki-ui`, and `maki-acp` suites;
+- the nominal-ID compile-fail doctest;
+- formatting and diff hygiene checks;
+- required plan and implementation reviews, including blocker re-review;
+- `.ssh/remote-ci.sh`, which ran the repository `just ci` workflow:
+  - `cargo fmt --all -- --check`;
+  - `stylua --check plugins/`;
+  - `cargo clippy --all --tests --benches -- -D warnings`;
+  - `ruff check scripts/` and `ty check scripts/`;
+  - `cargo nextest run --workspace`, with 4,666 tests passed and none skipped;
+  - generated documentation verification;
+  - `cargo machete` dependency analysis.
+
+The only observed warning was the existing future-incompatibility notice for `proc-macro-error2 v2.0.1`.
+
+## Remaining Boundaries and Follow-Up
+
+The following remain intentionally outside this PR and should not be inferred as delivered:
+
+- Agent and turn IDs are runtime-stable only; they are not persisted across process restarts.
+- Exactly-once means one producer terminalization decision and one event delivery attempt. It does not provide crash-durable subscriber delivery, replay, or acknowledgement.
+- Tool-use IDs and numeric UI `run_id` remain compatibility correlation fields, not runtime identity.
+- The Lua surface remains the compatibility `maki.agent.Session` API; no first-class agent userdata or graph API was added.
+- No shared persistent actor, manager/graph, wait/notification system, guest modes, or graph navigation was added.
+- The `proc-macro-error2` future-incompatibility warning is unrelated dependency maintenance.
+- The developer-facing PR/issue note about compatibility IDs versus runtime IDs still belongs in the eventual PR description; no separate user-facing API documentation was needed because the public Lua API shape did not change.
