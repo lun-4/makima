@@ -254,6 +254,47 @@ fn lua_registry(
     (registry, producer)
 }
 
+fn lua_registry_with_commands(
+    commands: Vec<TestLuaCommand>,
+) -> (maki_commands::CommandRegistry, maki_commands::Producer) {
+    let registry = maki_commands::CommandRegistry::new();
+    let producer = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+    let registrations = commands
+        .into_iter()
+        .map(|command| {
+            let completion = command.completion.then(|| {
+                Arc::new(TestLuaCompletion {
+                    handle: command.handle.clone(),
+                    plugin: Arc::clone(&command.plugin),
+                }) as Arc<dyn maki_commands::CommandCompletion>
+            });
+            maki_commands::Registration {
+                spec: maki_commands::CommandSpec {
+                    name: Arc::clone(&command.name),
+                    aliases: Arc::from([]),
+                    arguments: command
+                        .max_args
+                        .map(|max| maki_commands::ArgumentArity::bounded(0, max))
+                        .unwrap_or_else(|| maki_commands::ArgumentArity::unbounded(0)),
+                    docs: maki_commands::CommandDocs {
+                        summary: Arc::from("Lua test command"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: maki_commands::TargetCapabilities::default(),
+                },
+                behavior: Arc::new(TestLuaBehavior {
+                    handle: command.handle,
+                    plugin: command.plugin,
+                    name: command.name,
+                }),
+                completion,
+            }
+        })
+        .collect();
+    producer.replace(registrations).unwrap();
+    (registry, producer)
+}
+
 fn build_app_with_full(
     dir: StateDir,
     writer: Arc<StorageWriter>,
@@ -1050,6 +1091,105 @@ fn empty_completion_cancels_once_and_next_request_uses_new_session() {
 }
 
 #[test]
+fn argument_completion_clears_old_rows_while_request_pending() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let (registry, _producer) = lua_registry(TestLuaCommand {
+        handle: handle.clone(),
+        name: Arc::from("/deploy"),
+        plugin: Arc::from("deploy"),
+        max_args: Some(1),
+        completion: true,
+    });
+    let mut app = build_app_with_full(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        registry,
+        handle,
+        UiConfig::default(),
+    );
+    app.input_box.set_input("/deploy a".into());
+    app.command_palette.sync("/deploy a");
+    app.command_palette.set_argument_completion(
+        (8, 9),
+        CommandArgumentItem {
+            label: "old-result".into(),
+            insertion: "old-result".into(),
+            description: None,
+        },
+    );
+
+    app.input_box.set_input("/deploy b".into());
+    app.command_palette.sync("/deploy b");
+    app.command_palette
+        .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
+    assert!(app.command_palette.completion_session_id().is_some());
+    assert!(!rendered(&mut app).contains("old-result"));
+    assert!(probe.try_finish_command_arguments(Vec::new()).is_some());
+}
+
+#[test]
+fn unmatched_completion_items_cancel_the_argument_session() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let registry = maki_commands::CommandRegistry::new();
+    let _producer = register_test_lua_command(
+        &registry,
+        TestLuaCommand {
+            handle: handle.clone(),
+            name: Arc::from("/deploy"),
+            plugin: Arc::from("deploy"),
+            max_args: Some(1),
+            completion: true,
+        },
+    );
+    let mut app = build_app_with_full(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        registry,
+        handle,
+        UiConfig::default(),
+    );
+    app.input_box.set_input("/deploy z".into());
+    app.command_palette.sync("/deploy z");
+    app.command_palette
+        .sync_arguments("/deploy z", 9, &app.state.mode.id_key());
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if probe
+            .try_finish_command_arguments(vec![CommandArgumentItem {
+                label: "alpha".into(),
+                insertion: "alpha".into(),
+                description: None,
+            }])
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "completion request was not sent");
+        std::thread::yield_now();
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if app.command_palette.poll_arguments() == Dirty::YES {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "completion result was not applied"
+        );
+        std::thread::yield_now();
+    }
+
+    assert!(app.command_palette.completion_session_id().is_none());
+    assert_eq!(
+        probe.try_finish_command_argument_lifecycle(),
+        Some(("cancel", None, true))
+    );
+}
+
+#[test]
 fn ctrl_c_closes_palette_and_cancels_lifecycle() {
     let (mut app, probe, _producer) = lifecycle_app();
 
@@ -1294,6 +1434,179 @@ fn argument_completion_enter_fills_then_next_enter_executes() {
     assert_eq!(
         probe.try_recv_command(),
         Some(("/rename".into(), "final tail".into(), 0))
+    );
+}
+
+#[test]
+fn scrolled_argument_completion_accepts_offscreen_candidate() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let (registry, _producer) = lua_registry_with_commands(vec![
+        TestLuaCommand {
+            handle: handle.clone(),
+            name: Arc::from("/deploy"),
+            plugin: Arc::from("deploy"),
+            max_args: Some(1),
+            completion: true,
+        },
+        TestLuaCommand {
+            handle: handle.clone(),
+            name: Arc::from("/deployer"),
+            plugin: Arc::from("deployer"),
+            max_args: Some(1),
+            completion: true,
+        },
+    ]);
+    let ui = UiConfig {
+        autocomplete_height: 0.2,
+        ..UiConfig::default()
+    };
+    let mut app = build_app_with_full(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        registry,
+        handle,
+        ui,
+    );
+    app.input_box.set_input("/de a".into());
+    app.command_palette.sync("/de a");
+    app.command_palette.move_down();
+    assert_eq!(
+        app.command_palette
+            .confirm("/de a")
+            .unwrap()
+            .command
+            .invoked_name(),
+        "/deployer"
+    );
+    app.command_palette.set_argument_completions(
+        (4, 5),
+        (0..8)
+            .map(|i| CommandArgumentItem {
+                label: format!("candidate-{i}"),
+                insertion: format!("candidate-{i}"),
+                description: None,
+            })
+            .collect(),
+    );
+    app.command_palette.handle_key(key(KeyCode::Down), "/de a");
+    app.command_palette.handle_key(key(KeyCode::Down), "/de a");
+    let _ = rendered(&mut app);
+    for _ in 0..5 {
+        app.command_palette.handle_key(key(KeyCode::Down), "/de a");
+    }
+    assert_eq!(app.command_palette.argument_selected_for_test(), 7);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty());
+    assert_eq!(app.input_box.buffer.value(), "/de candidate-7");
+    assert_eq!(
+        app.command_palette
+            .confirm("/de candidate-7")
+            .unwrap()
+            .command
+            .invoked_name(),
+        "/deployer"
+    );
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        probe.try_recv_command(),
+        Some(("/deployer".into(), "candidate-7".into(), 0))
+    );
+}
+
+#[test]
+fn argument_completion_tab_preserves_command_for_next_request() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let (registry, _producer) = lua_registry_with_commands(vec![
+        TestLuaCommand {
+            handle: handle.clone(),
+            name: Arc::from("/deploy"),
+            plugin: Arc::from("deploy"),
+            max_args: Some(1),
+            completion: true,
+        },
+        TestLuaCommand {
+            handle: handle.clone(),
+            name: Arc::from("/deployer"),
+            plugin: Arc::from("deployer"),
+            max_args: Some(1),
+            completion: true,
+        },
+    ]);
+    let mut app = build_app_with_full(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        registry,
+        handle,
+        UiConfig::default(),
+    );
+    app.input_box.set_input("/de a".into());
+    app.command_palette.sync("/de a");
+    app.command_palette.move_down();
+    app.command_palette.set_argument_completions(
+        (4, 5),
+        vec![CommandArgumentItem {
+            label: "candidate-0".into(),
+            insertion: "candidate-0".into(),
+            description: None,
+        }],
+    );
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), "/de candidate-0");
+    assert_eq!(
+        app.command_palette
+            .confirm("/de candidate-0")
+            .unwrap()
+            .command
+            .invoked_name(),
+        "/deployer"
+    );
+    assert!(!app.command_palette.is_active());
+
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+    assert_eq!(app.input_box.buffer.value(), "/de candidate-0x");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if probe
+            .try_finish_command_arguments(vec![CommandArgumentItem {
+                label: "candidate-0x".into(),
+                insertion: "candidate-0x".into(),
+                description: None,
+            }])
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "completion request was not sent");
+        std::thread::yield_now();
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if app.command_palette.poll_arguments() == Dirty::YES {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "completion result was not applied"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        app.command_palette
+            .confirm("/de candidate-0x")
+            .unwrap()
+            .command
+            .invoked_name(),
+        "/deployer"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        probe.try_recv_command(),
+        Some(("/deployer".into(), "candidate-0x".into(), 0))
     );
 }
 
@@ -6086,6 +6399,33 @@ fn at_completion_insertion_synchronizes_argument_completion() {
 
     assert_eq!(app.input_box.buffer.value(), "/deploy @skill:review");
     assert!(app.command_palette.argument_generation() > generation);
+}
+
+#[test]
+fn at_completion_layout_ignores_autocomplete_height() {
+    let (_tmp, mut app, backend) = completion_app();
+    backend.register_source(
+        "skill",
+        (0..8)
+            .map(|i| maki_lua::ItemSpec {
+                label: format!("skill:item-{i}"),
+                kind: "skill".into(),
+                insertion: format!("@skill:item-{i}"),
+                description: None,
+            })
+            .collect(),
+    );
+    for c in "@skill:".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    converge_completion(&mut app);
+
+    app.ui_config.autocomplete_height = 0.2;
+    let low_fraction = rendered_rows(&mut app, 80, 24);
+    app.ui_config.autocomplete_height = 0.9;
+    let high_fraction = rendered_rows(&mut app, 80, 24);
+
+    assert_eq!(low_fraction, high_fraction);
 }
 
 #[test]

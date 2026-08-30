@@ -23,6 +23,7 @@ pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
+pub const DEFAULT_AUTOCOMPLETE_HEIGHT: f64 = 0.7;
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
@@ -99,6 +100,7 @@ pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_line
 pub enum ConfigValue {
     Bool(bool),
     U64(u64),
+    F64(f64),
     Str(&'static str),
 }
 
@@ -107,6 +109,7 @@ impl ConfigValue {
         match self {
             Self::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             Self::U64(v) => v.to_string(),
+            Self::F64(v) => v.to_string(),
             Self::Str(s) => (*s).to_string(),
         }
     }
@@ -189,6 +192,10 @@ pub enum ConfigError {
          A .bak backup is left next to the file."
     )]
     RenamedToolsTable,
+    #[error(
+        "invalid config: ui.autocomplete_height = {value} must be finite and in the range (0, 1]"
+    )]
+    InvalidAutocompleteHeight { value: f64 },
     #[error("invalid config: provider.{field} contains invalid glob pattern `{pattern}`: {source}")]
     InvalidModelPattern {
         field: &'static str,
@@ -368,6 +375,7 @@ pub struct UiFileConfig {
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub bell: Option<BellFileConfig>,
     pub max_input_lines: Option<u32>,
+    pub autocomplete_height: Option<f64>,
 }
 
 impl UiFileConfig {
@@ -384,7 +392,8 @@ impl UiFileConfig {
             show_thinking,
             theme,
             clock_format,
-            max_input_lines
+            max_input_lines,
+            autocomplete_height
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -924,6 +933,13 @@ pub struct UiConfig {
     pub max_input_lines: u32,
 
     #[config(
+        default = DEFAULT_AUTOCOMPLETE_HEIGHT,
+        ty = "number",
+        desc = "Fraction of terminal height used for slash command-argument suggestions; must be finite and in (0, 1]"
+    )]
+    pub autocomplete_height: f64,
+
+    #[config(
         default = true,
         desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
     )]
@@ -958,6 +974,7 @@ impl UiConfig {
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
+            autocomplete_height: f.autocomplete_height.unwrap_or(DEFAULT_AUTOCOMPLETE_HEIGHT),
             show_thinking: f.show_thinking.unwrap_or(true),
             clock_format: f.clock_format.unwrap_or_default(),
             theme: f.theme,
@@ -968,6 +985,14 @@ impl UiConfig {
 
     pub fn validate_all(&self) -> Result<(), ConfigError> {
         self.validate()?;
+        if !self.autocomplete_height.is_finite()
+            || !(0.0..=1.0).contains(&self.autocomplete_height)
+            || self.autocomplete_height == 0.0
+        {
+            return Err(ConfigError::InvalidAutocompleteHeight {
+                value: self.autocomplete_height,
+            });
+        }
         self.tool_output_lines.validate()?;
         Ok(())
     }
@@ -2876,6 +2901,107 @@ mod tests {
 
         let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
         assert_eq!(raw.ui.max_input_lines.unwrap(), 5);
+    }
+
+    #[test]
+    fn autocomplete_height_defaults_parses_and_merges() {
+        let defaults = RawConfig::default().into_config(false).unwrap();
+        assert_eq!(defaults.ui.autocomplete_height, DEFAULT_AUTOCOMPLETE_HEIGHT);
+
+        let raw: RawConfig = toml::from_str(&format!(
+            "[ui]\nautocomplete_height = {DEFAULT_AUTOCOMPLETE_HEIGHT}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            raw.ui.autocomplete_height,
+            Some(DEFAULT_AUTOCOMPLETE_HEIGHT)
+        );
+        assert_eq!(
+            raw.into_config(false).unwrap().ui.autocomplete_height,
+            DEFAULT_AUTOCOMPLETE_HEIGHT
+        );
+
+        let mut base: RawConfig = toml::from_str("[ui]\nautocomplete_height = 0.4\n").unwrap();
+        base.merge(toml::from_str("[ui]\nautocomplete_height = 0.9\n").unwrap());
+        assert_eq!(base.ui.autocomplete_height, Some(0.9));
+    }
+
+    #[test_case(0.0 ; "zero")]
+    #[test_case(-0.1 ; "negative")]
+    #[test_case(1.1 ; "above_one")]
+    fn autocomplete_height_validation_rejects_invalid_values(value: f64) {
+        let mut config = Config {
+            always_yolo: false,
+            always_automode: false,
+            always_fast: false,
+            always_workflow: false,
+            always_thinking: None,
+            ui: UiConfig::default(),
+            agent: AgentConfig::default(),
+            provider: ProviderConfig::default(),
+            storage: StorageConfig::default(),
+            permissions: PermissionsConfig::default(),
+            plugins: PluginsConfig::default(),
+        };
+        config.ui.autocomplete_height = value;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidAutocompleteHeight { value: actual }) if actual == value
+        ));
+    }
+
+    #[test]
+    fn autocomplete_height_validation_rejects_non_finite_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut config = Config {
+                always_yolo: false,
+                always_automode: false,
+                always_fast: false,
+                always_workflow: false,
+                always_thinking: None,
+                ui: UiConfig::default(),
+                agent: AgentConfig::default(),
+                provider: ProviderConfig::default(),
+                storage: StorageConfig::default(),
+                permissions: PermissionsConfig::default(),
+                plugins: PluginsConfig::default(),
+            };
+            config.ui.autocomplete_height = value;
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidAutocompleteHeight { value: actual })
+                    if actual.is_nan() == value.is_nan() && actual.is_infinite() == value.is_infinite()
+            ));
+        }
+    }
+
+    #[test_case("0.0" ; "zero")]
+    #[test_case("-0.1" ; "negative")]
+    #[test_case("1.1" ; "above_one")]
+    fn autocomplete_height_parsed_values_validate_at_startup(value: &str) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[ui]\nautocomplete_height = {value}\n")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidAutocompleteHeight { .. })
+        ));
+    }
+
+    #[test]
+    fn autocomplete_height_metadata() {
+        let field = UiConfig::FIELDS
+            .iter()
+            .find(|field| field.name == "autocomplete_height")
+            .expect("autocomplete_height metadata");
+        assert_eq!(field.ty, "number");
+        assert!(matches!(
+            field.default,
+            ConfigValue::F64(value) if value == DEFAULT_AUTOCOMPLETE_HEIGHT
+        ));
+        assert!(field.description.contains("finite"));
+        assert!(field.description.contains("(0, 1]"));
+        assert!(field.description.contains("slash command-argument"));
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]

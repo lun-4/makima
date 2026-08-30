@@ -52,7 +52,9 @@ struct Match {
 }
 
 pub struct CommandPalette {
-    selected: usize,
+    command_selected: usize,
+    argument_selected: usize,
+    argument_scroll_offset: usize,
     filtered: Vec<Match>,
     registry: CommandRegistry,
     target: TargetHandle,
@@ -96,7 +98,9 @@ impl CommandPalette {
             .expect("new command target is live");
         let nucleo = Self::build_nucleo(&snapshot);
         Self {
-            selected: 0,
+            command_selected: 0,
+            argument_selected: 0,
+            argument_scroll_offset: 0,
             filtered: Vec::new(),
             registry,
             target,
@@ -143,7 +147,11 @@ impl CommandPalette {
         match key.code {
             KeyCode::Up => {
                 if !self.argument_items.is_empty() {
-                    self.selected = self.selected.saturating_sub(1);
+                    self.argument_selected = if self.argument_selected == 0 {
+                        self.argument_items.len() - 1
+                    } else {
+                        self.argument_selected - 1
+                    };
                     self.notify_lifecycle(PaletteLifecycle::Highlight);
                     CommandAction::Consumed
                 } else {
@@ -153,7 +161,12 @@ impl CommandPalette {
             }
             KeyCode::Down => {
                 if !self.argument_items.is_empty() {
-                    self.selected = (self.selected + 1).min(self.argument_items.len() - 1);
+                    self.argument_selected =
+                        if self.argument_selected == self.argument_items.len() - 1 {
+                            0
+                        } else {
+                            self.argument_selected + 1
+                        };
                     self.notify_lifecycle(PaletteLifecycle::Highlight);
                     CommandAction::Consumed
                 } else {
@@ -168,7 +181,7 @@ impl CommandPalette {
             KeyCode::Enter => {
                 if let Some((range, item)) = self
                     .argument_range
-                    .zip(self.argument_items.get(self.selected))
+                    .zip(self.argument_items.get(self.argument_selected))
                 {
                     let insertion = &item.item.insertion;
                     let text = self.replace_argument(input, insertion);
@@ -178,9 +191,7 @@ impl CommandPalette {
                     // spending an Enter on a no-op accept.
                     let exact = input.get(range.0..range.1) == Some(insertion.as_ref());
                     self.notify_lifecycle(PaletteLifecycle::Accept);
-                    self.argument_items.clear();
-                    self.argument_range = None;
-                    self.pending_arguments = None;
+                    self.reset_argument_state();
                     if exact {
                         self.confirm_close(input)
                     } else {
@@ -196,18 +207,19 @@ impl CommandPalette {
             KeyCode::Tab => {
                 if let Some((range, item)) = self
                     .argument_range
-                    .zip(self.argument_items.get(self.selected))
+                    .zip(self.argument_items.get(self.argument_selected))
                 {
                     let insertion = item.item.insertion.clone();
-                    self.notify_lifecycle(PaletteLifecycle::Accept);
                     let text = self.replace_argument(input, &insertion);
+                    self.notify_lifecycle(PaletteLifecycle::Accept);
+                    self.reset_argument_state();
                     self.accepted_argument_input = Some(text.clone());
                     return CommandAction::Complete {
                         text,
                         cursor: range.0 + insertion.len(),
                     };
                 }
-                if let Some(item) = self.filtered.get(self.selected) {
+                if let Some(item) = self.filtered.get(self.command_selected) {
                     let name = item.command.invoked_name().to_string();
                     let text = if self.item_has_args(item) {
                         format!("{name} ")
@@ -244,47 +256,67 @@ impl CommandPalette {
     }
 
     #[cfg(test)]
+    pub(crate) fn argument_selected_for_test(&self) -> usize {
+        self.argument_selected
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_argument_completion(
         &mut self,
         range: (usize, usize),
         item: maki_lua::CommandArgumentItem,
     ) {
+        self.set_argument_completions(range, vec![item]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_argument_completions(
+        &mut self,
+        range: (usize, usize),
+        items: Vec<maki_lua::CommandArgumentItem>,
+    ) {
         self.argument_range = Some(range);
-        let ranking = completion_match(
-            "",
-            &item.label,
-            CompletionMatchOptions {
-                case_matching: CaseMatching::Ignore,
-                normalization: Normalization::Smart,
-            },
-        )
-        .unwrap()
-        .ranking;
-        self.argument_items = vec![ArgumentMatch {
-            candidate: None,
-            item: CompletionItem {
-                label: Arc::from(item.label),
-                insertion: Arc::from(item.insertion),
-                description: item.description.map(Arc::from),
-            },
-            indices: Vec::new(),
-            ranking,
-            order: 0,
-        }];
-        self.selected = 0;
+        self.argument_items = items
+            .into_iter()
+            .enumerate()
+            .map(|(order, item)| {
+                let ranking = completion_match(
+                    "",
+                    &item.label,
+                    CompletionMatchOptions {
+                        case_matching: CaseMatching::Ignore,
+                        normalization: Normalization::Smart,
+                    },
+                )
+                .unwrap()
+                .ranking;
+                ArgumentMatch {
+                    candidate: None,
+                    item: CompletionItem {
+                        label: Arc::from(item.label),
+                        insertion: Arc::from(item.insertion),
+                        description: item.description.map(Arc::from),
+                    },
+                    indices: Vec::new(),
+                    ranking,
+                    order,
+                }
+            })
+            .collect();
+        self.argument_selected = 0;
+        self.argument_scroll_offset = 0;
     }
 
     pub fn sync_arguments(&mut self, input: &str, cursor: usize, mode: &str) -> bool {
         self.argument_generation = self.argument_generation.wrapping_add(1);
-        self.argument_range = None;
-        self.pending_arguments = None;
+        self.reset_argument_state();
         if self.accepted_argument_input.as_deref() == Some(input) {
             return false;
         }
         let abandoned = self.accepted_argument_input.take().is_some();
         let Some(command) = self
             .filtered
-            .get(self.selected)
+            .get(self.command_selected)
             .map(|item| item.command.clone())
         else {
             self.cancel_arguments();
@@ -340,17 +372,20 @@ impl CommandPalette {
             return Dirty::NO;
         };
         if pending.generation != self.argument_generation {
-            return Dirty::NO;
+            self.cancel_arguments();
+            return Dirty::YES;
         }
         let CompletionResult::Items(items) = result else {
-            return Dirty::NO;
+            self.cancel_arguments();
+            return Dirty::YES;
         };
         if items.is_empty() {
             self.cancel_arguments();
             return Dirty::YES;
         }
         self.argument_items.clear();
-        self.selected = 0;
+        self.argument_selected = 0;
+        self.argument_scroll_offset = 0;
         for (order, candidate) in items.into_iter().enumerate() {
             let item = candidate.item().clone();
             let Some(matched) = completion_match(
@@ -389,6 +424,10 @@ impl CommandPalette {
                 &b.item.label,
             )
         });
+        if self.argument_items.is_empty() {
+            self.cancel_arguments();
+            return Dirty::YES;
+        }
         self.argument_range = Some(pending.range);
         self.notify_lifecycle(PaletteLifecycle::Highlight);
         Dirty::YES
@@ -402,7 +441,7 @@ impl CommandPalette {
             PaletteLifecycle::Highlight => {
                 if let Some(candidate) = self
                     .argument_items
-                    .get(self.selected)
+                    .get(self.argument_selected)
                     .and_then(|item| item.candidate.as_ref())
                 {
                     let _ = session.highlight(candidate);
@@ -411,7 +450,7 @@ impl CommandPalette {
             PaletteLifecycle::Accept => {
                 if let Some(candidate) = self
                     .argument_items
-                    .get_mut(self.selected)
+                    .get_mut(self.argument_selected)
                     .and_then(|item| item.candidate.take())
                 {
                     let _ = session.accept(candidate);
@@ -425,11 +464,17 @@ impl CommandPalette {
         }
     }
 
-    pub fn cancel_arguments(&mut self) {
-        self.notify_lifecycle(PaletteLifecycle::Cancel);
+    fn reset_argument_state(&mut self) {
         self.argument_items.clear();
         self.argument_range = None;
         self.pending_arguments = None;
+        self.argument_selected = 0;
+        self.argument_scroll_offset = 0;
+    }
+
+    pub fn cancel_arguments(&mut self) {
+        self.notify_lifecycle(PaletteLifecycle::Cancel);
+        self.reset_argument_state();
     }
 
     fn replace_argument(&self, input: &str, replacement: &str) -> String {
@@ -535,7 +580,9 @@ impl CommandPalette {
             })
             .collect();
 
-        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+        self.command_selected = self
+            .command_selected
+            .min(self.filtered.len().saturating_sub(1));
         // Argument items survive here: sync_arguments follows every sync
         // and clears them when their session ends.
     }
@@ -558,10 +605,10 @@ impl CommandPalette {
         if self.filtered.is_empty() {
             return;
         }
-        self.selected = if self.selected == 0 {
+        self.command_selected = if self.command_selected == 0 {
             self.filtered.len() - 1
         } else {
-            self.selected - 1
+            self.command_selected - 1
         };
     }
 
@@ -569,10 +616,10 @@ impl CommandPalette {
         if self.filtered.is_empty() {
             return;
         }
-        self.selected = if self.selected == self.filtered.len() - 1 {
+        self.command_selected = if self.command_selected == self.filtered.len() - 1 {
             0
         } else {
-            self.selected + 1
+            self.command_selected + 1
         };
     }
 
@@ -617,7 +664,7 @@ impl CommandPalette {
     }
 
     pub fn confirm(&self, input: &str) -> Option<ConfirmedCommand> {
-        let command = self.filtered.get(self.selected)?.command.clone();
+        let command = self.filtered.get(self.command_selected)?.command.clone();
         let args = input
             .strip_prefix('/')
             .and_then(|s| s.split_once(char::is_whitespace))
@@ -641,11 +688,19 @@ impl CommandPalette {
         }
     }
 
-    pub fn view(&self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        input_area: Rect,
+        autocomplete_height: f64,
+    ) -> Option<Rect> {
+        if !self.is_active() {
+            return None;
+        }
         let filtered = if self.argument_items.is_empty() {
             &self.filtered
         } else {
-            return self.view_arguments(frame, input_area);
+            return self.view_arguments(frame, input_area, autocomplete_height);
         };
         if filtered.is_empty() {
             return None;
@@ -683,7 +738,7 @@ impl CommandPalette {
             .enumerate()
             .map(|(i, m)| {
                 let name = m.command.invoked_name().to_string();
-                let selected = i == self.selected;
+                let selected = i == self.command_selected;
                 let name_pad = max_name - name.len() + GAP;
 
                 if selected {
@@ -716,11 +771,29 @@ impl CommandPalette {
         Some(popup)
     }
 
-    fn view_arguments(&self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
-        let height = (self.argument_items.len() as u16).min(input_area.y);
-        if height == 0 {
+    fn view_arguments(
+        &mut self,
+        frame: &mut Frame,
+        input_area: Rect,
+        autocomplete_height: f64,
+    ) -> Option<Rect> {
+        if input_area.y == 0 {
             return None;
         }
+        let visible_rows = argument_visible_rows(
+            self.argument_items.len(),
+            input_area.y,
+            frame.area().height,
+            autocomplete_height,
+        );
+        if visible_rows == 0 {
+            return None;
+        }
+        self.argument_selected = self
+            .argument_selected
+            .min(self.argument_items.len().saturating_sub(1));
+        self.ensure_argument_visible(visible_rows);
+        let height = visible_rows as u16;
         let width = self
             .argument_items
             .iter()
@@ -739,8 +812,10 @@ impl CommandPalette {
             .argument_items
             .iter()
             .enumerate()
+            .skip(self.argument_scroll_offset)
+            .take(visible_rows)
             .map(|(i, m)| {
-                let selected = i == self.selected;
+                let selected = i == self.argument_selected;
                 let style = if selected { t.item_selected } else { t.item };
                 let desc = m.item.description.as_deref().unwrap_or("");
                 let label = self.build_highlighted_spans(&m.item.label, &m.indices, style);
@@ -756,6 +831,22 @@ impl CommandPalette {
             popup,
         );
         Some(popup)
+    }
+
+    fn ensure_argument_visible(&mut self, visible_rows: usize) {
+        let len = self.argument_items.len();
+        if len == 0 || visible_rows == 0 {
+            self.argument_scroll_offset = 0;
+            return;
+        }
+        self.argument_scroll_offset = self
+            .argument_scroll_offset
+            .min(len.saturating_sub(visible_rows));
+        if self.argument_selected < self.argument_scroll_offset {
+            self.argument_scroll_offset = self.argument_selected;
+        } else if self.argument_selected >= self.argument_scroll_offset + visible_rows {
+            self.argument_scroll_offset = self.argument_selected + 1 - visible_rows;
+        }
     }
 
     fn build_highlighted_spans(&self, text: &str, indices: &[u32], base: Style) -> Vec<Span<'_>> {
@@ -792,25 +883,49 @@ impl CommandPalette {
     }
 }
 
+fn argument_visible_rows(
+    candidate_count: usize,
+    input_y: u16,
+    frame_height: u16,
+    fraction: f64,
+) -> usize {
+    if input_y == 0 || candidate_count == 0 || !fraction.is_finite() || fraction <= 0.0 {
+        return 0;
+    }
+    let fraction = fraction.min(1.0);
+    let fraction_rows = (f64::from(frame_height) * fraction).floor();
+    let fraction_rows = usize::try_from(fraction_rows as u64).unwrap_or(usize::MAX);
+    candidate_count
+        .min(input_y as usize)
+        .min(fraction_rows.max(1))
+}
+
 fn command_args(input: &str) -> &str {
+    let input = input.strip_prefix('/').unwrap_or("");
     input
-        .strip_prefix('/')
-        .and_then(|input| input.find(char::is_whitespace).map(|i| &input[i + 1..]))
-        .unwrap_or("")
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or("", |(index, ch)| &input[index + ch.len_utf8()..])
 }
 
 fn argument_at_cursor(input: &str, cursor: usize) -> Option<(usize, usize, String, usize)> {
     let slash = input.strip_prefix('/')?;
-    let command_end = slash.find(char::is_whitespace)? + 1;
+    let command_end = slash
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, ch)| 1 + index + ch.len_utf8())?;
     if cursor < command_end || !input.is_char_boundary(cursor) {
         return None;
     }
     let start = input[..cursor]
-        .rfind(char::is_whitespace)
-        .map_or(command_end, |i| i + 1);
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(command_end, |(index, ch)| index + ch.len_utf8());
     let end = input[cursor..]
-        .find(char::is_whitespace)
-        .map_or(input.len(), |i| cursor + i);
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(input.len(), |(index, _)| cursor + index);
     let arg = input[start..end].to_string();
     let index = input[command_end..start].split_whitespace().count();
     Some((start, end, arg, index))
@@ -820,13 +935,21 @@ fn argument_at_cursor(input: &str, cursor: usize) -> Option<(usize, usize, Strin
 mod tests {
     use std::sync::Arc;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_commands::{
         ArgumentArity, CommandBehavior, CommandDocs, CommandError, CommandFuture,
-        CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, HostResponse,
-        ProducerPrecedence, Registration, TargetCapabilities,
+        CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionItem,
+        HostResponse, ProducerPrecedence, Registration, TargetCapabilities,
     };
+    use maki_config::DEFAULT_AUTOCOMPLETE_HEIGHT;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
 
-    use super::CommandPalette;
+    use super::{
+        ArgumentMatch, CaseMatching, CommandPalette, CompletionMatchOptions, Normalization,
+        argument_at_cursor, argument_visible_rows, command_args, completion_match,
+    };
 
     struct Noop;
 
@@ -922,5 +1045,191 @@ mod tests {
             .map(|item| item.command.invoked_name())
             .collect();
         assert_eq!(names, vec!["/model", "/remodel"]);
+    }
+
+    fn argument_palette(count: usize) -> CommandPalette {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![registration("/test", "Test")])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        palette.argument_range = Some((6, 7));
+        palette.argument_items = (0..count)
+            .map(|i| ArgumentMatch {
+                candidate: None,
+                item: CompletionItem {
+                    label: format!("item-{i}").into(),
+                    insertion: format!("item-{i}").into(),
+                    description: None,
+                },
+                indices: Vec::new(),
+                ranking: completion_match(
+                    "",
+                    &format!("item-{i}"),
+                    CompletionMatchOptions {
+                        case_matching: CaseMatching::Ignore,
+                        normalization: Normalization::Smart,
+                    },
+                )
+                .unwrap()
+                .ranking,
+                order: i,
+            })
+            .collect();
+        palette
+    }
+
+    fn rendered_rows(
+        palette: &mut CommandPalette,
+        width: u16,
+        height: u16,
+        input_y: u16,
+    ) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                palette.view(
+                    frame,
+                    Rect::new(0, input_y, width, 1),
+                    DEFAULT_AUTOCOMPLETE_HEIGHT,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn command_name_navigation_still_wraps() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![
+                registration("/one", "One"),
+                registration("/two", "Two"),
+            ])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        palette.sync("/");
+
+        palette.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), "/");
+        assert_eq!(palette.command_selected, 1);
+        palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), "/");
+        palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), "/");
+        assert_eq!(palette.command_selected, 1);
+    }
+
+    #[test]
+    fn argument_visible_rows_clamps_fraction_and_space() {
+        assert_eq!(
+            argument_visible_rows(20, 0, 20, DEFAULT_AUTOCOMPLETE_HEIGHT),
+            0
+        );
+        assert_eq!(argument_visible_rows(20, 5, 20, 0.01), 1);
+        assert_eq!(argument_visible_rows(20, 5, 20, f64::NAN), 0);
+        assert_eq!(argument_visible_rows(20, 5, 20, f64::INFINITY), 0);
+        assert_eq!(argument_visible_rows(20, 5, 20, -0.1), 0);
+        assert_eq!(argument_visible_rows(20, 5, 20, 2.0), 5);
+        assert_eq!(
+            argument_visible_rows(3, 20, 20, DEFAULT_AUTOCOMPLETE_HEIGHT),
+            3
+        );
+    }
+
+    #[test]
+    fn argument_parser_handles_multibyte_whitespace() {
+        let input = "/test\u{3000}alpha\u{3000}beta";
+
+        assert_eq!(command_args(input), "alpha\u{3000}beta");
+        assert_eq!(
+            argument_at_cursor(input, input.find("alpha").unwrap() + "alpha".len()),
+            Some((8, 13, "alpha".into(), 0))
+        );
+    }
+
+    #[test]
+    fn command_palette_argument_navigation_wraps_up_and_down() {
+        let mut palette = argument_palette(3);
+
+        palette.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), "/test ");
+        assert_eq!(palette.argument_selected, 2);
+        palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), "/test ");
+        assert_eq!(palette.argument_selected, 0);
+    }
+
+    #[test]
+    fn argument_completion_tab_clears_the_popup() {
+        let mut palette = argument_palette(3);
+
+        assert!(matches!(
+            palette.handle_key(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                "/test item-0"
+            ),
+            super::CommandAction::Complete { .. }
+        ));
+        assert!(palette.argument_items.is_empty());
+        assert!(!palette.is_active());
+    }
+
+    #[test]
+    fn argument_completion_viewport_respects_height_fraction() {
+        let mut palette = argument_palette(20);
+        let rows = rendered_rows(&mut palette, 30, 20, 7);
+        assert_eq!(rows[0].trim(), "item-0");
+        assert_eq!(rows[6].trim(), "item-6");
+        assert!(
+            palette
+                .view_in_test(20, 7, DEFAULT_AUTOCOMPLETE_HEIGHT)
+                .is_some()
+        );
+        let mut one = argument_palette(20);
+        assert!(one.view_in_test(20, 5, 0.01).is_some());
+        assert_eq!(one.argument_scroll_offset, 0);
+        assert!(
+            one.view_in_test(20, 0, DEFAULT_AUTOCOMPLETE_HEIGHT)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn argument_completion_scroll_follows_selection_and_resize() {
+        let mut palette = argument_palette(20);
+        let _ = rendered_rows(&mut palette, 30, 20, 7);
+        palette.argument_selected = 19;
+        let rows = rendered_rows(&mut palette, 30, 20, 7);
+        assert_eq!(rows[0].trim(), "item-13");
+        assert_eq!(rows[6].trim(), "item-19");
+
+        palette.argument_selected = 0;
+        let rows = rendered_rows(&mut palette, 30, 20, 7);
+        assert_eq!(rows[0].trim(), "item-0");
+        assert_eq!(rows[6].trim(), "item-6");
+
+        let rows = rendered_rows(&mut palette, 30, 8, 4);
+        assert_eq!(rows[0].trim(), "item-0");
+        assert_eq!(rows[3].trim(), "item-3");
+    }
+
+    impl CommandPalette {
+        fn view_in_test(&mut self, frame_height: u16, input_y: u16, fraction: f64) -> Option<Rect> {
+            let mut terminal = Terminal::new(TestBackend::new(20, frame_height)).unwrap();
+            let mut result = None;
+            terminal
+                .draw(|frame| {
+                    result = self.view(frame, Rect::new(0, input_y, 20, 1), fraction);
+                })
+                .unwrap();
+            result
+        }
     }
 }
