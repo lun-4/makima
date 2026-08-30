@@ -146,10 +146,14 @@ impl RunNotificationState {
 
     fn on_done(&mut self, event: &AgentEvent) {
         let notification = match event {
-            AgentEvent::Done { .. } => Notification::TurnComplete {
-                response: self.response_candidate.take(),
-            },
-            AgentEvent::Error { .. } => {
+            AgentEvent::TurnOutcome(maki_agent::TurnOutcome::Completed { .. })
+            | AgentEvent::TurnOutcome(maki_agent::TurnOutcome::Cancelled { .. }) => {
+                Notification::TurnComplete {
+                    response: self.response_candidate.take(),
+                }
+            }
+            AgentEvent::TurnOutcome(maki_agent::TurnOutcome::Failed { .. })
+            | AgentEvent::ControlError { .. } => {
                 self.response_candidate = None;
                 Notification::error_completion()
             }
@@ -1812,7 +1816,7 @@ fn ring_bell() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::DoneReason;
+    use maki_agent::{AgentId, DoneReason, TurnId, TurnOutcome};
     use maki_providers::TokenUsage;
     use test_case::test_case;
 
@@ -1833,11 +1837,13 @@ mod tests {
     }
 
     fn done_event() -> AgentEvent {
-        AgentEvent::Done {
+        AgentEvent::TurnOutcome(TurnOutcome::Completed {
+            agent_id: AgentId::generate(),
+            turn_id: TurnId::generate(),
             usage: TokenUsage::default(),
             num_turns: 1,
             reason: DoneReason::EndTurn,
-        }
+        })
     }
 
     fn due_completion() -> RunNotificationState {

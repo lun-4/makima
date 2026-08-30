@@ -20,8 +20,9 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
-    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, SessionMailbox, TurnCompleteEvent,
+    AgentConfig, AgentError, AgentEvent, AgentId, AgentInput, AgentMode, DoneReason, EventSender,
+    ExtractedCommand, InterruptSource, SessionMailbox, TurnCancellationReason, TurnCompleteEvent,
+    TurnFailure, TurnId, TurnOutcome,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -55,7 +56,7 @@ pub fn resolve_compaction_model(
     (Arc::clone(provider), model.clone())
 }
 
-enum TurnOutcome {
+enum TurnProgress {
     Continue,
     Done(DoneReason),
 }
@@ -81,6 +82,7 @@ fn filter_tools(all: &Value, allowed: &[String]) -> Value {
 
 #[derive(Clone)]
 pub struct AgentParams {
+    pub agent_id: AgentId,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
     pub config: AgentConfig,
@@ -110,6 +112,7 @@ pub struct AgentRunParams<'h> {
 }
 
 pub struct Agent<'h> {
+    agent_id: AgentId,
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
     history: &'h mut History,
@@ -152,6 +155,7 @@ pub struct Agent<'h> {
 impl<'h> Agent<'h> {
     pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
         Self {
+            agent_id: params.agent_id,
             provider: params.provider,
             model: Arc::new(params.model),
             config: params.config,
@@ -225,9 +229,16 @@ impl<'h> Agent<'h> {
         self
     }
 
-    /// Cancellation is an ending, not a failure: it comes back as
-    /// `Ok(DoneReason::Cancelled)` so callers only report real errors.
-    pub async fn run(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
+    /// Runs one accepted turn and returns its authoritative terminal outcome.
+    ///
+    /// Exactly one terminal event delivery is attempted. A closed event channel
+    /// does not change the returned outcome and is never retried.
+    pub async fn run(&mut self, turn_id: TurnId, input: AgentInput) -> TurnOutcome {
+        self.total_usage = TokenUsage::default();
+        self.num_turns = 0;
+        self.reauth_attempts = 0;
+        self.rollback_len = self.history.len();
+
         let AgentInput {
             message,
             mode,
@@ -238,7 +249,6 @@ impl<'h> Agent<'h> {
             workflow,
             prompt: _,
         } = input;
-        self.rollback_len = self.history.len();
         self.push_input_context(preamble);
         if !message.trim().is_empty() || !images.is_empty() {
             self.history
@@ -249,23 +259,42 @@ impl<'h> Agent<'h> {
         self.opts = RequestOptions { thinking, fast };
 
         info!(
+            agent_id = %self.agent_id,
+            %turn_id,
             model = %self.model.id,
             mode = ?self.mode,
             message_len = message.len(),
             "agent run started"
         );
 
-        let reason = match self.run_loop().await {
-            Ok(reason) => reason,
+        let outcome = match self.run_loop().await {
+            Ok(reason) => TurnOutcome::Completed {
+                agent_id: self.agent_id,
+                turn_id,
+                usage: self.total_usage,
+                num_turns: self.num_turns,
+                reason,
+            },
             Err(AgentError::Cancelled) => {
                 sanitize_cancelled_history(self.history, self.rollback_len);
-                DoneReason::Cancelled
+                TurnOutcome::Cancelled {
+                    agent_id: self.agent_id,
+                    turn_id,
+                    usage: self.total_usage,
+                    num_turns: self.num_turns,
+                    reason: TurnCancellationReason::User,
+                }
             }
-            Err(e) => return Err(e),
+            Err(error) => TurnOutcome::Failed {
+                agent_id: self.agent_id,
+                turn_id,
+                usage: self.total_usage,
+                num_turns: self.num_turns,
+                failure: TurnFailure::from_agent_error(&error),
+            },
         };
-        self.emit_done(reason)?;
-
-        Ok(reason)
+        self.emit_outcome(&outcome);
+        outcome
     }
 
     fn push_input_context(&mut self, preamble: Vec<Message>) {
@@ -287,8 +316,8 @@ impl<'h> Agent<'h> {
                 return Ok(DoneReason::MaxTurns);
             }
             match self.turn().await? {
-                TurnOutcome::Continue => {}
-                TurnOutcome::Done(reason) => return Ok(reason),
+                TurnProgress::Continue => {}
+                TurnProgress::Done(reason) => return Ok(reason),
             }
         }
     }
@@ -312,7 +341,7 @@ impl<'h> Agent<'h> {
         }
     }
 
-    async fn turn(&mut self) -> Result<TurnOutcome, AgentError> {
+    async fn turn(&mut self) -> Result<TurnProgress, AgentError> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
@@ -385,7 +414,7 @@ impl<'h> Agent<'h> {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
             } else if self.recover_stalled_turn()? {
-                return Ok(TurnOutcome::Continue);
+                return Ok(TurnProgress::Continue);
             }
 
             if stop_reason == Some(StopReason::MaxTokens)
@@ -395,22 +424,22 @@ impl<'h> Agent<'h> {
                     self.num_turns,
                     "response truncated (max_tokens), re-prompting"
                 );
-                return Ok(TurnOutcome::Continue);
+                return Ok(TurnProgress::Continue);
             }
         }
 
         if self.try_auto_compact().await? || self.handle_queued_command().await? {
-            return Ok(TurnOutcome::Continue);
+            return Ok(TurnProgress::Continue);
         }
 
         if has_tools {
-            Ok(TurnOutcome::Continue)
+            Ok(TurnProgress::Continue)
         } else {
-            Ok(TurnOutcome::Done(stop_reason.into()))
+            Ok(TurnProgress::Done(stop_reason.into()))
         }
     }
 
-    async fn wait_for_reauth(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+    async fn wait_for_reauth(&mut self, err: AgentError) -> Result<TurnProgress, AgentError> {
         if self.reauth_attempts >= MAX_REAUTH_ATTEMPTS {
             error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
             return Err(err);
@@ -431,7 +460,7 @@ impl<'h> Agent<'h> {
         {
             Ok(_) => {
                 self.provider.refresh_auth().await?;
-                Ok(TurnOutcome::Continue)
+                Ok(TurnProgress::Continue)
             }
             Err(_) => Err(AgentError::Cancelled),
         }
@@ -451,19 +480,33 @@ impl<'h> Agent<'h> {
             })))
     }
 
-    fn emit_done(&self, reason: DoneReason) -> Result<(), AgentError> {
+    fn emit_outcome(&self, outcome: &TurnOutcome) {
+        let retryable = match outcome {
+            TurnOutcome::Failed { failure, .. } => Some(failure.retryable),
+            TurnOutcome::Completed { .. } | TurnOutcome::Cancelled { .. } => None,
+        };
         info!(
-            self.num_turns,
-            total_input = self.total_usage.input,
-            total_output = self.total_usage.output,
-            %reason,
-            "agent run completed"
+            agent_id = %outcome.agent_id(),
+            turn_id = %outcome.turn_id(),
+            num_turns = outcome.num_turns(),
+            total_input = outcome.usage().input,
+            total_output = outcome.usage().output,
+            ?retryable,
+            outcome = match outcome {
+                TurnOutcome::Completed { .. } => "completed",
+                TurnOutcome::Failed { .. } => "failed",
+                TurnOutcome::Cancelled { .. } => "cancelled",
+            },
+            "agent run terminalized"
         );
-        self.event_tx.send(AgentEvent::Done {
-            usage: self.total_usage,
-            num_turns: self.num_turns,
-            reason,
-        })
+        if let Err(error) = self.event_tx.send(AgentEvent::TurnOutcome(outcome.clone())) {
+            error!(
+                agent_id = %outcome.agent_id(),
+                turn_id = %outcome.turn_id(),
+                %error,
+                "terminal outcome delivery failed"
+            );
+        }
     }
 
     /// The turn came back without text, so [`Message::empty_marker`] takes its
@@ -702,6 +745,35 @@ mod tests {
         }
     }
 
+    struct ScriptedProvider {
+        results: Mutex<VecDeque<Result<StreamResponse, AgentError>>>,
+    }
+
+    impl Provider for ScriptedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                self.results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("ScriptedProvider: no more results")
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
     /// Streams `delta` (if any), fires `cancel_after_delta` (if any),
     /// then fails with `fail_status` or hangs until cancelled.
     #[derive(Default)]
@@ -791,8 +863,18 @@ mod tests {
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
+        make_agent_with_sender(provider, history, raw_tx, event_rx)
+    }
+
+    fn make_agent_with_sender(
+        provider: impl Provider + 'static,
+        history: &mut History,
+        raw_tx: flume::Sender<Envelope>,
+        event_rx: flume::Receiver<Envelope>,
+    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let agent = Agent::new(
             AgentParams {
+                agent_id: AgentId::generate(),
                 provider: Arc::new(provider),
                 model: default_model(),
                 config: AgentConfig::default(),
@@ -857,7 +939,7 @@ mod tests {
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
 
-            agent.run(input).await.unwrap();
+            agent.run(TurnId::generate(), input).await;
             drop(agent);
 
             assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
@@ -909,7 +991,7 @@ mod tests {
             let mut input = default_input();
             input.message.clear();
 
-            agent.run(input).await.unwrap();
+            agent.run(TurnId::generate(), input).await;
             drop(agent);
 
             assert_eq!(history.as_slice().len(), 2);
@@ -928,22 +1010,140 @@ mod tests {
 
     async fn run_agent(provider: MockProvider, max_turns: Option<u32>) -> (u32, DoneReason) {
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(provider, &mut history);
+        let (mut agent, _event_rx) = make_agent(provider, &mut history);
         agent.config.max_turns = max_turns;
-        let _ = agent.run(default_input()).await;
-        drain_events(&event_rx)
-            .into_iter()
-            .find_map(|e| match e.event {
-                AgentEvent::Done {
-                    num_turns, reason, ..
-                } => Some((num_turns, reason)),
-                _ => None,
-            })
-            .expect("expected Done event")
+        let outcome = agent.run(TurnId::generate(), default_input()).await;
+        match outcome {
+            TurnOutcome::Completed {
+                num_turns, reason, ..
+            } => (num_turns, reason),
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
     }
 
     fn has_event(events: &[Envelope], predicate: impl Fn(&AgentEvent) -> bool) -> bool {
         events.iter().any(|e| predicate(&e.event))
+    }
+
+    fn terminal_outcomes(events: &[Envelope]) -> Vec<&TurnOutcome> {
+        events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                AgentEvent::TurnOutcome(outcome) => Some(outcome),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn run_emits_same_completed_outcome_once() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let turn_id = TurnId::generate();
+            let outcome = agent.run(turn_id, default_input()).await;
+            let events = drain_events(&event_rx);
+            let terminal = terminal_outcomes(&events);
+            assert_eq!(terminal, [&outcome]);
+            assert_eq!(outcome.turn_id(), turn_id);
+        });
+    }
+
+    #[test]
+    fn run_emits_same_failed_outcome_once() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let provider = StubStreamProvider {
+                fail_status: Some(400),
+                ..Default::default()
+            };
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            let events = drain_events(&event_rx);
+            assert_eq!(terminal_outcomes(&events), [&outcome]);
+        });
+    }
+
+    #[test]
+    fn reused_agent_fails_then_succeeds() {
+        smol::block_on(async {
+            let provider = ScriptedProvider {
+                results: Mutex::new(VecDeque::from([
+                    Err(AgentError::Api {
+                        status: 400,
+                        message: "bad request".into(),
+                    }),
+                    Ok(text_response(StopReason::EndTurn)),
+                ])),
+            };
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+
+            let failed = agent.run(TurnId::generate(), default_input()).await;
+            let completed = agent.run(TurnId::generate(), default_input()).await;
+
+            assert!(matches!(failed, TurnOutcome::Failed { num_turns: 0, .. }));
+            assert!(matches!(
+                completed,
+                TurnOutcome::Completed { num_turns: 1, .. }
+            ));
+            let events = drain_events(&event_rx);
+            assert_eq!(terminal_outcomes(&events), [&failed, &completed]);
+        });
+    }
+
+    #[test]
+    fn reused_agent_reports_per_turn_usage_and_turn_count() {
+        smol::block_on(async {
+            let mut first = text_response(StopReason::EndTurn);
+            first.usage.input = 11;
+            let mut second = text_response(StopReason::EndTurn);
+            second.usage.input = 22;
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) =
+                make_agent(MockProvider::new(vec![first, second]), &mut history);
+
+            let first = agent.run(TurnId::generate(), default_input()).await;
+            let second = agent.run(TurnId::generate(), default_input()).await;
+
+            assert_eq!(first.usage().input, 11);
+            assert_eq!(second.usage().input, 22);
+            assert_eq!(first.num_turns(), 1);
+            assert_eq!(second.num_turns(), 1);
+        });
+    }
+
+    #[test]
+    fn terminal_delivery_failure_does_not_change_outcome() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (raw_tx, event_rx) = flume::bounded(1);
+            let (mut agent, event_rx) = make_agent_with_sender(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+                raw_tx,
+                event_rx,
+            );
+
+            let turn_id = TurnId::generate();
+            let outcome = agent.run(turn_id, default_input()).await;
+
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            assert_eq!(outcome.turn_id(), turn_id);
+            assert_eq!(outcome.num_turns(), 1);
+            assert_eq!(
+                event_rx
+                    .drain()
+                    .filter(|envelope| matches!(envelope.event, AgentEvent::TurnOutcome(_)))
+                    .count(),
+                0,
+                "terminal delivery must not be retried after the full channel rejects it"
+            );
+        });
     }
 
     fn has_interrupt_in_history(history: &[Message]) -> bool {
@@ -999,7 +1199,7 @@ mod tests {
                 "srv.fetch_issue",
                 "Fetch a GitHub issue",
             )])));
-            agent.run(default_input()).await.unwrap();
+            agent.run(TurnId::generate(), default_input()).await;
 
             let captured = captured.lock().unwrap();
             assert_eq!(captured.len(), 2);
@@ -1079,7 +1279,7 @@ mod tests {
             if let Some(s) = source {
                 agent = agent.with_interrupt_source(s);
             }
-            let _ = agent.run(default_input()).await;
+            let _ = agent.run(TurnId::generate(), default_input()).await;
             let events = drain_events(&event_rx);
 
             assert_eq!(
@@ -1114,10 +1314,10 @@ mod tests {
             let (agent, _event_rx) = make_agent(MockProvider::new(responses), &mut history);
             let result = agent
                 .with_interrupt_source(source)
-                .run(default_input())
+                .run(TurnId::generate(), default_input())
                 .await;
 
-            assert!(result.is_ok());
+            assert!(matches!(result, TurnOutcome::Completed { .. }));
         });
     }
 
@@ -1181,19 +1381,20 @@ mod tests {
             let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
             let mut agent = agent.with_cancel(cancel);
 
-            assert_eq!(
-                agent.run(default_input()).await.unwrap(),
-                DoneReason::Cancelled
-            );
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
             drop(agent);
             assert_ends_with_cancel_marker(&history);
-            assert!(has_event(&drain_events(&event_rx), |e| matches!(
-                e,
-                AgentEvent::Done {
-                    reason: DoneReason::Cancelled,
+            let events = drain_events(&event_rx);
+            assert_eq!(terminal_outcomes(&events), [&outcome]);
+            assert!(matches!(
+                &outcome,
+                TurnOutcome::Cancelled {
+                    turn_id: actual_turn_id,
+                    reason: TurnCancellationReason::User,
                     ..
-                }
-            )));
+                } if *actual_turn_id == outcome.turn_id()
+            ));
         });
     }
 
@@ -1211,10 +1412,8 @@ mod tests {
             let (agent, _event_rx) = make_agent(provider, &mut history);
             let mut agent = agent.with_cancel(cancel);
 
-            assert_eq!(
-                agent.run(default_input()).await.unwrap(),
-                DoneReason::Cancelled
-            );
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
             drop(agent);
             assert_ends_with_cancel_marker(&history);
             let messages = history.as_slice();
@@ -1255,10 +1454,8 @@ mod tests {
                 }
             });
 
-            assert_eq!(
-                agent.run(default_input()).await.unwrap(),
-                DoneReason::Cancelled
-            );
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
             drop(agent);
             pump.await;
 
@@ -1289,7 +1486,7 @@ mod tests {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(default_input()).await;
+            let _ = agent.run(TurnId::generate(), default_input()).await;
             drop(agent);
             let events = drain_events(&event_rx);
 
@@ -1337,7 +1534,7 @@ mod tests {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(default_input()).await;
+            let _ = agent.run(TurnId::generate(), default_input()).await;
             drop(agent);
             let events = drain_events(&event_rx);
 
@@ -1350,10 +1547,10 @@ mod tests {
             let done = events
                 .iter()
                 .find_map(|e| match &e.event {
-                    AgentEvent::Done { num_turns, .. } => Some(*num_turns),
+                    AgentEvent::TurnOutcome(outcome) => Some(outcome.num_turns()),
                     _ => None,
                 })
-                .expect("expected Done event");
+                .expect("expected terminal outcome");
             assert_eq!(done, expected_turns);
 
             assert!(
@@ -1380,8 +1577,8 @@ mod tests {
                 .collect();
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(default_input()).await;
-            let _ = agent.run(default_input()).await;
+            let _ = agent.run(TurnId::generate(), default_input()).await;
+            let _ = agent.run(TurnId::generate(), default_input()).await;
             drop(agent);
             let events = drain_events(&event_rx);
 

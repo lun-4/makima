@@ -39,10 +39,11 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry, GrepLine,
-    GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine, SnapshotSpan,
-    SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    AgentEvent, AgentId, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry,
+    GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine,
+    SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolStartEvent, TurnCancellationReason, TurnCompleteEvent, TurnFailure, TurnFailureKind,
+    TurnId, TurnOutcome,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

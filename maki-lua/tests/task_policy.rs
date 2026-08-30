@@ -939,6 +939,9 @@ fn despawn_releases_capacity_from_an_active_turn() {
         let out =
             exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": first_id }));
         assert_eq!(out["ok"], json!(true));
+        let error =
+            common::exec_tool(&reg, &ctx, "task_get", json!({ "task_id": first_id })).unwrap_err();
+        assert!(error.contains("unknown task_id"), "got: {error}");
         assert_eq!(started_rx.recv_async().await.unwrap(), TASK_PROMPT);
 
         let out =

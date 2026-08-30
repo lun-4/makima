@@ -25,8 +25,9 @@ use crate::tools::{
     DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
 };
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, Envelope, EventSender,
-    McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput, ToolOutputLines,
+    Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, Envelope,
+    EventSender, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
+    ToolOutputLines, TurnFailure, TurnId, TurnOutcome,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -207,16 +208,16 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     Ok(p) => Arc::from(p),
                     Err(e) => {
                         error!(error = %e, "provider error");
-                        let _ = event_tx.send(AgentEvent::Error {
+                        let _ = event_tx.send(AgentEvent::ControlError {
                             message: e.user_message(),
                         });
                         return;
                     }
                 };
-            let error_tx = event_tx.clone();
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
+                    agent_id: AgentId::generate(),
                     provider,
                     model,
                     config: params.config,
@@ -249,15 +250,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             .with_loaded_instructions(instructions.loaded)
             .with_mcp(mcp);
 
-            let result = agent.run(params.input).await;
+            agent.run(TurnId::generate(), params.input).await;
             drop(agent);
-
-            if let Err(e) = result {
-                error!(error = %e, "agent error");
-                let _ = error_tx.send(AgentEvent::Error {
-                    message: e.user_message(),
-                });
-            }
 
             if let Some(handle) = mcp_shutdown {
                 handle.shutdown().await;
@@ -450,7 +444,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     Ok(p) => Arc::from(p),
                     Err(e) => {
                         error!(error = %e, "provider error");
-                        let _ = EventSender::new(raw_tx, 0).send(AgentEvent::Error {
+                        let _ = EventSender::new(raw_tx, 0).send(AgentEvent::ControlError {
                             message: e.user_message(),
                         });
                         return;
@@ -461,6 +455,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             let mut history = History::restored(params.initial_history);
             let mut working_dir = PathBuf::from(working_dir);
             let permissions = permissions;
+            let agent_id = AgentId::generate();
             let mut run_id: u64 = 0;
 
             enum Wake {
@@ -501,6 +496,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                     None => break,
                 };
+                let turn_id = TurnId::generate();
                 let (trigger, cancel) = CancelToken::new();
                 let cancel_task = smol::spawn({
                     let cancel_rx = cancel_rx.clone();
@@ -533,10 +529,24 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                             model = new_model;
                         }
                         Err(e) => {
-                            error!(error = %e, "provider error");
-                            let _ = error_tx.send(AgentEvent::Error {
-                                message: e.user_message(),
-                            });
+                            error!(error = %e, agent_id = %agent_id, %turn_id, "provider error");
+                            let outcome = TurnOutcome::Failed {
+                                agent_id,
+                                turn_id,
+                                usage: TokenUsage::default(),
+                                num_turns: 0,
+                                failure: TurnFailure::from_agent_error(&e),
+                            };
+                            if let Err(send_error) = error_tx.send(AgentEvent::TurnOutcome(outcome))
+                            {
+                                error!(
+                                    %send_error,
+                                    agent_id = %agent_id,
+                                    %turn_id,
+                                    "terminal outcome delivery failed"
+                                );
+                            }
+                            cancel_task.cancel().await;
                             run_id += 1;
                             continue;
                         }
@@ -572,6 +582,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
                 let mut agent = Agent::new(
                     AgentParams {
+                        agent_id,
                         provider: Arc::clone(&provider),
                         model: model.clone(),
                         config: params.config.clone(),
@@ -603,16 +614,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_local_tools(Arc::clone(&params.local_tools))
                 .with_mcp(mcp.clone());
 
-                let result = agent.run(input).await;
+                agent.run(turn_id, input).await;
                 drop(agent);
                 cancel_task.cancel().await;
-
-                if let Err(ref e) = result {
-                    error!(error = %e, "agent error");
-                    let _ = error_tx.send(AgentEvent::Error {
-                        message: e.user_message(),
-                    });
-                }
 
                 if let Some(store) = &mut store {
                     store.record_turn(history.as_slice(), model.spec());

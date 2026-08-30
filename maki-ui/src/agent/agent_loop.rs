@@ -11,9 +11,9 @@ use maki_agent::tools::{
     DescriptionContext, FileReadTracker, QuestionMode, ToolAudience, ToolFilter, ToolRegistry,
 };
 use maki_agent::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History, Instructions,
-    McpCommand, PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
+    Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
+    CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
+    PromptRole, SessionMailbox, SharedMessages, ToolOutputLines, TurnFailure, TurnId, TurnOutcome,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -28,6 +28,7 @@ use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
 
 pub(super) struct AgentLoop {
+    agent_id: AgentId,
     model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
@@ -82,6 +83,7 @@ impl AgentLoop {
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
         Self {
+            agent_id: AgentId::generate(),
             model_slot,
             config,
             tool_output_lines,
@@ -171,7 +173,14 @@ impl AgentLoop {
                 if !displayed {
                     let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
                 }
-                self.do_agent_run(input, event_tx, run_id).await
+                let turn_id = TurnId::generate();
+                if let Err(error) = self
+                    .do_agent_run(input, event_tx.clone(), run_id, turn_id)
+                    .await
+                {
+                    self.emit_turn_failure(&event_tx, turn_id, error);
+                }
+                return;
             }
             QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
         };
@@ -225,6 +234,7 @@ impl AgentLoop {
         mut input: AgentInput,
         event_tx: EventSender,
         run_id: u64,
+        turn_id: TurnId,
     ) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
 
@@ -274,6 +284,7 @@ impl AgentLoop {
 
         let mut agent = Agent::new(
             AgentParams {
+                agent_id: self.agent_id,
                 provider: Arc::clone(&slot.provider),
                 model: slot.model.clone(),
                 config: self.config.clone(),
@@ -305,16 +316,16 @@ impl AgentLoop {
         .with_cancel(cancel)
         .with_mcp(self.mcp.clone());
 
-        let result = agent.run(input).await;
+        let outcome = agent.run(turn_id, input).await;
         drop(agent);
 
         self.clear_cancel_trigger(run_id);
 
-        if matches!(result, Ok(DoneReason::Cancelled)) {
+        if matches!(outcome, TurnOutcome::Cancelled { .. }) {
             self.min_run_id = run_id + 1;
         }
 
-        result.map(|_| ())
+        Ok(())
     }
 
     /// Base tools only. MCP definitions are injected per request by
@@ -358,10 +369,29 @@ impl AgentLoop {
         self.cancel_map.remove(&run_id);
     }
 
+    fn emit_turn_failure(&self, event_tx: &EventSender, turn_id: TurnId, error: AgentError) {
+        error!(error = %error, agent_id = %self.agent_id, %turn_id, "accepted turn setup failed");
+        let outcome = TurnOutcome::Failed {
+            agent_id: self.agent_id,
+            turn_id,
+            usage: Default::default(),
+            num_turns: 0,
+            failure: TurnFailure::from_agent_error(&error),
+        };
+        if let Err(send_error) = event_tx.send(AgentEvent::TurnOutcome(outcome)) {
+            error!(
+                %send_error,
+                agent_id = %self.agent_id,
+                %turn_id,
+                "terminal outcome delivery failed"
+            );
+        }
+    }
+
     fn emit_error(&self, run_id: u64, error: AgentError) {
         error!(error = %error, "agent error");
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-        let _ = event_tx.send(AgentEvent::Error {
+        let _ = event_tx.send(AgentEvent::ControlError {
             message: error.user_message(),
         });
     }

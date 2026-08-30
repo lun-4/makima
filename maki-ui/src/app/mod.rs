@@ -16,7 +16,7 @@ pub(crate) mod shell;
 pub(crate) mod tests;
 pub(crate) mod view;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -415,6 +415,9 @@ pub struct App {
     /// for async sessions, the driver `input_tx` (tab submits routed to the
     /// subagent). Keyed by `parent_tool_use_id`.
     subagent_channels: HashMap<String, SubagentChannels>,
+    /// Stamped child outcomes outrank the later history snapshot, which is
+    /// emitted independently and can otherwise make a failed child look done.
+    stamped_subagent_outcomes: HashSet<String>,
 }
 
 impl App {
@@ -518,6 +521,7 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_channels: HashMap::new(),
+            stamped_subagent_outcomes: HashSet::new(),
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -1641,6 +1645,37 @@ impl App {
             return vec![];
         }
 
+        if let (Some(subagent), AgentEvent::TurnOutcome(outcome)) =
+            (&envelope.subagent, &envelope.event)
+        {
+            let tool_use_id = subagent.parent_tool_use_id.clone();
+            if !self.stamped_subagent_outcomes.insert(tool_use_id.clone()) {
+                return vec![];
+            }
+            let chat_idx = self.resolve_or_create_chat(subagent);
+            match outcome {
+                maki_agent::TurnOutcome::Completed { .. } => {
+                    self.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+                }
+                maki_agent::TurnOutcome::Cancelled { .. } => {
+                    self.chats[chat_idx].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
+                }
+                maki_agent::TurnOutcome::Failed { failure, .. } => {
+                    self.chats[chat_idx].mark_failed(&failure.user_message);
+                    let text = format!(
+                        "{SUBAGENT_REPLY_HEADER}{tool_use_id}{SUBAGENT_REPLY_SUFFIX}failed: {}",
+                        truncate_snippet(&failure.user_message)
+                    );
+                    self.queue_and_notify(QueuedMessage {
+                        text,
+                        images: Vec::new(),
+                    });
+                }
+            }
+            self.sync_task_picker();
+            return vec![];
+        }
+
         if let AgentEvent::SubagentHistory {
             tool_use_id,
             messages,
@@ -1648,7 +1683,10 @@ impl App {
         {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+            if !self.stamped_subagent_outcomes.contains(&tool_use_id)
+                && let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str())
+                && !self.chats[sub_idx].is_finished()
+            {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
             // An async subagent's reply is delivered to the main agent so it
@@ -1847,7 +1885,7 @@ impl App {
                 ChatEventResult::AuthRequired
                 | ChatEventResult::PermissionRequest { .. }
                 | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
-                ChatEventResult::Continue => {}
+                ChatEventResult::Continue | ChatEventResult::ControlComplete => {}
             }
         }
         actions

@@ -9,7 +9,7 @@ use tracing::info;
 use super::history::{History, remove_orphaned_tool_results};
 use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
-use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
+use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
@@ -135,11 +135,7 @@ pub async fn compact(
         history.push(Message::synthetic(post.to_string()));
     }
 
-    event_tx.send(AgentEvent::Done {
-        usage,
-        num_turns: 1,
-        reason: DoneReason::EndTurn,
-    })?;
+    event_tx.send(AgentEvent::ControlComplete { usage })?;
 
     Ok(())
 }
