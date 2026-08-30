@@ -41,11 +41,12 @@ impl MessageQueue {
     }
 
     pub(crate) fn remove(&mut self, index: usize) {
-        if let Some(ref shared) = self.shared
-            && shared.remove(index).is_some()
-        {
-            self.clamp_focus();
+        // Removal success (or absence) only affects whether focus clamps;
+        // the panel must never point past the (possibly unchanged) list.
+        if let Some(ref shared) = self.shared {
+            shared.remove(index);
         }
+        self.clamp_focus();
     }
 
     pub(crate) fn clear(&mut self) {

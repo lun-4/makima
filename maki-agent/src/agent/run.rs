@@ -15,7 +15,7 @@ use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::streaming::{StreamError, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
-use crate::cancel::{CancelMap, CancelToken};
+use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
@@ -123,6 +123,7 @@ pub struct Agent<'h> {
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
+    cancel_reason_source: Option<ReasonedCancelToken>,
     total_usage: TokenUsage,
     context_size: u32,
     num_turns: u32,
@@ -170,6 +171,7 @@ impl<'h> Agent<'h> {
             user_response_rx: None,
             interrupt_source: None,
             cancel: CancelToken::none(),
+            cancel_reason_source: None,
             total_usage: TokenUsage::default(),
             context_size: 0,
             num_turns: 0,
@@ -216,6 +218,14 @@ impl<'h> Agent<'h> {
 
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    /// Installs a reason source for this turn's cancellation. The first reason
+    /// that fires (User from a plain trigger drop, or Closed/Shutdown from the
+    /// actor) wins; `run` reads it once when building the terminal outcome.
+    pub fn with_cancel_reason_source(mut self, source: ReasonedCancelToken) -> Self {
+        self.cancel_reason_source = Some(source);
         self
     }
 
@@ -277,12 +287,18 @@ impl<'h> Agent<'h> {
             },
             Err(AgentError::Cancelled) => {
                 sanitize_cancelled_history(self.history, self.rollback_len);
+                let reason = match &self.cancel_reason_source {
+                    Some(source) => source
+                        .reason()
+                        .unwrap_or(TurnCancellationReason::Interrupted),
+                    None => TurnCancellationReason::User,
+                };
                 TurnOutcome::Cancelled {
                     agent_id: self.agent_id,
                     turn_id,
                     usage: self.total_usage,
                     num_turns: self.num_turns,
-                    reason: TurnCancellationReason::User,
+                    reason,
                 }
             }
             Err(error) => TurnOutcome::Failed {

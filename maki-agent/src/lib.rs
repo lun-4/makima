@@ -1,5 +1,6 @@
 //! Async agent loop with tools.
 
+pub mod actor;
 pub mod agent;
 pub mod cancel;
 pub mod child_guard;
@@ -15,12 +16,19 @@ pub use mcp::{
 };
 pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 pub(crate) mod task_set;
+pub use actor::{
+    ActorBackend, ActorError, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
+    AgentActorHandle, BackendResult, ControlWork, InterruptQueue, QueueProjection, RootWork,
+    TurnAdmission, TurnContext, TurnTicket, WorkKind,
+};
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
     SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
     is_instruction_file,
 };
-pub use cancel::{CancelMap, CancelToken, CancelTrigger};
+pub use cancel::{
+    CancelMap, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
+};
 pub use mailbox::{MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub mod command;

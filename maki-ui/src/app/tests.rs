@@ -385,7 +385,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
         Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
         command_runtime,
     );
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
@@ -393,7 +393,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
 pub(crate) fn test_app() -> App {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
@@ -6208,7 +6208,7 @@ fn completion_app() -> (TempDir, App, Arc<maki_lua::TestCompletionBackend>) {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, backend) = maki_lua::test_support::event_handle_with_completion();
     let mut app = build_app_with_handle(dir.clone(), Arc::new(test_writer(dir)), handle);
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     std::sync::Arc::get_mut(&mut app.state.session)
         .unwrap()
