@@ -8,15 +8,23 @@
 //!    only on explicit close).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use maki_agent::AgentEvent;
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
-use maki_providers::Role;
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
+};
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 mod common;
-use common::{ctx_with_canned_provider, exec_tool, production_like_ctx};
+use common::{ctx_with_canned_provider, ctx_with_provider, exec_tool, production_like_ctx};
+
+const PROVIDER_FAILURE: &str = "deterministic provider failure";
+const RECOVERED_REPLY: &str = "recovered on the same session";
 
 const PROBE_SRC: &str = r#"
 session_holder = { sess = nil }
@@ -59,6 +67,17 @@ maki.api.register_tool({
     return maki.json.encode({ ok = true })
   end,
 })
+
+maki.api.register_tool({
+  name = "probe_prompt",
+  description = "run one blocking turn on the subagent session",
+  schema = { type = "object", properties = { message = { type = "string" } }, additionalProperties = false },
+  audiences = { "main" },
+  handler = function(input)
+    local result, err = session_holder.sess:prompt(input.message)
+    return maki.json.encode({ result = result, error = err })
+  end,
+})
 "#;
 
 fn load_probe_host() -> (Arc<ToolRegistry>, PluginHost) {
@@ -66,6 +85,37 @@ fn load_probe_host() -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("probe", PROBE_SRC).unwrap();
     (reg, host)
+}
+
+struct FailOnceProvider {
+    calls: AtomicUsize,
+}
+
+impl Provider for FailOnceProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _model: &'a Model,
+        _messages: &'a [Message],
+        _system: &'a str,
+        _tools: &'a Value,
+        _event_tx: &'a flume::Sender<ProviderEvent>,
+        _opts: RequestOptions,
+        _session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(AgentError::Config {
+                    message: PROVIDER_FAILURE.into(),
+                })
+            } else {
+                Ok(common::canned_reply(RECOVERED_REPLY))
+            }
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { unimplemented!() })
+    }
 }
 
 /// A subagent spawned during a run must survive that run ending normally.
@@ -98,6 +148,36 @@ fn subagent_outlives_the_run_that_spawned_it() {
         status["status"], "closed",
         "a spawned subagent must not be closed by its parent run ending normally: {status}"
     );
+}
+
+#[test]
+fn failed_subagent_turn_resolves_and_same_session_recovers() {
+    let (reg, _host) = load_probe_host();
+    let provider = Arc::new(FailOnceProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let (ctx, _parent_rx, _run_trigger) = ctx_with_provider(provider);
+
+    exec_tool(&reg, &ctx, "probe_spawn", json!({})).expect("spawn failed");
+
+    let failed = exec_tool(
+        &reg,
+        &ctx,
+        "probe_prompt",
+        json!({ "message": "fail this turn" }),
+    )
+    .expect("failed turn did not resolve");
+    assert_eq!(failed["error"], json!(PROVIDER_FAILURE));
+
+    let recovered = exec_tool(
+        &reg,
+        &ctx,
+        "probe_prompt",
+        json!({ "message": "reuse the same session" }),
+    )
+    .expect("later turn did not resolve");
+    assert!(recovered["error"].is_null(), "got: {recovered}");
+    assert_eq!(recovered["result"]["text"], json!(RECOVERED_REPLY));
 }
 
 /// After a subagent finishes a run, its transcript must be surfaced to the
