@@ -284,6 +284,7 @@ pub fn truncate_lines(s: &str, max: usize) -> Truncated<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{InMemoryThemesProvider, ThemesProvider};
     use maki_markdown::render::CODE_BAR;
     use test_case::test_case;
 
@@ -321,6 +322,7 @@ mod tests {
 
     #[test]
     fn heading_uses_theme_heading_style() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("# hello", "", style, style, TEST_WIDTH);
         assert_eq!(lines.len(), 1);
@@ -330,6 +332,7 @@ mod tests {
 
     #[test]
     fn code_block_emits_code_bar_with_theme_color() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("```\nhello\n```", "", style, style, TEST_WIDTH);
         let bar = lines
@@ -342,6 +345,7 @@ mod tests {
 
     #[test]
     fn bold_uses_theme_bold_fg_and_modifier() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("**bold**", "", style, style, TEST_WIDTH);
         let bold = find_span(&lines, "bold");
@@ -351,6 +355,7 @@ mod tests {
 
     #[test]
     fn heading_emphasis_preserves_heading_color() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("## ***hi***", "", style, style, TEST_WIDTH);
         let hi = find_span(&lines, "hi");
@@ -364,6 +369,7 @@ mod tests {
 
     #[test]
     fn heading_inline_code_recolors_to_code_fg() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("## foo `bar`", "", style, style, TEST_WIDTH);
         let bar = find_span(&lines, "bar");
@@ -372,6 +378,7 @@ mod tests {
 
     #[test]
     fn list_marker_uses_list_marker_style() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("- item", "", style, style, TEST_WIDTH);
         let marker = lines[0]
@@ -463,6 +470,7 @@ mod tests {
 
     #[test]
     fn strikethrough_uses_theme_strikethrough_style() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("~~struck~~", "", style, style, TEST_WIDTH);
         let struck = find_span(&lines, "struck");
@@ -471,15 +479,37 @@ mod tests {
     }
 
     #[test]
-    fn italic_uses_italic_modifier() {
+    fn italic_uses_theme_colour_and_italic_modifier() {
+        let _guard = theme::theme_test_guard();
+        InMemoryThemesProvider::bundled()
+            .install("dracula")
+            .unwrap();
+        let expected = theme::current().italic;
         let style = Style::default();
         let lines = text_to_lines("*italic*", "", style, style, TEST_WIDTH);
-        let it = find_span(&lines, "italic");
-        assert!(it.style.add_modifier.contains(Modifier::ITALIC));
+        let italic = find_span(&lines, "italic");
+
+        assert_eq!(italic.style.fg, expected.fg);
+        assert!(italic.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn bold_italic_preserves_theme_bold_style_and_adds_italic() {
+        let _guard = theme::theme_test_guard();
+        InMemoryThemesProvider::bundled()
+            .install("dracula")
+            .unwrap();
+        let expected = theme::current().bold.add_modifier(Modifier::ITALIC);
+        let style = Style::default();
+        let lines = text_to_lines("***bold italic***", "", style, style, TEST_WIDTH);
+        let bold_italic = find_span(&lines, "bold italic");
+
+        assert_eq!(bold_italic.style, expected);
     }
 
     #[test]
     fn table_border_uses_theme_table_border_style() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let input = "| a | b |\n| --- | --- |\n| 1 | 2 |";
         let lines = text_to_lines(input, "", style, style, TEST_WIDTH);
@@ -496,6 +526,7 @@ mod tests {
 
     #[test]
     fn horizontal_rule_uses_theme_style_and_fill_char() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("---", "", style, style, TEST_WIDTH);
         assert_eq!(lines.len(), 1);
@@ -545,6 +576,7 @@ mod tests {
 
     #[test]
     fn inline_code_inside_bold_gets_overlay() {
+        let _guard = theme::theme_test_guard();
         let style = Style::default();
         let lines = text_to_lines("**a `code` b**", "", style, style, TEST_WIDTH);
         let code = find_span(&lines, "code");

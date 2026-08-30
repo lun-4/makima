@@ -812,6 +812,12 @@ impl Theme {
             &["markup.bold", "variable.parameter"],
             Modifier::BOLD,
         );
+        let italic_style = derived_style("italic", &["markup.italic"], Modifier::empty())
+            .add_modifier(Modifier::ITALIC);
+        let bold_italic_style = ui
+            .get("bold_italic")
+            .map(|def| resolve_style(def, &palette).add_modifier(Modifier::BOLD | Modifier::ITALIC))
+            .unwrap_or_else(|| bold_style.add_modifier(Modifier::ITALIC));
 
         Ok(Self {
             background: color("background"),
@@ -837,14 +843,8 @@ impl Theme {
             error: style("error"),
             status_dim: style("status_dim"),
             bold: bold_style,
-            italic: ui
-                .get("italic")
-                .map(|d| resolve_style(d, &palette))
-                .unwrap_or_else(|| Style::default().add_modifier(Modifier::ITALIC)),
-            bold_italic: ui
-                .get("bold_italic")
-                .map(|d| resolve_style(d, &palette))
-                .unwrap_or_else(|| bold_style.add_modifier(Modifier::ITALIC)),
+            italic: italic_style,
+            bold_italic: bold_italic_style,
             inline_code: derived_style(
                 "inline_code",
                 &["function.call", "function"],
@@ -1091,6 +1091,124 @@ mod tests {
         assert_eq!(t.code_gutter.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
         assert_eq!(t.list_marker.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
         assert_eq!(t.bold.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
+        assert_eq!(t.italic.fg, Some(Color::Rgb(0xf1, 0xfa, 0x8c)));
+        assert!(t.italic.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(t.bold_italic.fg, t.bold.fg);
+        assert_eq!(
+            t.bold_italic.add_modifier,
+            t.bold.add_modifier | Modifier::ITALIC
+        );
+    }
+
+    #[test]
+    fn italic_derives_markup_italic_colour_and_modifier() {
+        let theme = Theme::from_toml(
+            r##"
+"markup.italic" = { fg = "yellow" }
+
+[palette]
+yellow = "#f1fa8c"
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.italic.fg, Some(Color::Rgb(0xf1, 0xfa, 0x8c)));
+        assert_eq!(theme.italic.add_modifier, Modifier::ITALIC);
+    }
+
+    #[test]
+    fn ui_italic_colour_overrides_derivation_and_preserves_modifier() {
+        let theme = Theme::from_toml(
+            r##"
+"markup.italic" = { fg = "yellow" }
+
+[palette]
+yellow = "#f1fa8c"
+pink = "#ff79c6"
+
+[ui]
+italic = { fg = "pink" }
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.italic.fg, Some(Color::Rgb(0xff, 0x79, 0xc6)));
+        assert_eq!(theme.italic.add_modifier, Modifier::ITALIC);
+    }
+
+    #[test]
+    fn bold_italic_preserves_bold_style_and_adds_italic() {
+        let derived = Theme::from_toml(
+            r##"
+"markup.bold" = { fg = "orange", bg = "background", modifiers = ["bold", "underlined"] }
+
+[palette]
+orange = "#ffb86c"
+background = "#282a36"
+"##,
+        )
+        .unwrap();
+        assert_eq!(
+            derived.bold_italic,
+            derived.bold.add_modifier(Modifier::ITALIC)
+        );
+
+        let overridden = Theme::from_toml(
+            r##"
+[palette]
+orange = "#ffb86c"
+background = "#282a36"
+
+[ui]
+bold = { fg = "orange", bg = "background" }
+"##,
+        )
+        .unwrap();
+        assert_eq!(
+            overridden.bold_italic,
+            overridden.bold.add_modifier(Modifier::ITALIC)
+        );
+        assert_eq!(overridden.bold.add_modifier, Modifier::empty());
+        assert_eq!(overridden.bold_italic.add_modifier, Modifier::ITALIC);
+    }
+
+    #[test]
+    fn ui_bold_italic_colour_overrides_fallback_and_preserves_both_modifiers() {
+        let theme = Theme::from_toml(
+            r##"
+[palette]
+orange = "#ffb86c"
+pink = "#ff79c6"
+
+[ui]
+bold = { fg = "orange" }
+bold_italic = { fg = "pink" }
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.bold_italic.fg, Some(Color::Rgb(0xff, 0x79, 0xc6)));
+        assert_eq!(
+            theme.bold_italic.add_modifier,
+            Modifier::BOLD | Modifier::ITALIC
+        );
+    }
+
+    #[test]
+    fn missing_italic_colour_preserves_modifier_only_italic_and_bold_style_fallback() {
+        let theme = Theme::from_toml(
+            r##"
+"markup.bold" = { fg = "orange", modifiers = ["bold"] }
+
+[palette]
+orange = "#ffb86c"
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.italic.fg, None);
+        assert_eq!(theme.italic.add_modifier, Modifier::ITALIC);
+        assert_eq!(theme.bold_italic, theme.bold.add_modifier(Modifier::ITALIC));
     }
 
     #[test]
