@@ -5447,14 +5447,16 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
 }
 
 #[test]
-fn double_esc_cancels_subagent_but_retains_input_channel() {
+fn main_turn_completion_keeps_async_subagent_cancellable_and_reusable() {
     const FOLLOW_UP: &str = "follow up";
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
     let (input_tx, input_rx) = flume::unbounded();
+    let (cancel_tx, cancel_rx) = flume::unbounded();
     let mut info = subagent_info(TASK_ID, "worker");
     info.input_tx = Some(input_tx);
+    info.cancel_tx = Some(cancel_tx);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
             text: "working".into(),
@@ -5462,12 +5464,15 @@ fn double_esc_cancels_subagent_but_retains_input_channel() {
         subagent: Some(info),
         run_id: 1,
     })));
+
+    app.update(done_event());
     app.active_chat = 1;
+    assert!(!app.chats[1].is_finished());
 
     app.update(Msg::Key(key(KeyCode::Esc)));
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
-    assert!(!app.chats[1].is_finished());
+    cancel_rx.try_recv().unwrap();
 
     type_and_submit(&mut app, FOLLOW_UP);
     assert_eq!(input_rx.try_recv().unwrap(), FOLLOW_UP);

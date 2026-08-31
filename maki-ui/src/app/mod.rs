@@ -1889,8 +1889,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.subagent_channels.clear();
+                    self.retain_live_async_subagents();
                     self.status = Status::Idle;
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
@@ -1903,11 +1902,10 @@ impl App {
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
-                    self.subagent_channels.clear();
                     self.terminalize_turn(&message);
+                    self.retain_live_async_subagents();
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.chat_index.clear();
                     self.fire_session_autocmd(
                         "TurnError",
                         serde_json::json!({ "message": message }),
@@ -2692,14 +2690,44 @@ impl App {
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
-    /// shell commands that outlive the agent.
+    /// shell commands and reusable async subagents that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
-        self.retain_resolved_subagents(DisplayRole::Error, ERROR_TEXT);
+        let reusable: HashSet<usize> = self
+            .chat_index
+            .iter()
+            .filter(|(id, _)| {
+                self.subagent_channels
+                    .get(id.as_str())
+                    .is_some_and(|channels| channels.input_tx.is_some())
+            })
+            .map(|(_, &index)| index)
+            .collect();
+        self.chat_index.retain(|_, &mut sub_idx| {
+            if reusable.contains(&sub_idx) || self.chats[sub_idx].is_finished() {
+                true
+            } else {
+                self.chats[sub_idx].mark_finished(DisplayRole::Error, ERROR_TEXT);
+                false
+            }
+        });
+        self.sync_subagents();
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
-        for chat in self.chats.iter_mut().skip(1) {
-            chat.fail_in_progress_with_message(message.into());
+        for (index, chat) in self.chats.iter_mut().enumerate().skip(1) {
+            if !reusable.contains(&index) {
+                chat.fail_in_progress_with_message(message.into());
+            }
         }
         self.sync_task_picker();
+    }
+
+    fn retain_live_async_subagents(&mut self) {
+        self.chat_index.retain(|id, _| {
+            self.subagent_channels
+                .get(id.as_str())
+                .is_some_and(|channels| channels.input_tx.is_some())
+        });
+        self.subagent_channels
+            .retain(|id, _| self.chat_index.contains_key(id));
     }
 
     /// Marks unfinished subagent chats as ended and drops them from

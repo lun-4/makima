@@ -147,7 +147,7 @@ impl Provider for GatedProvider {
 
 struct CancelThenRecoverProvider {
     calls: AtomicUsize,
-    entered: flume::Sender<()>,
+    entered: flume::Sender<usize>,
 }
 
 impl Provider for CancelThenRecoverProvider {
@@ -162,14 +162,15 @@ impl Provider for CancelThenRecoverProvider {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.send(call).unwrap();
+            if call == 0 {
                 event_tx
                     .send_async(ProviderEvent::ThinkingDelta {
                         text: String::new(),
                     })
                     .await
                     .unwrap();
-                self.entered.send(()).unwrap();
                 std::future::pending().await
             } else {
                 Ok(common::canned_reply(RECOVERED_REPLY))
@@ -297,7 +298,7 @@ fn child_cancellation_keeps_session_open_for_recovery() {
             json!({"message": "cancel me"}),
         )
     });
-    entered_rx.recv_timeout(TURN_TIMEOUT).unwrap();
+    assert_eq!(entered_rx.recv_timeout(TURN_TIMEOUT).unwrap(), 0);
     let cancel_tx = loop {
         let envelope = parent_rx.recv_timeout(TURN_TIMEOUT).unwrap();
         if let Some(cancel_tx) = envelope.subagent.and_then(|info| info.cancel_tx) {
@@ -311,8 +312,24 @@ fn child_cancellation_keeps_session_open_for_recovery() {
             .as_str()
             .is_some_and(|error| error.contains("cancel"))
     );
-    let recovered = exec_tool(&reg, &ctx, "probe_prompt", json!({"message": "recover"})).unwrap();
-    assert_eq!(recovered["result"]["text"], RECOVERED_REPLY);
+
+    exec_tool(&reg, &ctx, "probe_send", json!({"message": "recover"})).unwrap();
+    assert_eq!(entered_rx.recv_timeout(TURN_TIMEOUT).unwrap(), 1);
+    loop {
+        let envelope = parent_rx.recv_timeout(TURN_TIMEOUT).unwrap();
+        let AgentEvent::SubagentHistory { messages, .. } = envelope.event else {
+            continue;
+        };
+        let recovered = messages.iter().rev().any(|message| {
+            matches!(message.role, Role::Assistant)
+                && message.content.iter().any(|block| {
+                    matches!(block, maki_providers::ContentBlock::Text { text } if text == RECOVERED_REPLY)
+                })
+        });
+        if recovered {
+            break;
+        }
+    }
 }
 
 /// A subagent spawned during a run must survive that run ending normally.
