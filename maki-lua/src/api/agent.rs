@@ -164,10 +164,18 @@ impl LuaActorState {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         }
-        let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
+        let event = AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
             messages,
-        });
+        };
+        let _ = match self.subagent_info.get() {
+            Some(subagent) => self.parent_event_tx.send_envelope(Envelope {
+                event,
+                subagent: Some(subagent.clone()),
+                run_id: self.parent_event_tx.run_id(),
+            }),
+            None => self.parent_event_tx.send(event),
+        };
     }
 
     /// Idempotent close: retire the actor, resolving queued/parked waiters as

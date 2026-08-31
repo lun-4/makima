@@ -83,6 +83,8 @@ use crate::storage_writer::StorageWriter;
 use crate::theme::ThemesProvider;
 use ratatui::layout::Position;
 
+const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
+
 pub(crate) use crate::agent::QueuedMessage;
 
 fn command_thinking(config: ThinkingConfig) -> maki_commands::ThinkingConfig {
@@ -539,6 +541,19 @@ impl App {
 
     fn is_main_chat(&self) -> bool {
         self.active_chat == 0
+    }
+
+    fn status_for_chat(&self, chat_idx: usize) -> &Status {
+        if chat_idx > 0
+            && self
+                .chats
+                .get(chat_idx)
+                .is_some_and(|chat| !chat.is_finished())
+        {
+            &SUBAGENT_STREAMING_STATUS
+        } else {
+            &self.status
+        }
     }
 
     fn plan_form_active(&self) -> bool {
@@ -2676,7 +2691,7 @@ impl App {
         Cadence::any([
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
             StatusBar::cadence(
-                &self.status,
+                self.status_for_chat(self.active_chat),
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),
             ),

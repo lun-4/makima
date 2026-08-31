@@ -320,6 +320,10 @@ fn child_cancellation_keeps_session_open_for_recovery() {
         let AgentEvent::SubagentHistory { messages, .. } = envelope.event else {
             continue;
         };
+        assert!(
+            envelope.subagent.is_some(),
+            "recovered history must remain stamped as child activity"
+        );
         let recovered = messages.iter().rev().any(|message| {
             matches!(message.role, Role::Assistant)
                 && message.content.iter().any(|block| {

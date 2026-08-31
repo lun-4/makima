@@ -2161,6 +2161,27 @@ fn rendered_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
 }
 
 #[test]
+fn focused_running_subagent_draws_status_bar_spinner_while_main_is_idle() {
+    const SPINNER_GLYPHS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+    let mut app = app_with_subagent();
+    app.status = Status::Idle;
+    app.active_chat = 1;
+    assert!(!app.chats[1].is_finished());
+    assert!(
+        app.cadence().moves(),
+        "the footer spinner must keep repainting"
+    );
+
+    let rows = rendered_rows(&mut app, 80, 24);
+    let status = rows.last().expect("status row");
+    assert!(
+        status.chars().any(|ch| SPINNER_GLYPHS.contains(ch)),
+        "focused running subagent must animate the status bar: {status}"
+    );
+}
+
+#[test]
 fn top_bar_is_always_one_row() {
     let area = Rect::new(0, 0, 80, 24);
     // Persistent even with no subagents.
@@ -5438,6 +5459,27 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
     })));
     assert!(!app.chats[1].is_finished());
     assert!(app.task_entries()[1].is_spinning());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "recovered reply".into(),
+                }],
+                ..Default::default()
+            }],
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert_eq!(
+        app.queue.text_messages(),
+        [format!(
+            "{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}recovered reply"
+        )],
+        "old-run recovered history must queue a main-agent turn"
+    );
     app.update(envelope(TurnOutcome::Failed {
         agent_id: AgentId::generate(),
         turn_id: TurnId::generate(),
