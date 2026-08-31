@@ -191,7 +191,7 @@ local function diff_restore(blocks_from)
   end
 end
 
-local function apply_edit(path, ctx, transform)
+local function apply_edit(path, ctx, known_insertions, transform)
   path = maki.fs.abspath(path)
 
   local ok, err = ctx:check_before_edit(path)
@@ -209,12 +209,20 @@ local function apply_edit(path, ctx, transform)
     return nil, transform_err
   end
 
+  local valid, validation_err = ctx:validate_mutation(path, before, after)
+  if not valid then
+    return nil, validation_err
+  end
+
   local _, write_err = maki.fs.atomic_write(path, after)
   if write_err then
     return nil, "write error: " .. tostring(write_err)
   end
 
-  ctx:record_read(path)
+  local committed, commit_err = ctx:commit_mutation(path, before, after, known_insertions)
+  if not committed then
+    return nil, "provenance commit error: " .. tostring(commit_err)
+  end
 
   return {
     path = path,
@@ -285,7 +293,7 @@ maki.api.register_tool({
   end),
 
   handler = function(input, ctx)
-    local result, err = apply_edit(input.path, ctx, function(content)
+    local result, err = apply_edit(input.path, ctx, { input.new_string }, function(content)
       return fuzzy_replace.replace(content, input.old_string, input.new_string, input.replace_all or false)
     end)
     if not result then
@@ -356,7 +364,11 @@ register_tool_if(opts.multiedit, {
       return { llm_output = "provide at least one edit", is_error = true }
     end
 
-    local result, err = apply_edit(input.path, ctx, function(content)
+    local known_insertions = {}
+    for _, edit in ipairs(edits) do
+      known_insertions[#known_insertions + 1] = edit.new_string
+    end
+    local result, err = apply_edit(input.path, ctx, known_insertions, function(content)
       for i, edit in ipairs(edits) do
         local replaced, replace_err =
           fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false)
@@ -423,7 +435,7 @@ register_tool_if(opts.edit_lines, {
   end),
 
   handler = function(input, ctx)
-    local result, err = apply_edit(input.path, ctx, function(content)
+    local result, err = apply_edit(input.path, ctx, { input.new_string }, function(content)
       return replace_lines(content, input.start, input["end"], input.new_string)
     end)
     if not result then
@@ -472,7 +484,7 @@ register_tool_if(opts.insert_lines, {
   end),
 
   handler = function(input, ctx)
-    local result, err = apply_edit(input.path, ctx, function(content)
+    local result, err = apply_edit(input.path, ctx, { input.new_string }, function(content)
       return insert_after(content, input.line, input.new_string)
     end)
     if not result then

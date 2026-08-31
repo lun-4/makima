@@ -33,12 +33,14 @@ List directory contents. Returns entry names sorted alphabetically, directories 
 
 ### `read` {#read}
 
-Read a file. Returns contents with line numbers (1-indexed).
+Read a file with bounded output.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
-| `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. |
+| `byte_limit` | integer | no | Byte-mode maximum source bytes. Requires byte_offset. |
+| `byte_offset` | integer | no | Byte-mode start offset (zero-based UTF-8 boundary). Requires byte_limit. |
+| `limit` | integer | no | Line-mode maximum lines. Use 0 for the bounded end. Requires offset. |
+| `offset` | integer | no | Line-mode start line (1-indexed). Requires limit and cannot be mixed with byte mode. |
 | `path` | string | yes | Absolute path to the file |
 
 ### `write` {#write}

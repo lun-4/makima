@@ -4595,48 +4595,80 @@ fn host_list_picker_ui_drop_drains_callbacks() {
     );
 }
 
-/// read tool requires offset and limit; missing fields should fail schema validation.
-mod read_tool_required_params {
+/// The schema keeps both read modes optional; the handler enforces exactly one complete pair.
+mod read_tool_modes {
     use super::*;
 
-    const MISSING_OFFSET_ERR: &str = "invalid parameter 'offset': required";
-    const MISSING_LIMIT_ERR: &str = "invalid parameter 'limit': required";
     const MAX_OUTPUT_LINES: i32 = 2000;
 
     #[test]
-    fn missing_offset_fails_parse() {
+    fn mode_fields_are_optional_in_schema() {
         let (reg, _host) = builtins_host();
         let entry = reg.get("read").expect("read registered");
-        let err = entry
-            .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }))
-            .err()
-            .expect("missing offset should fail");
-        assert!(err.to_string().contains(MISSING_OFFSET_ERR), "got: {err}");
+        for input in [
+            serde_json::json!({ "path": "/tmp/foo.txt" }),
+            serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }),
+            serde_json::json!({ "path": "/tmp/foo.txt", "offset": 1 }),
+            serde_json::json!({ "path": "/tmp/foo.txt", "byte_offset": 0 }),
+            serde_json::json!({ "path": "/tmp/foo.txt", "byte_limit": 10 }),
+        ] {
+            assert!(
+                entry.tool.parse(&input).is_ok(),
+                "mode validation belongs to the handler: {input}"
+            );
+        }
     }
 
     #[test]
-    fn missing_limit_fails_parse() {
+    fn valid_line_and_byte_modes_parse() {
         let (reg, _host) = builtins_host();
         let entry = reg.get("read").expect("read registered");
-        let err = entry
-            .tool
-            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "offset": 1 }))
-            .err()
-            .expect("missing limit should fail");
-        assert!(err.to_string().contains(MISSING_LIMIT_ERR), "got: {err}");
+        for input in [
+            serde_json::json!({ "path": "/tmp/foo.txt", "offset": 1, "limit": 10 }),
+            serde_json::json!({ "path": "/tmp/foo.txt", "byte_offset": 0, "byte_limit": 10 }),
+        ] {
+            assert!(
+                entry.tool.parse(&input).is_ok(),
+                "valid mode should parse: {input}"
+            );
+        }
     }
 
     #[test]
-    fn both_offset_and_limit_present_parses() {
+    fn handler_requires_exactly_one_complete_mode_pair() {
         let (reg, _host) = builtins_host();
-        let entry = reg.get("read").expect("read registered");
-        let result = entry.tool.parse(&serde_json::json!({
-            "path": "/tmp/foo.txt",
-            "offset": 1,
-            "limit": 10
-        }));
-        assert!(result.is_ok(), "valid input should parse");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode.txt");
+        std::fs::write(&path, "hello").unwrap();
+        let path = path.to_str().unwrap();
+
+        for (input, expected) in [
+            (
+                serde_json::json!({ "path": path }),
+                "exactly one complete pair",
+            ),
+            (
+                serde_json::json!({ "path": path, "offset": 1 }),
+                "line mode requires both",
+            ),
+            (
+                serde_json::json!({ "path": path, "byte_limit": 1 }),
+                "byte mode requires both",
+            ),
+            (
+                serde_json::json!({
+                    "path": path,
+                    "offset": 1,
+                    "limit": 1,
+                    "byte_offset": 0,
+                    "byte_limit": 1
+                }),
+                "exactly one complete pair",
+            ),
+        ] {
+            let error = exec_tool(&reg, "read", input).expect_err("invalid mode must fail");
+            assert!(error.to_string().contains(expected), "got: {error}");
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@ use maki_agent::tools::{
 };
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
-use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
@@ -321,11 +321,38 @@ impl UserData for LuaCtx {
             Ok((Some(true), None))
         });
 
+        methods.add_method("begin_read", |_, this, path: String| {
+            let Some(tracker) = this.file_tracker() else {
+                return Ok(this.cap_err_pair("begin_read"));
+            };
+            Ok((Some(tracker.begin_read(Path::new(&path))), None))
+        });
+
+        methods.add_method(
+            "record_read_ranges",
+            |_, this, (path, content, ranges, lease): (String, String, Table, u64)| {
+                let Some(tracker) = this.file_tracker() else {
+                    return Ok(this.cap_err_pair("record_read_ranges"));
+                };
+                let ranges = ranges
+                    .sequence_values::<Table>()
+                    .map(|range| {
+                        let range = range?;
+                        Ok((range.get(1)?, range.get(2)?))
+                    })
+                    .collect::<mlua::Result<Vec<_>>>()?;
+                match tracker.record_observation(Path::new(&path), &content, &ranges, lease) {
+                    Ok(recorded) => Ok((Some(recorded), None)),
+                    Err(msg) => Ok((Some(false), Some(msg))),
+                }
+            },
+        );
+
         methods.add_method("record_read", |_, this, path: String| {
             let Some(tracker) = this.file_tracker() else {
                 return Ok(this.cap_err_pair("record_read"));
             };
-            tracker.record_read(Path::new(&path));
+            tracker.record_freshness(Path::new(&path));
             Ok((Some(true), None))
         });
 
@@ -341,6 +368,46 @@ impl UserData for LuaCtx {
                 Err(msg) => Ok((Some(false), Some(msg))),
             }
         });
+
+        methods.add_method(
+            "validate_mutation",
+            |_, this, (path, before, after): (String, String, String)| {
+                let Some(tracker) = this.file_tracker() else {
+                    return Ok(this.cap_err_pair("validate_mutation"));
+                };
+                match tracker.validate_mutation(Path::new(&path), &before, &after) {
+                    Ok(()) => Ok((Some(true), None)),
+                    Err(msg) => Ok((Some(false), Some(msg))),
+                }
+            },
+        );
+
+        methods.add_method(
+            "commit_mutation",
+            |_, this, (path, before, after, inserted): (String, String, String, Table)| {
+                let Some(tracker) = this.file_tracker() else {
+                    return Ok(this.cap_err_pair("commit_mutation"));
+                };
+                let inserted = inserted
+                    .sequence_values::<String>()
+                    .collect::<mlua::Result<Vec<_>>>()?;
+                match tracker.commit_mutation(Path::new(&path), &before, &after, &inserted) {
+                    Ok(()) => Ok((Some(true), None)),
+                    Err(msg) => Ok((Some(false), Some(msg))),
+                }
+            },
+        );
+
+        methods.add_method(
+            "record_complete_write",
+            |_, this, (path, content): (String, String)| {
+                let Some(tracker) = this.file_tracker() else {
+                    return Ok(this.cap_err_pair("record_complete_write"));
+                };
+                tracker.record_complete_write(Path::new(&path), &content);
+                Ok((Some(true), None))
+            },
+        );
 
         methods.add_async_method(
             "find_instructions",

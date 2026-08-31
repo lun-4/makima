@@ -78,6 +78,16 @@ fn file_content(fs: &InMemoryFs, path: &str) -> String {
         .expect("file exists on the backend")
 }
 
+fn read_all(ctx: &ToolContext, id: &str) {
+    let done = dispatch(
+        ctx,
+        id,
+        "read",
+        json!({ "path": FILE, "offset": 1, "limit": 0 }),
+    );
+    assert!(!done.is_error, "read failed: {}", done.output.as_text());
+}
+
 fn edit_opts() -> HashMap<String, Map<String, Value>> {
     HashMap::from([(
         "edit".to_string(),
@@ -88,12 +98,26 @@ fn edit_opts() -> HashMap<String, Map<String, Value>> {
     )])
 }
 
+fn read_opts(
+    max_line_bytes: usize,
+    max_output_bytes: usize,
+) -> HashMap<String, Map<String, Value>> {
+    HashMap::from([(
+        "read".to_string(),
+        Map::from_iter([
+            ("max_line_bytes".to_string(), json!(max_line_bytes)),
+            ("max_output_bytes".to_string(), json!(max_output_bytes)),
+        ]),
+    )])
+}
+
 #[test]
 fn batch_edits_same_file_preserve_all_replacements() {
     let fs = Arc::new(InMemoryFs::new());
     fs.seed(std::path::Path::new(FILE), b"alpha\nbeta\ngamma\n".to_vec());
-    let (registry, _host) = boot(Arc::clone(&fs), &["batch", "edit", "write"]);
+    let (registry, _host) = boot(Arc::clone(&fs), &["batch", "edit", "write", "read"]);
     let ctx = shared_ctx(&registry);
+    read_all(&ctx, "read-batch");
 
     let done = dispatch(
         &ctx,
@@ -134,6 +158,15 @@ fn edit_handlers_bypassing_lock_lose_updates() {
         .seed(std::path::Path::new(FILE), b"alpha\nbeta\ngamma\n".to_vec());
     let (registry, _host) = boot_with_backend(&["edit"], Arc::clone(&barrier) as _, HashMap::new());
     let ctx = shared_ctx(&registry);
+    let lease = ctx.file_tracker.begin_read(std::path::Path::new(FILE));
+    ctx.file_tracker
+        .record_observation(
+            std::path::Path::new(FILE),
+            "alpha\nbeta\ngamma\n",
+            &[(0, 17)],
+            lease,
+        )
+        .unwrap();
 
     let entry = registry.get("edit").expect("edit tool registered");
     let inv_a = entry
@@ -154,8 +187,10 @@ fn edit_handlers_bypassing_lock_lose_updates() {
     barrier.release_reads();
     let done = smol::block_on(async { (a.await, b.await) });
 
-    assert!(done.0.output.as_ref().is_ok());
-    assert!(done.1.output.as_ref().is_ok());
+    assert!(
+        done.0.output.as_ref().is_ok() || done.1.output.as_ref().is_ok(),
+        "at least one raced edit should commit"
+    );
 
     let content = file_content(&barrier.fs, FILE);
     assert_ne!(
@@ -173,9 +208,13 @@ fn mutable_tools_share_path_lock() {
     // edit + multiedit over disjoint regions of one file.
     let fs = Arc::new(InMemoryFs::new());
     fs.seed(std::path::Path::new(FILE), b"aaa\nbbb\nccc\nddd\n".to_vec());
-    let (registry, _host) =
-        boot_with_backend(&["edit", "write"], Arc::clone(&fs) as _, edit_opts());
+    let (registry, _host) = boot_with_backend(
+        &["edit", "write", "read"],
+        Arc::clone(&fs) as _,
+        edit_opts(),
+    );
     let ctx = shared_ctx(&registry);
+    read_all(&ctx, "read-mutable-1");
     let d1 = dispatch(
         &ctx,
         "m1",
@@ -198,9 +237,13 @@ fn mutable_tools_share_path_lock() {
     // edit + edit_lines: the line tool shares the same key.
     let fs = Arc::new(InMemoryFs::new());
     fs.seed(std::path::Path::new(FILE), b"one\ntwo\nthree\n".to_vec());
-    let (registry, _host) =
-        boot_with_backend(&["edit", "write"], Arc::clone(&fs) as _, edit_opts());
+    let (registry, _host) = boot_with_backend(
+        &["edit", "write", "read"],
+        Arc::clone(&fs) as _,
+        edit_opts(),
+    );
     let ctx = shared_ctx(&registry);
+    read_all(&ctx, "read-mutable-2");
     let d1 = dispatch(
         &ctx,
         "e1",
@@ -221,9 +264,13 @@ fn mutable_tools_share_path_lock() {
     // result; a raced one would be a torn mix.
     let fs = Arc::new(InMemoryFs::new());
     fs.seed(std::path::Path::new(FILE), b"old\n".to_vec());
-    let (registry, _host) =
-        boot_with_backend(&["edit", "write"], Arc::clone(&fs) as _, edit_opts());
+    let (registry, _host) = boot_with_backend(
+        &["edit", "write", "read"],
+        Arc::clone(&fs) as _,
+        edit_opts(),
+    );
     let ctx = shared_ctx(&registry);
+    read_all(&ctx, "read-mutable-3");
     let d1 = dispatch(
         &ctx,
         "w1",
@@ -247,9 +294,13 @@ fn mutable_tools_share_path_lock() {
     // insert_lines joins the same namespace.
     let fs = Arc::new(InMemoryFs::new());
     fs.seed(std::path::Path::new(FILE), b"a\nc\n".to_vec());
-    let (registry, _host) =
-        boot_with_backend(&["edit", "write"], Arc::clone(&fs) as _, edit_opts());
+    let (registry, _host) = boot_with_backend(
+        &["edit", "write", "read"],
+        Arc::clone(&fs) as _,
+        edit_opts(),
+    );
     let ctx = shared_ctx(&registry);
+    read_all(&ctx, "read-mutable-4");
     let d1 = dispatch(
         &ctx,
         "i1",
@@ -270,13 +321,364 @@ fn mutable_tools_share_path_lock() {
 /// The built-in write and edit handlers must pick the atomic whole-file
 /// write, never a plain one.
 #[test]
-fn edit_and_write_handlers_use_atomic_write() {
+fn long_ascii_line_cannot_be_written_back_truncated() {
+    let fs = Arc::new(InMemoryFs::new());
+    let content = "x".repeat(200);
+    fs.seed(std::path::Path::new(FILE), content.as_bytes().to_vec());
+    let (registry, _host) = boot_with_backend(
+        &["read", "write"],
+        Arc::clone(&fs) as _,
+        read_opts(80, 1024),
+    );
+    let ctx = shared_ctx(&registry);
+    let read = dispatch(
+        &ctx,
+        "long-read",
+        "read",
+        json!({"path": FILE, "offset": 1, "limit": 1}),
+    );
+    assert!(!read.is_error);
+    assert!(read.output.as_text().contains("[line truncated]"));
+    let read_text = read.output.as_text();
+    let represented = read_text.split_once(": ").expect("numbered read").1;
+    let write = dispatch(
+        &ctx,
+        "truncated-write",
+        "write",
+        json!({"path": FILE, "content": represented}),
+    );
+    assert!(
+        write.is_error,
+        "truncated representation must not be writable"
+    );
+    assert_eq!(file_content(&fs, FILE), content);
+}
+
+#[test]
+fn long_multibyte_line_cannot_replace_unseen_suffix() {
+    let fs = Arc::new(InMemoryFs::new());
+    let content = format!("{}tail", "é".repeat(80));
+    fs.seed(std::path::Path::new(FILE), content.as_bytes().to_vec());
+    let (registry, _host) =
+        boot_with_backend(&["read", "edit"], Arc::clone(&fs) as _, read_opts(80, 1024));
+    let ctx = shared_ctx(&registry);
+    let read = dispatch(
+        &ctx,
+        "utf8-read",
+        "read",
+        json!({"path": FILE, "offset": 1, "limit": 1}),
+    );
+    assert!(!read.is_error);
+    assert!(
+        read.output
+            .as_text()
+            .is_char_boundary(read.output.as_text().len())
+    );
+    let edit = dispatch(
+        &ctx,
+        "utf8-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "tail", "new_string": "TAIL"}),
+    );
+    assert!(edit.is_error, "unseen UTF-8 suffix must be protected");
+    assert_eq!(file_content(&fs, FILE), content);
+}
+
+#[test]
+fn whole_output_omits_fragment_without_granting_coverage() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(FILE), b"first\nsecond\n".to_vec());
+    let (registry, _host) =
+        boot_with_backend(&["read", "edit"], Arc::clone(&fs) as _, read_opts(1000, 10));
+    let ctx = shared_ctx(&registry);
+    let read = dispatch(
+        &ctx,
+        "bounded-read",
+        "read",
+        json!({"path": FILE, "offset": 1, "limit": 2}),
+    );
+    assert!(!read.is_error);
+    assert!(read.output.as_text().contains("first"));
+    assert!(!read.output.as_text().contains("second"));
+    assert!(read.output.as_text().contains("[file truncated"));
+    let edit = dispatch(
+        &ctx,
+        "omitted-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "second", "new_string": "SECOND"}),
+    );
+    assert!(edit.is_error, "omitted fragment must remain unseen");
+}
+
+#[test]
+fn partial_read_allows_observed_edit_and_blocks_unseen_edits() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(FILE), b"visible\nhidden\n".to_vec());
+    let (registry, _host) = boot(Arc::clone(&fs), &["read", "edit"]);
+    let ctx = shared_ctx(&registry);
+
+    let read = dispatch(
+        &ctx,
+        "partial-read",
+        "read",
+        json!({"path": FILE, "offset": 1, "limit": 1}),
+    );
+    assert!(!read.is_error, "read failed: {}", read.output.as_text());
+    let edit = dispatch(
+        &ctx,
+        "visible-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "visible", "new_string": "VISIBLE"}),
+    );
+    assert!(
+        !edit.is_error,
+        "covered edit failed: {}",
+        edit.output.as_text()
+    );
+    let hidden = dispatch(
+        &ctx,
+        "hidden-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "hidden", "new_string": "HIDDEN"}),
+    );
+    assert!(hidden.is_error, "unseen edit must fail");
+    assert!(hidden.output.as_text().contains("unseen source bytes"));
+    assert_eq!(file_content(&fs, FILE), "VISIBLE\nhidden\n");
+}
+
+#[test]
+fn partial_read_allows_pure_insertion() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(FILE), b"visible\nhidden\n".to_vec());
+    let (registry, _host) = boot_with_backend(&["read", "edit"], Arc::clone(&fs) as _, edit_opts());
+    let ctx = shared_ctx(&registry);
+    let read = dispatch(
+        &ctx,
+        "insert-read",
+        "read",
+        json!({"path": FILE, "offset": 1, "limit": 1}),
+    );
+    assert!(!read.is_error);
+    let insert = dispatch(
+        &ctx,
+        "insert",
+        "insert_lines",
+        json!({"path": FILE, "line": 1, "new_string": "added"}),
+    );
+    assert!(
+        !insert.is_error,
+        "insertion failed: {}",
+        insert.output.as_text()
+    );
+    assert_eq!(file_content(&fs, FILE), "visible\nadded\nhidden\n");
+}
+
+#[test]
+fn byte_chunks_accumulate_coverage() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(FILE), b"abcdefgh".to_vec());
+    let (registry, _host) = boot(Arc::clone(&fs), &["read", "edit"]);
+    let ctx = shared_ctx(&registry);
+
+    for (id, offset) in [("chunk-1", 0), ("chunk-2", 4)] {
+        let read = dispatch(
+            &ctx,
+            id,
+            "read",
+            json!({"path": FILE, "byte_offset": offset, "byte_limit": 4}),
+        );
+        assert!(!read.is_error, "chunk failed: {}", read.output.as_text());
+        assert!(read.output.as_text().contains(&format!("[bytes {offset}-")));
+    }
+    let edit = dispatch(
+        &ctx,
+        "chunk-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "abcdefgh", "new_string": "done"}),
+    );
+    assert!(
+        !edit.is_error,
+        "accumulated edit failed: {}",
+        edit.output.as_text()
+    );
+    assert_eq!(file_content(&fs, FILE), "done");
+}
+
+#[test]
+fn literal_truncation_markers_are_ordinary_source() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(
+        std::path::Path::new(FILE),
+        b"[line truncated]\n[file truncated]\n".to_vec(),
+    );
+    let (registry, _host) = boot(Arc::clone(&fs), &["read", "edit"]);
+    let ctx = shared_ctx(&registry);
+    read_all(&ctx, "marker-read");
+    let edit = dispatch(
+        &ctx,
+        "marker-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "[line truncated]", "new_string": "literal"}),
+    );
+    assert!(
+        !edit.is_error,
+        "literal marker edit failed: {}",
+        edit.output.as_text()
+    );
+}
+
+#[test]
+fn write_new_file_succeeds_without_provenance() {
+    let fs = Arc::new(InMemoryFs::new());
+    let (registry, _host) = boot(Arc::clone(&fs), &["write"]);
+    let ctx = shared_ctx(&registry);
+    let done = dispatch(
+        &ctx,
+        "new-write",
+        "write",
+        json!({"path": FILE, "content": "new\n"}),
+    );
+    assert!(
+        !done.is_error,
+        "new write failed: {}",
+        done.output.as_text()
+    );
+    assert_eq!(file_content(&fs, FILE), "new\n");
+}
+
+#[test]
+fn failed_coverage_check_does_not_call_atomic_write() {
     let watch = Watch::new();
     watch
         .fs
         .seed(std::path::Path::new(FILE), b"before\n".to_vec());
     let (registry, _host) = boot_with_watch(&watch, &["edit", "write"]);
     let ctx = shared_ctx(&registry);
+
+    let done = dispatch(
+        &ctx,
+        "blocked-write",
+        "write",
+        json!({"path": FILE, "content": "after\n"}),
+    );
+    assert!(done.is_error);
+    assert!(
+        !watch.atomic.load(Ordering::SeqCst),
+        "coverage rejection must happen before atomic_write"
+    );
+}
+
+#[test]
+fn grep_alone_grants_no_coverage_and_does_not_erase_precise_coverage() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(FILE), b"visible\nhidden\n".to_vec());
+    let (registry, _host) = boot(Arc::clone(&fs), &["grep", "read", "edit"]);
+    let ctx = shared_ctx(&registry);
+
+    let grep = dispatch(
+        &ctx,
+        "grep-only",
+        "grep",
+        json!({"path": FILE, "pattern": "hidden"}),
+    );
+    assert!(!grep.is_error, "grep failed: {}", grep.output.as_text());
+    let blocked = dispatch(
+        &ctx,
+        "grep-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "hidden", "new_string": "HIDDEN"}),
+    );
+    assert!(
+        blocked.is_error,
+        "grep must not authorize destructive mutation"
+    );
+
+    let read = dispatch(
+        &ctx,
+        "precise-read",
+        "read",
+        json!({"path": FILE, "offset": 1, "limit": 1}),
+    );
+    assert!(!read.is_error);
+    let grep = dispatch(
+        &ctx,
+        "grep-after-read",
+        "grep",
+        json!({"path": FILE, "pattern": "visible"}),
+    );
+    assert!(!grep.is_error);
+    let allowed = dispatch(
+        &ctx,
+        "read-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "visible", "new_string": "VISIBLE"}),
+    );
+    assert!(
+        !allowed.is_error,
+        "grep erased precise coverage: {}",
+        allowed.output.as_text()
+    );
+}
+
+#[test]
+fn snapshot_change_invalidates_coverage_with_stale_check_disabled() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(FILE), b"before\n".to_vec());
+    let (registry, _host) = boot(Arc::clone(&fs), &["read", "edit"]);
+    let mut ctx = shared_ctx(&registry);
+    ctx.config.stale_read_check = false;
+    read_all(&ctx, "snapshot-read");
+    fs.seed(std::path::Path::new(FILE), b"changed\n".to_vec());
+
+    let done = dispatch(
+        &ctx,
+        "snapshot-edit",
+        "edit",
+        json!({"path": FILE, "old_string": "changed", "new_string": "CHANGED"}),
+    );
+    assert!(
+        done.is_error,
+        "disabled mtime policy must not disable provenance"
+    );
+    assert!(done.output.as_text().contains("last precise read"));
+    assert_eq!(file_content(&fs, FILE), "changed\n");
+}
+
+#[test]
+fn existing_file_without_provenance_is_rejected() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(FILE), b"before\n".to_vec());
+    let (registry, _host) = boot(Arc::clone(&fs), &["edit", "write"]);
+    let ctx = shared_ctx(&registry);
+
+    for (id, tool, input) in [
+        (
+            "unread-edit",
+            "edit",
+            json!({"path": FILE, "old_string": "before", "new_string": "after"}),
+        ),
+        (
+            "unread-write",
+            "write",
+            json!({"path": FILE, "content": "after\n"}),
+        ),
+    ] {
+        let done = dispatch(&ctx, id, tool, input);
+        assert!(done.is_error, "{tool} without provenance must fail");
+        assert!(done.output.as_text().contains("last precise read"));
+    }
+    assert_eq!(file_content(&fs, FILE), "before\n");
+}
+
+#[test]
+fn edit_and_write_handlers_use_atomic_write() {
+    let watch = Watch::new();
+    watch
+        .fs
+        .seed(std::path::Path::new(FILE), b"before\n".to_vec());
+    let (registry, _host) = boot_with_watch(&watch, &["edit", "write", "read"]);
+    let ctx = shared_ctx(&registry);
+    read_all(&ctx, "read-atomic");
 
     let edit = dispatch(
         &ctx,
@@ -819,6 +1221,15 @@ fn dispatched_handlers_serialize_on_the_lock() {
             .seed(std::path::Path::new(FILE), b"alpha\nbeta\ngamma\n".to_vec());
         let (registry, _host) = boot_with_backend(&["edit"], Arc::clone(&probe) as _, edit_opts());
         let ctx = shared_ctx(&registry);
+        let lease = ctx.file_tracker.begin_read(std::path::Path::new(FILE));
+        ctx.file_tracker
+            .record_observation(
+                std::path::Path::new(FILE),
+                "alpha\nbeta\ngamma\n",
+                &[(0, 17)],
+                lease,
+            )
+            .unwrap();
         probe.arm_read_gate();
 
         let ctx_a = ctx.clone();

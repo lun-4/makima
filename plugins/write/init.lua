@@ -80,6 +80,21 @@ maki.api.register_tool({
       return { llm_output = err, is_error = true }
     end
 
+    local meta = maki.fs.metadata(path)
+    if meta and meta.is_dir then
+      return { llm_output = "error: path is a directory", is_error = true }
+    end
+    if meta then
+      local before, read_err = maki.fs.read(path)
+      if not before then
+        return { llm_output = "read error: " .. tostring(read_err), is_error = true }
+      end
+      local valid, validation_err = ctx:validate_mutation(path, before, content)
+      if not valid then
+        return { llm_output = validation_err, is_error = true }
+      end
+    end
+
     local parent = maki.fs.dirname(path)
     if parent then
       maki.fs.mkdir(parent, { parents = true })
@@ -90,7 +105,7 @@ maki.api.register_tool({
       return { llm_output = "write error: " .. tostring(write_err), is_error = true }
     end
 
-    ctx:record_read(path)
+    ctx:record_complete_write(path, content)
 
     local byte_count = #content
     local rel = shorten_path(path)
