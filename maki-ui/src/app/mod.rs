@@ -261,6 +261,7 @@ impl PickerItem for TaskEntry {
 struct SubagentChannels {
     answer_tx: Option<flume::Sender<String>>,
     input_tx: Option<flume::Sender<String>>,
+    cancel_tx: Option<flume::Sender<()>>,
 }
 
 fn truncate_snippet(text: &str) -> String {
@@ -416,7 +417,7 @@ pub struct App {
     subagent_channels: HashMap<String, SubagentChannels>,
     /// Stamped child outcomes outrank the later history snapshot, which is
     /// emitted independently and can otherwise make a failed child look done.
-    stamped_subagent_outcomes: HashSet<String>,
+    stamped_subagent_outcomes: HashSet<(String, maki_agent::TurnId)>,
 }
 
 impl App {
@@ -1002,7 +1003,7 @@ impl App {
                 KeyCode::Esc => self.queue.unfocus(),
                 _ if key::QUIT.matches(key) => self.queue.unfocus(),
                 _ if key::POP_QUEUE.matches(key) => {
-                    self.queue.remove(0);
+                    self.queue.pop_newest();
                 }
                 _ => {}
             }
@@ -1163,7 +1164,7 @@ impl App {
             BuiltinAction::PlanSubmit => return self.submit_plan(),
             BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
             BuiltinAction::PopQueue => {
-                self.queue.remove(0);
+                self.queue.pop_newest();
             }
             BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
             BuiltinAction::NextChat => {
@@ -1607,10 +1608,14 @@ impl App {
 
         self.chats[self.active_chat].flush();
         self.chats[self.active_chat].cancel_in_progress();
-        self.chats[self.active_chat].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
-        self.subagent_channels.remove(&tool_use_id);
-
-        vec![Action::CancelSubagent { tool_use_id }]
+        if let Some(cancel_tx) = self
+            .subagent_channels
+            .get(&tool_use_id)
+            .and_then(|channels| channels.cancel_tx.as_ref())
+        {
+            let _ = cancel_tx.try_send(());
+        }
+        vec![]
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
@@ -1657,7 +1662,15 @@ impl App {
             (&envelope.subagent, &envelope.event)
         {
             let tool_use_id = subagent.parent_tool_use_id.clone();
-            if !self.stamped_subagent_outcomes.insert(tool_use_id.clone()) {
+            let turn_id = match outcome {
+                maki_agent::TurnOutcome::Completed { turn_id, .. }
+                | maki_agent::TurnOutcome::Cancelled { turn_id, .. }
+                | maki_agent::TurnOutcome::Failed { turn_id, .. } => *turn_id,
+            };
+            if !self
+                .stamped_subagent_outcomes
+                .insert((tool_use_id.clone(), turn_id))
+            {
                 return vec![];
             }
             let chat_idx = self.resolve_or_create_chat(subagent);
@@ -1691,7 +1704,10 @@ impl App {
         {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory.
-            if !self.stamped_subagent_outcomes.contains(&tool_use_id)
+            if !self
+                .stamped_subagent_outcomes
+                .iter()
+                .any(|(id, _)| id == &tool_use_id)
                 && let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str())
                 && !self.chats[sub_idx].is_finished()
             {
@@ -1763,11 +1779,21 @@ impl App {
                 .insert_tool_output(e.id.clone(), e.output.clone());
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (role, text) = if e.is_error {
-                    (DisplayRole::Error, ERROR_TEXT)
+                    let text = e.output.as_text();
+                    let text = if text.is_empty() {
+                        ERROR_TEXT.into()
+                    } else {
+                        text
+                    };
+                    (DisplayRole::Error, text)
                 } else {
-                    (DisplayRole::Done, DONE_TEXT)
+                    (DisplayRole::Done, DONE_TEXT.into())
                 };
-                self.chats[sub_idx].mark_finished(role, text);
+                if e.is_error {
+                    self.chats[sub_idx].mark_failed(&text);
+                } else {
+                    self.chats[sub_idx].mark_finished(role, &text);
+                }
             }
             self.sync_task_picker();
         }
@@ -1893,7 +1919,10 @@ impl App {
                 ChatEventResult::AuthRequired
                 | ChatEventResult::PermissionRequest { .. }
                 | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
-                ChatEventResult::Continue | ChatEventResult::ControlComplete => {}
+                ChatEventResult::ControlComplete => {
+                    self.status = Status::Idle;
+                }
+                ChatEventResult::Continue => {}
             }
         }
         actions
@@ -1943,6 +1972,7 @@ impl App {
             SubagentChannels {
                 answer_tx: subagent.answer_tx.clone(),
                 input_tx: subagent.input_tx.clone(),
+                cancel_tx: subagent.cancel_tx.clone(),
             },
         );
         self.chats[0].update_tool_summary(id, &subagent.name);

@@ -144,7 +144,13 @@ impl QueueSender {
             #[cfg(test)]
             QueueBackend::Test(items) => {
                 let mut items = lock(items);
-                (index < items.len()).then(|| items.remove(index)).is_some()
+                let raw_index = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| visible_in_panel(&(*item).into()))
+                    .nth(index)
+                    .map(|(index, _)| index);
+                raw_index.and_then(|index| items.remove(index)).is_some()
             }
             QueueBackend::Actor(actor) => actor.remove_visible_at(index).is_some(),
         }

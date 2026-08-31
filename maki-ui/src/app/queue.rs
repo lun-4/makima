@@ -91,6 +91,12 @@ impl MessageQueue {
         }
     }
 
+    pub(crate) fn pop_newest(&mut self) {
+        if let Some(index) = self.panel_len().checked_sub(1) {
+            self.remove(index);
+        }
+    }
+
     pub(crate) fn panel_len(&self) -> usize {
         self.shared.as_ref().map_or(0, |s| s.panel_len())
     }

@@ -1072,6 +1072,9 @@ pub struct SubagentInfo {
     /// Queue into the subagent's background driver (async sessions only).
     #[serde(skip)]
     pub input_tx: Option<flume::Sender<String>>,
+    /// Cancel currently executing and queued work without closing the session.
+    #[serde(skip)]
+    pub cancel_tx: Option<flume::Sender<()>>,
 }
 
 #[derive(Debug, Clone)]

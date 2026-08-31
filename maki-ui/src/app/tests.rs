@@ -499,6 +499,7 @@ fn subagent_info_full(
         model: None,
         answer_tx,
         input_tx,
+        cancel_tx: None,
     }
 }
 
@@ -650,7 +651,7 @@ fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
 }
 
 #[test]
-fn standalone_compaction_does_not_exit_or_end_turn() {
+fn standalone_compaction_returns_to_idle_without_ending_the_session() {
     let mut app = test_app();
     app.exit_on_done = true;
     app.status = Status::Streaming;
@@ -659,7 +660,7 @@ fn standalone_compaction_does_not_exit_or_end_turn() {
         usage: TokenUsage::default(),
     }));
     assert_eq!(app.exit_request, ExitRequest::None);
-    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.status, Status::Idle);
 }
 
 #[test]
@@ -1982,7 +1983,7 @@ fn subagent_done_only_in_subagent_chat() {
 }
 
 #[test_case(|app: &mut App| finish_subagent_task(app, false), DONE_TEXT,      &DisplayRole::Done  ; "task_success")]
-#[test_case(|app: &mut App| finish_subagent_task(app, true),  ERROR_TEXT,     &DisplayRole::Error ; "task_failure")]
+#[test_case(|app: &mut App| finish_subagent_task(app, true),  "result",       &DisplayRole::Error ; "task_failure")]
 #[test_case(cancel_app as fn(&mut App),                       CANCELLED_TEXT, &DisplayRole::Error ; "cancel")]
 #[test_case(error_app  as fn(&mut App),                       ERROR_TEXT,     &DisplayRole::Error ; "main_error")]
 fn subagent_terminal_marker(
@@ -2008,7 +2009,7 @@ fn subagent_already_done_not_double_marked(terminate: fn(&mut App)) {
 }
 
 #[test_case(false, DONE_TEXT,  &DisplayRole::Done  ; "batch_subagent_success")]
-#[test_case(true,  ERROR_TEXT, &DisplayRole::Error ; "batch_subagent_failure")]
+#[test_case(true,  "result",   &DisplayRole::Error ; "batch_subagent_failure")]
 fn batch_subagent_done_marker(is_error: bool, expected_text: &str, expected_role: &DisplayRole) {
     let mut app = app_with_subagent_id("batch1__0");
     finish_subagent(&mut app, "batch1__0", is_error);
@@ -3438,21 +3439,27 @@ fn queue_esc_unfocuses_without_removing() {
 }
 
 #[test]
-fn ctrl_q_pops_front() {
+fn ctrl_q_pops_newest_visible_item() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));
-    app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
-    assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, "second");
-    assert!(app.queue.focus().is_none(), "unfocused stays unfocused");
-
     app.queue_and_notify(queued_msg("third"));
     app.queue.set_focus_at(1);
+
     app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+
+    assert_eq!(app.queue.len(), 2);
+    assert_eq!(
+        app.queue
+            .panel_entries()
+            .iter()
+            .map(|entry| entry.text.as_ref())
+            .collect::<Vec<_>>(),
+        ["queued", "second"]
+    );
     assert_eq!(
         app.queue.focus(),
-        Some(0),
-        "focus adjusted when item removed"
+        Some(1),
+        "focus follows the retained newest item"
     );
 }
 
@@ -5391,6 +5398,82 @@ fn subagent_history_finishes_workflow_chat() {
 }
 
 #[test]
+fn reusable_subagent_processes_distinct_turn_outcomes() {
+    const FAILURE_MESSAGE: &str = "second turn failed";
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (input_tx, input_rx) = flume::unbounded();
+    let mut info = subagent_info(TASK_ID, "worker");
+    info.input_tx = Some(input_tx);
+    let envelope = |outcome| {
+        Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::TurnOutcome(outcome),
+            subagent: Some(info.clone()),
+            run_id: 1,
+        }))
+    };
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "first".into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+
+    app.update(envelope(TurnOutcome::Completed {
+        agent_id: AgentId::generate(),
+        turn_id: TurnId::generate(),
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        reason: DoneReason::EndTurn,
+    }));
+    app.update(envelope(TurnOutcome::Failed {
+        agent_id: AgentId::generate(),
+        turn_id: TurnId::generate(),
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        failure: TurnFailure {
+            kind: TurnFailureKind::Provider,
+            diagnostic: FAILURE_MESSAGE.into(),
+            user_message: FAILURE_MESSAGE.into(),
+            retryable: false,
+        },
+    }));
+
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
+    assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
+    assert!(input_rx.try_recv().is_err());
+}
+
+#[test]
+fn double_esc_cancels_subagent_but_retains_input_channel() {
+    const FOLLOW_UP: &str = "follow up";
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (input_tx, input_rx) = flume::unbounded();
+    let mut info = subagent_info(TASK_ID, "worker");
+    info.input_tx = Some(input_tx);
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    app.active_chat = 1;
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty());
+    assert!(!app.chats[1].is_finished());
+
+    type_and_submit(&mut app, FOLLOW_UP);
+    assert_eq!(input_rx.try_recv().unwrap(), FOLLOW_UP);
+}
+
+#[test]
 fn stamped_child_failure_wins_over_prior_history_snapshot() {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -5732,13 +5815,8 @@ fn double_esc_in_subagent_cancels_subagent() {
     let mut app = app_with_active_subagent();
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(
-        &actions[0],
-        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
-    ));
-    assert!(app.chats[1].is_finished());
-    assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
+    assert!(actions.is_empty());
+    assert!(!app.chats[1].is_finished());
 }
 
 #[test]
@@ -5766,14 +5844,14 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
 }
 
 #[test]
-fn cancel_subagent_removes_answer_sender() {
+fn cancel_subagent_retains_channel() {
     let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     assert!(!app.subagent_channels.is_empty());
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.subagent_channels.contains_key(TASK_ID));
+    assert!(app.subagent_channels.contains_key(TASK_ID));
 }
 
 #[test]
@@ -5790,14 +5868,10 @@ fn multiple_subagents_cancel_one_other_unaffected() {
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(
-        &actions[0],
-        Action::CancelSubagent { tool_use_id } if tool_use_id == "task2"
-    ));
+    assert!(actions.is_empty());
     let task1_idx = *app.chat_index.get(TASK_ID).unwrap();
     assert!(!app.chats[task1_idx].is_finished());
-    assert!(app.chats[app.active_chat].is_finished());
+    assert!(!app.chats[app.active_chat].is_finished());
 }
 
 #[test]
@@ -5814,7 +5888,7 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.chats[1].is_finished());
+    assert!(!app.chats[1].is_finished());
 
     app.run_builtin(BuiltinAction::PrevChat);
     assert_eq!(app.active_chat, 0);

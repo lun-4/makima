@@ -108,6 +108,7 @@ struct LuaActorState {
     ui_id: String,
     parent_event_tx: EventSender,
     input_tx: flume::Sender<String>,
+    cancel_tx: flume::Sender<()>,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
@@ -118,8 +119,7 @@ struct LuaActorState {
     /// queued admission never sets it, so close cannot mistake queued work for
     /// an executed transcript.
     execution_started: std::sync::atomic::AtomicBool,
-    /// One-shot parent/UI transcript relay. The execution marker prevents
-    /// close/drop from racing an active backend with a stale fallback.
+    /// Prevents close/drop from duplicating the latest terminal relay.
     history_relayed: std::sync::atomic::AtomicBool,
     relay_snapshot: Mutex<Vec<Message>>,
     presentation: Mutex<HashMap<TurnId, AdapterResult>>,
@@ -135,6 +135,7 @@ impl LuaActorState {
                 model: Some(self.params.model.spec()),
                 answer_tx: self.answer_tx.clone(),
                 input_tx: Some(self.input_tx.clone()),
+                cancel_tx: Some(self.cancel_tx.clone()),
             });
         }
     }
@@ -142,6 +143,8 @@ impl LuaActorState {
     fn relay_history(&self, history: &History) {
         self.execution_started
             .store(true, std::sync::atomic::Ordering::Release);
+        self.history_relayed
+            .store(false, std::sync::atomic::Ordering::Release);
         *self.relay_snapshot.lock().unwrap() = history.as_slice().to_vec();
         self.relay_snapshot_if_pending();
     }
@@ -881,6 +884,7 @@ async fn session(
     let chip_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (cancel_tx, cancel_rx) = flume::unbounded::<()>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
 
@@ -901,9 +905,9 @@ async fn session(
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
-    // The subagent's cancel is independent of the parent run's cancel: it is
-    // triggered only through the shared `subagent_cancels` map (task_despawn,
-    // CancelSubagent, global CancelAll). Deriving it from `agent_ctx.cancel`
+    // The subagent's permanent close is independent of the parent run's cancel:
+    // it is triggered only through the shared `subagent_cancels` map
+    // (`task_despawn` and global cancellation). Deriving it from `agent_ctx.cancel`
     // (the run's token, which the UI fires at normal run end by dropping the
     // run's CancelTrigger) would close every in-flight subagent as soon as the
     // spawning run finishes.
@@ -960,6 +964,7 @@ async fn session(
         ui_id: ui_id.clone(),
         parent_event_tx: parent_tx,
         input_tx: ui_input_tx.clone(),
+        cancel_tx,
         subagent_info: Arc::clone(&subagent_info),
         local_tools: Arc::new(local_map),
         name: name.clone(),
@@ -983,11 +988,20 @@ async fn session(
     let thinking = state.thinking;
     let fast = state.fast;
 
-    // CancelSubagent (task_despawn, the UI's double-esc) and the global
-    // CancelAll fire the shared child token. Mapping that to `actor.close()`
+    // `task_despawn` and global cancellation fire the shared child token.
+    // Mapping that to `actor.close()`
     // aborts the running turn through its per-turn cancel and terminalizes
     // queued turns; a normal close stops the relay first.
     let (relay_stop_tx, relay_stop_rx) = flume::bounded::<()>(1);
+    {
+        let actor = actor.clone();
+        smol::spawn(async move {
+            while cancel_rx.recv_async().await.is_ok() {
+                actor.cancel_all();
+            }
+        })
+        .detach();
+    }
     {
         let actor = actor.clone();
         let child_cancel = state.child_cancel.clone();
@@ -1661,6 +1675,7 @@ mod tests {
         let (parent_raw_tx, parent_rx) = flume::unbounded();
         let (answer_tx, answer_rx) = flume::unbounded();
         let (input_tx, _input_rx) = flume::unbounded::<String>();
+        let (cancel_tx, _cancel_rx) = flume::unbounded::<()>();
         let (relay_stop_tx, _relay_stop_rx) = flume::bounded::<()>(1);
         let ui_id = "task-1".to_owned();
         let agent_id = AgentId::generate();
@@ -1704,6 +1719,7 @@ mod tests {
             ui_id: ui_id.clone(),
             parent_event_tx: EventSender::new(parent_raw_tx, RUN_ID),
             input_tx,
+            cancel_tx,
             subagent_info: Arc::new(OnceLock::new()),
             local_tools: LocalTools::default(),
             name: "probe".to_owned(),
@@ -1967,8 +1983,8 @@ mod tests {
                 .drain()
                 .filter(|e| matches!(e.event, AgentEvent::SubagentHistory { .. }))
                 .count(),
-            1,
-            "executed failure relays history once"
+            2,
+            "each executed turn relays history once"
         );
         state.close_with(&actor);
         assert!(
@@ -2069,6 +2085,7 @@ mod tests {
                 model: None,
                 answer_tx: None,
                 input_tx: None,
+                cancel_tx: None,
             })
             .unwrap();
         let (live_tx, live_rx) = flume::unbounded();
