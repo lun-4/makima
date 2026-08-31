@@ -33,7 +33,7 @@ use crate::components::btw_modal::BtwModal;
 use crate::components::command::ParsedCommand;
 use crate::components::command::{CommandAction, CommandPalette, ConfirmedCommand};
 use crate::components::file_completion::{
-    CompletionAction, CompletionItem, FileCompletionMenu, at_token_range,
+    CompletionAction, CompletionItem, FileCompletionMenu, at_token_query, at_token_range,
 };
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
@@ -1340,6 +1340,10 @@ impl App {
                     self.insert_completion(item);
                     return vec![];
                 }
+                CompletionAction::Advance(item) => {
+                    self.advance_completion(item);
+                    return vec![];
+                }
                 CompletionAction::Passthrough => {}
             }
         }
@@ -1470,8 +1474,8 @@ impl App {
 
         let cwd = self.state.session.cwd.clone();
         let query = {
-            let line = &self.input_box.buffer.lines()[self.input_box.buffer.y()];
-            line[start + 1..end].to_string()
+            let buffer = &self.input_box.buffer;
+            at_token_query(&buffer.lines()[buffer.y()], buffer.x()).unwrap_or_default()
         };
         self.file_completion.set_token_byte_range((start, end));
         if self.file_completion.is_active() {
@@ -1485,17 +1489,33 @@ impl App {
         }
     }
 
-    /// Replaces the `@`-token with the chosen completion and drops the popup.
+    /// Replaces the `@` token with a final completion and closes the popup.
     fn insert_completion(&mut self, item: CompletionItem) {
-        let replacement = item.replacement();
+        self.apply_completion(item, true);
+    }
+
+    /// Replaces the `@` token with an explicit directory and refreshes its children.
+    fn advance_completion(&mut self, item: CompletionItem) {
+        let replacement = item.advance_replacement();
+        self.apply_completion_replacement(replacement, false);
+        self.sync_file_completion();
+    }
+
+    fn apply_completion(&mut self, item: CompletionItem, close: bool) {
+        self.apply_completion_replacement(item.replacement(), close);
+    }
+
+    fn apply_completion_replacement(&mut self, replacement: String, close: bool) {
         let (start, end) = self.file_completion.token_byte_range();
-        self.file_completion.close();
+        if close {
+            self.file_completion.close();
+        }
         self.input_box
             .buffer
             .replace_range_on_current_line(start, end, &replacement);
-        let val = self.input_box.buffer.value();
-        self.command_palette.sync(&val);
-        self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
+        let value = self.input_box.buffer.value();
+        self.command_palette.sync(&value);
+        self.sync_command_arguments(&value, self.input_box.buffer.cursor_byte_offset());
     }
 
     /// Typing path for a focused subagent tab: characters go into the shared

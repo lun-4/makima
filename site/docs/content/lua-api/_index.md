@@ -622,7 +622,9 @@ maki.api.register_completion_source({prefix}, {spec})
 
 Register a completion source for `prefix`. The source's `get_items(ctx)` is
 called once when the `@` popup opens; `ctx` is `{ mode = "...", models = {...} }`.
-Returns its candidates as an array of `{ label, kind, insertion, description? }`.
+Returns candidates as `{ label, kind, insertion, description? }`. `insertion`
+is a logical `@` reference. The UI adds quotes when its value contains
+whitespace or trailing sentence punctuation.
 
 **Parameters:**
 
@@ -648,11 +650,11 @@ maki.api.register_expander({prefix}, {f})
 ```
 
 Register a submit-time expander for `prefix`. Called with `{ value = "..." }`
-(the part after `prefix:`) for each `@prefix:value` token; returns
-`(string, nil)` to splice that string in-place of the token, or
-`(nil, err)` to flash `err` and abort the run. Unknown prefixes pass through
-verbatim, so register an expander under every alias you accept (e.g. both
-`"skill"` and `"s"`).
+(the decoded part after `prefix:`) for each `@prefix:value` token; quoted
+values may contain whitespace and punctuation. Returns `(string, nil)` to
+splice that string in place of the token, or `(nil, err)` to flash `err` and
+abort the run. Unknown prefixes pass through verbatim, so register an
+expander under every alias you accept (e.g. both `"skill"` and `"s"`).
 
 **Parameters:**
 

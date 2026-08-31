@@ -30,7 +30,10 @@ pub use splash::{
     SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull, SplashRow, SplashStyle, VersionInfo,
 };
 
-pub use api::completion::{AtToken, CompletionCtx, ItemSpec, at_is_token_start, parse_at_tokens};
+pub use api::completion::{
+    ActiveAtToken, AtToken, AtTokenStatus, CompletionCtx, ItemSpec, active_at_token,
+    at_is_token_start, parse_at_tokens,
+};
 
 #[cfg(feature = "test-support")]
 pub mod test_support {

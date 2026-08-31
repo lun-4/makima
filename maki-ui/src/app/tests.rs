@@ -6506,7 +6506,58 @@ fn enter_inserts_file_verbatim() {
     }
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.input_box.buffer.value(), "@docs/read me.md");
+    assert_eq!(app.input_box.buffer.value(), "@\"docs/read me.md\"");
+}
+
+#[test]
+fn space_closes_unquoted_completion_but_not_quoted_completion() {
+    let (_tmp, mut app, _backend) = completion_app();
+    for character in "@partial ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    assert!(!app.file_completion.is_active());
+
+    app.input_box.set_input(String::new());
+    for character in "@\"partial path".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    assert!(app.file_completion.is_active());
+}
+
+#[test]
+fn parent_path_completion_advances_then_finishes() {
+    let (_tmp, mut app, _backend) = completion_app();
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("project");
+    let sibling = parent.path().join("sibling");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("outside.txt"), b"outside").unwrap();
+    std::sync::Arc::get_mut(&mut app.state.session)
+        .unwrap()
+        .set_cwd(project.to_string_lossy().into_owned());
+
+    for character in "@../sib".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.file_completion.is_active());
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("@../sibling{}", std::path::MAIN_SEPARATOR)
+    );
+
+    for character in "out".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("@../sibling{}outside.txt", std::path::MAIN_SEPARATOR)
+    );
+    assert!(!app.file_completion.is_active());
 }
 
 #[test]
@@ -6619,6 +6670,20 @@ fn at_subagent_prefix_lists_subagents() {
         subagent_match_names(&app),
         vec!["research".to_string(), "general".to_string()]
     );
+}
+
+#[test]
+fn mode_switch_closes_completion_source_snapshot() {
+    let (_tmp, mut app, backend) = completion_app();
+    seed_subagents(&backend, "build");
+    for character in "@a:".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    assert!(app.file_completion.is_active());
+
+    app.set_mode_id("plan".into());
+    assert!(!app.file_completion.is_active());
 }
 
 #[test]

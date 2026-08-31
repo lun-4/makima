@@ -23,9 +23,14 @@ use crate::runtime::{
     CommandArgumentContext, CommandArgumentLifecycle, CommandArgumentLifecycleRequest,
 };
 
-/// An `@` at `at_byte` begins a token only if nothing but whitespace precedes
-/// it (or it starts the text). Shared by the popup (via `maki-ui`) and the
-/// expander parser so both agree on what counts as a reference.
+const TRAILING_PUNCTUATION: &[char] = &[
+    ',', '.', '!', '?', ')', ']', '}', '"', '\'', '\u{ff0c}', '\u{ff0e}', '\u{3002}', '\u{ff01}',
+    '\u{ff1f}', '\u{ff09}', '\u{ff3d}', '\u{ff5d}', '\u{ff02}', '\u{ff07}',
+];
+
+/// An `@` at `at_byte` begins a token only if it starts the text or the byte
+/// immediately before it is whitespace. Shared by the popup (via `maki-ui`)
+/// and the expander parser so both agree on what counts as a reference.
 pub fn at_is_token_start(text: &str, at_byte: usize) -> bool {
     text[..at_byte]
         .chars()
@@ -33,15 +38,16 @@ pub fn at_is_token_start(text: &str, at_byte: usize) -> bool {
         .is_none_or(char::is_whitespace)
 }
 
-/// One candidate offered by a completion source. `label` is the fuzzy-match
-/// target and display text; `kind` drives rendering via `Theme::completion_kinds`;
-/// `insertion` replaces the whole `@`-token (including its leading `@`); the
-/// optional `description` is shown beside the label.
+/// One candidate offered by a completion source.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemSpec {
+    /// Fuzzy-match target and display text, usually including `prefix:value`.
     pub label: String,
+    /// Rendering kind, looked up in `Theme::completion_kinds`.
     pub kind: String,
+    /// Text that replaces the whole `@`-token, including its leading `@`.
     pub insertion: String,
+    /// Optional text shown beside the label in the completion popup.
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -74,7 +80,9 @@ fn install_store<T: Default + Send + Sync + 'static>(lua: &Lua) {
 
 /// Register a completion source for `prefix`. The source's `get_items(ctx)` is
 /// called once when the `@` popup opens; `ctx` is `{ mode = "...", models = {...} }`.
-/// Returns its candidates as an array of `{ label, kind, insertion, description? }`.
+/// Returns candidates as `{ label, kind, insertion, description? }`. `insertion`
+/// is a logical `@` reference. The UI adds quotes when its value contains
+/// whitespace or trailing sentence punctuation.
 ///
 /// @param prefix string The prefix this source owns (e.g. "skill"); labels typically carry the prefix (`skill:review`) so the fuzzy filter narrows by kind as the user types.
 /// @param spec table `{ get_items = function(ctx) -> { {label, kind, insertion, description?} } }`.
@@ -101,11 +109,11 @@ fn register_completion_source(
 }
 
 /// Register a submit-time expander for `prefix`. Called with `{ value = "..." }`
-/// (the part after `prefix:`) for each `@prefix:value` token; returns
-/// `(string, nil)` to splice that string in-place of the token, or
-/// `(nil, err)` to flash `err` and abort the run. Unknown prefixes pass through
-/// verbatim, so register an expander under every alias you accept (e.g. both
-/// `"skill"` and `"s"`).
+/// (the decoded part after `prefix:`) for each `@prefix:value` token; quoted
+/// values may contain whitespace and punctuation. Returns `(string, nil)` to
+/// splice that string in place of the token, or `(nil, err)` to flash `err` and
+/// abort the run. Unknown prefixes pass through verbatim, so register an
+/// expander under every alias you accept (e.g. both `"skill"` and `"s"`).
 ///
 /// @param prefix string The prefix this expander owns (e.g. "skill" or "s").
 /// @param f function `{ value = string } -> (string, string|nil)`.
@@ -141,56 +149,271 @@ lua_table! {
     ]
 }
 
-/// A parsed `@` reference token: the lowercase prefix (empty for file
-/// references like `@src/main.rs`), the value, and its byte range in the
-/// source text (including the leading `@`).
-pub struct AtToken {
+/// Whether an `@` token is ready to be submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtTokenStatus {
+    /// The token has a non-empty value and valid delimiters.
+    Complete,
+    /// The token is still being typed or has malformed quoting.
+    Incomplete,
+}
+
+/// The status-bearing token shared by completion and submit-time parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveAtToken {
+    /// Lowercase prefix, or empty for a file reference such as `@src/main.rs`.
     pub prefix: String,
+    /// Decoded value, without a tagged prefix or surrounding quotes.
     pub value: String,
+    /// Byte range in the source text, including `@` and any quote delimiters.
+    pub range: std::ops::Range<usize>,
+    /// Opening quote when the value is quoted.
+    pub quote: Option<char>,
+    /// Whether this token is safe to submit.
+    pub status: AtTokenStatus,
+}
+
+/// A complete `@` reference passed to expanders and renderers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtToken {
+    /// Lowercase prefix, or empty for a file reference such as `@src/main.rs`.
+    pub prefix: String,
+    /// Decoded value, without a tagged prefix or surrounding quotes.
+    pub value: String,
+    /// Byte range in the source text, including `@` and any quote delimiters.
     pub range: std::ops::Range<usize>,
 }
 
-/// Scan `text` for `@`-tokens at token boundaries. A token is `@prefix:value`
-/// running to the next whitespace; a token without a `:` is a file reference
-/// (empty prefix). An empty value (e.g. `@skill:`) is not a reference yet and
-/// is skipped.
-pub fn parse_at_tokens(text: &str) -> Vec<AtToken> {
+impl ActiveAtToken {
+    fn into_submit_token(self) -> Option<AtToken> {
+        (self.status == AtTokenStatus::Complete && !self.value.is_empty()).then_some(AtToken {
+            prefix: self.prefix,
+            value: self.value,
+            range: self.range,
+        })
+    }
+}
+
+struct ScannedAtToken {
+    token: ActiveAtToken,
+    scan_end: usize,
+}
+
+fn is_trailing_punctuation(c: char) -> bool {
+    TRAILING_PUNCTUATION.contains(&c)
+}
+
+fn decode_quoted_value(value: &str, quote: char) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) if next == quote || next == '\\' => decoded.push(next),
+                Some(next) => {
+                    decoded.push('\\');
+                    decoded.push(next);
+                }
+                None => decoded.push('\\'),
+            }
+        } else {
+            decoded.push(c);
+        }
+    }
+    decoded
+}
+
+fn quoted_value_end(text: &str, value_start: usize, limit: usize, quote: char) -> (usize, bool) {
+    let mut escaped = false;
+    for (offset, c) in text[value_start..limit].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return (value_start + offset, true);
+        }
+    }
+    (limit, false)
+}
+
+fn raw_token_end(text: &str, start: usize, limit: usize) -> usize {
+    let mut end = start;
+    while end < limit {
+        let c = text[end..limit].chars().next().unwrap();
+        if c.is_whitespace() {
+            break;
+        }
+        end += c.len_utf8();
+    }
+    end
+}
+
+/// Scan one token with `limit` as the exclusive visible end. Passing the full
+/// text makes this the submit scanner; passing a cursor byte makes it the
+/// completion scanner for the same state machine.
+fn scan_at_token(text: &str, start: usize, limit: usize) -> Option<ScannedAtToken> {
+    if start >= limit || !text.get(start..)?.starts_with('@') || !at_is_token_start(text, start) {
+        return None;
+    }
+
+    let mut cursor = start + 1;
+    let first = text[start + 1..limit].chars().next();
+    let (prefix, value_start, quote) = if matches!(first, Some('\'') | Some('"')) {
+        (None, cursor, first)
+    } else {
+        let mut colon = None;
+        while cursor < limit {
+            let c = text[cursor..limit].chars().next().unwrap();
+            if c.is_whitespace() {
+                break;
+            }
+            if c == ':' {
+                colon = Some(cursor);
+                break;
+            }
+            cursor += c.len_utf8();
+        }
+        match colon {
+            Some(colon) => {
+                let value_start = colon + 1;
+                let quote = text[value_start..limit]
+                    .chars()
+                    .next()
+                    .filter(|c| matches!(c, '\'' | '"'));
+                (Some(text[start + 1..colon].to_owned()), value_start, quote)
+            }
+            None => (None, start + 1, None),
+        }
+    };
+    let prefix = prefix.unwrap_or_default().to_ascii_lowercase();
+
+    if let Some(quote) = quote {
+        let value_start = value_start + quote.len_utf8();
+        let (value_end, closed) = quoted_value_end(text, value_start, limit, quote);
+        let value = decode_quoted_value(&text[value_start..value_end], quote);
+        if !closed {
+            return Some(ScannedAtToken {
+                token: ActiveAtToken {
+                    prefix,
+                    value,
+                    range: start..limit,
+                    quote: Some(quote),
+                    status: AtTokenStatus::Incomplete,
+                },
+                scan_end: limit,
+            });
+        }
+
+        let token_end = value_end + quote.len_utf8();
+        let raw_end = raw_token_end(text, token_end, limit);
+        let malformed = text[token_end..raw_end]
+            .chars()
+            .any(|c| !is_trailing_punctuation(c));
+        return Some(ScannedAtToken {
+            token: ActiveAtToken {
+                prefix,
+                value: value.clone(),
+                range: start..if malformed { raw_end } else { token_end },
+                quote: Some(quote),
+                status: if malformed || value.is_empty() {
+                    AtTokenStatus::Incomplete
+                } else {
+                    AtTokenStatus::Complete
+                },
+            },
+            scan_end: raw_end,
+        });
+    }
+
+    let raw_end = raw_token_end(text, value_start, limit);
+    let mut token_end = raw_end;
+    while token_end > value_start {
+        let c = text[..token_end].chars().next_back().unwrap();
+        if !is_trailing_punctuation(c) {
+            break;
+        }
+        token_end -= c.len_utf8();
+    }
+    let value = text[value_start..token_end].to_owned();
+    let status = if value.is_empty() {
+        AtTokenStatus::Incomplete
+    } else {
+        AtTokenStatus::Complete
+    };
+    Some(ScannedAtToken {
+        token: ActiveAtToken {
+            prefix,
+            value,
+            range: start..if status == AtTokenStatus::Complete {
+                token_end
+            } else {
+                raw_end
+            },
+            quote: None,
+            status,
+        },
+        scan_end: raw_end,
+    })
+}
+
+/// Return the `@` token under a byte cursor. The returned range is suitable
+/// for replacing the active text, and `Incomplete` covers empty, unfinished,
+/// or malformed quoted input while retaining its decoded value and delimiter.
+pub fn active_at_token(text: &str, cursor_byte: usize) -> Option<ActiveAtToken> {
+    if cursor_byte > text.len() || !text.is_char_boundary(cursor_byte) || cursor_byte == 0 {
+        return None;
+    }
+
+    let mut i = 0;
+    let mut active = None;
+    while i < cursor_byte {
+        let c = text[i..cursor_byte].chars().next().unwrap();
+        if c == '@' && at_is_token_start(text, i) {
+            let scanned = scan_at_token(text, i, cursor_byte)?;
+            if scanned.scan_end >= cursor_byte || scanned.token.range.end == cursor_byte {
+                active = Some(scanned.token);
+            }
+            i = scanned.scan_end.max(i + c.len_utf8());
+        } else {
+            i += c.len_utf8();
+        }
+    }
+    active
+}
+
+fn scan_at_tokens(text: &str) -> Vec<ActiveAtToken> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < text.len() {
         let c = text[i..].chars().next().unwrap();
         if c == '@' && at_is_token_start(text, i) {
-            let start = i;
-            let mut j = i + c.len_utf8();
-            while j < text.len() {
-                let cc = text[j..].chars().next().unwrap();
-                if cc.is_whitespace() {
-                    break;
-                }
-                j += cc.len_utf8();
+            if let Some(scanned) = scan_at_token(text, i, text.len()) {
+                i = scanned.scan_end.max(i + c.len_utf8());
+                out.push(scanned.token);
+            } else {
+                i += c.len_utf8();
             }
-            let content = &text[start + 1..j];
-            if let Some((prefix, value)) = content.split_once(':')
-                && !value.is_empty()
-            {
-                out.push(AtToken {
-                    prefix: prefix.to_ascii_lowercase(),
-                    value: value.to_string(),
-                    range: start..j,
-                });
-            } else if !content.contains(':') {
-                out.push(AtToken {
-                    prefix: String::new(),
-                    value: content.to_string(),
-                    range: start..j,
-                });
-            }
-            i = j;
         } else {
             i += c.len_utf8();
         }
     }
     out
+}
+
+/// Scan `text` for complete references beginning at token boundaries.
+///
+/// A tagged reference is `@prefix:value`; its prefix is case-insensitive and
+/// its value ends at whitespace or trailing sentence punctuation. A colonless
+/// reference is a file value. Quotes preserve spaces and punctuation, and only
+/// an escaped matching quote or backslash is decoded. Incomplete or malformed
+/// tokens are omitted and consume their protected spans, so nested `@`
+/// markers are not parsed separately.
+pub fn parse_at_tokens(text: &str) -> Vec<AtToken> {
+    scan_at_tokens(text)
+        .into_iter()
+        .filter_map(ActiveAtToken::into_submit_token)
+        .collect()
 }
 
 /// Look up the expander `Function` for `prefix` across all plugins.
@@ -555,6 +778,140 @@ mod tests {
     }
 
     #[test]
+    fn parse_unquoted_value_stops_before_trailing_punctuation() {
+        let tokens = parse_at_tokens(
+            "@skill:pdf, @skill:pdf. @skill:pdf! @skill:pdf? @skill:pdf) @skill:pdf] @skill:pdf}",
+        );
+        assert_eq!(tokens.len(), 7);
+        assert!(tokens.iter().all(|token| token.value == "pdf"));
+        assert_eq!(tokens[0].range, 0..10);
+        assert_eq!(tokens[1].range, 12..22);
+    }
+
+    #[test]
+    fn parse_punctuation_inside_unquoted_value_is_preserved() {
+        let tokens = parse_at_tokens("@model:zai/glm-5-v2 @skill:release/review");
+        assert_eq!(tokens[0].value, "zai/glm-5-v2");
+        assert_eq!(tokens[1].value, "release/review");
+    }
+
+    #[test]
+    fn parse_full_width_trailing_punctuation() {
+        let tokens = parse_at_tokens("@skill:pdf， @skill:pdf。 @skill:pdf！ @skill:pdf？");
+        assert_eq!(tokens.len(), 4);
+        assert!(tokens.iter().all(|token| token.value == "pdf"));
+    }
+
+    #[test]
+    fn parse_quoted_file_reference_preserves_spaces_and_punctuation() {
+        let tokens = parse_at_tokens("read @\"docs/release notes.md\". then @'next?.md'");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].prefix, "");
+        assert_eq!(tokens[0].value, "docs/release notes.md");
+        assert_eq!(tokens[0].range, 5..29);
+        assert_eq!(tokens[1].prefix, "");
+        assert_eq!(tokens[1].value, "next?.md");
+        assert_eq!(tokens[1].range, 36..47);
+    }
+
+    #[test]
+    fn parse_quoted_tagged_reference_preserves_spaces_and_punctuation() {
+        let tokens = parse_at_tokens("@SKILL:\"release review!\", @s:'next step?'");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].prefix, "skill");
+        assert_eq!(tokens[0].value, "release review!");
+        assert_eq!(tokens[0].range, 0..24);
+        assert_eq!(tokens[1].prefix, "s");
+        assert_eq!(tokens[1].value, "next step?");
+    }
+
+    #[test]
+    fn parse_quoted_value_decodes_only_quote_and_backslash_escapes() {
+        let tokens = parse_at_tokens(r#"@skill:"release\ review" @skill:'it\'s' @skill:"a\nb""#);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].value, "release\\ review");
+        assert_eq!(tokens[1].value, "it's");
+        assert_eq!(tokens[2].value, "a\\nb");
+    }
+
+    #[test]
+    fn scan_unfinished_quoted_value_is_incomplete_and_parse_skips_it() {
+        let text = "use @skill:\"release review now";
+        let tokens = scan_at_tokens(text);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].prefix, "skill");
+        assert_eq!(tokens[0].value, "release review now");
+        assert_eq!(tokens[0].range, 4..text.len());
+        assert_eq!(tokens[0].quote, Some('"'));
+        assert_eq!(tokens[0].status, AtTokenStatus::Incomplete);
+        assert!(parse_at_tokens(text).is_empty());
+    }
+
+    #[test]
+    fn malformed_quoted_value_consumes_nested_at_without_submitting() {
+        let text = r#"use @skill:"release @model:zai/glm-5"#;
+        let tokens = scan_at_tokens(text);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].range, 4..text.len());
+        assert_eq!(tokens[0].status, AtTokenStatus::Incomplete);
+        assert_eq!(tokens[0].value, "release @model:zai/glm-5");
+        assert!(parse_at_tokens(text).is_empty());
+    }
+
+    #[test]
+    fn malformed_closed_quote_consumes_nested_at_without_submitting() {
+        let text = r#"use @skill:"release"broken@model:zai/glm-5"#;
+        let tokens = scan_at_tokens(text);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].range, 4..text.len());
+        assert_eq!(tokens[0].status, AtTokenStatus::Incomplete);
+        assert_eq!(tokens[0].value, "release");
+        assert!(parse_at_tokens(text).is_empty());
+    }
+
+    #[test]
+    fn active_at_token_uses_shared_scanner_state() {
+        let text = "go @SKILL:\"release review\", now";
+        let active = active_at_token(text, 26).unwrap();
+        assert_eq!(active.prefix, "skill");
+        assert_eq!(active.value, "release review");
+        assert_eq!(active.range, 3..26);
+        assert_eq!(active.quote, Some('"'));
+        assert_eq!(active.status, AtTokenStatus::Complete);
+    }
+
+    #[test]
+    fn active_at_token_reports_incomplete_quote_and_protects_nested_at() {
+        let text = r#"go @skill:"release @model:zai/glm-5"#;
+        let active = active_at_token(text, text.len()).unwrap();
+        assert_eq!(active.prefix, "skill");
+        assert_eq!(active.value, "release @model:zai/glm-5");
+        assert_eq!(active.range, 3..text.len());
+        assert_eq!(active.quote, Some('"'));
+        assert_eq!(active.status, AtTokenStatus::Incomplete);
+    }
+
+    #[test]
+    fn parse_empty_tagged_values_are_skipped() {
+        let tokens = parse_at_tokens("@skill: @skill:\"\" @skill:' '");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].prefix, "skill");
+        assert_eq!(tokens[0].value, " ");
+    }
+
+    #[test]
+    fn parse_punctuation_only_unprefixed_value_is_incomplete() {
+        let text = "@...";
+        let token = active_at_token(text, text.len()).unwrap();
+        assert_eq!(token.prefix, "");
+        assert_eq!(token.value, "");
+        assert_eq!(token.range, 0..text.len());
+        assert_eq!(token.quote, None);
+        assert_eq!(token.status, AtTokenStatus::Incomplete);
+        assert!(parse_at_tokens(text).is_empty());
+    }
+
+    #[test]
     fn parse_file_reference_has_empty_prefix() {
         let tokens = parse_at_tokens("read @src/main.rs and @/abs/path ok");
         assert_eq!(tokens.len(), 2);
@@ -583,6 +940,28 @@ mod tests {
     }
 
     #[test]
+    fn expand_quoted_value_decodes_before_dispatch() {
+        let lua = lua_with_stores();
+        register_expander(&lua, "skill", |v| (Some(format!("<{v}>")), None));
+        assert_eq!(
+            smol::block_on(expand_references(
+                &lua,
+                r#"use @skill:"release review" now"#
+            ))
+            .unwrap(),
+            "use <release review> now"
+        );
+        assert_eq!(
+            smol::block_on(expand_references(
+                &lua,
+                r#"use @skill:"release\"review" now"#
+            ))
+            .unwrap(),
+            "use <release\"review> now"
+        );
+    }
+
+    #[test]
     fn expand_unknown_prefix_passes_through() {
         let lua = lua_with_stores();
         register_expander(&lua, "skill", |v| (Some(format!("<skill:{v}>")), None));
@@ -599,6 +978,10 @@ mod tests {
         assert_eq!(
             smol::block_on(expand_references(&lua, "@src/main.rs @skill:rev")).unwrap(),
             "@src/main.rs <skill:rev>"
+        );
+        assert_eq!(
+            smol::block_on(expand_references(&lua, r#"@"docs/release notes.md"."#)).unwrap(),
+            r#"@"docs/release notes.md"."#
         );
     }
 

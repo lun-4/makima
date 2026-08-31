@@ -1,4 +1,6 @@
+use std::io;
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -30,29 +32,27 @@ const COL_GAP: usize = 2;
 const PENDING_DEBOUNCE_MS: u128 = 100;
 const MAX_MATERIALIZED: u32 = 640;
 const FILE_KIND: &str = "file";
-
-/// `maki_lua::at_is_token_start` re-export so the popup and the (Lua-side)
-/// expander parser agree on what counts as a reference. Kept here as the
-/// canonical entry for `maki-ui` callers.
-pub(crate) use maki_lua::at_is_token_start;
+const DIRECTORY_KIND: &str = "directory";
+const DIRECTORY_SUFFIX: char = std::path::MAIN_SEPARATOR;
 
 /// Byte range of the `@`-token under the cursor (including its leading `@`),
-/// or `None` when the most recent `@` does not begin a token (e.g. `foo@bar`).
+/// or `None` when the most recent `@` does not begin a token.
 pub fn at_token_range(line: &str, cursor_chars: usize) -> Option<(usize, usize)> {
     let cursor_byte = TextBuffer::char_to_byte(line, cursor_chars);
-    let before = &line[..cursor_byte];
-    let bytes = before.as_bytes();
-    let mut i = before.len();
-    while i > 0 {
-        i -= 1;
-        if bytes[i] != b'@' {
-            continue;
+    maki_lua::active_at_token(line, cursor_byte).map(|token| (token.range.start, token.range.end))
+}
+
+/// Query for the active token, decoded by the shared Lua parser. The query
+/// excludes the leading `@`, prefix, and quote delimiters.
+pub fn at_token_query(line: &str, cursor_chars: usize) -> Option<String> {
+    let cursor_byte = TextBuffer::char_to_byte(line, cursor_chars);
+    maki_lua::active_at_token(line, cursor_byte).map(|token| {
+        if token.prefix.is_empty() {
+            token.value
+        } else {
+            format!("{}:{}", token.prefix, token.value)
         }
-        if at_is_token_start(line, i) {
-            return Some((i, cursor_byte));
-        }
-    }
-    None
+    })
 }
 
 /// A generic completion candidate. `label` is the fuzzy-match target and
@@ -70,7 +70,29 @@ pub struct CompletionItem {
 impl CompletionItem {
     /// Text that replaces the whole `@`-token (including its leading `@`).
     pub(crate) fn replacement(&self) -> String {
-        self.insertion.clone()
+        normalize_completion_insertion(
+            &self.insertion,
+            self.kind == FILE_KIND || self.kind == DIRECTORY_KIND,
+        )
+    }
+
+    pub(crate) fn advance_replacement(&self) -> String {
+        let replacement = self.replacement();
+        let Some(quote) = replacement
+            .chars()
+            .nth(1)
+            .filter(|quote| matches!(quote, '\'' | '"'))
+        else {
+            return replacement;
+        };
+        replacement
+            .strip_suffix(quote)
+            .unwrap_or(&replacement)
+            .to_string()
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.kind == DIRECTORY_KIND
     }
 
     fn display(&self) -> String {
@@ -81,13 +103,101 @@ impl CompletionItem {
     }
 
     fn file(path: String) -> Self {
+        Self::path(path, false)
+    }
+
+    fn directory(path: String) -> Self {
+        Self::path(path, true)
+    }
+
+    fn path(mut path: String, directory: bool) -> Self {
+        if directory && !path.ends_with(['/', '\\']) {
+            path.push(DIRECTORY_SUFFIX);
+        }
+        let kind = if directory { DIRECTORY_KIND } else { FILE_KIND };
         Self {
             label: path.clone(),
-            kind: FILE_KIND.to_string(),
+            kind: kind.to_string(),
             insertion: format!("@{path}"),
             description: None,
         }
     }
+}
+
+fn normalize_completion_insertion(insertion: &str, file: bool) -> String {
+    let delimiter_start = insertion.trim_end_matches(char::is_whitespace).len();
+    let (token, delimiter) = insertion.split_at(delimiter_start);
+    let Some(body) = token.strip_prefix('@') else {
+        return insertion.to_string();
+    };
+    let (prefix, value) = if file {
+        ("", body)
+    } else {
+        body.split_once(':')
+            .map_or(("", body), |(prefix, value)| (prefix, value))
+    };
+    if matches!(value.chars().next(), Some('\'' | '"'))
+        && value.len() >= 2
+        && value.chars().next() == value.chars().next_back()
+    {
+        return insertion.to_string();
+    }
+    let unsafe_value = value.chars().any(char::is_whitespace)
+        || value
+            .chars()
+            .next_back()
+            .is_some_and(is_trailing_punctuation);
+    if !unsafe_value {
+        return insertion.to_string();
+    }
+    let quote = if value.contains('"') && !value.contains('\'') {
+        '\''
+    } else {
+        '"'
+    };
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == quote || character == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    let prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}:")
+    };
+    format!("@{prefix}{quote}{escaped}{quote}{delimiter}")
+}
+
+fn is_trailing_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        ',' | '.'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+            | '"'
+            | '\''
+            | '\u{ff0c}'
+            | '\u{ff0e}'
+            | '\u{3002}'
+            | '\u{ff01}'
+            | '\u{ff1f}'
+            | '\u{ff09}'
+            | '\u{ff3d}'
+            | '\u{ff5d}'
+            | '\u{ff02}'
+            | '\u{ff07}'
+    )
+}
+
+#[derive(Debug, Clone)]
+struct FileCandidate {
+    path: String,
+    is_directory: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,12 +219,25 @@ struct QueryIntent {
 pub enum CompletionAction {
     Consumed,
     Select(CompletionItem),
+    /// Move filesystem discovery into the selected directory and refresh.
+    Advance(CompletionItem),
     Close,
     Passthrough,
 }
 
+enum Discovery {
+    Project {
+        nucleo: Nucleo<()>,
+        done_rx: flume::Receiver<()>,
+        cancel: Arc<AtomicBool>,
+    },
+    Explicit {
+        candidates: Vec<FileCandidate>,
+    },
+}
+
 struct Session {
-    nucleo: Nucleo<()>,
+    discovery: Discovery,
     query: String,
     query_refresh_pending: bool,
     intent: QueryIntent,
@@ -135,11 +258,10 @@ struct Session {
     scroll_offset: usize,
     viewport_height: usize,
 
-    cancel: Arc<AtomicBool>,
-    done_rx: flume::Receiver<()>,
     started_at: Instant,
 
     walking: bool,
+    root: PathBuf,
     matching: bool,
     visible: bool,
 
@@ -148,21 +270,138 @@ struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        if let Discovery::Project { cancel, .. } = &self.discovery {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
+}
+
+trait FileResolver: Send + Sync {
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>>;
+}
+
+#[derive(Debug, Default)]
+struct RealFileResolver;
+
+impl FileResolver for RealFileResolver {
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+        discover_one_level(path)
+    }
+}
+
+fn resolve_file_path(cwd: &Path, home: Option<&Path>, value: &str) -> PathBuf {
+    let path = if value == "~" {
+        home.map_or_else(|| PathBuf::from(value), Path::to_path_buf)
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home.map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(value))
+    } else {
+        PathBuf::from(value)
+    };
+    if path.is_relative() {
+        cwd.join(path)
+    } else {
+        path
+    }
+}
+
+fn discovery_path(cwd: &Path, home: Option<&Path>, value: &str) -> (PathBuf, String, String) {
+    let path = resolve_file_path(cwd, home, value);
+    let lists_path = value.ends_with(['/', '\\']) || matches!(value, "~" | "." | "..");
+    if lists_path {
+        let display_prefix = if value.ends_with(['/', '\\']) {
+            value.to_string()
+        } else {
+            format!("{value}{DIRECTORY_SUFFIX}")
+        };
+        return (path, String::new(), display_prefix);
+    }
+    let leaf = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let display_prefix = value.strip_suffix(&leaf).unwrap_or(value).to_string();
+    (
+        path.parent().unwrap_or(cwd).to_path_buf(),
+        leaf,
+        display_prefix,
+    )
+}
+
+fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() && !metadata.is_dir() {
+            continue;
+        }
+        entries.push(FileCandidate {
+            path: entry.file_name().to_string_lossy().into_owned(),
+            is_directory: metadata.is_dir(),
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+fn explicit_candidates(
+    resolver: &dyn FileResolver,
+    cwd: &Path,
+    home: Option<&Path>,
+    value: &str,
+) -> Vec<FileCandidate> {
+    let (parent, leaf, display_prefix) = discovery_path(cwd, home, value);
+    resolver
+        .read_dir(&parent)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|candidate| {
+            leaf.is_empty()
+                || completion_match(
+                    &leaf,
+                    &candidate.path,
+                    CompletionMatchOptions {
+                        case_matching: CaseMatching::Smart,
+                        normalization: Normalization::Smart,
+                    },
+                )
+                .is_some()
+        })
+        .map(|candidate| FileCandidate {
+            path: format!("{display_prefix}{}", candidate.path),
+            is_directory: candidate.is_directory,
+        })
+        .collect()
 }
 
 pub struct FileCompletionMenu {
     session: Option<Session>,
+    resolver: Arc<dyn FileResolver>,
+    home: Option<PathBuf>,
 }
 
 impl FileCompletionMenu {
     pub fn new() -> Self {
-        Self { session: None }
+        Self::with_resolver(Arc::new(RealFileResolver), maki_storage::paths::home())
+    }
+
+    fn with_resolver(resolver: Arc<dyn FileResolver>, home: Option<PathBuf>) -> Self {
+        Self {
+            session: None,
+            resolver,
+            home,
+        }
     }
 
     /// Open the popup. `items` are the non-file candidates gathered from Lua
-    /// completion sources by the caller; the file walker is spawned for `cwd`.
+    /// completion sources by the caller. Files are discovered relative to cwd.
     pub fn open(
         &mut self,
         cwd: &str,
@@ -171,10 +410,31 @@ impl FileCompletionMenu {
         token_byte_range: (usize, usize),
     ) {
         self.close();
-
-        let Some((nucleo, done_rx, cancel_clone)) = super::file_picker::spawn_file_walker(cwd)
-        else {
-            return;
+        let root = PathBuf::from(cwd);
+        let (discovery, walking) = if query.starts_with(['~', '/', '.']) {
+            (
+                Discovery::Explicit {
+                    candidates: explicit_candidates(
+                        self.resolver.as_ref(),
+                        &root,
+                        self.home.as_deref(),
+                        query,
+                    ),
+                },
+                false,
+            )
+        } else {
+            let Some((nucleo, done_rx, cancel)) = super::file_picker::spawn_file_walker(cwd) else {
+                return;
+            };
+            (
+                Discovery::Project {
+                    nucleo,
+                    done_rx,
+                    cancel,
+                },
+                true,
+            )
         };
 
         let ref_items = items
@@ -191,7 +451,7 @@ impl FileCompletionMenu {
             .collect();
 
         let session = Session {
-            nucleo,
+            discovery,
             query: String::new(),
             query_refresh_pending: false,
             intent: QueryIntent {
@@ -211,10 +471,9 @@ impl FileCompletionMenu {
             cols: 1,
             scroll_offset: 0,
             viewport_height: 0,
-            cancel: cancel_clone,
-            done_rx,
             started_at: Instant::now(),
-            walking: true,
+            walking,
+            root,
             matching: false,
             visible: false,
             token_byte_range,
@@ -257,42 +516,81 @@ impl FileCompletionMenu {
     }
 
     pub fn sync_query(&mut self, query: &str) {
-        let Some(s) = &mut self.session else {
+        let Some(session) = &mut self.session else {
             return;
         };
-        let retrieval_query = query.to_lowercase();
-        s.nucleo.pattern.reparse(
-            0,
-            &retrieval_query,
-            CaseMatching::Smart,
-            Normalization::Smart,
-            false,
-        );
-        let intent = parse_query(query);
-        let query_changed = s.query != query;
-        if query_changed {
-            s.query_refresh_pending =
-                !s.file_matches.is_empty() && s.nucleo.injector().injected_items() > 0;
-            s.coarse_match_count = 0;
-            s.materialized_count = 0;
-            s.final_match_count = 0;
-            s.truncated = false;
+        let explicit = query.starts_with(['~', '/', '.']);
+        let was_explicit = matches!(session.discovery, Discovery::Explicit { .. });
+        if explicit {
+            if let Discovery::Project { cancel, .. } = &session.discovery {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            session.discovery = Discovery::Explicit {
+                candidates: explicit_candidates(
+                    self.resolver.as_ref(),
+                    &session.root,
+                    self.home.as_deref(),
+                    query,
+                ),
+            };
+            session.walking = false;
+            session.matching = false;
+            session.query_refresh_pending = false;
+            session.ref_matches.clear();
+            session.file_matches.clear();
+        } else {
+            if was_explicit {
+                let Some((nucleo, done_rx, cancel)) =
+                    super::file_picker::spawn_file_walker(&session.root.to_string_lossy())
+                else {
+                    return;
+                };
+                session.discovery = Discovery::Project {
+                    nucleo,
+                    done_rx,
+                    cancel,
+                };
+                session.walking = true;
+                session.started_at = Instant::now();
+                session.file_matches.clear();
+            }
+            if let Discovery::Project { nucleo, .. } = &mut session.discovery {
+                nucleo.pattern.reparse(
+                    0,
+                    &query.to_lowercase(),
+                    CaseMatching::Smart,
+                    Normalization::Smart,
+                    false,
+                );
+            }
+            let query_changed = session.query != query;
+            if query_changed {
+                session.query_refresh_pending = matches!(&session.discovery, Discovery::Project { nucleo, .. } if nucleo.injector().injected_items() > 0);
+            }
+            session.ref_matches = fuzzy_match(
+                &parse_query(query),
+                session
+                    .ref_items
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(order, (label, item))| (label, item, order)),
+            );
         }
-        s.intent = intent;
-        s.query = query.to_string();
-        s.selected = 0;
-        s.scroll_offset = 0;
-
-        s.ref_matches = fuzzy_match(
-            &s.intent,
-            s.ref_items
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(order, (label, item))| (label, item, order)),
-        );
-        if !s.query_refresh_pending {
-            rebuild_combined(s);
+        session.intent = parse_query(query);
+        session.query = query.to_string();
+        session.selected = 0;
+        session.scroll_offset = 0;
+        session.coarse_match_count = 0;
+        session.materialized_count = 0;
+        session.final_match_count = 0;
+        session.truncated = false;
+        if explicit {
+            refresh_explicit_matches(session);
+            rebuild_combined(session);
+            session.visible = !session.matches.is_empty();
+        } else if !session.query_refresh_pending {
+            rebuild_combined(session);
         }
     }
 
@@ -308,6 +606,7 @@ impl FileCompletionMenu {
                     return CompletionAction::Passthrough;
                 }
                 return match s.matches.get(s.selected).map(|c| c.item.clone()) {
+                    Some(item) if item.is_directory() => CompletionAction::Advance(item),
                     Some(item) => CompletionAction::Select(item),
                     None => CompletionAction::Passthrough,
                 };
@@ -336,27 +635,41 @@ impl FileCompletionMenu {
             return (Dirty::NO, None);
         };
 
-        let status = s.nucleo.tick(0);
-        s.matching = status.running;
-        let mut dirty = Dirty::from(status.changed);
-
-        if s.walking {
-            match s.done_rx.try_recv() {
-                Ok(()) => {
-                    s.walking = false;
-                    dirty = Dirty::YES;
+        let mut dirty = Dirty::NO;
+        let mut status_changed = false;
+        if let Discovery::Project {
+            nucleo, done_rx, ..
+        } = &mut s.discovery
+        {
+            let status = nucleo.tick(0);
+            s.matching = status.running;
+            status_changed = status.changed;
+            dirty = Dirty::from(status.changed);
+            if s.walking {
+                match done_rx.try_recv() {
+                    Ok(()) => {
+                        s.walking = false;
+                        dirty = Dirty::YES;
+                    }
+                    Err(flume::TryRecvError::Disconnected) => {
+                        warn!("{WALKER_CRASHED_MSG}: walker channel disconnected");
+                        s.walking = false;
+                        dirty = Dirty::YES;
+                    }
+                    Err(flume::TryRecvError::Empty) => {}
                 }
-                Err(flume::TryRecvError::Disconnected) => {
-                    warn!("{WALKER_CRASHED_MSG}: walker thread panicked");
-                    self.session = None;
-                    return (Dirty::YES, Some(WALKER_CRASHED_MSG.into()));
-                }
-                Err(flume::TryRecvError::Empty) => {}
             }
+        }
+        if matches!(s.discovery, Discovery::Explicit { .. }) {
+            s.walking = false;
+            s.matching = false;
         }
 
         if !s.visible {
-            let has_files = s.nucleo.injector().injected_items() > 0;
+            let has_files = match &s.discovery {
+                Discovery::Project { nucleo, .. } => nucleo.injector().injected_items() > 0,
+                Discovery::Explicit { candidates } => !candidates.is_empty(),
+            };
             let has_refs = !s.ref_matches.is_empty();
             let debounce_elapsed = s.started_at.elapsed().as_millis() >= PENDING_DEBOUNCE_MS;
 
@@ -367,14 +680,18 @@ impl FileCompletionMenu {
         }
 
         if let Some(s) = self.session.as_mut() {
-            let refresh_finished = s.query_refresh_pending && !status.running;
+            let refresh_finished = s.query_refresh_pending && !s.matching;
             if refresh_finished {
                 refresh_file_matches(s);
                 rebuild_combined(s);
                 clamp_selection(s);
                 s.query_refresh_pending = false;
-            } else if !s.query_refresh_pending && status.changed {
+            } else if !s.query_refresh_pending && status_changed {
                 refresh_file_matches(s);
+                rebuild_combined(s);
+                clamp_selection(s);
+            } else if matches!(s.discovery, Discovery::Explicit { .. }) {
+                refresh_explicit_matches(s);
                 rebuild_combined(s);
                 clamp_selection(s);
             }
@@ -555,7 +872,10 @@ fn fuzzy_match(
 }
 
 fn refresh_file_matches(s: &mut Session) {
-    let snapshot = s.nucleo.snapshot();
+    let Discovery::Project { nucleo, .. } = &s.discovery else {
+        return;
+    };
+    let snapshot = nucleo.snapshot();
     let coarse_match_count = snapshot.matched_item_count();
     let materialized_count = coarse_match_count.min(MAX_MATERIALIZED);
     let mut paths: Vec<String> = snapshot
@@ -568,11 +888,35 @@ fn refresh_file_matches(s: &mut Session) {
     s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
-        if let Some(candidate) = match_candidate(CompletionItem::file(path), &s.intent, 0, order) {
+        let item = CompletionItem::file(path);
+        if let Some(candidate) = match_candidate(item, &s.intent, 0, order) {
             s.file_matches.push(candidate);
         }
     }
     s.final_match_count = s.file_matches.len() as u32;
+}
+
+fn refresh_explicit_matches(s: &mut Session) {
+    let Discovery::Explicit { candidates } = &s.discovery else {
+        return;
+    };
+    let mut paths = candidates.clone();
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
+    s.file_matches.clear();
+    for (order, candidate) in paths.into_iter().enumerate() {
+        let item = if candidate.is_directory {
+            CompletionItem::directory(candidate.path)
+        } else {
+            CompletionItem::file(candidate.path)
+        };
+        if let Some(candidate) = match_candidate(item, &s.intent, 0, order) {
+            s.file_matches.push(candidate);
+        }
+    }
+    s.coarse_match_count = s.file_matches.len() as u32;
+    s.materialized_count = s.coarse_match_count;
+    s.final_match_count = s.coarse_match_count;
+    s.truncated = false;
 }
 
 fn rebuild_combined(s: &mut Session) {
@@ -764,6 +1108,13 @@ mod tests {
         }
     }
 
+    fn project_nucleo_mut(session: &mut Session) -> &mut Nucleo<()> {
+        let Discovery::Project { nucleo, .. } = &mut session.discovery else {
+            panic!("test session must use project discovery");
+        };
+        nucleo
+    }
+
     fn session_with_items(items: Vec<ItemSpec>) -> FileCompletionMenu {
         let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
         let (_, done_rx) = flume::bounded(1);
@@ -781,7 +1132,11 @@ mod tests {
             })
             .collect();
         menu.session = Some(Session {
-            nucleo,
+            discovery: Discovery::Project {
+                nucleo,
+                done_rx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
             query: String::new(),
             query_refresh_pending: false,
             intent: QueryIntent {
@@ -801,15 +1156,97 @@ mod tests {
             cols: 1,
             scroll_offset: 0,
             viewport_height: 0,
-            cancel: Arc::new(AtomicBool::new(false)),
-            done_rx,
             started_at: Instant::now(),
             walking: true,
+            root: PathBuf::new(),
             matching: false,
             visible: false,
             token_byte_range: (0, 0),
         });
         menu
+    }
+
+    struct CountingResolver {
+        reads: std::sync::Mutex<Vec<PathBuf>>,
+        entries: Vec<FileCandidate>,
+    }
+
+    impl FileResolver for CountingResolver {
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+            self.reads.lock().unwrap().push(path.to_path_buf());
+            Ok(self.entries.clone())
+        }
+    }
+
+    #[test]
+    fn explicit_discovery_reads_parent_once_and_marks_directories() {
+        let cwd = PathBuf::from("/workspace/project");
+        let resolver = CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![
+                FileCandidate {
+                    path: "alpha.txt".into(),
+                    is_directory: false,
+                },
+                FileCandidate {
+                    path: "archive".into(),
+                    is_directory: true,
+                },
+            ],
+        };
+        let candidates = explicit_candidates(&resolver, &cwd, None, "../ar");
+        assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[cwd.join("..")]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "../archive");
+        assert!(candidates[0].is_directory);
+    }
+
+    #[test]
+    fn home_discovery_preserves_tilde_namespace() {
+        let cwd = PathBuf::from("/workspace/project");
+        let home = PathBuf::from("/home/tester");
+        let resolver = CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "notes.txt".into(),
+                is_directory: false,
+            }],
+        };
+        let candidates = explicit_candidates(&resolver, &cwd, Some(&home), "~/not");
+        assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[home]);
+        assert_eq!(candidates[0].path, "~/notes.txt");
+    }
+
+    #[test]
+    fn quoted_directory_advance_keeps_quote_open() {
+        let item = CompletionItem::directory("../release notes".into());
+        assert_eq!(
+            item.advance_replacement(),
+            format!("@\"../release notes{}", DIRECTORY_SUFFIX)
+        );
+        assert_eq!(
+            item.replacement(),
+            format!("@\"../release notes{}\"", DIRECTORY_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn explicit_directory_selection_returns_advance() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        let item = CompletionItem::directory("../archive".into());
+        session.matches.push(Candidate {
+            item,
+            matching: completion_match_default("ar", "../archive").unwrap(),
+            source_rank: 0,
+            source_order: 0,
+        });
+        session.visible = true;
+        session.walking = false;
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Enter)),
+            CompletionAction::Advance(item) if item.insertion.ends_with(DIRECTORY_SUFFIX)
+        ));
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -835,13 +1272,39 @@ mod tests {
         at_token_range(line, cursor)
     }
 
+    #[test_case("@src tail", 9 => None; "unquoted_whitespace_closes")]
+    #[test_case("@\"src tail", 10 => Some((0, 10)); "unfinished_quote_keeps_spaces")]
+    #[test_case("@\"src tail\"", 11 => Some((0, 11)); "closed_quote_is_active_at_end")]
+    fn active_at_token_quote_and_whitespace_cases(
+        line: &str,
+        cursor: usize,
+    ) -> Option<(usize, usize)> {
+        at_token_range(line, cursor)
+    }
+
+    #[test_case("@main.rs" => "@main.rs"; "safe_file")]
+    #[test_case("@docs/read me.md" => "@\"docs/read me.md\""; "file_space")]
+    #[test_case("@skill:release review " => "@skill:\"release review\" "; "tagged_space_and_delimiter")]
+    #[test_case("@file?" => "@\"file?\""; "trailing_punctuation")]
+    #[test_case("@\"already quoted\"" => "@\"already quoted\""; "already_quoted")]
+    #[test_case("@say\"what?" => "@'say\"what?'"; "alternate_delimiter")]
+    fn completion_replacement_quotes_unsafe_values(insertion: &str) -> String {
+        normalize_completion_insertion(insertion, false)
+    }
+
+    #[test]
+    fn windows_drive_file_insertion_quotes_whole_path() {
+        let item = CompletionItem::file(r"C:\Program Files\notes.txt".into());
+        assert_eq!(item.replacement(), r#"@"C:\\Program Files\\notes.txt""#);
+    }
+
     #[test]
     fn insertion_replaces_token_keeps_single_at() {
         let mut buf = TextBuffer::new("foo @xyz".into());
         let range = at_token_range(&buf.lines()[0], 8).unwrap();
         let item = CompletionItem::file("docs/read me.md".into());
         buf.replace_range_on_current_line(range.0, range.1, &item.replacement());
-        assert_eq!(buf.value(), "foo @docs/read me.md");
+        assert_eq!(buf.value(), "foo @\"docs/read me.md\"");
     }
 
     #[test]
@@ -1065,7 +1528,7 @@ mod tests {
             source_rank: 0,
             source_order: 0,
         }];
-        s.nucleo.restart(true);
+        project_nucleo_mut(s).restart(true);
         s.file_matches.clear();
         menu.sync_query("sk");
         let s = menu.session.as_ref().unwrap();
@@ -1501,12 +1964,16 @@ mod tests {
         let mut menu = session_with_items(Vec::new());
         let session = menu.session.as_mut().unwrap();
         session.walking = false;
-        session.nucleo.injector().push((), |_, columns| {
-            columns[0] = Utf32String::from("weak_match");
-        });
-        session.nucleo.injector().push((), |_, columns| {
-            columns[0] = Utf32String::from("needle-file");
-        });
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("weak_match");
+            });
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("needle-file");
+            });
         menu.sync_query("needle");
         for _ in 0..100 {
             let _ = menu.tick();
@@ -1528,12 +1995,16 @@ mod tests {
         {
             let session = menu.session.as_mut().unwrap();
             session.walking = false;
-            session.nucleo.injector().push((), |_, columns| {
-                columns[0] = Utf32String::from("zeta-file");
-            });
-            session.nucleo.injector().push((), |_, columns| {
-                columns[0] = Utf32String::from("alpha-file");
-            });
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| {
+                    columns[0] = Utf32String::from("zeta-file");
+                });
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| {
+                    columns[0] = Utf32String::from("alpha-file");
+                });
         }
         menu.sync_query("");
         for _ in 0..100 {
@@ -1559,14 +2030,16 @@ mod tests {
         {
             let session = menu.session.as_mut().unwrap();
             session.walking = false;
-            session.nucleo.injector().push((), |_, columns| {
-                columns[0] = Utf32String::from("skill:example");
-            });
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| {
+                    columns[0] = Utf32String::from("skill:example");
+                });
         }
         menu.sync_query("skill:");
         {
             let session = menu.session.as_mut().unwrap();
-            while session.nucleo.tick(0).running {}
+            while project_nucleo_mut(session).tick(0).running {}
             refresh_file_matches(session);
         }
 
@@ -1585,11 +2058,13 @@ mod tests {
             let session = menu.session.as_mut().unwrap();
             session.walking = false;
             for index in 0..=MAX_MATERIALIZED {
-                session.nucleo.injector().push((), |_, columns| {
-                    columns[0] = Utf32String::from(format!("file-{index:03}.rs").as_str());
-                });
+                project_nucleo_mut(session)
+                    .injector()
+                    .push((), |_, columns| {
+                        columns[0] = Utf32String::from(format!("file-{index:03}.rs").as_str());
+                    });
             }
-            while session.nucleo.tick(0).running {}
+            while project_nucleo_mut(session).tick(0).running {}
             refresh_file_matches(session);
         }
         let session = menu.session.as_ref().unwrap();
@@ -1609,12 +2084,14 @@ mod tests {
     fn refresh_clamps_selection_after_reordering() {
         let mut menu = session_with_items(Vec::new());
         let session = menu.session.as_mut().unwrap();
-        session.nucleo.injector().push((), |_, columns| {
-            columns[0] = Utf32String::from("needle-file");
-        });
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("needle-file");
+            });
         session.walking = false;
         session.selected = 99;
-        session.nucleo.tick(0);
+        project_nucleo_mut(session).tick(0);
         menu.sync_query("needle");
         let _ = menu.tick();
         assert_eq!(menu.session.as_ref().unwrap().selected, 0);
@@ -1624,9 +2101,11 @@ mod tests {
     fn refresh_then_accept_inserts_selected_item() {
         let mut menu = session_with_items(Vec::new());
         let session = menu.session.as_mut().unwrap();
-        session.nucleo.injector().push((), |_, columns| {
-            columns[0] = Utf32String::from("needle-file");
-        });
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("needle-file");
+            });
         session.walking = false;
         menu.sync_query("needle");
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
@@ -1658,9 +2137,11 @@ mod tests {
             let session = menu.session.as_mut().unwrap();
             session.walking = false;
             for path in ["alpha-file", "beta-file", "gamma-file"] {
-                session.nucleo.injector().push((), |_, columns| {
-                    columns[0] = Utf32String::from(path);
-                });
+                project_nucleo_mut(session)
+                    .injector()
+                    .push((), |_, columns| {
+                        columns[0] = Utf32String::from(path);
+                    });
             }
         }
         menu.sync_query("");
@@ -1716,12 +2197,12 @@ mod tests {
         let mut menu = session_with_items(Vec::new());
         let s = menu.session.as_mut().unwrap();
         for path in ["Cargo.lock", "justfile", "maki-ui/src/app/mod.rs"] {
-            s.nucleo.injector().push((), |_, cols| {
+            project_nucleo_mut(s).injector().push((), |_, cols| {
                 cols[0] = Utf32String::from(path);
             });
         }
         s.walking = false;
-        while s.nucleo.tick(0).running {}
+        while project_nucleo_mut(s).tick(0).running {}
 
         menu.sync_query("Cargo");
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
