@@ -14,7 +14,7 @@ use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
-use crate::runtime::{active_task_id, job_task_id, with_jobs};
+use crate::runtime::{active_task_id, job_task_id, loading_plugin_generation, with_jobs};
 
 const READER_BUF_SIZE: usize = 8 * 1024;
 
@@ -29,6 +29,7 @@ pub(crate) enum JobEvent {
 pub(crate) enum JobOwner {
     Task(u64),
     Plugin(Arc<str>),
+    PluginCandidate { plugin: Arc<str>, generation: u64 },
 }
 
 struct JobMeta {
@@ -210,11 +211,12 @@ impl JobStore {
 
     pub fn drain_plugin_events(&self, buf: &mut Vec<(u32, JobEvent)>) {
         buf.clear();
-        for (&id, job) in self
-            .jobs
-            .iter()
-            .filter(|(_, job)| matches!(job.owner, JobOwner::Plugin(_)))
-        {
+        for (&id, job) in self.jobs.iter().filter(|(_, job)| {
+            matches!(
+                job.owner,
+                JobOwner::Plugin(_) | JobOwner::PluginCandidate { .. }
+            )
+        }) {
             if let Some(ref rx) = job.event_rx {
                 while let Ok(event) = rx.try_recv() {
                     buf.push((id, event));
@@ -239,6 +241,27 @@ impl JobStore {
             .collect::<Vec<_>>();
         for id in ids {
             self.remove(lua, id, true);
+        }
+    }
+
+    pub fn abort_candidate(&mut self, lua: &Lua, plugin: &str, generation: u64) {
+        let owner = JobOwner::PluginCandidate {
+            plugin: Arc::from(plugin),
+            generation,
+        };
+        self.kill_owner(lua, &owner);
+    }
+
+    pub fn promote_candidate(&mut self, plugin: &str, generation: u64) {
+        for job in self.jobs.values_mut() {
+            if job.owner
+                == (JobOwner::PluginCandidate {
+                    plugin: Arc::from(plugin),
+                    generation,
+                })
+            {
+                job.owner = JobOwner::Plugin(Arc::from(plugin));
+            }
         }
     }
 
@@ -301,7 +324,11 @@ impl JobMeta {
     fn can_access(&self, task_id: Option<u64>, plugin: &str) -> bool {
         match &self.owner {
             JobOwner::Task(owner_id) => task_id == Some(*owner_id),
-            JobOwner::Plugin(owner_plugin) => owner_plugin.as_ref() == plugin,
+            JobOwner::Plugin(owner_plugin)
+            | JobOwner::PluginCandidate {
+                plugin: owner_plugin,
+                ..
+            } => owner_plugin.as_ref() == plugin,
         }
     }
 }
@@ -382,7 +409,12 @@ fn jobstart(
         None | Some("task") => job_task_id(lua).map(JobOwner::Task).ok_or_else(|| {
             mlua::Error::runtime("jobstart: no active task; use owner = \"plugin\"")
         })?,
-        Some("plugin") => JobOwner::Plugin(Arc::clone(&plugin)),
+        Some("plugin") => loading_plugin_generation(lua)
+            .map(|generation| JobOwner::PluginCandidate {
+                plugin: Arc::clone(&plugin),
+                generation,
+            })
+            .unwrap_or_else(|| JobOwner::Plugin(Arc::clone(&plugin))),
         Some(other) => {
             return Err(mlua::Error::runtime(format!(
                 "jobstart: unknown owner {other:?}; expected \"task\" or \"plugin\""

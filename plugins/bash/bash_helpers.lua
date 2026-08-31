@@ -12,12 +12,6 @@ local M = {}
 local VERDICT_TOOL_NAME = "classifier_verdict"
 local VERDICT_ACK = "Verdict recorded."
 
-M.auto_mode_on = false
-
-function M.set_auto_mode(v)
-  M.auto_mode_on = not not v
-end
-
 function M.defaults()
   return { auto_mode = false }
 end

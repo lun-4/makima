@@ -4,6 +4,7 @@ mod command_router;
 pub(crate) mod shared_queue;
 
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +66,7 @@ pub(crate) struct AgentHandles {
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
     mailbox: Option<SessionMailbox>,
+    cwd: Arc<ArcSwap<PathBuf>>,
     task: smol::Task<()>,
 }
 
@@ -78,6 +80,7 @@ impl AgentHandles {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
+        initial_cwd: PathBuf,
         session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
@@ -93,6 +96,7 @@ impl AgentHandles {
             config,
             tool_output_lines,
             permissions,
+            Arc::new(ArcSwap::from_pointee(initial_cwd)),
             mcp_handle,
             mcp_config_errors,
             session_id,
@@ -101,6 +105,14 @@ impl AgentHandles {
             model_policy,
             system_prompt,
         )
+    }
+
+    pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
+        self.mailbox.clone()
+    }
+
+    pub(crate) fn cwd_slot(&self) -> Arc<ArcSwap<PathBuf>> {
+        Arc::clone(&self.cwd)
     }
 
     pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
@@ -167,6 +179,7 @@ impl AgentHandles {
             config,
             tool_output_lines,
             permissions,
+            Arc::clone(&self.cwd),
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
             Some(SessionRef::from(app.state.session.id)),
@@ -230,6 +243,7 @@ fn spawn_agent_internal(
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
+    cwd: Arc<ArcSwap<PathBuf>>,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     session_id: Option<SessionRef>,
@@ -252,7 +266,7 @@ fn spawn_agent_internal(
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = session_id
         .as_ref()
-        .map(|session_id| SessionMailbox::register(session_id.id()));
+        .map(|session_id| SessionMailbox::new(session_id.id()));
 
     spawn_command_router(
         cmd_rx,
@@ -262,6 +276,7 @@ fn spawn_agent_internal(
 
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
+        Arc::clone(&cwd),
         config,
         tool_output_lines,
         initial_history,
@@ -300,6 +315,7 @@ fn spawn_agent_internal(
         model_policy,
         system_prompt,
         mailbox,
+        cwd,
         task,
     }
 }
@@ -373,6 +389,7 @@ mod tests {
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
+            PathBuf::from("/tmp"),
             None,
             maki_providers::Timeouts::default(),
             EventHandle::disconnected_for_test(),

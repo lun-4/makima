@@ -264,6 +264,16 @@ impl UserData for LuaCtx {
             Ok((Some(session_id.id().to_string()), None))
         });
 
+        methods.add_method("resolve_path", |_, this, path: String| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("resolve_path"));
+            };
+            match agent.resolve_path(&path) {
+                Ok(path) => Ok((Some(path), None)),
+                Err(error) => Ok((None, Some(error))),
+            }
+        });
+
         methods.add_method("live_buf", |lua, this, buf: mlua::AnyUserData| {
             if matches!(this.caps, Caps::Restore { .. }) {
                 return Ok(this.cap_err_pair("live_buf"));
@@ -348,12 +358,14 @@ impl UserData for LuaCtx {
                 let Some(loaded) = this.loaded_instructions().cloned() else {
                     return Ok(this.cap_err_pair("find_instructions"));
                 };
+                let Some(cwd) = this.agent().map(|agent| agent.cwd.clone()) else {
+                    return Ok(this.cap_err_pair("find_instructions"));
+                };
                 // Nothing may hold the ctx borrow across the wait: a cancel
                 // hook firing meanwhile needs `ctx:finish`, which takes it
                 // mutably.
                 drop(this);
                 let results = smol::unblock(move || {
-                    let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
                     maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded)
                 })

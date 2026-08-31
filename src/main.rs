@@ -68,6 +68,7 @@ mod command_attachments {
                         .collect(),
                 })
             }),
+            lease_committer: None,
         })
     }
 }

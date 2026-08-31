@@ -40,12 +40,15 @@ use maki_config::RawConfig;
 
 use crate::api::autocmd::{self, AutocmdStore};
 use crate::api::completion::{self, CompletionCtx, ItemSpec};
-use crate::api::create_maki_global;
 use crate::api::r#fn::{JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::FsBackend;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
+use crate::api::session_option::{
+    PendingSessionOptions, SessionOptionStore, SessionOptionValidation, SessionOptionValidators,
+    commit_pending, unload as unload_session_options,
+};
 use crate::api::slot::SlotStore;
 use crate::api::store::{self, Store};
 use crate::api::timer::{self, TimerStore};
@@ -60,6 +63,7 @@ use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::picker::{PickerCallbacks, PickerEvent};
 use crate::api::util::setup::ConfigStore;
+use crate::api::{PluginLoadContext, create_maki_global};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
@@ -148,6 +152,7 @@ pub(crate) struct PromptHintRegistration {
 }
 
 pub(crate) type PromptHintCallbacks = BTreeMap<Arc<str>, Vec<PromptHintRegistration>>;
+pub(crate) type PendingPromptHintCallbacks = Arc<Mutex<PromptHintCallbacks>>;
 
 /// Load/clear drain in-flight tools first so we never mutate a
 /// plugin environment while a tool call is still running.
@@ -188,6 +193,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
+        cwd: PathBuf,
         reply: flume::Sender<Option<String>>,
     },
     ClearPlugin {
@@ -1810,7 +1816,16 @@ struct CommandPublisher {
     command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
 }
 
-struct LoadingPlugin(Arc<str>);
+pub(crate) struct LoadingPlugin(pub(crate) Arc<str>, pub(crate) u64);
+
+pub(crate) fn loading_plugin(lua: &Lua) -> Option<Arc<str>> {
+    lua.app_data_ref::<LoadingPlugin>()
+        .map(|loading| Arc::clone(&loading.0))
+}
+
+pub(crate) fn loading_plugin_generation(lua: &Lua) -> Option<u64> {
+    lua.app_data_ref::<LoadingPlugin>().map(|loading| loading.1)
+}
 
 struct LuaRuntime {
     /// Held for its Drop (joins the poker thread). Field order doesn't
@@ -1850,6 +1865,7 @@ impl LuaRuntime {
         hint_writer: HintWriter,
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
+        session_options: maki_agent::session_coordinator::SessionOptionCatalog,
         state_dir: Option<PathBuf>,
         fs: Arc<dyn FsBackend>,
     ) -> Result<Self, PluginError> {
@@ -1884,6 +1900,10 @@ impl LuaRuntime {
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
+        lua.set_app_data(SessionOptionStore::default());
+        lua.set_app_data(SessionOptionValidators::default());
+        lua.set_app_data(SessionOptionValidation::default());
+        lua.set_app_data(session_options);
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(TimerStore::new());
         lua.set_app_data(Store::default());
@@ -1989,6 +2009,18 @@ impl LuaRuntime {
                 return;
             }
         }
+    }
+
+    fn abort_candidate_jobs(&self, plugin: &str, generation: u64) {
+        with_jobs(&self.lua, |store| {
+            store.abort_candidate(&self.lua, plugin, generation);
+        });
+    }
+
+    fn promote_candidate_jobs(&self, plugin: &str, generation: u64) {
+        with_jobs(&self.lua, |store| {
+            store.promote_candidate(plugin, generation)
+        });
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
@@ -2197,6 +2229,241 @@ impl LuaRuntime {
             .collect()
     }
 
+    fn discard_pending_commands(&mut self, pending: crate::api::util::command::PendingCommandMap) {
+        let entries = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+        for entry in entries.into_values() {
+            crate::api::util::command::remove_command_entry(&self.lua, entry);
+        }
+    }
+
+    fn discard_pending_keymaps(&mut self, pending: crate::api::keymap::PendingKeymapStore) {
+        let bindings = pending.lock().unwrap_or_else(|e| e.into_inner()).drain();
+        for binding in bindings {
+            let _ = self.lua.remove_registry_value(binding.callback);
+        }
+    }
+
+    fn validate_pending_commands(
+        &self,
+        plugin: &Arc<str>,
+        pending: &crate::api::util::command::PendingCommandMap,
+    ) -> Result<(), PluginError> {
+        let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let registrations = command_registrations(
+            Some(&pending),
+            plugin,
+            &self.tx,
+            &self.command_arguments,
+            &self.command_argument_lifecycle,
+        );
+        maki_commands::validate_registrations(registrations)
+            .map(|_| ())
+            .map_err(|error| PluginError::Lua {
+                plugin: plugin.to_string(),
+                source: mlua::Error::runtime(format!("invalid command registration: {error}")),
+            })
+    }
+
+    fn commit_pending_registrations(
+        &mut self,
+        plugin: &Arc<str>,
+        pending_commands: crate::api::util::command::PendingCommandMap,
+        pending_keymaps: crate::api::keymap::PendingKeymapStore,
+    ) -> Result<(), PluginError> {
+        let mut pending_commands = pending_commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let registrations = command_registrations(
+            Some(&pending_commands),
+            plugin,
+            &self.tx,
+            &self.command_arguments,
+            &self.command_argument_lifecycle,
+        );
+        replace_command_producer(
+            &self.command_registry,
+            &self.command_producers,
+            plugin,
+            registrations,
+        )
+        .map_err(|error| PluginError::Lua {
+            plugin: plugin.to_string(),
+            source: mlua::Error::runtime(format!("invalid command registration: {error}")),
+        })?;
+        let candidate = std::mem::take(&mut *pending_commands);
+        drop(pending_commands);
+        let old = {
+            self.lua
+                .app_data_mut::<CommandHandlerMap>()
+                .and_then(|mut live| live.insert(Arc::clone(plugin), candidate))
+        };
+        if let Some(entries) = old {
+            if let Some(mut retired) = self
+                .lua
+                .app_data_mut::<crate::api::util::command::RetiredCommandHandlerMap>()
+            {
+                retired.push((Arc::clone(plugin), entries));
+            }
+            let _ = self.tx.send(Request::DropCommandKeys {
+                plugin: Arc::clone(plugin),
+            });
+        }
+        let candidate = pending_keymaps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain();
+        let mut old_callbacks = Vec::new();
+        if let Some(mut live) = self.lua.app_data_mut::<KeymapStore>() {
+            old_callbacks.extend(live.clear_plugin(plugin));
+            for binding in candidate {
+                if let Some(old) = live.insert_stored(binding) {
+                    old_callbacks.push(old);
+                }
+            }
+            let entries = live.snapshot_entries();
+            drop(live);
+            if let Some(writer) = self.lua.app_data_ref::<KeymapWriter>() {
+                writer.publish(entries);
+            }
+        }
+        for key in old_callbacks {
+            let _ = self.lua.remove_registry_value(key);
+        }
+        Ok(())
+    }
+
+    fn commit_pending_completion(
+        &mut self,
+        plugin: &Arc<str>,
+        sources: Arc<Mutex<completion::PendingCompletionStore>>,
+        expanders: Arc<Mutex<completion::PendingExpanderStore>>,
+    ) {
+        let sources = std::mem::take(&mut sources.lock().unwrap_or_else(|e| e.into_inner()).0);
+        let expanders = std::mem::take(&mut expanders.lock().unwrap_or_else(|e| e.into_inner()).0);
+        if let Some(mut store) = self.lua.app_data_mut::<completion::CompletionStore>() {
+            store.0.insert(Arc::clone(plugin), sources);
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<completion::ExpanderStore>() {
+            store.0.insert(Arc::clone(plugin), expanders);
+        }
+    }
+
+    fn commit_pending_options(
+        &mut self,
+        plugin: &Arc<str>,
+        pending: crate::api::options::PendingPluginOptionSpecs,
+    ) {
+        if let Some(specs) = pending.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>()
+        {
+            store.insert(Arc::clone(plugin), specs);
+        } else if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
+            store.remove(plugin);
+        }
+    }
+
+    fn discard_pending_autocmds(&mut self, pending: crate::api::autocmd::PendingAutocmdStore) {
+        drop(pending.lock().unwrap_or_else(|error| error.into_inner()));
+    }
+
+    fn discard_pending_timers(&mut self, pending: crate::api::timer::PendingTimerStore) {
+        let keys = pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .discard_candidate();
+        for key in keys {
+            let _ = self.lua.remove_registry_value(key);
+        }
+    }
+
+    fn commit_pending_autocmds(&mut self, pending: crate::api::autocmd::PendingAutocmdStore) {
+        let candidate =
+            std::mem::take(&mut *pending.lock().unwrap_or_else(|error| error.into_inner()));
+        if let Some(mut live) = self.lua.app_data_mut::<AutocmdStore>() {
+            *live = candidate;
+        }
+    }
+
+    fn commit_pending_timers(&mut self, pending: crate::api::timer::PendingTimerStore) {
+        let candidate = std::mem::replace(
+            &mut *pending.lock().unwrap_or_else(|error| error.into_inner()),
+            TimerStore::new(),
+        );
+        let old = self
+            .lua
+            .app_data_mut::<TimerStore>()
+            .map(|mut live| live.replace_entries(candidate))
+            .unwrap_or_default();
+        for key in old {
+            let _ = self.lua.remove_registry_value(key);
+        }
+    }
+
+    fn discard_pending_plugin_slice(&mut self, pending: PendingPromptHintCallbacks) {
+        let map = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+        for regs in map.into_values() {
+            for reg in regs {
+                if let HintContent::Callback(key) = reg.content {
+                    let _ = self.lua.remove_registry_value(key);
+                }
+            }
+        }
+    }
+
+    fn discard_pending_completion(
+        &mut self,
+        sources: Arc<Mutex<completion::PendingCompletionStore>>,
+        expanders: Arc<Mutex<completion::PendingExpanderStore>>,
+    ) {
+        let _ = std::mem::take(&mut sources.lock().unwrap_or_else(|e| e.into_inner()).0);
+        let _ = std::mem::take(&mut expanders.lock().unwrap_or_else(|e| e.into_inner()).0);
+    }
+
+    fn commit_pending_store(&mut self, plugin: &str, pending: crate::api::store::PendingStore) {
+        let candidate = pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain();
+        let candidate_events: Vec<(String, String)> = candidate
+            .iter()
+            .map(|(registry, key, _, _)| (registry.clone(), key.clone()))
+            .collect();
+        let mut removed = if let Some(mut store) = self.lua.app_data_mut::<Store>() {
+            let removed = store.clear_plugin(plugin);
+            for (registry, key, owner, value) in candidate {
+                store
+                    .register(registry, key, owner, value)
+                    .expect("candidate store was validated during plugin load");
+            }
+            removed
+        } else {
+            Vec::new()
+        };
+        removed.sort_unstable();
+        removed.dedup();
+        for registry in removed {
+            if candidate_events.iter().any(|event| event.0 == registry) {
+                continue;
+            }
+            if let Ok(data) = self
+                .lua
+                .create_table()
+                .and_then(|table| table.set("registry", registry.as_str()).map(|_| table))
+            {
+                autocmd::dispatch(&self.lua, store::STORE_CHANGED, None, LuaValue::Table(data));
+            }
+        }
+        for (registry, key) in candidate_events {
+            if let Ok(data) = self.lua.create_table().and_then(|table| {
+                table.set("registry", registry)?;
+                table.set("key", key)?;
+                Ok(table)
+            }) {
+                autocmd::dispatch(&self.lua, store::STORE_CHANGED, None, LuaValue::Table(data));
+            }
+        }
+    }
+
     fn discard_pending(&mut self, tools: Vec<PendingTool>) {
         for t in tools {
             if let Err(e) = self.lua.remove_registry_value(t.handler_key) {
@@ -2268,12 +2535,17 @@ impl LuaRuntime {
     /// `plugins.<name>` options only reach a plugin through
     /// `maki.api.register_options`; if the plugin never declared any, every
     /// key the user set is a typo or unsupported, so fail the load loudly.
-    fn check_opts_consumed(&self, name: &str, opts: &PluginOpts) -> Result<(), mlua::Error> {
+    fn check_opts_consumed(
+        &self,
+        name: &str,
+        opts: &PluginOpts,
+        pending: &crate::api::options::PendingPluginOptionSpecs,
+    ) -> Result<(), mlua::Error> {
         if opts.is_empty()
-            || self
-                .lua
-                .app_data_ref::<PluginOptionSpecs>()
-                .is_some_and(|store| store.contains_key(name))
+            || pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
         {
             return Ok(());
         }
@@ -2308,12 +2580,59 @@ impl LuaRuntime {
         // Scoped to this load so a failed load simply drops its rules; only a
         // successful load commits them to the store.
         let pending_rules: PendingRules = Arc::default();
+        let pending_commands = Arc::new(Mutex::new(HashMap::new()));
+        let pending_keymaps = Arc::new(Mutex::new(KeymapStore::new()));
+        let pending_store = Arc::new(Mutex::new(Store::default()));
+        let pending_options = Arc::new(Mutex::new(None));
+        let pending_sources = Arc::new(Mutex::new(completion::PendingCompletionStore::default()));
+        let pending_expanders = Arc::new(Mutex::new(completion::PendingExpanderStore::default()));
+        let mut candidate_slots = self
+            .lua
+            .app_data_ref::<SlotStore>()
+            .map(|store| store.clone())
+            .unwrap_or_default();
+        candidate_slots.clear_plugin(&name);
+        let pending_slots = Arc::new(Mutex::new(candidate_slots));
+        let pending_prompts = Arc::new(Mutex::new(PromptHintCallbacks::default()));
+        let pending_hint = Arc::new(Mutex::new(None));
+        let pending_autocmds = Arc::new(Mutex::new({
+            let mut candidate = self
+                .lua
+                .app_data_ref::<AutocmdStore>()
+                .map(|store| store.clone())
+                .unwrap_or_default();
+            candidate.clear_plugin(&name);
+            candidate
+        }));
+        let pending_timers = Arc::new(Mutex::new(
+            TimerStore::candidate(&self.lua, &name).map_err(&map_err)?,
+        ));
 
         let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
+        let generation = self
+            .lua
+            .app_data_ref::<SessionOptionStore>()
+            .map_or(1, |store| store.next_generation(&name));
+        let pending_session_options = PendingSessionOptions::new(Arc::clone(&name), generation);
+        let context = PluginLoadContext {
+            pending: Arc::clone(&self.pending),
+            pending_rules: Arc::clone(&pending_rules),
+            pending_autocmds: Arc::clone(&pending_autocmds),
+            pending_timers: Arc::clone(&pending_timers),
+            pending_session_options: pending_session_options.clone(),
+            pending_commands: Arc::clone(&pending_commands),
+            pending_keymaps: Arc::clone(&pending_keymaps),
+            pending_store: Arc::clone(&pending_store),
+            pending_options: Arc::clone(&pending_options),
+            pending_sources: Arc::clone(&pending_sources),
+            pending_expanders: Arc::clone(&pending_expanders),
+            pending_slots: Arc::clone(&pending_slots),
+            pending_prompts: Arc::clone(&pending_prompts),
+            pending_hint: Arc::clone(&pending_hint),
+        };
         let maki = create_maki_global(
             &self.lua,
-            Arc::clone(&self.pending),
-            Arc::clone(&pending_rules),
+            context,
             Arc::clone(&name),
             self.ui_action_tx.clone(),
             permissions,
@@ -2329,8 +2648,8 @@ impl LuaRuntime {
 
         let env = self.build_env(maki, require_root).map_err(&map_err)?;
 
-        self.drop_plugin_keys(&name);
-        self.lua.set_app_data(LoadingPlugin(Arc::clone(&name)));
+        self.lua
+            .set_app_data(LoadingPlugin(Arc::clone(&name), generation));
 
         let main_fn = self
             .lua
@@ -2347,11 +2666,22 @@ impl LuaRuntime {
         };
 
         self.lua.remove_app_data::<LoadingPlugin>();
-        let exec_result = exec_result.and_then(|()| self.check_opts_consumed(&name, &opts));
+        let exec_result =
+            exec_result.and_then(|()| self.check_opts_consumed(&name, &opts, &pending_options));
         if let Err(e) = exec_result {
+            self.abort_candidate_jobs(&name, generation);
             let stale = self.drain_pending();
             self.discard_pending(stale);
-            self.drop_plugin_keys(&name);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(pending_sources, pending_expanders);
+            self.discard_pending_autocmds(pending_autocmds);
+            self.discard_pending_timers(pending_timers);
+            self.discard_pending_plugin_slice(pending_prompts);
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
             return Err(map_err(e));
         }
 
@@ -2389,9 +2719,44 @@ impl LuaRuntime {
             })
             .collect();
 
-        if let Err(e) = self.registry.replace_plugin(&name, registry_entries) {
+        if let Err(error) = self.validate_pending_commands(&name, &pending_commands) {
+            self.abort_candidate_jobs(&name, generation);
             self.discard_pending(pending);
-            self.drop_plugin_keys(&name);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(
+                Arc::clone(&pending_sources),
+                Arc::clone(&pending_expanders),
+            );
+            self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
+            self.discard_pending_timers(Arc::clone(&pending_timers));
+            self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(error);
+        }
+
+        let previous_registry_entries = self.registry.plugin_entries(&name);
+        if let Err(e) = self.registry.replace_plugin(&name, registry_entries) {
+            self.abort_candidate_jobs(&name, generation);
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(
+                Arc::clone(&pending_sources),
+                Arc::clone(&pending_expanders),
+            );
+            self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
+            self.discard_pending_timers(Arc::clone(&pending_timers));
+            self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
             return Err(match e {
                 RegistryError::NameConflict { name: n, .. } => PluginError::NameConflict {
                     plugin: name.to_string(),
@@ -2400,12 +2765,106 @@ impl LuaRuntime {
             });
         }
 
-        if let Err(error) = self.publish_commands(&name) {
-            self.registry.clear_plugin(&name);
+        let session_options = self
+            .lua
+            .app_data_ref::<maki_agent::session_coordinator::SessionOptionCatalog>()
+            .expect("session option catalog installed")
+            .clone();
+        if let Err(error) =
+            commit_pending(&self.lua, &session_options, &pending_session_options).await
+        {
+            self.abort_candidate_jobs(&name, generation);
+            if let Err(restore_error) = self
+                .registry
+                .replace_plugin(&name, previous_registry_entries)
+            {
+                tracing::error!(plugin = %name, error = %restore_error, "failed to restore plugin tools after session option validation");
+            }
             self.discard_pending(pending);
-            self.drop_plugin_keys(&name);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(
+                Arc::clone(&pending_sources),
+                Arc::clone(&pending_expanders),
+            );
+            self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
+            self.discard_pending_timers(Arc::clone(&pending_timers));
+            self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(PluginError::Lua {
+                plugin: name.to_string(),
+                source: mlua::Error::runtime(error),
+            });
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
+            store.commit(Arc::clone(&name), generation);
+        }
+        if let Err(error) =
+            self.commit_pending_registrations(&name, pending_commands, pending_keymaps)
+        {
+            self.abort_candidate_jobs(&name, generation);
             return Err(error);
         }
+        self.commit_pending_autocmds(pending_autocmds);
+        self.commit_pending_timers(pending_timers);
+        if let Some(candidate) = self
+            .lua
+            .remove_app_data::<crate::api::slot::PendingSlotStore>()
+        {
+            let candidate = candidate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(mut live) = self.lua.app_data_mut::<SlotStore>() {
+                *live = candidate;
+            }
+        }
+        if let Some(candidate) = self.lua.remove_app_data::<PendingPromptHintCallbacks>()
+            && let Some(mut live) = self.lua.app_data_mut::<PromptHintCallbacks>()
+            && let Some(old) = live.insert(
+                Arc::clone(&name),
+                candidate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&name)
+                    .unwrap_or_default(),
+            )
+        {
+            for reg in old {
+                if let HintContent::Callback(key) = reg.content {
+                    let _ = self.lua.remove_registry_value(key);
+                }
+            }
+        }
+        if let Some(candidate) = self
+            .lua
+            .remove_app_data::<crate::api::ui::PendingHintStore>()
+        {
+            let value = candidate.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(mut live) = self.lua.app_data_mut::<HintStore>() {
+                live.clear_plugin(&name);
+                if let Some(spans) = value {
+                    live.set(Arc::clone(&name), spans);
+                }
+                let entries = live.snapshot_entries();
+                drop(live);
+                if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
+                    writer.publish(entries);
+                }
+            }
+        }
+        self.commit_pending_store(&name, pending_store);
+        self.commit_pending_options(&name, pending_options);
+        self.commit_pending_completion(&name, pending_sources, pending_expanders);
+        with_jobs(&self.lua, |store| {
+            store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::clone(&name)));
+        });
+        self.promote_candidate_jobs(&name, generation);
+        self.warm_tools.borrow_mut().clear();
 
         let keys: HashMap<Arc<str>, ToolKeys> = pending
             .into_iter()
@@ -2438,32 +2897,19 @@ impl LuaRuntime {
         Ok(())
     }
 
-    fn command_registrations(&self, plugin: &Arc<str>) -> Result<Vec<Registration>, PluginError> {
-        let commands = self.lua.app_data_ref::<CommandHandlerMap>();
-        Ok(command_registrations(
-            commands.as_ref().and_then(|commands| commands.get(plugin)),
-            plugin,
-            &self.tx,
-            &self.command_arguments,
-            &self.command_argument_lifecycle,
-        ))
-    }
-
-    fn publish_commands(&mut self, plugin: &Arc<str>) -> Result<(), PluginError> {
-        let registrations = self.command_registrations(plugin)?;
-        replace_command_producer(
-            &self.command_registry,
-            &self.command_producers,
-            plugin,
-            registrations,
-        )
-        .map_err(|error| PluginError::Lua {
-            plugin: plugin.to_string(),
-            source: mlua::Error::runtime(format!("invalid command registration: {error}")),
-        })
-    }
-
-    fn clear_plugin(&mut self, plugin: &str) {
+    async fn clear_plugin(&mut self, plugin: &str) {
+        let session_options = self
+            .lua
+            .app_data_ref::<maki_agent::session_coordinator::SessionOptionCatalog>()
+            .expect("session option catalog installed")
+            .clone();
+        if let Err(error) = unload_session_options(&self.lua, &session_options, plugin).await {
+            tracing::warn!(plugin, %error, "failed to unload plugin session options");
+            return;
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
+            store.remove(plugin);
+        }
         self.registry.clear_plugin(plugin);
         self.plugin_rules.remove(plugin);
         self.drop_plugin_keys(plugin);
@@ -2543,7 +2989,13 @@ impl LuaRuntime {
     /// Computes the tool's mutable-path callback result. `None` when the
     /// tool has no callback or the callback returns nil/non-string, meaning
     /// the invocation does not participate in write serialization.
-    async fn compute_mutable_path(&self, plugin: &str, tool: &str, input: Value) -> Option<String> {
+    async fn compute_mutable_path(
+        &self,
+        plugin: &str,
+        tool: &str,
+        input: Value,
+        cwd: PathBuf,
+    ) -> Option<String> {
         let (func, lua_input) = plugin_fn(
             &self.lua,
             &self.plugins,
@@ -2553,13 +3005,16 @@ impl LuaRuntime {
             |tk| tk.mutable_path.as_ref(),
             &input,
         )?;
-        let result: LuaValue = match run_detached(&self.lua, func.call_async(lua_input)).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(plugin, tool, error = %e, "mutable_path callback failed");
-                return None;
-            }
-        };
+        let context = self.lua.create_table().ok()?;
+        context.set("cwd", cwd.to_string_lossy().as_ref()).ok()?;
+        let result: LuaValue =
+            match run_detached(&self.lua, func.call_async((lua_input, context))).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(plugin, tool, error = %e, "mutable_path callback failed");
+                    return None;
+                }
+            };
         match result {
             LuaValue::String(s) => s.to_str().ok().map(|s| s.to_string()),
             _ => None,
@@ -3149,6 +3604,7 @@ pub(crate) struct LuaThread {
     pub hint_reader: crate::api::util::command::HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub modes: Arc<maki_agent::ModeRegistry>,
+    pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
 }
 
 /// Pulls one `splash.render` frame. The shared Lua keeps the last task's
@@ -3207,6 +3663,7 @@ fn splash_frame(
 pub struct SpawnConfig {
     pub command_registry: CommandRegistry,
     pub modes: Arc<maki_agent::ModeRegistry>,
+    pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
     pub bundled_dirs: &'static [&'static Dir<'static>],
     pub jit: bool,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -3220,6 +3677,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
     let SpawnConfig {
         command_registry,
         modes,
+        session_options,
         bundled_dirs,
         jit,
         plugin_rules,
@@ -3257,6 +3715,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
     let (hint_writer, hint_reader) = HintWriter::new();
     let runtime_command_arguments = command_arguments.clone();
     let runtime_command_argument_lifecycle = command_argument_lifecycle.clone();
+    let runtime_session_options = session_options.clone();
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
@@ -3275,6 +3734,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                 hint_writer,
                 jit,
                 plugin_rules,
+                runtime_session_options,
                 state_dir,
                 fs,
             ) {
@@ -3445,7 +3905,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         }
                         Request::ClearPlugin { plugin, reply } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            rt.clear_plugin(&plugin);
+                            rt.clear_plugin(&plugin).await;
                             let _ = reply.send(());
                         }
                         Request::DropCommandKeys { plugin } => {
@@ -3568,9 +4028,10 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             plugin,
                             tool,
                             input,
+                            cwd,
                             reply,
                         } => {
-                            let res = rt.compute_mutable_path(&plugin, &tool, input).await;
+                            let res = rt.compute_mutable_path(&plugin, &tool, input, cwd).await;
                             let _ = reply.send(res);
                         }
                         Request::RunInitLua {
@@ -3840,6 +4301,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
         hint_reader,
         ui_action_rx,
         modes,
+        session_options,
     })
 }
 

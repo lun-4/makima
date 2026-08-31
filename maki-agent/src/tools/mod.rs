@@ -227,6 +227,7 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    pub cwd: PathBuf,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
@@ -271,6 +272,17 @@ impl ToolContext {
     pub fn restrict_write_to(&self) -> Option<PathBuf> {
         self.modes.restrict_write_to(&self.mode)
     }
+
+    pub fn resolve_path(&self, path: &str) -> Result<String, String> {
+        resolve_path_from(path, &self.cwd)
+    }
+
+    pub fn resolve_search_path(&self, path: Option<&str>) -> Result<String, String> {
+        match path {
+            Some(path) => self.resolve_path(path),
+            None => Ok(self.cwd.to_string_lossy().into_owned()),
+        }
+    }
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -281,6 +293,11 @@ pub enum ToolLive {
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
+    let cwd = env::current_dir().map_err(|error| format!("cwd error: {error}"))?;
+    resolve_path_from(path, &cwd)
+}
+
+fn resolve_path_from(path: &str, cwd: &Path) -> Result<String, String> {
     let expanded = if let Some(rest) = path.strip_prefix("~/") {
         let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
         home.join(rest).to_string_lossy().into_owned()
@@ -292,7 +309,6 @@ pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
     };
 
     if Path::new(&expanded).is_relative() {
-        let cwd = env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
         Ok(cwd.join(&expanded).to_string_lossy().into_owned())
     } else {
         Ok(expanded)
@@ -486,6 +502,7 @@ pub fn interpreter_ctx(
         mode: mode.clone(),
         question_mode: QuestionMode::Headless,
         session_id: None,
+        cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
@@ -619,6 +636,21 @@ pub mod test_support {
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
+    }
+
+    pub fn stub_ctx_with_session(
+        mode: &AgentMode,
+        event_tx: Option<&EventSender>,
+        tool_use_id: Option<&str>,
+        session_id: maki_storage::id::MakiId,
+    ) -> ToolContext {
+        let mut ctx = stub_ctx_with(mode, event_tx, tool_use_id);
+        set_session(&mut ctx, session_id);
+        ctx
+    }
+
+    pub fn set_session(ctx: &mut ToolContext, session_id: maki_storage::id::MakiId) {
+        ctx.session_id = Some(SessionRef::from(session_id));
     }
 
     pub fn stub_ctx(mode: &AgentMode) -> ToolContext {
@@ -934,6 +966,22 @@ mod tests {
 
         let no_partial = format!("{}sibling/file.txt", home.display());
         assert_eq!(relative_path(&no_partial), no_partial);
+    }
+
+    #[test]
+    fn tool_context_resolves_paths_against_session_cwd() {
+        let dir = TempDir::new().unwrap();
+        let mut ctx = test_support::stub_ctx(&AgentMode::Build);
+        ctx.cwd = dir.path().to_path_buf();
+
+        assert_eq!(
+            ctx.resolve_path("nested/file.txt").unwrap(),
+            dir.path().join("nested/file.txt").to_string_lossy()
+        );
+        assert_eq!(
+            ctx.resolve_search_path(None).unwrap(),
+            dir.path().to_string_lossy()
+        );
     }
 
     #[test]

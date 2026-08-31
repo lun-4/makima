@@ -1,6 +1,7 @@
 mod compaction;
 mod history;
 mod instructions;
+pub mod isolated_turn;
 mod run;
 mod streaming;
 pub mod tool_dispatch;

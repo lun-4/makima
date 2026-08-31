@@ -641,7 +641,7 @@ impl Winner {
     }
 }
 
-fn validate_registrations(
+pub fn validate_registrations(
     registrations: Vec<Registration>,
 ) -> Result<Vec<Registration>, RegistrationError> {
     let mut spellings = HashSet::new();

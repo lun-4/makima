@@ -77,6 +77,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::model::DOCS,
         &api::net::DOCS,
         &api::session::DOCS,
+        &api::session_option::DOCS,
         &api::text::DOCS,
         &api::time::DOCS,
         &api::timer::DOCS,
@@ -131,8 +132,37 @@ mod tests {
         let (ui_tx, _ui_rx) = flume::unbounded();
         let maki = create_maki_global(
             &lua,
-            Arc::default(),
-            Arc::default(),
+            crate::api::PluginLoadContext {
+                pending: Arc::default(),
+                pending_rules: Arc::default(),
+                pending_autocmds: Arc::default(),
+                pending_timers: Arc::new(std::sync::Mutex::new(
+                    crate::api::timer::TimerStore::new(),
+                )),
+                pending_session_options: crate::api::session_option::PendingSessionOptions::new(
+                    Arc::from("docs-test"),
+                    1,
+                ),
+                pending_commands: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                pending_keymaps: Arc::new(std::sync::Mutex::new(
+                    crate::api::keymap::KeymapStore::new(),
+                )),
+                pending_store: Arc::new(std::sync::Mutex::new(crate::api::store::Store::default())),
+                pending_options: Arc::new(std::sync::Mutex::new(None)),
+                pending_sources: Arc::new(std::sync::Mutex::new(
+                    crate::api::completion::PendingCompletionStore::default(),
+                )),
+                pending_expanders: Arc::new(std::sync::Mutex::new(
+                    crate::api::completion::PendingExpanderStore::default(),
+                )),
+                pending_slots: Arc::new(std::sync::Mutex::new(
+                    crate::api::slot::SlotStore::default(),
+                )),
+                pending_prompts: Arc::new(std::sync::Mutex::new(
+                    crate::runtime::PromptHintCallbacks::default(),
+                )),
+                pending_hint: Arc::new(std::sync::Mutex::new(None)),
+            },
             Arc::from("docs-test"),
             Some(ui_tx),
             &PluginPermissions::trusted(),

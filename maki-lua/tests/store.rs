@@ -107,19 +107,31 @@ fn store_changed_fires_on_register_with_registry_and_key() {
     host.load_source(
         "watcher",
         r#"
-        local events = {}
         maki.api.create_autocmd("StoreChanged", {
           callback = function(ev)
-            events[#events + 1] = ev.data
+            if ev.data and ev.data.key and ev.data.registry ~= "events" then
+              maki.store.register("events", ev.data.registry, ev.data.key)
+            end
           end,
         })
+        "#,
+    )
+    .unwrap();
+    host.load_source(
+        "owner",
+        r#"
         maki.store.register("renderers", "main", 1)
         maki.store.register("other", "main", 2)
         maki.store.register("renderers", "main", 3)
-        assert(#events == 3)
-        assert(events[1].registry == "renderers" and events[1].key == "main")
-        assert(events[2].registry == "other" and events[2].key == "main")
-        assert(events[3].registry == "renderers" and events[3].key == "main")
+        "#,
+    )
+    .unwrap();
+    host.load_source(
+        "probe",
+        r#"
+        local events = maki.store.collect("events")
+        assert(events.renderers == "main")
+        assert(events.other == "main")
         "#,
     )
     .unwrap();
@@ -145,13 +157,13 @@ fn store_changed_fires_when_owner_unloads() {
     host.load_source("owner", r#"maki.store.register("renderers", "main", true)"#)
         .unwrap();
     host.load_source(
-        "probe",
+        "probe_before",
         r#"assert(maki.store.collect("marker").cleared == nil)"#,
     )
     .unwrap();
     host.unload("owner").unwrap();
     host.load_source(
-        "probe",
+        "probe_after",
         r#"assert(maki.store.collect("marker").cleared == true)"#,
     )
     .unwrap();

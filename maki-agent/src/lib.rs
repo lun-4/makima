@@ -27,6 +27,9 @@ pub mod command;
 pub mod diff;
 pub mod permissions;
 pub mod prompt;
+pub mod session_checkpoint;
+pub mod session_coordinator;
+pub mod session_options;
 pub mod template;
 pub mod tools;
 pub use tools::ToolFilter;
@@ -96,4 +99,5 @@ pub struct AgentInput {
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
+    pub lease_committer: Option<session_coordinator::SessionLeaseCommitter>,
 }

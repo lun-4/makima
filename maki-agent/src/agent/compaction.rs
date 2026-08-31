@@ -127,10 +127,10 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
+    cancel: &CancelToken,
     config: &AgentConfig,
 ) -> Result<(), AgentError> {
-    let cancel = CancelToken::none();
-    let usage = compact_history(provider, model, history, event_tx, &cancel, config).await?;
+    let usage = compact_history(provider, model, history, event_tx, cancel, config).await?;
     if let Some(post) = normalize(&config.post_compaction_instructions) {
         history.push(Message::synthetic(post.to_string()));
     }
@@ -324,6 +324,7 @@ mod tests {
                 &model,
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
                 &AgentConfig::default(),
             )
             .await
@@ -358,6 +359,7 @@ mod tests {
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
                 &AgentConfig::default(),
             )
             .await
@@ -389,6 +391,7 @@ mod tests {
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
                 &config,
             )
             .await

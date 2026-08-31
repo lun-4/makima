@@ -271,7 +271,7 @@ string or a table with richer output fields.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
-  - `mutable_path` (`string|function`) Schema field name (type: string) for the primary path the tool writes, or `function(input)` returning the resolved target path (nil when the call does not mutate). When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
+  - `mutable_path` (`string|function`) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
 **Example:**
@@ -843,6 +843,37 @@ for name, info in pairs(maki.api.get_slots()) do
   print(name, info.owner, info.declared)
 end
 ```
+
+---
+
+### `maki.api.register_session_option()` {#maki-api-register_session_option}
+
+```lua
+maki.api.register_session_option({spec})
+```
+
+Registers one selectable session option owned by the loading plugin.
+
+The `id` must use the plugin namespace, such as `bash.auto_mode`. Core owns
+unqualified ids. The definition supplies `name`, `description`, `category`,
+an ordered non-empty `values` list, and `initial_value`. Set `persistent` to
+retain each session's value across reloads.
+
+An optional synchronous `validate(value)` callback returns `true` to accept
+the candidate. It returns `false, message` or raises an error to reject it.
+Rejection leaves every session and the active plugin generation unchanged.
+Validation cannot yield or mutate session options.
+
+Compatible plugin replacement retains current session values. The returned
+handle becomes stale after replacement or unload. Runtime failures from
+`get(opts?)` and `set(value, opts?)` use the normal `(value, err)` convention.
+Both methods accept an optional `{ session = id }` target.
+
+**Parameters:**
+
+- `{spec}` (`table`) Session option definition and optional validation callback.
+
+**Returns:** userdata Generation-bound handle with `get(opts?)` and `set(value, opts?)`.
 
 
 ## maki.perf {#maki-perf}
@@ -3517,6 +3548,53 @@ observation waits for the session's next agent run.
 
 ```lua
 maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
+```
+
+---
+
+### `maki.session.options()` {#maki-session-options}
+
+```lua
+maki.session.options({opts?})
+```
+
+Returns the complete ordered option snapshot for a live session.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional `session` id; defaults to the focused session.
+
+**Returns:** (`table|nil`, `string|nil`) `{version, options}`, or nil and an error.
+
+**Example:**
+
+```lua
+local snapshot, err = maki.session.options({ session = id })
+```
+
+---
+
+### `maki.session.set_option()` {#maki-session-set_option}
+
+```lua
+maki.session.set_option({id}, {value}, {opts?})
+```
+
+Sets one option explicitly for a live session. Validation, runtime adoption,
+and persistence complete before success is returned.
+
+**Parameters:**
+
+- `{id}` (`string`) Stable option id.
+- `{value}` (`string`) Selectable value id.
+- `{opts?}` (`table?`) Optional `session` id; defaults to the focused session.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
+
+**Example:**
+
+```lua
+local ok, err = maki.session.set_option("fast", "enabled", { session = id })
 ```
 
 ---

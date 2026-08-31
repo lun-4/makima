@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use maki_lua_macro::lua_fn;
 use mlua::{Lua, Result as LuaResult, Table, Value as LuaValue};
@@ -15,6 +15,7 @@ pub(crate) type PluginOpts = Arc<JsonMap<String, JsonValue>>;
 /// by docgen and by the loader to reject `plugins.<name>` keys no plugin ever
 /// declared.
 pub type PluginOptionSpecs = BTreeMap<Arc<str>, Vec<OptionSpec>>;
+pub(crate) type PendingPluginOptionSpecs = Arc<Mutex<Option<Vec<OptionSpec>>>>;
 
 const SPEC_KEYS: &[&str] = &["default", "type", "min", "desc"];
 /// `plugins.<name>.enabled` is consumed by the config layer and never reaches
@@ -253,6 +254,7 @@ fn validate_user_opts(
 #[lua_fn]
 fn register_options(
     lua: &Lua,
+    #[ctx] pending: PendingPluginOptionSpecs,
     #[ctx] plugin: Arc<str>,
     #[ctx] opts: PluginOpts,
     spec: Table,
@@ -277,12 +279,13 @@ fn register_options(
         }
     }
 
-    if let Some(mut store) = lua.app_data_mut::<PluginOptionSpecs>()
-        && store.insert(Arc::clone(&plugin), specs).is_some()
-    {
+    let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_some() {
         return Err(mlua::Error::runtime(
             "register_options: called more than once; call it once at the top level of the plugin",
         ));
     }
+    *pending = Some(specs);
+    drop(pending);
     Ok(merged)
 }

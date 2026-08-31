@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::{Receiver, Sender};
@@ -15,22 +15,24 @@ const ERR_SECONDS_RANGE: &str = "seconds must be a finite number > 0 and < 1e9";
 /// (`key`) and referenced by `callback`; each fire re-pins it under a fresh
 /// key that the fire task owns and removes on completion.
 pub(crate) struct TimerEntry {
-    plugin: Arc<str>,
-    key: RegistryKey,
-    callback: Function,
-    interval: Duration,
-    next_fire: Instant,
+    pub(crate) plugin: Arc<str>,
+    pub(crate) key: RegistryKey,
+    pub(crate) callback: Function,
+    pub(crate) interval: Duration,
+    pub(crate) next_fire: Instant,
 }
 
 /// Recurring schedules owned by the dispatcher loop's timer arm.
 pub(crate) struct TimerStore {
-    entries: HashMap<u64, TimerEntry>,
+    pub(crate) entries: HashMap<u64, TimerEntry>,
     next_id: u64,
     /// `set` pokes this so the pump wakes early when a newly registered
     /// deadline is earlier than the one it is already sleeping on.
     wake_tx: Sender<()>,
-    wake_rx: Receiver<()>,
+    pub(crate) wake_rx: Receiver<()>,
 }
+
+pub(crate) type PendingTimerStore = Arc<Mutex<TimerStore>>;
 
 impl TimerStore {
     pub fn new() -> Self {
@@ -41,6 +43,47 @@ impl TimerStore {
             wake_tx,
             wake_rx,
         }
+    }
+
+    pub fn candidate(lua: &Lua, plugin: &str) -> LuaResult<Self> {
+        let live = lua
+            .app_data_ref::<TimerStore>()
+            .ok_or_else(|| mlua::Error::runtime("timer store not initialized"))?;
+        let (wake_tx, wake_rx) = flume::bounded(1);
+        let mut candidate = Self {
+            entries: HashMap::new(),
+            next_id: live.next_id,
+            wake_tx,
+            wake_rx,
+        };
+        for (&id, entry) in &live.entries {
+            if entry.plugin.as_ref() == plugin {
+                continue;
+            }
+            candidate.entries.insert(
+                id,
+                TimerEntry {
+                    plugin: Arc::clone(&entry.plugin),
+                    key: lua.create_registry_value(entry.callback.clone())?,
+                    callback: entry.callback.clone(),
+                    interval: entry.interval,
+                    next_fire: entry.next_fire,
+                },
+            );
+        }
+        Ok(candidate)
+    }
+
+    pub fn discard_candidate(&mut self) -> Vec<RegistryKey> {
+        self.entries.drain().map(|(_, entry)| entry.key).collect()
+    }
+
+    pub fn replace_entries(&mut self, mut candidate: TimerStore) -> Vec<RegistryKey> {
+        let old = self.entries.drain().map(|(_, entry)| entry.key).collect();
+        self.entries = std::mem::take(&mut candidate.entries);
+        self.next_id = candidate.next_id;
+        let _ = self.wake_tx.try_send(());
+        old
     }
 
     pub fn add(
@@ -180,19 +223,33 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
 ///   end
 /// end)
 #[lua_fn]
-fn set(lua: &Lua, #[ctx] plugin: Arc<str>, seconds: f64, callback: Function) -> LuaResult<u64> {
+fn set(
+    lua: &Lua,
+    #[ctx] pending: PendingTimerStore,
+    #[ctx] plugin: Arc<str>,
+    seconds: f64,
+    callback: Function,
+) -> LuaResult<u64> {
     if !seconds.is_finite() || seconds <= 0.0 || seconds >= MAX_LUA_SECONDS {
         return Err(mlua::Error::runtime(ERR_SECONDS_RANGE));
     }
     let key = lua.create_registry_value(callback.clone())?;
-    let mut store = lua
-        .app_data_mut::<TimerStore>()
-        .ok_or_else(|| mlua::Error::runtime("timer store not initialized"))?;
-    let id = store.add(plugin, key, callback, Duration::from_secs_f64(seconds));
-    // One pending wake is enough: the pump re-picks the earliest deadline
-    // on its next pass.
-    let _ = store.wake_tx.try_send(());
-    Ok(id)
+    let interval = Duration::from_secs_f64(seconds);
+    if crate::runtime::loading_plugin(lua).is_some() {
+        Ok(pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .add(plugin, key, callback, interval))
+    } else {
+        let mut store = lua
+            .app_data_mut::<TimerStore>()
+            .ok_or_else(|| mlua::Error::runtime("timer store not initialized"))?;
+        let id = store.add(plugin, key, callback, interval);
+        // One pending wake is enough: the pump re-picks the earliest deadline
+        // on its next pass.
+        let _ = store.wake_tx.try_send(());
+        Ok(id)
+    }
 }
 
 /// Stop the timer {id}. Does nothing for an unknown id. A fire that already
@@ -204,11 +261,17 @@ fn set(lua: &Lua, #[ctx] plugin: Arc<str>, seconds: f64, callback: Function) -> 
 /// -- later
 /// maki.timer.del(id)
 #[lua_fn]
-fn del(lua: &Lua, id: u64) -> LuaResult<()> {
-    if let Some(key) = lua
-        .app_data_mut::<TimerStore>()
-        .and_then(|mut store| store.del(id))
-    {
+fn del(lua: &Lua, #[ctx] pending: PendingTimerStore, id: u64) -> LuaResult<()> {
+    let key = if crate::runtime::loading_plugin(lua).is_some() {
+        pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .del(id)
+    } else {
+        lua.app_data_mut::<TimerStore>()
+            .and_then(|mut store| store.del(id))
+    };
+    if let Some(key) = key {
         lua.remove_registry_value(key).ok();
     }
     Ok(())
@@ -228,8 +291,8 @@ lua_table! {
     ///   print("five seconds gone")
     /// end)
     /// ```
-    "maki.timer" => pub(crate) fn create_timer_table(plugin: Arc<str>), DOCS [
-        set(plugin), del,
+    "maki.timer" => pub(crate) fn create_timer_table(pending: PendingTimerStore, plugin: Arc<str>), DOCS [
+        set(pending, plugin), del(pending),
     ]
 }
 
@@ -242,7 +305,12 @@ mod tests {
     fn setup() -> (Lua, Table) {
         let lua = Lua::new();
         lua.set_app_data(TimerStore::new());
-        let tbl = create_timer_table(&lua, Arc::from("test")).unwrap();
+        let tbl = create_timer_table(
+            &lua,
+            Arc::new(Mutex::new(TimerStore::new())),
+            Arc::from("test"),
+        )
+        .unwrap();
         lua.globals().set("timer_tbl", tbl.clone()).unwrap();
         (lua, tbl)
     }

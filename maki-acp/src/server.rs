@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::{
@@ -43,17 +43,34 @@ use tracing::{debug, warn};
 use crate::{AcpParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
-const RESTORED_FAST: bool = false;
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
 static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
+static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationKind {
+    PrimaryTurn,
+    IsolatedTurn,
+    ManualCompaction,
+    #[cfg(test)]
+    TestLocal,
+}
+
+struct PendingOperation {
+    id: u64,
+    request_id: RequestId,
+    kind: OperationKind,
+    cancel: Option<maki_agent::cancel::CancelTrigger>,
+    _lease: Option<maki_agent::session_coordinator::SessionLease>,
+}
 
 /// What the client still owes us. Only one permission or elicitation can be
 /// outstanding: the agent holds the answer channel while it waits for one.
 #[derive(Default)]
 struct Pending {
-    prompt: Option<RequestId>,
+    operation: Option<PendingOperation>,
     permission: Option<i64>,
     elicitation: Option<i64>,
 }
@@ -95,8 +112,43 @@ impl Drop for SessionLock {
     }
 }
 
+struct OptionProjection {
+    out_tx: Sender<Value>,
+    session_id: SessionId,
+    read: maki_agent::session_coordinator::SessionReadHandle,
+    command_state: Arc<maki_agent::command::SessionCommandState>,
+    permissions: Arc<maki_agent::permissions::PermissionManager>,
+    emitted_version: AtomicU64,
+}
+
+impl OptionProjection {
+    fn emit(&self, snapshot: &maki_agent::session_options::SessionOptionsSnapshot) {
+        let mut observed = self.emitted_version.load(Ordering::Acquire);
+        while snapshot.version > observed {
+            match self.emitted_version.compare_exchange_weak(
+                observed,
+                snapshot.version,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    apply_committed_options(snapshot, &self.command_state, &self.permissions);
+                    emit_config_options(&self.out_tx, &self.session_id, snapshot);
+                    return;
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn emit_current(&self) {
+        self.emit(&self.read.options());
+    }
+}
+
 struct SessionState {
     handle: InteractiveHandle,
+    coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
     command_state: Arc<maki_agent::command::SessionCommandState>,
@@ -104,13 +156,37 @@ struct SessionState {
     command_registry: maki_commands::CommandRegistry,
     command_target: TargetHandle,
     command_projection_task: smol::Task<()>,
+    option_projection: Option<Arc<OptionProjection>>,
+    option_projection_task: smol::Task<()>,
     lock: Option<SessionLock>,
+}
+
+struct SpawnSession {
+    model: Model,
+    cwd: PathBuf,
+    session_id: Option<SessionRef>,
+    history: Vec<Message>,
+    mcp_handle: Option<McpHandle>,
+    elicitation: bool,
+    yolo: bool,
+    workflow: bool,
+}
+
+struct InstallSession<'a> {
+    handle: InteractiveHandle,
+    mcp: Option<McpHandle>,
+    current_model: String,
+    history: Vec<Message>,
+    initial_cost: Option<f64>,
+    cwd: PathBuf,
+    fast: bool,
+    workflow: bool,
+    persisted_options: &'a BTreeMap<String, String>,
 }
 
 struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
-    model_policy: Arc<ModelPolicy>,
     modes: Arc<maki_agent::ModeRegistry>,
     session: Option<SessionState>,
     /// Whether the client advertised form elicitation support at `initialize`.
@@ -140,7 +216,6 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let mut server = Server {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
-        model_policy: Arc::clone(&params.model_policy),
         modes: Arc::clone(&params.modes),
         session: None,
         elicitation: false,
@@ -152,7 +227,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     while let Ok(incoming) = in_rx.recv_async().await {
         match incoming {
             Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
-            Incoming::Models(batch) => refresh_models(&mut server, batch),
+            Incoming::Models(batch) => refresh_models(&mut server, batch).await,
         }
     }
 
@@ -196,7 +271,7 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
     .detach();
 }
 
-fn refresh_models(srv: &mut Server, batch: Vec<String>) {
+async fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     let old_len = srv.model_specs.len();
     for spec in batch {
         if !srv.model_specs.contains(&spec) {
@@ -207,16 +282,28 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
         return;
     }
     let Some(session) = &srv.session else { return };
-    let current_model = session.command_state.current_model();
     session
         .command_state
         .set_model_specs(srv.model_specs.clone());
-    let option = methods::model_config_option(&current_model, &srv.model_specs);
-    session_update(
-        &srv.out_tx,
-        &SessionId::from(session.handle.session_id.to_string()),
-        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
-    );
+    let Some(coordinator) = &session.coordinator else {
+        return;
+    };
+    match coordinator
+        .update_model_values(
+            srv.model_specs
+                .iter()
+                .map(|spec| Arc::from(spec.as_str()))
+                .collect(),
+        )
+        .await
+    {
+        Ok(_) => {
+            if let Some(projection) = &session.option_projection {
+                projection.emit_current();
+            }
+        }
+        Err(error) => warn!(%error, "failed to publish discovered models"),
+    }
 }
 
 async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
@@ -238,7 +325,7 @@ async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
     } else if let Some(method) = raw.get("method").and_then(Value::as_str) {
         match id {
             Some(id) => handle_request(server, method, id, &raw, params).await,
-            None => handle_notification(server, method),
+            None => handle_notification(server, method, &raw),
         }
     } else if let Some(id) = id {
         server.respond(id, Err(AcpError::invalid_request()));
@@ -275,7 +362,7 @@ async fn handle_request(
             Err(e) => Err(e),
         },
         "session/set_mode" => handle_set_mode(srv, raw),
-        "session/set_config_option" => handle_set_config(srv, raw),
+        "session/set_config_option" => handle_set_config(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
@@ -292,16 +379,38 @@ async fn new_session(
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, params).await;
     let handle = spawn_session(
         params,
-        req.cwd,
-        None,
-        Vec::new(),
-        mcp.clone(),
-        srv.elicitation,
+        SpawnSession {
+            model: params.model.clone(),
+            cwd: req.cwd,
+            session_id: None,
+            history: Vec::new(),
+            mcp_handle: mcp.clone(),
+            elicitation: srv.elicitation,
+            yolo: params.yolo,
+            workflow: false,
+        },
     );
+    let session_id = handle.session_id.to_string();
     let spec = params.model.spec();
-    let resp = methods::new_session_response(handle.session_id.as_str(), &srv.modes)
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, None, cwd, params);
+    let persisted_options = Default::default();
+    let snapshot = install_session(
+        srv,
+        params,
+        InstallSession {
+            handle,
+            mcp,
+            current_model: spec,
+            history: Vec::new(),
+            initial_cost: None,
+            cwd,
+            fast: false,
+            workflow: false,
+            persisted_options: &persisted_options,
+        },
+    )
+    .ok_or_else(|| AcpError::internal_error().data(json_str(&"session registration failed")))?;
+    let resp = methods::new_session_response(&session_id, &srv.modes)
+        .config_options(methods::session_config_options(&snapshot));
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -325,39 +434,69 @@ async fn load_session(
     for update in translate::replay_history(&restored.history, replay_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
-    let session_cwd = req.cwd.clone();
+    let session_cwd = restored.cwd.clone().unwrap_or(req.cwd);
+    let recorded_model = match Model::from_spec(&restored.model) {
+        Ok(model) if params.model_policy.allows(&model.spec()) => model,
+        _ => params.model.clone(),
+    };
+    let spec = recorded_model.spec();
+    let fast = restored.meta.fast && recorded_model.supports_fast();
+    let yolo = restored.meta.yolo;
+    let workflow = restored.meta.workflow;
+    let coordinator_history = restored.history.clone();
     let handle = spawn_session(
         params,
-        req.cwd,
-        Some(session_ref),
-        restored.history,
-        mcp.clone(),
-        srv.elicitation,
+        SpawnSession {
+            model: recorded_model.clone(),
+            cwd: session_cwd.clone(),
+            session_id: Some(session_ref),
+            history: restored.history,
+            mcp_handle: mcp.clone(),
+            elicitation: srv.elicitation,
+            yolo,
+            workflow,
+        },
     );
-    let spec = params.model.spec();
-    let resp = methods::load_session_response(&srv.modes)
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    let recorded_model = Model::from_spec(&restored.model).unwrap_or_else(|_| params.model.clone());
     let restored_cost = settle_session(
         &restored.usage,
         &mut restored.by_model,
         &recorded_model,
-        RESTORED_FAST,
+        fast,
     );
-    install_session(srv, handle, mcp, spec, restored_cost, session_cwd, params);
+    let snapshot = install_session(
+        srv,
+        params,
+        InstallSession {
+            handle,
+            mcp,
+            current_model: spec,
+            history: coordinator_history,
+            initial_cost: restored_cost,
+            cwd: session_cwd,
+            fast,
+            workflow,
+            persisted_options: &restored.meta.session_options,
+        },
+    )
+    .ok_or_else(|| AcpError::internal_error().data(json_str(&"session registration failed")))?;
+    let resp = methods::load_session_response(&srv.modes)
+        .config_options(methods::session_config_options(&snapshot));
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
-fn spawn_session(
-    params: &AcpParams,
-    cwd: PathBuf,
-    session_id: Option<SessionRef>,
-    history: Vec<Message>,
-    mcp_handle: Option<McpHandle>,
-    elicitation: bool,
-) -> InteractiveHandle {
+fn spawn_session(params: &AcpParams, session: SpawnSession) -> InteractiveHandle {
+    let SpawnSession {
+        model,
+        cwd,
+        session_id,
+        history,
+        mcp_handle,
+        elicitation,
+        yolo,
+        workflow,
+    } = session;
     headless::spawn_interactive(InteractiveParams {
-        model: params.model.clone(),
+        model,
         config: params.config.clone(),
         permissions_config: params.permissions_config.clone(),
         timeouts: params.timeouts,
@@ -368,10 +507,10 @@ fn spawn_session(
         session_id,
         modes: Arc::clone(&params.modes),
         initial_history: history,
-        yolo: params.yolo,
+        yolo,
         system_prompt_override: params.system_prompt_override.clone(),
         append_system_prompt: params.append_system_prompt.clone(),
-        workflow: false,
+        workflow,
         model_policy: Arc::clone(&params.model_policy),
         question_mode: if elicitation {
             QuestionMode::Elicitation
@@ -456,14 +595,24 @@ async fn close_session(srv: &mut Server) {
     };
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
-    if let Some(id) = state.pending.lock().unwrap().prompt.take() {
+    let operation = state.pending.lock().unwrap().operation.take();
+    if let Some(operation) = operation {
         let resp = PromptResponse::new(StopReason::Cancelled);
         send(
             &srv.out_tx,
-            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+            Response::new(
+                operation.request_id,
+                Ok(AgentResponse::PromptResponse(resp)),
+            ),
         );
     }
     state.command_projection_task.cancel().await;
+    state.option_projection_task.cancel().await;
+    if let Some(coordinator) = &state.coordinator
+        && let Err(error) = coordinator.close().await
+    {
+        warn!(%error, "failed to close session coordinator");
+    }
     state.handle.task.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
@@ -475,13 +624,101 @@ async fn close_session(srv: &mut Server) {
 
 fn install_session(
     srv: &mut Server,
-    handle: InteractiveHandle,
-    mcp: Option<McpHandle>,
-    current_model: String,
-    initial_cost: Option<f64>,
-    cwd: PathBuf,
     params: &AcpParams,
-) {
+    session: InstallSession<'_>,
+) -> Option<maki_agent::session_options::SessionOptionsSnapshot> {
+    let InstallSession {
+        handle,
+        mcp,
+        current_model,
+        history,
+        initial_cost,
+        cwd,
+        fast,
+        workflow,
+        persisted_options,
+    } = session;
+    let definitions = maki_agent::session_coordinator::builtin_option_definitions(
+        Arc::from(current_model.as_str()),
+        srv.model_specs.iter().map(|spec| Arc::from(spec.as_str())),
+        handle.permissions.is_yolo(),
+        fast,
+        workflow,
+    );
+    let checkpoint = match maki_agent::session_checkpoint::SessionLogCheckpoint::resolve(
+        handle.session_id.id(),
+        &current_model,
+        &cwd.to_string_lossy(),
+    ) {
+        Ok(checkpoint) => Arc::new(checkpoint),
+        Err(error) => {
+            warn!(%error, "failed to open session checkpoint");
+            return None;
+        }
+    };
+    let coordinator = match maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+        maki_agent::session_coordinator::SessionCoordinatorParams {
+            session_id: handle.session_id.id(),
+            catalog: params.session_options.clone(),
+            definitions,
+            persisted_options: persisted_options.clone(),
+            history,
+            model: Arc::from(current_model.as_str()),
+            cwd: cwd.clone(),
+            model_policy: Arc::clone(&params.model_policy),
+            model_adopter: Arc::new({
+                let control_tx = handle.control_tx.clone();
+                move |model: Model| {
+                    let control_tx = control_tx.clone();
+                    Box::pin(async move {
+                        let (reply, response) = flume::bounded(1);
+                        control_tx
+                            .send_async(maki_agent::headless::InteractiveControl::AdoptModel {
+                                model,
+                                reply,
+                            })
+                            .await
+                            .map_err(|_| Arc::from("session ended before model adoption"))?;
+                        response
+                            .recv_async()
+                            .await
+                            .map_err(|_| Arc::from("session ended during model adoption"))?
+                            .map_err(Arc::from)
+                    }) as maki_agent::session_coordinator::ModelAdoptionFuture
+                }
+            }),
+            directory_adopter: Arc::new({
+                let control_tx = handle.control_tx.clone();
+                move |path: PathBuf| {
+                    let control_tx = control_tx.clone();
+                    Box::pin(async move {
+                        let (reply, response) = flume::bounded(1);
+                        control_tx
+                            .send_async(maki_agent::headless::InteractiveControl::ChangeDirectory {
+                                path,
+                                reply,
+                            })
+                            .await
+                            .map_err(|_| Arc::from("session ended before directory adoption"))?;
+                        response
+                            .recv_async()
+                            .await
+                            .map_err(|_| Arc::from("session ended during directory adoption"))?
+                            .map_err(Arc::from)
+                    })
+                        as maki_agent::session_coordinator::DirectoryAdoptionFuture
+                }
+            }),
+            checkpoint,
+            mailbox: handle.mailbox.clone(),
+        },
+    ) {
+        Ok(coordinator) => coordinator,
+        Err(error) => {
+            warn!(%error, "failed to register session coordinator");
+            return None;
+        }
+    };
     let pending = PendingState::default();
     start_event_pump(
         handle.event_rx.clone(),
@@ -490,7 +727,7 @@ fn install_session(
         Arc::clone(&pending),
         srv.elicitation,
         handle.answer_tx.clone(),
-        cwd.clone(),
+        coordinator.read(),
         maki_storage::paths::home(),
         initial_cost,
     );
@@ -503,18 +740,21 @@ fn install_session(
             .collect::<Vec<_>>()
             .into(),
         cwd.clone(),
-        RESTORED_FAST,
-        false,
+        fast,
+        workflow,
     ));
     let command_target = command_registry.bind_target(
         maki_agent::command::portable_capabilities(),
-        Arc::new(maki_agent::command::SessionCommandHost::new(
-            Arc::clone(&params.model_policy),
-            handle.model_tx.clone(),
-            handle.control_tx.clone(),
-            Arc::clone(&command_state),
-            Arc::clone(&handle.permissions),
-        )),
+        Arc::new(
+            maki_agent::command::SessionCommandHost::new(
+                Arc::clone(&params.model_policy),
+                handle.model_tx.clone(),
+                handle.control_tx.clone(),
+                Arc::clone(&command_state),
+                Arc::clone(&handle.permissions),
+            )
+            .with_coordinator(coordinator.clone()),
+        ),
     );
     let session_id = SessionId::from(handle.session_id.to_string());
     let commands = command_registry
@@ -523,9 +763,22 @@ fn install_session(
     emit_available_commands(&srv.out_tx, &session_id, &commands);
     let command_projection_task = watch_available_commands(
         srv.out_tx.clone(),
-        session_id,
+        session_id.clone(),
         command_registry.clone(),
         command_target.clone(),
+    );
+    let option_snapshot = coordinator.read().options();
+    let option_projection = Arc::new(OptionProjection {
+        out_tx: srv.out_tx.clone(),
+        session_id,
+        read: coordinator.read(),
+        command_state: Arc::clone(&command_state),
+        permissions: Arc::clone(&handle.permissions),
+        emitted_version: AtomicU64::new(option_snapshot.version),
+    });
+    let option_projection_task = watch_config_options(
+        Arc::clone(&option_projection),
+        coordinator.read().subscribe(),
     );
     // Claim-if-free heartbeat: beats every interval while the session is
     // open, so the lock goes stale only when this process stops beating. A
@@ -540,7 +793,7 @@ fn install_session(
                 Ok(session_lock::LockBeat::Lost)
             ) {
                 warn!(session_id = %id, "session lock claim failed: open elsewhere");
-                return;
+                return None;
             }
             let (stop_tx, stop_rx) = flume::bounded(1);
             let beat_dir = dir.clone();
@@ -569,6 +822,7 @@ fn install_session(
     };
     srv.session = Some(SessionState {
         handle,
+        coordinator: Some(coordinator),
         mcp,
         current_mode: AgentMode::Build,
         command_state,
@@ -576,8 +830,11 @@ fn install_session(
         command_registry,
         command_target,
         command_projection_task,
+        option_projection: Some(option_projection),
+        option_projection_task,
         lock,
     });
+    Some(option_snapshot)
 }
 
 fn available_commands(commands: &[PresentedCommand]) -> Vec<AvailableCommand> {
@@ -612,6 +869,66 @@ fn emit_available_commands(
     );
 }
 
+fn apply_committed_options(
+    snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
+    command_state: &maki_agent::command::SessionCommandState,
+    permissions: &maki_agent::permissions::PermissionManager,
+) {
+    let value = |id: &str| {
+        snapshot
+            .options
+            .iter()
+            .find(|option| option.definition.id.as_ref() == id)
+            .map(|option| option.current_value.as_ref())
+    };
+    if let Some(spec) = value(maki_agent::session_options::MODEL_OPTION_ID) {
+        match Model::from_spec(spec) {
+            Ok(model) => command_state.set_model(&model),
+            Err(error) => warn!(%error, %spec, "committed model could not be parsed"),
+        }
+    }
+    permissions.set_yolo(
+        value(maki_agent::session_options::YOLO_OPTION_ID)
+            == Some(maki_agent::session_options::ENABLED_VALUE),
+    );
+    if let Err(error) = command_state.set_fast(
+        value(maki_agent::session_options::FAST_OPTION_ID)
+            == Some(maki_agent::session_options::ENABLED_VALUE),
+    ) {
+        warn!(%error, "committed Fast value could not be applied");
+    }
+    command_state.set_workflow(
+        value(maki_agent::session_options::WORKFLOW_OPTION_ID)
+            == Some(maki_agent::session_options::ENABLED_VALUE),
+    );
+}
+
+fn emit_config_options(
+    out_tx: &Sender<Value>,
+    session_id: &SessionId,
+    snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
+) {
+    session_update(
+        out_tx,
+        session_id,
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+            methods::session_config_options(snapshot),
+        )),
+    );
+}
+
+fn watch_config_options(
+    projection: Arc<OptionProjection>,
+    mut subscription: maki_agent::session_options::SessionOptionsSubscription,
+) -> smol::Task<()> {
+    smol::spawn(async move {
+        loop {
+            let snapshot = subscription.changed().await;
+            projection.emit(&snapshot);
+        }
+    })
+}
+
 fn watch_available_commands(
     out_tx: Sender<Value>,
     session_id: SessionId,
@@ -638,6 +955,7 @@ struct Restored {
     usage: TokenUsage,
     by_model: HashMap<String, StoredTokenUsage>,
     model: String,
+    meta: maki_storage::sessions::SessionMeta,
 }
 
 fn load_history(session_id: MakiId) -> Result<Restored, AcpError> {
@@ -669,6 +987,7 @@ fn load_history_from(
     let model = session.model.clone();
     let usage = session.token_usage;
     let by_model = session.usage_by_model().clone();
+    let meta = session.meta.clone();
     let history = session.take_messages();
     Ok(Restored {
         history,
@@ -676,38 +995,310 @@ fn load_history_from(
         usage,
         by_model,
         model,
+        meta,
     })
+}
+
+fn validate_session<'a>(srv: &'a Server, requested: &str) -> Result<&'a SessionState, AcpError> {
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    let active = session.handle.session_id.to_string();
+    if active != requested
+        || maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(
+            session.handle.session_id.id(),
+        )
+        .is_err()
+    {
+        return Err(AcpError::resource_not_found(Some(format!(
+            "session/{requested}"
+        ))));
+    }
+    Ok(session)
 }
 
 async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
-    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    let session = validate_session(srv, req.session_id.0.as_ref())?;
     let content = extract_prompt_content(&req.prompt)?;
     let dispatch = session
         .command_registry
         .dispatch_input(&session.command_target, content)
         .await;
     match dispatch {
-        InputDispatch::LiteralInput(content) => send_command_turn(
-            session,
-            id,
-            AgentTurn {
-                content,
-                prompt: None,
-            },
-        ),
+        InputDispatch::LiteralInput(content) => {
+            send_command_turn(
+                session,
+                id,
+                AgentTurn {
+                    content,
+                    prompt: None,
+                },
+            )
+            .await
+        }
         InputDispatch::Dispatched(CommandOutcome::Completed) => {
+            if let Some(projection) = &session.option_projection {
+                projection.emit_current();
+            }
             respond_prompt(&srv.out_tx, id.clone(), StopReason::EndTurn);
             Ok(())
         }
         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-            send_command_turn(session, id, turn)
+            send_command_turn(session, id, turn).await
+        }
+        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
+            send_isolated_turn(session, &srv.out_tx, id, turn).await
+        }
+        InputDispatch::Dispatched(CommandOutcome::ManualCompaction) => {
+            send_manual_compaction(session, &srv.out_tx, id).await
+        }
+        InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
+            let text = match feedback {
+                maki_commands::FrontendFeedback::WorkingDirectory(path) => {
+                    format!("Working directory: {}", path.display())
+                }
+            };
+            let sid = SessionId::from(session.handle.session_id.to_string());
+            session_update(&srv.out_tx, &sid, translate::text_delta(&text));
+            respond_prompt(&srv.out_tx, id.clone(), StopReason::EndTurn);
+            Ok(())
         }
         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(command_error(error)),
     }
 }
 
-fn send_command_turn(
+async fn send_manual_compaction(
+    session: &SessionState,
+    out_tx: &Sender<Value>,
+    id: &RequestId,
+) -> Result<(), AcpError> {
+    if session.pending.lock().unwrap().operation.is_some() {
+        return Err(AcpError::new(
+            -32600,
+            "session already has an active operation",
+        ));
+    }
+    let lease = session
+        .coordinator
+        .as_ref()
+        .ok_or_else(no_session)?
+        .acquire_lease()
+        .await
+        .map_err(coordinator_error)?;
+    let lease_committer = lease.committer();
+    let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+    let tool_id = format!("compact-{operation_id}");
+    let (trigger, cancel) = maki_agent::cancel::CancelToken::new();
+    {
+        let mut pending = session.pending.lock().unwrap();
+        if pending.operation.is_some() {
+            return Err(AcpError::new(
+                -32600,
+                "session already has an active operation",
+            ));
+        }
+        pending.operation = Some(PendingOperation {
+            id: operation_id,
+            request_id: id.clone(),
+            kind: OperationKind::ManualCompaction,
+            cancel: Some(trigger),
+            _lease: Some(lease),
+        });
+    }
+    let sid = SessionId::from(session.handle.session_id.to_string());
+    session_update(
+        out_tx,
+        &sid,
+        translate::local_operation_pending(&tool_id, "Compact context"),
+    );
+    let (output, events) = flume::unbounded();
+    if session
+        .handle
+        .control_tx
+        .send(maki_agent::headless::InteractiveControl::ManualCompaction {
+            output,
+            cancel,
+            lease_committer,
+        })
+        .is_err()
+    {
+        take_operation(
+            &session.pending,
+            operation_id,
+            OperationKind::ManualCompaction,
+        );
+        return Err(AcpError::new(-32603, "session ended"));
+    }
+    let pending = Arc::clone(&session.pending);
+    let out_tx = out_tx.clone();
+    smol::spawn(async move {
+        while let Ok(event) = events.recv_async().await {
+            use maki_agent::headless::ManualCompactionEvent;
+
+            match event {
+                ManualCompactionEvent::Started => {
+                    session_update(&out_tx, &sid, translate::local_operation_started(&tool_id));
+                }
+                ManualCompactionEvent::Completed => {
+                    if let Some(operation) =
+                        take_operation(&pending, operation_id, OperationKind::ManualCompaction)
+                    {
+                        session_update(
+                            &out_tx,
+                            &sid,
+                            translate::local_operation_terminal(&tool_id, None),
+                        );
+                        respond_prompt(&out_tx, operation.request_id, StopReason::EndTurn);
+                    }
+                    break;
+                }
+                ManualCompactionEvent::Cancelled => {
+                    if let Some(operation) =
+                        take_operation(&pending, operation_id, OperationKind::ManualCompaction)
+                    {
+                        session_update(
+                            &out_tx,
+                            &sid,
+                            translate::local_operation_terminal(&tool_id, Some("cancelled")),
+                        );
+                        respond_prompt(&out_tx, operation.request_id, StopReason::Cancelled);
+                    }
+                    break;
+                }
+                ManualCompactionEvent::Failed(error) => {
+                    if let Some(operation) =
+                        take_operation(&pending, operation_id, OperationKind::ManualCompaction)
+                    {
+                        session_update(
+                            &out_tx,
+                            &sid,
+                            translate::local_operation_terminal(&tool_id, Some(&error)),
+                        );
+                        let error = AcpError::internal_error().data(Value::String(error));
+                        send(
+                            &out_tx,
+                            Response::new(operation.request_id, Err::<AgentResponse, _>(error)),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    })
+    .detach();
+    Ok(())
+}
+
+async fn send_isolated_turn(
+    session: &SessionState,
+    out_tx: &Sender<Value>,
+    id: &RequestId,
+    turn: maki_commands::IsolatedTurn,
+) -> Result<(), AcpError> {
+    if session.pending.lock().unwrap().operation.is_some() {
+        return Err(AcpError::new(
+            -32600,
+            "session already has an active operation",
+        ));
+    }
+    let images = turn
+        .content
+        .attachments
+        .iter()
+        .map(|attachment| ImageSource {
+            media_type: image_media_type(&attachment.media_type),
+            data: Arc::clone(&attachment.data),
+        })
+        .collect();
+    let lease = session
+        .coordinator
+        .as_ref()
+        .ok_or_else(no_session)?
+        .acquire_lease()
+        .await
+        .map_err(coordinator_error)?;
+    let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+    let (trigger, cancel) = maki_agent::cancel::CancelToken::new();
+    {
+        let mut pending = session.pending.lock().unwrap();
+        if pending.operation.is_some() {
+            return Err(AcpError::new(
+                -32600,
+                "session already has an active operation",
+            ));
+        }
+        pending.operation = Some(PendingOperation {
+            id: operation_id,
+            request_id: id.clone(),
+            kind: OperationKind::IsolatedTurn,
+            cancel: Some(trigger),
+            _lease: Some(lease),
+        });
+    }
+    let (output, events) = flume::unbounded();
+    if session
+        .handle
+        .control_tx
+        .send(maki_agent::headless::InteractiveControl::IsolatedTurn {
+            question: turn.content.text.to_string(),
+            images,
+            output,
+            cancel,
+        })
+        .is_err()
+    {
+        take_operation(&session.pending, operation_id, OperationKind::IsolatedTurn);
+        return Err(AcpError::new(-32603, "session ended"));
+    }
+    let pending = Arc::clone(&session.pending);
+    let out_tx = out_tx.clone();
+    let sid = SessionId::from(session.handle.session_id.to_string());
+    smol::spawn(async move {
+        while let Ok(event) = events.recv_async().await {
+            use maki_agent::agent::isolated_turn::IsolatedTurnEvent;
+
+            match event {
+                IsolatedTurnEvent::TextDelta(text) => {
+                    session_update(&out_tx, &sid, translate::text_delta(&text));
+                }
+                IsolatedTurnEvent::ThinkingDelta(text) => {
+                    session_update(&out_tx, &sid, translate::thinking_delta(&text));
+                }
+                IsolatedTurnEvent::Done => {
+                    if let Some(operation) =
+                        take_operation(&pending, operation_id, OperationKind::IsolatedTurn)
+                    {
+                        respond_prompt(&out_tx, operation.request_id, StopReason::EndTurn);
+                    }
+                    break;
+                }
+                IsolatedTurnEvent::Cancelled => {
+                    if let Some(operation) =
+                        take_operation(&pending, operation_id, OperationKind::IsolatedTurn)
+                    {
+                        respond_prompt(&out_tx, operation.request_id, StopReason::Cancelled);
+                    }
+                    break;
+                }
+                IsolatedTurnEvent::Error(message) => {
+                    if let Some(operation) =
+                        take_operation(&pending, operation_id, OperationKind::IsolatedTurn)
+                    {
+                        let error = AcpError::internal_error().data(Value::String(message));
+                        send(
+                            &out_tx,
+                            Response::new(operation.request_id, Err::<AgentResponse, _>(error)),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    })
+    .detach();
+    Ok(())
+}
+
+async fn send_command_turn(
     session: &SessionState,
     id: &RequestId,
     turn: AgentTurn,
@@ -729,18 +1320,62 @@ fn send_command_turn(
             data: Arc::clone(&attachment.data),
         })
         .collect();
-    send_agent_input(
-        session,
-        id,
-        agent_input(
-            turn.content.text.to_string(),
-            images,
-            session.current_mode.clone(),
-            session.command_state.fast(),
-            session.command_state.workflow(),
-            prompt,
-        ),
-    )
+    let options = session
+        .coordinator
+        .as_ref()
+        .ok_or_else(no_session)?
+        .read()
+        .options();
+    let enabled = |id: &str| {
+        options.options.iter().any(|option| {
+            option.definition.id.as_ref() == id
+                && option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE
+        })
+    };
+    let mut input = agent_input(
+        turn.content.text.to_string(),
+        images,
+        session.current_mode.clone(),
+        enabled(maki_agent::session_options::FAST_OPTION_ID),
+        enabled(maki_agent::session_options::WORKFLOW_OPTION_ID),
+        prompt,
+    );
+    if session.pending.lock().unwrap().operation.is_some() {
+        return Err(AcpError::new(
+            -32600,
+            "session already has an active operation",
+        ));
+    }
+    let lease = session
+        .coordinator
+        .as_ref()
+        .ok_or_else(no_session)?
+        .acquire_lease()
+        .await
+        .map_err(coordinator_error)?;
+    input.lease_committer = lease.committer();
+    let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut pending = session.pending.lock().unwrap();
+        if pending.operation.is_some() {
+            return Err(AcpError::new(
+                -32600,
+                "session already has an active operation",
+            ));
+        }
+        pending.operation = Some(PendingOperation {
+            id: operation_id,
+            request_id: id.clone(),
+            kind: OperationKind::PrimaryTurn,
+            cancel: None,
+            _lease: Some(lease),
+        });
+    }
+    if session.handle.input_tx.send(input).is_err() {
+        take_operation(&session.pending, operation_id, OperationKind::PrimaryTurn);
+        return Err(AcpError::new(-32603, "session ended"));
+    }
+    Ok(())
 }
 
 fn agent_input(
@@ -760,24 +1395,59 @@ fn agent_input(
         fast,
         workflow,
         prompt: prompt.map(Box::new),
+        lease_committer: None,
     }
-}
-
-fn send_agent_input(
-    session: &SessionState,
-    id: &RequestId,
-    input: AgentInput,
-) -> Result<(), AcpError> {
-    session.pending.lock().unwrap().prompt = Some(id.clone());
-    if session.handle.input_tx.send(input).is_err() {
-        session.pending.lock().unwrap().prompt.take();
-        return Err(AcpError::new(-32603, "session ended"));
-    }
-    Ok(())
 }
 
 fn command_error(error: maki_commands::CommandError) -> AcpError {
     AcpError::new(-32602, error.to_string())
+}
+
+fn coordinator_error(error: maki_agent::session_coordinator::SessionCoordinatorError) -> AcpError {
+    use maki_agent::session_coordinator::SessionCoordinatorError;
+    use maki_agent::session_options::SessionOptionError;
+
+    match error {
+        SessionCoordinatorError::StaleSession(id) => {
+            AcpError::resource_not_found(Some(format!("session/{id}")))
+        }
+        SessionCoordinatorError::SessionBusy(_) => AcpError::new(-32600, error.to_string()),
+        SessionCoordinatorError::Option(
+            SessionOptionError::UnknownId(_)
+            | SessionOptionError::InvalidValue { .. }
+            | SessionOptionError::FastUnsupported
+            | SessionOptionError::PolicyRejected(_),
+        ) => AcpError::invalid_params().data(json_str(&error.to_string())),
+        _ => AcpError::internal_error().data(json_str(&error.to_string())),
+    }
+}
+
+fn take_operation(
+    pending: &PendingState,
+    operation_id: u64,
+    kind: OperationKind,
+) -> Option<PendingOperation> {
+    let mut pending = pending.lock().unwrap();
+    if pending
+        .operation
+        .as_ref()
+        .is_some_and(|operation| operation.id == operation_id && operation.kind == kind)
+    {
+        pending.operation.take()
+    } else {
+        None
+    }
+}
+
+fn take_active_operation(pending: &PendingState, kind: OperationKind) -> Option<PendingOperation> {
+    let operation_id = pending
+        .lock()
+        .unwrap()
+        .operation
+        .as_ref()
+        .filter(|operation| operation.kind == kind)
+        .map(|operation| operation.id)?;
+    take_operation(pending, operation_id, kind)
 }
 
 fn respond_prompt(out_tx: &Sender<Value>, id: RequestId, reason: StopReason) {
@@ -792,6 +1462,7 @@ fn respond_prompt(out_tx: &Sender<Value>, id: RequestId, reason: StopReason) {
 
 fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionModeRequest = parse_params(raw)?;
+    validate_session(srv, req.session_id.0.as_ref())?;
     let mode_str = req.mode_id.0.to_string();
     let new_mode = methods::mode_id_to_agent_mode(&mode_str, &srv.modes)
         .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
@@ -810,46 +1481,54 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     ))
 }
 
-fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
-    if req.config_id.0.as_ref() != methods::MODEL_CONFIG_ID {
-        let detail = format!("unknown config option: {}", req.config_id);
-        return Err(AcpError::invalid_params().data(json_str(&detail)));
-    }
-
-    let spec = req.value.0.to_string();
-    if !srv.model_policy.allows(&spec) {
-        return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
-    }
-    let model =
-        Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
-
+    validate_session(srv, req.session_id.0.as_ref())?;
+    let config_id = req.config_id.0.to_string();
+    let value = req.value.0.to_string();
     let session = srv.session.as_mut().ok_or_else(no_session)?;
-    session
-        .handle
-        .model_tx
-        .send(model.clone())
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    session.command_state.set_model(&model);
-
+    let coordinator = session.coordinator.as_ref().ok_or_else(no_session)?;
+    let snapshot = coordinator
+        .set_option(config_id.as_str(), value.as_str())
+        .await
+        .map_err(coordinator_error)?;
+    apply_committed_options(
+        &snapshot,
+        &session.command_state,
+        &session.handle.permissions,
+    );
     Ok(AgentResponse::SetSessionConfigOptionResponse(
-        SetSessionConfigOptionResponse::new(vec![methods::model_config_option(
-            &spec,
-            &srv.model_specs,
-        )]),
+        SetSessionConfigOptionResponse::new(methods::session_config_options(&snapshot)),
     ))
 }
 
-fn handle_notification(srv: &Server, method: &str) {
+fn handle_notification(srv: &Server, method: &str, raw: &Value) {
     match method {
         "session/cancel" => {
-            if let Some(session) = &srv.session {
+            let Some(requested) = raw
+                .get("params")
+                .and_then(|params| params.get("sessionId"))
+                .and_then(Value::as_str)
+            else {
+                return;
+            };
+            if let Ok(session) = validate_session(srv, requested) {
                 // Any answer still in flight belongs to the cancelled turn, so
                 // forget its id and let it be dropped on arrival.
-                let mut pending = session.pending.lock().unwrap();
-                pending.permission = None;
-                pending.elicitation = None;
-                let _ = session.handle.cancel_tx.try_send(());
+                let isolated_cancel = {
+                    let mut pending = session.pending.lock().unwrap();
+                    pending.permission = None;
+                    pending.elicitation = None;
+                    pending
+                        .operation
+                        .as_mut()
+                        .and_then(|operation| operation.cancel.take())
+                };
+                if let Some(trigger) = isolated_cancel {
+                    trigger.cancel();
+                } else {
+                    let _ = session.handle.cancel_tx.try_send(());
+                }
             }
         }
         _ => debug!(method, "unknown notification"),
@@ -977,7 +1656,7 @@ fn start_event_pump(
     pending: PendingState,
     elicitation: bool,
     answer_tx: Sender<String>,
-    cwd: PathBuf,
+    session: maki_agent::session_coordinator::SessionReadHandle,
     home: Option<PathBuf>,
     initial_cost: Option<f64>,
 ) {
@@ -1001,10 +1680,12 @@ fn start_event_pump(
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => {
-                    translate::tool_start(&event, &cwd, home.as_deref())
+                    translate::tool_start(&event, &session.cwd(), home.as_deref())
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
-                AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
+                AgentEvent::ToolDone(event) => {
+                    translate::tool_done(&event, &session.cwd(), home.as_deref())
+                }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
                     let fields =
@@ -1053,45 +1734,66 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::TurnOutcome(outcome) => {
-                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                    if let Some(operation) =
+                        take_active_operation(&pending, OperationKind::PrimaryTurn)
+                    {
                         match outcome {
                             maki_agent::TurnOutcome::Completed { reason, .. } => {
                                 let resp = PromptResponse::new(translate::map_done_reason(reason));
                                 send(
                                     &out_tx,
-                                    Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+                                    Response::new(
+                                        operation.request_id,
+                                        Ok(AgentResponse::PromptResponse(resp)),
+                                    ),
                                 );
                             }
                             maki_agent::TurnOutcome::Cancelled { .. } => {
-                                let resp = PromptResponse::new(StopReason::Cancelled);
-                                send(
+                                respond_prompt(
                                     &out_tx,
-                                    Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+                                    operation.request_id,
+                                    StopReason::Cancelled,
                                 );
                             }
                             maki_agent::TurnOutcome::Failed { failure, .. } => {
                                 let error = AcpError::internal_error()
                                     .data(Value::String(failure.user_message));
-                                send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
+                                send(
+                                    &out_tx,
+                                    Response::<AgentResponse>::new(
+                                        operation.request_id,
+                                        Err(error),
+                                    ),
+                                );
                             }
                         }
                     }
                     continue;
                 }
                 AgentEvent::ControlComplete { .. } => {
-                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                    if let Some(operation) =
+                        take_active_operation(&pending, OperationKind::PrimaryTurn)
+                    {
                         let resp = PromptResponse::new(StopReason::EndTurn);
                         send(
                             &out_tx,
-                            Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
+                            Response::new(
+                                operation.request_id,
+                                Ok(AgentResponse::PromptResponse(resp)),
+                            ),
                         );
                     }
                     continue;
                 }
                 AgentEvent::ControlError { message } => {
-                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                    if let Some(operation) =
+                        take_active_operation(&pending, OperationKind::PrimaryTurn)
+                    {
                         let error = AcpError::internal_error().data(Value::String(message));
-                        send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
+                        send(
+                            &out_tx,
+                            Response::<AgentResponse>::new(operation.request_id, Err(error)),
+                        );
                     }
                     continue;
                 }
@@ -1185,6 +1887,61 @@ mod tests {
         )
     }
 
+    fn test_coordinator(
+        session_id: MakiId,
+        model: &str,
+        cwd: PathBuf,
+    ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
+        let checkpoint: Arc<
+            dyn maki_storage::checkpoint::CheckpointWriter<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >,
+        > = Arc::new(|request: maki_storage::checkpoint::CheckpointRequest<_>| {
+            Box::pin(async move {
+                Ok(maki_storage::checkpoint::CheckpointAck {
+                    session_id: request.session_id,
+                    version: request.version,
+                })
+            }) as maki_storage::checkpoint::CheckpointFuture
+        });
+        let mut model_specs = vec![
+            Arc::from(model),
+            Arc::from(FAST_SPEC),
+            Arc::from(OFFLINE_SPEC),
+        ];
+        model_specs.sort();
+        model_specs.dedup();
+        maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+            maki_agent::session_coordinator::SessionCoordinatorParams {
+                session_id,
+                catalog: Default::default(),
+                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                    model,
+                    model_specs,
+                    false,
+                    false,
+                    false,
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(model),
+                cwd,
+                model_policy: Arc::new(maki_config::ModelPolicy::default()),
+                model_adopter: Arc::new(|_: Model| {
+                    Box::pin(async { Ok(()) })
+                        as maki_agent::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path: PathBuf| {
+                    Box::pin(async move { Ok(path) })
+                        as maki_agent::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint,
+                mailbox: maki_agent::SessionMailbox::new(session_id),
+            },
+        )
+        .unwrap()
+    }
+
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
             "id": id,
@@ -1209,6 +1966,7 @@ mod tests {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
         let (input_tx, input_rx) = flume::unbounded();
+        let session_id = MakiId::generate();
         let handle = InteractiveHandle {
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
@@ -1217,7 +1975,8 @@ mod tests {
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
             control_tx: flume::unbounded().0,
-            session_id: SessionRef::from(MakiId::generate()),
+            session_id: SessionRef::from(session_id),
+            mailbox: maki_agent::SessionMailbox::new(session_id),
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
@@ -1225,6 +1984,11 @@ mod tests {
             )),
             task: smol::spawn(async {}),
         };
+        let coordinator = test_coordinator(
+            handle.session_id.id(),
+            OFFLINE_SPEC,
+            PathBuf::from("/project"),
+        );
         let command_registry = test_registry(&[]);
         let command_state = Arc::new(maki_agent::command::SessionCommandState::new(
             String::new(),
@@ -1233,20 +1997,34 @@ mod tests {
             false,
             false,
         ));
-        let command_target = test_target(
-            &command_registry,
-            handle.model_tx.clone(),
-            handle.control_tx.clone(),
-            Arc::clone(&command_state),
-            Arc::clone(&handle.permissions),
+        let command_target = command_registry.bind_target(
+            maki_agent::command::portable_capabilities(),
+            Arc::new(
+                maki_agent::command::SessionCommandHost::new(
+                    Arc::new(maki_config::ModelPolicy::default()),
+                    handle.model_tx.clone(),
+                    handle.control_tx.clone(),
+                    Arc::clone(&command_state),
+                    Arc::clone(&handle.permissions),
+                )
+                .with_coordinator(coordinator.clone()),
+            ),
         );
         let server = Server {
-            out_tx,
+            out_tx: out_tx.clone(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             model_specs: Vec::new(),
-            model_policy: Arc::new(maki_config::ModelPolicy::default()),
             session: Some(SessionState {
+                option_projection: Some(Arc::new(OptionProjection {
+                    out_tx: out_tx.clone(),
+                    session_id: SessionId::from(handle.session_id.to_string()),
+                    read: coordinator.read(),
+                    command_state: Arc::clone(&command_state),
+                    permissions: Arc::clone(&handle.permissions),
+                    emitted_version: AtomicU64::new(coordinator.read().options().version),
+                })),
                 handle,
+                coordinator: Some(coordinator),
                 mcp: None,
                 current_mode: AgentMode::Build,
                 command_state,
@@ -1257,6 +2035,7 @@ mod tests {
                 command_registry,
                 command_target,
                 command_projection_task: smol::spawn(async {}),
+                option_projection_task: smol::spawn(async {}),
                 lock: None,
             }),
             elicitation: false,
@@ -1265,41 +2044,198 @@ mod tests {
     }
 
     #[test]
+    fn operation_terminal_is_compare_and_set() {
+        let pending = Arc::new(Mutex::new(Pending {
+            operation: Some(PendingOperation {
+                id: 7,
+                request_id: RequestId::Number(41),
+                kind: OperationKind::TestLocal,
+                cancel: None,
+                _lease: None,
+            }),
+            ..Pending::default()
+        }));
+
+        assert!(take_operation(&pending, 6, OperationKind::TestLocal).is_none());
+        assert!(take_operation(&pending, 7, OperationKind::PrimaryTurn).is_none());
+        let operation = take_operation(&pending, 7, OperationKind::TestLocal).unwrap();
+        assert_eq!(operation.request_id, RequestId::Number(41));
+        assert!(take_operation(&pending, 7, OperationKind::TestLocal).is_none());
+    }
+
+    #[test]
+    fn primary_terminal_cannot_finish_isolated_operation() {
+        let pending = Arc::new(Mutex::new(Pending {
+            operation: Some(PendingOperation {
+                id: 9,
+                request_id: RequestId::Number(43),
+                kind: OperationKind::TestLocal,
+                cancel: None,
+                _lease: None,
+            }),
+            ..Pending::default()
+        }));
+
+        assert!(take_active_operation(&pending, OperationKind::PrimaryTurn).is_none());
+        assert!(take_active_operation(&pending, OperationKind::TestLocal).is_some());
+    }
+
+    #[test]
+    fn primary_prompt_holds_coordinator_lease_until_terminal() {
+        smol::block_on(async {
+            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.id();
+            let coordinator = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .clone();
+            let request_id = RequestId::Number(41);
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id.to_string(), "hello", false),
+                &request_id,
+            )
+            .await
+            .unwrap();
+            assert!(input_rx.try_recv().is_ok());
+
+            let (done_tx, done_rx) = flume::bounded(1);
+            let queued = coordinator.clone();
+            smol::spawn(async move {
+                let result = queued
+                    .set_option(
+                        maki_agent::session_options::YOLO_OPTION_ID,
+                        maki_agent::session_options::ENABLED_VALUE,
+                    )
+                    .await;
+                let _ = done_tx.send(result);
+            })
+            .detach();
+            assert!(done_rx.try_recv().is_err());
+
+            let pending = &srv.session.as_ref().unwrap().pending;
+            let operation = take_active_operation(pending, OperationKind::PrimaryTurn).unwrap();
+            assert_eq!(operation.request_id, request_id);
+            drop(operation);
+            let snapshot = done_rx.recv_async().await.unwrap().unwrap();
+            assert_eq!(
+                snapshot.options[1].current_value.as_ref(),
+                maki_agent::session_options::ENABLED_VALUE
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn slash_update_precedes_prompt_response() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let session = srv.session.as_mut().unwrap();
+            let coordinator = session.coordinator.as_ref().unwrap().clone();
+            coordinator
+                .set_option(maki_agent::session_options::MODEL_OPTION_ID, FAST_SPEC)
+                .await
+                .unwrap();
+            session
+                .command_state
+                .set_model(&Model::from_spec(FAST_SPEC).unwrap());
+            session.option_projection = Some(Arc::new(OptionProjection {
+                out_tx: srv.out_tx.clone(),
+                session_id: SessionId::from(session.handle.session_id.to_string()),
+                read: coordinator.read(),
+                command_state: Arc::clone(&session.command_state),
+                permissions: Arc::clone(&session.handle.permissions),
+                emitted_version: AtomicU64::new(coordinator.read().options().version),
+            }));
+            let request_id = RequestId::Number(42);
+            handle_prompt(
+                &mut srv,
+                &serde_json::json!({
+                    "params": {
+                        "sessionId": coordinator.read().session_id().to_string(),
+                        "prompt": [{ "type": "text", "text": "/fast" }]
+                    }
+                }),
+                &request_id,
+            )
+            .await
+            .unwrap();
+
+            let update = out_rx.recv_async().await.unwrap();
+            assert_eq!(update["method"], "session/update");
+            assert_eq!(
+                update["params"]["update"]["configOptions"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(4)
+            );
+            let response = out_rx.recv_async().await.unwrap();
+            assert_eq!(response["id"], 42);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn config_model_change_clears_ineligible_fast_mode() {
         let (mut srv, ..) = server_awaiting_answer();
-        let (model_tx, model_rx) = flume::unbounded();
+        let coordinator = srv
+            .session
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .clone();
+        smol::block_on(async {
+            coordinator
+                .set_option(maki_agent::session_options::MODEL_OPTION_ID, FAST_SPEC)
+                .await
+                .unwrap();
+            coordinator
+                .set_option(
+                    maki_agent::session_options::FAST_OPTION_ID,
+                    maki_agent::session_options::ENABLED_VALUE,
+                )
+                .await
+                .unwrap();
+        });
         let session = srv.session.as_mut().unwrap();
-        session.handle.model_tx = model_tx;
         session
             .command_state
             .set_model(&Model::from_spec(FAST_SPEC).expect("fast-capable test model should parse"));
-        let fast_result = smol::block_on(
-            session
-                .command_registry
-                .dispatch_input(&session.command_target, "/fast".into()),
-        );
-        assert!(matches!(
-            fast_result,
-            maki_commands::InputDispatch::Dispatched(maki_commands::CommandOutcome::Completed)
-        ));
-        assert!(session.command_state.fast());
+        session.command_state.set_fast(true).unwrap();
 
-        let result = handle_set_config(
+        let active_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+        let result = smol::block_on(handle_set_config(
             &mut srv,
             &serde_json::json!({
                 "params": {
-                    "sessionId": MakiId::generate().to_string(),
+                    "sessionId": active_id,
                     "configId": methods::MODEL_CONFIG_ID,
                     "value": OFFLINE_SPEC,
                 }
             }),
-        );
+        ));
 
-        assert!(result.is_ok());
-        assert_eq!(model_rx.recv().unwrap().spec(), OFFLINE_SPEC);
+        let response = result.unwrap();
+        let AgentResponse::SetSessionConfigOptionResponse(response) = response else {
+            panic!("expected config option response");
+        };
+        assert_eq!(response.config_options.len(), 4);
+        let snapshot = coordinator.read().options();
+        assert_eq!(snapshot.options[0].current_value.as_ref(), OFFLINE_SPEC);
+        assert_eq!(
+            snapshot.options[2].current_value.as_ref(),
+            maki_agent::session_options::DISABLED_VALUE
+        );
         let state = &srv.session.as_ref().unwrap().command_state;
         assert_eq!(state.current_model(), OFFLINE_SPEC);
         assert!(!state.fast());
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]
@@ -1323,9 +2259,68 @@ mod tests {
     }
 
     #[test]
+    fn acp_rejects_stale_session_ids_for_prompt_set_option_mode_and_cancel() {
+        let (mut srv, answer_rx, _, input_rx) = server_awaiting_answer();
+        let stale = MakiId::generate().to_string();
+        let prompt_error = smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request(&stale, "hello", false),
+            &RequestId::Number(9),
+        ))
+        .unwrap_err();
+        assert_eq!(prompt_error.code, AcpError::resource_not_found(None).code);
+        assert!(input_rx.is_empty());
+
+        let config_error = smol::block_on(handle_set_config(
+            &mut srv,
+            &serde_json::json!({
+                "params": {
+                    "sessionId": stale,
+                    "configId": maki_agent::session_options::YOLO_OPTION_ID,
+                    "value": maki_agent::session_options::ENABLED_VALUE
+                }
+            }),
+        ))
+        .unwrap_err();
+        assert_eq!(config_error.code, AcpError::resource_not_found(None).code);
+
+        let mode_error = handle_set_mode(
+            &mut srv,
+            &serde_json::json!({
+                "params": {
+                    "sessionId": stale,
+                    "modeId": "build"
+                }
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(mode_error.code, AcpError::resource_not_found(None).code);
+
+        handle_notification(
+            &srv,
+            "session/cancel",
+            &serde_json::json!({ "params": { "sessionId": stale } }),
+        );
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(PermissionAnswer::AllowOnce.encode()),
+            "stale cancellation must not cancel the active session"
+        );
+    }
+
+    #[test]
     fn cancel_drops_the_outstanding_permission_request() {
         let (srv, answer_rx, ..) = server_awaiting_answer();
-        handle_notification(&srv, "session/cancel");
+        handle_notification(
+            &srv,
+            "session/cancel",
+            &serde_json::json!({
+                "params": {
+                    "sessionId": srv.session.as_ref().unwrap().handle.session_id.to_string()
+                }
+            }),
+        );
 
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
         assert!(answer_rx.is_empty(), "the cancelled turn owns that answer");
@@ -1391,6 +2386,7 @@ mod tests {
         let (answer_tx, answer_rx) = flume::unbounded::<String>();
         let pending = Arc::new(Mutex::new(Pending::default()));
         let session_id = SessionRef::from(MakiId::generate());
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
 
         start_event_pump(
             event_rx,
@@ -1399,7 +2395,7 @@ mod tests {
             Arc::clone(&pending),
             true,
             answer_tx,
-            PathBuf::from("."),
+            coordinator.read(),
             maki_storage::paths::home(),
             None,
         );
@@ -1423,7 +2419,7 @@ mod tests {
                         answer, r#"{"dismissed":true}"#,
                         "the pump must dismiss a question it cannot render, not drop it",
                     );
-                    return;
+                    break;
                 }
                 assert!(
                     out_rx.try_recv().is_err(),
@@ -1436,6 +2432,7 @@ mod tests {
                 smol::Timer::after(std::time::Duration::from_millis(5)).await;
             }
         });
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]
@@ -1465,9 +2462,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "compact", "new", "clear", "model", "cd", "btw", "yolo", "fast", "workflow"
-            ]
+            ["compact", "model", "cd", "btw", "yolo", "fast", "workflow"]
         );
 
         let producer = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
@@ -1505,9 +2500,29 @@ mod tests {
     fn discovered_models_are_pushed_to_the_client() {
         let (mut srv, _, out_rx, _) = server_awaiting_answer();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
-        refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]);
+        smol::block_on(refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]));
         let update = out_rx.try_recv().expect("the fuller list is announced");
-        let options = &update["params"]["update"]["configOptions"][0]["options"];
+        let config_options = update["params"]["update"]["configOptions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            config_options.len(),
+            4,
+            "discovery publishes the full snapshot"
+        );
+        assert_eq!(
+            config_options[1]["currentValue"],
+            maki_agent::session_options::DISABLED_VALUE
+        );
+        assert_eq!(
+            config_options[2]["currentValue"],
+            maki_agent::session_options::DISABLED_VALUE
+        );
+        assert_eq!(
+            config_options[3]["currentValue"],
+            maki_agent::session_options::DISABLED_VALUE
+        );
+        let options = &config_options[0]["options"];
         let selectable: Vec<&str> = options
             .as_array()
             .unwrap()
@@ -1516,11 +2531,11 @@ mod tests {
             .collect();
         assert!(selectable.contains(&OFFLINE_SPEC));
         assert!(selectable.contains(&DISCOVERED_SPEC));
-        refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]);
+        smol::block_on(refresh_models(&mut srv, vec![DISCOVERED_SPEC.to_owned()]));
         assert!(out_rx.is_empty());
     }
 
-    fn prompt_request(text: &str, image: bool) -> Value {
+    fn prompt_request(session_id: &str, text: &str, image: bool) -> Value {
         let mut prompt = vec![serde_json::json!({ "type": "text", "text": text })];
         if image {
             prompt.push(serde_json::json!({
@@ -1531,10 +2546,21 @@ mod tests {
         }
         serde_json::json!({
             "params": {
-                "sessionId": MakiId::generate().to_string(),
+                "sessionId": session_id,
                 "prompt": prompt,
             }
         })
+    }
+
+    async fn dispatch_prompt(
+        srv: &mut Server,
+        text: &str,
+        image: bool,
+        id: &RequestId,
+    ) -> Result<(), AcpError> {
+        let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+        let raw = prompt_request(&session_id, text, image);
+        handle_prompt(srv, &raw, id).await
     }
 
     fn install_registry(srv: &mut Server, registry: maki_commands::CommandRegistry) {
@@ -1550,11 +2576,187 @@ mod tests {
     }
 
     #[test]
+    fn compact_tool_progress_success_sequence() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let (control_tx, control_rx) = flume::unbounded();
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            install_registry(&mut srv, test_registry(&[]));
+            let request_id = RequestId::Number(30);
+
+            dispatch_prompt(&mut srv, "/compact", false, &request_id)
+                .await
+                .unwrap();
+            assert!(input_rx.is_empty(), "compaction bypasses primary input");
+            let pending = out_rx.recv_async().await.unwrap();
+            assert_eq!(pending["params"]["update"]["sessionUpdate"], "tool_call");
+            assert_eq!(pending["params"]["update"]["title"], "Compact context");
+            let control = control_rx.recv_async().await.unwrap();
+            let maki_agent::headless::InteractiveControl::ManualCompaction { output, .. } = control
+            else {
+                panic!("expected manual compaction control");
+            };
+            output
+                .send_async(maki_agent::headless::ManualCompactionEvent::Started)
+                .await
+                .unwrap();
+            output
+                .send_async(maki_agent::headless::ManualCompactionEvent::Completed)
+                .await
+                .unwrap();
+
+            let started = out_rx.recv_async().await.unwrap();
+            let completed = out_rx.recv_async().await.unwrap();
+            let terminal = out_rx.recv_async().await.unwrap();
+            assert_eq!(started["params"]["update"]["status"], "in_progress");
+            assert_eq!(completed["params"]["update"]["status"], "completed");
+            assert_eq!(terminal["id"], 30);
+            assert_eq!(terminal["result"]["stopReason"], "end_turn");
+            assert!(out_rx.is_empty(), "compaction prompt completes once");
+        });
+    }
+
+    #[test]
+    fn compact_prompt_cancellation_completes_once() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let (control_tx, control_rx) = flume::unbounded();
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            install_registry(&mut srv, test_registry(&[]));
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+
+            dispatch_prompt(&mut srv, "/compact", false, &RequestId::Number(33))
+                .await
+                .unwrap();
+            let _pending = out_rx.recv_async().await.unwrap();
+            let control = control_rx.recv_async().await.unwrap();
+            let maki_agent::headless::InteractiveControl::ManualCompaction {
+                output, cancel, ..
+            } = control
+            else {
+                panic!("expected manual compaction control");
+            };
+            handle_notification(
+                &srv,
+                "session/cancel",
+                &serde_json::json!({ "params": { "sessionId": session_id } }),
+            );
+            cancel.cancelled().await;
+            output
+                .send_async(maki_agent::headless::ManualCompactionEvent::Cancelled)
+                .await
+                .unwrap();
+
+            let failed = out_rx.recv_async().await.unwrap();
+            let terminal = out_rx.recv_async().await.unwrap();
+            assert_eq!(failed["params"]["update"]["status"], "failed");
+            assert_eq!(terminal["id"], 33);
+            assert_eq!(terminal["result"]["stopReason"], "cancelled");
+            let _ = output
+                .send_async(maki_agent::headless::ManualCompactionEvent::Completed)
+                .await;
+            smol::future::yield_now().await;
+            assert!(
+                out_rx.is_empty(),
+                "late completion must not terminate twice"
+            );
+        });
+    }
+
+    #[test]
+    fn compact_tool_progress_failure_sequence() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let (control_tx, control_rx) = flume::unbounded();
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            install_registry(&mut srv, test_registry(&[]));
+
+            dispatch_prompt(&mut srv, "/compact", false, &RequestId::Number(32))
+                .await
+                .unwrap();
+            let _pending = out_rx.recv_async().await.unwrap();
+            let control = control_rx.recv_async().await.unwrap();
+            let maki_agent::headless::InteractiveControl::ManualCompaction { output, .. } = control
+            else {
+                panic!("expected manual compaction control");
+            };
+            output
+                .send_async(maki_agent::headless::ManualCompactionEvent::Failed(
+                    "save failed".into(),
+                ))
+                .await
+                .unwrap();
+
+            let failed = out_rx.recv_async().await.unwrap();
+            let terminal = out_rx.recv_async().await.unwrap();
+            assert_eq!(failed["params"]["update"]["status"], "failed");
+            assert_eq!(terminal["id"], 32);
+            assert_eq!(terminal["error"]["data"], "save failed");
+            assert!(out_rx.is_empty(), "failed compaction completes once");
+        });
+    }
+
+    #[test]
+    fn btw_streams_and_completes_active_prompt() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let (control_tx, control_rx) = flume::unbounded();
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            install_registry(&mut srv, test_registry(&[]));
+            let request_id = RequestId::Number(31);
+
+            dispatch_prompt(&mut srv, "/btw why?", true, &request_id)
+                .await
+                .unwrap();
+            assert!(input_rx.is_empty(), "isolated turns bypass primary input");
+            let control = control_rx.recv_async().await.unwrap();
+            let maki_agent::headless::InteractiveControl::IsolatedTurn {
+                question,
+                images,
+                output,
+                ..
+            } = control
+            else {
+                panic!("expected isolated turn control");
+            };
+            assert_eq!(question, "why?");
+            assert_eq!(images.len(), 1);
+
+            use maki_agent::agent::isolated_turn::IsolatedTurnEvent;
+            output
+                .send_async(IsolatedTurnEvent::ThinkingDelta("thought".into()))
+                .await
+                .unwrap();
+            output
+                .send_async(IsolatedTurnEvent::TextDelta("answer".into()))
+                .await
+                .unwrap();
+            output.send_async(IsolatedTurnEvent::Done).await.unwrap();
+
+            let thought = out_rx.recv_async().await.unwrap();
+            let answer = out_rx.recv_async().await.unwrap();
+            let terminal = out_rx.recv_async().await.unwrap();
+            assert_eq!(
+                thought["params"]["update"]["sessionUpdate"],
+                "agent_thought_chunk"
+            );
+            assert_eq!(
+                answer["params"]["update"]["sessionUpdate"],
+                "agent_message_chunk"
+            );
+            assert_eq!(terminal["id"], 31);
+            assert_eq!(terminal["result"]["stopReason"], "end_turn");
+            assert!(out_rx.is_empty(), "operation terminates exactly once");
+        });
+    }
+
+    #[test]
     fn unknown_slash_prompt_is_sent_to_agent_literal() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
-        smol::block_on(handle_prompt(
+        smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/does-not-exist value", false),
+            "/does-not-exist value",
+            false,
             &RequestId::Number(1),
         ))
         .unwrap();
@@ -1577,9 +2779,10 @@ mod tests {
         }]);
         install_registry(&mut srv, registry);
 
-        smol::block_on(handle_prompt(
+        smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/project:review src", false),
+            "/project:review src",
+            false,
             &RequestId::Number(2),
         ))
         .unwrap();
@@ -1590,9 +2793,10 @@ mod tests {
     fn unavailable_interactive_command_is_sent_to_agent_literal() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
 
-        smol::block_on(handle_prompt(
+        smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/help", true),
+            "/help",
+            true,
             &RequestId::Number(3),
         ))
         .unwrap();
@@ -1605,9 +2809,10 @@ mod tests {
     fn portable_bare_model_returns_shared_usage_error() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
 
-        let error = smol::block_on(handle_prompt(
+        let error = smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/model", false),
+            "/model",
+            false,
             &RequestId::Number(3),
         ))
         .unwrap_err();
@@ -1621,9 +2826,10 @@ mod tests {
     fn portable_local_builtin_rejects_non_text_content() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
 
-        let error = smol::block_on(handle_prompt(
+        let error = smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/compact", true),
+            "/compact",
+            true,
             &RequestId::Number(3),
         ))
         .unwrap_err();
@@ -1645,9 +2851,10 @@ mod tests {
         }]);
         install_registry(&mut srv, registry);
 
-        smol::block_on(handle_prompt(
+        smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/project:review src", true),
+            "/project:review src",
+            true,
             &RequestId::Number(3),
         ))
         .unwrap();
@@ -1668,9 +2875,10 @@ mod tests {
             argument_hint: None,
         }]);
         install_registry(&mut srv, registry);
+        let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
         let raw = serde_json::json!({
             "params": {
-                "sessionId": MakiId::generate().to_string(),
+                "sessionId": session_id,
                 "prompt": [
                     { "type": "text", "text": "/project:review src" },
                     { "type": "audio", "data": "aGVsbG8=", "mimeType": "audio/wav" }
@@ -1722,9 +2930,10 @@ mod tests {
             .unwrap();
         install_registry(&mut srv, registry);
 
-        smol::block_on(handle_prompt(
+        smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/lua-complete", false),
+            "/lua-complete",
+            false,
             &RequestId::Number(4),
         ))
         .unwrap();
@@ -1736,9 +2945,10 @@ mod tests {
     #[test]
     fn portable_bare_btw_is_rejected_by_registry() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
-        let error = smol::block_on(handle_prompt(
+        let error = smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/btw", false),
+            "/btw",
+            false,
             &RequestId::Number(4),
         ))
         .unwrap_err();
@@ -1751,15 +2961,17 @@ mod tests {
     }
 
     #[test]
-    fn portable_agent_turn_builtin_is_forwarded_to_agent() {
+    fn isolated_btw_is_not_forwarded_to_primary_agent() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
-        smol::block_on(handle_prompt(
+        let error = smol::block_on(dispatch_prompt(
             &mut srv,
-            &prompt_request("/btw explain this", false),
+            "/btw explain this",
+            false,
             &RequestId::Number(4),
         ))
-        .unwrap();
-        assert_eq!(input_rx.try_recv().unwrap().message, "explain this");
+        .unwrap_err();
+        assert_eq!(error.code, AcpError::internal_error().code);
+        assert!(input_rx.is_empty());
     }
 
     #[test]
@@ -1787,6 +2999,36 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&history.history).unwrap(),
             serde_json::to_value(&messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn load_history_restores_projected_option_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new("anthropic/test-model", "/project");
+        session.meta.yolo = true;
+        session.meta.fast = true;
+        session.meta.workflow = true;
+        session
+            .meta
+            .session_options
+            .insert("bash.auto_mode".into(), "enabled".into());
+        session.save(&dir).unwrap();
+
+        let restored = load_history_from(&dir, session.id).unwrap();
+
+        assert!(restored.meta.yolo);
+        assert!(restored.meta.fast);
+        assert!(restored.meta.workflow);
+        assert_eq!(
+            restored
+                .meta
+                .session_options
+                .get("bash.auto_mode")
+                .map(String::as_str),
+            Some("enabled")
         );
     }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
@@ -11,6 +11,7 @@ static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
 const WILDCARD_PATTERN: &str = "*";
 
+#[derive(Clone)]
 pub(crate) struct AutocmdEntry {
     pub id: u64,
     pub callback: Function,
@@ -19,10 +20,12 @@ pub(crate) struct AutocmdEntry {
     pub patterns: Option<Vec<String>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct AutocmdStore {
     pub(crate) listeners: HashMap<String, Vec<AutocmdEntry>>,
 }
+
+pub(crate) type PendingAutocmdStore = Arc<Mutex<AutocmdStore>>;
 
 impl AutocmdStore {
     pub fn register(&mut self, event: String, entry: AutocmdEntry) {
@@ -64,28 +67,46 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// gets its own `ev` table, so one plugin's mutation cannot leak into the
 /// next.
 pub(crate) fn dispatch(lua: &Lua, event: &str, pattern: Option<&str>, data: Value) {
-    let Ok(_guard) = DepthGuard::enter(lua, "autocmd", event) else {
-        tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
-        return;
-    };
-    let snapshot: Vec<(u64, Arc<str>, Function)> = {
+    let snapshot = {
         let Some(mut store) = lua.app_data_mut::<AutocmdStore>() else {
             return;
         };
-        let Some(entries) = store.listeners.get_mut(event) else {
-            return;
-        };
-        let mut snapshot = Vec::new();
-        // Drop `once` entries now, at snapshot time: if a callback refires
-        // the same event they are already gone, so they stay exactly-once.
-        entries.retain(|e| {
-            let fires = pattern_matches(e.patterns.as_deref(), pattern);
-            if fires {
-                snapshot.push((e.id, Arc::clone(&e.plugin), e.callback.clone()));
-            }
-            !(fires && e.once)
-        });
-        snapshot
+        snapshot(&mut store, event, pattern)
+    };
+    dispatch_snapshot(lua, event, pattern, data, snapshot);
+}
+
+fn snapshot(
+    store: &mut AutocmdStore,
+    event: &str,
+    pattern: Option<&str>,
+) -> Vec<(u64, Arc<str>, Function)> {
+    let Some(entries) = store.listeners.get_mut(event) else {
+        return Vec::new();
+    };
+    let mut snapshot = Vec::new();
+    // Drop `once` entries now, at snapshot time: if a callback refires
+    // the same event they are already gone, so they stay exactly-once.
+    entries.retain(|e| {
+        let fires = pattern_matches(e.patterns.as_deref(), pattern);
+        if fires {
+            snapshot.push((e.id, Arc::clone(&e.plugin), e.callback.clone()));
+        }
+        !(fires && e.once)
+    });
+    snapshot
+}
+
+fn dispatch_snapshot(
+    lua: &Lua,
+    event: &str,
+    pattern: Option<&str>,
+    data: Value,
+    snapshot: Vec<(u64, Arc<str>, Function)>,
+) {
+    let Ok(_guard) = DepthGuard::enter(lua, "autocmd", event) else {
+        tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
+        return;
     };
     for (id, plugin, callback) in snapshot {
         let ev = match make_ev_table(lua, id, event, pattern, &data) {
@@ -154,7 +175,13 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   end,
 /// })
 #[lua_fn]
-fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table) -> LuaResult<u64> {
+fn create_autocmd(
+    lua: &Lua,
+    #[ctx] pending: PendingAutocmdStore,
+    #[ctx] plugin: Arc<str>,
+    event: Value,
+    opts: Table,
+) -> LuaResult<u64> {
     let events = parse_string_or_seq(event, "event")?;
     let callback: Function = opts.get("callback")?;
     let once: bool = opts.get("once").unwrap_or(false);
@@ -163,20 +190,36 @@ fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table)
         v => Some(parse_string_or_seq(v, "pattern")?),
     };
     let id = NEXT_AUTOCMD_ID.fetch_add(1, Ordering::Relaxed);
-    let mut store = lua
-        .app_data_mut::<AutocmdStore>()
-        .ok_or_else(|| mlua::Error::runtime("autocmd store not initialized"))?;
-    for event in events {
-        store.register(
-            event,
-            AutocmdEntry {
-                id,
-                callback: callback.clone(),
-                plugin: Arc::clone(&plugin),
-                once,
-                patterns: patterns.clone(),
-            },
-        );
+    if crate::runtime::loading_plugin(lua).is_some() {
+        let mut store = pending.lock().unwrap_or_else(|error| error.into_inner());
+        for event in events {
+            store.register(
+                event,
+                AutocmdEntry {
+                    id,
+                    callback: callback.clone(),
+                    plugin: Arc::clone(&plugin),
+                    once,
+                    patterns: patterns.clone(),
+                },
+            );
+        }
+    } else {
+        let mut store = lua
+            .app_data_mut::<AutocmdStore>()
+            .ok_or_else(|| mlua::Error::runtime("autocmd store not initialized"))?;
+        for event in events {
+            store.register(
+                event,
+                AutocmdEntry {
+                    id,
+                    callback: callback.clone(),
+                    plugin: Arc::clone(&plugin),
+                    once,
+                    patterns: patterns.clone(),
+                },
+            );
+        }
     }
     Ok(id)
 }
@@ -189,8 +232,13 @@ fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table)
 /// @example
 /// maki.api.del_autocmd(id)
 #[lua_fn]
-fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
-    if let Some(mut store) = lua.app_data_mut::<AutocmdStore>() {
+fn del_autocmd(lua: &Lua, #[ctx] pending: PendingAutocmdStore, id: u64) -> LuaResult<()> {
+    if crate::runtime::loading_plugin(lua).is_some() {
+        pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id);
+    } else if let Some(mut store) = lua.app_data_mut::<AutocmdStore>() {
         store.remove(id);
     }
     Ok(())
@@ -210,7 +258,12 @@ fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
 ///   data = { msg = "hello" },
 /// })
 #[lua_fn]
-fn exec_autocmds(lua: &Lua, event: Value, opts: Option<Table>) -> LuaResult<()> {
+fn exec_autocmds(
+    lua: &Lua,
+    #[ctx] pending: PendingAutocmdStore,
+    event: Value,
+    opts: Option<Table>,
+) -> LuaResult<()> {
     let events = parse_string_or_seq(event, "event")?;
     let (pattern, data) = match opts {
         Some(opts) => {
@@ -224,14 +277,22 @@ fn exec_autocmds(lua: &Lua, event: Value, opts: Option<Table>) -> LuaResult<()> 
         None => (None, Value::Nil),
     };
     for event in events {
-        dispatch(lua, &event, pattern.as_deref(), data.clone());
+        if crate::runtime::loading_plugin(lua).is_some() {
+            let snapshot = {
+                let mut store = pending.lock().unwrap_or_else(|error| error.into_inner());
+                snapshot(&mut store, &event, pattern.as_deref())
+            };
+            dispatch_snapshot(lua, &event, pattern.as_deref(), data.clone(), snapshot);
+        } else {
+            dispatch(lua, &event, pattern.as_deref(), data.clone());
+        }
     }
     Ok(())
 }
 
 lua_table! {
-    extend "maki.api" => pub(crate) fn add_autocmd_methods(plugin: Arc<str>), DOCS [
-        create_autocmd(plugin), del_autocmd, exec_autocmds,
+    extend "maki.api" => pub(crate) fn add_autocmd_methods(pending: PendingAutocmdStore, plugin: Arc<str>), DOCS [
+        create_autocmd(pending, plugin), del_autocmd(pending), exec_autocmds(pending),
     ]
 }
 

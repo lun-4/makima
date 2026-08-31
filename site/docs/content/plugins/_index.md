@@ -155,9 +155,13 @@ maki.api.register_tool({
 
     local limit = opts.search_result_limit
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+    local path, path_err = ctx:resolve_path(input.path or ".")
+    if not path then
+      return { llm_output = "error: " .. tostring(path_err), is_error = true }
+    end
 
     local files, err = maki.fs.glob(pattern, {
-      path = input.path,
+      path = path,
       gitignore = true,
       sort = "mtime",
       limit = limit,

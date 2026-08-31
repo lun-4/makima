@@ -12,7 +12,7 @@ use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
 use crate::tools::{LocalToolFn, ToolContext, truncate_line};
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
-use maki_config::ToolKey;
+use maki_config::{FILE_WRITE_TOOLS, ToolKey};
 
 #[derive(Clone, Copy)]
 pub enum Emit {
@@ -117,7 +117,7 @@ pub async fn run(
             }
         };
 
-        if let Some(target) = invocation.mutable_path() {
+        if let Some(target) = invocation.mutable_path(ctx) {
             let restrict = ctx.restrict_write_to();
             let is_plan_target = restrict.as_deref().is_some_and(|pp| target == pp);
             if !is_plan_target {
@@ -129,7 +129,7 @@ pub async fn run(
                     );
                     return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
                 }
-                if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
+                if let Some(reason) = ctx.permissions.boundary_block_reason(&target) {
                     return done_error(reason);
                 }
             }
@@ -163,10 +163,11 @@ pub async fn run(
         // prompts. The execution context carries this dispatch's owner
         // appended to the inherited chain, so recursive same-path calls
         // from inside a locked handler are rejected instead of deadlocking.
-        let locked = match invocation.mutable_path() {
+        let locked = match invocation.mutable_path(ctx) {
             Some(target) => {
                 let key = match crate::tools::file_locks::FileWriteLocks::lock_key(
                     &target.to_string_lossy(),
+                    &ctx.cwd,
                 ) {
                     Ok(key) => key,
                     Err(e) => return done_error(e),
@@ -345,6 +346,18 @@ async fn enforce_permission(
         ));
     }
     if let Some(scopes) = inv.permission_scopes().await {
+        let scopes = if FILE_WRITE_TOOLS.contains(&name) {
+            crate::tools::PermissionScopes {
+                scopes: scopes
+                    .scopes
+                    .into_iter()
+                    .map(|scope| ctx.resolve_path(&scope).unwrap_or(scope))
+                    .collect(),
+                force_prompt: scopes.force_prompt,
+            }
+        } else {
+            scopes
+        };
         let tool_key = ToolKey::native(name);
         ctx.permissions
             .enforce(
@@ -1046,7 +1059,6 @@ mod tests {
 
     // ---- write-lock dispatch tests ----------------------------------------
 
-    use std::path::Path;
     use std::time::Duration;
 
     use crate::cancel::CancelToken;
@@ -1113,8 +1125,8 @@ mod tests {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("gated".into()))
         }
-        fn mutable_path(&self) -> Option<&Path> {
-            Some(Path::new(&self.path))
+        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
+            Some(PathBuf::from(&self.path))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
@@ -1629,8 +1641,8 @@ mod tests {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("recursive".into()))
         }
-        fn mutable_path(&self) -> Option<&Path> {
-            self.input["path"].as_str().map(Path::new)
+        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
+            self.input["path"].as_str().map(PathBuf::from)
         }
         fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
@@ -1687,8 +1699,8 @@ mod tests {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("inner".into()))
         }
-        fn mutable_path(&self) -> Option<&Path> {
-            Some(Path::new(&self.path))
+        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
+            Some(PathBuf::from(&self.path))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async {

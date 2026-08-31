@@ -46,6 +46,7 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 | `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | no |
 | `/build` | Switch to build mode (full tool access) |  | no |
 | `/memory` | View, edit, and delete memory files |  | yes |
+| `/options` | Browse and change session options |  | yes |
 | `/plan` | Switch to plan mode (analyse and write only the plan file) |  | no |
 | `/rename` | Rename the current session | <title> | yes |
 | `/sessions` | Browse and switch sessions | [query] | yes |

@@ -991,21 +991,35 @@ fn memory_computed_mutable_path_locks_the_real_note() {
     let (registry, _host) = boot_with_backend(&["memory"], fs as _, HashMap::new());
     let entry = registry.get("memory").expect("memory tool registered");
 
-    let write = entry
-        .tool
-        .parse(&json!({"command": "write", "path": "notes.md", "content": "x"}))
-        .expect("parse");
-    let target = write
-        .mutable_path()
-        .map(|p| p.to_path_buf())
+    let parse_write = || {
+        entry
+            .tool
+            .parse(&json!({"command": "write", "path": "notes.md", "content": "x"}))
+            .expect("parse")
+    };
+    let mut first_ctx = shared_ctx(&registry);
+    first_ctx.cwd = PathBuf::from("/projects/first");
+    let first_target = parse_write()
+        .mutable_path(&first_ctx)
+        .expect("memory write declares a mutable path");
+    let mut second_ctx = first_ctx.clone();
+    second_ctx.cwd = PathBuf::from("/projects/second");
+    let second_target = parse_write()
+        .mutable_path(&second_ctx)
         .expect("memory write declares a mutable path");
     assert!(
-        target.is_absolute(),
-        "lock key must be absolute: {target:?}"
+        first_target.is_absolute(),
+        "lock key must be absolute: {first_target:?}"
     );
     assert!(
-        target.to_string_lossy().ends_with("memories/notes.md"),
-        "lock key must be the note's real location: {target:?}"
+        first_target
+            .to_string_lossy()
+            .ends_with("memories/notes.md"),
+        "lock key must be the note's real location: {first_target:?}"
+    );
+    assert_ne!(
+        first_target, second_target,
+        "lock key must use the invocation session cwd"
     );
 
     let read = entry
@@ -1013,7 +1027,7 @@ fn memory_computed_mutable_path_locks_the_real_note() {
         .parse(&json!({"command": "read", "path": "notes.md"}))
         .expect("parse");
     assert!(
-        read.mutable_path().is_none(),
+        read.mutable_path(&first_ctx).is_none(),
         "memory read must not participate in write serialization"
     );
 }

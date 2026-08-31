@@ -1042,6 +1042,7 @@ impl SubagentDriver {
             fast: self.fast,
             workflow: false,
             prompt: None,
+            lease_committer: None,
         };
         let outcome = agent.run(turn_id, input).await;
         drop(agent);

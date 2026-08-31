@@ -8,7 +8,7 @@
 //! Legacy `.json` files are loaded transparently and converted to `.jsonl` on next save.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -156,6 +156,10 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub yolo: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_options: BTreeMap<String, String>,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells

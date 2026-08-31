@@ -1,4 +1,7 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::borrow::Cow;
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,16 +32,20 @@ use mlua::{
 };
 use serde_json::{Value, json};
 
+use crate::api::PluginLoadContext;
 use crate::api::completion::add_completion_fns;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
+use crate::api::session_option::add_session_option_fn;
 use crate::api::ui::buf::{BufHandle, line_to_lua};
-use crate::api::util::command::{CommandEntry, CommandHandlerMap, UiAction, ui_roundtrip};
+use crate::api::util::command::{
+    CommandEntry, CommandHandlerMap, PendingCommandMap, UiAction, remove_command_entry,
+    ui_roundtrip,
+};
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::runtime::{
-    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
-    command_invocation,
+    HintContent, LiveCtx, PromptHintRegistration, Request, command_depth, command_invocation,
 };
 
 const TOOL_NAME_MAX: usize = 64;
@@ -415,15 +422,15 @@ impl ToolInvocation for LuaToolInvocation {
         }
     }
 
-    fn mutable_path(&self) -> Option<&Path> {
+    fn mutable_path(&self, ctx: &ToolContext) -> Option<PathBuf> {
         match &self.mutable_path {
             Some(MutablePathKind::Field(field)) => {
-                self.input.get(field.as_ref())?.as_str().map(Path::new)
+                self.input.get(field.as_ref())?.as_str().map(PathBuf::from)
             }
             Some(MutablePathKind::Callback) => self
                 .mutable_path_once
-                .get_or_init(|| self.compute_callback_mutable_path())
-                .as_deref(),
+                .get_or_init(|| self.compute_callback_mutable_path(&ctx.cwd))
+                .clone(),
             None => None,
         }
     }
@@ -674,7 +681,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
-///   mutable_path    (string|function) Schema field name (type: string) for the primary path the tool writes, or `function(input)` returning the resolved target path (nil when the call does not mutate). When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
+///   mutable_path    (string|function) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
 /// @example
@@ -850,8 +857,13 @@ fn register_permission_rule(
 ///   end,
 /// })
 #[lua_fn]
-fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
-    register_command_from_lua(lua, &spec, plugin)
+fn register_command(
+    lua: &Lua,
+    #[ctx] pending: PendingCommandMap,
+    #[ctx] plugin: Arc<str>,
+    spec: Table,
+) -> LuaResult<()> {
+    register_command_from_lua(lua, &spec, plugin, pending)
 }
 
 /// Runs a slash command by name, exactly as typing it in the input would.
@@ -935,7 +947,12 @@ async fn run_command(
 ///   content = "- Prefer **grep** over reading entire files.",
 /// })
 #[lua_fn]
-fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+fn register_prompt_hint(
+    lua: &Lua,
+    #[ctx] pending: crate::runtime::PendingPromptHintCallbacks,
+    #[ctx] plugin: Arc<str>,
+    spec: Table,
+) -> LuaResult<()> {
     let slot: Slot = parse_slot(&spec)?;
     if slot.kind() == SlotKind::Singleton {
         return Err(mlua::Error::runtime(format!(
@@ -953,10 +970,12 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
         slot,
         content,
     };
-    let mut map = lua
-        .app_data_mut::<PromptHintCallbacks>()
-        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-    map.entry(Arc::clone(&plugin)).or_default().push(reg);
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(Arc::clone(&plugin))
+        .or_default()
+        .push(reg);
     Ok(())
 }
 
@@ -980,7 +999,12 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 ///   content = "Be concise. No filler words.",
 /// })
 #[lua_fn]
-fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
+fn set_prompt(
+    lua: &Lua,
+    #[ctx] pending: crate::runtime::PendingPromptHintCallbacks,
+    #[ctx] plugin: Arc<str>,
+    spec: Table,
+) -> LuaResult<()> {
     let slot: Slot = parse_slot(&spec)?;
     if slot.kind() == SlotKind::Aggregate {
         return Err(mlua::Error::runtime(format!(
@@ -998,10 +1022,12 @@ fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> 
         slot,
         content,
     };
-    let mut map = lua
-        .app_data_mut::<PromptHintCallbacks>()
-        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-    map.entry(Arc::clone(&plugin)).or_default().push(reg);
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(Arc::clone(&plugin))
+        .or_default()
+        .push(reg);
     Ok(())
 }
 
@@ -1087,9 +1113,9 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending), register_permission_rule(pending_rules), register_command(plugin),
-        register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, pending_commands: PendingCommandMap, pending_options: crate::api::options::PendingPluginOptionSpecs, pending_prompts: crate::runtime::PendingPromptHintCallbacks, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending), register_permission_rule(pending_rules), register_command(pending_commands, plugin),
+        register_prompt_hint(pending_prompts, plugin), register_options(pending_options, plugin, opts), set_prompt(pending_prompts, plugin),
         get_tools, get_tool,
         manual run_command,
     ]
@@ -1097,15 +1123,36 @@ lua_table! {
 
 pub(crate) fn create_api_table(
     lua: &Lua,
-    pending: PendingTools,
-    pending_rules: PendingRules,
+    context: PluginLoadContext,
     plugin: Arc<str>,
     opts: PluginOpts,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    add_tool_fns(&t, lua, pending, pending_rules, Arc::clone(&plugin), opts)?;
-    add_completion_fns(&t, lua, plugin)?;
+    add_tool_fns(
+        &t,
+        lua,
+        context.pending.clone(),
+        context.pending_rules.clone(),
+        context.pending_commands.clone(),
+        context.pending_options.clone(),
+        context.pending_prompts.clone(),
+        Arc::clone(&plugin),
+        opts,
+    )?;
+    add_completion_fns(
+        &t,
+        lua,
+        Arc::clone(&plugin),
+        context.pending_sources.clone(),
+        context.pending_expanders.clone(),
+    )?;
+    add_session_option_fn(
+        &t,
+        lua,
+        context.pending_session_options.clone(),
+        ui_action_tx.clone(),
+    )?;
     run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }
@@ -1456,7 +1503,12 @@ fn parse_nargs(spec: &Table) -> LuaResult<ArgumentArity> {
     }
 }
 
-fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaResult<()> {
+fn register_command_from_lua(
+    lua: &Lua,
+    spec: &Table,
+    plugin: Arc<str>,
+    pending: PendingCommandMap,
+) -> LuaResult<()> {
     let mut name: String = spec
         .get("name")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'name'"))?;
@@ -1511,40 +1563,34 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
     let name: Arc<str> = Arc::from(name.as_str());
     let description: Arc<str> = Arc::from(description.as_str());
 
-    {
-        let mut map = lua
-            .app_data_mut::<CommandHandlerMap>()
-            .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-        let commands = map.entry(Arc::clone(&plugin)).or_default();
-        if let Some(previous) = commands.remove(&name) {
-            let _ = lua.remove_registry_value(previous.handler);
-            for key in [
-                previous.argument_completion,
-                previous.completion_on_highlight,
-                previous.completion_on_accept,
-                previous.completion_on_cancel,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let _ = lua.remove_registry_value(key);
-            }
+    let entry = CommandEntry {
+        handler: handler_key,
+        description,
+        argument_hint,
+        arguments,
+        tui_only,
+        argument_completion: completion_key,
+        completion_on_highlight,
+        completion_on_accept,
+        completion_on_cancel,
+    };
+
+    if crate::runtime::loading_plugin(lua).is_some() {
+        let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = pending.insert(Arc::clone(&name), entry) {
+            remove_command_entry(lua, previous);
         }
-        commands.insert(
-            Arc::clone(&name),
-            CommandEntry {
-                handler: handler_key,
-                description,
-                argument_hint,
-                arguments,
-                tui_only,
-                argument_completion: completion_key,
-                completion_on_highlight,
-                completion_on_accept,
-                completion_on_cancel,
-            },
-        );
+        return Ok(());
     }
+
+    let mut map = lua
+        .app_data_mut::<CommandHandlerMap>()
+        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+    let commands = map.entry(Arc::clone(&plugin)).or_default();
+    if let Some(previous) = commands.insert(Arc::clone(&name), entry) {
+        remove_command_entry(lua, previous);
+    }
+    drop(map);
 
     if let Err(error) = crate::runtime::publish_registered_commands(lua, &plugin) {
         // The registry rejected the batch (invalid name, duplicate spelling);
@@ -1798,7 +1844,7 @@ impl LuaToolInvocation {
     /// callback. Mirrors the `describe` round trip: same timeout, and on any
     /// failure the invocation reports no mutable path so dispatch skips the
     /// lock rather than stalling the agent.
-    fn compute_callback_mutable_path(&self) -> Option<PathBuf> {
+    fn compute_callback_mutable_path(&self, cwd: &Path) -> Option<PathBuf> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         let sent = self
             .tx
@@ -1806,6 +1852,7 @@ impl LuaToolInvocation {
                 plugin: Arc::clone(&self.plugin),
                 tool: Arc::clone(&self.tool),
                 input: self.input.clone(),
+                cwd: cwd.to_path_buf(),
                 reply: reply_tx,
             })
             .is_ok();

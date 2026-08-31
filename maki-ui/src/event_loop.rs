@@ -20,6 +20,10 @@ use crossterm::event::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::session_coordinator::{
+    DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCoordinatorHandle,
+    SessionCoordinatorParams, builtin_option_definitions,
+};
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
@@ -72,9 +76,6 @@ use crate::theme::ThemesProvider;
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
-const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
-const INVALID_MODEL_ERR: &str = "Invalid model";
-const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const NOT_LIVE_ERR: &str = "session not live";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
@@ -287,6 +288,8 @@ fn parse_session_id(id: &str) -> Result<MakiId, String> {
 struct SessionRuntime {
     app: App,
     handles: AgentHandles,
+    model_slot: Arc<ArcSwap<ModelSlot>>,
+    coordinator: SessionCoordinatorHandle,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
@@ -342,16 +345,38 @@ struct SpawnCtx {
 }
 
 impl SpawnCtx {
-    fn spawn_runtime(&self, session: AppSession) -> SessionRuntime {
+    fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
         let resumed = !session.messages().is_empty();
+        let session_id = session.id;
+        let history = session.messages().to_vec();
+        let model_spec = session.model.clone();
+        let cwd = PathBuf::from(&session.cwd);
+        let startup = self.model_slot.load();
+        let (model, provider) = if startup.model.spec() == model_spec {
+            (startup.model.clone(), Arc::clone(&startup.provider))
+        } else {
+            let mut model = Model::from_spec(&model_spec).context("restore session model")?;
+            let provider = Arc::from(
+                from_model(&mut model, self.timeouts).context("restore session provider")?,
+            );
+            (model, provider)
+        };
+        drop(startup);
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: model.clone(),
+            provider,
+        }));
         let permissions = Arc::new(self.permissions.fork());
+        permissions.set_yolo(session.meta.yolo);
+        permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
         let handles = AgentHandles::spawn(
-            &self.model_slot,
-            session.messages().to_vec(),
+            &model_slot,
+            history.clone(),
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
-            Some(SessionRef::from(session.id)),
+            cwd.clone(),
+            Some(SessionRef::from(session_id)),
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
@@ -359,8 +384,73 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             self.system_prompt.clone(),
         );
+        self.storage_writer.send(Arc::new(session.clone()));
+        let available_models = self
+            .available_models
+            .load_full()
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|spec| Arc::from(spec.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let definitions = builtin_option_definitions(
+            Arc::from(model_spec.as_str()),
+            available_models,
+            session.meta.yolo,
+            session.meta.fast,
+            session.meta.workflow,
+        );
+        let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id,
+            catalog: self.lua_event_handle.session_option_catalog(),
+            definitions,
+            persisted_options: session.meta.session_options.clone(),
+            history,
+            model: Arc::from(model_spec.as_str()),
+            cwd,
+            model_policy: Arc::clone(&self.model_policy),
+            model_adopter: Arc::new({
+                let model_slot = Arc::clone(&model_slot);
+                let timeouts = self.timeouts;
+                move |mut model: Model| {
+                    let model_slot = Arc::clone(&model_slot);
+                    Box::pin(async move {
+                        let provider = from_model(&mut model, timeouts)
+                            .map_err(|error| Arc::from(error.to_string()))?;
+                        model_slot.store(Arc::new(ModelSlot {
+                            model,
+                            provider: Arc::from(provider),
+                        }));
+                        Ok(())
+                    }) as ModelAdoptionFuture
+                }
+            }),
+            directory_adopter: Arc::new({
+                let cwd = handles.cwd_slot();
+                let permissions = Arc::clone(&permissions);
+                move |path: PathBuf| {
+                    let cwd = Arc::clone(&cwd);
+                    let permissions = Arc::clone(&permissions);
+                    Box::pin(async move {
+                        let canonical = path
+                            .canonicalize()
+                            .map_err(|error| Arc::from(error.to_string()))?;
+                        cwd.store(Arc::new(canonical.clone()));
+                        permissions.set_cwd(canonical.clone());
+                        Ok(canonical)
+                    }) as DirectoryAdoptionFuture
+                }
+            }),
+            checkpoint: self.storage_writer.coordinator_checkpoint(),
+            mailbox: handles
+                .mailbox()
+                .ok_or_else(|| eyre!("session mailbox unavailable"))?,
+        })
+        .map_err(|error| eyre!(error))?;
         let mut app = App::new(
-            &self.model_slot.load().model,
+            &model,
             session,
             self.storage.clone(),
             Arc::clone(&self.available_models),
@@ -377,19 +467,22 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
         );
+        app.coordinator = Some(coordinator.clone());
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
-        SessionRuntime {
+        Ok(SessionRuntime {
             app,
             handles,
+            model_slot,
+            coordinator,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
             notifications: RunNotificationState::default(),
-        }
+        })
     }
 }
 
@@ -611,7 +704,7 @@ impl<'t> EventLoop<'t> {
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
             .map(|session| ctx.spawn_runtime(session))
-            .collect();
+            .collect::<Result<_>>()?;
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
         }
@@ -807,10 +900,18 @@ impl<'t> EventLoop<'t> {
                     let actions = self.sessions[index].app.submit_command_turn(turn);
                     self.dispatch(index, actions);
                 }
+                maki_commands::CommandOutcome::IsolatedTurn(turn) => {
+                    let actions = self.sessions[index].app.submit_isolated_turn(turn);
+                    self.dispatch(index, actions);
+                }
+                maki_commands::CommandOutcome::FrontendFeedback(feedback) => {
+                    self.sessions[index].app.present_frontend_feedback(feedback);
+                }
                 maki_commands::CommandOutcome::Failed(error) => {
                     self.sessions[index].app.flash(error.to_string());
                 }
-                maki_commands::CommandOutcome::Completed => {}
+                maki_commands::CommandOutcome::ManualCompaction
+                | maki_commands::CommandOutcome::Completed => {}
             },
         }
     }
@@ -1161,6 +1262,7 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     let rt = self.remove_runtime(i);
+                    let _ = smol::block_on(rt.coordinator.close());
                     rt.handles.cancel();
                 }
                 self.ctx.storage_writer.delete(id, move |res| {
@@ -1198,7 +1300,14 @@ impl<'t> EventLoop<'t> {
                     let slot = self.ctx.model_slot.load();
                     AppSession::new(&slot.model.spec(), &self.session_cwd)
                 };
-                let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+                let runtime = match self.ctx.spawn_runtime(session) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let idx = self.push_runtime(runtime);
                 let id = self.sessions[idx].id();
                 if let Some(prompt) = prompt {
                     let _ = self.submit_text(idx, prompt);
@@ -1297,14 +1406,18 @@ impl<'t> EventLoop<'t> {
                 if let Some(spec) = spec {
                     self.change_model(self.focused, &spec)?;
                 }
-                let app = self.focused_app();
                 if let Some(thinking) = thinking {
-                    app.set_thinking(&thinking)?;
+                    self.focused_app().set_thinking(&thinking)?;
                 }
                 if let Some(fast) = fast {
-                    app.set_fast(fast)?;
+                    self.set_boolean_option(
+                        self.focused,
+                        maki_agent::session_options::FAST_OPTION_ID,
+                        fast,
+                    )?;
+                    self.focused_app().set_fast(fast)?;
                 }
-                Ok(app.model_state())
+                Ok(self.focused_app().model_state())
             }
         }
     }
@@ -1376,26 +1489,11 @@ impl<'t> EventLoop<'t> {
         if let Some(block) = session_lock::resume_block(&session.cwd, &cwd, open_elsewhere) {
             return Err(block.to_string());
         }
-        let focused = &mut self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
-            let old_id = focused.id();
-            let actions = focused.app.load_loaded_session(session);
-            let sessions_dir = self.sessions_dir.clone();
-            smol::unblock(move || {
-                session_lock::release(&sessions_dir, &old_id);
-            })
-            .detach();
-            let sessions_dir = self.sessions_dir.clone();
-            smol::unblock(move || {
-                if let Err(e) = session_lock::heartbeat(&sessions_dir, &id) {
-                    warn!(id = %id, error = %e, "session lock claim failed");
-                }
-            })
-            .detach();
-            self.dispatch(self.focused, actions);
-            return Ok(());
-        }
-        let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+        let runtime = self
+            .ctx
+            .spawn_runtime(session)
+            .map_err(|error| error.to_string())?;
+        let idx = self.push_runtime(runtime);
         self.focused = idx;
         Ok(())
     }
@@ -1517,7 +1615,7 @@ impl<'t> EventLoop<'t> {
         let permissions = Arc::clone(&rt.app.permissions);
         rt.handles.respawn(
             history,
-            &self.ctx.model_slot,
+            &rt.model_slot,
             self.ctx.config.clone(),
             self.ctx.ui_config.tool_output_lines,
             &permissions,
@@ -1554,21 +1652,27 @@ impl<'t> EventLoop<'t> {
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
             Action::NewSession => {
+                if let Err(error) =
+                    smol::block_on(self.sessions[idx].coordinator.replace_history(Vec::new()))
+                {
+                    self.sessions[idx].app.flash(error.to_string());
+                    return;
+                }
                 self.respawn_agent(idx, Vec::new());
             }
             Action::LoadSession(loaded) => {
                 let loaded = *loaded;
-                if loaded.model_spec != self.ctx.model_slot.load().model.spec()
-                    && self.ctx.model_policy.allows(&loaded.model_spec)
-                    && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
-                    && let Ok(new_provider) = from_model(&mut new_model, self.ctx.timeouts)
-                {
-                    self.sessions[idx].app.usage_slot.store(None);
-                    self.ctx.model_slot.store(Arc::new(ModelSlot {
-                        model: new_model,
-                        provider: Arc::from(new_provider),
-                    }));
-                    self.refresh_usage_into(Arc::clone(&self.sessions[idx].app.usage_slot));
+                if let Err(error) = self.change_model(idx, &loaded.model_spec) {
+                    self.sessions[idx].app.flash(error);
+                    return;
+                }
+                if let Err(error) = smol::block_on(
+                    self.sessions[idx]
+                        .coordinator
+                        .replace_history(loaded.messages.clone()),
+                ) {
+                    self.sessions[idx].app.flash(error.to_string());
+                    return;
                 }
                 self.respawn_agent(idx, loaded.messages);
             }
@@ -1632,7 +1736,7 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::Btw(question, images) => {
-                let slot = self.ctx.model_slot.load();
+                let slot = self.sessions[idx].model_slot.load();
                 self.sessions[idx].app.start_btw(
                     question,
                     images,
@@ -1652,22 +1756,25 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    fn set_boolean_option(&self, idx: usize, id: &str, enabled: bool) -> Result<(), String> {
+        let value = if enabled {
+            maki_agent::session_options::ENABLED_VALUE
+        } else {
+            maki_agent::session_options::DISABLED_VALUE
+        };
+        smol::block_on(self.sessions[idx].coordinator.set_option(id, value))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     fn change_model(&mut self, idx: usize, spec: &str) -> Result<(), String> {
-        if !self.ctx.model_policy.allows(spec) {
-            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
-        }
-        let mut new_model =
-            Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
-        let new_provider = from_model(&mut new_model, self.ctx.timeouts)
-            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
+        smol::block_on(self.sessions[idx].coordinator.set_option("model", spec))
+            .map_err(|error| error.to_string())?;
+        let model = self.sessions[idx].model_slot.load().model.clone();
         let app = &mut self.sessions[idx].app;
-        app.update_model(&new_model);
+        app.update_model(&model);
         app.record_recent_model(spec);
         app.usage_slot.store(None);
-        self.ctx.model_slot.store(Arc::new(ModelSlot {
-            model: new_model,
-            provider: Arc::from(new_provider),
-        }));
         self.refresh_usage(idx);
         Ok(())
     }
@@ -1690,11 +1797,11 @@ impl<'t> EventLoop<'t> {
 
     fn refresh_usage(&mut self, idx: usize) {
         let slot = Arc::clone(&self.sessions[idx].app.usage_slot);
-        self.refresh_usage_into(slot);
+        let provider = Arc::clone(&self.sessions[idx].model_slot.load().provider);
+        Self::refresh_usage_into(slot, provider);
     }
 
-    fn refresh_usage_into(&self, slot: Arc<ArcSwapOption<UsageFetchState>>) {
-        let provider = Arc::clone(&self.ctx.model_slot.load().provider);
+    fn refresh_usage_into(slot: Arc<ArcSwapOption<UsageFetchState>>, provider: Arc<dyn Provider>) {
         slot.store(Some(Arc::new(UsageFetchState::Loading)));
         smol::spawn(async move {
             let state = match provider.fetch_usage().await {
@@ -1750,9 +1857,15 @@ impl<'t> EventLoop<'t> {
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
-                mut app, handles, ..
+                mut app,
+                handles,
+                coordinator,
+                ..
             } = rt;
             app.checkpoint_now();
+            if let Err(error) = smol::block_on(coordinator.close()) {
+                warn!(%error, "session coordinator close failed");
+            }
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
             tabs.push(Arc::unwrap_or_clone(app.state.session));

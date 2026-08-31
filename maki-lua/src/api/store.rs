@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table, Value};
@@ -20,8 +20,10 @@ pub(crate) struct Store {
     entries: HashMap<String, HashMap<String, Entry>>,
 }
 
+pub(crate) type PendingStore = Arc<Mutex<Store>>;
+
 impl Store {
-    fn register(
+    pub(crate) fn register(
         &mut self,
         registry: String,
         key: String,
@@ -55,6 +57,17 @@ impl Store {
         self.entries.retain(|_, entries| !entries.is_empty());
         changed
     }
+
+    pub(crate) fn drain(&mut self) -> Vec<(String, String, Arc<str>, Value)> {
+        std::mem::take(&mut self.entries)
+            .into_iter()
+            .flat_map(|(registry, entries)| {
+                entries
+                    .into_iter()
+                    .map(move |(key, entry)| (registry.clone(), key, entry.owner, entry.value))
+            })
+            .collect()
+    }
 }
 
 /// Register a value in a store registry under a stable key. The same plugin
@@ -73,11 +86,31 @@ impl Store {
 #[lua_fn]
 fn register(
     lua: &Lua,
+    #[ctx] pending: PendingStore,
     #[ctx] plugin: Arc<str>,
     registry: String,
     key: String,
     value: Value,
 ) -> LuaResult<()> {
+    if crate::runtime::loading_plugin(lua).is_some() {
+        if let Some(store) = lua.app_data_ref::<Store>()
+            && let Some(existing) = store
+                .entries
+                .get(&registry)
+                .and_then(|entries| entries.get(&key))
+            && existing.owner != plugin
+        {
+            return Err(mlua::Error::runtime(format!(
+                "store entry '{registry}.{key}' is already registered by plugin '{}'",
+                existing.owner
+            )));
+        }
+        pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .register(registry, key, plugin, value)?;
+        return Ok(());
+    }
     let mut store = lua
         .app_data_mut::<Store>()
         .ok_or_else(|| mlua::Error::runtime("store not initialized"))?;
@@ -97,10 +130,29 @@ fn register(
 /// @param registry string Registry name.
 /// @return table Map of entry key to registered value.
 #[lua_fn]
-fn collect(lua: &Lua, registry: String) -> LuaResult<Table> {
+fn collect(
+    lua: &Lua,
+    #[ctx] pending: PendingStore,
+    #[ctx] plugin: Arc<str>,
+    registry: String,
+) -> LuaResult<Table> {
     let result = lua.create_table()?;
+    let loading = crate::runtime::loading_plugin(lua).is_some();
     if let Some(store) = lua.app_data_ref::<Store>()
         && let Some(entries) = store.entries.get(&registry)
+    {
+        for (key, entry) in entries {
+            if !loading || entry.owner != plugin {
+                result.set(key.as_str(), entry.value.clone())?;
+            }
+        }
+    }
+    if loading
+        && let Some(entries) = pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .get(&registry)
     {
         for (key, entry) in entries {
             result.set(key.as_str(), entry.value.clone())?;
@@ -121,8 +173,8 @@ lua_table! {
     /// unloads (one event per touched registry, no ordering guarantee).
     /// Gather the initial state at load time and keep it fresh from events;
     /// do not poll.
-    "maki.store" => pub(crate) fn create_store_table(plugin: Arc<str>), DOCS [
-        register(plugin), collect,
+    "maki.store" => pub(crate) fn create_store_table(pending: PendingStore, plugin: Arc<str>), DOCS [
+        register(pending, plugin), collect(pending, plugin),
     ]
 }
 

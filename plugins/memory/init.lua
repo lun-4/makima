@@ -3,8 +3,7 @@ local helpers = require("memory_helpers")
 
 local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines" }
 
-local function memories_path_suffix()
-  local cwd = maki.uv.cwd()
+local function memories_path_suffix(cwd)
   local root = maki.fs.root(cwd, ".git") or cwd
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
@@ -25,7 +24,7 @@ end
 -- them here so the agent can edit notes directly. Reads may come from the
 -- legacy dir while writes go to the state dir, so cover both.
 local function register_write_rules()
-  local suffix = memories_path_suffix()
+  local suffix = memories_path_suffix(maki.uv.cwd())
   local dirs = { legacy_dir_if_exists(suffix) }
   local state = maki.env.state_dir()
   if state then
@@ -39,8 +38,8 @@ local function register_write_rules()
 end
 register_write_rules()
 
-local function resolve_dir(check_legacy)
-  local suffix = memories_path_suffix()
+local function resolve_dir(check_legacy, cwd)
+  local suffix = memories_path_suffix(cwd or maki.uv.cwd())
   if check_legacy then
     local dir = legacy_dir_if_exists(suffix)
     if dir then
@@ -199,21 +198,6 @@ maki.api.register_tool({
     },
   },
 
-  mutable_path = function(input)
-    if input.command ~= "write" and input.command ~= "delete" then
-      return nil
-    end
-    local dir, dir_err = resolve_dir(false)
-    if not dir then
-      return nil
-    end
-    local file_path, err = helpers.safe_resolve(dir, input.path)
-    if not file_path then
-      return nil
-    end
-    return file_path
-  end,
-
   header = function(input)
     local parts = { input.command or "" }
     if input.path then
@@ -229,6 +213,17 @@ maki.api.register_tool({
     return render_content(content, input.path or "memory.md", ctx)
   end,
 
+  mutable_path = function(input, ctx)
+    if (input.command ~= "write" and input.command ~= "delete") or type(input.path) ~= "string" then
+      return nil
+    end
+    local dir = resolve_dir(false, ctx.cwd)
+    if not dir then
+      return nil
+    end
+    return helpers.safe_resolve(dir, input.path)
+  end,
+
   handler = function(input, ctx)
     if type(input.tags) == "string" then
       input.tags = { input.tags }
@@ -237,8 +232,12 @@ maki.api.register_tool({
     if verr then
       return { llm_output = "error: " .. verr, is_error = true }
     end
+    local cwd, cwd_err = ctx:resolve_path(".")
+    if not cwd then
+      return { llm_output = "error: " .. tostring(cwd_err), is_error = true }
+    end
     local cmd = input.command
-    local dir, dir_err = resolve_dir(cmd == "list" or cmd == "read")
+    local dir, dir_err = resolve_dir(cmd == "list" or cmd == "read", cwd)
     if not dir then
       return { llm_output = "error: " .. dir_err, is_error = true }
     end
