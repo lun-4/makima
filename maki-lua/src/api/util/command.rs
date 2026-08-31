@@ -15,6 +15,64 @@ use crate::api::util::pair::{Pair, try_pair};
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
+pub type StatusContent = Vec<(String, String)>;
+pub type StatusContentEntries = Vec<(Arc<str>, StatusContent)>;
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct StatusContentSnapshot {
+    pub entries: StatusContentEntries,
+    pub generation: u64,
+}
+
+#[derive(Clone)]
+pub struct StatusContentReader(Arc<ArcSwap<StatusContentSnapshot>>);
+
+impl StatusContentReader {
+    pub fn empty() -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(
+            StatusContentSnapshot::default(),
+        )))
+    }
+
+    pub fn load_full(&self) -> Arc<StatusContentSnapshot> {
+        self.0.load_full()
+    }
+}
+
+pub(crate) struct StatusContentWriter {
+    store: Arc<ArcSwap<StatusContentSnapshot>>,
+    generation: AtomicU64,
+}
+
+impl StatusContentWriter {
+    pub fn new() -> (Self, StatusContentReader) {
+        let inner = Arc::new(ArcSwap::from_pointee(StatusContentSnapshot::default()));
+        (
+            Self {
+                store: Arc::clone(&inner),
+                generation: AtomicU64::new(0),
+            },
+            StatusContentReader(inner),
+        )
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn publish(&self, entries: StatusContentEntries) -> bool {
+        if self.store.load().entries == entries {
+            return false;
+        }
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.store(Arc::new(StatusContentSnapshot {
+            entries,
+            generation,
+        }));
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CommandArgumentItem {
     pub label: String,
@@ -349,6 +407,7 @@ pub enum SessionRequest {
     ListAll,
     Live,
     Current,
+    Usage,
     New { prompt: Option<String>, focus: bool },
     Prompt { id: Option<String>, text: String },
     Focus { id: String },
@@ -369,6 +428,54 @@ pub enum ModelRequest {
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderUsageSnapshot {
+    pub provider_id: String,
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<ProviderUsageLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderUsageLimit {
+    pub window: ProviderUsageWindow,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderUsageWindow {
+    Hours { value: u64 },
+    Days { value: u64 },
+    Monthly,
+    Weekly { model: Option<String> },
+    Credits,
+    Subscription,
+    Other { label: String },
+}
+
+pub type ProviderUsageReply = Result<ProviderUsageSnapshot, String>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderUsageInvalidation(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderUsageAck {
+    pub invalidation: ProviderUsageInvalidation,
+    pub status_generation: u64,
+}
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
 /// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
@@ -435,6 +542,11 @@ pub enum UiAction {
         req: ModelRequest,
         reply_tx: flume::Sender<UiReply>,
     },
+    UsageFetch {
+        force: bool,
+        reply_tx: flume::Sender<ProviderUsageReply>,
+    },
+    ProviderUsageAck(ProviderUsageAck),
     WinSaveView {
         reply_tx: flume::Sender<WinView>,
     },
@@ -638,6 +750,19 @@ mod tests {
         let mut cfg = original.clone();
         cfg.apply_patch(FloatConfigPatch::default());
         assert_eq!(cfg, original);
+    }
+
+    #[test]
+    fn status_content_publishes_only_changes() {
+        let (writer, reader) = StatusContentWriter::new();
+        let entries = vec![(Arc::from("plug"), vec![("ready".into(), "success".into())])];
+
+        assert!(writer.publish(entries.clone()));
+        assert_eq!(reader.load_full().generation, 1);
+        assert!(!writer.publish(entries));
+        assert_eq!(reader.load_full().generation, 1);
+        assert!(writer.publish(Vec::new()));
+        assert_eq!(reader.load_full().generation, 2);
     }
 
     #[test]

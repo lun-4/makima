@@ -53,9 +53,9 @@ use crate::api::tool::{
     LuaTool, MutablePathSpec, PendingRules, PendingTool, PendingTools, PermissionScopeSpec,
     ToolCallReply,
 };
-use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
-use crate::api::util::command::{CommandHandlerMap, HintWriter, UiAction};
+use crate::api::ui::{HintStore, StatusContentStore};
+use crate::api::util::command::{CommandHandlerMap, HintWriter, StatusContentWriter, UiAction};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::picker::{PickerCallbacks, PickerEvent};
@@ -237,6 +237,10 @@ pub enum Request {
     SetVersion {
         current: String,
         latest: Option<String>,
+    },
+    ProviderUsageChanged {
+        snapshot: crate::ProviderUsageSnapshot,
+        invalidation: Option<crate::ProviderUsageInvalidation>,
     },
     ClickTool {
         tool_use_id: String,
@@ -1848,6 +1852,7 @@ impl LuaRuntime {
         command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
         keymap_writer: KeymapWriter,
         hint_writer: HintWriter,
+        status_content_writer: StatusContentWriter,
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
         state_dir: Option<PathBuf>,
@@ -1885,6 +1890,7 @@ impl LuaRuntime {
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(AutocmdStore::default());
+        lua.set_app_data(crate::api::usage::UsageMirror::default());
         lua.set_app_data(TimerStore::new());
         lua.set_app_data(Store::default());
         lua.set_app_data(SlotStore::default());
@@ -1894,6 +1900,8 @@ impl LuaRuntime {
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(StatusContentStore::new());
+        lua.set_app_data(status_content_writer);
         lua.set_app_data(Arc::clone(&registry));
         lua.set_app_data(Arc::clone(&modes));
         if let Some(state_dir) = state_dir {
@@ -2024,6 +2032,9 @@ impl LuaRuntime {
         }
         if let Some(mut store) = self.lua.app_data_mut::<AutocmdStore>() {
             store.clear_plugin(name);
+        }
+        if let Some(mut mirror) = self.lua.app_data_mut::<crate::api::usage::UsageMirror>() {
+            mirror.clear_plugin(name);
         }
         if let Some(mut store) = self.lua.app_data_mut::<TimerStore>() {
             for key in store.clear_plugin(name) {
@@ -2483,6 +2494,16 @@ impl LuaRuntime {
             let entries = store.snapshot_entries();
             drop(store);
             if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
+                writer.publish(entries);
+            }
+        }
+        if let Some(mut store) = self.lua.app_data_mut::<StatusContentStore>() {
+            let changed = store.clear_plugin(plugin);
+            let entries = changed.then(|| store.snapshot_entries());
+            drop(store);
+            if let Some(entries) = entries
+                && let Some(writer) = self.lua.app_data_ref::<StatusContentWriter>()
+            {
                 writer.publish(entries);
             }
         }
@@ -3147,6 +3168,7 @@ pub(crate) struct LuaThread {
     pub shutdown: Arc<AtomicBool>,
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
+    pub status_content_reader: crate::api::util::command::StatusContentReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub modes: Arc<maki_agent::ModeRegistry>,
 }
@@ -3255,6 +3277,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
     let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
+    let (status_content_writer, status_content_reader) = StatusContentWriter::new();
     let runtime_command_arguments = command_arguments.clone();
     let runtime_command_argument_lifecycle = command_argument_lifecycle.clone();
 
@@ -3273,6 +3296,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                 runtime_command_argument_lifecycle,
                 keymap_writer,
                 hint_writer,
+                status_content_writer,
                 jit,
                 plugin_rules,
                 state_dir,
@@ -3676,6 +3700,34 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 info.latest = latest;
                             }
                         }
+                        Request::ProviderUsageChanged {
+                            snapshot,
+                            invalidation,
+                        } => {
+                            crate::api::usage::publish(&rt.lua, snapshot);
+                            if let Some(invalidation) = invalidation
+                                && let Some(tx) = rt.ui_action_tx.as_ref()
+                            {
+                                let usage_has_content = rt
+                                    .lua
+                                    .app_data_ref::<crate::api::ui::StatusContentStore>()
+                                    .map(|store| store.has_plugin_content("usage"))
+                                    .unwrap_or(false);
+                                if !usage_has_content {
+                                    let generation = rt
+                                        .lua
+                                        .app_data_ref::<StatusContentWriter>()
+                                        .map(|writer| writer.generation())
+                                        .unwrap_or_default();
+                                    let _ = tx.try_send(UiAction::ProviderUsageAck(
+                                        crate::ProviderUsageAck {
+                                            invalidation,
+                                            status_generation: generation,
+                                        },
+                                    ));
+                                }
+                            }
+                        }
                         Request::Describe {
                             plugin,
                             tool,
@@ -3838,6 +3890,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
         shutdown,
         keymap_reader,
         hint_reader,
+        status_content_reader,
         ui_action_rx,
         modes,
     })

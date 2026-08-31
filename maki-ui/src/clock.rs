@@ -2,10 +2,6 @@ use std::sync::OnceLock;
 
 use maki_config::ClockFormat;
 
-pub fn hm(format: ClockFormat) -> &'static str {
-    if is_12h(format) { "%-I:%M %p" } else { "%H:%M" }
-}
-
 pub fn hms(format: ClockFormat) -> &'static str {
     if is_12h(format) {
         "%-I:%M:%S %p"

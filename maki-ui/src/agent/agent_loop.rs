@@ -22,14 +22,14 @@ use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::error;
 
-use super::ModelSlot;
+use super::ProviderSlot;
 use super::SystemPromptOverride;
 use super::cancel_map::RunCancelMap;
 use super::shared_queue::{QueueItem, QueueReceiver};
 
 pub(super) struct AgentLoop {
     agent_id: AgentId,
-    model_slot: Arc<ArcSwap<ModelSlot>>,
+    model_slot: Arc<ProviderSlot>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     vars: Vars,
@@ -59,7 +59,7 @@ pub(super) struct AgentLoop {
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        model_slot: Arc<ArcSwap<ModelSlot>>,
+        model_slot: Arc<ProviderSlot>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
@@ -213,8 +213,10 @@ impl AgentLoop {
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
+        let current_provider =
+            Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>;
         let (provider, model) = agent::resolve_compaction_model(
-            &slot.provider,
+            &current_provider,
             &slot.model,
             self.timeouts,
             &self.model_policy,
@@ -285,7 +287,7 @@ impl AgentLoop {
         let mut agent = Agent::new(
             AgentParams {
                 agent_id: self.agent_id,
-                provider: Arc::clone(&slot.provider),
+                provider: Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>,
                 model: slot.model.clone(),
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,

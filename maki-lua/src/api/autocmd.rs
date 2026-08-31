@@ -129,7 +129,7 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-/// `"SessionFocusChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
+/// `"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
 /// `"SplashHidden"`, and `"StoreChanged"`. Plugins can
 /// also fire their own events with `exec_autocmds`.
 ///

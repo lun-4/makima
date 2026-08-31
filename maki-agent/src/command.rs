@@ -442,7 +442,6 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::Compact => BuiltinOperation::Compact,
                 maki_commands::BuiltinId::New => BuiltinOperation::ResetSession,
                 maki_commands::BuiltinId::Help => BuiltinOperation::ToggleHelp,
-                maki_commands::BuiltinId::Usage => BuiltinOperation::ToggleUsage,
                 maki_commands::BuiltinId::Queue => BuiltinOperation::FocusQueue,
                 maki_commands::BuiltinId::Model if arguments.is_empty() => {
                     if !invocation.target_supports(TargetCapability::InteractiveUi) {

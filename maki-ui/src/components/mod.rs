@@ -28,7 +28,6 @@ pub mod status_bar;
 pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
-pub(crate) mod usage_modal;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -217,7 +216,6 @@ pub enum Action {
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
     RefreshModels,
-    RefreshUsage,
     Compact,
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
