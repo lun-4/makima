@@ -6,15 +6,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::AgentEvent;
+use maki_agent::SessionMailbox;
 use maki_agent::ToolOutput;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
+use maki_agent::session_coordinator::{
+    DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
+    SessionCoordinatorParams, builtin_option_definitions,
+};
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey, ToolOutputLines,
 };
 use maki_lua::PluginHost;
-use maki_providers::StreamResponse;
+use maki_providers::{Model, StreamResponse};
+use maki_storage::checkpoint::{
+    CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+};
+use maki_storage::id::MakiId;
 use serde_json::{Value, json};
 
 mod common;
@@ -361,25 +370,63 @@ fn index_dir_renders_identically_live_and_restored() {
 // the approve path falls through to the async jobstart loop, which this harness
 // cannot observe, so it is covered at the `spec.lua` unit layer instead.
 
+fn session_for(host: &PluginHost) -> SessionCoordinatorHandle {
+    let id = MakiId::generate();
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+        Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
+            Box::pin(async move {
+                Ok(CheckpointAck {
+                    session_id: request.session_id,
+                    version: request.version,
+                })
+            }) as CheckpointFuture
+        });
+    SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id: id,
+        catalog: host.event_handle().session_option_catalog(),
+        definitions: builtin_option_definitions(
+            "test/model",
+            [Arc::from("test/model")],
+            false,
+            false,
+            false,
+        ),
+        persisted_options: Default::default(),
+        history: Vec::new(),
+        model: Arc::from("test/model"),
+        cwd: PathBuf::from("/tmp"),
+        model_policy: Arc::default(),
+        model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
+        directory_adopter: Arc::new(|path: PathBuf| {
+            Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
+        }),
+        checkpoint,
+        mailbox: SessionMailbox::new(id),
+    })
+    .unwrap()
+}
+
 /// Load the real bash plugin with auto mode forced on and the classifier
 /// stubbed per `stub_code` (defines `bh.classify_verdict`).
-fn bash_host_with_classifier(stub_code: &str) -> (PluginHost, Arc<ToolRegistry>) {
+fn bash_host_with_classifier(
+    stub_code: &str,
+) -> (PluginHost, Arc<ToolRegistry>, SessionCoordinatorHandle) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    // The classifier stub and the auto toggle must reach the same `bash_helpers`
-    // instance the handler captured. Every `load_source` gets a fresh per-env
-    // require cache, so a separate plugin chunk wouldn't share the module; run
-    // them as one source instead. The setup comes after `BASH_SRC` because it
-    // defaults auto mode off via `bh.set_auto_mode(opts.auto_mode)`.
+    // The classifier stub must reach the same `bash_helpers` instance the
+    // handler captured. Every `load_source` gets a fresh per-env require cache,
+    // so run the setup in the same source.
     let classifier_setup = format!(
         r#"local bh = require("bash_helpers")
-bh.set_auto_mode(true)
 {stub_code}
 "#
     );
-    host.load_source("bash", &format!("{BASH_SRC}\n{classifier_setup}"))
+    let mut opts = serde_json::Map::new();
+    opts.insert("auto_mode".to_string(), json!(true));
+    host.load_source_with_opts("bash", &format!("{BASH_SRC}\n{classifier_setup}"), opts)
         .unwrap();
-    (host, reg)
+    let session = session_for(&host);
+    (host, reg, session)
 }
 
 struct Verdict {
@@ -392,11 +439,17 @@ struct Verdict {
 /// Run the bash tool and return whether it produced an error plus the output
 /// text. Mirrors `exec_live` but surfaces `is_error` (the gate's deny/fallback
 /// paths return error tool output, not live view bodies).
-fn exec_verdict(host: &PluginHost, reg: &ToolRegistry, input: Value) -> Verdict {
-    let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+fn exec_verdict(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    session: &SessionCoordinatorHandle,
+    input: Value,
+) -> Verdict {
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
         &maki_agent::AgentMode::Build,
         None,
         Some("classifier_tool_use_id"),
+        session.read().session_id(),
     );
     ctx.tool_output_lines = view_lines();
     let inv = reg
@@ -460,16 +513,18 @@ fn yolo_permissions() -> Arc<PermissionManager> {
 fn exec_verdict_prompt(
     host: &PluginHost,
     reg: &ToolRegistry,
+    session: &SessionCoordinatorHandle,
     input: Value,
     permissions: Arc<PermissionManager>,
     answer: Option<&str>,
 ) -> Verdict {
     let (tx, rx) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
-    let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
         &maki_agent::AgentMode::Build,
         Some(&event_tx),
         Some("classifier_tool_use_id"),
+        session.read().session_id(),
     );
     ctx.permissions = permissions;
     if let Some(answer) = answer {
@@ -508,10 +563,11 @@ const CLASSIFY_ERROR_STUB: &str =
 
 #[test]
 fn auto_mode_deny_yolo_rejects_without_running_jobstart() {
-    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
+        &session,
         json!({ "command": "echo denied-side-effect" }),
         yolo_permissions(),
         None,
@@ -530,8 +586,13 @@ fn auto_mode_deny_yolo_rejects_without_running_jobstart() {
 
 #[test]
 fn auto_mode_error_denies_fail_closed_without_prompting() {
-    let (host, reg) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
-    let result = exec_verdict(&host, &reg, json!({ "command": "echo never-runs-2" }));
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
+    let result = exec_verdict(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "echo never-runs-2" }),
+    );
     assert!(
         result.is_error,
         "a classifier error must fail closed (deny)"
@@ -552,7 +613,7 @@ fn auto_mode_error_denies_fail_closed_without_prompting() {
 /// so the classifier session is the real `maki.agent.session` reusing the parent
 /// (canned) provider via `inherit_provider`. The plugin's gating logic runs
 /// unchanged; only the spawn is forwarded.
-fn bash_host_with_real_classifier() -> (PluginHost, Arc<ToolRegistry>) {
+fn bash_host_with_real_classifier() -> (PluginHost, Arc<ToolRegistry>, SessionCoordinatorHandle) {
     bash_host_with_real_classifier_auto(true)
 }
 
@@ -562,13 +623,13 @@ fn bash_host_with_real_classifier() -> (PluginHost, Arc<ToolRegistry>) {
 /// `load_source` gets its own per-env require cache, so toggling `bash_helpers`
 /// from a separate chunk would hit a different singleton than the handler
 /// captured; two hosts avoid that footgun.)
-fn bash_host_with_real_classifier_auto(auto_on: bool) -> (PluginHost, Arc<ToolRegistry>) {
+fn bash_host_with_real_classifier_auto(
+    auto_on: bool,
+) -> (PluginHost, Arc<ToolRegistry>, SessionCoordinatorHandle) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let classifier_setup = format!(
-        r#"
+    let classifier_setup = r#"
 local bh = require("bash_helpers")
-bh.set_auto_mode({auto})
 local real_classify = bh.classify_verdict
 local real_session = maki.agent.session
 local function canned_spawn(ctx, opts)
@@ -579,12 +640,13 @@ end
 bh.classify_verdict = function(command, cwd, opts, ctx)
   return real_classify(command, cwd, opts, ctx, canned_spawn)
 end
-"#,
-        auto = if auto_on { "true" } else { "false" },
-    );
-    host.load_source("bash", &format!("{BASH_SRC}\n{classifier_setup}"))
+"#;
+    let mut opts = serde_json::Map::new();
+    opts.insert("auto_mode".to_string(), json!(auto_on));
+    host.load_source_with_opts("bash", &format!("{BASH_SRC}\n{classifier_setup}"), opts)
         .unwrap();
-    (host, reg)
+    let session = session_for(&host);
+    (host, reg, session)
 }
 
 fn verdict_tool_use(approved: bool, reason: &str) -> StreamResponse {
@@ -599,11 +661,13 @@ fn verdict_tool_use(approved: bool, reason: &str) -> StreamResponse {
 fn exec_bash_real(
     host: &PluginHost,
     reg: &ToolRegistry,
+    session: &SessionCoordinatorHandle,
     provider: Arc<common::CannedProvider>,
     permissions: Arc<PermissionManager>,
     input: Value,
 ) -> Result<ToolOutput, String> {
     let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    maki_agent::tools::test_support::set_session(&mut ctx, session.read().session_id());
     ctx.permissions = permissions;
     ctx.tool_output_lines = view_lines();
     let inv = reg
@@ -629,7 +693,7 @@ fn bash_output(out: ToolOutput) -> String {
 /// approve path is the one the stub suite could not observe.
 #[test]
 fn automode_deny_blocks_and_approve_runs() {
-    let (host, reg) = bash_host_with_real_classifier();
+    let (host, reg, session) = bash_host_with_real_classifier();
 
     let deny = Arc::new(common::CannedProvider::new(vec![
         verdict_tool_use(false, "stub deny reason"),
@@ -638,6 +702,7 @@ fn automode_deny_blocks_and_approve_runs() {
     let err = exec_bash_real(
         &host,
         &reg,
+        &session,
         Arc::clone(&deny),
         yolo_permissions(),
         json!({ "command": "echo denied-side-effect" }),
@@ -656,6 +721,7 @@ fn automode_deny_blocks_and_approve_runs() {
     let out = exec_bash_real(
         &host,
         &reg,
+        &session,
         Arc::clone(&approve),
         prompt_permissions(),
         json!({ "command": "echo approved-side-effect" }),
@@ -668,7 +734,7 @@ fn automode_deny_blocks_and_approve_runs() {
 /// fails closed — denied, no prompt, no run.
 #[test]
 fn automode_error_fails_closed_without_prompting() {
-    let (host, reg) = bash_host_with_real_classifier();
+    let (host, reg, session) = bash_host_with_real_classifier();
     let provider = Arc::new(common::CannedProvider::new(vec![
         common::canned_tool_use("classifier_verdict", json!({ "approved": "not-a-bool" })),
         common::canned_reply("done"),
@@ -676,6 +742,7 @@ fn automode_error_fails_closed_without_prompting() {
     let err = exec_bash_real(
         &host,
         &reg,
+        &session,
         Arc::clone(&provider),
         prompt_permissions(),
         json!({ "command": "echo never-runs" }),
@@ -691,11 +758,12 @@ fn automode_error_fails_closed_without_prompting() {
 /// rather than a cross-chunk mutation).
 #[test]
 fn automode_toggle_flows_through_ui() {
-    let (host_off, reg_off) = bash_host_with_real_classifier_auto(false);
+    let (host_off, reg_off, session_off) = bash_host_with_real_classifier_auto(false);
     let idle = Arc::new(common::CannedProvider::new(vec![]));
     let out = exec_bash_real(
         &host_off,
         &reg_off,
+        &session_off,
         Arc::clone(&idle),
         prompt_permissions(),
         json!({ "command": "echo auto-off-runs" }),
@@ -707,7 +775,7 @@ fn automode_toggle_flows_through_ui() {
         "classifier must not run with auto mode off"
     );
 
-    let (host_on, reg_on) = bash_host_with_real_classifier_auto(true);
+    let (host_on, reg_on, session_on) = bash_host_with_real_classifier_auto(true);
     let deny = Arc::new(common::CannedProvider::new(vec![
         verdict_tool_use(false, "denied with auto on"),
         common::canned_reply("done"),
@@ -715,6 +783,7 @@ fn automode_toggle_flows_through_ui() {
     let err = exec_bash_real(
         &host_on,
         &reg_on,
+        &session_on,
         Arc::clone(&deny),
         yolo_permissions(),
         json!({ "command": "echo should-be-denied" }),
@@ -743,10 +812,11 @@ fn permission_requests(events: &[AgentEvent]) -> Vec<(String, Vec<String>)> {
 
 #[test]
 fn auto_mode_deny_user_allow_runs() {
-    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
+        &session,
         json!({ "command": "echo ask-allow-side-effect" }),
         prompt_permissions(),
         Some("allow"),
@@ -769,10 +839,11 @@ fn auto_mode_deny_user_allow_runs() {
 
 #[test]
 fn auto_mode_deny_user_deny_fails() {
-    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
+        &session,
         json!({ "command": "echo ask-deny-side-effect" }),
         prompt_permissions(),
         Some("deny"),
@@ -789,10 +860,11 @@ fn auto_mode_deny_user_deny_fails() {
 
 #[test]
 fn auto_mode_classifier_error_still_fails_closed() {
-    let (host, reg) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
+        &session,
         json!({ "command": "echo never-runs-ask" }),
         prompt_permissions(),
         Some("allow"),
@@ -814,10 +886,11 @@ fn auto_mode_classifier_error_still_fails_closed() {
 
 #[test]
 fn auto_mode_deny_no_response_channel_fails_closed() {
-    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
+        &session,
         json!({ "command": "echo no-answerer" }),
         prompt_permissions(),
         None,
@@ -848,10 +921,11 @@ fn auto_mode_deny_allow_rule_skips_prompt() {
         PathBuf::from("/tmp"),
         Arc::default(),
     ));
-    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
+        &session,
         json!({ "command": "echo allow-rule-side-effect" }),
         perms,
         None,
@@ -874,7 +948,7 @@ fn auto_mode_deny_allow_rule_skips_prompt() {
 /// the whole call short-circuits like the automode-off path.
 #[test]
 fn auto_mode_deny_cd_hint_prompts_on_raw_input_scopes() {
-    let (host, reg) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
 
     let echo_only = Arc::new(PermissionManager::new(
         PermissionsConfig {
@@ -892,6 +966,7 @@ fn auto_mode_deny_cd_hint_prompts_on_raw_input_scopes() {
     let result = exec_verdict_prompt(
         &host,
         &reg,
+        &session,
         json!({ "command": "cd /tmp && echo foo" }),
         Arc::clone(&echo_only),
         Some("allow"),
@@ -931,6 +1006,7 @@ fn auto_mode_deny_cd_hint_prompts_on_raw_input_scopes() {
     let result = exec_verdict_prompt(
         &host,
         &reg,
+        &session,
         json!({ "command": "cd /tmp && echo foo" }),
         both,
         None,

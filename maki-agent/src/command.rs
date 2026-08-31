@@ -36,7 +36,7 @@ pub fn portable_capabilities() -> TargetCapabilities {
     TargetCapabilities::from_slice(&[
         TargetCapability::AgentTurns,
         TargetCapability::ModelSelection,
-        TargetCapability::SessionControl,
+        TargetCapability::HistoryCompaction,
         TargetCapability::WorkingDirectory,
         TargetCapability::PermissionToggles,
         TargetCapability::ConfigToggles,
@@ -103,41 +103,87 @@ impl SessionCommandState {
             .fast
     }
 
-    fn toggle_fast(&self) {
+    pub fn set_fast(&self, enabled: bool) -> Result<(), &'static str> {
         let mut state = self.model.lock().unwrap_or_else(|error| error.into_inner());
-        if Model::from_spec(&state.current).is_ok_and(|model| model.supports_fast()) {
-            state.fast = !state.fast;
+        if enabled && !Model::from_spec(&state.current).is_ok_and(|model| model.supports_fast()) {
+            return Err(FAST_UNSUPPORTED);
         }
+        state.fast = enabled;
+        Ok(())
     }
 
     pub fn workflow(&self) -> bool {
         self.workflow.load(Ordering::Relaxed)
     }
+
+    pub fn set_workflow(&self, enabled: bool) {
+        self.workflow.store(enabled, Ordering::Relaxed);
+    }
 }
 
 pub struct SessionCommandHost {
-    model_policy: Arc<ModelPolicy>,
-    model_tx: flume::Sender<Model>,
     control_tx: flume::Sender<InteractiveControl>,
     state: Arc<SessionCommandState>,
     permissions: Arc<PermissionManager>,
+    coordinator: Option<crate::session_coordinator::SessionCoordinatorHandle>,
 }
 
 impl SessionCommandHost {
     pub fn new(
-        model_policy: Arc<ModelPolicy>,
-        model_tx: flume::Sender<Model>,
+        _model_policy: Arc<ModelPolicy>,
+        _model_tx: flume::Sender<Model>,
         control_tx: flume::Sender<InteractiveControl>,
         state: Arc<SessionCommandState>,
         permissions: Arc<PermissionManager>,
     ) -> Self {
         Self {
-            model_policy,
-            model_tx,
             control_tx,
             state,
             permissions,
+            coordinator: None,
         }
+    }
+
+    pub fn with_coordinator(
+        mut self,
+        coordinator: crate::session_coordinator::SessionCoordinatorHandle,
+    ) -> Self {
+        self.coordinator = Some(coordinator);
+        self
+    }
+
+    fn toggle_option(
+        &self,
+        id: &'static str,
+    ) -> CommandFuture<Result<(bool, crate::session_options::SessionOptionsSnapshot), CommandError>>
+    {
+        let coordinator = self.coordinator.clone();
+        Box::pin(async move {
+            let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
+            let current = coordinator
+                .read()
+                .options()
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == id)
+                .map(|option| {
+                    option.current_value.as_ref() == crate::session_options::ENABLED_VALUE
+                })
+                .ok_or_else(|| {
+                    CommandError::Producer(Arc::from(format!("unknown session option: {id}")))
+                })?;
+            let enabled = !current;
+            let value = if enabled {
+                crate::session_options::ENABLED_VALUE
+            } else {
+                crate::session_options::DISABLED_VALUE
+            };
+            let snapshot = coordinator
+                .set_option(id, value)
+                .await
+                .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
+            Ok((enabled, snapshot))
+        })
     }
 
     fn control(
@@ -209,50 +255,84 @@ impl maki_commands::CommandHost for SessionCommandHost {
             HostRequest::Builtin(operation) => operation,
         };
         match operation {
-            maki_commands::BuiltinOperation::Compact => self.control(InteractiveControl::Compact),
+            maki_commands::BuiltinOperation::Compact => {
+                Box::pin(async { Ok(HostResponse::ManualCompaction) })
+            }
             maki_commands::BuiltinOperation::ResetSession => {
                 self.control(InteractiveControl::Reset)
             }
             maki_commands::BuiltinOperation::ToggleYolo => {
-                self.permissions.toggle_yolo();
-                Box::pin(async { Ok(HostResponse::Completed) })
+                let future = self.toggle_option(crate::session_options::YOLO_OPTION_ID);
+                let permissions = Arc::clone(&self.permissions);
+                Box::pin(async move {
+                    let (enabled, _) = future.await?;
+                    permissions.set_yolo(enabled);
+                    Ok(HostResponse::Completed)
+                })
             }
             maki_commands::BuiltinOperation::ToggleFast => {
-                self.state.toggle_fast();
-                Box::pin(async { Ok(HostResponse::Completed) })
-            }
-            maki_commands::BuiltinOperation::ToggleWorkflow => {
-                self.state.workflow.fetch_xor(true, Ordering::Relaxed);
-                Box::pin(async { Ok(HostResponse::Completed) })
-            }
-            maki_commands::BuiltinOperation::ChangeDirectory { path } => {
-                let future = self.control({
-                    let path = path.clone();
-                    move |reply| InteractiveControl::ChangeDirectory { path, reply }
-                });
+                let future = self.toggle_option(crate::session_options::FAST_OPTION_ID);
                 let state = Arc::clone(&self.state);
                 Box::pin(async move {
-                    let response = future.await?;
-                    *state.cwd.lock().unwrap_or_else(|error| error.into_inner()) = path;
-                    Ok(response)
+                    let (enabled, _) = future.await?;
+                    state
+                        .set_fast(enabled)
+                        .map_err(|error| CommandError::Producer(Arc::from(error)))?;
+                    Ok(HostResponse::Completed)
+                })
+            }
+            maki_commands::BuiltinOperation::ToggleWorkflow => {
+                let future = self.toggle_option(crate::session_options::WORKFLOW_OPTION_ID);
+                let state = Arc::clone(&self.state);
+                Box::pin(async move {
+                    let (enabled, _) = future.await?;
+                    state.set_workflow(enabled);
+                    Ok(HostResponse::Completed)
+                })
+            }
+            maki_commands::BuiltinOperation::ChangeDirectory { path } => {
+                let coordinator = self.coordinator.clone();
+                let state = Arc::clone(&self.state);
+                Box::pin(async move {
+                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
+                    let canonical = coordinator
+                        .change_directory(path)
+                        .await
+                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
+                    *state.cwd.lock().unwrap_or_else(|error| error.into_inner()) =
+                        canonical.clone();
+                    Ok(HostResponse::FrontendFeedback(
+                        maki_commands::FrontendFeedback::WorkingDirectory(canonical),
+                    ))
                 })
             }
             maki_commands::BuiltinOperation::SetModel { spec } => {
-                let model_policy = Arc::clone(&self.model_policy);
-                let model_tx = self.model_tx.clone();
+                let coordinator = self.coordinator.clone();
                 let state = Arc::clone(&self.state);
                 Box::pin(async move {
-                    if !model_policy.allows(&spec) {
-                        return Err(CommandError::Producer(Arc::from(
-                            "model is not allowed by policy",
-                        )));
-                    }
-                    let model = Model::from_spec(&spec)
+                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
+                    let snapshot = coordinator
+                        .set_option(crate::session_options::MODEL_OPTION_ID, Arc::clone(&spec))
+                        .await
                         .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
-                    model_tx.send(model.clone()).map_err(|_| {
-                        CommandError::Producer(Arc::from("session ended before model change"))
-                    })?;
+                    let current = |id: &str| {
+                        snapshot
+                            .options
+                            .iter()
+                            .find(|option| option.definition.id.as_ref() == id)
+                            .map(|option| option.current_value.as_ref())
+                    };
+                    let model_spec = current(crate::session_options::MODEL_OPTION_ID)
+                        .ok_or_else(|| CommandError::Producer(Arc::from("missing model option")))?;
+                    let model = Model::from_spec(model_spec)
+                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
                     state.set_model(&model);
+                    state
+                        .set_fast(
+                            current(crate::session_options::FAST_OPTION_ID)
+                                == Some(crate::session_options::ENABLED_VALUE),
+                        )
+                        .map_err(|error| CommandError::Producer(Arc::from(error)))?;
                     Ok(HostResponse::Completed)
                 })
             }
@@ -260,12 +340,11 @@ impl maki_commands::CommandHost for SessionCommandHost {
                 question,
                 attachments,
             } => Box::pin(async move {
-                Ok(HostResponse::AgentTurn(AgentTurn {
+                Ok(HostResponse::IsolatedTurn(maki_commands::IsolatedTurn {
                     content: CommandContent {
                         text: question,
                         attachments,
                     },
-                    prompt: None,
                 }))
             }),
             operation => Box::pin(async move {
@@ -553,6 +632,11 @@ impl CommandBehavior for BuiltinBehavior {
             {
                 HostResponse::Completed => Ok(CommandOutcome::Completed),
                 HostResponse::AgentTurn(turn) => Ok(CommandOutcome::AgentTurn(turn)),
+                HostResponse::IsolatedTurn(turn) => Ok(CommandOutcome::IsolatedTurn(turn)),
+                HostResponse::ManualCompaction => Ok(CommandOutcome::ManualCompaction),
+                HostResponse::FrontendFeedback(feedback) => {
+                    Ok(CommandOutcome::FrontendFeedback(feedback))
+                }
                 HostResponse::Context(_) => Err(CommandError::Producer(Arc::from(
                     "invalid builtin host response",
                 ))),
@@ -782,6 +866,9 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
 #[cfg(test)]
 mod tests {
     use maki_commands::CommandHost;
+    use maki_storage::checkpoint::{
+        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+    };
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -825,6 +912,48 @@ mod tests {
     }
 
     struct FakeCommandHost;
+
+    fn test_coordinator(
+        model: &str,
+        models: impl IntoIterator<Item = Arc<str>>,
+    ) -> crate::session_coordinator::SessionCoordinatorHandle {
+        let checkpoint: Arc<dyn CheckpointWriter<crate::session_coordinator::SessionCheckpoint>> =
+            Arc::new(
+                |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                },
+            );
+        let session_id = maki_storage::id::MakiId::generate();
+        crate::session_coordinator::SessionCoordinatorHandle::register(
+            crate::session_coordinator::SessionCoordinatorParams {
+                session_id,
+                catalog: Default::default(),
+                definitions: crate::session_coordinator::builtin_option_definitions(
+                    model, models, false, false, false,
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(model),
+                cwd: PathBuf::from("/project"),
+                model_policy: Arc::new(ModelPolicy::default()),
+                model_adopter: Arc::new(|_: Model| {
+                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path: PathBuf| {
+                    Box::pin(async move { Ok(path) })
+                        as crate::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint,
+                mailbox: crate::SessionMailbox::new(session_id),
+            },
+        )
+        .unwrap()
+    }
 
     #[derive(Default)]
     struct RecordingCommandHost(Mutex<Vec<maki_commands::BuiltinOperation>>);
@@ -1007,9 +1136,40 @@ mod tests {
     }
 
     #[test]
+    fn portable_target_separates_compaction_from_session_replacement() {
+        let registry = maki_commands::CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let target = registry.bind_target(
+            portable_capabilities(),
+            Arc::new(RecordingCommandHost::default()),
+        );
+        let presented = registry.presented_commands(&target).unwrap();
+        let names: Vec<_> = presented
+            .iter()
+            .map(|command| command.name.as_ref())
+            .collect();
+
+        assert!(names.contains(&maki_commands::COMPACT_COMMAND_NAME));
+        assert!(!names.contains(&"/new"));
+        assert!(!names.contains(&"/clear"));
+        assert!(matches!(
+            smol::block_on(registry.dispatch_input(&target, "/compact".into())),
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        for input in ["/new", "/clear"] {
+            assert!(matches!(
+                smol::block_on(registry.dispatch_input(&target, input.into())),
+                maki_commands::InputDispatch::LiteralInput(content) if content.text.as_ref() == input
+            ));
+        }
+    }
+
+    #[test]
     fn session_host_dispatches_portable_state_operations() {
         let (model_tx, model_rx) = flume::unbounded();
-        let (control_tx, control_rx) = flume::unbounded();
+        drop(model_rx);
+        let (control_tx, _control_rx) = flume::unbounded();
         let state = Arc::new(SessionCommandState::new(
             FAST_MODEL.into(),
             Arc::from([]),
@@ -1022,13 +1182,18 @@ mod tests {
             PathBuf::from("/project"),
             Arc::default(),
         ));
+        let coordinator = test_coordinator(
+            FAST_MODEL,
+            [Arc::from(FAST_MODEL), Arc::from(OFFLINE_MODEL)],
+        );
         let host = SessionCommandHost::new(
             Arc::new(ModelPolicy::default()),
             model_tx,
             control_tx,
             Arc::clone(&state),
             Arc::clone(&permissions),
-        );
+        )
+        .with_coordinator(coordinator.clone());
         let request = |operation| HostRequest::Builtin(operation);
         assert!(matches!(
             smol::block_on(host.request(request(maki_commands::BuiltinOperation::ToggleYolo))),
@@ -1054,34 +1219,27 @@ mod tests {
         )));
         assert!(matches!(
             quick,
-            Ok(HostResponse::AgentTurn(AgentTurn { content, .. }))
+            Ok(HostResponse::IsolatedTurn(maki_commands::IsolatedTurn { content }))
                 if content.text.as_ref() == "explain this"
         ));
 
-        let compact = host.request(request(maki_commands::BuiltinOperation::Compact));
-        let compact_task = smol::spawn(compact);
-        let InteractiveControl::Compact(reply) = control_rx.recv().unwrap() else {
-            panic!("expected compact control");
-        };
-        reply.send(Ok(())).unwrap();
         assert!(matches!(
-            smol::block_on(compact_task),
-            Ok(HostResponse::Completed)
+            smol::block_on(host.request(request(maki_commands::BuiltinOperation::Compact))),
+            Ok(HostResponse::ManualCompaction)
         ));
 
-        let directory = host.request(request(maki_commands::BuiltinOperation::ChangeDirectory {
-            path: PathBuf::from("/tmp"),
-        }));
-        let directory_task = smol::spawn(directory);
-        let InteractiveControl::ChangeDirectory { path, reply } = control_rx.recv().unwrap() else {
-            panic!("expected change-directory control");
-        };
-        assert_eq!(path, PathBuf::from("/tmp"));
-        reply.send(Ok(())).unwrap();
+        let directory = smol::block_on(host.request(request(
+            maki_commands::BuiltinOperation::ChangeDirectory {
+                path: PathBuf::from("/tmp"),
+            },
+        )));
         assert!(matches!(
-            smol::block_on(directory_task),
-            Ok(HostResponse::Completed)
+            directory,
+            Ok(HostResponse::FrontendFeedback(
+                maki_commands::FrontendFeedback::WorkingDirectory(path)
+            )) if path == Path::new("/tmp")
         ));
+        assert_eq!(coordinator.read().cwd(), PathBuf::from("/tmp"));
 
         let model = Model::from_spec(OFFLINE_MODEL).unwrap();
         let result = smol::block_on(host.request(HostRequest::Builtin(
@@ -1090,9 +1248,15 @@ mod tests {
             },
         )));
         assert!(matches!(result, Ok(HostResponse::Completed)));
-        assert_eq!(model_rx.recv().unwrap().spec(), model.spec());
+        assert_eq!(
+            coordinator.read().options().options[0]
+                .current_value
+                .as_ref(),
+            model.spec()
+        );
         assert_eq!(state.current_model(), model.spec());
         assert!(!state.fast());
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     const FAST_MODEL: &str = "anthropic/claude-opus-4-8";

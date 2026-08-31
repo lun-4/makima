@@ -253,9 +253,13 @@ maki.api.register_tool({
     local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
 
     local max_line_bytes = opts.max_line_bytes
+    local path, path_err = ctx:resolve_path(input.path or ".")
+    if not path then
+      return { llm_output = "error: " .. tostring(path_err), is_error = true }
+    end
 
     local entries, err = maki.fs.grep(pattern, {
-      path = input.path,
+      path = path,
       include = input.include,
       context_before = input.context_before or 0,
       context_after = input.context_after or 0,

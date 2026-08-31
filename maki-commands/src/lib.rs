@@ -11,12 +11,13 @@ pub use completion::{
 };
 pub use dispatch::{
     AgentTurn, CommandAttachment, CommandBehavior, CommandContent, CommandError, CommandHost,
-    CommandInvocation, CommandOutcome, HostRequest, HostResponse, InputDispatch, PromptReference,
-    RegistrationError, ResolutionError, ResolvedCommand, ResolvedInput,
+    CommandInvocation, CommandOutcome, FrontendFeedback, HostRequest, HostResponse, InputDispatch,
+    IsolatedTurn, PromptReference, RegistrationError, ResolutionError, ResolvedCommand,
+    ResolvedInput,
 };
 pub use registry::{
     CommandRegistry, PresentedCommand, Producer, ProducerPrecedence, RegistrySnapshot,
-    RegistrySubscription, TargetHandle,
+    RegistrySubscription, TargetHandle, validate_registrations,
 };
 pub use spec::{
     ArgumentArity, BUILTIN_COMMANDS, BuiltinDefinition, BuiltinId, BuiltinOperation,

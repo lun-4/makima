@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -263,9 +264,22 @@ pub struct AgentTurn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedTurn {
+    pub content: CommandContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontendFeedback {
+    WorkingDirectory(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutcome {
     Completed,
     AgentTurn(AgentTurn),
+    IsolatedTurn(IsolatedTurn),
+    ManualCompaction,
+    FrontendFeedback(FrontendFeedback),
     Failed(CommandError),
 }
 
@@ -280,6 +294,9 @@ pub enum HostResponse {
     Context(HostContextResponse),
     Completed,
     AgentTurn(AgentTurn),
+    IsolatedTurn(IsolatedTurn),
+    ManualCompaction,
+    FrontendFeedback(FrontendFeedback),
 }
 
 pub trait CommandHost: Send + Sync + 'static {

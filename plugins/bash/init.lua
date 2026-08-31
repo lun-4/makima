@@ -270,15 +270,46 @@ local opts = maki.api.register_options(output_limits.extend({
   },
 }))
 
-bh.set_auto_mode(opts.auto_mode)
+local auto_mode = maki.api.register_session_option({
+  id = "bash.auto_mode",
+  name = "Bash auto mode",
+  description = "Classify every bash command before executing it",
+  category = "mode",
+  values = {
+    { value = "enabled", name = "Enabled" },
+    { value = "disabled", name = "Disabled" },
+  },
+  initial_value = opts.auto_mode and "enabled" or "disabled",
+  persistent = true,
+})
+
+local function auto_mode_enabled(session_id)
+  local target = session_id and { session = session_id } or nil
+  local value, err = auto_mode:get(target)
+  if not value then
+    return nil, err
+  end
+  return value == "enabled", nil
+end
 
 maki.api.register_command({
   name = "/automode",
   description = "Toggle bash auto mode (classifier gates every bash command)",
   tui_only = false,
   handler = function()
-    bh.set_auto_mode(not bh.auto_mode_on)
-    maki.ui.flash("auto mode: " .. (bh.auto_mode_on and "on" or "off"))
+    local enabled, err = auto_mode_enabled()
+    if enabled == nil then
+      maki.ui.flash(err)
+      return
+    end
+    local value = enabled and "disabled" or "enabled"
+    local ok
+    ok, err = auto_mode:set(value)
+    if not ok then
+      maki.ui.flash(err)
+      return
+    end
+    maki.ui.flash("auto mode: " .. (value == "enabled" and "on" or "off"))
   end,
 })
 
@@ -318,9 +349,6 @@ maki.api.register_tool({
     },
   },
   permission_scopes = function(input)
-    if bh.auto_mode_on then
-      return nil
-    end
     return command_scopes(input.command)
   end,
 
@@ -370,14 +398,28 @@ maki.api.register_tool({
     end
 
     local command, workdir = parse_cd_hint(input)
+    local resolved_workdir, workdir_err = ctx:resolve_path(workdir or ".")
+    if not resolved_workdir then
+      return { llm_output = workdir_err, is_error = true }
+    end
+    workdir = resolved_workdir
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     ctx:set_deadline(timeout_secs)
 
+    local session_id, session_err = ctx:session_id()
+    if not session_id then
+      return { llm_output = session_err or "bash requires a live session", is_error = true }
+    end
+    local enabled, option_err = auto_mode_enabled(session_id)
+    if enabled == nil then
+      return { llm_output = option_err, is_error = true }
+    end
+
     local auto_annotation
-    if bh.auto_mode_on then
-      local verdict, reason, err = bh.classify_verdict(command, workdir or maki.uv.cwd(), opts, ctx)
+    if enabled then
+      local verdict, reason, err = bh.classify_verdict(command, workdir, opts, ctx)
       if verdict == "approve" then
         auto_annotation = { { "auto-mode: allowed", "dim" } }
         -- fall through to the jobstart path unchanged

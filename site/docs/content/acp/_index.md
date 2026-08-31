@@ -35,16 +35,22 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 
 ## What works
 
-- **Sessions persist.** Loading a session replays the full conversation in the editor, so you can resume where you left off. A session that is open in another terminal cannot be loaded.
-- **Model switching.** Pick a model from the editor's dropdown, mid-session. All configured providers show up. Providers that list their models over the wire (OpenRouter and friends) are discovered in the background, so the dropdown keeps filling up for a moment after the session starts, one provider at a time.
-- **Modes.** Switch between build (full access) and plan (plan-file writes only) from the editor.
-- **Permissions.** Tool permission prompts appear in the editor: allow or reject, once or always.
-- **Questions.** The `question` tool becomes a native form in the editor (ACP elicitation). If the client does not support elicitation, the tool is dropped and the model asks in plain text.
-- **Live tool calls.** Tool progress streams as it happens, including sub-agents and batched calls.
-- **Images and context.** Prompts can include images and editor-attached files.
-- **Slash commands.** The editor receives the target-scoped central command list and updates when plugin or MCP registrations change. An available leading slash command runs before model input. Unknown and unavailable slash-prefixed text remains a model prompt. Agent-turn commands preserve images and text resources; local commands reject non-text content.
+- Sessions persist. Loading a session replays the full conversation in the editor. A session that is open in another terminal cannot be loaded.
+- Session options include Model, YOLO, Fast, Workflow, and available plugin options such as Bash auto mode. New and loaded sessions return the complete ordered option list. Option updates also contain the complete list.
+- Model switching uses the editor's model selector. All configured providers appear. Providers such as OpenRouter add discovered models in the background. A model change and any required Fast disablement appear as one update.
+- Modes switch between build mode and plan mode. Build mode has full tool access. Plan mode limits writes to the plan file.
+- Tool permission prompts appear in the editor. The user can allow or reject the operation once or always.
+- The `question` tool becomes an ACP elicitation form. If the client does not support elicitation, Makima removes the tool and the model asks in plain text.
+- Tool progress streams during execution, including sub-agents and batched calls.
+- Prompts can include images and editor-attached files.
+- The editor receives the target-scoped command list. The list updates when plugin or MCP registrations change. An available leading slash command runs before model input. Unknown and unavailable slash-prefixed text remains a model prompt. Agent-turn commands preserve images and text resources. Local commands reject non-text content.
+- `/compact` reports a `Compact context` tool call and saves the compacted model history before it reports success.
+- `/btw` runs one isolated model request with copied history and no tools. Its question and response do not change the primary model history.
+- `/cd` reports the canonical working directory as an agent message. Later relative tool locations use that directory.
 
-ACP maps the target-scoped central registry to ACP command metadata. It does not implement or inspect individual command names. Commands that require TUI capabilities are omitted from ACP's advertised command list. Invoking an unavailable command forwards the complete prompt as ordinary model input. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
+ACP maps the target-scoped central registry to ACP command metadata. It does not implement or inspect individual command names. Commands that require TUI capabilities are omitted from ACP's advertised command list. `/new` and `/clear` require TUI session replacement, so ACP does not advertise or execute them. Typing either command forwards the complete prompt as ordinary model input. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
+
+ACP cannot remove messages from the editor's visible transcript or change the editor's displayed session directory. `/compact` changes only the model context. `/cd` changes Makima's canonical working directory and reports it in the transcript, but the editor can continue to display its original directory field.
 
 Authentication, providers, and permissions come from your normal Makima config. Set up [providers](/docs/providers/) first and ACP sessions just work.
 

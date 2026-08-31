@@ -7,13 +7,17 @@ use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
 use maki_agent::agent::estimate_message_tokens;
-use maki_providers::{Model, TokenUsage};
+#[cfg(test)]
+use maki_providers::Model;
+use maki_providers::TokenUsage;
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
 
 use crate::AppSession;
 
-use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
+#[cfg(test)]
+use super::session_state::SessionState;
+use super::session_state::{rules_to_stored, stored_to_rules};
 use super::{App, Mode, PendingInput, PlanState, Status};
 
 /// The shortest gap between two writes that carry only UI state.
@@ -131,6 +135,8 @@ impl App {
             thinking: Some(state.thinking.into()),
             fast: state.fast,
             workflow: state.workflow,
+            yolo: self.permissions.is_yolo(),
+            session_options: Default::default(),
         }
     }
 
@@ -345,6 +351,7 @@ impl App {
         vec![Action::LoadSession(Box::new(self.install_local_history()))]
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_loaded_session(
         &mut self,
         session: AppSession,
@@ -352,6 +359,7 @@ impl App {
     ) -> LoadedSession {
         self.checkpoint_now();
         self.rotate_command_target();
+        self.permissions.set_yolo(session.meta.yolo);
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.state =
@@ -367,6 +375,7 @@ impl App {
 
     /// Applies an already-loaded session, for callers that loaded it
     /// themselves (e.g. to run their own checks first).
+    #[cfg(test)]
     pub(crate) fn load_loaded_session(&mut self, session: AppSession) -> Vec<Action> {
         let loaded = self.apply_loaded_session(session, &self.state.model.clone());
         vec![Action::LoadSession(Box::new(loaded))]

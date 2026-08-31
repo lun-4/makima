@@ -88,6 +88,37 @@ pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {
     )
 }
 
+pub fn local_operation_pending(id: &str, title: &str) -> SessionUpdate {
+    SessionUpdate::ToolCall(
+        ToolCall::new(ToolCallId::from(id.to_string()), title.to_string())
+            .status(ToolCallStatus::Pending),
+    )
+}
+
+pub fn local_operation_started(id: &str) -> SessionUpdate {
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(id.to_string()),
+        ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+    ))
+}
+
+pub fn local_operation_terminal(id: &str, error: Option<&str>) -> SessionUpdate {
+    let mut fields = ToolCallUpdateFields::new().status(if error.is_some() {
+        ToolCallStatus::Failed
+    } else {
+        ToolCallStatus::Completed
+    });
+    if let Some(error) = error {
+        fields = fields.content(vec![ToolCallContent::Content(Content::new(
+            ContentBlock::Text(TextContent::new(error.to_string())),
+        ))]);
+    }
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(id.to_string()),
+        fields,
+    ))
+}
+
 pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
     let mut fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::InProgress)

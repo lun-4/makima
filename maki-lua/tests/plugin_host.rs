@@ -1,15 +1,17 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::ToolOutput;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
     ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
     timeout_annotation,
 };
+use maki_agent::{AgentMode, ToolOutput};
 use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
@@ -93,6 +95,52 @@ fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
     host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
         .unwrap();
     (reg, host)
+}
+
+fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
+    use maki_agent::session_coordinator::{
+        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorParams,
+        builtin_option_definitions,
+    };
+    use maki_storage::checkpoint::{
+        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+    };
+
+    let id = maki_storage::id::MakiId::generate();
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+        Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
+            Box::pin(async move {
+                Ok(CheckpointAck {
+                    session_id: request.session_id,
+                    version: request.version,
+                })
+            }) as CheckpointFuture
+        });
+    maki_agent::session_coordinator::SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id: id,
+        catalog: host.event_handle().session_option_catalog(),
+        definitions: builtin_option_definitions(
+            "test/model",
+            [Arc::from("test/model")],
+            false,
+            false,
+            false,
+        ),
+        persisted_options: Default::default(),
+        history: Vec::new(),
+        model: Arc::from("test/model"),
+        cwd: "/tmp".into(),
+        model_policy: Arc::default(),
+        model_adopter: Arc::new(|_: maki_providers::Model| {
+            Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+        }),
+        directory_adopter: Arc::new(|path| {
+            Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
+        }),
+        checkpoint,
+        mailbox: maki_agent::SessionMailbox::new(id),
+    })
+    .unwrap()
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result<String, String> {
@@ -1082,6 +1130,13 @@ fn bundled_commands_project_complete_metadata() {
             (
                 "/memory".into(),
                 "View, edit, and delete memory files".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
+            (
+                "/options".into(),
+                "Browse and change session options".into(),
                 None,
                 maki_commands::ArgumentArity::NONE,
                 true
@@ -2181,6 +2236,148 @@ fn unloading_plugin_kills_its_jobs() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(unix)]
+fn process_group_pid(path: &Path) -> Pid {
+    poll_until("job did not publish its process id", || {
+        std::fs::read_to_string(path)
+            .ok()?
+            .parse::<i32>()
+            .ok()
+            .and_then(Pid::from_raw)
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_exit(pid: Pid) {
+    poll_until("process group survived cleanup", || {
+        test_kill_process_group(pid).is_err().then_some(())
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_plugin_reload_preserves_old_job_and_kills_candidate() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.pid");
+    let candidate_path = dir.path().join("candidate.pid");
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            old_path.display()
+        ),
+    )
+    .unwrap();
+    let old_pid = process_group_pid(&old_path);
+
+    let result = host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"
+            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
+            maki.fn.jobwait(id, 100)
+            error("reject candidate")
+            "#,
+            candidate_path.display()
+        ),
+    );
+    assert!(result.is_err());
+
+    let candidate_pid = process_group_pid(&candidate_path);
+    wait_for_process_group_exit(candidate_pid);
+    assert!(test_kill_process_group(old_pid).is_ok());
+
+    host.unload("transactional_jobs").unwrap();
+    wait_for_process_group_exit(old_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_plugin_reload_kills_old_job_and_keeps_candidate() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.pid");
+    let candidate_path = dir.path().join("candidate.pid");
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            old_path.display()
+        ),
+    )
+    .unwrap();
+    let old_pid = process_group_pid(&old_path);
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"
+            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
+            maki.fn.jobwait(id, 100)
+            maki.api.register_tool({{
+                name = "stop_candidate_job",
+                description = "stops the candidate job",
+                schema = {MINIMAL_SCHEMA},
+                audiences = {{ "main" }},
+                handler = function()
+                    maki.fn.jobstop(id)
+                    return "stopped"
+                end,
+            }})
+            "#,
+            candidate_path.display()
+        ),
+    )
+    .unwrap();
+
+    let candidate_pid = process_group_pid(&candidate_path);
+    wait_for_process_group_exit(old_pid);
+    assert!(test_kill_process_group(candidate_pid).is_ok());
+    assert_eq!(
+        exec_tool(&reg, "stop_candidate_job", json!({})).unwrap(),
+        "stopped"
+    );
+    wait_for_process_group_exit(candidate_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn unloading_promoted_plugin_job_kills_candidate() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.pid");
+    let candidate_path = dir.path().join("candidate.pid");
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            old_path.display()
+        ),
+    )
+    .unwrap();
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"
+            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
+            maki.fn.jobwait(id, 100)
+            "#,
+            candidate_path.display()
+        ),
+    )
+    .unwrap();
+    let candidate_pid = process_group_pid(&candidate_path);
+
+    host.unload("transactional_jobs").unwrap();
+    wait_for_process_group_exit(candidate_pid);
 }
 
 #[test]
@@ -3297,10 +3494,12 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
     let (result_tx, result_rx) = flume::bounded(1);
     std::thread::spawn(move || {
         let (reg, host) = builtins_host();
-        let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+        let session = test_session(&host);
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
             &maki_agent::AgentMode::Build,
             Some(&event_tx),
             Some(BASH_CANCEL_ID),
+            session.read().session_id(),
         );
         ctx.cancel = token;
         // The rtk probe costs up to two 2s job waits before the command even
@@ -3647,7 +3846,8 @@ fn mutable_path_returns_path_from_input() {
         .tool
         .parse(&serde_json::json!({ "path": "/tmp/foo.txt" }))
         .expect("parse failed");
-    assert_eq!(inv.mutable_path(), Some(Path::new("/tmp/foo.txt")));
+    let ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    assert_eq!(inv.mutable_path(&ctx), Some(PathBuf::from("/tmp/foo.txt")));
 }
 
 #[test]

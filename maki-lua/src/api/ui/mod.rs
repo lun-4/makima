@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use humantime::format_duration;
@@ -25,6 +25,8 @@ use win::WinHandle;
 pub(crate) struct HintStore {
     hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
 }
+
+pub(crate) type PendingHintStore = Arc<Mutex<Option<Vec<(String, String)>>>>;
 
 impl HintStore {
     pub fn new() -> Self {
@@ -558,6 +560,7 @@ pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     plugin: Arc<str>,
+    pending_hint: Option<crate::api::ui::PendingHintStore>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
@@ -571,9 +574,35 @@ pub(crate) fn create_ui_table(
     }
 
     let p = Arc::clone(&plugin);
+    let pending = pending_hint;
     t.set(
         "set_status_hint",
         lua.create_function(move |lua, value: mlua::Value| {
+            if crate::runtime::loading_plugin(lua).is_some()
+                && let Some(pending) = &pending
+            {
+                let spans = match value {
+                    mlua::Value::Nil => None,
+                    mlua::Value::Table(tbl) => Some(
+                        tbl.sequence_values::<Table>()
+                            .map(|entry| {
+                                let entry = entry?;
+                                Ok((
+                                    entry.get::<String>(1)?,
+                                    entry.get::<String>(2).unwrap_or_default(),
+                                ))
+                            })
+                            .collect::<LuaResult<_>>()?,
+                    ),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_hint expects a table or nil",
+                        ));
+                    }
+                };
+                *pending.lock().unwrap_or_else(|e| e.into_inner()) = spans;
+                return Ok(());
+            }
             match value {
                 mlua::Value::Nil => {
                     if let Some(mut store) = lua.app_data_mut::<HintStore>() {

@@ -122,6 +122,7 @@ pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::Sent;
 pub(crate) use session::session_has_content;
 use session_state::SessionState;
+pub(crate) use session_state::stored_to_rules;
 
 const CANCEL_MSG: &str = "Cancelled.";
 /// Bypasses the per-run staleness filter because re-bake replies
@@ -404,6 +405,7 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
+    pub(crate) coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
     pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
@@ -513,6 +515,7 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
+            coordinator: None,
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             hints: Watch::seeded(hint_reader.load_full()),
@@ -2038,12 +2041,33 @@ impl App {
                     maki_commands::CommandOutcome::AgentTurn(turn) => {
                         actions.extend(self.submit_command_turn(turn))
                     }
+                    maki_commands::CommandOutcome::IsolatedTurn(turn) => {
+                        actions.extend(self.submit_isolated_turn(turn))
+                    }
+                    maki_commands::CommandOutcome::FrontendFeedback(feedback) => {
+                        self.present_frontend_feedback(feedback)
+                    }
                     maki_commands::CommandOutcome::Failed(error) => self.flash(error.to_string()),
-                    maki_commands::CommandOutcome::Completed => break,
+                    maki_commands::CommandOutcome::ManualCompaction
+                    | maki_commands::CommandOutcome::Completed => break,
                 },
             }
         }
         actions
+    }
+
+    fn toggle_coordinator_option(&self, id: &str, current: bool) -> Result<bool, String> {
+        let Some(coordinator) = &self.coordinator else {
+            return Ok(!current);
+        };
+        let value = if current {
+            maki_agent::session_options::DISABLED_VALUE
+        } else {
+            maki_agent::session_options::ENABLED_VALUE
+        };
+        smol::block_on(coordinator.set_option(id, value))
+            .map(|_| !current)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn execute_host_request(
@@ -2173,15 +2197,23 @@ impl App {
                 vec![Action::Btw(question.to_string(), images)]
             }
             BuiltinOperation::ToggleYolo => {
-                let enabled = self.permissions.toggle_yolo();
-                self.flash(
-                    if enabled {
-                        "YOLO mode enabled"
-                    } else {
-                        "YOLO mode disabled"
+                match self.toggle_coordinator_option(
+                    maki_agent::session_options::YOLO_OPTION_ID,
+                    self.permissions.is_yolo(),
+                ) {
+                    Ok(enabled) => {
+                        self.permissions.set_yolo(enabled);
+                        self.flash(
+                            if enabled {
+                                "YOLO mode enabled"
+                            } else {
+                                "YOLO mode disabled"
+                            }
+                            .into(),
+                        );
                     }
-                    .into(),
-                );
+                    Err(error) => self.flash(error),
+                }
                 vec![]
             }
             BuiltinOperation::SetThinking { config } => {
@@ -2194,33 +2226,63 @@ impl App {
                 vec![]
             }
             BuiltinOperation::ToggleFast => {
-                self.state.fast = !self.state.fast;
-                self.flash(
-                    if self.state.fast {
-                        FAST_ON_MSG
-                    } else {
-                        FAST_OFF_MSG
+                match self.toggle_coordinator_option(
+                    maki_agent::session_options::FAST_OPTION_ID,
+                    self.state.fast,
+                ) {
+                    Ok(enabled) => {
+                        self.state.fast = enabled;
+                        self.flash(if enabled { FAST_ON_MSG } else { FAST_OFF_MSG }.into());
                     }
-                    .into(),
-                );
+                    Err(error) => self.flash(error),
+                }
                 vec![]
             }
             BuiltinOperation::ToggleWorkflow => {
-                self.state.workflow = !self.state.workflow;
-                self.flash(
-                    if self.state.workflow {
-                        WORKFLOW_ON_MSG
-                    } else {
-                        WORKFLOW_OFF_MSG
+                match self.toggle_coordinator_option(
+                    maki_agent::session_options::WORKFLOW_OPTION_ID,
+                    self.state.workflow,
+                ) {
+                    Ok(enabled) => {
+                        self.state.workflow = enabled;
+                        self.flash(
+                            if enabled {
+                                WORKFLOW_ON_MSG
+                            } else {
+                                WORKFLOW_OFF_MSG
+                            }
+                            .into(),
+                        );
                     }
-                    .into(),
-                );
+                    Err(error) => self.flash(error),
+                }
                 vec![]
             }
             BuiltinOperation::Exit => self.quit(),
             BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
         };
         Ok((HostResponse::Completed, actions))
+    }
+
+    pub(crate) fn submit_isolated_turn(&self, turn: maki_commands::IsolatedTurn) -> Vec<Action> {
+        let images = turn
+            .content
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                maki_agent::ImageMediaType::from_mime(&attachment.media_type)
+                    .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
+            })
+            .collect();
+        vec![Action::Btw(turn.content.text.to_string(), images)]
+    }
+
+    pub(crate) fn present_frontend_feedback(&mut self, feedback: maki_commands::FrontendFeedback) {
+        match feedback {
+            maki_commands::FrontendFeedback::WorkingDirectory(path) => {
+                self.flash(format!("Working directory: {}", path.display()));
+            }
+        }
     }
 
     pub(crate) fn submit_command_turn(&mut self, turn: AgentTurn) -> Vec<Action> {
@@ -2280,11 +2342,19 @@ impl App {
     }
 
     fn change_directory(&mut self, path: PathBuf) -> Vec<Action> {
-        match path.canonicalize().and_then(|path| {
-            path.is_dir()
-                .then_some(path)
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
-        }) {
+        let result = match &self.coordinator {
+            Some(coordinator) => smol::block_on(coordinator.change_directory(path))
+                .map_err(|error| error.to_string()),
+            None => path
+                .canonicalize()
+                .and_then(|path| {
+                    path.is_dir()
+                        .then_some(path)
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
+                })
+                .map_err(|error| error.to_string()),
+        };
+        match result {
             Ok(path) => {
                 self.state
                     .session_mut()

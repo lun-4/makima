@@ -10,7 +10,7 @@
 //! `expand_references`), never touching `Lua` directly.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
@@ -62,9 +62,15 @@ pub struct CompletionCtx {
 #[derive(Default)]
 pub(crate) struct CompletionStore(pub(crate) HashMap<Arc<str>, HashMap<String, Function>>);
 
+#[derive(Default)]
+pub(crate) struct PendingCompletionStore(pub(crate) HashMap<String, Function>);
+
 /// `plugin -> prefix -> expander fn`. Aliases are separate prefix entries.
 #[derive(Default)]
 pub(crate) struct ExpanderStore(pub(crate) HashMap<Arc<str>, HashMap<String, Function>>);
+
+#[derive(Default)]
+pub(crate) struct PendingExpanderStore(pub(crate) HashMap<String, Function>);
 
 fn install_store<T: Default + Send + Sync + 'static>(lua: &Lua) {
     if lua.app_data_ref::<T>().is_none() {
@@ -89,6 +95,7 @@ fn install_store<T: Default + Send + Sync + 'static>(lua: &Lua) {
 fn register_completion_source(
     lua: &Lua,
     #[ctx] plugin: Arc<str>,
+    #[ctx] pending: Arc<Mutex<PendingCompletionStore>>,
     prefix: String,
     spec: Table,
 ) -> LuaResult<()> {
@@ -96,7 +103,15 @@ fn register_completion_source(
     let mut store = lua
         .app_data_mut::<CompletionStore>()
         .ok_or_else(|| mlua::Error::runtime("completion store not available"))?;
-    store.0.entry(plugin).or_default().insert(prefix, get_items);
+    if crate::runtime::loading_plugin(lua).is_some() {
+        pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .insert(prefix, get_items);
+    } else {
+        store.0.entry(plugin).or_default().insert(prefix, get_items);
+    }
     Ok(())
 }
 
@@ -121,13 +136,22 @@ fn register_completion_source(
 fn register_expander(
     lua: &Lua,
     #[ctx] plugin: Arc<str>,
+    #[ctx] pending: Arc<Mutex<PendingExpanderStore>>,
     prefix: String,
     f: Function,
 ) -> LuaResult<()> {
     let mut store = lua
         .app_data_mut::<ExpanderStore>()
         .ok_or_else(|| mlua::Error::runtime("expander store not available"))?;
-    store.0.entry(plugin).or_default().insert(prefix, f);
+    if crate::runtime::loading_plugin(lua).is_some() {
+        pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .insert(prefix, f);
+    } else {
+        store.0.entry(plugin).or_default().insert(prefix, f);
+    }
     Ok(())
 }
 
@@ -136,8 +160,8 @@ lua_table! {
     /// and expanders (submit-time token replacement) keyed by prefix. The
     /// built-in `skill`, `task`, and `model` plugins provide the defaults; you
     /// can add your own kinds the same way.
-    extend "maki.api" => pub(crate) fn add_completion_fns(plugin: Arc<str>), DOCS [
-        register_completion_source(plugin), register_expander(plugin),
+    extend "maki.api" => pub(crate) fn add_completion_fns(plugin: Arc<str>, pending_sources: Arc<Mutex<PendingCompletionStore>>, pending_expanders: Arc<Mutex<PendingExpanderStore>>), DOCS [
+        register_completion_source(plugin, pending_sources), register_expander(plugin, pending_expanders),
     ]
 }
 

@@ -192,7 +192,11 @@ local function diff_restore(blocks_from)
 end
 
 local function apply_edit(path, ctx, transform)
-  path = maki.fs.abspath(path)
+  local resolved, resolve_err = ctx:resolve_path(path)
+  if not resolved then
+    return nil, resolve_err
+  end
+  path = resolved
 
   local ok, err = ctx:check_before_edit(path)
   if not ok then

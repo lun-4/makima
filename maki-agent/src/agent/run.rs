@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -248,6 +249,7 @@ impl<'h> Agent<'h> {
             fast,
             workflow,
             prompt: _,
+            lease_committer: _,
         } = input;
         self.push_input_context(preamble);
         if !message.trim().is_empty() || !images.is_empty() {
@@ -542,6 +544,15 @@ impl<'h> Agent<'h> {
     }
 
     fn tool_context(&self) -> ToolContext {
+        let cwd = self
+            .session_id
+            .as_ref()
+            .and_then(|session| {
+                crate::session_coordinator::SessionCoordinatorHandle::resolve(session.id()).ok()
+            })
+            .map(|coordinator| coordinator.read().cwd())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
         ToolContext {
             provider: Arc::clone(&self.provider),
             model: Arc::clone(&self.model),
@@ -549,6 +560,7 @@ impl<'h> Agent<'h> {
             mode: self.mode.clone(),
             question_mode: self.question_mode,
             session_id: self.session_id.clone(),
+            cwd,
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
@@ -921,6 +933,7 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
+            lease_committer: None,
         }
     }
 
@@ -928,8 +941,8 @@ mod tests {
     fn run_ingests_preamble_then_mailbox_then_user_message() {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
-            let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            let mailbox = SessionMailbox::new(id);
+            mailbox.push("mailbox".into(), false);
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -952,8 +965,8 @@ mod tests {
     fn queued_input_drains_preamble_and_mailbox() {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
-            let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            let mailbox = SessionMailbox::new(id);
+            mailbox.push("mailbox".into(), false);
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(input, 0)]);
@@ -980,8 +993,8 @@ mod tests {
     fn wake_only_run_does_not_insert_an_empty_user_turn() {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
-            let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "failed".into(), true).unwrap();
+            let mailbox = SessionMailbox::new(id);
+            mailbox.push("failed".into(), true);
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),

@@ -208,7 +208,21 @@ fn drive_print(
                 literal.workflow,
             )?
         }
-        InputDispatch::Dispatched(CommandOutcome::Completed) => return Ok(()),
+        InputDispatch::Dispatched(
+            CommandOutcome::Completed | CommandOutcome::FrontendFeedback(_),
+        ) => {
+            return Ok(());
+        }
+        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(_)) => {
+            return Err(color_eyre::eyre::eyre!(
+                "isolated turns are unavailable in print mode"
+            ));
+        }
+        InputDispatch::Dispatched(CommandOutcome::ManualCompaction) => {
+            return Err(color_eyre::eyre::eyre!(
+                "manual compaction is unavailable in print mode"
+            ));
+        }
         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => return Err(error.into()),
         InputDispatch::LiteralInput(_) => literal,
     };
@@ -265,6 +279,7 @@ pub fn run(
         fast,
         workflow,
         prompt: None,
+        lease_committer: None,
     };
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
@@ -554,6 +569,7 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
+            lease_committer: None,
         }
     }
 

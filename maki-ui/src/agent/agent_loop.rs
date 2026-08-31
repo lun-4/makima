@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -30,6 +31,7 @@ use super::shared_queue::{QueueItem, QueueReceiver};
 pub(super) struct AgentLoop {
     agent_id: AgentId,
     model_slot: Arc<ArcSwap<ModelSlot>>,
+    cwd: Arc<ArcSwap<PathBuf>>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     vars: Vars,
@@ -60,6 +62,7 @@ impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         model_slot: Arc<ArcSwap<ModelSlot>>,
+        cwd: Arc<ArcSwap<PathBuf>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
@@ -85,6 +88,7 @@ impl AgentLoop {
         Self {
             agent_id: AgentId::generate(),
             model_slot,
+            cwd,
             config,
             tool_output_lines,
             vars: Vars::default(),
@@ -161,6 +165,39 @@ impl AgentLoop {
     async fn process_entry(&mut self, entry: QueueItem) {
         let run_id = entry.run_id();
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+        let lease = match &self.session_id {
+            Some(session_id) => {
+                match maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(
+                    session_id.id(),
+                ) {
+                    Ok(coordinator) => match coordinator.acquire_lease().await {
+                        Ok(lease) => Some(lease),
+                        Err(error) => {
+                            self.emit_error(
+                                run_id,
+                                AgentError::Config {
+                                    message: error.to_string(),
+                                },
+                            );
+                            return;
+                        }
+                    },
+                    Err(
+                        maki_agent::session_coordinator::SessionCoordinatorError::StaleSession(_),
+                    ) => None,
+                    Err(error) => {
+                        self.emit_error(
+                            run_id,
+                            AgentError::Config {
+                                message: error.to_string(),
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
 
         let result = match entry {
             QueueItem::Message {
@@ -175,14 +212,25 @@ impl AgentLoop {
                 }
                 let turn_id = TurnId::generate();
                 if let Err(error) = self
-                    .do_agent_run(input, event_tx.clone(), run_id, turn_id)
+                    .do_agent_run(input, event_tx.clone(), run_id, turn_id, lease.as_ref())
                     .await
                 {
                     self.emit_turn_failure(&event_tx, turn_id, error);
                 }
                 return;
             }
-            QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
+            QueueItem::Compact { .. } => {
+                let result = self.do_compact(&event_tx).await;
+                match (result, lease.as_ref().and_then(|lease| lease.committer())) {
+                    (Ok(()), Some(committer)) => committer
+                        .commit_history(self.history.as_slice().to_vec())
+                        .await
+                        .map_err(|error| AgentError::Config {
+                            message: error.to_string(),
+                        }),
+                    (result, _) => result,
+                }
+            }
         };
 
         if let Err(e) = result {
@@ -191,7 +239,7 @@ impl AgentLoop {
     }
 
     async fn initialize(&mut self) -> bool {
-        self.vars = template::env_vars();
+        self.vars = template::env_vars_for(&self.cwd.load());
         self.reload_instructions().await;
         if self.init_cancel.is_cancelled() {
             return false;
@@ -224,6 +272,7 @@ impl AgentLoop {
             &model,
             &mut self.history,
             event_tx,
+            &maki_agent::cancel::CancelToken::none(),
             &self.config,
         )
         .await
@@ -235,11 +284,13 @@ impl AgentLoop {
         event_tx: EventSender,
         run_id: u64,
         turn_id: TurnId,
+        lease: Option<&maki_agent::session_coordinator::SessionLease>,
     ) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
+        input.lease_committer = lease.and_then(|lease| lease.committer());
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
-        self.vars = template::env_vars();
+        self.vars = template::env_vars_for(&self.cwd.load());
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
@@ -282,6 +333,7 @@ impl AgentLoop {
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
+        let lease_committer = input.lease_committer.clone();
         let mut agent = Agent::new(
             AgentParams {
                 agent_id: self.agent_id,
@@ -325,7 +377,19 @@ impl AgentLoop {
             self.min_run_id = run_id + 1;
         }
 
-        Ok(())
+        match (outcome, lease_committer) {
+            (TurnOutcome::Completed { .. }, Some(committer)) => committer
+                .commit_history(self.history.as_slice().to_vec())
+                .await
+                .map_err(|error| AgentError::Config {
+                    message: error.to_string(),
+                }),
+            (TurnOutcome::Failed { failure, .. }, _) => Err(AgentError::Config {
+                message: failure.user_message,
+            }),
+            (TurnOutcome::Cancelled { .. }, _) => Ok(()),
+            (_, None) => Ok(()),
+        }
     }
 
     /// Base tools only. MCP definitions are injected per request by

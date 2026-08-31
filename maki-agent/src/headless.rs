@@ -6,15 +6,12 @@ use flume::Receiver;
 use futures_lite::future;
 use maki_config::ModelPolicy;
 use maki_providers::Message;
-use maki_providers::Timeouts;
-use maki_providers::TokenUsage;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
-use maki_storage::StateDir;
+use maki_providers::{Timeouts, TokenUsage};
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::Session;
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
@@ -25,52 +22,10 @@ use crate::tools::{
     DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
 };
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, Envelope,
-    EventSender, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
+    Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
+    Envelope, EventSender, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
     ToolOutputLines, TurnFailure, TurnId, TurnOutcome,
 };
-
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
-
-struct SessionStore {
-    dir: StateDir,
-    session: StoredSession,
-}
-
-impl SessionStore {
-    fn open(session_id: MakiId, cwd: &str, model_spec: &str) -> Option<Self> {
-        let dir = StateDir::resolve()
-            .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
-            .ok()?;
-        Some(Self::open_in(dir, session_id, cwd, model_spec))
-    }
-
-    fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
-        match StoredSession::load(session_id, &dir) {
-            Ok(session) => Self { dir, session },
-            Err(_) => {
-                let mut session = StoredSession::new(model_spec, cwd);
-                session.id = session_id;
-                let mut store = Self { dir, session };
-                store.save();
-                store
-            }
-        }
-    }
-
-    fn save(&mut self) {
-        if let Err(e) = self.session.save(&self.dir) {
-            warn!(error = %e, session_id = %self.session.id, "failed to persist session");
-        }
-    }
-
-    fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.replace_messages(messages.to_vec());
-        self.session.set_model(model_spec);
-        self.session.update_title_if_default();
-        self.save();
-    }
-}
 
 pub struct HeadlessParams {
     pub model: Model,
@@ -194,7 +149,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_id = MakiId::generate();
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
-    let mailbox = SessionMailbox::register(session_id);
+    let mailbox = SessionMailbox::new(session_id);
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
     let task = smol::spawn({
         let file_write_locks = Arc::clone(&file_write_locks);
@@ -292,25 +247,54 @@ pub struct InteractiveParams {
     pub local_tools: LocalTools,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualCompactionEvent {
+    Started,
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
 pub enum InteractiveControl {
     Compact(flume::Sender<Result<(), String>>),
+    ManualCompaction {
+        output: flume::Sender<ManualCompactionEvent>,
+        cancel: CancelToken,
+        lease_committer: Option<crate::session_coordinator::SessionLeaseCommitter>,
+    },
     Reset(flume::Sender<Result<(), String>>),
+    AdoptModel {
+        model: Model,
+        reply: flume::Sender<Result<(), String>>,
+    },
     ChangeDirectory {
         path: PathBuf,
-        reply: flume::Sender<Result<(), String>>,
+        reply: flume::Sender<Result<PathBuf, String>>,
+    },
+    IsolatedTurn {
+        question: String,
+        images: Vec<maki_providers::ImageSource>,
+        output: flume::Sender<agent::isolated_turn::IsolatedTurnEvent>,
+        cancel: CancelToken,
     },
 }
 
 struct InteractiveControlContext<'a> {
+    session_id: MakiId,
     history: &'a mut History,
-    store: &'a mut Option<SessionStore>,
     model: &'a Model,
     provider: &'a dyn Provider,
     raw_tx: &'a flume::Sender<Envelope>,
     run_id: u64,
     config: &'a AgentConfig,
-    working_dir: &'a mut PathBuf,
-    permissions: &'a PermissionManager,
+}
+
+async fn persist_history(session_id: MakiId, history: &[Message]) -> Result<(), String> {
+    crate::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
+        .map_err(|error| error.to_string())?
+        .replace_history(history.to_vec())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn apply_interactive_control(
@@ -318,59 +302,66 @@ async fn apply_interactive_control(
     context: InteractiveControlContext<'_>,
 ) {
     let InteractiveControlContext {
+        session_id,
         history,
-        store,
         model,
         provider,
         raw_tx,
         run_id,
         config,
-        working_dir,
-        permissions,
     } = context;
     let result = match &control {
-        InteractiveControl::Compact(_) => agent::compact(
-            provider,
-            model,
-            history,
-            &EventSender::new(raw_tx.clone(), run_id),
-            config,
-        )
-        .await
-        .map_err(|error| error.to_string()),
-        InteractiveControl::Reset(_) => {
-            history.replace(Vec::new());
-            if let Some(store) = store {
-                store.record_turn(&[], model.spec());
+        InteractiveControl::Compact(_) => {
+            let previous = history.as_slice().to_vec();
+            match agent::compact(
+                provider,
+                model,
+                history,
+                &EventSender::new(raw_tx.clone(), run_id),
+                &CancelToken::none(),
+                config,
+            )
+            .await
+            {
+                Ok(()) => persist_history(session_id, history.as_slice())
+                    .await
+                    .inspect_err(|_| history.replace(previous)),
+                Err(error) => Err(error.to_string()),
             }
-            Ok(())
         }
-        InteractiveControl::ChangeDirectory { path, .. } => path
-            .canonicalize()
-            .and_then(|path| {
-                if !path.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotADirectory,
-                        "path is not a directory",
-                    ));
-                }
-                *working_dir = path;
-                permissions.set_cwd(working_dir.clone());
-                if let Some(store) = store {
-                    store
-                        .session
-                        .set_cwd(working_dir.to_string_lossy().into_owned());
-                    store.save();
-                }
-                Ok(())
-            })
-            .map_err(|error| error.to_string()),
+        InteractiveControl::ManualCompaction { .. } => {
+            Err("manual compaction was not intercepted by the session loop".into())
+        }
+        InteractiveControl::Reset(_) => {
+            let previous = history.as_slice().to_vec();
+            history.replace(Vec::new());
+            persist_history(session_id, history.as_slice())
+                .await
+                .inspect_err(|_| history.replace(previous))
+        }
+        InteractiveControl::AdoptModel { .. } => {
+            Err("model adoption was not intercepted by the session loop".into())
+        }
+        InteractiveControl::ChangeDirectory { .. } => {
+            Err("directory adoption was not intercepted by the session loop".into())
+        }
+        InteractiveControl::IsolatedTurn { .. } => {
+            Err("isolated turn was not intercepted by the session loop".into())
+        }
     };
-    let reply = match control {
-        InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply) => reply,
-        InteractiveControl::ChangeDirectory { reply, .. } => reply,
-    };
-    let _ = reply.send(result);
+    match control {
+        InteractiveControl::Compact(reply)
+        | InteractiveControl::Reset(reply)
+        | InteractiveControl::AdoptModel { reply, .. } => {
+            let _ = reply.send(result);
+        }
+        InteractiveControl::ChangeDirectory { reply, .. } => {
+            let _ = reply.send(Err(
+                "directory adoption was not intercepted by the session loop".into(),
+            ));
+        }
+        InteractiveControl::ManualCompaction { .. } | InteractiveControl::IsolatedTurn { .. } => {}
+    }
 }
 
 pub struct InteractiveHandle {
@@ -382,6 +373,7 @@ pub struct InteractiveHandle {
     pub model_tx: flume::Sender<Model>,
     pub control_tx: flume::Sender<InteractiveControl>,
     pub session_id: SessionRef,
+    pub mailbox: SessionMailbox,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
@@ -416,7 +408,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             (id, SessionRef::from(id))
         }
     };
-    let mailbox = SessionMailbox::register(session_id);
+    let mailbox = SessionMailbox::new(session_id);
+    let handle_mailbox = mailbox.clone();
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -451,7 +444,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 };
 
-            let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
             let mut history = History::restored(params.initial_history);
             let mut working_dir = PathBuf::from(working_dir);
             let permissions = permissions;
@@ -476,19 +468,136 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
                 let input = match wake {
                     Some(Wake::Input(input)) => input,
+                    Some(Wake::Control(InteractiveControl::AdoptModel {
+                        model: mut candidate,
+                        reply,
+                    })) => {
+                        let result =
+                            match provider::from_model_async(&mut candidate, params.timeouts).await
+                            {
+                                Ok(adopted) => {
+                                    provider = Arc::from(adopted);
+                                    model = candidate;
+                                    Ok(())
+                                }
+                                Err(error) => Err(error.user_message()),
+                            };
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                    Some(Wake::Control(InteractiveControl::ChangeDirectory { path, reply })) => {
+                        let result = path
+                            .canonicalize()
+                            .and_then(|canonical| {
+                                if canonical.is_dir() {
+                                    Ok(canonical)
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotADirectory,
+                                        "path is not a directory",
+                                    ))
+                                }
+                            })
+                            .inspect(|canonical| {
+                                working_dir = canonical.clone();
+                                permissions.set_cwd(canonical.clone());
+                            })
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                    Some(Wake::Control(InteractiveControl::ManualCompaction {
+                        output,
+                        cancel,
+                        lease_committer,
+                    })) => {
+                        let _ = output.send(ManualCompactionEvent::Started);
+                        let previous = history.as_slice().to_vec();
+                        let (private_tx, _private_rx) = flume::unbounded();
+                        let result = agent::compact(
+                            &*provider,
+                            &model,
+                            &mut history,
+                            &EventSender::new(private_tx, run_id),
+                            &cancel,
+                            &params.config,
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                        let result = match result {
+                            Ok(()) => match lease_committer {
+                                Some(committer) => committer
+                                    .commit_history(history.as_slice().to_vec())
+                                    .await
+                                    .map_err(|error| error.to_string()),
+                                None => persist_history(session_id, history.as_slice()).await,
+                            },
+                            Err(error) => Err(error),
+                        };
+                        let terminal = match result {
+                            Ok(()) => ManualCompactionEvent::Completed,
+                            Err(_) if cancel.is_cancelled() => {
+                                history.replace(previous);
+                                ManualCompactionEvent::Cancelled
+                            }
+                            Err(error) => {
+                                history.replace(previous);
+                                ManualCompactionEvent::Failed(error)
+                            }
+                        };
+                        let _ = output.send(terminal);
+                        continue;
+                    }
+                    Some(Wake::Control(InteractiveControl::IsolatedTurn {
+                        question,
+                        images,
+                        output,
+                        cancel,
+                    })) => {
+                        let vars = template::env_vars_for(&working_dir);
+                        let instructions = agent::load_instructions(&working_dir.to_string_lossy());
+                        let mut system =
+                            params.system_prompt_override.clone().unwrap_or_else(|| {
+                                agent::build_system_prompt(
+                                    &vars,
+                                    &modes,
+                                    &AgentMode::Build,
+                                    &instructions.text,
+                                    &params.prompt_slots,
+                                    &model,
+                                )
+                            });
+                        if let Some(append) = &params.append_system_prompt {
+                            system.push('\n');
+                            system.push_str(append);
+                        }
+                        agent::isolated_turn::run_isolated_turn(
+                            agent::isolated_turn::IsolatedTurnRequest {
+                                provider: Arc::clone(&provider),
+                                model: model.clone(),
+                                history: history.as_slice().to_vec(),
+                                system,
+                                question,
+                                images,
+                                session_id: Some(SessionRef::from(session_id)),
+                                cancel,
+                            },
+                            output,
+                        )
+                        .await;
+                        continue;
+                    }
                     Some(Wake::Control(control)) => {
                         apply_interactive_control(
                             control,
                             InteractiveControlContext {
+                                session_id,
                                 history: &mut history,
-                                store: &mut store,
                                 model: &model,
                                 provider: &*provider,
                                 raw_tx: &raw_tx,
                                 run_id,
                                 config: &params.config,
-                                working_dir: &mut working_dir,
-                                permissions: &permissions,
                             },
                         )
                         .await;
@@ -497,6 +606,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     None => break,
                 };
                 let turn_id = TurnId::generate();
+                let lease_committer = input.lease_committer.clone();
                 let (trigger, cancel) = CancelToken::new();
                 let cancel_task = smol::spawn({
                     let cancel_rx = cancel_rx.clone();
@@ -514,8 +624,23 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     let _ = cancel.race(mcp.ready()).await;
                 }
 
-                let event_tx = EventSender::new(raw_tx.clone(), run_id);
-                let error_tx = event_tx.clone();
+                let (turn_event_tx, turn_event_rx) = flume::unbounded::<Envelope>();
+                let terminal_task = smol::spawn({
+                    let raw_tx = raw_tx.clone();
+                    async move {
+                        let mut terminal = None;
+                        while let Ok(envelope) = turn_event_rx.recv_async().await {
+                            if matches!(envelope.event, AgentEvent::TurnOutcome(_)) {
+                                terminal = Some(envelope);
+                            } else {
+                                let _ = raw_tx.send(envelope);
+                            }
+                        }
+                        terminal
+                    }
+                });
+                let event_tx = EventSender::new(turn_event_tx.clone(), run_id);
+                let error_tx = EventSender::new(raw_tx.clone(), run_id);
 
                 if let Some(mut new_model) = model_rx
                     .try_iter()
@@ -614,12 +739,32 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_local_tools(Arc::clone(&params.local_tools))
                 .with_mcp(mcp.clone());
 
-                agent.run(turn_id, input).await;
+                let outcome = agent.run(turn_id, input).await;
                 drop(agent);
+                drop(turn_event_tx);
                 cancel_task.cancel().await;
+                let terminal = terminal_task.await;
 
-                if let Some(store) = &mut store {
-                    store.record_turn(history.as_slice(), model.spec());
+                if let TurnOutcome::Failed { failure, .. } = &outcome {
+                    error!(error = %failure.user_message, "agent error");
+                }
+                let checkpoint = match lease_committer {
+                    Some(committer) => committer
+                        .commit_history(history.as_slice().to_vec())
+                        .await
+                        .map_err(|error| error.to_string()),
+                    None => persist_history(session_id, history.as_slice()).await,
+                };
+                match checkpoint {
+                    Ok(()) => {
+                        if let Some(terminal) = terminal {
+                            let _ = raw_tx.send(terminal);
+                        }
+                    }
+                    Err(error) => {
+                        error!(%error, %session_id, "failed to checkpoint completed turn");
+                        let _ = error_tx.send(AgentEvent::ControlError { message: error });
+                    }
                 }
                 run_id += 1;
             }
@@ -639,6 +784,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         model_tx,
         control_tx,
         session_id: session_ref,
+        mailbox: handle_mailbox,
         permissions,
         task,
     }
@@ -657,92 +803,7 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::generate_title;
-    use tempfile::TempDir;
-
     use super::*;
-
-    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
-    const CWD: &str = "/project";
-    const MODEL_SPEC: &str = "anthropic/claude-test";
-
-    fn session_id() -> MakiId {
-        SESSION_ID.parse().unwrap()
-    }
-
-    fn store_in(tmp: &TempDir) -> SessionStore {
-        SessionStore::open_in(
-            StateDir::from_path(tmp.path().to_path_buf()),
-            session_id(),
-            CWD,
-            MODEL_SPEC,
-        )
-    }
-
-    fn load(tmp: &TempDir) -> StoredSession {
-        StoredSession::load(session_id(), &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
-    }
-
-    #[test]
-    fn new_session_is_loadable_before_first_turn() {
-        let tmp = TempDir::new().unwrap();
-        store_in(&tmp);
-        let loaded = load(&tmp);
-        assert_eq!(loaded.id, session_id());
-        assert_eq!(loaded.cwd, CWD);
-        assert_eq!(loaded.model, MODEL_SPEC);
-        assert!(loaded.messages().is_empty());
-    }
-
-    #[test]
-    fn record_turn_persists_messages_and_title() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        let messages = vec![Message::user("fix the login bug".into())];
-        store.record_turn(&messages, MODEL_SPEC.into());
-
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 1);
-        assert_eq!(loaded.title, generate_title(&messages));
-    }
-
-    #[test]
-    fn record_turn_persists_observations() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        store.record_turn(
-            &[
-                Message::user("fix the login bug".into()),
-                Message::observation("build failed".into()),
-            ],
-            MODEL_SPEC.into(),
-        );
-
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 2);
-        assert!(loaded.messages()[1].is_observation());
-    }
-
-    #[test]
-    fn reopening_resumes_existing_session() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        store.record_turn(&[Message::user("first prompt".into())], MODEL_SPEC.into());
-        drop(store);
-
-        let mut store = store_in(&tmp);
-        assert_eq!(store.session.messages().len(), 1);
-
-        let messages = vec![
-            Message::user("first prompt".into()),
-            Message::user("second prompt".into()),
-        ];
-        store.record_turn(&messages, "other/model".into());
-
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 2);
-        assert_eq!(loaded.model, "other/model");
-    }
 
     #[test]
     fn extract_tool_names_filters_valid_entries() {

@@ -414,8 +414,13 @@ impl PermissionManager {
     }
 
     pub fn toggle_yolo(&self) -> bool {
-        let prev = self.yolo.fetch_xor(true, Ordering::Relaxed);
-        !prev
+        let enabled = !self.is_yolo();
+        self.set_yolo(enabled);
+        enabled
+    }
+
+    pub fn set_yolo(&self, enabled: bool) {
+        self.yolo.store(enabled, Ordering::Relaxed);
     }
 
     pub fn is_yolo(&self) -> bool {
@@ -1286,6 +1291,18 @@ mod tests {
             mgr.check(&tool, "*", None),
             PermissionCheck::Denied
         ));
+    }
+
+    #[test]
+    fn explicit_yolo_setter_is_idempotent() {
+        let mgr = default_mgr();
+
+        mgr.set_yolo(true);
+        mgr.set_yolo(true);
+        assert!(mgr.is_yolo());
+        mgr.set_yolo(false);
+        mgr.set_yolo(false);
+        assert!(!mgr.is_yolo());
     }
 
     #[test]

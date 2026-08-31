@@ -3002,6 +3002,7 @@ dependencies = [
  "isahc",
  "serde",
  "serde_json",
+ "smol",
  "tempfile",
  "test-case",
  "thiserror 2.0.20",

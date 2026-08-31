@@ -215,6 +215,7 @@ mod tests {
                 fast: false,
                 workflow: false,
                 prompt: None,
+                lease_committer: None,
             },
             run_id: 0,
             displayed,

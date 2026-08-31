@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
@@ -203,7 +203,7 @@ pub trait ToolInvocation: Send + Sync {
     /// normalized path for invocations that expose one: an advisory
     /// in-process lock, never protection for shell commands, other
     /// processes, or paths the tool mutates without declaring them.
-    fn mutable_path(&self) -> Option<&Path> {
+    fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
         None
     }
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
@@ -361,6 +361,19 @@ impl ToolRegistry {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+    }
+
+    pub fn plugin_entries(&self, plugin: &str) -> Vec<(Arc<dyn Tool>, ToolSource)> {
+        self.tools
+            .load()
+            .iter()
+            .filter_map(|entry| match &entry.source {
+                ToolSource::Lua { plugin: owner } if owner.as_ref() == plugin => {
+                    Some((Arc::clone(&entry.tool), entry.source.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn replace_plugin(
