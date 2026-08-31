@@ -2811,6 +2811,7 @@ impl App {
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
+            self.input_box.handle_paste(text);
             return;
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {

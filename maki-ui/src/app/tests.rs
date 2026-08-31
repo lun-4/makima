@@ -7022,6 +7022,19 @@ fn typing_in_subagent_chat_edits_input_and_submits_to_subagent() {
 }
 
 #[test]
+fn paste_in_subagent_chat_edits_input_and_submits_to_subagent() {
+    const PASTED: &str = "first\nsecond";
+
+    let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
+    app.update(Msg::Paste("first\r\nsecond".into()));
+    assert_eq!(app.input_box.buffer.value(), PASTED);
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(input_rx.try_recv().unwrap(), PASTED);
+    assert!(app.queue.text_messages().is_empty());
+}
+
+#[test]
 fn subagent_completion_queues_reply_to_main() {
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
     // Terminal completion flushes the subagent's history; the driver surfaces
