@@ -261,7 +261,7 @@ impl PickerItem for TaskEntry {
 struct SubagentChannels {
     answer_tx: Option<flume::Sender<String>>,
     input_tx: Option<flume::Sender<String>>,
-    cancel_tx: Option<flume::Sender<()>>,
+    cancel: Option<maki_agent::SubagentCancel>,
 }
 
 fn truncate_snippet(text: &str) -> String {
@@ -1608,12 +1608,12 @@ impl App {
 
         self.chats[self.active_chat].flush();
         self.chats[self.active_chat].cancel_in_progress();
-        if let Some(cancel_tx) = self
+        if let Some(cancel) = self
             .subagent_channels
             .get(&tool_use_id)
-            .and_then(|channels| channels.cancel_tx.as_ref())
+            .and_then(|channels| channels.cancel.as_ref())
         {
-            let _ = cancel_tx.try_send(());
+            cancel.cancel();
         }
         vec![]
     }
@@ -1642,7 +1642,7 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+        if envelope.subagent.is_none() && envelope.run_id != self.run_id {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -1766,6 +1766,15 @@ impl App {
             Some(ref subagent) => self.resolve_or_create_chat(subagent),
             None => 0,
         };
+        if chat_idx > 0
+            && !matches!(
+                envelope.event,
+                AgentEvent::TurnOutcome(_) | AgentEvent::SubagentHistory { .. }
+            )
+        {
+            self.chats[chat_idx].reopen();
+            self.sync_task_picker();
+        }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             if self.state.mode == Mode::Plan
@@ -1970,7 +1979,7 @@ impl App {
             SubagentChannels {
                 answer_tx: subagent.answer_tx.clone(),
                 input_tx: subagent.input_tx.clone(),
-                cancel_tx: subagent.cancel_tx.clone(),
+                cancel: subagent.cancel.clone(),
             },
         );
         self.chats[0].update_tool_summary(id, &subagent.name);

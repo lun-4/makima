@@ -299,21 +299,21 @@ fn child_cancellation_keeps_session_open_for_recovery() {
         )
     });
     assert_eq!(entered_rx.recv_timeout(TURN_TIMEOUT).unwrap(), 0);
-    let cancel_tx = loop {
+    let cancel = loop {
         let envelope = parent_rx.recv_timeout(TURN_TIMEOUT).unwrap();
-        if let Some(cancel_tx) = envelope.subagent.and_then(|info| info.cancel_tx) {
-            break cancel_tx;
+        if let Some(cancel) = envelope.subagent.and_then(|info| info.cancel) {
+            break cancel;
         }
     };
-    cancel_tx.send(()).unwrap();
+    cancel.cancel();
+    exec_tool(&reg, &ctx, "probe_send", json!({"message": "recover"})).unwrap();
+
     let cancelled = prompt.join().unwrap().unwrap();
     assert!(
         cancelled["error"]
             .as_str()
             .is_some_and(|error| error.contains("cancel"))
     );
-
-    exec_tool(&reg, &ctx, "probe_send", json!({"message": "recover"})).unwrap();
     assert_eq!(entered_rx.recv_timeout(TURN_TIMEOUT).unwrap(), 1);
     loop {
         let envelope = parent_rx.recv_timeout(TURN_TIMEOUT).unwrap();

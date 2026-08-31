@@ -499,7 +499,7 @@ fn subagent_info_full(
         model: None,
         answer_tx,
         input_tx,
-        cancel_tx: None,
+        cancel: None,
     }
 }
 
@@ -5428,6 +5428,16 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
         num_turns: 1,
         reason: DoneReason::EndTurn,
     }));
+    app.run_id = 2;
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "second turn".into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert!(!app.chats[1].is_finished());
+    assert!(app.task_entries()[1].is_spinning());
     app.update(envelope(TurnOutcome::Failed {
         agent_id: AgentId::generate(),
         turn_id: TurnId::generate(),
@@ -5453,10 +5463,13 @@ fn main_turn_completion_keeps_async_subagent_cancellable_and_reusable() {
     app.status = Status::Streaming;
     app.run_id = 1;
     let (input_tx, input_rx) = flume::unbounded();
-    let (cancel_tx, cancel_rx) = flume::unbounded();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let mut info = subagent_info(TASK_ID, "worker");
     info.input_tx = Some(input_tx);
-    info.cancel_tx = Some(cancel_tx);
+    info.cancel = Some(maki_agent::SubagentCancel::new({
+        let cancelled = Arc::clone(&cancelled);
+        move || cancelled.store(true, Ordering::SeqCst)
+    }));
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
             text: "working".into(),
@@ -5472,7 +5485,7 @@ fn main_turn_completion_keeps_async_subagent_cancellable_and_reusable() {
     app.update(Msg::Key(key(KeyCode::Esc)));
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
-    cancel_rx.try_recv().unwrap();
+    assert!(cancelled.load(Ordering::SeqCst));
 
     type_and_submit(&mut app, FOLLOW_UP);
     assert_eq!(input_rx.try_recv().unwrap(), FOLLOW_UP);

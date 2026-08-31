@@ -24,7 +24,7 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
     AgentRunParams, EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession,
-    SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId, TurnOutcome,
+    SubagentCancel, SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId, TurnOutcome,
 };
 use maki_config::ToolKey;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
@@ -108,7 +108,7 @@ struct LuaActorState {
     ui_id: String,
     parent_event_tx: EventSender,
     input_tx: flume::Sender<String>,
-    cancel_tx: flume::Sender<()>,
+    cancel: SubagentCancel,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
@@ -135,7 +135,7 @@ impl LuaActorState {
                 model: Some(self.params.model.spec()),
                 answer_tx: self.answer_tx.clone(),
                 input_tx: Some(self.input_tx.clone()),
-                cancel_tx: Some(self.cancel_tx.clone()),
+                cancel: Some(self.cancel.clone()),
             });
         }
     }
@@ -884,7 +884,6 @@ async fn session(
     let chip_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (cancel_tx, cancel_rx) = flume::unbounded::<()>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
 
@@ -946,6 +945,15 @@ async fn session(
         model_policy: Arc::clone(&agent_ctx.model_policy),
         file_write_locks: Arc::clone(&agent_ctx.file_write_locks),
     };
+    let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
+    let cancel = SubagentCancel::new({
+        let cancel_actor = Arc::clone(&cancel_actor);
+        move || {
+            if let Some(actor) = cancel_actor.lock().unwrap().as_ref() {
+                actor.cancel_all();
+            }
+        }
+    });
     let state = Arc::new(LuaActorState {
         params,
         system: system.unwrap_or_default(),
@@ -964,7 +972,7 @@ async fn session(
         ui_id: ui_id.clone(),
         parent_event_tx: parent_tx,
         input_tx: ui_input_tx.clone(),
-        cancel_tx,
+        cancel,
         subagent_info: Arc::clone(&subagent_info),
         local_tools: Arc::new(local_map),
         name: name.clone(),
@@ -985,6 +993,7 @@ async fn session(
     // The runner exits when the actor closes; detach so dropping this task
     // later never cancels the actor prematurely.
     task.detach();
+    *cancel_actor.lock().unwrap() = Some(actor.clone());
     let thinking = state.thinking;
     let fast = state.fast;
 
@@ -993,15 +1002,6 @@ async fn session(
     // aborts the running turn through its per-turn cancel and terminalizes
     // queued turns; a normal close stops the relay first.
     let (relay_stop_tx, relay_stop_rx) = flume::bounded::<()>(1);
-    {
-        let actor = actor.clone();
-        smol::spawn(async move {
-            while cancel_rx.recv_async().await.is_ok() {
-                actor.cancel_all();
-            }
-        })
-        .detach();
-    }
     {
         let actor = actor.clone();
         let child_cancel = state.child_cancel.clone();
@@ -1675,7 +1675,6 @@ mod tests {
         let (parent_raw_tx, parent_rx) = flume::unbounded();
         let (answer_tx, answer_rx) = flume::unbounded();
         let (input_tx, _input_rx) = flume::unbounded::<String>();
-        let (cancel_tx, _cancel_rx) = flume::unbounded::<()>();
         let (relay_stop_tx, _relay_stop_rx) = flume::bounded::<()>(1);
         let ui_id = "task-1".to_owned();
         let agent_id = AgentId::generate();
@@ -1719,7 +1718,7 @@ mod tests {
             ui_id: ui_id.clone(),
             parent_event_tx: EventSender::new(parent_raw_tx, RUN_ID),
             input_tx,
-            cancel_tx,
+            cancel: SubagentCancel::new(|| {}),
             subagent_info: Arc::new(OnceLock::new()),
             local_tools: LocalTools::default(),
             name: "probe".to_owned(),
@@ -2085,7 +2084,7 @@ mod tests {
                 model: None,
                 answer_tx: None,
                 input_tx: None,
-                cancel_tx: None,
+                cancel: None,
             })
             .unwrap();
         let (live_tx, live_rx) = flume::unbounded();

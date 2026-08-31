@@ -49,9 +49,9 @@ pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, Thi
 pub use types::{
     AgentEvent, AgentId, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry,
     GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine,
-    SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent, TurnCancellationReason, TurnCompleteEvent, TurnFailure, TurnFailureKind,
-    TurnId, TurnOutcome,
+    SnapshotSpan, SpanStyle, SubagentCancel, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput,
+    ToolOutput, ToolStartEvent, TurnCancellationReason, TurnCompleteEvent, TurnFailure,
+    TurnFailureKind, TurnId, TurnOutcome,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
