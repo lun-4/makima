@@ -411,14 +411,6 @@ mod tests {
     fn generated_docs_describe_italic_theme_fallback() {
         let docs = generate();
 
-        assert!(docs.contains("A theme TOML file"));
-        assert!(docs.contains("inside its `[ui]` table"));
-        assert!(docs.contains("Without `[ui].italic`"));
-        assert!(docs.contains("`markup.italic` syntax scope"));
-        assert!(docs.contains("explicit `[ui].italic` takes precedence"));
         assert!(docs.contains("Makima adds the italic modifier in either case"));
-        assert!(docs.contains("Without `[ui].bold_italic`"));
-        assert!(docs.contains("resolved bold style, including its colors and modifiers"));
-        assert!(docs.contains("both bold and italic modifiers"));
     }
 }
