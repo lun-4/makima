@@ -91,10 +91,6 @@ impl CompletionItem {
             .to_string()
     }
 
-    pub fn is_directory(&self) -> bool {
-        self.kind == DIRECTORY_KIND
-    }
-
     fn display(&self) -> String {
         match &self.description {
             Some(d) if !d.is_empty() => format!("{}  {}", self.label, d),
@@ -146,7 +142,7 @@ fn normalize_completion_insertion(insertion: &str, file: bool) -> String {
         || value
             .chars()
             .next_back()
-            .is_some_and(is_trailing_punctuation);
+            .is_some_and(maki_lua::is_trailing_at_token_punctuation);
     if !unsafe_value {
         return insertion.to_string();
     }
@@ -170,30 +166,6 @@ fn normalize_completion_insertion(insertion: &str, file: bool) -> String {
     format!("@{prefix}{quote}{escaped}{quote}{delimiter}")
 }
 
-fn is_trailing_punctuation(character: char) -> bool {
-    matches!(
-        character,
-        ',' | '.'
-            | '!'
-            | '?'
-            | ')'
-            | ']'
-            | '}'
-            | '"'
-            | '\''
-            | '\u{ff0c}'
-            | '\u{ff0e}'
-            | '\u{3002}'
-            | '\u{ff01}'
-            | '\u{ff1f}'
-            | '\u{ff09}'
-            | '\u{ff3d}'
-            | '\u{ff5d}'
-            | '\u{ff02}'
-            | '\u{ff07}'
-    )
-}
-
 #[derive(Debug, Clone)]
 struct FileCandidate {
     path: String,
@@ -206,6 +178,7 @@ struct Candidate {
     matching: CompletionMatch,
     source_rank: u8,
     source_order: usize,
+    descendable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +330,9 @@ fn explicit_candidates(
     home: Option<&Path>,
     value: &str,
 ) -> Vec<FileCandidate> {
+    if value.starts_with('~') && home.is_none() {
+        return Vec::new();
+    }
     let (parent, leaf, display_prefix) = discovery_path(cwd, home, value);
     resolver
         .read_dir(&parent)
@@ -381,21 +357,43 @@ fn explicit_candidates(
         .collect()
 }
 
+type Walker = (Nucleo<()>, flume::Receiver<()>, Arc<AtomicBool>);
+type WalkerSpawner = Arc<dyn Fn(&str) -> Option<Walker> + Send + Sync>;
+
 pub struct FileCompletionMenu {
     session: Option<Session>,
     resolver: Arc<dyn FileResolver>,
+    walker_spawner: WalkerSpawner,
     home: Option<PathBuf>,
 }
 
 impl FileCompletionMenu {
     pub fn new() -> Self {
-        Self::with_resolver(Arc::new(RealFileResolver), maki_storage::paths::home())
+        Self::with_dependencies(
+            Arc::new(RealFileResolver),
+            Arc::new(super::file_picker::spawn_file_walker),
+            maki_storage::paths::home(),
+        )
     }
 
+    #[cfg(test)]
     fn with_resolver(resolver: Arc<dyn FileResolver>, home: Option<PathBuf>) -> Self {
+        Self::with_dependencies(
+            resolver,
+            Arc::new(super::file_picker::spawn_file_walker),
+            home,
+        )
+    }
+
+    fn with_dependencies(
+        resolver: Arc<dyn FileResolver>,
+        walker_spawner: WalkerSpawner,
+        home: Option<PathBuf>,
+    ) -> Self {
         Self {
             session: None,
             resolver,
+            walker_spawner,
             home,
         }
     }
@@ -424,7 +422,7 @@ impl FileCompletionMenu {
                 false,
             )
         } else {
-            let Some((nucleo, done_rx, cancel)) = super::file_picker::spawn_file_walker(cwd) else {
+            let Some((nucleo, done_rx, cancel)) = (self.walker_spawner)(cwd) else {
                 return;
             };
             (
@@ -541,7 +539,7 @@ impl FileCompletionMenu {
         } else {
             if was_explicit {
                 let Some((nucleo, done_rx, cancel)) =
-                    super::file_picker::spawn_file_walker(&session.root.to_string_lossy())
+                    (self.walker_spawner)(&session.root.to_string_lossy())
                 else {
                     return;
                 };
@@ -605,9 +603,11 @@ impl FileCompletionMenu {
                 if !s.visible || s.query_refresh_pending {
                     return CompletionAction::Passthrough;
                 }
-                return match s.matches.get(s.selected).map(|c| c.item.clone()) {
-                    Some(item) if item.is_directory() => CompletionAction::Advance(item),
-                    Some(item) => CompletionAction::Select(item),
+                return match s.matches.get(s.selected) {
+                    Some(candidate) if candidate.descendable => {
+                        CompletionAction::Advance(candidate.item.clone())
+                    }
+                    Some(candidate) => CompletionAction::Select(candidate.item.clone()),
                     None => CompletionAction::Passthrough,
                 };
             }
@@ -653,8 +653,8 @@ impl FileCompletionMenu {
                     }
                     Err(flume::TryRecvError::Disconnected) => {
                         warn!("{WALKER_CRASHED_MSG}: walker channel disconnected");
-                        s.walking = false;
-                        dirty = Dirty::YES;
+                        self.session = None;
+                        return (Dirty::YES, Some(WALKER_CRASHED_MSG.into()));
                     }
                     Err(flume::TryRecvError::Empty) => {}
                 }
@@ -688,10 +688,6 @@ impl FileCompletionMenu {
                 s.query_refresh_pending = false;
             } else if !s.query_refresh_pending && status_changed {
                 refresh_file_matches(s);
-                rebuild_combined(s);
-                clamp_selection(s);
-            } else if matches!(s.discovery, Discovery::Explicit { .. }) {
-                refresh_explicit_matches(s);
                 rebuild_combined(s);
                 clamp_selection(s);
             }
@@ -805,6 +801,7 @@ fn match_candidate(
     intent: &QueryIntent,
     source: u8,
     order: usize,
+    descendable: bool,
 ) -> Option<Candidate> {
     if intent.kind.is_some_and(|kind| kind != item.kind) {
         return None;
@@ -839,6 +836,7 @@ fn match_candidate(
             },
             source_rank: source,
             source_order: order,
+            descendable,
         });
     }
     let matched = completion_match(
@@ -858,6 +856,7 @@ fn match_candidate(
         matching,
         source_rank: source,
         source_order: order,
+        descendable,
     })
 }
 
@@ -867,7 +866,7 @@ fn fuzzy_match(
 ) -> Vec<Candidate> {
     items
         .into_iter()
-        .filter_map(|(_, item, order)| match_candidate(item, intent, 1, order))
+        .filter_map(|(_, item, order)| match_candidate(item, intent, 1, order, false))
         .collect()
 }
 
@@ -889,7 +888,7 @@ fn refresh_file_matches(s: &mut Session) {
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
         let item = CompletionItem::file(path);
-        if let Some(candidate) = match_candidate(item, &s.intent, 0, order) {
+        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, false) {
             s.file_matches.push(candidate);
         }
     }
@@ -909,7 +908,8 @@ fn refresh_explicit_matches(s: &mut Session) {
         } else {
             CompletionItem::file(candidate.path)
         };
-        if let Some(candidate) = match_candidate(item, &s.intent, 0, order) {
+        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, candidate.is_directory)
+        {
             s.file_matches.push(candidate);
         }
     }
@@ -1178,6 +1178,186 @@ mod tests {
         }
     }
 
+    fn test_walker() -> Walker {
+        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+        let (done_tx, done_rx) = flume::bounded(1);
+        std::mem::forget(done_tx);
+        (nucleo, done_rx, Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn explicit_mode_project_walker_lifecycle() {
+        let spawns = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancellations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawner: WalkerSpawner = {
+            let spawns = spawns.clone();
+            let cancellations = cancellations.clone();
+            Arc::new(move |cwd| {
+                spawns.lock().unwrap().push(cwd.to_string());
+                let walker = test_walker();
+                cancellations.lock().unwrap().push(walker.2.clone());
+                Some(walker)
+            })
+        };
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: Vec::new(),
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+
+        menu.open("/project", Vec::new(), "../", (0, 3));
+        assert!(spawns.lock().unwrap().is_empty());
+        menu.sync_query("src");
+        assert_eq!(spawns.lock().unwrap().as_slice(), &["/project"]);
+        menu.sync_query("../");
+        assert!(cancellations.lock().unwrap()[0].load(Ordering::Relaxed));
+        menu.sync_query("src");
+        assert_eq!(spawns.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn explicit_mode_ignores_stale_walker_signals() {
+        let (done_tx, done_rx) = flume::bounded(1);
+        let receiver = Arc::new(std::sync::Mutex::new(Some(done_rx)));
+        let spawner: WalkerSpawner = {
+            let receiver = receiver.clone();
+            Arc::new(move |_| {
+                let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+                Some((
+                    nucleo,
+                    receiver.lock().unwrap().take().unwrap(),
+                    Arc::new(AtomicBool::new(false)),
+                ))
+            })
+        };
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "outside.txt".into(),
+                is_directory: false,
+            }],
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+        menu.open("/project", Vec::new(), "src", (0, 4));
+        menu.sync_query("../out");
+        drop(done_tx);
+
+        assert_eq!(menu.tick(), (Dirty::NO, None));
+        assert!(menu.is_active());
+        assert_eq!(menu.match_items()[0].label, "../outside.txt");
+    }
+
+    struct RecoveringResolver;
+
+    impl FileResolver for RecoveringResolver {
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+            if path.ends_with("missing") {
+                Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+            } else {
+                Ok(vec![FileCandidate {
+                    path: "found.txt".into(),
+                    is_directory: false,
+                }])
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_discovery_failures_are_recoverable() {
+        let mut menu = FileCompletionMenu::with_resolver(Arc::new(RecoveringResolver), None);
+        menu.open("/project", Vec::new(), "./missing/", (0, 10));
+        assert!(menu.is_active());
+        assert!(menu.match_items().is_empty());
+
+        menu.sync_query("./valid/");
+        assert!(menu.has_selectable());
+        assert_eq!(menu.match_items()[0].label, "./valid/found.txt");
+    }
+
+    #[test]
+    fn project_walker_disconnect_flashes_and_closes() {
+        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+        let (done_tx, done_rx) = flume::bounded(1);
+        drop(done_tx);
+        let walker = Arc::new(std::sync::Mutex::new(Some((nucleo, done_rx))));
+        let spawner: WalkerSpawner = Arc::new(move |_| {
+            let (nucleo, done_rx) = walker.lock().unwrap().take().unwrap();
+            Some((nucleo, done_rx, Arc::new(AtomicBool::new(false))))
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(
+            Arc::new(CountingResolver {
+                reads: std::sync::Mutex::new(Vec::new()),
+                entries: Vec::new(),
+            }),
+            spawner,
+            None,
+        );
+        menu.open("/project", Vec::new(), "src", (0, 4));
+
+        assert_eq!(
+            menu.tick(),
+            (Dirty::YES, Some(WALKER_CRASHED_MSG.to_string()))
+        );
+        assert!(!menu.is_active());
+    }
+
+    #[test]
+    fn switching_from_explicit_to_project_restores_project_and_lua_matches() {
+        let spawner: WalkerSpawner = Arc::new(move |_| Some(test_walker()));
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "outside.txt".into(),
+                is_directory: false,
+            }],
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+        menu.open(
+            "/project",
+            vec![item("skill:review", "skill", "@skill:review")],
+            "../out",
+            (0, 7),
+        );
+        assert_eq!(menu.match_items()[0].kind, FILE_KIND);
+
+        menu.sync_query("review");
+        let session = menu.session.as_mut().unwrap();
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from("review.txt")
+            });
+        session.walking = false;
+        for _ in 0..20 {
+            let _ = menu.tick();
+            if menu.match_items().iter().any(|item| item.kind == FILE_KIND) {
+                break;
+            }
+        }
+        let kinds = menu
+            .match_items()
+            .into_iter()
+            .map(|item| item.kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&FILE_KIND.to_string()));
+        assert!(kinds.contains(&"skill".to_string()));
+    }
+
+    #[test]
+    fn lua_directory_kind_does_not_advance() {
+        let mut menu = session_with_items(vec![item(
+            "directory:plugin",
+            DIRECTORY_KIND,
+            "@directory:plugin",
+        )]);
+        menu.sync_query("plugin");
+        menu.session.as_mut().unwrap().visible = true;
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Enter)),
+            CompletionAction::Select(_)
+        ));
+    }
+
     #[test]
     fn explicit_discovery_reads_parent_once_and_marks_directories() {
         let cwd = PathBuf::from("/workspace/project");
@@ -1240,6 +1420,7 @@ mod tests {
             matching: completion_match_default("ar", "../archive").unwrap(),
             source_rank: 0,
             source_order: 0,
+            descendable: true,
         });
         session.visible = true;
         session.walking = false;
@@ -1499,6 +1680,7 @@ mod tests {
                 },
                 source_rank: 0,
                 source_order: i,
+                descendable: false,
             })
             .collect();
         menu.sync_query("");
@@ -1527,6 +1709,7 @@ mod tests {
             },
             source_rank: 0,
             source_order: 0,
+            descendable: false,
         }];
         project_nucleo_mut(s).restart(true);
         s.file_matches.clear();
@@ -1591,6 +1774,7 @@ mod tests {
                 },
                 source_rank: 0,
                 source_order: i,
+                descendable: false,
             })
             .collect();
         menu
@@ -1783,8 +1967,14 @@ mod tests {
     fn add_file(menu: &mut FileCompletionMenu, path: &str) {
         let session = menu.session.as_mut().unwrap();
         let order = session.file_matches.len();
-        let candidate =
-            match_candidate(CompletionItem::file(path.into()), &session.intent, 0, order).unwrap();
+        let candidate = match_candidate(
+            CompletionItem::file(path.into()),
+            &session.intent,
+            0,
+            order,
+            false,
+        )
+        .unwrap();
         session.file_matches.push(candidate);
         rebuild_combined(session);
     }
@@ -1834,6 +2024,7 @@ mod tests {
             },
             source_rank: 0,
             source_order: 0,
+            descendable: false,
         });
         rebuild_combined(menu.session.as_mut().unwrap());
         assert_eq!(labels(&menu), vec!["tagged", "weak_match"]);

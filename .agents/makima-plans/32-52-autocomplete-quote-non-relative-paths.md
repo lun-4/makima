@@ -11,6 +11,16 @@ Treat the two issues as one shared token contract across `maki-lua` parsing and 
 - Normalize final completion insertions in the UI so values containing whitespace or punctuation that the unquoted parser would trim are enclosed in quotes. Preserve any intentional whitespace after a plugin insertion as a delimiter outside the closing quote.
 - Keep the existing project-relative `Nucleo` walker for ordinary file queries. For queries beginning with `~`, `/`, or `.`, resolve the requested parent from the session cwd and optional home, synchronously `read_dir` exactly that parent, and fuzzy-rank only its immediate children. Selecting a directory advances the active token and refreshes; selecting a file finalizes and closes it.
 
+Post-implementation review changes:
+
+- Export `is_trailing_at_token_punctuation` from `maki-lua` and use it in `maki-ui`, so parser trimming and insertion quoting use one punctuation predicate.
+- Inject the project walker spawner into `FileCompletionMenu` for lifecycle and stale-signal tests. Initially explicit sessions do not spawn a walker. Entering explicit mode cancels the project walker. Returning to ordinary mode starts a fresh walker.
+- Restore the ordinary project walker disconnect behavior: log the failure, close the popup, and flash `File scanner crashed`. Partial walker results do not remain open after a disconnect.
+- Store explicit filesystem descendability on the internal candidate. Lua candidates cannot trigger directory advancement by setting `kind = "directory"`.
+- Do not refresh, sort, or rebuild explicit matches on idle ticks. Explicit results refresh when the query changes.
+- Treat `~` discovery without an available home directory as an empty recoverable explicit session.
+- Keep Windows drive-letter paths outside explicit discovery scope. Keep completed tagged tokens active at the cursor until whitespace or another close action.
+
 Affected contracts and files:
 
 - `maki-lua/src/api/completion.rs`: canonical `AtToken` grammar, expansion ranges, `ItemSpec` insertion documentation, parser/expander tests.
@@ -48,7 +58,7 @@ Scope boundaries:
    - Parse each candidate’s existing insertion into a reference body plus any intentional trailing whitespace delimiter (for example the built-in model/subagent candidates).
    - Quote the value when it contains whitespace or any character that the unquoted parser would strip from the right edge. Preserve the candidate’s `@` prefix and tagged prefix, choose a deterministic delimiter (`"` by default, with `'` preferred when it avoids escaping), escape any remaining active delimiter and backslashes according to the quoted grammar, and put intentional trailing whitespace after the closing quote.
    - Do not double-quote already valid quoted insertions. Keep labels and fuzzy-match targets unchanged; normalization applies to replacement text only.
-   - Apply the same helper to built-in file candidates and Lua-provided candidates so plugin authors do not each need to reproduce parser rules. Update the `ItemSpec` API documentation to state that `insertion` is a logical `@` insertion and the UI quotes its value when required.
+   - Apply the same helper to built-in file candidates and Lua-provided candidates so plugin authors do not each need to reproduce parser rules. Export the parser's trailing-punctuation predicate and use it for UI insertion normalization, so punctuation classification cannot diverge across crates. Update the `ItemSpec` API documentation to state that `insertion` is a logical `@` insertion and the UI quotes its value when required.
    - For explicit-path directory advancement, keep the token syntactically open: preserve an opening quote without adding the closing delimiter while the user is still browsing. Add the closing quote only on final file/non-directory selection.
 
 4. Add explicit-path resolution and depth-one discovery to `maki-ui/src/components/file_completion.rs`.
@@ -65,10 +75,10 @@ Scope boundaries:
    - If an existing ordinary session switches into explicit mode, cancel/drop its project walker state before publishing explicit results. If the user deletes the explicit prefix and returns to an ordinary query, start a fresh project walker rooted at the retained session cwd.
    - Ensure project walker completion/tick events cannot overwrite explicit results. Clear project refresh counters/pending flags when entering explicit mode, and clear explicit candidates when leaving it.
    - Set popup visibility directly from explicit discovery state/results instead of relying on current `Nucleo` injector checks. An explicit query with candidates becomes visible immediately; an explicit query with no candidates remains an active but non-rendered session so further editing can recover. Adjust `tick` and `cadence` for optional project state without fake walking/matching activity.
-   - Preserve existing debounce, materialization cap, asynchronous refresh, ranking, and crash flash behavior in ordinary project mode.
+   - Preserve existing debounce, materialization cap, asynchronous refresh, ranking, and crash flash behavior in ordinary project mode. A walker channel disconnect logs the failure, closes the popup, and flashes `File scanner crashed`.
 
 6. Represent directory advancement separately from final completion.
-   - Add internal candidate/action metadata that explicitly identifies descendable explicit-path directories. Do not infer navigation from display text or a trailing separator alone.
+   - Add internal candidate/action metadata that explicitly identifies descendable explicit-path directories. Do not infer navigation from display text, a trailing separator, or the Lua-controlled candidate kind. A Lua item with `kind = "directory"` remains a final selection.
    - Make Enter and Tab return an advance action for such directories and the existing final-select action for files and non-file references. Preserve navigation keys, Esc, modified cursor behavior, and passthrough behavior.
    - In `maki-ui/src/app/mod.rs`, handle advance by replacing the active token with the selected directory’s open replacement, updating cursor/range, synchronizing command and argument completion, and immediately re-running file completion without closing it.
    - Handle final selection by inserting the safely quoted final replacement, synchronizing command/argument completion, and closing the popup as today.
@@ -98,6 +108,7 @@ Scope boundaries:
    - Run focused `maki-lua` completion tests, focused `maki-ui` file-completion/input/app tests, then `cargo check -p maki-lua --tests` and `cargo check -p maki-ui --tests`.
    - Run `just gen-docs-check` after regeneration.
    - Run `just lint` and `just test` before completion.
+   - Final validation passed through `.ssh/remote-ci.sh`: formatting, Clippy with warnings denied, 4,686 workspace tests, generated documentation checks, Ruff, ty, and cargo-machete.
 
 ### Acceptance Criteria
 
@@ -122,11 +133,11 @@ Scope boundaries:
 | AC.3 | `completion_replacement_quotes_unsafe_values` (`#[test_case]` for file/tagged/space/punctuation/delimiter cases), `completion_replacement_preserves_trailing_delimiter`, and `safe_replacement_is_unchanged` in `maki-ui/src/components/file_completion.rs` |
 | AC.4 | `active_at_token_quote_and_whitespace_cases` in `file_completion.rs`; `at_token_spans_quoted_and_punctuated_cases` in `input.rs`; app regression `space_closes_unquoted_completion_but_not_quoted_completion` |
 | AC.5 | `explicit_path_resolution_cases` with injected cwd/home plus app tests `parent_path_completion_finds_sibling` and `absolute_path_completion_finds_external_file` |
-| AC.6 | `explicit_discovery_reads_parent_once` with a counting fake; `explicit_mode_project_walker_lifecycle` with an injected walker spawner/cancel observer; `explicit_mode_ignores_stale_walker_signals`; `explicit_discovery_is_depth_one` |
+| AC.6 | `explicit_discovery_reads_parent_once_and_marks_directories` with a counting fake; `explicit_mode_project_walker_lifecycle` with an injected walker spawner/cancel observer; `explicit_mode_ignores_stale_walker_signals`; existing depth-one discovery coverage |
 | AC.7 | `explicit_candidates_preserve_namespace_rank_leaf_and_offset_highlights` over home/root/current/parent forms, including cfg-gated Unix/Windows root semantics and typed-versus-generated separator behavior |
-| AC.8 | `explicit_directory_selection_advances_then_file_selection_finishes` app scenario using a `#[test_case]` for Enter/Tab, plus `quoted_explicit_path_advances_then_closes_on_file` |
-| AC.9 | `explicit_discovery_failures_are_recoverable` with injected read/entry failures, missing/non-directory parent, and absent home; `explicit_failure_clears_stale_candidates` |
-| AC.10 | Existing completion/parser/input test suites plus `switching_from_explicit_to_project_restores_project_and_lua_matches`, existing `enter_inserts_file_verbatim`, and existing tagged-reference expansion tests |
+| AC.8 | `parent_path_completion_advances_then_finishes`, `explicit_directory_selection_returns_advance`, and `quoted_explicit_path_advances_then_closes_on_file` |
+| AC.9 | `explicit_discovery_failures_are_recoverable` with an injected resolver, missing/non-directory parent and absent-home coverage, plus stale-candidate clearing checks |
+| AC.10 | Existing completion/parser/input test suites plus `project_walker_disconnect_flashes_and_closes`, `switching_from_explicit_to_project_restores_project_and_lua_matches`, `lua_directory_kind_does_not_advance`, `enter_inserts_file_verbatim`, and existing tagged-reference expansion tests |
 | AC.11 | `just gen-docs-check` and a focused docs/source assertion if the doc generator already supports snapshot/content checks; otherwise the generated-doc consistency command is the executable regression check |
 
 Use `tempfile::TempDir` and injected filesystem/walker seams. Do not depend on real root/home contents or portable permission denial. Simulate read failures through the discovery seam. Existing tests use short convergence loops with deadlines; do not add sleeps.
@@ -143,11 +154,13 @@ Documentation is required because #32 adds user-visible syntax and changes the c
 
 ### Risks, Blockers, and Required Decisions
 
-- Parser/completion divergence is the main risk. Keep punctuation classification and insertion quoting in shared helpers where crate boundaries permit; where they cannot share implementation, enforce parity with identical table-driven cases.
+- Parser/completion divergence is the main risk. `maki-lua::is_trailing_at_token_punctuation` is the shared predicate for parser trimming and UI insertion quoting.
 - Quoted directory browsing needs two states: an unfinished replacement during advancement and a closed replacement at final selection. Model this explicitly rather than trimming/adding quotes heuristically in `app/mod.rs`.
 - Plugin insertions may intentionally end in whitespace. Separate that delimiter before quoting and restore it after the closing quote so model/subagent behavior remains compatible.
 - Synchronous `read_dir` can block on a slow filesystem, but #52 explicitly requests bounded synchronous depth-one discovery. One call per refresh is enforced through an injectable counting test.
 - The current menu unconditionally starts a walker and derives visibility from its injector. The implementation must make project discovery optional and explicit visibility first-class; otherwise explicit queries race or never render.
 - Windows rooted-path and separator behavior differs from Unix. Use `Path`/`PathBuf`/`MAIN_SEPARATOR`, test platform-independent temp absolute paths, and avoid asserting real `/` contents.
 - Embedded delimiters and backslashes must round-trip through the minimal quoted escape grammar. Prefer the alternate delimiter to reduce escaping, then escape the selected delimiter and backslashes; table-test values containing either delimiter, both delimiters, backslashes, and combinations so completion never emits an invalid token.
+- Windows drive-letter values such as `C:\\...` do not enter explicit discovery because explicit mode intentionally classifies only values beginning with `~`, `/`, or `.`.
+- A completed tagged token remains active at the cursor. Whitespace, selection, submission, or another popup close condition ends completion.
 - No unresolved product decision or test-infrastructure blocker remains; the required discovery and walker seams are part of this implementation.

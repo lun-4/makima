@@ -32,7 +32,7 @@ pub use splash::{
 
 pub use api::completion::{
     ActiveAtToken, AtToken, AtTokenStatus, CompletionCtx, ItemSpec, active_at_token,
-    at_is_token_start, parse_at_tokens,
+    at_is_token_start, is_trailing_at_token_punctuation, parse_at_tokens,
 };
 
 #[cfg(feature = "test-support")]

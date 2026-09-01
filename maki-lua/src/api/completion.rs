@@ -199,7 +199,7 @@ struct ScannedAtToken {
     scan_end: usize,
 }
 
-fn is_trailing_punctuation(c: char) -> bool {
+pub fn is_trailing_at_token_punctuation(c: char) -> bool {
     TRAILING_PUNCTUATION.contains(&c)
 }
 
@@ -309,7 +309,7 @@ fn scan_at_token(text: &str, start: usize, limit: usize) -> Option<ScannedAtToke
         let raw_end = raw_token_end(text, token_end, limit);
         let malformed = text[token_end..raw_end]
             .chars()
-            .any(|c| !is_trailing_punctuation(c));
+            .any(|c| !is_trailing_at_token_punctuation(c));
         return Some(ScannedAtToken {
             token: ActiveAtToken {
                 prefix,
@@ -330,7 +330,7 @@ fn scan_at_token(text: &str, start: usize, limit: usize) -> Option<ScannedAtToke
     let mut token_end = raw_end;
     while token_end > value_start {
         let c = text[..token_end].chars().next_back().unwrap();
-        if !is_trailing_punctuation(c) {
+        if !is_trailing_at_token_punctuation(c) {
             break;
         }
         token_end -= c.len_utf8();
@@ -371,7 +371,7 @@ pub fn active_at_token(text: &str, cursor_byte: usize) -> Option<ActiveAtToken> 
         let c = text[i..cursor_byte].chars().next().unwrap();
         if c == '@' && at_is_token_start(text, i) {
             let scanned = scan_at_token(text, i, cursor_byte)?;
-            if scanned.scan_end >= cursor_byte || scanned.token.range.end == cursor_byte {
+            if scanned.scan_end >= cursor_byte {
                 active = Some(scanned.token);
             }
             i = scanned.scan_end.max(i + c.len_utf8());

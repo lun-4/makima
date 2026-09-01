@@ -6561,6 +6561,67 @@ fn parent_path_completion_advances_then_finishes() {
 }
 
 #[test]
+fn absolute_path_completion_finds_external_file() {
+    let (_tmp, mut app, _backend) = completion_app();
+    let external = tempfile::tempdir().unwrap();
+    let file = external.path().join("external-note.txt");
+    std::fs::write(&file, b"external").unwrap();
+    let query = format!(
+        "@{}{}external",
+        external.path().display(),
+        std::path::MAIN_SEPARATOR
+    );
+
+    for character in query.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.input_box.buffer.value(), format!("@{}", file.display()));
+    assert!(!app.file_completion.is_active());
+}
+
+#[test]
+fn quoted_explicit_path_advances_then_closes_on_file() {
+    let (_tmp, mut app, _backend) = completion_app();
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("project");
+    let directory = parent.path().join("release notes");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("final report?.md"), b"report").unwrap();
+    Arc::get_mut(&mut app.state.session)
+        .unwrap()
+        .set_cwd(project.to_string_lossy().into_owned());
+
+    for character in "@\"../release".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("@\"../release notes{}", std::path::MAIN_SEPARATOR)
+    );
+    assert!(app.file_completion.is_active());
+
+    for character in "final".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!(
+            "@\"../release notes{}final report?.md\"",
+            std::path::MAIN_SEPARATOR
+        )
+    );
+    assert!(!app.file_completion.is_active());
+}
+
+#[test]
 fn popup_closes_when_token_removed() {
     let (_tmp, mut app, _backend) = completion_app();
     app.update(Msg::Key(key(KeyCode::Char('@'))));
