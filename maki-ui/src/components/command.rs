@@ -53,6 +53,7 @@ struct Match {
 
 pub struct CommandPalette {
     command_selected: usize,
+    command_query: String,
     argument_selected: usize,
     argument_scroll_offset: usize,
     filtered: Vec<Match>,
@@ -99,6 +100,7 @@ impl CommandPalette {
         let nucleo = Self::build_nucleo(&snapshot);
         Self {
             command_selected: 0,
+            command_query: String::new(),
             argument_selected: 0,
             argument_scroll_offset: 0,
             filtered: Vec::new(),
@@ -580,9 +582,14 @@ impl CommandPalette {
             })
             .collect();
 
-        self.command_selected = self
-            .command_selected
-            .min(self.filtered.len().saturating_sub(1));
+        if self.command_query != query {
+            self.command_selected = 0;
+            self.command_query = query.to_owned();
+        } else {
+            self.command_selected = self
+                .command_selected
+                .min(self.filtered.len().saturating_sub(1));
+        }
         // Argument items survive here: sync_arguments follows every sync
         // and clears them when their session ends.
     }
