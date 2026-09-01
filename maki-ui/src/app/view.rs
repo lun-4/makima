@@ -8,7 +8,6 @@ use crate::components::keybindings::key;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{self, StatusBarContext, UsageStats};
-use crate::components::usage_modal::{UsageFetchState, UsageModalContext, compact_usage_line};
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
@@ -399,20 +398,6 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
-        if self.usage_modal.is_open() {
-            let ctx = UsageModalContext {
-                total: &self.state.token_usage,
-                total_cost: self.state.cost,
-                by_model: self.state.session.usage_by_model(),
-                model: &self.state.model,
-                fast: self.state.fast,
-                clock_format: self.ui_config.clock_format,
-            };
-            let r = self.usage_modal.view(frame, full, &ctx);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
-        }
         let r = self.float_mgr.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
@@ -444,7 +429,8 @@ impl App {
             fast: self.state.fast,
             workflow: self.state.workflow,
             restoring: self.restoring.load(Ordering::Relaxed),
-            usage: self.usage_readout(),
+            status_content: self.status_content.get(),
+            suppress_status_content: self.suppress_status_content.load(Ordering::Acquire),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }
@@ -574,19 +560,6 @@ impl App {
     pub(super) fn top_bar_rect(&self, area: Rect) -> Rect {
         let form_visible = self.permission_active() || self.plan_form_active();
         self.compute_layout(area, form_visible).top_bar_area
-    }
-
-    /// Inline quota readout (`5h30% w50%`) drawn in the status bar after the
-    /// context length and cost. Only `Ready` states render; providers without
-    /// a quota endpoint stay clean.
-    pub(super) fn usage_readout(&self) -> Option<Line<'static>> {
-        let state = self.usage_slot.load_full()?;
-        match &*state {
-            UsageFetchState::Ready(usage) if !usage.limits.is_empty() => {
-                Some(compact_usage_line(usage))
-            }
-            _ => None,
-        }
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {

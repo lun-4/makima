@@ -109,6 +109,7 @@ The rules:
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
+| [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
 | [`maki.time`](#maki-time) | Wall-clock timestamps and relative-age formatting. |
 | [`maki.timer`](#maki-timer) | Recurring callbacks on the runtime's timer pump. |
@@ -685,7 +686,7 @@ Listen for one or more events. Returns an id you can pass to
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-`"SessionFocusChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
+`"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
 `"SplashHidden"`, and `"StoreChanged"`. Plugins can
 also fire their own events with `exec_autocmds`.
 
@@ -3397,6 +3398,29 @@ local id = maki.session.current()
 
 ---
 
+### `maki.session.usage()` {#maki-session-usage}
+
+```lua
+maki.session.usage()
+```
+
+Returns the focused session's token usage without making a network request.
+Costs are the values recorded when each turn was billed and remain nil when
+no turn for that total or model was priced. Models are sorted by total tokens
+descending, then model spec ascending.
+
+**Returns:** (`table|nil`, `string|nil`) `{total={input, output, cache_creation,
+  cache_read, cost}, models}`, where each model has `{model, input, output,
+  cache_creation, cache_read, cost}`, or nil and an error.
+
+**Example:**
+
+```lua
+local usage, err = maki.session.usage()
+```
+
+---
+
 ### `maki.session.focus()` {#maki-session-focus}
 
 ```lua
@@ -3588,6 +3612,62 @@ the choice is also persisted as the global default for new sessions.
 ```lua
 maki.session.set_thinking({ mode = "medium", set_default = true })
 ```
+
+
+## maki.usage {#maki-usage}
+
+Provider-side quota snapshots. `get` reads the Lua-thread mirror,
+`fetch` asks the interactive UI to refresh it, and `on_change` observes
+canonical publications. Without an interactive UI `get` stays nil,
+`fetch` returns `nil, "no interactive UI attached"`, and callbacks are idle.
+
+---
+
+### `maki.usage.get()` {#maki-usage-get}
+
+```lua
+maki.usage.get()
+```
+
+Returns the latest provider quota snapshot without starting a network request.
+Returns nil until the interactive UI publishes its first snapshot.
+
+**Returns:** table|nil `{provider_id, provider, model, status}` or nil.
+
+---
+
+### `maki.usage.fetch()` {#maki-usage-fetch}
+
+```lua
+maki.usage.fetch({opts?})
+```
+
+Fetches the active provider account's quota. Ordinary fetches join an
+in-flight request; a forced fetch queues one fresh follow-up.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional `{force = boolean}`.
+
+**Returns:** table|nil, string|nil Fresh `{provider_id, provider, model, status}`, or nil and an error.
+
+---
+
+### `maki.usage.on_change()` {#maki-usage-on_change}
+
+```lua
+maki.usage.on_change({callback})
+```
+
+Registers a synchronous callback for provider quota snapshot changes.
+Registrations belong to the plugin and are removed when it unloads.
+Callback failures are logged and do not stop other callbacks.
+
+**Parameters:**
+
+- `{callback}` (`function`) Called with `{provider_id, provider, model, status}`.
+
+**Returns:** function Idempotent unsubscribe callback.
 
 
 ## maki.text {#maki-text}
@@ -5055,6 +5135,23 @@ end
 
 ---
 
+### `maki.ui.format_time()` {#maki-ui-format_time}
+
+```lua
+maki.ui.format_time({epoch_ms}, {style?})
+```
+
+Formats a Unix timestamp as local time using the configured clock.
+
+**Parameters:**
+
+- `{epoch_ms}` (`integer`) Unix timestamp in milliseconds.
+- `{style?}` (`string?`) Output style: `time`, `weekday`, or `date`. Defaults to `time`.
+
+**Returns:** (`string`) Formatted local time.
+
+---
+
 ### `maki.ui.highlight()` {#maki-ui-highlight}
 
 ```lua
@@ -5375,6 +5472,28 @@ local win = maki.ui.open_win(buf, {
   cursor_line = true,
   footer = { { "q", "quit" }, { "Enter", "select" } },
 })
+```
+
+---
+
+### `maki.ui.set_status_content()` {#maki-ui-set_status_content}
+
+```lua
+maki.ui.set_status_content({spans})
+```
+
+Sets styled status content for your plugin. Each span is a {text, style_name} pair. An empty table clears your plugin's content. Only your own content is affected.
+
+**Parameters:**
+
+- `{spans}` (`table`) Sequence of {text, style_name} string pairs.
+
+**Example:**
+
+```lua
+maki.ui.set_status_content({ {"connected", "success"}, {" readonly", "muted"} })
+-- later, clear it:
+maki.ui.set_status_content({})
 ```
 
 ---

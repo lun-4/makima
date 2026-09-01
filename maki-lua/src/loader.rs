@@ -15,7 +15,7 @@ use crate::api::completion::{CompletionCtx, ItemSpec};
 use crate::api::fs::{FsBackend, RealFs};
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::util::command::{HintReader, UiAction};
+use crate::api::util::command::{HintReader, StatusContentReader, UiAction};
 use crate::api::util::picker::PickerEvent;
 use crate::coalesced_latest::CoalescedLatest;
 use crate::error::PluginError;
@@ -41,6 +41,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "sessions",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    },
+    BundledPlugin {
+        name: "usage",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/usage"),
     },
     BundledPlugin {
         name: "index",
@@ -554,6 +558,10 @@ impl PluginHost {
         self.inner.hint_reader.clone()
     }
 
+    pub fn status_content_reader(&self) -> StatusContentReader {
+        self.inner.status_content_reader.clone()
+    }
+
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
     }
@@ -979,6 +987,23 @@ impl EventHandle {
         });
     }
 
+    pub fn set_clock_format(&self, format: maki_config::ClockFormat) {
+        let _ = self.prio_tx.try_send(Request::SetClockFormat(format));
+    }
+
+    pub fn provider_usage_changed(
+        &self,
+        snapshot: crate::ProviderUsageSnapshot,
+        invalidation: Option<crate::ProviderUsageInvalidation>,
+    ) -> bool {
+        self.prio_tx
+            .send(Request::ProviderUsageChanged {
+                snapshot,
+                invalidation,
+            })
+            .is_ok()
+    }
+
     pub fn run_keybind_callback(&self, id: u64) -> bool {
         self.prio_tx
             .try_send(Request::RunKeybindCallback { id })
@@ -1108,6 +1133,24 @@ mod tests {
                 .iter()
                 .map(|c| c.spec().name.as_ref())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn usage_builtin_registers_command() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_builtins(&PluginsConfig {
+            enabled: true,
+            names: vec!["usage".into()],
+            opts: HashMap::new(),
+        })
+        .unwrap();
+        assert!(
+            command_snapshot(&host)
+                .commands()
+                .iter()
+                .any(|command| command.spec().name.as_ref() == "/usage")
         );
     }
 
@@ -1316,6 +1359,61 @@ mod tests {
         let snap = command_snapshot(&host);
         assert_eq!(snap.commands().len(), 1);
         assert_eq!(snap.commands()[0].spec().name.as_ref(), "/hello");
+    }
+
+    #[test]
+    fn provider_usage_publication_updates_mirror_before_callback_and_unload_cleans_it() {
+        use crate::{ProviderUsageSnapshot, UiAction};
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "usage_observer",
+            r#"
+            maki.usage.on_change(function(snapshot)
+                local current = maki.usage.get()
+                if current.provider_id == snapshot.provider_id
+                    and current.status == snapshot.status then
+                    maki.ui.flash("usage:" .. current.status)
+                end
+            end)
+            "#,
+        )
+        .unwrap();
+        let handle = host.event_handle();
+        let actions = host.ui_action_rx();
+        let snapshot = ProviderUsageSnapshot {
+            provider_id: "anthropic".into(),
+            provider: "Anthropic".into(),
+            model: "claude-sonnet-4-5".into(),
+            status: "unsupported".into(),
+            limits: Vec::new(),
+            plan: None,
+            error: None,
+        };
+
+        assert!(
+            handle.provider_usage_changed(
+                snapshot.clone(),
+                Some(crate::ProviderUsageInvalidation(1)),
+            )
+        );
+        assert!(matches!(
+            actions.recv_timeout(Duration::from_secs(1)),
+            Ok(UiAction::Flash(message)) if message == "usage:unsupported"
+        ));
+        assert!(matches!(
+            actions.recv_timeout(Duration::from_secs(1)),
+            Ok(UiAction::ProviderUsageAck(crate::ProviderUsageAck {
+                invalidation: crate::ProviderUsageInvalidation(1),
+                ..
+            }))
+        ));
+
+        host.unload("usage_observer").unwrap();
+        assert!(
+            handle.provider_usage_changed(snapshot, Some(crate::ProviderUsageInvalidation(2)),)
+        );
+        assert!(actions.try_recv().is_err());
     }
 
     /// End-to-end: a plugin registers a keymap override, the override is published

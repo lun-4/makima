@@ -16,6 +16,7 @@ use test_case::test_case;
 #[test_case("sessions", include_str!("../../plugins/sessions/tests/spec.lua") ; "sessions_plugin_spec")]
 #[test_case("skill", include_str!("../../plugins/skill/tests/spec.lua") ; "skill_plugin_spec")]
 #[test_case("task", include_str!("../../plugins/task/tests/spec.lua") ; "task_plugin_spec")]
+#[test_case("usage", include_str!("../../plugins/usage/tests/spec.lua") ; "usage_plugin_spec")]
 #[test_case("view_image", include_str!("../../plugins/view_image/tests/spec.lua") ; "view_image_plugin_spec")]
 #[test_case("webfetch", include_str!("../../plugins/webfetch/tests/spec.lua") ; "webfetch_plugin_spec")]
 #[test_case("websearch", include_str!("../../plugins/websearch/tests/spec.lua") ; "websearch_plugin_spec")]

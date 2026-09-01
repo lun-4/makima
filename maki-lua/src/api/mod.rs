@@ -27,6 +27,7 @@ pub(crate) mod timer;
 pub(crate) mod tool;
 pub(crate) mod treesitter;
 pub(crate) mod ui;
+pub(crate) mod usage;
 pub(crate) mod util;
 pub(crate) mod uv;
 pub(crate) mod yaml;
@@ -87,6 +88,10 @@ pub(crate) fn create_maki_global(
     maki.set(
         "model",
         model::create_model_table(lua, ui_action_tx.clone())?,
+    )?;
+    maki.set(
+        "usage",
+        usage::create_usage_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,
     )?;
     maki.set(
         "ui",

@@ -20,7 +20,6 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/new` | Start a new session |  | no |
 | `/clear` | Alias for `/new` |  | no |
 | `/help` | Show keybindings |  | yes |
-| `/usage` | Show token usage breakdown |  | yes |
 | `/queue` | Remove items from queue |  | yes |
 | `/model` | Switch model | <model> | no |
 | `/theme` | Switch color theme | <theme> | yes |
@@ -52,6 +51,7 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 | `/splash` | Preview and select a splash renderer | [splash] | yes |
 | `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | yes |
 | `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |
+| `/usage` | Show provider quota and focused-session token usage |  | yes |
 
 ## Command arguments
 

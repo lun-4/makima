@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
+use maki_lua::StatusContentSnapshot;
 
 use crate::animation::spinner_frame;
 use crate::theme;
@@ -47,13 +48,12 @@ pub struct StatusBarContext<'a> {
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub retry_info: Option<&'a RetryInfo>,
-    /// Inline provider quota readout (`5h30% w50%`), drawn after the context
-    /// length and cost. `None` for providers without a quota endpoint.
-    pub usage: Option<Line<'static>>,
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
     pub restoring: bool,
+    pub status_content: Option<&'a StatusContentSnapshot>,
+    pub suppress_status_content: bool,
 }
 
 pub struct StatusBar {
@@ -228,18 +228,28 @@ impl StatusBar {
                     ));
                 }
 
-                if let Some(usage) = ctx.usage.as_ref() {
-                    rest_spans.push(Span::raw(" "));
-                    rest_spans.extend(usage.spans.iter().cloned());
-                }
-
                 let left_width: usize = left_spans.iter().map(Span::width).sum();
                 let rest_width: usize = rest_spans.iter().map(Span::width).sum();
                 let available = (area.width as usize).saturating_sub(left_width + rest_width);
-                let model = truncate_tail(ctx.model_id, available);
+                let model_min_width = 8.min(ctx.model_id.width());
+                let plugin_spans = if !ctx.suppress_status_content {
+                    ctx.status_content
+                        .map(|snapshot| {
+                            status_content_spans(
+                                snapshot,
+                                available.saturating_sub(model_min_width),
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let plugin_width: usize = plugin_spans.iter().map(Span::width).sum();
+                let model = truncate_tail(ctx.model_id, available.saturating_sub(plugin_width));
 
                 right_spans.push(Span::styled(model, theme::current().status_dim));
                 right_spans.append(&mut rest_spans);
+                right_spans.extend(plugin_spans);
             }
         }
 
@@ -262,6 +272,63 @@ impl StatusBar {
             right_area,
         );
     }
+}
+
+fn status_content_spans(snapshot: &StatusContentSnapshot, max_width: usize) -> Vec<Span<'static>> {
+    let mut remaining = max_width;
+    let mut spans = Vec::new();
+    let mut has_content = false;
+    for (_, entries) in &snapshot.entries {
+        let mut owner_has_content = false;
+        for (text, style_name) in entries {
+            if text.is_empty() {
+                continue;
+            }
+            let separator = usize::from(has_content && !owner_has_content);
+            if remaining <= separator {
+                return spans;
+            }
+            remaining -= separator;
+            let clipped = truncate_head(text, remaining);
+            let width = clipped.width();
+            if width == 0 {
+                continue;
+            }
+            if separator != 0 {
+                spans.push(Span::raw(" "));
+            }
+            remaining -= width;
+            spans.push(Span::styled(
+                clipped.into_owned(),
+                theme::style_by_name(style_name),
+            ));
+            has_content = true;
+            owner_has_content = true;
+        }
+    }
+    spans
+}
+
+fn truncate_head(s: &str, max_width: usize) -> Cow<'_, str> {
+    if s.width() <= max_width {
+        return Cow::Borrowed(s);
+    }
+    let mut width = 0;
+    let end = s
+        .char_indices()
+        .take_while(|(_, ch)| {
+            let next = width + ch.width().unwrap_or(0);
+            if next > max_width {
+                false
+            } else {
+                width = next;
+                true
+            }
+        })
+        .map(|(index, ch)| index + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    Cow::Owned(s[..end].to_owned())
 }
 
 pub(crate) fn truncate_tail(s: &str, max_width: usize) -> Cow<'_, str> {
@@ -359,6 +426,7 @@ fn spawn_branch_watcher(cwd: &Path) -> Option<flume::Receiver<()>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use super::*;
     use crate::repaint::expect::QUIET;
@@ -376,6 +444,94 @@ mod tests {
     const SESSION_COST: f64 = 1.5;
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
+
+    fn render_context(status_content: Option<&StatusContentSnapshot>, width: u16) -> String {
+        let bar = StatusBar::new(FLASH_TTL);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        let status = Status::Idle;
+        let ctx = StatusBarContext {
+            status: &status,
+            mode_label: Cow::Borrowed("build"),
+            mode_style: Style::default(),
+            model_id: MODEL_ID,
+            stats: UsageStats {
+                global_cost: None,
+                context_size: CONTEXT_SIZE,
+                cost: Some(CHAT_COST),
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                show_global: false,
+            },
+            auto_scroll: true,
+            retry_info: None,
+            thinking_label: None,
+            fast: false,
+            workflow: false,
+            restoring: false,
+            status_content,
+            suppress_status_content: false,
+        };
+        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn status_bar_orders_model_context_cost_then_plugin_at_right() {
+        let snapshot = StatusContentSnapshot {
+            entries: vec![(Arc::from("usage"), vec![("PLUGIN".into(), "accent".into())])],
+            generation: 1,
+        };
+        let text = render_context(Some(&snapshot), 120);
+        let model = text.find(MODEL_ID).unwrap();
+        let context = text.find("12.0k/200.0k (6%)").unwrap();
+        let cost = text.find(CHAT_COST_TEXT).unwrap();
+        let plugin = text.find("PLUGIN").unwrap();
+        assert!(model < context && context < cost && cost < plugin, "{text}");
+        assert!(text.trim_end().ends_with("PLUGIN"), "{text}");
+    }
+
+    #[test]
+    fn status_bar_narrow_width_keeps_plugin_and_model_minimum() {
+        let snapshot = StatusContentSnapshot {
+            entries: vec![(Arc::from("usage"), vec![("PLUGIN".into(), "accent".into())])],
+            generation: 1,
+        };
+        let text = render_context(Some(&snapshot), 47);
+        assert!(text.contains("PLUGIN"), "{text}");
+        assert!(text.contains("..-model"), "{text}");
+    }
+
+    #[test]
+    fn status_content_preserves_authored_span_spacing() {
+        let snapshot = StatusContentSnapshot {
+            entries: vec![(
+                Arc::from("usage"),
+                vec![
+                    ("5h30%".into(), "accent".into()),
+                    (" ".into(), "dim".into()),
+                    ("w90%".into(), "accent".into()),
+                ],
+            )],
+            generation: 1,
+        };
+        let spans = status_content_spans(&snapshot, 32);
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "5h30% w90%");
+    }
+
+    #[test]
+    fn status_content_separates_plugin_entries_once() {
+        let snapshot = StatusContentSnapshot {
+            entries: vec![
+                (Arc::from("one"), vec![("a".into(), "accent".into())]),
+                (Arc::from("two"), vec![("b".into(), "accent".into())]),
+            ],
+            generation: 1,
+        };
+        let spans = status_content_spans(&snapshot, 32);
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "a b");
+    }
 
     fn render(global_cost: Option<f64>, show_global: bool) -> String {
         let bar = StatusBar::new(FLASH_TTL);
@@ -399,7 +555,8 @@ mod tests {
             fast: false,
             workflow: false,
             restoring: false,
-            usage: None,
+            status_content: None,
+            suppress_status_content: false,
         };
         terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
@@ -583,7 +740,8 @@ mod tests {
             fast: false,
             workflow: false,
             restoring: false,
-            usage: None,
+            status_content: None,
+            suppress_status_content: false,
         };
         term.draw(|frame| bar.view(frame, frame.area(), &ctx))
             .unwrap();

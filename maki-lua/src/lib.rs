@@ -16,8 +16,10 @@ pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::time::format_ago;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, CommandArgumentItem, Dimension, Edge, FloatConfig,
-    FloatConfigPatch, HintReader, HintSnapshot, ModelRequest, SessionReply, SessionRequest, Split,
-    TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
+    FloatConfigPatch, HintReader, HintSnapshot, ModelRequest, ProviderUsageAck,
+    ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
+    ProviderUsageWindow, SessionReply, SessionRequest, Split, StatusContent, StatusContentReader,
+    StatusContentSnapshot, TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use api::util::picker::{PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
@@ -38,7 +40,10 @@ pub use api::completion::{
 #[cfg(feature = "test-support")]
 pub mod test_support {
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
-    use crate::api::util::command::{HintEntries, HintReader, HintWriter};
+    use crate::api::util::command::{
+        HintEntries, HintReader, HintWriter, StatusContentEntries, StatusContentReader,
+        StatusContentWriter,
+    };
     use crate::{EventHandle, KeymapReader, PluginHost, TestCompletionBackend};
 
     /// Stands in for the Lua thread publishing a plugin's status hints.
@@ -53,6 +58,19 @@ pub mod test_support {
     pub fn hint_writer_pair() -> (HintWriterHandle, HintReader) {
         let (writer, reader) = HintWriter::new();
         (HintWriterHandle(writer), reader)
+    }
+
+    pub struct StatusContentWriterHandle(StatusContentWriter);
+
+    impl StatusContentWriterHandle {
+        pub fn publish(&self, entries: StatusContentEntries) -> bool {
+            self.0.publish(entries)
+        }
+    }
+
+    pub fn status_content_writer_pair() -> (StatusContentWriterHandle, StatusContentReader) {
+        let (writer, reader) = StatusContentWriter::new();
+        (StatusContentWriterHandle(writer), reader)
     }
 
     /// Observes which requests an [`crate::EventHandle`] sends, without a

@@ -2,15 +2,19 @@ use std::sync::OnceLock;
 
 use maki_config::ClockFormat;
 
-pub fn hm(format: ClockFormat) -> &'static str {
-    if is_12h(format) { "%-I:%M %p" } else { "%H:%M" }
-}
-
 pub fn hms(format: ClockFormat) -> &'static str {
     if is_12h(format) {
         "%-I:%M:%S %p"
     } else {
         "%H:%M:%S"
+    }
+}
+
+pub(crate) fn resolved(format: ClockFormat) -> ClockFormat {
+    if is_12h(format) {
+        ClockFormat::Hour12
+    } else {
+        ClockFormat::Hour24
     }
 }
 
@@ -75,7 +79,8 @@ fn system_uses_12h() -> bool {
 mod tests {
     use test_case::test_case;
 
-    use super::posix_fmt_is_12h;
+    use super::{posix_fmt_is_12h, resolved};
+    use maki_config::ClockFormat;
 
     #[test_case(b"%r", true ; "twelve_hour_r")]
     #[test_case(b"%I:%M:%S %p", true ; "twelve_hour_i_and_p")]
@@ -85,5 +90,13 @@ mod tests {
     #[test_case(b"", false ; "empty_defaults_to_24h")]
     fn posix_fmt(fmt: &[u8], expected: bool) {
         assert_eq!(posix_fmt_is_12h(fmt), expected);
+    }
+
+    #[test]
+    fn resolved_system_is_an_explicit_format() {
+        assert!(matches!(
+            resolved(ClockFormat::System),
+            ClockFormat::Hour12 | ClockFormat::Hour24
+        ));
     }
 }

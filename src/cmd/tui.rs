@@ -400,6 +400,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 session_picker,
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
+                status_content_reader: stack.plugin_host.status_content_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),

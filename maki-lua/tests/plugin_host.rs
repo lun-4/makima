@@ -1128,6 +1128,13 @@ fn bundled_commands_project_complete_metadata() {
                 maki_commands::ArgumentArity::OPTIONAL,
                 true
             ),
+            (
+                "/usage".into(),
+                "Show provider quota and focused-session token usage".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
         ]
     );
 }

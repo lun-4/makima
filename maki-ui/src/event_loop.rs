@@ -7,11 +7,13 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
@@ -25,17 +27,20 @@ use maki_agent::{
 };
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, ModelRequest, SessionRequest, UiAction, UiReply,
+    EventHandle, HintReader, KeymapReader, ModelRequest, ProviderUsageAck,
+    ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
+    ProviderUsageWindow, SessionRequest, StatusContentReader, UiAction, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
-use maki_providers::{Message, Model, ThinkingConfig};
+use maki_providers::{Message, Model, ThinkingConfig, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock;
 use maki_storage::sessions::{
-    Prefs, SESSIONS_DIR, SessionError, StoredThinking, normalize_title, write_prefs,
+    Prefs, SESSIONS_DIR, SessionError, StoredThinking, StoredTokenUsage, normalize_title,
+    write_prefs,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -51,7 +56,8 @@ fn claim_lock(dir: &std::path::Path, id: &MakiId) -> Result<()> {
 
 use crate::AppSession;
 use crate::agent::{
-    AgentCommand, AgentHandles, ModelSlot, SystemPromptOverride, shared_queue::QueueItem,
+    AgentCommand, AgentHandles, ProviderChange, ProviderSlot, SystemPromptOverride,
+    shared_queue::QueueItem,
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
@@ -59,9 +65,13 @@ use crate::color_compat;
 use crate::command_runtime::{CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
-use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
+use crate::provider_usage::{
+    ProviderIdentity, ProviderUsageCoordinator, ProviderUsageFetch, ProviderUsageFetchId,
+    ProviderUsageFetchResult, ProviderUsageInput, ProviderUsageOutput, ProviderUsageRequestKind,
+    ProviderUsageResolution,
+};
 use crate::repaint::{Dirty, IDLE_POLL};
 
 use crate::storage_writer::StorageWriter;
@@ -75,6 +85,8 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
+const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
+const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
@@ -104,6 +116,7 @@ pub struct EventLoopParams {
     pub session_picker: bool,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
+    pub status_content_reader: StatusContentReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
@@ -330,10 +343,11 @@ struct SpawnCtx {
     timeouts: Timeouts,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
+    status_content_reader: StatusContentReader,
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
-    model_slot: Arc<ArcSwap<ModelSlot>>,
+    model_slot: Arc<ProviderSlot>,
     available_models: Arc<ArcSwapOption<Vec<String>>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
@@ -368,6 +382,7 @@ impl SpawnCtx {
             handles.mcp_config_errors.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
+            self.status_content_reader.clone(),
             Arc::clone(&self.storage_writer),
             self.ui_config.clone(),
             self.input_history_size,
@@ -393,6 +408,20 @@ impl SpawnCtx {
     }
 }
 
+enum InternalEvent {
+    ModelCandidate {
+        requested_spec: String,
+        expected_provider: ProviderIdentity,
+        model: Model,
+        provider: Arc<dyn Provider>,
+    },
+    ProviderUsageFetched {
+        fetch_id: ProviderUsageFetchId,
+        provider: ProviderIdentity,
+        result: ProviderUsageFetchResult,
+    },
+}
+
 pub(crate) struct EventLoop<'t> {
     terminal: &'t mut ratatui::DefaultTerminal,
     sessions: Vec<SessionRuntime>,
@@ -410,6 +439,12 @@ pub(crate) struct EventLoop<'t> {
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
     command_rx: flume::Receiver<CommandEvent>,
+    provider_change_rx: flume::Receiver<ProviderChange>,
+    provider_usage: ProviderUsageCoordinator<flume::Sender<ProviderUsageReply>>,
+    next_status_invalidation: u64,
+    pending_status_invalidation: Option<ProviderUsageInvalidation>,
+    internal_tx: flume::Sender<InternalEvent>,
+    internal_rx: flume::Receiver<InternalEvent>,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -423,6 +458,8 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Command(CommandEvent),
+    ProviderChanged(ProviderChange),
+    Internal(InternalEvent),
 }
 
 struct BackgroundModels {
@@ -453,7 +490,9 @@ fn merge_batch(
 }
 
 fn spawn_model_fetch(
-    model_slot: &Arc<ArcSwap<ModelSlot>>,
+    requested_spec: String,
+    expected_provider: ProviderIdentity,
+    internal_tx: flume::Sender<InternalEvent>,
     timeouts: Timeouts,
     policy: Arc<ModelPolicy>,
 ) -> BackgroundModels {
@@ -461,29 +500,29 @@ fn spawn_model_fetch(
     let bg = Arc::clone(&available);
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let warn_tx_bg = warn_tx.clone();
-    let model_slot = Arc::clone(model_slot);
     let task = smol::spawn(async move {
         let warn_tx = warn_tx_bg;
         let done = Box::new(move || {
-            let spec = model_slot.load().model.spec();
-            let mut resolved = match Model::from_spec(&spec) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(spec = %spec, error = %e, "failed to resolve model after discovery");
+            let mut resolved = match Model::from_spec(&requested_spec) {
+                Ok(model) => model,
+                Err(error) => {
+                    warn!(spec = %requested_spec, %error, "failed to resolve model after discovery");
                     return;
                 }
             };
             let provider = match from_model(&mut resolved, timeouts) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(spec = %spec, error = %e, "failed to create provider after discovery");
+                Ok(provider) => Arc::from(provider),
+                Err(error) => {
+                    warn!(spec = %requested_spec, %error, "failed to create provider after discovery");
                     return;
                 }
             };
-            model_slot.store(Arc::new(ModelSlot {
+            let _ = internal_tx.send(InternalEvent::ModelCandidate {
+                requested_spec,
+                expected_provider,
                 model: resolved,
-                provider: Arc::from(provider),
-            }));
+                provider,
+            });
         });
         fetch_all_models(
             &policy,
@@ -523,12 +562,15 @@ impl<'t> EventLoop<'t> {
             session_picker,
             keymap_reader,
             hint_reader,
+            status_content_reader,
             ui_action_rx,
             lua_event_handle,
             model_policy,
             system_prompt_override,
             append_system_prompt,
         } = params;
+
+        lua_event_handle.set_clock_format(crate::clock::resolved(ui_config.clock_format));
 
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
@@ -564,11 +606,16 @@ impl<'t> EventLoop<'t> {
         } else {
             Arc::from(from_model(&mut model, timeouts).context("create provider")?)
         };
-        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
-            model: model.clone(),
-            provider,
-        }));
-        let bg = spawn_model_fetch(&model_slot, timeouts, Arc::clone(&model_policy));
+        let (model_slot, provider_change_rx) = ProviderSlot::new(model.clone(), provider);
+        let initial_provider = model_slot.load().provider.identity();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let bg = spawn_model_fetch(
+            model.spec(),
+            initial_provider,
+            internal_tx.clone(),
+            timeouts,
+            Arc::clone(&model_policy),
+        );
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
@@ -594,6 +641,7 @@ impl<'t> EventLoop<'t> {
             timeouts,
             keymap_reader,
             hint_reader,
+            status_content_reader,
             lua_event_handle,
             mcp_handle,
             mcp_config_errors,
@@ -652,6 +700,12 @@ impl<'t> EventLoop<'t> {
             warn_tx: bg.warn_tx,
             ui_action_rx,
             command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(initial_provider),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            internal_tx,
+            internal_rx,
             _model_fetch_task: bg.task,
         })
     }
@@ -671,9 +725,6 @@ impl<'t> EventLoop<'t> {
         } else if self.session_picker {
             self.focused_app().open_startup_session_picker();
         }
-        // Populate the inline quota readout without waiting for `/usage` or
-        // Ctrl+R; provider/model changes below trigger their own refresh.
-        self.refresh_usage(self.focused);
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
         let mut dirty = Dirty::YES;
@@ -745,6 +796,10 @@ impl<'t> EventLoop<'t> {
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.command_rx, |res| res.ok().map(Wake::Command));
+        sel = sel.recv(&self.provider_change_rx, |res| {
+            res.ok().map(Wake::ProviderChanged)
+        });
+        sel = sel.recv(&self.internal_rx, |res| res.ok().map(Wake::Internal));
         for (i, rt) in self.sessions.iter().enumerate() {
             if !rt.handles.agent_rx.is_disconnected() {
                 sel = sel.recv(&rt.handles.agent_rx, move |res| {
@@ -767,8 +822,87 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Command(command) => self.handle_command(command),
+            Wake::ProviderChanged(change) => self.handle_provider_change(change),
+            Wake::Internal(event) => self.handle_internal(event),
         }
         Ok(())
+    }
+
+    fn handle_internal(&mut self, event: InternalEvent) {
+        match event {
+            InternalEvent::ModelCandidate {
+                requested_spec,
+                expected_provider,
+                model,
+                provider,
+            } => {
+                let current = self.ctx.model_slot.load();
+                let still_current = current.model.spec() == requested_spec
+                    && current.provider.identity() == expected_provider;
+                drop(current);
+                if still_current {
+                    self.ctx.model_slot.install(model, provider);
+                }
+            }
+            InternalEvent::ProviderUsageFetched {
+                fetch_id,
+                provider,
+                result,
+            } => {
+                let current = self.ctx.model_slot.load().provider.identity();
+                if provider != current {
+                    let outputs = self
+                        .provider_usage
+                        .handle(ProviderUsageInput::Transition { provider: current });
+                    self.handle_provider_usage_outputs(outputs);
+                }
+                let outputs = self.provider_usage.handle(ProviderUsageInput::Completed {
+                    fetch_id,
+                    provider,
+                    result,
+                });
+                self.handle_provider_usage_outputs(outputs);
+            }
+        }
+    }
+
+    fn handle_provider_change(&mut self, _change: ProviderChange) {
+        let provider = self.ctx.model_slot.load().provider.identity();
+        for runtime in &self.sessions {
+            runtime
+                .app
+                .suppress_status_content
+                .store(true, Ordering::Release);
+        }
+        let outputs = self
+            .provider_usage
+            .handle(ProviderUsageInput::Transition { provider });
+        self.handle_provider_usage_outputs(outputs);
+        self.next_status_invalidation = self.next_status_invalidation.wrapping_add(1);
+        let invalidation = ProviderUsageInvalidation(self.next_status_invalidation);
+        self.pending_status_invalidation = Some(invalidation);
+        if !self
+            .ctx
+            .lua_event_handle
+            .provider_usage_changed(self.provider_usage_loading_snapshot(), Some(invalidation))
+        {
+            self.pending_status_invalidation = None;
+            for runtime in &self.sessions {
+                runtime
+                    .app
+                    .suppress_status_content
+                    .store(false, Ordering::Release);
+            }
+        }
+        let current = self.ctx.model_slot.load();
+        self.ctx.lua_event_handle.fire_autocmd(
+            "ProviderChanged",
+            serde_json::json!({
+                "provider_id": format!("{}:{}:{}", current.model.provider, provider.instance.0, provider.auth.0),
+                "provider": current.model.provider_display_name(),
+                "model": current.model.id,
+            }),
+        );
     }
 
     /// The one save trigger. A checkpoint writes only on a real change, so
@@ -992,6 +1126,27 @@ impl<'t> EventLoop<'t> {
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
+            UiAction::ProviderUsageAck(ack) => {
+                self.handle_provider_usage_ack(ack);
+            }
+            UiAction::UsageFetch { force, reply_tx } => {
+                let provider = self.ctx.model_slot.load().provider.identity();
+                let outputs = self
+                    .provider_usage
+                    .handle(ProviderUsageInput::Transition { provider });
+                self.handle_provider_usage_outputs(outputs);
+                let kind = if force {
+                    ProviderUsageRequestKind::Forced
+                } else {
+                    ProviderUsageRequestKind::Ordinary
+                };
+                let outputs = self.provider_usage.handle(ProviderUsageInput::Request {
+                    provider,
+                    kind,
+                    waiter: reply_tx,
+                });
+                self.handle_provider_usage_outputs(outputs);
+            }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
             }
@@ -1020,6 +1175,180 @@ impl<'t> EventLoop<'t> {
                 }
             }
         }
+    }
+
+    fn handle_provider_usage_ack(&mut self, ack: ProviderUsageAck) {
+        if self.pending_status_invalidation != Some(ack.invalidation) {
+            return;
+        }
+        let generations = self
+            .sessions
+            .iter_mut()
+            .map(|runtime| runtime.app.reconcile_status_content())
+            .collect::<Vec<_>>();
+        if generations
+            .iter()
+            .any(|generation| *generation < ack.status_generation)
+        {
+            return;
+        }
+        self.pending_status_invalidation = None;
+        for runtime in &self.sessions {
+            runtime
+                .app
+                .suppress_status_content
+                .store(false, Ordering::Release);
+        }
+    }
+
+    fn handle_provider_usage_outputs(
+        &mut self,
+        outputs: Vec<ProviderUsageOutput<flume::Sender<ProviderUsageReply>>>,
+    ) {
+        for output in outputs {
+            match output {
+                ProviderUsageOutput::StartFetch(fetch) => self.start_provider_usage_fetch(fetch),
+                ProviderUsageOutput::Resolve {
+                    waiters,
+                    resolution,
+                } => {
+                    let reply = match resolution {
+                        ProviderUsageResolution::CompletedWithIdentity { provider, result } => {
+                            let Some(snapshot) = self.provider_usage_snapshot(provider, result)
+                            else {
+                                for waiter in waiters {
+                                    let _ = waiter.send(Err(PROVIDER_USAGE_CHANGED_ERR.to_owned()));
+                                }
+                                continue;
+                            };
+                            if self
+                                .ctx
+                                .lua_event_handle
+                                .provider_usage_changed(snapshot.clone(), None)
+                            {
+                                Ok(snapshot)
+                            } else {
+                                Err(PROVIDER_USAGE_SHUTDOWN_ERR.to_owned())
+                            }
+                        }
+                        ProviderUsageResolution::Completed(result) => {
+                            let provider = *self.provider_usage.provider();
+                            let Some(snapshot) = self.provider_usage_snapshot(provider, result)
+                            else {
+                                for waiter in waiters {
+                                    let _ = waiter.send(Err(PROVIDER_USAGE_CHANGED_ERR.to_owned()));
+                                }
+                                continue;
+                            };
+                            if self
+                                .ctx
+                                .lua_event_handle
+                                .provider_usage_changed(snapshot.clone(), None)
+                            {
+                                Ok(snapshot)
+                            } else {
+                                Err(PROVIDER_USAGE_SHUTDOWN_ERR.to_owned())
+                            }
+                        }
+                        ProviderUsageResolution::ProviderChanged { .. } => {
+                            Err(PROVIDER_USAGE_CHANGED_ERR.to_owned())
+                        }
+                        ProviderUsageResolution::Shutdown => {
+                            Err(PROVIDER_USAGE_SHUTDOWN_ERR.to_owned())
+                        }
+                    };
+                    for waiter in waiters {
+                        let _ = waiter.send(reply.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_provider_usage_fetch(&self, fetch: ProviderUsageFetch) {
+        let current = self.ctx.model_slot.load();
+        if current.provider.identity() != fetch.provider {
+            let _ = self.internal_tx.send(InternalEvent::ProviderUsageFetched {
+                fetch_id: fetch.id,
+                provider: fetch.provider,
+                result: ProviderUsageFetchResult::Error(PROVIDER_USAGE_CHANGED_ERR.to_owned()),
+            });
+            return;
+        }
+        let provider = Arc::clone(&current.provider);
+        drop(current);
+        self.ctx
+            .lua_event_handle
+            .provider_usage_changed(self.provider_usage_loading_snapshot(), None);
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = match provider.fetch_usage().await {
+                Ok(Some(usage)) => ProviderUsageFetchResult::Ready(usage),
+                Ok(None) => ProviderUsageFetchResult::Unsupported,
+                Err(error) => ProviderUsageFetchResult::Error(error.user_message()),
+            };
+            let _ = internal_tx.send(InternalEvent::ProviderUsageFetched {
+                fetch_id: fetch.id,
+                provider: fetch.provider,
+                result,
+            });
+        })
+        .detach();
+    }
+
+    fn provider_usage_loading_snapshot(&self) -> ProviderUsageSnapshot {
+        let current = self.ctx.model_slot.load();
+        ProviderUsageSnapshot {
+            provider_id: format!(
+                "{}:{}:{}",
+                current.model.provider,
+                current.provider.identity().instance.0,
+                current.provider.identity().auth.0
+            ),
+            provider: current.model.provider_display_name().to_owned(),
+            model: current.model.id.clone(),
+            status: "loading".into(),
+            limits: Vec::new(),
+            plan: None,
+            error: None,
+        }
+    }
+
+    fn provider_usage_snapshot(
+        &self,
+        provider: ProviderIdentity,
+        result: ProviderUsageFetchResult,
+    ) -> Option<ProviderUsageSnapshot> {
+        let current = self.ctx.model_slot.load();
+        if current.provider.identity() != provider {
+            return None;
+        }
+        let (status, limits, plan, error) = match result {
+            ProviderUsageFetchResult::Ready(usage) => (
+                "ready".into(),
+                usage.limits.into_iter().map(provider_usage_limit).collect(),
+                usage.plan,
+                None,
+            ),
+            ProviderUsageFetchResult::Unsupported => ("unsupported".into(), Vec::new(), None, None),
+            ProviderUsageFetchResult::Error(message) => {
+                ("error".into(), Vec::new(), None, Some(message))
+            }
+        };
+        Some(ProviderUsageSnapshot {
+            provider_id: format!(
+                "{}:{}:{}",
+                current.model.provider,
+                current.provider.identity().instance.0,
+                current.provider.identity().auth.0
+            ),
+            provider: current.model.provider_display_name().to_owned(),
+            model: current.model.id.clone(),
+            status,
+            limits,
+            plan,
+            error,
+        })
     }
 
     /// Exits with the editor's status code; `-1` (flashed on the session's
@@ -1193,6 +1522,15 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Current => {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
+            SessionRequest::Usage => {
+                let app = &self.sessions[self.focused].app;
+                let reply = session_usage(
+                    &app.state.token_usage,
+                    app.state.cost,
+                    app.state.session.usage_by_model(),
+                );
+                let _ = reply_tx.send(Ok(reply));
+            }
             SessionRequest::New { prompt, focus } => {
                 let session = {
                     let slot = self.ctx.model_slot.load();
@@ -1347,6 +1685,11 @@ impl<'t> EventLoop<'t> {
     }
 
     fn push_runtime(&mut self, rt: SessionRuntime) -> usize {
+        if self.pending_status_invalidation.is_some() {
+            rt.app
+                .suppress_status_content
+                .store(true, Ordering::Release);
+        }
         let id = rt.id();
         let sessions_dir = self.sessions_dir.clone();
         smol::unblock(move || {
@@ -1563,12 +1906,9 @@ impl<'t> EventLoop<'t> {
                     && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
                     && let Ok(new_provider) = from_model(&mut new_model, self.ctx.timeouts)
                 {
-                    self.sessions[idx].app.usage_slot.store(None);
-                    self.ctx.model_slot.store(Arc::new(ModelSlot {
-                        model: new_model,
-                        provider: Arc::from(new_provider),
-                    }));
-                    self.refresh_usage_into(Arc::clone(&self.sessions[idx].app.usage_slot));
+                    self.ctx
+                        .model_slot
+                        .install(new_model, Arc::from(new_provider));
                 }
                 self.respawn_agent(idx, loaded.messages);
             }
@@ -1636,7 +1976,7 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx].app.start_btw(
                     question,
                     images,
-                    Arc::clone(&slot.provider),
+                    Arc::clone(&slot.provider) as Arc<dyn Provider>,
                     slot.model.clone(),
                 );
             }
@@ -1647,7 +1987,6 @@ impl<'t> EventLoop<'t> {
             }
             Action::Bell => ring_bell(),
             Action::RefreshModels => self.refresh_models(),
-            Action::RefreshUsage => self.refresh_usage(idx),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
     }
@@ -1663,12 +2002,9 @@ impl<'t> EventLoop<'t> {
         let app = &mut self.sessions[idx].app;
         app.update_model(&new_model);
         app.record_recent_model(spec);
-        app.usage_slot.store(None);
-        self.ctx.model_slot.store(Arc::new(ModelSlot {
-            model: new_model,
-            provider: Arc::from(new_provider),
-        }));
-        self.refresh_usage(idx);
+        self.ctx
+            .model_slot
+            .install(new_model, Arc::from(new_provider));
         Ok(())
     }
 
@@ -1688,37 +2024,13 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
-    fn refresh_usage(&mut self, idx: usize) {
-        let slot = Arc::clone(&self.sessions[idx].app.usage_slot);
-        self.refresh_usage_into(slot);
-    }
-
-    fn refresh_usage_into(&self, slot: Arc<ArcSwapOption<UsageFetchState>>) {
-        let provider = Arc::clone(&self.ctx.model_slot.load().provider);
-        slot.store(Some(Arc::new(UsageFetchState::Loading)));
-        smol::spawn(async move {
-            let state = match provider.fetch_usage().await {
-                Ok(Some(usage)) => UsageFetchState::Ready(usage),
-                Ok(None) => UsageFetchState::Unsupported,
-                Err(e) => UsageFetchState::Error(e.user_message()),
-            };
-            slot.store(Some(Arc::new(state)));
-        })
-        .detach();
-    }
-
     fn refresh_provider(&mut self, slug: String) {
         let mut model = self.ctx.model_slot.load().model.clone();
         if model.provider.to_string() == slug {
             if let Ok(provider) =
                 maki_providers::provider::from_model(&mut model, self.ctx.timeouts)
             {
-                self.focused_app().usage_slot.store(None);
-                self.ctx.model_slot.store(Arc::new(ModelSlot {
-                    model,
-                    provider: Arc::from(provider),
-                }));
-                self.refresh_usage(self.focused);
+                self.ctx.model_slot.install(model, Arc::from(provider));
             }
         } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
             && let Err(e) = self.change_model(self.focused, builtin.default_model)
@@ -1728,6 +2040,8 @@ impl<'t> EventLoop<'t> {
     }
 
     fn shutdown(mut self) -> ShutdownReport {
+        let outputs = self.provider_usage.handle(ProviderUsageInput::Shutdown);
+        self.handle_provider_usage_outputs(outputs);
         let started = Instant::now();
         let mut phase_start = started;
         let mut lap = || {
@@ -1786,6 +2100,61 @@ impl<'t> EventLoop<'t> {
             tabs,
             focused: self.focused,
         }
+    }
+}
+
+fn session_usage(
+    total: &TokenUsage,
+    cost: Option<f64>,
+    usage_by_model: &HashMap<String, StoredTokenUsage>,
+) -> serde_json::Value {
+    let mut models: Vec<_> = usage_by_model.iter().collect();
+    models.sort_by(|(a_model, a_usage), (b_model, b_usage)| {
+        b_usage
+            .total()
+            .cmp(&a_usage.total())
+            .then_with(|| a_model.cmp(b_model))
+    });
+    let models: Vec<_> = models
+        .into_iter()
+        .map(|(model, usage)| {
+            json!({
+                "model": model,
+                "input": usage.input,
+                "output": usage.output,
+                "cache_creation": usage.cache_creation,
+                "cache_read": usage.cache_read,
+                "cost": usage.cost,
+            })
+        })
+        .collect();
+
+    json!({
+        "total": {
+            "input": total.input,
+            "output": total.output,
+            "cache_creation": total.cache_creation,
+            "cache_read": total.cache_read,
+            "cost": cost,
+        },
+        "models": models,
+    })
+}
+
+fn provider_usage_limit(limit: maki_providers::UsageLimit) -> ProviderUsageLimit {
+    ProviderUsageLimit {
+        window: match limit.kind {
+            maki_providers::UsageWindow::Hours(value) => ProviderUsageWindow::Hours { value },
+            maki_providers::UsageWindow::Days(value) => ProviderUsageWindow::Days { value },
+            maki_providers::UsageWindow::Monthly => ProviderUsageWindow::Monthly,
+            maki_providers::UsageWindow::Weekly { model } => ProviderUsageWindow::Weekly { model },
+            maki_providers::UsageWindow::Credits => ProviderUsageWindow::Credits,
+            maki_providers::UsageWindow::Subscription => ProviderUsageWindow::Subscription,
+            maki_providers::UsageWindow::Other(label) => ProviderUsageWindow::Other { label },
+        },
+        percentage: limit.percentage,
+        reset_at_ms: limit.reset_at,
+        detail: limit.detail,
     }
 }
 
@@ -1851,6 +2220,87 @@ mod tests {
         state.on_done(&done_event());
         state.on_drain();
         state
+    }
+
+    #[test]
+    fn session_usage_preserves_costs_and_sorts_models_deterministically() {
+        let total = TokenUsage {
+            input: 10,
+            output: 20,
+            cache_creation: 30,
+            cache_read: 40,
+        };
+        let usage_by_model = HashMap::from([
+            (
+                "z/model".to_owned(),
+                StoredTokenUsage {
+                    input: 5,
+                    output: 5,
+                    cache_creation: 0,
+                    cache_read: 0,
+                    cost: None,
+                },
+            ),
+            (
+                "b/model".to_owned(),
+                StoredTokenUsage {
+                    input: 14,
+                    output: 1,
+                    cache_creation: 2,
+                    cache_read: 3,
+                    cost: Some(0.25),
+                },
+            ),
+            (
+                "a/model".to_owned(),
+                StoredTokenUsage {
+                    input: 10,
+                    output: 0,
+                    cache_creation: 0,
+                    cache_read: 0,
+                    cost: Some(0.5),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            session_usage(&total, None, &usage_by_model),
+            json!({
+                "total": {
+                    "input": 10,
+                    "output": 20,
+                    "cache_creation": 30,
+                    "cache_read": 40,
+                    "cost": null,
+                },
+                "models": [
+                    {
+                        "model": "b/model",
+                        "input": 14,
+                        "output": 1,
+                        "cache_creation": 2,
+                        "cache_read": 3,
+                        "cost": 0.25,
+                    },
+                    {
+                        "model": "a/model",
+                        "input": 10,
+                        "output": 0,
+                        "cache_creation": 0,
+                        "cache_read": 0,
+                        "cost": 0.5,
+                    },
+                    {
+                        "model": "z/model",
+                        "input": 5,
+                        "output": 5,
+                        "cache_creation": 0,
+                        "cache_read": 0,
+                        "cost": null,
+                    },
+                ],
+            })
+        );
     }
 
     #[test]

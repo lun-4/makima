@@ -4,13 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use humantime::format_duration;
+use jiff::{Timestamp, tz::TimeZone};
+use maki_config::ClockFormat;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
-    TitlePos, UiAction, WinCommand, WinEvent, ui_send,
+    StatusContent, StatusContentEntries, StatusContentWriter, TitlePos, UiAction, WinCommand,
+    WinEvent, ui_send,
 };
 use crate::api::util::pair::{Pair, try_pair};
 use crate::api::util::picker::{PickerCallbackEntry, PickerCallbacks, PickerResult};
@@ -21,6 +24,48 @@ pub(crate) mod win;
 
 use crate::runtime::with_task_bufs;
 use win::WinHandle;
+
+pub(crate) struct StatusContentStore {
+    content: BTreeMap<Arc<str>, StatusContent>,
+}
+
+impl StatusContentStore {
+    pub fn new() -> Self {
+        Self {
+            content: BTreeMap::new(),
+        }
+    }
+
+    pub fn set(&mut self, plugin: Arc<str>, content: StatusContent) -> bool {
+        let content: StatusContent = content
+            .into_iter()
+            .filter(|(text, _)| !text.is_empty())
+            .collect();
+        if content.is_empty() {
+            return self.content.remove(&plugin).is_some();
+        }
+        if self.content.get(&plugin) == Some(&content) {
+            return false;
+        }
+        self.content.insert(plugin, content);
+        true
+    }
+
+    pub fn clear_plugin(&mut self, plugin: &str) -> bool {
+        self.content.remove(plugin).is_some()
+    }
+
+    pub fn has_plugin_content(&self, plugin: &str) -> bool {
+        self.content.contains_key(plugin)
+    }
+
+    pub fn snapshot_entries(&self) -> StatusContentEntries {
+        self.content
+            .iter()
+            .map(|(plugin, content)| (Arc::clone(plugin), content.clone()))
+            .collect()
+    }
+}
 
 pub(crate) struct HintStore {
     hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
@@ -62,6 +107,15 @@ fn publish_hint_snapshot(lua: &Lua) {
     }
 }
 
+fn publish_status_content_snapshot(lua: &Lua) {
+    if let Some(store) = lua.app_data_ref::<StatusContentStore>() {
+        let entries = store.snapshot_entries();
+        if let Some(writer) = lua.app_data_ref::<StatusContentWriter>() {
+            writer.publish(entries);
+        }
+    }
+}
+
 pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
     let footer_tbl: Table = match tbl.get("footer") {
         Ok(t) => t,
@@ -88,6 +142,32 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 #[lua_fn]
 fn buf(lua: &Lua) -> LuaResult<buf::BufHandle> {
     Ok(with_task_bufs(lua, |store| store.create_live()))
+}
+
+/// Formats a Unix timestamp as local time using the configured clock.
+///
+/// @param epoch_ms integer Unix timestamp in milliseconds.
+/// @param style string? Output style: `time`, `weekday`, or `date`. Defaults to `time`.
+/// @return (string) Formatted local time.
+#[lua_fn]
+fn format_time(lua: &Lua, epoch_ms: u64, style: Option<String>) -> LuaResult<String> {
+    let format = lua
+        .app_data_ref::<ClockFormat>()
+        .map_or(ClockFormat::System, |f| *f);
+    let ts = Timestamp::from_second((epoch_ms / 1000) as i64)
+        .map_err(|e| mlua::Error::runtime(e.to_string()))?
+        .to_zoned(TimeZone::system());
+    let clock = if matches!(format, ClockFormat::Hour12) {
+        "%-I:%M %p"
+    } else {
+        "%H:%M"
+    };
+    let pattern = match style.as_deref() {
+        Some("weekday") => format!("%a {clock}"),
+        Some("date") => format!("%b %-d, {clock}"),
+        _ => clock.to_owned(),
+    };
+    Ok(ts.strftime(&pattern).to_string())
 }
 
 /// Looks up a semantic color from the current theme. Use this to keep
@@ -522,6 +602,21 @@ fn open_win(
 }
 
 #[allow(non_upper_case_globals)]
+pub(crate) const set_status_content__doc: FnDoc = FnDoc {
+    name: "set_status_content",
+    args: "{spans}",
+    desc: "Sets styled status content for your plugin. Each span is a {text, style_name} pair. An empty table clears your plugin's content. Only your own content is affected.",
+    params: &[ParamDoc {
+        name: "{spans}",
+        ty: "table",
+        desc: "Sequence of {text, style_name} string pairs.",
+    }],
+    returns: "",
+    guard: None,
+    example: "maki.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- later, clear it:\nmaki.ui.set_status_content({})",
+};
+
+#[allow(non_upper_case_globals)]
 pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     name: "set_status_hint",
     args: "{spans}",
@@ -547,10 +642,10 @@ lua_table! {
     /// local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
-        buf, theme_color, highlight, markdown, humantime, terminal_size,
+        buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,
-        manual set_status_hint,
+        manual set_status_content, manual set_status_hint,
     ]
 }
 
@@ -569,6 +664,55 @@ pub(crate) fn create_ui_table(
         open_list_picker__register(&t, lua, tx.clone())?;
         open_win__register(&t, lua, tx)?;
     }
+
+    let p = Arc::clone(&plugin);
+    t.set(
+        "set_status_content",
+        lua.create_function(move |lua, value: mlua::Value| {
+            if matches!(value, mlua::Value::Nil) {
+                let changed = lua
+                    .app_data_mut::<StatusContentStore>()
+                    .is_some_and(|mut store| store.set(Arc::clone(&p), Vec::new()));
+                if changed {
+                    publish_status_content_snapshot(lua);
+                }
+                return Ok(());
+            }
+            let mlua::Value::Table(tbl) = value else {
+                return Err(mlua::Error::runtime("set_status_content expects a table"));
+            };
+            let content = tbl
+                .sequence_values::<Table>()
+                .map(|entry| {
+                    let entry = entry?;
+                    let text = match entry.get::<mlua::Value>(1)? {
+                        mlua::Value::String(value) => value.to_str()?.to_owned(),
+                        _ => {
+                            return Err(mlua::Error::runtime(
+                                "set_status_content text must be a string",
+                            ));
+                        }
+                    };
+                    let style_name = match entry.get::<mlua::Value>(2)? {
+                        mlua::Value::String(value) => value.to_str()?.to_owned(),
+                        _ => {
+                            return Err(mlua::Error::runtime(
+                                "set_status_content style_name must be a string",
+                            ));
+                        }
+                    };
+                    Ok((text, style_name))
+                })
+                .collect::<LuaResult<StatusContent>>()?;
+            let changed = lua
+                .app_data_mut::<StatusContentStore>()
+                .is_some_and(|mut store| store.set(Arc::clone(&p), content));
+            if changed {
+                publish_status_content_snapshot(lua);
+            }
+            Ok(())
+        })?,
+    )?;
 
     let p = Arc::clone(&plugin);
     t.set(
@@ -1378,6 +1522,76 @@ mod tests {
 
         let list_line: Table = result.get(5).unwrap();
         assert_eq!(span_style(&list_line, 1), STYLE_LIST_MARKER);
+    }
+
+    #[test]
+    fn status_content_store_orders_plugins_and_tracks_changes() {
+        let mut store = StatusContentStore::new();
+        assert!(store.set(Arc::from("zzz"), vec![("z".into(), "muted".into())]));
+        assert!(store.set(Arc::from("aaa"), vec![("a".into(), "accent".into())]));
+        assert!(!store.set(Arc::from("aaa"), vec![("a".into(), "accent".into())]));
+
+        let entries = store.snapshot_entries();
+        assert_eq!(entries[0].0.as_ref(), "aaa");
+        assert_eq!(entries[1].0.as_ref(), "zzz");
+        assert!(store.clear_plugin("aaa"));
+        assert!(!store.clear_plugin("aaa"));
+        assert_eq!(store.snapshot_entries()[0].0.as_ref(), "zzz");
+    }
+
+    #[test]
+    fn format_time_uses_explicit_clock_formats() {
+        let lua = Lua::new();
+        lua.set_app_data(ClockFormat::Hour12);
+        let ui = create_ui_table(&lua, None, Arc::from("test")).unwrap();
+        let f: mlua::Function = ui.get("format_time").unwrap();
+        let twelve: String = f.call((0_u64, "time")).unwrap();
+        lua.set_app_data(ClockFormat::Hour24);
+        let twenty_four: String = f.call((0_u64, "time")).unwrap();
+        assert!(twelve.contains("AM") || twelve.contains("PM"));
+        assert!(!twenty_four.contains("AM") && !twenty_four.contains("PM"));
+    }
+
+    #[test]
+    fn status_content_api_validates_strings_and_owns_plugin_entry() {
+        let lua = Lua::new();
+        lua.set_app_data(StatusContentStore::new());
+        let (writer, reader) = StatusContentWriter::new();
+        lua.set_app_data(writer);
+        let ui = create_ui_table(&lua, None, Arc::from("plug")).unwrap();
+        let other_ui = create_ui_table(&lua, None, Arc::from("other")).unwrap();
+        lua.globals().set("ui", ui).unwrap();
+        lua.globals().set("other_ui", other_ui).unwrap();
+
+        lua.load(r#"ui.set_status_content({ { "ready", "success" } })"#)
+            .exec()
+            .unwrap();
+        let snapshot = reader.load_full();
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.entries[0].0.as_ref(), "plug");
+        assert_eq!(snapshot.entries[0].1[0], ("ready".into(), "success".into()));
+
+        lua.load(r#"ui.set_status_content({ { "ready", "success" } })"#)
+            .exec()
+            .unwrap();
+        assert_eq!(reader.load_full().generation, 1);
+
+        for source in [
+            r#"ui.set_status_content({ { 1, "success" } })"#,
+            r#"ui.set_status_content({ { "ready", false } })"#,
+        ] {
+            assert!(lua.load(source).exec().is_err(), "{source}");
+        }
+        lua.load(r#"ui.set_status_content(nil)"#).exec().unwrap();
+
+        lua.load(r#"other_ui.set_status_content({ { "other", "muted" } })"#)
+            .exec()
+            .unwrap();
+        lua.load("ui.set_status_content({})").exec().unwrap();
+        let snapshot = reader.load_full();
+        assert_eq!(snapshot.generation, 3);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].0.as_ref(), "other");
     }
 
     #[test]

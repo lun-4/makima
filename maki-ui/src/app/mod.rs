@@ -52,7 +52,6 @@ use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
@@ -73,7 +72,7 @@ use maki_commands::{
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
-    KeymapReader, Split, WinCommand, WinEvent, WinView,
+    KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, Role, ThinkingConfig, add_cost, format_tokens};
 use maki_storage::StateDir;
@@ -355,8 +354,6 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
-    pub(super) usage_modal: UsageModal,
-    usage_readout_watch: Watch<UsageFetchState>,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
@@ -394,7 +391,6 @@ pub struct App {
 
     pub(crate) storage: StateDir,
     pub(crate) theme_provider: Arc<dyn ThemesProvider>,
-    pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
@@ -409,6 +405,9 @@ pub struct App {
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
+    pub(super) status_content_reader: StatusContentReader,
+    status_content: Watch<StatusContentSnapshot>,
+    pub(crate) suppress_status_content: Arc<AtomicBool>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     /// Per-subagent channels: the `answer_tx` (mid-turn interrupt replies) and,
@@ -431,6 +430,7 @@ impl App {
         mcp_config_errors: McpConfigErrors,
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
+        status_content_reader: StatusContentReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -471,8 +471,6 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
-            usage_modal: UsageModal::new(),
-            usage_readout_watch: Watch::default(),
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
@@ -503,7 +501,6 @@ impl App {
             submit_released: false,
             storage,
             theme_provider,
-            usage_slot: Arc::new(ArcSwapOption::empty()),
             available_models,
             shared_history: None,
             btw_system: None,
@@ -516,8 +513,11 @@ impl App {
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             hints: Watch::seeded(hint_reader.load_full()),
+            status_content: Watch::seeded(status_content_reader.load_full()),
+            suppress_status_content: Arc::new(AtomicBool::new(false)),
             keymap_reader,
             hint_reader,
+            status_content_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_channels: HashMap::new(),
@@ -736,10 +736,6 @@ impl App {
             self.help_modal.scroll(delta);
             return None;
         }
-        if self.usage_modal.is_open() {
-            self.usage_modal.scroll(delta);
-            return None;
-        }
         let pos = Position::new(column, row);
         if self.float_mgr.is_focused() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
@@ -918,14 +914,6 @@ impl App {
 
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        if self.usage_modal.is_open() {
-            if key::REFRESH.matches(key) {
-                return Some(vec![Action::RefreshUsage]);
-            }
-            self.usage_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -2130,14 +2118,6 @@ impl App {
                 self.help_modal.toggle();
                 vec![]
             }
-            BuiltinOperation::ToggleUsage => {
-                self.usage_modal.toggle();
-                if self.usage_modal.is_open() {
-                    vec![Action::RefreshUsage]
-                } else {
-                    vec![]
-                }
-            }
             BuiltinOperation::FocusQueue => {
                 self.queue.set_focus();
                 vec![]
@@ -2317,10 +2297,9 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
-            &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -2336,10 +2315,9 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
-            &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
@@ -2594,6 +2572,12 @@ impl App {
 
     /// Every poller that feeds the screen, in one place and never in `view`;
     /// see [`crate::repaint`] for why.
+    pub(crate) fn reconcile_status_content(&mut self) -> u64 {
+        let snapshot = self.status_content_reader.load_full();
+        let _ = self.status_content.poll(Arc::clone(&snapshot));
+        snapshot.generation
+    }
+
     pub fn tick(&mut self) -> Dirty {
         // `|` never short-circuits: every poller must run on every tick.
         let mut dirty = self.float_mgr.tick()
@@ -2606,9 +2590,10 @@ impl App {
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
             | self.model_picker.refresh()
-            | self.usage_modal.poll(&self.usage_slot)
-            | self.usage_readout_watch.poll(self.usage_slot.load_full())
             | self.hints.poll(self.hint_reader.load_full())
+            | self
+                .status_content
+                .poll(self.status_content_reader.load_full())
             | self.tick_file_picker()
             | self.tick_file_completion()
             | self.command_palette.poll_arguments();

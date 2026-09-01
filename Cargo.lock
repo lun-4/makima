@@ -2869,6 +2869,7 @@ dependencies = [
  "image",
  "include_dir",
  "isahc",
+ "jiff",
  "jsonschema",
  "maki-agent",
  "maki-commands",

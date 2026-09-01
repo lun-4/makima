@@ -5,9 +5,10 @@ pub(crate) mod shared_queue;
 
 use std::mem;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
@@ -18,19 +19,177 @@ use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
 use self::cancel_map::new_run_cancel_map;
-use maki_providers::provider::Provider;
-use maki_providers::{Message, Model};
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    AgentError, Message, Model, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions,
+    StreamResponse,
+};
 use tracing::{info, warn};
 
 use crate::app::App;
+use crate::provider_usage::{ProviderAuthGeneration, ProviderIdentity, ProviderInstanceGeneration};
 
 use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 
-pub(crate) struct ModelSlot {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderChange {
+    Installed(ProviderIdentity),
+    Auth(ProviderIdentity),
+}
+
+pub(crate) struct TrackedProvider {
+    inner: Arc<dyn Provider>,
+    instance: ProviderInstanceGeneration,
+    auth_generation: AtomicU64,
+    change_tx: flume::Sender<ProviderChange>,
+}
+
+impl TrackedProvider {
+    fn new(
+        inner: Arc<dyn Provider>,
+        instance: ProviderInstanceGeneration,
+        change_tx: flume::Sender<ProviderChange>,
+    ) -> Self {
+        Self {
+            inner,
+            instance,
+            auth_generation: AtomicU64::new(0),
+            change_tx,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> ProviderIdentity {
+        ProviderIdentity::new(
+            self.instance,
+            ProviderAuthGeneration(self.auth_generation.load(Ordering::Acquire)),
+        )
+    }
+
+    fn bump_auth_generation(&self) {
+        let auth = self
+            .auth_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let _ = self
+            .change_tx
+            .send(ProviderChange::Auth(ProviderIdentity::new(
+                self.instance,
+                ProviderAuthGeneration(auth),
+            )));
+    }
+}
+
+impl Provider for TrackedProvider {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a serde_json::Value,
+        event_tx: &'a flume::Sender<ProviderEvent>,
+        opts: RequestOptions,
+        session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        self.inner
+            .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        self.inner.list_models()
+    }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        self.inner.fetch_usage()
+    }
+
+    fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            self.inner.refresh_auth().await?;
+            self.bump_auth_generation();
+            Ok(())
+        })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async {
+            self.inner.reload_auth().await?;
+            self.bump_auth_generation();
+            Ok(())
+        })
+    }
+
+    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+        Box::pin(async {
+            let rotated = self.inner.rotate_key().await?;
+            if rotated {
+                self.bump_auth_generation();
+            }
+            Ok(rotated)
+        })
+    }
+
+    fn adjust_model(&self, model: &mut Model) {
+        self.inner.adjust_model(model);
+    }
+}
+
+pub(crate) struct ProviderSnapshot {
     pub(crate) model: Model,
-    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) provider: Arc<TrackedProvider>,
+}
+
+pub(crate) struct ProviderSlot {
+    current: ArcSwap<ProviderSnapshot>,
+    next_instance: AtomicU64,
+    change_tx: flume::Sender<ProviderChange>,
+}
+
+impl ProviderSlot {
+    pub(crate) fn new(
+        model: Model,
+        provider: Arc<dyn Provider>,
+    ) -> (Arc<Self>, flume::Receiver<ProviderChange>) {
+        let (change_tx, change_rx) = flume::unbounded();
+        let tracked = Arc::new(TrackedProvider::new(
+            provider,
+            ProviderInstanceGeneration(0),
+            change_tx.clone(),
+        ));
+        (
+            Arc::new(Self {
+                current: ArcSwap::from_pointee(ProviderSnapshot {
+                    model,
+                    provider: tracked,
+                }),
+                next_instance: AtomicU64::new(1),
+                change_tx,
+            }),
+            change_rx,
+        )
+    }
+
+    pub(crate) fn load(&self) -> Guard<Arc<ProviderSnapshot>> {
+        self.current.load()
+    }
+
+    pub(crate) fn install(&self, model: Model, provider: Arc<dyn Provider>) -> ProviderIdentity {
+        let instance =
+            ProviderInstanceGeneration(self.next_instance.fetch_add(1, Ordering::AcqRel));
+        let tracked = Arc::new(TrackedProvider::new(
+            provider,
+            instance,
+            self.change_tx.clone(),
+        ));
+        let identity = tracked.identity();
+        self.current.store(Arc::new(ProviderSnapshot {
+            model,
+            provider: tracked,
+        }));
+        let _ = self.change_tx.send(ProviderChange::Installed(identity));
+        identity
+    }
 }
 
 /// Inherited via CLI across every session (including respawns).
@@ -73,7 +232,7 @@ impl AgentHandles {
     /// once and shuts it down at exit. Only the agent loop task lives here.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
-        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        model_slot: &Arc<ProviderSlot>,
         initial_history: Vec<Message>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
@@ -145,7 +304,7 @@ impl AgentHandles {
     pub(crate) fn respawn(
         &mut self,
         history: Vec<Message>,
-        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        model_slot: &Arc<ProviderSlot>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -225,7 +384,7 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
-    model_slot: &Arc<ArcSwap<ModelSlot>>,
+    model_slot: &Arc<ProviderSlot>,
     initial_history: Vec<Message>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
@@ -324,6 +483,11 @@ mod tests {
 
     struct StubProvider;
 
+    struct AuthProvider {
+        reload_ok: bool,
+        rotate: bool,
+    }
+
     impl Provider for StubProvider {
         fn stream_message<'a>(
             &'a self,
@@ -343,25 +507,64 @@ mod tests {
         }
     }
 
-    fn stub_spawn() -> (
-        AgentHandles,
-        Arc<ArcSwap<ModelSlot>>,
-        Arc<PermissionManager>,
-    ) {
+    impl Provider for AuthProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+            Box::pin(async move {
+                if self.reload_ok {
+                    Ok(())
+                } else {
+                    Err(AgentError::Config {
+                        message: "reload failed".into(),
+                    })
+                }
+            })
+        }
+
+        fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
+            Box::pin(async move { Ok(self.rotate) })
+        }
+    }
+
+    fn auth_slot(
+        reload_ok: bool,
+        rotate: bool,
+    ) -> (Arc<ProviderSlot>, flume::Receiver<ProviderChange>) {
+        ProviderSlot::new(
+            crate::components::test_model(),
+            Arc::new(AuthProvider { reload_ok, rotate }),
+        )
+    }
+
+    fn stub_spawn() -> (AgentHandles, Arc<ProviderSlot>, Arc<PermissionManager>) {
         stub_spawn_with(Vec::new())
     }
 
     fn stub_spawn_with(
         initial_history: Vec<Message>,
-    ) -> (
-        AgentHandles,
-        Arc<ArcSwap<ModelSlot>>,
-        Arc<PermissionManager>,
-    ) {
-        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
-            model: crate::components::test_model(),
-            provider: Arc::new(StubProvider),
-        }));
+    ) -> (AgentHandles, Arc<ProviderSlot>, Arc<PermissionManager>) {
+        let (model_slot, _change_rx) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
@@ -386,7 +589,7 @@ mod tests {
 
     fn respawn(
         handles: &mut AgentHandles,
-        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        model_slot: &Arc<ProviderSlot>,
         permissions: &Arc<PermissionManager>,
         app: &mut App,
     ) {
@@ -399,6 +602,75 @@ mod tests {
             app,
             EventHandle::disconnected_for_test(),
         );
+    }
+
+    #[test]
+    fn provider_install_increments_instance_and_resets_auth_generation() {
+        let (slot, change_rx) = auth_slot(true, false);
+        assert_eq!(
+            slot.load().provider.identity(),
+            ProviderIdentity::new(ProviderInstanceGeneration(0), ProviderAuthGeneration(0))
+        );
+
+        let identity = slot.install(
+            crate::components::test_model(),
+            Arc::new(AuthProvider {
+                reload_ok: true,
+                rotate: false,
+            }),
+        );
+
+        assert_eq!(
+            identity,
+            ProviderIdentity::new(ProviderInstanceGeneration(1), ProviderAuthGeneration(0))
+        );
+        assert_eq!(slot.load().provider.identity(), identity);
+        assert_eq!(
+            change_rx.recv().expect("install notification"),
+            ProviderChange::Installed(identity)
+        );
+    }
+
+    #[test]
+    fn successful_auth_operations_bump_before_notification() {
+        let (slot, change_rx) = auth_slot(true, true);
+        let provider = Arc::clone(&slot.load().provider);
+
+        smol::block_on(provider.reload_auth()).expect("reload succeeds");
+        assert_eq!(
+            change_rx.recv().expect("reload notification"),
+            ProviderChange::Auth(provider.identity())
+        );
+        assert_eq!(provider.identity().auth, ProviderAuthGeneration(1));
+
+        smol::block_on(provider.refresh_auth()).expect("refresh succeeds");
+        assert_eq!(
+            change_rx.recv().expect("refresh notification"),
+            ProviderChange::Auth(provider.identity())
+        );
+        assert_eq!(provider.identity().auth, ProviderAuthGeneration(2));
+
+        assert!(smol::block_on(provider.rotate_key()).expect("rotation succeeds"));
+        assert_eq!(
+            change_rx.recv().expect("rotation notification"),
+            ProviderChange::Auth(provider.identity())
+        );
+        assert_eq!(provider.identity().auth, ProviderAuthGeneration(3));
+    }
+
+    #[test]
+    fn failed_reload_and_false_rotation_do_not_bump_auth_generation() {
+        let (failed_slot, failed_rx) = auth_slot(false, false);
+        let failed = Arc::clone(&failed_slot.load().provider);
+        assert!(smol::block_on(failed.reload_auth()).is_err());
+        assert_eq!(failed.identity().auth, ProviderAuthGeneration(0));
+        assert!(failed_rx.is_empty());
+
+        let (slot, change_rx) = auth_slot(true, false);
+        let provider = Arc::clone(&slot.load().provider);
+        assert!(!smol::block_on(provider.rotate_key()).expect("rotation succeeds"));
+        assert_eq!(provider.identity().auth, ProviderAuthGeneration(0));
+        assert!(change_rx.is_empty());
     }
 
     /// Senders captured before any respawn (Lua restore replies, clicks) must

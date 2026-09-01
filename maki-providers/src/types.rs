@@ -801,37 +801,6 @@ pub enum UsageWindow {
     Other(String),
 }
 
-impl UsageWindow {
-    /// The full wording shown in the usage modal.
-    pub fn label(&self) -> String {
-        match self {
-            Self::Hours(n) => format!("{n}-hour usage"),
-            Self::Days(1) => "Daily usage".into(),
-            Self::Days(n) => format!("{n}-day usage"),
-            Self::Monthly => "Monthly usage".into(),
-            Self::Weekly { model: None } => "Weekly usage".into(),
-            Self::Weekly { model: Some(m) } => format!("Current week ({m})"),
-            Self::Credits => "Usage credits".into(),
-            Self::Subscription => "Subscription".into(),
-            Self::Other(text) => text.clone(),
-        }
-    }
-
-    /// A terse lane code for the compact one-line readout.
-    pub fn short(&self) -> String {
-        match self {
-            Self::Hours(n) => format!("{n}h"),
-            Self::Days(1) => "d".into(),
-            Self::Days(n) => format!("{n}d"),
-            Self::Monthly => "m".into(),
-            Self::Weekly { .. } => "w".into(),
-            Self::Credits => "cr".into(),
-            Self::Subscription => "sub".into(),
-            Self::Other(text) => text.clone(),
-        }
-    }
-}
-
 /// A single quota window (e.g. a 5-hour or weekly token quota).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageLimit {

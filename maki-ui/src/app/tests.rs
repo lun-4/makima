@@ -20,9 +20,7 @@ use maki_agent::{
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
-use maki_providers::{
-    ContentBlock, Effort, Message, ProviderUsage, Role, TokenUsage, UsageLimit, UsageWindow,
-};
+use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
@@ -323,6 +321,7 @@ fn build_app_with_full(
         McpConfigErrors::new(PathBuf::new()),
         KeymapReader::empty(),
         HintReader::empty(),
+        maki_lua::StatusContentReader::empty(),
         writer,
         ui,
         100,
@@ -369,6 +368,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
         McpConfigErrors::new(PathBuf::new()),
         KeymapReader::empty(),
         HintReader::empty(),
+        maki_lua::StatusContentReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -2160,59 +2160,6 @@ fn rendered_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
 }
 
 #[test]
-fn usage_readout_draws_in_status_bar() {
-    let mut app = test_app();
-    let usage = ProviderUsage {
-        plan: None,
-        limits: vec![
-            UsageLimit {
-                kind: UsageWindow::Hours(5),
-                percentage: Some(30),
-                reset_at: None,
-                detail: None,
-            },
-            UsageLimit {
-                kind: UsageWindow::Weekly { model: None },
-                percentage: Some(50),
-                reset_at: None,
-                detail: None,
-            },
-        ],
-    };
-    app.usage_slot
-        .store(Some(Arc::new(UsageFetchState::Ready(usage))));
-    let rows = rendered_rows(&mut app, 80, 24);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("5h30% w50%"),
-        "usage readout missing from rendered bottom region:\n{text}"
-    );
-}
-
-#[test]
-fn usage_readout_blank_for_non_ready_states() {
-    let app = test_app();
-    app.usage_slot
-        .store(Some(Arc::new(UsageFetchState::Loading)));
-    assert!(
-        app.usage_readout().is_none(),
-        "Loading must not paint a readout"
-    );
-    app.usage_slot
-        .store(Some(Arc::new(UsageFetchState::Unsupported)));
-    assert!(
-        app.usage_readout().is_none(),
-        "Unsupported must not paint a readout"
-    );
-    app.usage_slot
-        .store(Some(Arc::new(UsageFetchState::Error("boom".into()))));
-    assert!(
-        app.usage_readout().is_none(),
-        "Error must not paint a readout"
-    );
-}
-
-#[test]
 fn top_bar_is_always_one_row() {
     let area = Rect::new(0, 0, 80, 24);
     // Persistent even with no subagents.
@@ -2769,20 +2716,6 @@ fn assert_owes_one_frame(app: &mut App, arrival: impl FnOnce()) {
     arrival();
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
-}
-
-/// `/usage` spawns a detached fetch that stores its answer with nothing
-/// listening, so an unpolled modal sits on `Loading` until the user presses
-/// some unrelated key.
-#[test]
-fn usage_quota_arriving_in_the_background_owes_a_frame() {
-    let mut app = test_app();
-    app.execute_command(cmd("/usage"), 0);
-    let slot = Arc::clone(&app.usage_slot);
-
-    assert_owes_one_frame(&mut app, || {
-        slot.store(Some(Arc::new(UsageFetchState::Loading)));
-    });
 }
 
 /// Providers publish their model list into a shared slot that wakes nothing,
@@ -3858,42 +3791,6 @@ fn yolo_toggle() {
 }
 
 #[test]
-fn usage_command_toggles_modal() {
-    let mut app = test_app();
-    assert!(!app.usage_modal.is_open());
-    let open_actions = app.execute_command(cmd("/usage"), 0);
-    assert!(app.usage_modal.is_open());
-    assert!(
-        open_actions
-            .iter()
-            .any(|a| matches!(a, Action::RefreshUsage)),
-        "opening should request a quota refresh"
-    );
-    let close_actions = app.execute_command(cmd("/usage"), 0);
-    assert!(!app.usage_modal.is_open());
-    assert!(
-        !close_actions
-            .iter()
-            .any(|a| matches!(a, Action::RefreshUsage)),
-        "closing should not trigger a refresh"
-    );
-}
-
-#[test]
-fn ctrl_r_refreshes_usage_while_modal_open() {
-    let mut app = test_app();
-    app.execute_command(cmd("/usage"), 0);
-    assert!(app.usage_modal.is_open());
-
-    let actions = app.update(Msg::Key(kb::REFRESH.to_key_event()));
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::RefreshUsage)),
-        "Ctrl+R should emit RefreshUsage"
-    );
-    assert!(app.usage_modal.is_open(), "modal should stay open");
-}
-
-#[test]
 fn cd_command_behavior() {
     let mut app = test_app();
     app.execute_command(
@@ -4069,7 +3966,7 @@ fn run_cmdline_keeps_typed_input() {
     let mut app = test_app();
     app.input_box.set_input("half written".into());
 
-    app.run_cmdline("/usage", 0).unwrap();
+    app.run_cmdline("/help", 0).unwrap();
 
     assert_eq!(app.input_box.buffer.value(), "half written");
 }

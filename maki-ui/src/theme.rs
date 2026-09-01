@@ -14,12 +14,6 @@ use syntect::highlighting::{
 const DEFAULT_THEME: &str = "dracula";
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
-/// Endpoints of the quota readout ramp: blue when nearly unused, red when the
-/// lane is exhausted. Chosen to be explicit about usage, independent of the
-/// theme's `accent`/`status` styles.
-const USAGE_BLUE: Color = Color::Rgb(88, 150, 255);
-const USAGE_RED: Color = Color::Rgb(255, 92, 92);
-
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
     ("comment", "comment, comment punctuation.definition.comment"),
     (
@@ -392,6 +386,7 @@ pub fn style_by_name(name: &str) -> Style {
     let t = current();
     match name {
         "dim" | "tool_dim" => t.tool_dim,
+        "status_dim" => t.status_dim,
         "path" | "tool_path" => t.tool_path,
         "tool" => t.tool,
         "tool_prefix" => t.tool_prefix,
@@ -444,6 +439,16 @@ pub fn style_by_name(name: &str) -> Style {
             .unwrap_or(t.item),
         "completion.model" | "completion_model" => {
             t.completion_kinds.get("model").copied().unwrap_or(t.item)
+        }
+        _ if let Some(hex) = name.strip_prefix('#')
+            && hex.len() == 6
+            && let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) =>
+        {
+            Style::new().fg(Color::Rgb(r, g, b))
         }
         _ => Style::default(),
     }
@@ -985,19 +990,6 @@ pub(crate) fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
 }
 
-/// Line style for a quota percentage: interpolates blue → red across 0-100%.
-pub fn usage_color(percentage: u32) -> Style {
-    let t = percentage.clamp(0, 100) as f32 / 100.0;
-    let (Color::Rgb(bl, bg, bb), Color::Rgb(rl, rg, rb)) = (USAGE_BLUE, USAGE_RED) else {
-        return Style::new().fg(USAGE_RED);
-    };
-    Style::new().fg(Color::Rgb(
-        lerp_u8(bl, rl, t),
-        lerp_u8(bg, rg, t),
-        lerp_u8(bb, rb, t),
-    ))
-}
-
 pub(crate) fn dim_style(style: Style, factor: f32) -> Style {
     match (style.fg, current().background) {
         (Some(Color::Rgb(fr, fg, fb)), Color::Rgb(br, bg, bb)) => style.fg(Color::Rgb(
@@ -1024,34 +1016,6 @@ fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
 mod tests {
     use super::*;
     use test_case::test_case;
-
-    fn rgb(style: Style) -> (u8, u8, u8) {
-        match style.fg {
-            Some(Color::Rgb(r, g, b)) => (r, g, b),
-            other => panic!("expected rgb fg, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn usage_color_ends_are_blue_and_red() {
-        assert_eq!(rgb(usage_color(0)), rgb(Style::new().fg(USAGE_BLUE)));
-        assert_eq!(rgb(usage_color(100)), rgb(Style::new().fg(USAGE_RED)));
-    }
-
-    #[test]
-    fn usage_color_midpoint_between() {
-        let red = rgb(Style::new().fg(USAGE_RED));
-        let mid = rgb(usage_color(50));
-        assert!(
-            mid.0 > 120 && mid.1 > 120 && mid.2 < 200,
-            "midpoint {mid:?} between red {red:?}"
-        );
-    }
-
-    #[test]
-    fn usage_color_clamps_out_of_range() {
-        assert_eq!(rgb(usage_color(150)), rgb(Style::new().fg(USAGE_RED)));
-    }
 
     fn dracula_toml() -> &'static str {
         BUNDLED_THEMES
@@ -1562,6 +1526,10 @@ mode_build = "#112233"
         assert_eq!(style_by_name("warning"), t.todo_in_progress);
         assert_eq!(style_by_name("match"), t.item_match);
         assert_eq!(style_by_name("match_selected"), t.item_match_selected);
+        assert_eq!(
+            style_by_name("#12aBcF").fg,
+            Some(Color::Rgb(0x12, 0xab, 0xcf))
+        );
     }
 
     #[test_case("nonexistent_style")]

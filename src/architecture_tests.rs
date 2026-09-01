@@ -23,6 +23,18 @@ const FORBIDDEN_ACP_IDENTIFIERS: &[&str] = &[
     "CommandMailbox",
     "InvocationLifecycle",
 ];
+const FORBIDDEN_RUST_USAGE_UI_IDENTIFIERS: &[&str] = &[
+    "UsageWindow::label",
+    "UsageWindow::short",
+    "RefreshUsage",
+    "ToggleUsage",
+    "UsageFetchState",
+    "UsageModal",
+    "UsageModalContext",
+    "usage_modal",
+    "usage_readout",
+    "usage_slot",
+];
 const FORBIDDEN_ACP_COMMANDS: &[&str] = &[
     "/compact",
     "/new",
@@ -59,6 +71,29 @@ fn frontends_cannot_register_standard_commands() {
                 "{path} contains forbidden standard-registration identifier `{identifier}`"
             );
         }
+    }
+}
+
+#[test]
+fn rust_frontends_do_not_own_usage_presentation() {
+    assert!(
+        Path::new("plugins/usage/init.lua").is_file(),
+        "bundled usage plugin is missing"
+    );
+    for source in production_sources(&["maki-ui/src", "maki-agent/src", "maki-commands/src"])
+        .expect(SOURCE_SCAN_ERROR)
+    {
+        let path = source.path.to_string_lossy();
+        for identifier in FORBIDDEN_RUST_USAGE_UI_IDENTIFIERS {
+            assert!(
+                !source.identifiers.iter().any(|name| name == identifier),
+                "{path} contains retired Rust usage UI identifier `{identifier}`"
+            );
+        }
+        assert!(
+            !source.strings.iter().any(|value| value == "/usage"),
+            "{path} contains retired Rust `/usage` command literal"
+        );
     }
 }
 
