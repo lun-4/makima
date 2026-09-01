@@ -92,6 +92,16 @@ You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside
 
 Themes use 24-bit colors, but not every terminal can show them. Makima checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKIMA_TRUECOLOR=1` to force truecolor or `MAKIMA_TRUECOLOR=0` to force the fallback.
 
+A theme TOML file can define optional `italic` and `bold_italic` keys inside its `[ui]` table. These are theme styles, not fields in the `ui` table passed to `maki.setup()`. Without `[ui].italic`, Markdown italics use the foreground from the `markup.italic` syntax scope. An explicit `[ui].italic` takes precedence. Makima adds the italic modifier in either case.
+
+Without `[ui].bold_italic`, bold italics preserve the resolved bold style, including its colors and modifiers, and add italic. An explicit `[ui].bold_italic` takes precedence and receives both bold and italic modifiers, even when it only specifies a color.
+
+```toml
+[ui]
+italic = { fg = "yellow" }
+bold_italic = { fg = "orange" }
+```
+
 Theme files can also carry an optional `[completion]` table that recolors the `@` reference popup per candidate kind. Each key takes the same style definition as other UI styles: `fg` and `bg` (a palette color name or a `#rrggbb` value) plus a `modifiers` array (`"bold"`, `"italic"`, `"underlined"`).
 
 | Key | Meaning | Falls back to |

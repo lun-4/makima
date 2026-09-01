@@ -138,6 +138,20 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
+        "A theme TOML file can define optional `italic` and `bold_italic` keys \
+         inside its `[ui]` table. These are theme styles, not fields in the \
+         `ui` table passed to `maki.setup()`. Without `[ui].italic`, Markdown \
+         italics use the foreground from the `markup.italic` syntax scope. An \
+         explicit `[ui].italic` takes precedence. Makima adds the italic \
+         modifier in either case.\n\nWithout `[ui].bold_italic`, bold italics preserve \
+         the resolved bold style, including its colors and modifiers, and add \
+         italic. An explicit `[ui].bold_italic` takes precedence and receives \
+         both bold and italic modifiers, even when it only specifies a color.\n\n\
+         ```toml\n[ui]\nitalic = {{ fg = \"yellow\" }}\nbold_italic = {{ fg = \"orange\" }}\n```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Theme files can also carry an optional `[completion]` table that \
          recolors the `@` reference popup per candidate kind. Each key takes \
          the same style definition as other UI styles: `fg` and `bg` (a \
@@ -391,5 +405,12 @@ mod tests {
         assert!(page.contains(&format!(
             "| `autocomplete_height` | number | `{DEFAULT_AUTOCOMPLETE_HEIGHT}` | - | Fraction of terminal height used for slash command-argument suggestions; must be finite and in (0, 1] |"
         )));
+    }
+
+    #[test]
+    fn generated_docs_describe_italic_theme_fallback() {
+        let docs = generate();
+
+        assert!(docs.contains("Makima adds the italic modifier in either case"));
     }
 }
