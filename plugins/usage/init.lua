@@ -63,7 +63,7 @@ local function render(current)
   local height = helpers.modal_height(#lines, size.rows)
   if height ~= current.height then
     current.height = height
-    current.win:set_config({ height = height })
+    current.win:set_config({ height = helpers.modal_window_height(height) })
   end
   local visible, scroll = helpers.viewport(lines, current.scroll, current.height)
   current.scroll = scroll

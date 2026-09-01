@@ -107,6 +107,8 @@ case("close_keys_and_modal_height_are_pure", function()
   eq(h.modal_height(100, 20), 12)
   eq(h.modal_height(3, 100), 3)
   eq(h.modal_height(0, 1), 1)
+  eq(h.modal_window_height(12), 14)
+  eq(h.modal_window_height(3), 5)
 end)
 
 case("modal_lines_include_quota_session_and_recorded_costs", function()

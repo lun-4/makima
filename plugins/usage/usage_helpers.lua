@@ -3,14 +3,19 @@ local M = {}
 local PREFIX = "  "
 local EMPTY = "—"
 local DAY = 24 * 60 * 60
+local MODAL_BORDER_ROWS = 2
 
 function M.is_close_key(key)
   return key == "q" or key == "esc" or key == "ctrl+c"
 end
 
 function M.modal_height(line_count, terminal_rows)
-  local max_height = math.max(1, math.floor(terminal_rows * 0.7) - 2)
+  local max_height = math.max(1, math.floor(terminal_rows * 0.7) - MODAL_BORDER_ROWS)
   return math.max(1, math.min(line_count, max_height))
+end
+
+function M.modal_window_height(content_height)
+  return content_height + MODAL_BORDER_ROWS
 end
 
 local function value_or(value, fallback)
