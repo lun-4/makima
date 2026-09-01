@@ -99,6 +99,21 @@ case("reset_text_routes_absolute_dates_by_style", function()
   eq(calls[2][2], "date")
 end)
 
+case("reset_text_falls_back_to_raw_epoch_for_invalid_timestamp", function()
+  local original = maki.ui.format_time
+  maki.ui.format_time = function()
+    error("timestamp out of range")
+  end
+  local ok, result = pcall(function()
+    return h.reset_text(9223372036854775807, 0)
+  end)
+  maki.ui.format_time = original
+  if not ok then
+    error(result)
+  end
+  eq(result, "Resets 9223372036854776000")
+end)
+
 case("close_keys_and_modal_height_are_pure", function()
   eq(h.is_close_key("q"), true)
   eq(h.is_close_key("esc"), true)
