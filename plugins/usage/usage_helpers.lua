@@ -127,14 +127,14 @@ function M.normalize(state)
 end
 
 local function percentage_style(percentage)
-  local blue = { 0x55, 0xaa, 0xff }
-  local red = { 0xff, 0x55, 0x55 }
+  local blue = { 0x58, 0x96, 0xff }
+  local red = { 0xff, 0x5c, 0x5c }
   local ratio = math.max(0, math.min(100, percentage)) / 100
   local color = string.format(
     "#%02x%02x%02x",
-    math.floor(blue[1] + (red[1] - blue[1]) * ratio + 0.5),
-    math.floor(blue[2] + (red[2] - blue[2]) * ratio + 0.5),
-    math.floor(blue[3] + (red[3] - blue[3]) * ratio + 0.5)
+    math.floor(blue[1] + (red[1] - blue[1]) * ratio),
+    math.floor(blue[2] + (red[2] - blue[2]) * ratio),
+    math.floor(blue[3] + (red[3] - blue[3]) * ratio)
   )
   return color
 end
