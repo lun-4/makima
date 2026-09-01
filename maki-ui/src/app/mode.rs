@@ -159,6 +159,7 @@ impl App {
 
     /// Applies a mode switch, guarding plan-mode invariants (plan path).
     pub(crate) fn set_mode_id(&mut self, id: String) {
+        self.file_completion.close();
         match id.as_str() {
             "build" => {
                 self.state.mode = Mode::Build;

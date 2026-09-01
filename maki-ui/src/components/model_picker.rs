@@ -625,6 +625,6 @@ mod tests {
 
         let entry = p.picker.selected_item().expect("selection after refresh");
         assert_eq!(entry.spec, "zai/glm-5");
-        assert_eq!(entry.section(), Some("Z.AI"));
+        assert_eq!(entry.section(), Some("Recent"));
     }
 }

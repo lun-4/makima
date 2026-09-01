@@ -235,7 +235,8 @@ impl<T: PickerItem> State<T> {
 
     fn update_search_and_clamp(&mut self) {
         self.rebuild_filter();
-        self.clamp_selection();
+        self.selected = 0;
+        self.scroll_offset = 0;
     }
 
     fn move_up(&mut self) {
@@ -1183,6 +1184,18 @@ mod tests {
 
         p.handle_key(key(KeyCode::Char('l')));
         assert_eq!(ready_state(&p).filtered, vec![0]);
+    }
+
+    #[test]
+    fn search_change_resets_selection_to_top_result() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["Alpha", "Beta", "Gamma"]), " Test ");
+        p.handle_key(key(KeyCode::Down));
+        assert_eq!(ready_state(&p).selected, 1);
+
+        p.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(ready_state(&p).selected, 0);
+        assert_eq!(p.selected_item().unwrap().label, "Alpha");
     }
 
     #[test]

@@ -20,11 +20,25 @@ Each reference has a long prefix, a one-letter short form, and a fixed meaning a
 | Subagent | `@subagent:type` | `@a:type` | Becomes `<subagent:type>` in place. The agent delegates the request to a `task` subagent of the given type. |
 | Model | `@model:spec` | `@m:spec` | Becomes `<model:spec>` in place. Paired with a subagent, sets that subagent's model. |
 
-Prefixes are case-insensitive, so `@SKILL:pdf` and `@s:pdf` are the same. A bare `@skill:` with nothing after it is not a reference yet, it is just the popup waiting for you to type.
+Prefixes are case-insensitive, so `@SKILL:pdf` and `@s:pdf` are the same. A bare `@skill:` with nothing after it is not a reference yet. It keeps the popup open while the user types.
+
+An unquoted reference ends at whitespace. Sentence punctuation at the right edge is not part of its value. This applies to `, . ! ? ) ] } " '` and the equivalent full-width characters. For example, `use @skill:pdf,` expands to `use <skill:pdf>,`. Punctuation in the middle of a value remains part of the value.
+
+Single or double quotes preserve spaces and trailing punctuation in a value:
+
+```text
+@"docs/release notes.md"
+@'docs/what next?.md'
+@skill:"release review"
+```
+
+The opening and closing quote must match. Completion adds quotes when an insertion needs them. Unquoted whitespace closes the popup. An unfinished quoted reference stays open across whitespace until completion inserts the matching closing quote.
 
 File references are the odd one out. They are never expanded or stripped. Makima does not inject file contents at submit time. The agent gets the path as text and decides when to read it. This keeps big files out of context until they are actually needed.
 
-Filesystem completion and the file picker use Nucleo for coarse retrieval and the shared matcher for final admission, highlighting, and ranking. Each surface materializes at most 640 coarse results for final matching. Additional coarse results are not ranked and are not guaranteed to appear.
+Project-relative file completion uses the project index. A file value that starts with `~`, `/`, or `.` instead reads one directory at a time. For example, `@~/`, `@/var/`, `@./`, and `@../` list the immediate children of those directories. Selecting a directory keeps the popup open at the next level. Selecting a file completes the reference and closes the popup. Missing or unreadable directories produce no candidates and remain editable.
+
+Project-index completion and the file picker use Nucleo for coarse retrieval and the shared matcher for final admission, highlighting, and ranking. Each surface materializes at most 640 coarse results for final matching. Additional coarse results are not ranked and are not guaranteed to appear.
 
 ## Subagents
 

@@ -689,18 +689,22 @@ fn at_token_spans(
 /// Whether a file reference's path resolves to an existing file or dir:
 /// relative to `cwd`, absolute, or `~`-expanded.
 fn file_ref_exists(cwd: &str, value: &str) -> bool {
-    let path = match value.strip_prefix("~/") {
-        Some(rest) => match maki_storage::paths::home() {
+    let path = if value == "~" {
+        match maki_storage::paths::home() {
+            Some(home) => home,
+            None => return false,
+        }
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        match maki_storage::paths::home() {
             Some(home) => home.join(rest),
             None => return false,
-        },
-        None => {
-            let p = Path::new(value);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                Path::new(cwd).join(p)
-            }
+        }
+    } else {
+        let path = Path::new(value);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            Path::new(cwd).join(path)
         }
     };
     path.is_file() || path.is_dir()
@@ -1449,6 +1453,62 @@ mod tests {
         assert_eq!(spans[1].style, AT_KNOWN_STYLE);
         assert_eq!(spans[3].content, "@nope/missing.rs");
         assert_eq!(spans[3].style, AT_UNKNOWN_STYLE);
+    }
+
+    #[test]
+    fn at_token_spans_cover_quotes_but_exclude_punctuation() {
+        let labels = labels_for(&["skill:release review"]);
+        let spans = at_token_spans(
+            "use @skill:\"release review\", next",
+            "",
+            &labels,
+            AT_KNOWN_STYLE,
+            AT_UNKNOWN_STYLE,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "use ");
+        assert_eq!(spans[1].content, "@skill:\"release review\"");
+        assert_eq!(spans[1].style, AT_KNOWN_STYLE);
+        assert_eq!(spans[2].content, ", next");
+        assert_eq!(spans[2].style, Style::default());
+    }
+
+    #[test]
+    fn at_token_spans_resolve_quoted_file_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("release notes.md"), b"x").unwrap();
+        let labels = labels_for(&[]);
+        let spans = at_token_spans(
+            "read @\"release notes.md\".",
+            tmp.path().to_str().unwrap(),
+            &labels,
+            AT_KNOWN_STYLE,
+            AT_UNKNOWN_STYLE,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[1].content, "@\"release notes.md\"");
+        assert_eq!(spans[1].style, AT_KNOWN_STYLE);
+        assert_eq!(spans[2].content, ".");
+        assert_eq!(spans[2].style, Style::default());
+    }
+
+    #[test]
+    fn at_token_spans_exclude_unquoted_sentence_punctuation() {
+        let labels = labels_for(&["skill:committing"]);
+        let spans = at_token_spans(
+            "use @skill:committing, next",
+            "",
+            &labels,
+            AT_KNOWN_STYLE,
+            AT_UNKNOWN_STYLE,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[1].content, "@skill:committing");
+        assert_eq!(spans[1].style, AT_KNOWN_STYLE);
+        assert_eq!(spans[2].content, ", next");
     }
 
     #[test]
