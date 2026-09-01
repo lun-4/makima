@@ -2,7 +2,7 @@ local helpers = require("usage_helpers")
 
 local REFRESH_SECONDS = 30
 local MODAL_TICK_MS = 500
-local MODAL_WIDTH = "70%"
+local MODAL_WIDTH = "60%"
 local MODAL_HEIGHT = "70%"
 
 local active = false
@@ -59,6 +59,12 @@ local function render(current)
     return
   end
   local lines = helpers.lines(quota_state(), current.session)
+  local size = maki.ui.terminal_size()
+  local height = helpers.modal_height(#lines, size.rows)
+  if height ~= current.height then
+    current.height = height
+    current.win:set_config({ height = height })
+  end
   local visible, scroll = helpers.viewport(lines, current.scroll, current.height)
   current.scroll = scroll
   current.line_count = #lines
@@ -128,7 +134,7 @@ local function open()
       current.height = ev.height
       current.dirty = true
     elseif ev.type == "key" then
-      if ev.key == "q" or ev.key == "esc" then
+      if helpers.is_close_key(ev.key) then
         close_modal(current.generation)
       elseif ev.key == "ctrl+r" then
         refresh_modal(current, true)

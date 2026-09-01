@@ -155,6 +155,7 @@ pub enum Request {
     /// Plugins are loaded, so native codegen may start using idle time. Sent
     /// last so it never interleaves with the loads themselves.
     WarmJit,
+    SetClockFormat(maki_config::ClockFormat),
     LoadSource {
         name: Arc<str>,
         source: String,
@@ -1891,6 +1892,7 @@ impl LuaRuntime {
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(crate::api::usage::UsageMirror::default());
+        lua.set_app_data(maki_config::ClockFormat::default());
         lua.set_app_data(TimerStore::new());
         lua.set_app_data(Store::default());
         lua.set_app_data(SlotStore::default());
@@ -3610,6 +3612,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::CollectPromptSlots { reply } => {
                             let slots = rt.collect_prompt_slots().await;
                             let _ = reply.send(slots);
+                        }
+                        Request::SetClockFormat(format) => {
+                            rt.lua.set_app_data(format);
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));

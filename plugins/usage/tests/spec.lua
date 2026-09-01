@@ -61,9 +61,52 @@ case("compact_status_skips_non_ready_and_percentless_lanes", function()
   })
   eq(#spans, 3)
   eq(spans[1][1], "5h30%")
-  eq(spans[1][2], "accent")
+  eq(spans[1][2], "#8891cc")
   eq(spans[3][1], "w90%")
-  eq(spans[3][2], "error")
+  eq(spans[3][2], "#ee5e66")
+end)
+
+case("status_gradient_has_exact_low_mid_high_colors", function()
+  local spans = h.status_content(ready({
+    { window = { kind = "hours", value = 1 }, percentage = 0 },
+    { window = { kind = "hours", value = 1 }, percentage = 50 },
+    { window = { kind = "hours", value = 1 }, percentage = 100 },
+  }))
+  eq(spans[1][2], "#55aaff")
+  eq(spans[3][2], "#aa80aa")
+  eq(spans[5][2], "#ff5555")
+end)
+
+case("reset_text_routes_absolute_dates_by_style", function()
+  local original = maki.ui.format_time
+  local calls = {}
+  maki.ui.format_time = function(epoch_ms, style)
+    calls[#calls + 1] = { epoch_ms, style }
+    return style
+  end
+  local ok, result = pcall(function()
+    local weekday = h.reset_text(2 * 24 * 60 * 60 * 1000, 0)
+    local date = h.reset_text(8 * 24 * 60 * 60 * 1000, 0)
+    return { weekday, date }
+  end)
+  maki.ui.format_time = original
+  if not ok then
+    error(result)
+  end
+  eq(result[1], "Resets weekday")
+  eq(result[2], "Resets date")
+  eq(calls[1][2], "weekday")
+  eq(calls[2][2], "date")
+end)
+
+case("close_keys_and_modal_height_are_pure", function()
+  eq(h.is_close_key("q"), true)
+  eq(h.is_close_key("esc"), true)
+  eq(h.is_close_key("ctrl+c"), true)
+  eq(h.is_close_key("ctrl+r"), false)
+  eq(h.modal_height(100, 20), 12)
+  eq(h.modal_height(3, 100), 3)
+  eq(h.modal_height(0, 1), 1)
 end)
 
 case("modal_lines_include_quota_session_and_recorded_costs", function()
@@ -83,6 +126,7 @@ case("modal_lines_include_quota_session_and_recorded_costs", function()
     },
     models = {
       { model = "provider/model", input = 10, output = 20, cache_read = 30, cache_creation = 40, cost = 0.25 },
+      { model = "provider/unpriced", input = 1, output = 2, cache_read = 3, cache_creation = 4 },
     },
   }, 1000)
   local all = {}
@@ -91,9 +135,12 @@ case("modal_lines_include_quota_session_and_recorded_costs", function()
   end
   local rendered = table.concat(all, "\n")
   has(rendered, "Anthropic quota")
-  has(rendered, "5-hour usage  30% used  Resets in 1m")
+  has(rendered, "5-hour usage  30% used  Resets in 0 hr 1 min")
   has(rendered, "all models")
+  has(rendered, "cache-read     300")
+  has(rendered, "cache-create     400")
   has(rendered, "$1.235")
+  has(rendered, "—")
   has(rendered, "provider/model")
   has(rendered, "$0.250")
 end)

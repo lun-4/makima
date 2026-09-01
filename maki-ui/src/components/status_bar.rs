@@ -232,19 +232,24 @@ impl StatusBar {
                 let rest_width: usize = rest_spans.iter().map(Span::width).sum();
                 let available = (area.width as usize).saturating_sub(left_width + rest_width);
                 let model_min_width = 8.min(ctx.model_id.width());
-                let plugin_width = available.saturating_sub(model_min_width);
-                if !ctx.suppress_status_content
-                    && let Some(snapshot) = ctx.status_content
-                {
-                    let plugin_spans = status_content_spans(snapshot, plugin_width);
-                    right_spans.extend(plugin_spans);
-                }
-                let used_plugin_width: usize = right_spans.iter().map(Span::width).sum();
-                let model =
-                    truncate_tail(ctx.model_id, available.saturating_sub(used_plugin_width));
+                let plugin_spans = if !ctx.suppress_status_content {
+                    ctx.status_content
+                        .map(|snapshot| {
+                            status_content_spans(
+                                snapshot,
+                                available.saturating_sub(model_min_width),
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let plugin_width: usize = plugin_spans.iter().map(Span::width).sum();
+                let model = truncate_tail(ctx.model_id, available.saturating_sub(plugin_width));
 
                 right_spans.push(Span::styled(model, theme::current().status_dim));
                 right_spans.append(&mut rest_spans);
+                right_spans.extend(plugin_spans);
             }
         }
 
@@ -439,6 +444,62 @@ mod tests {
     const SESSION_COST: f64 = 1.5;
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
+
+    fn render_context(status_content: Option<&StatusContentSnapshot>, width: u16) -> String {
+        let bar = StatusBar::new(FLASH_TTL);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        let status = Status::Idle;
+        let ctx = StatusBarContext {
+            status: &status,
+            mode_label: Cow::Borrowed("build"),
+            mode_style: Style::default(),
+            model_id: MODEL_ID,
+            stats: UsageStats {
+                global_cost: None,
+                context_size: CONTEXT_SIZE,
+                cost: Some(CHAT_COST),
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                show_global: false,
+            },
+            auto_scroll: true,
+            retry_info: None,
+            thinking_label: None,
+            fast: false,
+            workflow: false,
+            restoring: false,
+            status_content,
+            suppress_status_content: false,
+        };
+        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn status_bar_orders_model_context_cost_then_plugin_at_right() {
+        let snapshot = StatusContentSnapshot {
+            entries: vec![(Arc::from("usage"), vec![("PLUGIN".into(), "accent".into())])],
+            generation: 1,
+        };
+        let text = render_context(Some(&snapshot), 120);
+        let model = text.find(MODEL_ID).unwrap();
+        let context = text.find("12.0k/200.0k (6%)").unwrap();
+        let cost = text.find(CHAT_COST_TEXT).unwrap();
+        let plugin = text.find("PLUGIN").unwrap();
+        assert!(model < context && context < cost && cost < plugin, "{text}");
+        assert!(text.trim_end().ends_with("PLUGIN"), "{text}");
+    }
+
+    #[test]
+    fn status_bar_narrow_width_keeps_plugin_and_model_minimum() {
+        let snapshot = StatusContentSnapshot {
+            entries: vec![(Arc::from("usage"), vec![("PLUGIN".into(), "accent".into())])],
+            generation: 1,
+        };
+        let text = render_context(Some(&snapshot), 47);
+        assert!(text.contains("PLUGIN"), "{text}");
+        assert!(text.contains("..-model"), "{text}");
+    }
 
     #[test]
     fn status_content_preserves_authored_span_spacing() {

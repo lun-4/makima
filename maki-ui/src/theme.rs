@@ -440,6 +440,16 @@ pub fn style_by_name(name: &str) -> Style {
         "completion.model" | "completion_model" => {
             t.completion_kinds.get("model").copied().unwrap_or(t.item)
         }
+        _ if let Some(hex) = name.strip_prefix('#')
+            && hex.len() == 6
+            && let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) =>
+        {
+            Style::new().fg(Color::Rgb(r, g, b))
+        }
         _ => Style::default(),
     }
 }
@@ -1516,6 +1526,10 @@ mode_build = "#112233"
         assert_eq!(style_by_name("warning"), t.todo_in_progress);
         assert_eq!(style_by_name("match"), t.item_match);
         assert_eq!(style_by_name("match_selected"), t.item_match_selected);
+        assert_eq!(
+            style_by_name("#12aBcF").fg,
+            Some(Color::Rgb(0x12, 0xab, 0xcf))
+        );
     }
 
     #[test_case("nonexistent_style")]

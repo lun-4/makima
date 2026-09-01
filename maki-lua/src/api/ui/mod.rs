@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use humantime::format_duration;
+use jiff::{Timestamp, tz::TimeZone};
+use maki_config::ClockFormat;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
@@ -140,6 +142,32 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 #[lua_fn]
 fn buf(lua: &Lua) -> LuaResult<buf::BufHandle> {
     Ok(with_task_bufs(lua, |store| store.create_live()))
+}
+
+/// Formats a Unix timestamp as local time using the configured clock.
+///
+/// @param epoch_ms integer Unix timestamp in milliseconds.
+/// @param style string? Output style: `time`, `weekday`, or `date`. Defaults to `time`.
+/// @return (string) Formatted local time.
+#[lua_fn]
+fn format_time(lua: &Lua, epoch_ms: u64, style: Option<String>) -> LuaResult<String> {
+    let format = lua
+        .app_data_ref::<ClockFormat>()
+        .map_or(ClockFormat::System, |f| *f);
+    let ts = Timestamp::from_second((epoch_ms / 1000) as i64)
+        .map_err(|e| mlua::Error::runtime(e.to_string()))?
+        .to_zoned(TimeZone::system());
+    let clock = if matches!(format, ClockFormat::Hour12) {
+        "%-I:%M %p"
+    } else {
+        "%H:%M"
+    };
+    let pattern = match style.as_deref() {
+        Some("weekday") => format!("%a {clock}"),
+        Some("date") => format!("%b %-d, {clock}"),
+        _ => clock.to_owned(),
+    };
+    Ok(ts.strftime(&pattern).to_string())
 }
 
 /// Looks up a semantic color from the current theme. Use this to keep
@@ -614,7 +642,7 @@ lua_table! {
     /// local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
-        buf, theme_color, highlight, markdown, humantime, terminal_size,
+        buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,
         manual set_status_content, manual set_status_hint,
@@ -1509,6 +1537,19 @@ mod tests {
         assert!(store.clear_plugin("aaa"));
         assert!(!store.clear_plugin("aaa"));
         assert_eq!(store.snapshot_entries()[0].0.as_ref(), "zzz");
+    }
+
+    #[test]
+    fn format_time_uses_explicit_clock_formats() {
+        let lua = Lua::new();
+        lua.set_app_data(ClockFormat::Hour12);
+        let ui = create_ui_table(&lua, None, Arc::from("test")).unwrap();
+        let f: mlua::Function = ui.get("format_time").unwrap();
+        let twelve: String = f.call((0_u64, "time")).unwrap();
+        lua.set_app_data(ClockFormat::Hour24);
+        let twenty_four: String = f.call((0_u64, "time")).unwrap();
+        assert!(twelve.contains("AM") || twelve.contains("PM"));
+        assert!(!twenty_four.contains("AM") && !twenty_four.contains("PM"));
     }
 
     #[test]

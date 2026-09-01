@@ -570,6 +570,8 @@ impl<'t> EventLoop<'t> {
             append_system_prompt,
         } = params;
 
+        lua_event_handle.set_clock_format(crate::clock::resolved(ui_config.clock_format));
+
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
         // in-memory name is set, so the user's saved pick survives.

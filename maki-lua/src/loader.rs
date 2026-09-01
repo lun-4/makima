@@ -987,6 +987,10 @@ impl EventHandle {
         });
     }
 
+    pub fn set_clock_format(&self, format: maki_config::ClockFormat) {
+        let _ = self.prio_tx.try_send(Request::SetClockFormat(format));
+    }
+
     pub fn provider_usage_changed(
         &self,
         snapshot: crate::ProviderUsageSnapshot,

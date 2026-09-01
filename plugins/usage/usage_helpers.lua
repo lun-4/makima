@@ -4,6 +4,15 @@ local PREFIX = "  "
 local EMPTY = "—"
 local DAY = 24 * 60 * 60
 
+function M.is_close_key(key)
+  return key == "q" or key == "esc" or key == "ctrl+c"
+end
+
+function M.modal_height(line_count, terminal_rows)
+  local max_height = math.max(1, math.floor(terminal_rows * 0.7) - 2)
+  return math.max(1, math.min(line_count, max_height))
+end
+
 local function value_or(value, fallback)
   if value == nil then
     return fallback
@@ -113,12 +122,16 @@ function M.normalize(state)
 end
 
 local function percentage_style(percentage)
-  if percentage >= 80 then
-    return "error"
-  elseif percentage >= 50 then
-    return "warning"
-  end
-  return "accent"
+  local blue = { 0x55, 0xaa, 0xff }
+  local red = { 0xff, 0x55, 0x55 }
+  local ratio = math.max(0, math.min(100, percentage)) / 100
+  local color = string.format(
+    "#%02x%02x%02x",
+    math.floor(blue[1] + (red[1] - blue[1]) * ratio + 0.5),
+    math.floor(blue[2] + (red[2] - blue[2]) * ratio + 0.5),
+    math.floor(blue[3] + (red[3] - blue[3]) * ratio + 0.5)
+  )
+  return color
 end
 
 function M.status_content(state)
@@ -148,13 +161,16 @@ local function append(lines, text, style)
   lines[#lines + 1] = line(text, style)
 end
 
-local function reset_text(epoch_ms, now)
+function M.reset_text(epoch_ms, now)
   local seconds = math.floor(epoch_ms / 1000)
   local delta = seconds - (now or os.time())
   if delta > 0 and delta < DAY then
-    return "Resets in " .. maki.ui.humantime(delta)
+    local hours = math.floor(delta / 3600)
+    local minutes = math.floor((delta % 3600) / 60)
+    return string.format("Resets in %d hr %d min", hours, minutes)
   end
-  return "Resets " .. os.date("%b %d %H:%M", seconds)
+  local style = delta < 7 * DAY and "weekday" or "date"
+  return "Resets " .. maki.ui.format_time(epoch_ms, style)
 end
 
 local function quota_lines(lines, state, now)
@@ -181,7 +197,7 @@ local function quota_lines(lines, state, now)
         parts[#parts + 1] = "  " .. limit.detail
       end
       if limit.reset_at_ms then
-        parts[#parts + 1] = "  " .. reset_text(limit.reset_at_ms, now)
+        parts[#parts + 1] = "  " .. M.reset_text(limit.reset_at_ms, now)
       end
       append(lines, table.concat(parts))
     end
@@ -196,19 +212,17 @@ local function total_tokens(usage)
 end
 
 local function usage_row(label, usage)
-  local text = string.format(
-    "%s%-18s  in %7s  out %7s  cache %7s  total %7s",
+  return string.format(
+    "%s%-18s  in %7s  out %7s  cache-read %7s  cache-create %7s  total %7s  %6s",
     PREFIX,
     label,
     M.format_tokens(usage.input),
     M.format_tokens(usage.output),
-    M.format_tokens(value_or(usage.cache_read, 0) + value_or(usage.cache_creation, 0)),
-    M.format_tokens(total_tokens(usage))
+    M.format_tokens(value_or(usage.cache_read, 0)),
+    M.format_tokens(value_or(usage.cache_creation, 0)),
+    M.format_tokens(total_tokens(usage)),
+    usage.cost ~= nil and string.format("$%.3f", usage.cost) or EMPTY
   )
-  if usage.cost ~= nil then
-    text = text .. string.format("  $%.3f", usage.cost)
-  end
-  return text
 end
 
 function M.lines(state, session, now)

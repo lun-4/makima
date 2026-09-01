@@ -5135,6 +5135,23 @@ end
 
 ---
 
+### `maki.ui.format_time()` {#maki-ui-format_time}
+
+```lua
+maki.ui.format_time({epoch_ms}, {style?})
+```
+
+Formats a Unix timestamp as local time using the configured clock.
+
+**Parameters:**
+
+- `{epoch_ms}` (`integer`) Unix timestamp in milliseconds.
+- `{style?}` (`string?`) Output style: `time`, `weekday`, or `date`. Defaults to `time`.
+
+**Returns:** (`string`) Formatted local time.
+
+---
+
 ### `maki.ui.highlight()` {#maki-ui-highlight}
 
 ```lua

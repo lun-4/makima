@@ -233,8 +233,8 @@ impl<W> ProviderUsageCoordinator<W> {
         let previous = std::mem::replace(&mut self.provider, provider);
         let mut waiters = self
             .active
-            .as_mut()
-            .map(|active| std::mem::take(&mut active.waiters))
+            .take()
+            .map(|active| active.waiters)
             .unwrap_or_default();
         if let Some(mut pending) = self.pending.take() {
             waiters.append(&mut pending);
@@ -529,12 +529,14 @@ mod tests {
             )]
         );
         assert_eq!(coordinator.provider(), &next);
+        assert_eq!(coordinator.state(), ProviderUsageCoordinatorState::Idle);
         assert_eq!(
-            coordinator.state(),
-            ProviderUsageCoordinatorState::Fetching {
-                active: FIRST_FETCH,
-                follow_up_queued: false,
-            }
+            coordinator.handle(request(
+                next,
+                ProviderUsageRequestKind::Ordinary,
+                THIRD_WAITER,
+            )),
+            vec![start(SECOND_FETCH, next)]
         );
     }
 
@@ -550,20 +552,16 @@ mod tests {
             FIRST_WAITER,
         ));
         coordinator.handle(ProviderUsageInput::Transition { provider: next });
-        assert!(
-            coordinator
-                .handle(request(
-                    next,
-                    ProviderUsageRequestKind::Ordinary,
-                    SECOND_WAITER,
-                ))
-                .is_empty()
-        );
-
         assert_eq!(
-            coordinator.handle(completed(FIRST_FETCH)),
+            coordinator.handle(request(
+                next,
+                ProviderUsageRequestKind::Ordinary,
+                SECOND_WAITER,
+            )),
             vec![start(SECOND_FETCH, next)]
         );
+
+        assert!(coordinator.handle(completed(FIRST_FETCH)).is_empty());
         assert_eq!(
             coordinator.state(),
             ProviderUsageCoordinatorState::Fetching {
