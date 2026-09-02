@@ -95,6 +95,42 @@ fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
     (reg, host)
 }
 
+#[test]
+fn autoresearch_handler_errors_are_reported() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config.names.push("autoresearch".to_owned());
+    host.load_builtins(&config).unwrap();
+
+    assert_eq!(
+        exec_tool(
+            &reg,
+            "research_init",
+            json!({
+                "goal": "reduce latency",
+                "primary_metric": "latency",
+                "direction": "minimize",
+            }),
+        )
+        .unwrap_err(),
+        "switch to autoresearch mode with /autoresearch first"
+    );
+    assert_eq!(
+        exec_tool(&reg, "research_run", json!({})).unwrap_err(),
+        "switch to autoresearch mode with /autoresearch first"
+    );
+    assert_eq!(
+        exec_tool(
+            &reg,
+            "research_log",
+            json!({"status": "discard", "description": "no result"}),
+        )
+        .unwrap_err(),
+        "switch to autoresearch mode with /autoresearch first"
+    );
+}
+
 fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result<String, String> {
     exec_tool_in(reg, name, input, None)
 }
