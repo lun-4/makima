@@ -366,6 +366,7 @@ impl SpawnCtx {
             self.ui_config.tool_output_lines,
             &permissions,
             Some(SessionRef::from(session.id)),
+            session.meta.plugin_data.clone(),
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),

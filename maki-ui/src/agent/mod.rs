@@ -3,6 +3,7 @@ mod cancel_map;
 mod command_router;
 pub(crate) mod shared_queue;
 
+use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +18,7 @@ use maki_agent::{
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
+use serde_json::Value;
 
 use self::cancel_map::new_run_cancel_map;
 use maki_providers::provider::{BoxFuture, Provider};
@@ -238,6 +240,7 @@ impl AgentHandles {
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
         session_id: Option<SessionRef>,
+        plugin_data: HashMap<String, Value>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
@@ -255,6 +258,7 @@ impl AgentHandles {
             mcp_handle,
             mcp_config_errors,
             session_id,
+            plugin_data,
             timeouts,
             lua_handle,
             model_policy,
@@ -329,6 +333,7 @@ impl AgentHandles {
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
             Some(SessionRef::from(app.state.session.id)),
+            app.state.session.meta.plugin_data.clone(),
             self.timeouts,
             lua_handle,
             Arc::clone(&self.model_policy),
@@ -392,6 +397,7 @@ fn spawn_agent_internal(
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     session_id: Option<SessionRef>,
+    plugin_data: HashMap<String, Value>,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
@@ -411,7 +417,7 @@ fn spawn_agent_internal(
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = session_id
         .as_ref()
-        .map(|session_id| SessionMailbox::register(session_id.id()));
+        .map(|session_id| SessionMailbox::register_with_data(session_id.id(), plugin_data));
 
     spawn_command_router(
         cmd_rx,
@@ -577,6 +583,7 @@ mod tests {
             ToolOutputLines::default(),
             &permissions,
             None,
+            HashMap::new(),
             maki_providers::Timeouts::default(),
             EventHandle::disconnected_for_test(),
             None,

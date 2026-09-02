@@ -6,6 +6,7 @@ use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::{Action, LoadedSession};
+use maki_agent::SessionMailbox;
 use maki_agent::agent::estimate_message_tokens;
 use maki_providers::{Model, TokenUsage};
 use maki_storage::id::MakiId;
@@ -131,6 +132,8 @@ impl App {
             thinking: Some(state.thinking.into()),
             fast: state.fast,
             workflow: state.workflow,
+            plugin_data: SessionMailbox::plugin_data_snapshot(state.session.id)
+                .unwrap_or_else(|_| state.session.meta.plugin_data.clone()),
         }
     }
 
