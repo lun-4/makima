@@ -2210,7 +2210,7 @@ fn top_bar_shows_active_chat_running_count_and_cwd() {
         .map_or_else(|| app.status_bar.cwd_branch(), |(_, branch)| branch);
     assert!(bar.contains(branch), "branch shown: {bar}");
     // No per-subagent rows in the bar.
-    assert!(!bar.contains("research"), "no name rows: {bar}");
+    assert!(!bar.contains("↳"), "no subagent badge: {bar}");
 
     // A second running subagent bumps the count.
     app.update(subagent_msg(
