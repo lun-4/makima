@@ -113,6 +113,10 @@ impl SessionMailbox {
         Ok(plugin_data)
     }
 
+    pub fn snapshot_plugin_data(&self) -> HashMap<String, Value> {
+        lock(&self.state).plugin_data.clone()
+    }
+
     fn state(session_id: MakiId) -> Result<Arc<Mutex<State>>, MailboxError> {
         let mut mailboxes = lock(&MAILBOXES);
         let Some(state) = mailboxes.get(&session_id).and_then(Weak::upgrade) else {
