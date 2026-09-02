@@ -3550,6 +3550,53 @@ maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 
 ---
 
+### `maki.session.get_data()` {#maki-session-get_data}
+
+```lua
+maki.session.get_data({session})
+```
+
+Returns this plugin's persisted JSON-compatible data for a live session.
+Plugins cannot read another plugin's data.
+
+**Parameters:**
+
+- `{session}` (`string`) Live session id.
+
+**Returns:** (`any|nil`, `string|nil`) Stored value, nil if unset, or nil and an error.
+
+**Example:**
+
+```lua
+local state, err = maki.session.get_data(session_id)
+```
+
+---
+
+### `maki.session.set_data()` {#maki-session-set_data}
+
+```lua
+maki.session.set_data({session}, {value})
+```
+
+Replaces this plugin's persisted data for a live session. Values must be
+JSON-compatible. Passing nil clears the data.
+
+**Parameters:**
+
+- `{session}` (`string`) Live session id.
+- `{value}` (`any`) JSON-compatible value, or nil to clear.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.set_data(session_id, { run = 3 })
+```
+
+---
+
 ### `maki.session.set_title()` {#maki-session-set_title}
 
 ```lua
