@@ -38,6 +38,31 @@ function M.initialization_command(branch)
   }, "\n")
 end
 
+function M.guarded_command(state, command, require_clean)
+  local expected_branch = M.shell_quote(state.branch)
+  local expected_commit = M.shell_quote(state.accepted_commit)
+  local checks = {
+    "set -eu",
+    "current_branch=$(git branch --show-current)",
+    '[ "$current_branch" = '
+      .. expected_branch
+      .. ' ] || { printf "expected branch %s, found %s\\n" '
+      .. expected_branch
+      .. ' "$current_branch" >&2; exit 1; }',
+    "current_commit=$(git rev-parse HEAD)",
+    '[ "$current_commit" = '
+      .. expected_commit
+      .. ' ] || { printf "expected HEAD %s, found %s\\n" '
+      .. expected_commit
+      .. ' "$current_commit" >&2; exit 1; }',
+  }
+  if require_clean then
+    checks[#checks + 1] = 'test -z "$(git status --porcelain=v1 --untracked-files=all)"'
+  end
+  checks[#checks + 1] = command
+  return table.concat(checks, "\n")
+end
+
 function M.parse_initialization(output)
   local commit = output:match("AUTORESEARCH_COMMIT=([0-9a-fA-F]+)")
   if not commit then

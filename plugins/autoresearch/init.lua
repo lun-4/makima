@@ -9,7 +9,6 @@ local NANOS_PER_SECOND = 1_000_000_000
 local STATE_VERSION = 1
 
 local sessions = {}
-local verified_sessions = {}
 local focused_session
 
 local opts = maki.api.register_options({
@@ -160,24 +159,22 @@ local function finish_loop(summary, reason)
   return summary .. "\n" .. reason .. "; returned to build mode."
 end
 
-local function resume_session(ctx, sid)
+local function resume_session(ctx, sid, require_clean)
   local state, load_error = load_session(sid)
-  if not state or verified_sessions[sid] then
+  if not state then
     return state, load_error
   end
-  local command = "git rev-parse --verify --quiet "
-    .. helpers.shell_quote(state.accepted_commit .. "^{commit}")
-    .. ' >/dev/null && test "$(git branch --show-current)" = '
-    .. helpers.shell_quote(state.branch)
+  local command = helpers.guarded_command(state, ":", require_clean and state.pending == nil)
   local _, verify_error = run_git(ctx, command, "Verify autoresearch state")
   if verify_error then
     return nil,
-      "stored autoresearch state does not match the current Git branch; switch to "
+      "autoresearch state does not match the current Git checkout; restore branch "
         .. state.branch
+        .. " at "
+        .. state.accepted_commit
         .. " and retry: "
         .. verify_error
   end
-  verified_sessions[sid] = true
   repaint_status(sid, state)
   return state
 end
@@ -272,7 +269,6 @@ maki.api.register_command({
         return
       end
       sessions[sid] = nil
-      verified_sessions[sid] = nil
       maki.ui.set_status_content({})
       maki.ui.flash("autoresearch state reset")
       return
@@ -322,7 +318,7 @@ maki.api.register_tool({
     if not sid then
       return fail(session_error)
     end
-    local existing, resume_error = resume_session(ctx, sid)
+    local existing, resume_error = resume_session(ctx, sid, true)
     if resume_error then
       return fail(resume_error)
     end
@@ -366,7 +362,6 @@ maki.api.register_tool({
       best_metric = nil,
       pending = nil,
     }
-    verified_sessions[sid] = true
     local persisted, persist_error = persist_session(sid, state)
     if not persisted then
       return fail("could not persist autoresearch state: " .. persist_error)
@@ -503,8 +498,11 @@ maki.api.register_tool({
       if pending.error then
         return tool_error("a failed benchmark cannot be kept")
       end
-      local status, status_error =
-        run_git(ctx, "git status --porcelain=v1 --untracked-files=all", "Inspect experiment changes")
+      local status, status_error = run_git(
+        ctx,
+        helpers.guarded_command(state, "git status --porcelain=v1 --untracked-files=all", false),
+        "Inspect experiment changes"
+      )
       if not status then
         return tool_error(status_error)
       end
@@ -520,8 +518,9 @@ maki.api.register_tool({
           pending.primary,
           state.accepted_metric
         )
-        local _, commit_error =
-          run_git(ctx, "git add -A && git commit -m " .. helpers.shell_quote(message), "Commit accepted experiment")
+        local command =
+          helpers.guarded_command(state, "git add -A && git commit -m " .. helpers.shell_quote(message), false)
+        local _, commit_error = run_git(ctx, command, "Commit accepted experiment")
         if commit_error then
           return tool_error(commit_error)
         end
@@ -539,7 +538,11 @@ maki.api.register_tool({
       end
       state.accepted_metric = pending.primary
     else
-      local command = "git reset --hard " .. helpers.shell_quote(state.accepted_commit) .. " && git clean -fd"
+      local command = helpers.guarded_command(
+        state,
+        "git reset --hard " .. helpers.shell_quote(state.accepted_commit) .. " && git clean -fd",
+        false
+      )
       local _, rollback_error = run_git(ctx, command, "Roll back rejected experiment")
       if rollback_error then
         return tool_error("rollback failed; pending run retained for retry: " .. rollback_error)

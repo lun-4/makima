@@ -26,6 +26,19 @@ case("initialization_is_one_shell_transaction", function()
   assert(command:find('printf "AUTORESEARCH_COMMIT=%%s\\n"'))
 end)
 
+case("guarded_command_checks_branch_head_and_cleanliness", function()
+  local command = helpers.guarded_command({
+    branch = "autoresearch/parser",
+    accepted_commit = "abc123",
+  }, "git reset --hard 'abc123'", true)
+  assert(command:find("git branch --show-current", 1, true))
+  assert(command:find("autoresearch/parser", 1, true))
+  assert(command:find("git rev-parse HEAD", 1, true))
+  assert(command:find("abc123", 1, true))
+  assert(command:find("git status --porcelain=v1 --untracked-files=all", 1, true))
+  assert(command:find("git reset --hard 'abc123'", 1, true))
+end)
+
 case("parse_initialization_commit", function()
   local commit, err = helpers.parse_initialization("AUTORESEARCH_COMMIT=abc123\nExit code: 0")
   eq(err, nil)
