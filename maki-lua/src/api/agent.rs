@@ -461,8 +461,9 @@ async fn call_tool(
 }
 
 /// Run the normal interactive permission prompt for a tool call, without
-/// dispatching the tool. This is how a plugin escalates a classifier deny to
-/// the same allow/deny/remember choices a user would see with automode off.
+/// dispatching the tool. This is how a plugin escalates a classifier deny or
+/// failure to the same allow/deny/remember choices a user would see with
+/// automode off.
 /// Allow and deny rules apply exactly as they do for a plain tool call.
 ///
 /// @param ctx LuaCtx Agent context.
@@ -526,7 +527,7 @@ async fn permission_prompt(
 }
 
 /// Whether this session is in YOLO mode, where permission prompts are skipped
-/// and the bash automode classifier's deny is final (no escalation).
+/// and the bash automode classifier's deny or failure is final (no escalation).
 ///
 /// YOLO toggles at runtime (`/yolo`, `--yolo`), so query it per call rather
 /// than caching it.
