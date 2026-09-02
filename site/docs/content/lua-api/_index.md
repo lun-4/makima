@@ -3315,8 +3315,8 @@ end
 ## maki.session {#maki-session}
 
 Host session primitives. The interactive UI can run several sessions
-at once; these functions let plugins list, create, focus, rename, and
-delete them. Session management returns `nil, "no interactive UI
+at once; these functions let plugins list, create, focus, configure,
+rename, and delete them. Session management returns `nil, "no interactive UI
 attached"` without a UI. `notify` instead targets a live agent mailbox
 directly, so it also works under ACP and SDK frontends.
 
@@ -3443,6 +3443,29 @@ the current directory and must not be open in another terminal.
 
 ```lua
 local _, err = maki.session.focus(id)
+```
+
+---
+
+### `maki.session.set_mode()` {#maki-session-set_mode}
+
+```lua
+maki.session.set_mode({id}, {mode})
+```
+
+Changes the active mode of a live session without focusing it.
+
+**Parameters:**
+
+- `{id}` (`string`) Live session id.
+- `{mode}` (`string`) Mode id ("build", "plan", or a custom name).
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.session.set_mode(id, "build")
 ```
 
 ---
