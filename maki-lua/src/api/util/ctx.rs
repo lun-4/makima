@@ -184,6 +184,13 @@ impl LuaCtx {
         }
     }
 
+    fn mode(&self) -> Option<String> {
+        match &self.caps {
+            Caps::Handler { agent, .. } => Some(agent.mode.id().key().to_owned()),
+            Caps::Start { .. } | Caps::Restore { .. } => None,
+        }
+    }
+
     /// Outer `None` means the kind has no session at all, inner `None`
     /// means this run has one but it is not tied to a session.
     fn session_id(&self) -> Option<Option<&SessionRef>> {
@@ -248,6 +255,13 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("audience"));
             };
             Ok((Some(audience.name().unwrap_or("main").to_string()), None))
+        });
+
+        methods.add_method("mode", |_, this, ()| {
+            let Some(mode) = this.mode() else {
+                return Ok(this.cap_err_pair("mode"));
+            };
+            Ok((Some(mode), None))
         });
 
         // The session that called this tool, which under concurrent
@@ -555,6 +569,17 @@ mod tests {
             LuaCtx::handler(&ctx).session_id(),
             Some(None),
             "a sessionless run still has the capability, so lua sees nil without an error"
+        );
+    }
+
+    #[test]
+    fn mode_reaches_handler_without_ui_roundtrip() {
+        let ctx = populated_ctx();
+        assert_eq!(LuaCtx::handler(&ctx).mode(), Some("build".to_owned()));
+        assert_eq!(
+            LuaCtx::start(&ctx).mode(),
+            None,
+            "start cannot dispatch and does not need the active mode"
         );
     }
 
