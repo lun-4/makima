@@ -1247,6 +1247,8 @@ impl Drop for LuaSession {
 /// tools).
 ///
 /// @param message string User message to send.
+/// @param opts table? Optional fields:
+///   `timeout` (integer?) - maximum wait in seconds. A timeout closes the session.
 /// @return (table?, string?) Result table on success, or `(nil, err)` on
 /// failure. A run cut short after streaming some text hands you both: the
 /// error and a `{ text = <what it streamed> }` table.
@@ -1260,15 +1262,45 @@ async fn prompt(
     lua: Lua,
     this: mlua::UserDataRef<LuaSession>,
     message: String,
+    opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let input_tx = this.input_tx.clone();
     let state = Arc::clone(&this.state);
+    let parent_cancels = Arc::clone(&this.parent_cancels);
+    let id = this.id.clone();
+    let cancel_slot = this.cancel_slot;
+    let timeout = opts
+        .map(|opts| opts.get::<Option<u64>>("timeout"))
+        .transpose()?
+        .flatten();
+    if timeout == Some(0) {
+        return Ok(err_pair("timeout must be greater than zero"));
+    }
     drop(this);
     let (reply_tx, reply_rx) = flume::bounded(1);
     if let Err(error) = admit_turn(&input_tx, &state, message, Some(reply_tx)) {
         return Ok((None, Some(error)));
     }
-    match reply_rx.recv_async().await {
+    let reply = match timeout {
+        Some(seconds) => {
+            let result =
+                futures_lite::future::race(async { Some(reply_rx.recv_async().await) }, async {
+                    smol::Timer::after(Duration::from_secs(seconds)).await;
+                    None
+                })
+                .await;
+            let Some(result) = result else {
+                state.lock().unwrap().close();
+                parent_cancels.retire(&id, cancel_slot);
+                return Ok(err_pair(format!(
+                    "session prompt timed out after {seconds}s"
+                )));
+            };
+            result
+        }
+        None => reply_rx.recv_async().await,
+    };
+    match reply {
         Err(_) => Ok((None, Some(SESSION_CLOSED_ERR.to_owned()))),
         Ok(result) => build_prompt_result(&lua, result),
     }
