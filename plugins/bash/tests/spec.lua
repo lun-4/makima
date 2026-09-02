@@ -11,8 +11,9 @@ local CLASSIFIER_SYSTEM = require("auto_classifier_prompt")
 -- fake records every opts/call it sees so tests can assert wiring.
 local function fake_session(spawn_log, result, prompt_err)
   return {
-    prompt = function(_self, message)
+    prompt = function(_self, message, opts)
       spawn_log.message = message
+      spawn_log.prompt_opts = opts
       return result, prompt_err
     end,
     close = function() end,
@@ -30,12 +31,13 @@ local function fake_spawn(spawn_log, result, prompt_err)
   end
 end
 
-local OPT = { auto_model = "test/model", auto_mode = true }
+local OPT = { auto_model = "test/model", auto_mode = true, auto_timeout_secs = 17 }
 
 case("defaults_off", function()
   local d = bh.defaults()
   eq(d.auto_mode, false)
   eq(d.auto_model, nil, "no default model: unset means inherit the session model")
+  eq(d.auto_timeout_secs, 30)
 end)
 
 case("toggle_state", function()
@@ -100,6 +102,7 @@ case("classify_verdict_approve_runs_spawn", function()
   eq(reason, "ok")
   eq(err, nil)
   eq(log.called, 1, "trivial command is still gated: spawn must be called")
+  eq(log.prompt_opts.timeout, 17)
 end)
 
 case("classify_verdict_deny", function()

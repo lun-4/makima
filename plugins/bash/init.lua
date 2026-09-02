@@ -268,6 +268,11 @@ local opts = maki.api.register_options(output_limits.extend({
     type = "string",
     desc = "Model spec for the bash auto-mode classifier. Unset: inherits the current session model.",
   },
+  auto_timeout_secs = {
+    default = 30,
+    min = 5,
+    desc = "Stop the auto-mode classifier after this many seconds and fall back to normal permission handling.",
+  },
 }))
 
 bh.set_auto_mode(opts.auto_mode)
