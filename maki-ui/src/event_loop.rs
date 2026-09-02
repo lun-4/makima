@@ -1563,6 +1563,18 @@ impl<'t> EventLoop<'t> {
                     .map(|()| json!(true));
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::SetMode { id, mode } => {
+                let reply = parse_session_id(&id)
+                    .and_then(|id| {
+                        self.position(id)
+                            .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
+                    })
+                    .map(|index| {
+                        self.sessions[index].app.set_mode_id(mode);
+                        json!(true)
+                    });
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
                 let reply = (|| {

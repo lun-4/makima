@@ -106,6 +106,27 @@ async fn focus(
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
 }
 
+/// Changes the active mode of a live session without focusing it.
+///
+/// @param id string Live session id.
+/// @param mode string Mode id ("build", "plan", or a custom name).
+/// @return (boolean|nil, string|nil) true on success, or nil and an error.
+/// @example
+/// local _, err = maki.session.set_mode(id, "build")
+#[lua_fn]
+async fn set_mode(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    id: String,
+    mode: String,
+) -> LuaResult<Pair<Value>> {
+    let mode = match crate::api::mode::resolve_mode(&lua, mode)? {
+        Ok(mode) => mode,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await
+}
+
 /// Deletes a session and its stored history, cancelling it first if it
 /// is running. The focused session cannot be deleted.
 ///
@@ -305,12 +326,12 @@ async fn set_thinking(
 
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
-    /// at once; these functions let plugins list, create, focus, rename, and
-    /// delete them. Session management returns `nil, "no interactive UI
+    /// at once; these functions let plugins list, create, focus, configure,
+    /// rename, and delete them. Session management returns `nil, "no interactive UI
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(plugin: Arc<str>, tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), get_data(plugin), set_data(plugin), set_title(tx), thinking(tx), set_thinking(tx)]
+    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), focus(tx), set_mode(tx), delete(tx), new(tx), prompt(tx), notify(), get_data(plugin), set_data(plugin), set_title(tx), thinking(tx), set_thinking(tx)]
 }
 
 #[cfg(test)]
@@ -323,6 +344,7 @@ mod tests {
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
+        lua.set_app_data(Arc::new(maki_agent::ModeRegistry::builtin()));
         let t = create_session_table(&lua, Arc::from("test"), tx).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
@@ -416,6 +438,32 @@ mod tests {
             smol::block_on(lua.load("return session.focus('abc')").eval_async()).unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
+    }
+
+    #[test]
+    fn set_mode_targets_the_requested_session() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::SetMode { id, mode },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected set mode request");
+            };
+            assert_eq!(id, "background");
+            assert_eq!(mode, "build");
+            reply_tx.send(Ok(json!(true))).unwrap();
+        });
+        let (value, error): (bool, Option<String>) = smol::block_on(
+            lua.load("return session.set_mode('background', 'build')")
+                .eval_async(),
+        )
+        .unwrap();
+        checker.join().unwrap();
+        assert!(value);
+        assert_eq!(error, None);
     }
 
     #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]
