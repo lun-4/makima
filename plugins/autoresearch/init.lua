@@ -113,9 +113,6 @@ local function tool_error(message, body)
 end
 
 local function repaint_status(sid, state)
-  if not focused_session then
-    focused_session = sid
-  end
   if focused_session == sid then
     maki.ui.set_status_content(helpers.status_content(state))
   end
@@ -150,12 +147,17 @@ local function persist_session(sid, state)
   return true
 end
 
-local function finish_loop(summary, reason)
-  local switched, switch_error = maki.api.mode.set("build")
+local function finish_loop(sid, summary, reason)
+  local switched, switch_error = maki.session.set_mode(sid, "build")
   if not switched then
     return summary .. "\n" .. reason .. "; could not return to build mode: " .. switch_error
   end
-  maki.ui.set_status_content({})
+  local cleared, clear_error = maki.session.set_data(sid, nil)
+  if not cleared then
+    return summary .. "\n" .. reason .. "; returned to build mode but could not clear state: " .. clear_error
+  end
+  sessions[sid] = nil
+  repaint_status(sid, nil)
   return summary .. "\n" .. reason .. "; returned to build mode."
 end
 
@@ -556,10 +558,10 @@ maki.api.register_tool({
     end
     local summary = string.format("Run #%d %s: %s", pending.run, input.status, input.description)
     if state.run_count >= state.max_iterations then
-      return finish_loop(summary, "Maximum iterations reached")
+      return finish_loop(sid, summary, "Maximum iterations reached")
     end
     if input.continue_loop == false then
-      return finish_loop(summary, "Autoresearch stopped")
+      return finish_loop(sid, summary, "Autoresearch stopped")
     end
 
     local notified, notify_error = maki.session.notify(CONTINUE_PROMPT, { session = sid, wake = true })
