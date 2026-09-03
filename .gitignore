@@ -7,3 +7,4 @@ runs.csv
 /.playwright-mcp/
 /result
 .ssh/
+AGENTS.local.md
