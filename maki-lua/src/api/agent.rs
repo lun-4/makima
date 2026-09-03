@@ -2,13 +2,16 @@
 //! validation, concurrency) lives in the task plugin, not here.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
+use maki_agent::actor::{
+    ActorBackend, ActorLifecycle, ActorStatus, BackendResult, TurnContext, WorkKind,
+};
 use maki_agent::agent::tool_dispatch::{self, Emit};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::tools::interpreter_bridge;
@@ -19,20 +22,22 @@ use maki_agent::tools::{
     ToolAudience, ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, SubagentInfo, ToolDoneEvent,
-    TurnCancellationReason, TurnId, TurnOutcome,
+    Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
+    AgentRunParams, EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession,
+    SubagentCancel, SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId, TurnOutcome,
 };
 use maki_config::ToolKey;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
-use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost};
+use maki_providers::{
+    ContentBlock, Message, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost,
+};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::api::r#async::LuaSemaphore;
 use crate::api::ui::buf::BufHandle;
@@ -70,92 +75,278 @@ async fn build_session_provider(
     }
 }
 
-/// Observable phase of a subagent run, read by `status()`.
-enum SubagentStatus {
-    Running,
-    Done(Box<SubagentRunResult>),
-    Closed,
-}
-
-/// Terminal result of one subagent message, surfaced by `status()`/`prompt`.
+/// The actor lifecycle is the session lifecycle, and the actor's retained
+/// outcomes are the outcome truth. `AdapterResult` is presentation storage
+/// only, keyed by [`TurnId`]; it never arbitrates lifecycle or outcomes.
 #[derive(Clone)]
-struct SubagentRunResult {
+struct AdapterResult {
     text: String,
     captured: Option<JsonValue>,
-    usage: TokenUsage,
     error: Option<String>,
-    outcome: TurnOutcome,
 }
 
-struct SessionState {
-    agent_id: AgentId,
-    closed: bool,
-    pending: usize,
-    status: SubagentStatus,
-    waiters: HashMap<TurnId, flume::Sender<SubagentRunResult>>,
-    accepted: HashSet<TurnId>,
-    active: Option<TurnId>,
-    finalized: HashSet<TurnId>,
+/// Shared backend state, owned by the adapter and cloned into the actor's
+/// backend. Runs are transient: the [`actor::Runner`](maki_agent::actor) owns
+/// the [`History`], while every per-session capability that must outlive a
+/// run (MCP, answer channels, UI identity, cancel wiring) lives here.
+///
+/// Writes happen inside [the `ActorBackend::run_turn` future]
+/// (`LuaActorBackend`), which can only borrow `&mut self`, so every field is
+/// a `Mutex`/`Sender`/`OnceLock` the borrowed shell can touch. `prompt` and
+/// `status` never read through this struct; they speak to the actor handle.
+struct LuaActorState {
+    params: AgentParams,
+    system: String,
+    tools: JsonValue,
+    thinking: ThinkingConfig,
+    fast: bool,
+    mcp: Option<McpSession>,
+    chip_event_tx: EventSender,
+    child_cancel: CancelToken,
+    answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
+    answer_tx: Option<flume::Sender<String>>,
+    ui_id: String,
+    parent_event_tx: EventSender,
+    input_tx: flume::Sender<String>,
+    cancel: SubagentCancel,
+    subagent_info: Arc<OnceLock<SubagentInfo>>,
+    local_tools: LocalTools,
+    name: String,
+    commit: Arc<Mutex<Option<JsonValue>>>,
+    semaphore: Option<Arc<async_lock::Semaphore>>,
+    start: Instant,
+    /// Set only after the adapter backend has actually entered a turn. A
+    /// queued admission never sets it, so close cannot mistake queued work for
+    /// an executed transcript.
+    execution_started: std::sync::atomic::AtomicBool,
+    /// Prevents close/drop from duplicating the latest terminal relay.
+    history_relayed: std::sync::atomic::AtomicBool,
+    relay_snapshot: Mutex<Vec<Message>>,
+    presentation: Mutex<HashMap<TurnId, AdapterResult>>,
 }
 
-impl SessionState {
-    fn new(agent_id: AgentId) -> Self {
-        Self {
-            agent_id,
-            closed: false,
-            pending: 0,
-            status: SubagentStatus::Running,
-            waiters: HashMap::new(),
-            accepted: HashSet::new(),
-            active: None,
-            finalized: HashSet::new(),
+impl LuaActorState {
+    fn init_subagent_info(&self, first_message: &str) {
+        if self.subagent_info.get().is_none() {
+            let _ = self.subagent_info.set(SubagentInfo {
+                parent_tool_use_id: self.ui_id.clone(),
+                name: self.name.clone(),
+                prompt: Some(first_message.to_owned()),
+                model: Some(self.params.model.spec()),
+                answer_tx: self.answer_tx.clone(),
+                input_tx: Some(self.input_tx.clone()),
+                cancel: Some(self.cancel.clone()),
+            });
         }
     }
 
-    fn finalize(&mut self, turn_id: TurnId, result: SubagentRunResult) {
-        if !self.accepted.remove(&turn_id) || !self.finalized.insert(turn_id) {
+    fn relay_history(&self, history: &History) {
+        self.execution_started
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.history_relayed
+            .store(false, std::sync::atomic::Ordering::Release);
+        *self.relay_snapshot.lock().unwrap() = history.as_slice().to_vec();
+        self.relay_snapshot_if_pending();
+    }
+
+    /// Close-time fallback: emit an existing transcript exactly once, but
+    /// never an empty snapshot or one belonging to queued-only work.
+    fn relay_snapshot_if_pending(&self) {
+        if self
+            .history_relayed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
-        if self.active == Some(turn_id) {
-            self.active = None;
+        let messages = self.relay_snapshot.lock().unwrap().clone();
+        if messages.is_empty() {
+            self.history_relayed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
         }
-        self.pending -= 1;
-        if let Some(waiter) = self.waiters.remove(&turn_id) {
-            let _ = waiter.send(result.clone());
-        }
-        self.status = if self.closed {
-            SubagentStatus::Closed
-        } else if self.pending == 0 {
-            SubagentStatus::Done(Box::new(result))
-        } else {
-            SubagentStatus::Running
+        let event = AgentEvent::SubagentHistory {
+            tool_use_id: self.ui_id.clone(),
+            messages,
+        };
+        let _ = match self.subagent_info.get() {
+            Some(subagent) => self.parent_event_tx.send_envelope(Envelope {
+                event,
+                subagent: Some(subagent.clone()),
+                run_id: self.parent_event_tx.run_id(),
+            }),
+            None => self.parent_event_tx.send(event),
         };
     }
 
-    fn close(&mut self) {
-        if self.closed {
-            return;
+    /// Idempotent close: retire the actor, resolving queued/parked waiters as
+    /// Closed and rejecting later work. An executing backend relays its own
+    /// transcript when it settles; close never races it with a stale fallback.
+    fn close_with(&self, actor: &AgentActorHandle) {
+        actor.close();
+        if !self
+            .execution_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.relay_snapshot_if_pending();
         }
-        self.closed = true;
-        let turn_ids = self
-            .accepted
-            .iter()
-            .copied()
-            .filter(|turn_id| Some(*turn_id) != self.active)
-            .collect::<Vec<_>>();
-        for turn_id in turn_ids {
-            self.finalize(
-                turn_id,
-                cancelled_result(
-                    self.agent_id,
-                    turn_id,
-                    TokenUsage::default(),
-                    TurnCancellationReason::Closed,
-                ),
-            );
-        }
-        self.status = SubagentStatus::Closed;
     }
+
+    /// Commits the per-turn presentation result. Actor outcomes and the
+    /// snapshot remain authoritative; this is history-relay/status decoration.
+    fn present_result(&self, turn_id: TurnId, result: AdapterResult) {
+        self.presentation.lock().unwrap().insert(turn_id, result);
+    }
+}
+
+/// The actor backend for one Lua session. Thin `&mut self` shell over the
+/// shared [`LuaActorState`] so the boxed `run_turn` future stays `Send`.
+struct LuaActorBackend {
+    state: Arc<LuaActorState>,
+}
+
+impl LuaActorBackend {
+    fn new(state: Arc<LuaActorState>) -> Self {
+        Self { state }
+    }
+}
+
+impl ActorBackend for LuaActorBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        context: TurnContext,
+        input: AgentInput,
+        _work: WorkKind,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            let state = &*self.state;
+            state
+                .execution_started
+                .store(true, std::sync::atomic::Ordering::Release);
+            // The chip sender drives the parent relay: it is the only handle
+            // keeping `sub_tx` alive, and `Agent::run` emits through it.
+            let event_tx = state.chip_event_tx.clone();
+            let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
+            state.init_subagent_info(&input.message);
+            info!(
+                agent_id = %context.agent_id,
+                %turn_id,
+                "lua actor turn"
+            );
+            // The semaphore gates the turn, racing close/shutdown so a blocked
+            // acquire cannot strand after the actor closes. The permit is
+            // dropped on every path; a race loss yields an EnteredRun Cancelled
+            // (the outcome truth), never a dead actor.
+            let permit = match &state.semaphore {
+                Some(semaphore) => {
+                    let semaphore = Arc::clone(semaphore);
+                    let cancel = context.cancel.clone();
+                    match cancel.race(semaphore.acquire_arc()).await {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            let cancelled = TurnOutcome::Cancelled {
+                                agent_id: context.agent_id,
+                                turn_id,
+                                usage: TokenUsage::default(),
+                                num_turns: 0,
+                                reason: context
+                                    .cancel_reason
+                                    .reason()
+                                    .unwrap_or(TurnCancellationReason::User),
+                            };
+                            let text = latest_assistant_text(history);
+                            state.relay_history(history);
+                            state.present_result(
+                                turn_id,
+                                AdapterResult {
+                                    text,
+                                    captured: state.commit.lock().unwrap().take(),
+                                    error: Some(CANCELLED_MSG.to_owned()),
+                                },
+                            );
+                            return BackendResult::EnteredRun(cancelled);
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            let mut agent = Agent::new(
+                state.params.clone(),
+                AgentRunParams {
+                    history,
+                    system: state.system.clone(),
+                    event_tx,
+                    tools: state.tools.clone(),
+                },
+            )
+            .with_user_response_rx(Arc::clone(&state.answer_rx))
+            .with_cancel(context.cancel.clone())
+            .with_cancel_reason_source(context.cancel_reason.clone())
+            .with_mcp(state.mcp.clone())
+            .with_local_tools(Arc::clone(&state.local_tools));
+            let outcome = agent.run(turn_id, input).await;
+            drop(agent);
+            drop(permit);
+
+            let text = latest_assistant_text(history);
+            let error = match &outcome {
+                TurnOutcome::Completed { .. } => None,
+                TurnOutcome::Failed { failure, .. } => Some(failure.diagnostic.clone()),
+                TurnOutcome::Cancelled { .. } => Some(CANCELLED_MSG.to_owned()),
+            };
+            // Actor cumulative usage is the total source for status/prompt totals.
+            state.relay_history(history);
+            state.present_result(
+                turn_id,
+                AdapterResult {
+                    text,
+                    captured: state.commit.lock().unwrap().take(),
+                    error,
+                },
+            );
+            BackendResult::EnteredRun(outcome)
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _history: &'a mut History,
+        _context: TurnContext,
+        control: &'a maki_agent::ControlWork,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        // Lua sessions admit turns only; standalone controls never reach here.
+        Box::pin(async move {
+            warn!(control = %control.name, "unexpected control for Lua session backend");
+            BackendResult::ControlFailed
+        })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _history: &'a mut History,
+        _context: TurnContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        // Lua sessions admit turns only; compacts are a TUI-run concern.
+        Box::pin(async move {
+            warn!("unexpected compact for Lua session backend");
+            BackendResult::CompactDone
+        })
+    }
+}
+
+fn latest_assistant_text(history: &History) -> String {
+    history
+        .as_slice()
+        .iter()
+        .rfind(|m| matches!(m.role, Role::Assistant))
+        .and_then(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER => Some(text.as_str()),
+                _ => None,
+            })
+        })
+        .map_or_else(String::new, str::to_owned)
 }
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
@@ -699,7 +890,7 @@ async fn session(
     };
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
-    let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
+    let chip_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
 
@@ -722,9 +913,9 @@ async fn session(
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
-    // The subagent's cancel is independent of the parent run's cancel: it is
-    // triggered only through the shared `subagent_cancels` map (task_despawn,
-    // CancelSubagent, global CancelAll). Deriving it from `agent_ctx.cancel`
+    // The subagent's permanent close is independent of the parent run's cancel:
+    // it is triggered only through the shared `subagent_cancels` map
+    // (`task_despawn` and global cancellation). Deriving it from `agent_ctx.cancel`
     // (the run's token, which the UI fires at normal run end by dropping the
     // run's CancelTrigger) would close every in-flight subagent as soon as the
     // spawning run finishes.
@@ -738,33 +929,42 @@ async fn session(
     let name = name.unwrap_or_default();
     info!(name = %name, model = %model.id, "subagent session opened");
 
-    let (input_tx, input_rx) = flume::unbounded::<TurnInput>();
+    // UI input relay: tab submits from the parent dispatch into this session.
+    // Each message is admitted to the actor as its own turn (no second FIFO;
+    // the actor's queue is the FIFO).
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let agent_id = AgentId::generate();
-    let state = Arc::new(Mutex::new(SessionState::new(agent_id)));
-
-    let driver = SubagentDriver {
+    let params = AgentParams {
         agent_id,
-        params: AgentParams {
-            agent_id,
-            provider,
-            model: model.clone(),
-            config: agent_ctx.config.clone(),
-            tool_output_lines: maki_config::ToolOutputLines::default(),
-            permissions: Arc::clone(&agent_ctx.permissions),
-            session_id: agent_ctx.session_id.clone(),
-            mailbox: None,
-            timeouts: agent_ctx.timeouts,
-            file_tracker: FileReadTracker::fresh(),
-            prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
-            modes: Arc::clone(&agent_ctx.modes),
-            subagent_cancels: Arc::new(CancelMap::new()),
-            registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
-            audience,
-            question_mode: agent_ctx.question_mode,
-            model_policy: Arc::clone(&agent_ctx.model_policy),
-            file_write_locks: Arc::clone(&agent_ctx.file_write_locks),
-        },
+        provider,
+        model,
+        config: agent_ctx.config.clone(),
+        tool_output_lines: maki_config::ToolOutputLines::default(),
+        permissions: Arc::clone(&agent_ctx.permissions),
+        session_id: agent_ctx.session_id.clone(),
+        mailbox: None,
+        timeouts: agent_ctx.timeouts,
+        file_tracker: FileReadTracker::fresh(),
+        prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
+        modes: Arc::clone(&agent_ctx.modes),
+        subagent_cancels: Arc::new(CancelMap::new()),
+        registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+        audience,
+        question_mode: agent_ctx.question_mode,
+        model_policy: Arc::clone(&agent_ctx.model_policy),
+        file_write_locks: Arc::clone(&agent_ctx.file_write_locks),
+    };
+    let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
+    let cancel = SubagentCancel::new({
+        let cancel_actor = Arc::clone(&cancel_actor);
+        move || {
+            if let Some(actor) = cancel_actor.lock().unwrap().as_ref() {
+                actor.cancel_all();
+            }
+        }
+    });
+    let state = Arc::new(LuaActorState {
+        params,
         system: system.unwrap_or_default(),
         tools: tools_json,
         thinking,
@@ -774,42 +974,91 @@ async fn session(
             .as_ref()
             .filter(|_| mcp_enabled)
             .map(McpSession::fresh),
-        history: History::new(Vec::new()),
-        sub_event_tx,
+        chip_event_tx,
         child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
-        parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         ui_id: ui_id.clone(),
-        cancel_slot,
-        parent_event_tx: parent_tx.clone(),
+        parent_event_tx: parent_tx,
+        input_tx: ui_input_tx.clone(),
+        cancel,
         subagent_info: Arc::clone(&subagent_info),
-        ui_input_tx: ui_input_tx.clone(),
         local_tools: Arc::new(local_map),
         name: name.clone(),
-        usage: TokenUsage::default(),
-        start: Instant::now(),
         commit,
         semaphore,
-        replied: false,
-        closed: false,
-    };
+        start: Instant::now(),
+        execution_started: std::sync::atomic::AtomicBool::new(false),
+        history_relayed: std::sync::atomic::AtomicBool::new(false),
+        relay_snapshot: Mutex::new(Vec::new()),
+        presentation: Mutex::new(HashMap::new()),
+    });
+    let (actor, task) = AgentActorHandle::spawn(
+        agent_id,
+        Vec::new(),
+        None,
+        Box::new(LuaActorBackend::new(Arc::clone(&state))),
+    );
+    // The runner exits when the actor closes; detach so dropping this task
+    // later never cancels the actor prematurely.
+    task.detach();
+    *cancel_actor.lock().unwrap() = Some(actor.clone());
+    let thinking = state.thinking;
+    let fast = state.fast;
 
-    let driver_input_tx = input_tx.clone();
-    smol::spawn(subagent_ui_input_relay(
-        ui_input_rx,
-        driver_input_tx,
-        Arc::clone(&state),
-    ))
-    .detach();
-    smol::spawn(subagent_driver(driver, input_rx, Arc::clone(&state))).detach();
+    // `task_despawn` and global cancellation fire the shared child token.
+    // Mapping that to `actor.close()`
+    // aborts the running turn through its per-turn cancel and terminalizes
+    // queued turns; a normal close stops the relay first.
+    let (relay_stop_tx, relay_stop_rx) = flume::bounded::<()>(1);
+    {
+        let actor = actor.clone();
+        let child_cancel = state.child_cancel.clone();
+        smol::spawn(async move {
+            select(
+                Box::pin(async move { child_cancel.cancelled().await }),
+                Box::pin(async move {
+                    let _ = relay_stop_rx.recv_async().await;
+                }),
+            )
+            .await;
+            actor.close();
+        })
+        .detach();
+    }
+
+    // Tab submits go through the actor's admission, exactly like `send`.
+    {
+        let actor = actor.clone();
+        smol::spawn(async move {
+            while let Ok(message) = ui_input_rx.recv_async().await {
+                let _ = actor.admit_turn(
+                    AgentInput {
+                        message,
+                        mode: AgentMode::Build,
+                        images: Vec::new(),
+                        preamble: Vec::new(),
+                        thinking,
+                        fast,
+                        workflow: false,
+                        prompt: None,
+                    },
+                    None,
+                    String::new(),
+                );
+            }
+        })
+        .detach();
+    }
 
     let sess = lua.create_userdata(LuaSession {
         id: ui_id,
-        input_tx,
+        agent_id,
+        actor: Arc::new(actor),
         state,
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         cancel_slot,
+        relay_stop_tx,
     })?;
     Ok((Some(sess), None))
 }
@@ -907,331 +1156,42 @@ async fn dispatch_racing_live(
     }
 }
 
-/// Owns a subagent's history and run loop, driven in the background.
-/// The driver lives off the main agent's call stack so the main agent can
-/// keep working while a subagent runs, and can queue more messages to it.
-struct TurnInput {
-    turn_id: TurnId,
-    message: String,
-}
-
-struct SubagentDriver {
-    agent_id: AgentId,
-    params: AgentParams,
-    system: String,
-    tools: JsonValue,
-    thinking: ThinkingConfig,
-    fast: bool,
-    /// Fresh per session so `tool_search` loads never leak between a
-    /// subagent and its parent.
-    mcp: Option<McpSession>,
-    history: History,
-    sub_event_tx: EventSender,
-    child_cancel: maki_agent::cancel::CancelToken,
-    answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
-    answer_tx: Option<flume::Sender<String>>,
-    parent_cancels: Arc<CancelMap<String>>,
-    /// Stable identity for UI, cancel, and history. Falls back to a synthetic
-    /// id for workflow-mode sessions (no model-issued tool call exists).
-    /// Shared with any sibling session the same tool call opened.
-    ui_id: String,
-    /// Which registration under [`ui_id`](Self::ui_id) is ours.
-    cancel_slot: CancelSlot,
-    parent_event_tx: EventSender,
-    subagent_info: Arc<OnceLock<SubagentInfo>>,
-    ui_input_tx: flume::Sender<String>,
-    local_tools: LocalTools,
-    name: String,
-    usage: TokenUsage,
-    start: Instant,
-    /// Structured-output commit slot, surfaced as `captured` on completion.
-    commit: Arc<Mutex<Option<JsonValue>>>,
-    semaphore: Option<Arc<async_lock::Semaphore>>,
-    /// Whether a completed run has already surfaced its history to the parent,
-    /// so `close` does not re-emit a duplicate reply to the main agent.
-    replied: bool,
-    closed: bool,
-}
-
-impl SubagentDriver {
-    /// Surface this subagent's transcript to the parent so its latest reply
-    /// reaches the main agent. Idempotent: only the first completed run after a
-    /// spawn delivers a reply; `close` uses the same guard to avoid re-queueing
-    /// the same text when the user eventually despawns the subagent.
-    fn emit_history(&mut self) {
-        if self.replied {
-            return;
-        }
-        self.replied = true;
-        let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
-            tool_use_id: self.ui_id.clone(),
-            messages: self.history.as_slice().to_vec(),
-        });
-    }
-
-    fn close(&mut self) {
-        if self.closed {
-            return;
-        }
-        self.closed = true;
-        self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
-        if !self.replied {
-            let messages =
-                std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
-            let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
-                tool_use_id: self.ui_id.clone(),
-                messages,
-            });
-        }
-        info!(
-            name = %self.name,
-            duration_ms = self.start.elapsed().as_millis() as u64,
-            input_tokens = self.usage.total_input(),
-            output_tokens = self.usage.output,
-            "subagent session closed",
-        );
-    }
-
-    /// Run one user message to completion and surface the result. The
-    /// structured-output / summary nudge policy lives in the calling plugin
-    /// (which queues nudges via `send`) so `task_policy` can observe it.
-    async fn run_one(&mut self, turn_id: TurnId, message: String) -> SubagentRunResult {
-        if self.subagent_info.get().is_none() {
-            let _ = self.subagent_info.set(SubagentInfo {
-                parent_tool_use_id: self.ui_id.clone(),
-                name: self.name.clone(),
-                prompt: Some(message.clone()),
-                model: Some(self.params.model.spec()),
-                answer_tx: self.answer_tx.take(),
-                input_tx: Some(self.ui_input_tx.clone()),
-            });
-        }
-        self.run_agent(turn_id, message).await
-    }
-
-    async fn run_agent(&mut self, turn_id: TurnId, message: String) -> SubagentRunResult {
-        let history_len = self.history.len();
-        self.run_agent_inner(turn_id, message, history_len).await
-    }
-
-    async fn run_agent_inner(
-        &mut self,
-        turn_id: TurnId,
-        message: String,
-        history_len: usize,
-    ) -> SubagentRunResult {
-        let mut agent = Agent::new(
-            self.params.clone(),
-            AgentRunParams {
-                history: &mut self.history,
-                system: self.system.clone(),
-                event_tx: self.sub_event_tx.clone(),
-                tools: self.tools.clone(),
-            },
-        )
-        .with_user_response_rx(Arc::clone(&self.answer_rx))
-        .with_cancel(self.child_cancel.clone())
-        .with_mcp(self.mcp.clone())
-        .with_local_tools(Arc::clone(&self.local_tools));
-
-        let input = AgentInput {
-            message,
-            mode: AgentMode::Build,
-            images: Vec::new(),
-            preamble: Vec::new(),
-            thinking: self.thinking,
-            fast: self.fast,
-            workflow: false,
-            prompt: None,
-        };
-        let outcome = agent.run(turn_id, input).await;
-        drop(agent);
-        self.usage += outcome.usage();
-        let error = match &outcome {
-            TurnOutcome::Completed { .. } => None,
-            TurnOutcome::Failed { failure, .. } => Some(failure.diagnostic.clone()),
-            TurnOutcome::Cancelled { .. } => Some(CANCELLED_MSG.to_owned()),
-        };
-
-        let text = self.history.as_slice()[history_len.min(self.history.len())..]
-            .iter()
-            .rfind(|m| matches!(m.role, Role::Assistant))
-            .and_then(|m| {
-                m.content.iter().find_map(|b| match b {
-                    ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER => {
-                        Some(text.as_str())
-                    }
-                    _ => None,
-                })
-            })
-            .map_or_else(String::new, str::to_owned);
-
-        SubagentRunResult {
-            text,
-            captured: self.commit.lock().unwrap().take(),
-            usage: self.usage,
-            error,
-            outcome,
-        }
-    }
-}
-
-fn admit_turn(
-    input_tx: &flume::Sender<TurnInput>,
-    state: &Mutex<SessionState>,
-    message: String,
-    reply_tx: Option<flume::Sender<SubagentRunResult>>,
-) -> Result<(), String> {
-    let mut state = state.lock().unwrap();
-    if state.closed {
-        return Err(SESSION_CLOSED_ERR.to_owned());
-    }
-    let turn_id = TurnId::generate();
-    state.pending += 1;
-    state.accepted.insert(turn_id);
-    state.status = SubagentStatus::Running;
-    if let Some(reply_tx) = reply_tx {
-        state.waiters.insert(turn_id, reply_tx.clone());
-    }
-    if input_tx.send(TurnInput { turn_id, message }).is_err() {
-        let agent_id = state.agent_id;
-        state.finalize(
-            turn_id,
-            cancelled_result(
-                agent_id,
-                turn_id,
-                TokenUsage::default(),
-                TurnCancellationReason::Closed,
-            ),
-        );
-        state.close();
-        return Err(SESSION_CLOSED_ERR.to_owned());
-    }
-    Ok(())
-}
-
-async fn subagent_ui_input_relay(
-    input_rx: flume::Receiver<String>,
-    input_tx: flume::Sender<TurnInput>,
-    state: Arc<Mutex<SessionState>>,
-) {
-    while let Ok(message) = input_rx.recv_async().await {
-        if admit_turn(&input_tx, &state, message, None).is_err() {
-            break;
-        }
-    }
-}
-
-fn cancelled_result(
-    agent_id: AgentId,
-    turn_id: TurnId,
-    usage: TokenUsage,
-    reason: TurnCancellationReason,
-) -> SubagentRunResult {
-    SubagentRunResult {
-        text: String::new(),
-        captured: None,
-        usage,
-        error: Some(CANCELLED_MSG.to_owned()),
-        outcome: TurnOutcome::Cancelled {
-            agent_id,
-            turn_id,
-            usage: TokenUsage::default(),
-            num_turns: 0,
-            reason,
-        },
-    }
-}
-
-fn finalize_input(state: &Mutex<SessionState>, input: TurnInput, result: SubagentRunResult) {
-    state.lock().unwrap().finalize(input.turn_id, result);
-}
-
-/// Background driver: owns the run loop so one message no longer blocks the
-/// main agent. The state slot is the single source of truth for `status()`.
-async fn subagent_driver(
-    mut driver: SubagentDriver,
-    input_rx: flume::Receiver<TurnInput>,
-    state: Arc<Mutex<SessionState>>,
-) {
-    loop {
-        let cancel = driver.child_cancel.clone();
-        let next = select(
-            Box::pin(input_rx.recv_async()),
-            Box::pin(async move { cancel.cancelled().await }),
-        )
-        .await;
-        let input = match next {
-            Either::Left((Ok(input), _)) => input,
-            Either::Left((Err(_), _)) | Either::Right(((), _)) => break,
-        };
-        {
-            let mut shared = state.lock().unwrap();
-            if shared.closed || shared.finalized.contains(&input.turn_id) {
-                continue;
-            }
-            shared.active = Some(input.turn_id);
-        }
-        let permit = match &driver.semaphore {
-            Some(semaphore) => {
-                let cancel = driver.child_cancel.clone();
-                match cancel.race(Arc::clone(semaphore).acquire_arc()).await {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        let result = cancelled_result(
-                            driver.agent_id,
-                            input.turn_id,
-                            driver.usage,
-                            TurnCancellationReason::Closed,
-                        );
-                        finalize_input(&state, input, result);
-                        break;
-                    }
-                }
-            }
-            None => None,
-        };
-        let mut result = driver.run_one(input.turn_id, input.message.clone()).await;
-        drop(permit);
-        if state.lock().unwrap().closed
-            && let TurnOutcome::Cancelled { reason, .. } = &mut result.outcome
-        {
-            *reason = TurnCancellationReason::Closed;
-        }
-        finalize_input(&state, input, result);
-        driver.emit_history();
-        if driver.child_cancel.is_cancelled() {
-            break;
-        }
-    }
-
-    {
-        state.lock().unwrap().close();
-    }
-    while let Ok(input) = input_rx.try_recv() {
-        let result = cancelled_result(
-            driver.agent_id,
-            input.turn_id,
-            driver.usage,
-            TurnCancellationReason::Closed,
-        );
-        finalize_input(&state, input, result);
-    }
-    driver.close();
-}
-
+/// One `maki.agent.session` userdata. The actor handle is the lifecycle and
+/// outcome truth; `state` is the adapter's shared backend state.
 struct LuaSession {
     id: String,
-    input_tx: flume::Sender<TurnInput>,
-    state: Arc<Mutex<SessionState>>,
+    agent_id: AgentId,
+    /// Agent actor data; used for `agent_id`.
+    ///
+    /// This is a separate Arc so prompt/send/status can keep the session
+    /// alive while the actor is being torn down (the actor owns its own
+    /// backend Arc).
+    actor: Arc<AgentActorHandle>,
+    state: Arc<LuaActorState>,
     parent_cancels: Arc<CancelMap<String>>,
     cancel_slot: CancelSlot,
+    /// Stops the CancelSubagent->close relay so a normal close (not a
+    /// cancellation) does not double-close.
+    relay_stop_tx: flume::Sender<()>,
 }
 
 impl Drop for LuaSession {
     fn drop(&mut self) {
-        self.state.lock().unwrap().close();
+        // The actor retains every terminal outcome; closing it first would
+        // terminalize queued turns. The history fallback fires once, only if
+        // no executed turn relayed already.
+        let _ = self.relay_stop_tx.try_send(());
+        self.state.close_with(&self.actor);
         self.parent_cancels.retire(&self.id, self.cancel_slot);
+        let snapshot = self.actor.snapshot();
+        info!(
+            name = %self.state.name,
+            agent_id = %self.agent_id,
+            duration_ms = self.state.start.elapsed().as_millis() as u64,
+            input_tokens = snapshot.cumulative_usage.total_input(),
+            output_tokens = snapshot.cumulative_usage.output,
+            "subagent session dropped",
+        );
     }
 }
 
@@ -1264,7 +1224,7 @@ async fn prompt(
     message: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
-    let input_tx = this.input_tx.clone();
+    let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
     let parent_cancels = Arc::clone(&this.parent_cancels);
     let id = this.id.clone();
@@ -1277,36 +1237,60 @@ async fn prompt(
         return Ok(err_pair("timeout must be greater than zero"));
     }
     drop(this);
-    let (reply_tx, reply_rx) = flume::bounded(1);
-    if let Err(error) = admit_turn(&input_tx, &state, message, Some(reply_tx)) {
-        return Ok((None, Some(error)));
-    }
-    let reply = match timeout {
+    let Ok(ticket) = actor.admit_turn(
+        AgentInput {
+            message,
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: state.thinking,
+            fast: state.fast,
+            workflow: false,
+            prompt: None,
+        },
+        None,
+        String::new(),
+    ) else {
+        return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
+    };
+    let turn_id = ticket.turn_id();
+    let outcome = match timeout {
         Some(seconds) => {
-            let result =
-                futures_lite::future::race(async { Some(reply_rx.recv_async().await) }, async {
-                    smol::Timer::after(Duration::from_secs(seconds)).await;
-                    None
-                })
-                .await;
-            let Some(result) = result else {
-                state.lock().unwrap().close();
+            let outcome = futures_lite::future::race(async { Some(ticket.wait().await) }, async {
+                smol::Timer::after(Duration::from_secs(seconds)).await;
+                None
+            })
+            .await;
+            let Some(outcome) = outcome else {
+                state.close_with(&actor);
                 parent_cancels.retire(&id, cancel_slot);
                 return Ok(err_pair(format!(
                     "session prompt timed out after {seconds}s"
                 )));
             };
-            result
+            outcome
         }
-        None => reply_rx.recv_async().await,
+        None => ticket.wait().await,
     };
-    match reply {
-        Err(_) => Ok((None, Some(SESSION_CLOSED_ERR.to_owned()))),
-        Ok(result) => build_prompt_result(&lua, result),
-    }
+    // The actor retains every outcome and accumulates usage before the ticket
+    // resolves, so the snapshot's cumulative usage is the per-session total the
+    // old driver surfaced (`input_tokens`/`output_tokens` across all turns).
+    // The presentation result stays keyed by the admitted turn.
+    let result = state
+        .presentation
+        .lock()
+        .unwrap()
+        .remove(&turn_id)
+        .unwrap_or_else(|| derive_result(&outcome));
+    let cumulative = actor.snapshot().cumulative_usage;
+    build_prompt_result(&lua, result, cumulative)
 }
 
-fn build_prompt_result(lua: &Lua, result: SubagentRunResult) -> LuaResult<Pair<Table>> {
+fn build_prompt_result(
+    lua: &Lua,
+    result: AdapterResult,
+    usage: TokenUsage,
+) -> LuaResult<Pair<Table>> {
     if let Some(e) = &result.error {
         let tbl = if result.text.is_empty() {
             None
@@ -1319,12 +1303,30 @@ fn build_prompt_result(lua: &Lua, result: SubagentRunResult) -> LuaResult<Pair<T
     }
     let tbl = lua.create_table()?;
     tbl.set("text", result.text)?;
-    tbl.set("input_tokens", result.usage.total_input())?;
-    tbl.set("output_tokens", result.usage.output)?;
+    tbl.set("input_tokens", usage.total_input())?;
+    tbl.set("output_tokens", usage.output)?;
     if let Some(captured) = &result.captured {
         tbl.set("captured", json_to_lua(lua, captured)?)?;
     }
     Ok((Some(tbl), None))
+}
+
+/// Safe fallback for an admitted turn whose backend presentation result was
+/// lost to a racing actor close: derive the adapter view from the outcome.
+fn derive_result(outcome: &TurnOutcome) -> AdapterResult {
+    AdapterResult {
+        text: String::new(),
+        captured: None,
+        error: match outcome {
+            TurnOutcome::Completed { .. } => None,
+            TurnOutcome::Failed { failure, .. } => Some(failure.diagnostic.clone()),
+            TurnOutcome::Cancelled { .. } => Some(CANCELLED_MSG.to_owned()),
+        },
+    }
+}
+
+fn actor_is_busy(status: ActorStatus, queued: usize) -> bool {
+    matches!(status, ActorStatus::Running(_)) || queued > 0
 }
 
 /// Non-blocking: enqueue a message to the subagent's driver and return
@@ -1338,12 +1340,25 @@ async fn send(
     this: mlua::UserDataRef<LuaSession>,
     message: String,
 ) -> LuaResult<Pair<bool>> {
-    let input_tx = this.input_tx.clone();
+    let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
     drop(this);
-    match admit_turn(&input_tx, &state, message, None) {
-        Ok(()) => Ok((Some(true), None)),
-        Err(error) => Ok((None, Some(error))),
+    match actor.admit_turn(
+        AgentInput {
+            message,
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: state.thinking,
+            fast: state.fast,
+            workflow: false,
+            prompt: None,
+        },
+        None,
+        String::new(),
+    ) {
+        Ok(_) => Ok((Some(true), None)),
+        Err(_) => Ok((None, Some(SESSION_CLOSED_ERR.to_owned()))),
     }
 }
 
@@ -1354,32 +1369,50 @@ async fn send(
 ///   and possibly `error`.
 #[lua_fn]
 async fn status(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair<Table>> {
+    let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
     drop(this);
+    let snapshot = actor.snapshot();
     let tbl = lua.create_table()?;
-    match &state.lock().unwrap().status {
-        SubagentStatus::Running => {
-            tbl.set("status", "running")?;
+    match snapshot.lifecycle {
+        ActorLifecycle::Open => {
+            // A newer turn admitted behind the latest outcome keeps the session
+            // running: the old SessionState reported Running while pending > 0,
+            // so only an idle queue with a retained latest outcome is "done".
+            let busy = actor_is_busy(snapshot.status, snapshot.queued);
+            if busy {
+                tbl.set("status", "running")?;
+            } else if let Some(outcome) = snapshot.latest {
+                let result = state
+                    .presentation
+                    .lock()
+                    .unwrap()
+                    .get(&outcome.turn_id())
+                    .cloned()
+                    .unwrap_or_else(|| derive_result(&outcome));
+                tbl.set("status", "done")?;
+                let r = lua.create_table()?;
+                r.set("text", result.text.clone())?;
+                // Done totals are the per-session cumulative usage, matching the
+                // old driver's session-wide counters.
+                r.set("input_tokens", snapshot.cumulative_usage.total_input())?;
+                r.set("output_tokens", snapshot.cumulative_usage.output)?;
+                if let Some(captured) = &result.captured {
+                    r.set("captured", json_to_lua(&lua, captured)?)?;
+                }
+                tbl.set("result", r)?;
+                if let Some(e) = &result.error {
+                    tbl.set("error", e.clone())?;
+                }
+                if let TurnOutcome::Failed { failure, .. } = &outcome {
+                    tbl.set("retryable", failure.retryable)?;
+                }
+            } else {
+                tbl.set("status", "running")?;
+            }
         }
-        SubagentStatus::Closed => {
+        ActorLifecycle::Closed | ActorLifecycle::Shutdown => {
             tbl.set("status", "closed")?;
-        }
-        SubagentStatus::Done(result) => {
-            tbl.set("status", "done")?;
-            let r = lua.create_table()?;
-            r.set("text", result.text.clone())?;
-            r.set("input_tokens", result.usage.total_input())?;
-            r.set("output_tokens", result.usage.output)?;
-            if let Some(captured) = &result.captured {
-                r.set("captured", json_to_lua(&lua, captured)?)?;
-            }
-            tbl.set("result", r)?;
-            if let Some(e) = &result.error {
-                tbl.set("error", e.clone())?;
-            }
-            if let TurnOutcome::Failed { failure, .. } = &result.outcome {
-                tbl.set("retryable", failure.retryable)?;
-            }
         }
     }
     Ok((Some(tbl), None))
@@ -1393,7 +1426,8 @@ async fn status(lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<Pair
 /// @return
 #[lua_fn]
 async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
-    this.state.lock().unwrap().close();
+    let _ = this.relay_stop_tx.try_send(());
+    this.state.close_with(&this.actor);
     this.parent_cancels.retire(&this.id, this.cancel_slot);
     Ok(())
 }
@@ -1459,14 +1493,38 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use maki_agent::cancel::CancelToken;
     use maki_agent::tools::test_support::stub_ctx;
     use maki_agent::{
-        AgentId, DoneReason, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+        AgentId, AgentParams, DoneReason, TurnCompleteEvent, TurnId, TurnOutcome, TurnTicket,
     };
-    use maki_providers::Message;
-    use serde_json::json;
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{
+        AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StopReason,
+        StreamResponse, ThinkingConfig, TokenUsage,
+    };
+    use maki_storage::id::SessionRef;
+    use serde_json::{Value, json};
 
     use super::*;
+
+    fn canned_reply(text: &str) -> StreamResponse {
+        canned_reply_with_usage(text, TokenUsage::default())
+    }
+
+    fn canned_reply_with_usage(text: &str, usage: TokenUsage) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: text.into() }],
+                ..Default::default()
+            },
+            usage,
+            stop_reason: Some(StopReason::EndTurn),
+        }
+    }
 
     /// `inherit_provider` must select the reuse branch even when `model_spec`
     /// is present, so a test-side wrapper can drive a real spawned session
@@ -1533,7 +1591,10 @@ mod tests {
 
     const RUN_ID: u64 = 7;
     const PARENT_ID: &str = "task-1";
-    const DONE_USAGE: TokenUsage = tokens(150, 30);
+    const FIRST_USAGE: TokenUsage = tokens(100, 20);
+    const SECOND_USAGE: TokenUsage = tokens(50, 10);
+    const CUMULATIVE_USAGE: TokenUsage = tokens(150, 30);
+    const DONE_USAGE: TokenUsage = CUMULATIVE_USAGE;
 
     const fn tokens(input: u32, output: u32) -> TokenUsage {
         TokenUsage {
@@ -1563,144 +1624,426 @@ mod tests {
         }))
     }
 
-    fn completed_result(
-        agent_id: AgentId,
-        turn_id: TurnId,
-        usage: TokenUsage,
-    ) -> SubagentRunResult {
-        SubagentRunResult {
-            text: "done".into(),
-            captured: None,
-            usage,
-            error: None,
-            outcome: TurnOutcome::Completed {
-                agent_id,
-                turn_id,
-                usage,
-                num_turns: 1,
-                reason: DoneReason::EndTurn,
-            },
+    /// A provider that never resolves, so a running turn parks until its
+    /// cancel fires. Deterministic for close/cancel tests.
+    struct HangingProvider;
+
+    impl Provider for HangingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                unreachable!()
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
         }
     }
 
-    fn failed_result(agent_id: AgentId, turn_id: TurnId, usage: TokenUsage) -> SubagentRunResult {
-        SubagentRunResult {
-            text: String::new(),
-            captured: None,
-            usage,
-            error: Some("provider failed".into()),
-            outcome: TurnOutcome::Failed {
-                agent_id,
-                turn_id,
-                usage,
-                num_turns: 1,
-                failure: TurnFailure {
-                    kind: TurnFailureKind::Provider,
-                    diagnostic: "provider failed".into(),
-                    user_message: "provider failed".into(),
-                    retryable: true,
-                },
-            },
+    /// A canned `LuaActorState` + actor harness. Runs park on the hanging
+    /// provider until their cancel fires, so close/cancel tests are
+    /// deterministic.
+    fn canned_state(
+        semaphore: Option<Arc<async_lock::Semaphore>>,
+    ) -> (
+        Arc<AgentActorHandle>,
+        Arc<LuaActorState>,
+        LuaSession,
+        flume::Receiver<Envelope>,
+    ) {
+        session_with_provider(Arc::new(HangingProvider), semaphore)
+    }
+
+    /// A provider whose turns answer with one canned reply.
+    struct StreamOnceProvider {
+        replies: Mutex<Vec<StreamResponse>>,
+    }
+
+    impl StreamOnceProvider {
+        fn new_replies(replies: Vec<StreamResponse>) -> Self {
+            Self {
+                replies: Mutex::new(replies),
+            }
         }
+    }
+
+    impl Provider for StreamOnceProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let mut replies = self.replies.lock().unwrap();
+                assert!(!replies.is_empty(), "no more canned replies");
+                Ok(replies.remove(0))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// Rebuild a canned state with a working provider, so an admitted turn
+    /// actually executes.
+    fn session_with_provider(
+        provider: Arc<dyn Provider>,
+        semaphore: Option<Arc<async_lock::Semaphore>>,
+    ) -> (
+        Arc<AgentActorHandle>,
+        Arc<LuaActorState>,
+        LuaSession,
+        flume::Receiver<Envelope>,
+    ) {
+        let (parent_raw_tx, parent_rx) = flume::unbounded();
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let (input_tx, _input_rx) = flume::unbounded::<String>();
+        let (relay_stop_tx, _relay_stop_rx) = flume::bounded::<()>(1);
+        let ui_id = "task-1".to_owned();
+        let agent_id = AgentId::generate();
+        let (child_trigger, child_cancel) = CancelToken::new();
+        let ctx = AgentContext::from(&stub_ctx(&AgentMode::Build));
+        let params = AgentParams {
+            agent_id,
+            provider,
+            model: ctx.model.as_ref().clone(),
+            config: ctx.config.clone(),
+            tool_output_lines: maki_config::ToolOutputLines::default(),
+            permissions: Arc::clone(&ctx.permissions),
+            session_id: ctx.session_id.clone(),
+            mailbox: None,
+            timeouts: ctx.timeouts,
+            file_tracker: FileReadTracker::fresh(),
+            prompt_slots: Arc::clone(&ctx.prompt_slots),
+            modes: Arc::clone(&ctx.modes),
+            subagent_cancels: Arc::new(CancelMap::new()),
+            registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+            audience: DEFAULT_SESSION_AUDIENCE,
+            question_mode: ctx.question_mode,
+            model_policy: Arc::clone(&ctx.model_policy),
+            file_write_locks: Arc::clone(&ctx.file_write_locks),
+        };
+        let (parent_cancels, cancel_slot) = {
+            let map = Arc::new(CancelMap::new());
+            (Arc::clone(&map), map.insert(ui_id.clone(), child_trigger))
+        };
+        let state = Arc::new(LuaActorState {
+            params,
+            system: String::new(),
+            tools: JsonValue::Array(vec![]),
+            thinking: ThinkingConfig::Off,
+            fast: false,
+            mcp: None,
+            chip_event_tx: EventSender::new(parent_raw_tx.clone(), RUN_ID),
+            child_cancel,
+            answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
+            answer_tx: Some(answer_tx),
+            ui_id: ui_id.clone(),
+            parent_event_tx: EventSender::new(parent_raw_tx, RUN_ID),
+            input_tx,
+            cancel: SubagentCancel::new(|| {}),
+            subagent_info: Arc::new(OnceLock::new()),
+            local_tools: LocalTools::default(),
+            name: "probe".to_owned(),
+            commit: Arc::new(Mutex::new(None)),
+            semaphore,
+            start: Instant::now(),
+            execution_started: std::sync::atomic::AtomicBool::new(false),
+            history_relayed: std::sync::atomic::AtomicBool::new(false),
+            relay_snapshot: Mutex::new(Vec::new()),
+            presentation: Mutex::new(HashMap::new()),
+        });
+        let (actor, task) = AgentActorHandle::spawn(
+            agent_id,
+            Vec::new(),
+            None,
+            Box::new(LuaActorBackend::new(Arc::clone(&state))),
+        );
+        task.detach();
+        let actor = Arc::new(actor);
+        let sess = LuaSession {
+            id: ui_id,
+            agent_id,
+            actor: Arc::clone(&actor),
+            state: Arc::clone(&state),
+            parent_cancels,
+            cancel_slot,
+            relay_stop_tx,
+        };
+        (actor, state, sess, parent_rx)
+    }
+
+    fn admit(state: &LuaActorState, actor: &AgentActorHandle, message: &str) -> TurnTicket {
+        actor
+            .admit_turn(
+                AgentInput {
+                    message: message.to_owned(),
+                    mode: AgentMode::Build,
+                    images: Vec::new(),
+                    preamble: Vec::new(),
+                    thinking: state.thinking,
+                    fast: state.fast,
+                    workflow: false,
+                    prompt: None,
+                },
+                None,
+                String::new(),
+            )
+            .unwrap()
     }
 
     #[test]
-    fn close_rejects_new_admission_and_resolves_blocking_waiter() {
-        let agent_id = AgentId::generate();
-        let state = Arc::new(Mutex::new(SessionState::new(agent_id)));
-        let (input_tx, input_rx) = flume::unbounded();
-        let (reply_tx, reply_rx) = flume::bounded(1);
-
-        admit_turn(&input_tx, &state, "waiting".into(), Some(reply_tx)).unwrap();
-        let input = input_rx.recv().unwrap();
-        state.lock().unwrap().close();
-
-        assert_eq!(
-            admit_turn(&input_tx, &state, "rejected".into(), None),
-            Err(SESSION_CLOSED_ERR.into())
+    fn close_rejects_new_admission_and_closes_actor() {
+        let (actor, state, _sess, _rx) = canned_state(None);
+        actor.close();
+        assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Closed));
+        assert!(
+            actor
+                .admit_turn(
+                    AgentInput {
+                        message: "rejected".into(),
+                        mode: AgentMode::Build,
+                        images: Vec::new(),
+                        preamble: Vec::new(),
+                        thinking: state.thinking,
+                        fast: state.fast,
+                        workflow: false,
+                        prompt: None,
+                    },
+                    None,
+                    String::new(),
+                )
+                .is_err()
         );
-        let result = reply_rx.recv().unwrap();
+    }
+
+    #[test]
+    fn queued_only_close_does_not_relay_history() {
+        let (actor, state, _sess, parent_rx) = canned_state(None);
+        let _ticket = admit(&state, &actor, "queued");
+        state.close_with(&actor);
+        assert!(
+            parent_rx
+                .drain()
+                .all(|e| !matches!(e.event, AgentEvent::SubagentHistory { .. }))
+        );
+    }
+
+    #[test]
+    fn admitted_and_closed_turn_resolves_as_cancelled() {
+        let (actor, state, _sess, _rx) = canned_state(None);
+        let ticket = admit(&state, &actor, "waiting");
+        let turn_id = ticket.turn_id();
+        actor.close();
+        let outcome = smol::block_on(ticket.wait());
         assert!(matches!(
-            result.outcome,
+            outcome,
+            TurnOutcome::Cancelled { turn_id: id, reason: TurnCancellationReason::Closed, .. }
+                if id == turn_id
+        ));
+    }
+
+    #[test]
+    fn close_resolves_semaphore_blocked_turn_as_cancelled() {
+        let semaphore = Arc::new(async_lock::Semaphore::new(0));
+        let (actor, state, _sess, _rx) = canned_state(Some(semaphore));
+        let ticket = admit(&state, &actor, "blocked on semaphore");
+        let turn_id = ticket.turn_id();
+        // The acquire is parked; closing the actor fires the per-turn cancel
+        // and the run must settle as Cancelled rather than strand.
+        actor.close();
+        let outcome = smol::block_on(ticket.wait());
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Cancelled { turn_id: id, reason, .. }
+                if id == turn_id && reason == TurnCancellationReason::Closed
+        ));
+    }
+
+    #[test]
+    fn executed_cancelled_turn_relays_history_once() {
+        let (actor, state, _sess, parent_rx) = canned_state(None);
+        let ticket = admit(&state, &actor, "cancel me");
+        for _ in 0..100_000 {
+            if matches!(actor.snapshot().status, ActorStatus::Running(_)) {
+                break;
+            }
+            smol::block_on(smol::future::yield_now());
+        }
+        assert!(matches!(actor.snapshot().status, ActorStatus::Running(_)));
+        state.close_with(&actor);
+        assert!(matches!(
+            smol::block_on(ticket.wait()),
             TurnOutcome::Cancelled {
-                agent_id: id,
-                turn_id,
                 reason: TurnCancellationReason::Closed,
                 ..
-            } if id == agent_id && turn_id == input.turn_id
+            }
         ));
-        assert_eq!(result.error.as_deref(), Some(CANCELLED_MSG));
+        assert_eq!(
+            parent_rx
+                .drain()
+                .filter(|e| matches!(e.event, AgentEvent::SubagentHistory { .. }))
+                .count(),
+            1,
+            "executed cancellation relays history once"
+        );
+        state.close_with(&actor);
+        assert!(
+            parent_rx
+                .drain()
+                .all(|e| !matches!(e.event, AgentEvent::SubagentHistory { .. }))
+        );
     }
 
     #[test]
-    fn finalization_tracks_pending_turns_and_status() {
-        let agent_id = AgentId::generate();
-        let state = Arc::new(Mutex::new(SessionState::new(agent_id)));
-        let (input_tx, input_rx) = flume::unbounded();
+    fn close_retires_only_its_own_cancel_slot() {
+        // Two sessions share one `ui_id`; retiring ours must leave the sibling
+        // registration (and its entry) untouched.
+        let map = Arc::new(CancelMap::new());
+        let (own_trigger, _own_token) = CancelToken::new();
+        let own_slot = map.insert("task-1".to_owned(), own_trigger);
+        let (sibling_trigger, sibling_token) = CancelToken::new();
+        let sibling_slot = map.insert("task-1".to_owned(), sibling_trigger);
 
-        admit_turn(&input_tx, &state, "first".into(), None).unwrap();
-        admit_turn(&input_tx, &state, "second".into(), None).unwrap();
-        let first = input_rx.recv().unwrap();
-        let second = input_rx.recv().unwrap();
-        let first_turn_id = first.turn_id;
-        let second_turn_id = second.turn_id;
-        finalize_input(
-            &state,
-            first,
-            completed_result(agent_id, first_turn_id, tokens(10, 2)),
+        map.retire(&"task-1".to_owned(), own_slot);
+        assert!(
+            !sibling_token.is_cancelled(),
+            "sibling must not be cancelled by our retire"
         );
-        let state_guard = state.lock().unwrap();
-        assert_eq!(state_guard.pending, 1);
-        assert!(matches!(state_guard.status, SubagentStatus::Running));
-        drop(state_guard);
+        // A later CancelSubagent under the same id must still reach the sibling.
+        map.cancel_or_precancel("task-1".to_owned());
+        assert!(
+            sibling_token.is_cancelled(),
+            "sibling must still be cancellable after our retire"
+        );
+        map.retire(&"task-1".to_owned(), sibling_slot);
+        map.remove(&"task-1".to_owned());
+    }
 
-        finalize_input(
-            &state,
-            second,
-            completed_result(agent_id, second_turn_id, tokens(30, 4)),
-        );
-        let state_guard = state.lock().unwrap();
-        assert_eq!(state_guard.pending, 0);
+    #[test]
+    fn executed_completed_turns_accumulate_usage() {
+        let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
+            canned_reply_with_usage("the answer", FIRST_USAGE),
+            canned_reply_with_usage("the follow-up", SECOND_USAGE),
+        ]));
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
+        let first = admit(&state, &actor, "run me");
+        let first_id = first.turn_id();
+        let first_outcome = smol::block_on(first.wait());
         assert!(matches!(
-            &state_guard.status,
-            SubagentStatus::Done(result) if result.usage == tokens(30, 4)
+            first_outcome,
+            TurnOutcome::Completed { turn_id, .. } if turn_id == first_id
         ));
+        let first_result = state
+            .presentation
+            .lock()
+            .unwrap()
+            .get(&first_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(first_result.text, "the answer");
+        assert_eq!(first_result.error, None);
+
+        let second = admit(&state, &actor, "follow up");
+        let second_id = second.turn_id();
+        let second_outcome = smol::block_on(second.wait());
+        assert!(matches!(
+            second_outcome,
+            TurnOutcome::Completed { turn_id, .. } if turn_id == second_id
+        ));
+        assert_eq!(actor.snapshot().cumulative_usage, CUMULATIVE_USAGE);
+        drop(sess);
+        assert!(
+            parent_rx
+                .drain()
+                .any(|e| matches!(e.event, AgentEvent::SubagentHistory { .. })),
+            "completed run must surface history"
+        );
     }
 
     #[test]
-    fn failed_finalization_keeps_session_open_for_later_turn() {
-        let agent_id = AgentId::generate();
-        let state = Arc::new(Mutex::new(SessionState::new(agent_id)));
-        let (input_tx, input_rx) = flume::unbounded();
+    fn status_stays_running_while_turn_is_active_or_queued() {
+        assert!(actor_is_busy(ActorStatus::Running(TurnId::generate()), 0));
+        assert!(actor_is_busy(ActorStatus::Idle, 1));
+        assert!(!actor_is_busy(ActorStatus::Idle, 0));
+    }
 
-        admit_turn(&input_tx, &state, "fails".into(), None).unwrap();
-        let failed = input_rx.recv().unwrap();
-        let failed_turn_id = failed.turn_id;
-        finalize_input(
-            &state,
+    #[test]
+    fn failed_turn_keeps_session_open_for_later_turn() {
+        let fail = Arc::new(FailOnceProvider::default());
+        let provider: Arc<dyn Provider> = fail.clone();
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
+
+        let ticket = admit(&state, &actor, "fail this turn");
+        let turn_id = ticket.turn_id();
+        let failed = smol::block_on(ticket.wait());
+        assert!(matches!(
             failed,
-            failed_result(agent_id, failed_turn_id, tokens(8, 1)),
+            TurnOutcome::Failed { turn_id: id, .. } if id == turn_id
+        ));
+        assert!(
+            state
+                .presentation
+                .lock()
+                .unwrap()
+                .get(&turn_id)
+                .is_some_and(|r| r.error.is_some()),
+            "failed turn must present an error"
         );
-        {
-            let state_guard = state.lock().unwrap();
-            assert!(!state_guard.closed);
-            assert!(
-                matches!(&state_guard.status, SubagentStatus::Done(result) if result.error.is_some())
-            );
-        }
 
-        admit_turn(&input_tx, &state, "later".into(), None).unwrap();
-        assert_eq!(state.lock().unwrap().pending, 1);
+        let recovered = admit(&state, &actor, "reuse the same session");
+        let recovered_id = recovered.turn_id();
+        let outcome = smol::block_on(recovered.wait());
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Completed { turn_id: id, .. } if id == recovered_id
+        ));
+        assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Open));
+        drop(sess);
+        assert_eq!(
+            parent_rx
+                .drain()
+                .filter(|e| matches!(e.event, AgentEvent::SubagentHistory { .. }))
+                .count(),
+            2,
+            "each executed turn relays history once"
+        );
+        state.close_with(&actor);
+        assert!(
+            parent_rx
+                .drain()
+                .all(|e| !matches!(e.event, AgentEvent::SubagentHistory { .. }))
+        );
     }
 
     #[test]
     fn status_done_result_keeps_cumulative_compatibility_usage() {
-        let agent_id = AgentId::generate();
-        let cumulative = tokens(150, 30);
         let lua = Lua::new();
+        let cumulative = tokens(150, 30);
         let (result, error) = build_prompt_result(
             &lua,
-            completed_result(agent_id, TurnId::generate(), cumulative),
+            AdapterResult {
+                text: "done".into(),
+                captured: None,
+                error: None,
+            },
+            cumulative,
         )
         .unwrap();
 
@@ -1708,6 +2051,63 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.get::<u32>("input_tokens").unwrap(), 150);
         assert_eq!(result.get::<u32>("output_tokens").unwrap(), 30);
+    }
+
+    #[test]
+    fn prompt_derives_closed_result_from_outcome_when_presentation_missing() {
+        let lua = Lua::new();
+        let agent_id = AgentId::generate();
+        let turn_id = TurnId::generate();
+        let outcome = TurnOutcome::Cancelled {
+            agent_id,
+            turn_id,
+            usage: TokenUsage::default(),
+            num_turns: 0,
+            reason: TurnCancellationReason::Closed,
+        };
+        let (result, error) =
+            build_prompt_result(&lua, derive_result(&outcome), outcome.usage()).unwrap();
+        assert!(result.is_none());
+        assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
+    }
+
+    struct FailOnceProvider {
+        calls: AtomicUsize,
+    }
+
+    impl Default for FailOnceProvider {
+        fn default() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Provider for FailOnceProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(AgentError::Config {
+                        message: "provider failed".into(),
+                    })
+                } else {
+                    Ok(canned_reply("recovered on the same session"))
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
     }
 
     #[test]
@@ -1723,6 +2123,7 @@ mod tests {
                 model: None,
                 answer_tx: None,
                 input_tx: None,
+                cancel: None,
             })
             .unwrap();
         let (live_tx, live_rx) = flume::unbounded();

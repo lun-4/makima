@@ -385,7 +385,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
         Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
         command_runtime,
     );
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
@@ -393,7 +393,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
 pub(crate) fn test_app() -> App {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
@@ -499,6 +499,7 @@ fn subagent_info_full(
         model: None,
         answer_tx,
         input_tx,
+        cancel: None,
     }
 }
 
@@ -650,7 +651,7 @@ fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
 }
 
 #[test]
-fn standalone_compaction_does_not_exit_or_end_turn() {
+fn standalone_compaction_returns_to_idle_without_ending_the_session() {
     let mut app = test_app();
     app.exit_on_done = true;
     app.status = Status::Streaming;
@@ -659,7 +660,7 @@ fn standalone_compaction_does_not_exit_or_end_turn() {
         usage: TokenUsage::default(),
     }));
     assert_eq!(app.exit_request, ExitRequest::None);
-    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.status, Status::Idle);
 }
 
 #[test]
@@ -1982,7 +1983,7 @@ fn subagent_done_only_in_subagent_chat() {
 }
 
 #[test_case(|app: &mut App| finish_subagent_task(app, false), DONE_TEXT,      &DisplayRole::Done  ; "task_success")]
-#[test_case(|app: &mut App| finish_subagent_task(app, true),  ERROR_TEXT,     &DisplayRole::Error ; "task_failure")]
+#[test_case(|app: &mut App| finish_subagent_task(app, true),  "result",       &DisplayRole::Error ; "task_failure")]
 #[test_case(cancel_app as fn(&mut App),                       CANCELLED_TEXT, &DisplayRole::Error ; "cancel")]
 #[test_case(error_app  as fn(&mut App),                       ERROR_TEXT,     &DisplayRole::Error ; "main_error")]
 fn subagent_terminal_marker(
@@ -2008,7 +2009,7 @@ fn subagent_already_done_not_double_marked(terminate: fn(&mut App)) {
 }
 
 #[test_case(false, DONE_TEXT,  &DisplayRole::Done  ; "batch_subagent_success")]
-#[test_case(true,  ERROR_TEXT, &DisplayRole::Error ; "batch_subagent_failure")]
+#[test_case(true,  "result",   &DisplayRole::Error ; "batch_subagent_failure")]
 fn batch_subagent_done_marker(is_error: bool, expected_text: &str, expected_role: &DisplayRole) {
     let mut app = app_with_subagent_id("batch1__0");
     finish_subagent(&mut app, "batch1__0", is_error);
@@ -2157,6 +2158,27 @@ fn rendered_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
                 .collect()
         })
         .collect()
+}
+
+#[test]
+fn focused_running_subagent_draws_status_bar_spinner_while_main_is_idle() {
+    const SPINNER_GLYPHS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+    let mut app = app_with_subagent();
+    app.status = Status::Idle;
+    app.active_chat = 1;
+    assert!(!app.chats[1].is_finished());
+    assert!(
+        app.cadence().moves(),
+        "the footer spinner must keep repainting"
+    );
+
+    let rows = rendered_rows(&mut app, 80, 24);
+    let status = rows.last().expect("status row");
+    assert!(
+        status.chars().any(|ch| SPINNER_GLYPHS.contains(ch)),
+        "focused running subagent must animate the status bar: {status}"
+    );
 }
 
 #[test]
@@ -3438,21 +3460,27 @@ fn queue_esc_unfocuses_without_removing() {
 }
 
 #[test]
-fn ctrl_q_pops_front() {
+fn ctrl_q_pops_newest_visible_item() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));
-    app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
-    assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, "second");
-    assert!(app.queue.focus().is_none(), "unfocused stays unfocused");
-
     app.queue_and_notify(queued_msg("third"));
     app.queue.set_focus_at(1);
+
     app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+
+    assert_eq!(app.queue.len(), 2);
+    assert_eq!(
+        app.queue
+            .panel_entries()
+            .iter()
+            .map(|entry| entry.text.as_ref())
+            .collect::<Vec<_>>(),
+        ["queued", "second"]
+    );
     assert_eq!(
         app.queue.focus(),
-        Some(0),
-        "focus adjusted when item removed"
+        Some(1),
+        "focus follows the retained newest item"
     );
 }
 
@@ -5391,6 +5419,121 @@ fn subagent_history_finishes_workflow_chat() {
 }
 
 #[test]
+fn reusable_subagent_processes_distinct_turn_outcomes() {
+    const FAILURE_MESSAGE: &str = "second turn failed";
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (input_tx, input_rx) = flume::unbounded();
+    let mut info = subagent_info(TASK_ID, "worker");
+    info.input_tx = Some(input_tx);
+    let envelope = |outcome| {
+        Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::TurnOutcome(outcome),
+            subagent: Some(info.clone()),
+            run_id: 1,
+        }))
+    };
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "first".into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+
+    app.update(envelope(TurnOutcome::Completed {
+        agent_id: AgentId::generate(),
+        turn_id: TurnId::generate(),
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        reason: DoneReason::EndTurn,
+    }));
+    app.run_id = 2;
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "second turn".into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert!(!app.chats[1].is_finished());
+    assert!(app.task_entries()[1].is_spinning());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "recovered reply".into(),
+                }],
+                ..Default::default()
+            }],
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert_eq!(
+        app.queue.text_messages(),
+        [format!(
+            "{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}recovered reply"
+        )],
+        "old-run recovered history must queue a main-agent turn"
+    );
+    app.update(envelope(TurnOutcome::Failed {
+        agent_id: AgentId::generate(),
+        turn_id: TurnId::generate(),
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        failure: TurnFailure {
+            kind: TurnFailureKind::Provider,
+            diagnostic: FAILURE_MESSAGE.into(),
+            user_message: FAILURE_MESSAGE.into(),
+            retryable: false,
+        },
+    }));
+
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
+    assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
+    assert!(input_rx.try_recv().is_err());
+}
+
+#[test]
+fn main_turn_completion_keeps_async_subagent_cancellable_and_reusable() {
+    const FOLLOW_UP: &str = "follow up";
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (input_tx, input_rx) = flume::unbounded();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut info = subagent_info(TASK_ID, "worker");
+    info.input_tx = Some(input_tx);
+    info.cancel = Some(maki_agent::SubagentCancel::new({
+        let cancelled = Arc::clone(&cancelled);
+        move || cancelled.store(true, Ordering::SeqCst)
+    }));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    app.update(done_event());
+    app.active_chat = 1;
+    assert!(!app.chats[1].is_finished());
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty());
+    assert!(cancelled.load(Ordering::SeqCst));
+
+    type_and_submit(&mut app, FOLLOW_UP);
+    assert_eq!(input_rx.try_recv().unwrap(), FOLLOW_UP);
+}
+
+#[test]
 fn stamped_child_failure_wins_over_prior_history_snapshot() {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -5732,13 +5875,8 @@ fn double_esc_in_subagent_cancels_subagent() {
     let mut app = app_with_active_subagent();
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(
-        &actions[0],
-        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
-    ));
-    assert!(app.chats[1].is_finished());
-    assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
+    assert!(actions.is_empty());
+    assert!(!app.chats[1].is_finished());
 }
 
 #[test]
@@ -5766,14 +5904,14 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
 }
 
 #[test]
-fn cancel_subagent_removes_answer_sender() {
+fn cancel_subagent_retains_channel() {
     let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     assert!(!app.subagent_channels.is_empty());
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.subagent_channels.contains_key(TASK_ID));
+    assert!(app.subagent_channels.contains_key(TASK_ID));
 }
 
 #[test]
@@ -5790,14 +5928,10 @@ fn multiple_subagents_cancel_one_other_unaffected() {
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(
-        &actions[0],
-        Action::CancelSubagent { tool_use_id } if tool_use_id == "task2"
-    ));
+    assert!(actions.is_empty());
     let task1_idx = *app.chat_index.get(TASK_ID).unwrap();
     assert!(!app.chats[task1_idx].is_finished());
-    assert!(app.chats[app.active_chat].is_finished());
+    assert!(!app.chats[app.active_chat].is_finished());
 }
 
 #[test]
@@ -5814,7 +5948,7 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.chats[1].is_finished());
+    assert!(!app.chats[1].is_finished());
 
     app.run_builtin(BuiltinAction::PrevChat);
     assert_eq!(app.active_chat, 0);
@@ -6208,7 +6342,7 @@ fn completion_app() -> (TempDir, App, Arc<maki_lua::TestCompletionBackend>) {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, backend) = maki_lua::test_support::event_handle_with_completion();
     let mut app = build_app_with_handle(dir.clone(), Arc::new(test_writer(dir)), handle);
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     std::sync::Arc::get_mut(&mut app.state.session)
         .unwrap()
@@ -6885,6 +7019,19 @@ fn typing_in_subagent_chat_edits_input_and_submits_to_subagent() {
     // Enter submits to the subagent's driver queue, not the main agent.
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(input_rx.try_recv().unwrap(), "hi");
+}
+
+#[test]
+fn paste_in_subagent_chat_edits_input_and_submits_to_subagent() {
+    const PASTED: &str = "first\nsecond";
+
+    let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
+    app.update(Msg::Paste("first\r\nsecond".into()));
+    assert_eq!(app.input_box.buffer.value(), PASTED);
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(input_rx.try_recv().unwrap(), PASTED);
+    assert!(app.queue.text_messages().is_empty());
 }
 
 #[test]

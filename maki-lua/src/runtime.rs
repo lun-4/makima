@@ -3874,6 +3874,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
             // queued requests. Drain them so queued command work is dropped.
             for _ in rx.drain() {}
             for _ in prio_rx.drain() {}
+            crate::api::tool::clear_local_callbacks();
         })
         .map_err(|e| PluginError::Io {
             path: PathBuf::from("lua-thread"),

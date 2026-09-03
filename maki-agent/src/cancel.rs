@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use event_listener::Event;
 
+use crate::types::TurnCancellationReason;
+
 struct Shared {
     cancelled: AtomicBool,
     event: Event,
@@ -22,10 +24,105 @@ impl Shared {
     }
 }
 
+/// Fires once, from the first trigger to drop, then keeps the winning reason.
+struct ReasonedShared {
+    cancelled: AtomicBool,
+    reason: Mutex<Option<TurnCancellationReason>>,
+    event: Event,
+}
+
+impl ReasonedShared {
+    fn fire(&self, reason: TurnCancellationReason) {
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *self.reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+        self.event.notify(usize::MAX);
+    }
+}
+
 #[derive(Clone)]
 pub struct CancelToken(Arc<Shared>);
 
 pub struct CancelTrigger(Arc<Shared>);
+
+/// Single-fire cancellation that records the first reason to win.
+///
+/// Dropping any trigger fires the shared flag; the first reason stored wins
+/// even when several sources race. `Agent::run` reads the winner once, when
+/// it constructs the terminal [`TurnOutcome::Cancelled`], so the outcome is
+/// never mutated after emission.
+#[derive(Clone)]
+pub struct ReasonedCancelToken(Arc<ReasonedShared>);
+
+#[derive(Clone)]
+pub struct ReasonedCancelTrigger(Arc<ReasonedShared>);
+
+impl ReasonedCancelToken {
+    pub fn new() -> (ReasonedCancelTrigger, Self) {
+        let shared = Arc::new(ReasonedShared {
+            cancelled: AtomicBool::new(false),
+            reason: Mutex::new(None),
+            event: Event::new(),
+        });
+        (ReasonedCancelTrigger(Arc::clone(&shared)), Self(shared))
+    }
+
+    pub fn none() -> Self {
+        Self(Arc::new(ReasonedShared {
+            cancelled: AtomicBool::new(false),
+            reason: Mutex::new(None),
+            event: Event::new(),
+        }))
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn reason(&self) -> Option<TurnCancellationReason> {
+        *self.0.reason.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Waits until the token fires, returning the winning reason.
+    pub async fn cancelled(&self) -> TurnCancellationReason {
+        loop {
+            if let Some(reason) = self.reason() {
+                return reason;
+            }
+            let listener = self.0.event.listen();
+            if let Some(reason) = self.reason() {
+                return reason;
+            }
+            listener.await;
+        }
+    }
+
+    pub async fn race<T>(
+        &self,
+        future: impl Future<Output = T>,
+    ) -> Result<T, TurnCancellationReason> {
+        if let Some(reason) = self.reason() {
+            return Err(reason);
+        }
+        futures_lite::future::race(async { Ok(future.await) }, async {
+            Err(self.cancelled().await)
+        })
+        .await
+    }
+}
+
+impl ReasonedCancelTrigger {
+    pub fn cancel(self, reason: TurnCancellationReason) {
+        self.0.fire(reason);
+    }
+}
+
+impl Drop for ReasonedCancelTrigger {
+    fn drop(&mut self) {
+        self.0.fire(crate::types::TurnCancellationReason::User);
+    }
+}
 
 impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
@@ -432,5 +529,49 @@ mod tests {
         assert!(token.is_cancelled());
         map.retire(&"x".to_owned(), slot);
         assert!(!map.has_key(&"x".to_owned()));
+    }
+
+    #[test]
+    fn reasoned_token_first_reason_wins() {
+        smol::block_on(async {
+            let (closed_trigger, closed_token) = ReasonedCancelToken::new();
+            let (user_trigger, user_token) = ReasonedCancelToken::new();
+            closed_trigger.cancel(TurnCancellationReason::Closed);
+            user_trigger.cancel(TurnCancellationReason::User);
+            assert_eq!(
+                closed_token.cancelled().await,
+                TurnCancellationReason::Closed
+            );
+            assert_eq!(user_token.cancelled().await, TurnCancellationReason::User);
+        });
+    }
+
+    #[test]
+    fn reasoned_token_second_fire_keeps_first_reason() {
+        let (closed_trigger, token) = ReasonedCancelToken::new();
+        let (user_trigger, _) = ReasonedCancelToken::new();
+        closed_trigger.cancel(TurnCancellationReason::Closed);
+        user_trigger.cancel(TurnCancellationReason::User);
+        assert_eq!(token.reason(), Some(TurnCancellationReason::Closed));
+    }
+
+    #[test]
+    fn reasoned_token_drop_uses_user_reason() {
+        let (trigger, token) = ReasonedCancelToken::new();
+        drop(trigger);
+        let reason = smol::block_on(token.cancelled());
+        assert_eq!(reason, TurnCancellationReason::User);
+    }
+
+    #[test]
+    fn reasoned_token_race_returns_reason_when_cancelled() {
+        smol::block_on(async {
+            let (trigger, token) = ReasonedCancelToken::new();
+            let (user_trigger, _) = ReasonedCancelToken::new();
+            trigger.cancel(TurnCancellationReason::Shutdown);
+            user_trigger.cancel(TurnCancellationReason::User);
+            let result = token.race(std::future::pending::<()>()).await;
+            assert_eq!(result.unwrap_err(), TurnCancellationReason::Shutdown);
+        });
     }
 }
