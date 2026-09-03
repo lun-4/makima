@@ -1,6 +1,6 @@
 # Goal
 
-Eliminate the eight contention-sensitive or incorrectly asserted tests identified in `flaky_test_report.md` by making valuable tests deterministic and removing redundant, timing-dependent tests. Update the report so it records each disposition and the verification results.
+Eliminate the eight contention-sensitive or incorrectly asserted tests identified in the embedded flaky test report by making valuable tests deterministic and removing redundant, timing-dependent tests. Update the report so it records each disposition and the verification results.
 
 # Implementation Summary
 
@@ -14,7 +14,7 @@ Affected touch points:
 - `maki-lua/src/loader.rs`: assert the actual post-unload provider-usage acknowledgement.
 - `maki-lua/src/write_lock_regression.rs`: gate the delete operation after lock acquisition by matching the note path.
 - `maki-lua/tests/in_memory_host.rs`: remove the timing-dependent splash startup test.
-- `flaky_test_report.md`: mark all eight findings fixed or removed, explain the final disposition, and append verification evidence.
+- The embedded flaky test report: mark all eight findings fixed or removed, explain the final disposition, and append verification evidence.
 
 Non-goals: changing Nucleo, Lua-host scheduling, completion lifecycle semantics, splash startup durability, provider-usage protocol, file-lock ordering guarantees, nextest thread configuration, or session-lock behavior.
 
@@ -50,7 +50,7 @@ Non-goals: changing Nucleo, Lua-host scheduling, completion lifecycle semantics,
 
 ## Phase 5: Maintain the report and validate under contention
 
-1. Update `flaky_test_report.md` in place rather than deleting historical evidence. Add a `## Resolutions` section containing one Markdown table with exactly these columns: `test`, `disposition`, `root cause`, `resolution`, `verification`. Give each of the eight tests exactly one row, using only `retained/repaired` or `removed` in `disposition`:
+1. Update the embedded flaky test report rather than deleting historical evidence. Add a `## Resolutions` section containing one Markdown table with exactly these columns: `test`, `disposition`, `root cause`, `resolution`, `verification`. Give each of the eight tests exactly one row, using only `retained/repaired` or `removed` in `disposition`:
    - five retained/repaired: the two file-completion tests, argument rows while pending, provider usage after unload, and memory write/delete serialization;
    - three removed: model-reference Enter, empty completion/session renewal, and splash startup option versus saved selection.
 2. Record why no production semantics changed and replace now-obsolete “needs investigation” language with the resolved root causes.
@@ -63,7 +63,7 @@ Non-goals: changing Nucleo, Lua-host scheduling, completion lifecycle semantics,
 - **AC.3:** The post-unload provider-usage path deterministically observes `ProviderUsageAck(2)` and fails if the unloaded callback emits a Flash first.
 - **AC.4:** The memory serialization test parks the delete's stat for the exact seeded note path after lock acquisition, proves the concurrent write remains blocked, and passes only when delete then write are serialized in that order.
 - **AC.5:** The redundant model-reference Enter and empty-completion/session-renewal tests and the misleading splash startup-option-versus-saved test are absent, while named deterministic lower-level/integration tests cover model replacement, Enter routing, cancellation, fresh session allocation, and splash selection behavior.
-- **AC.6:** `flaky_test_report.md` has a machine-checkable resolution table containing each of the eight test names exactly once, five `retained/repaired` and three `removed` dispositions, resolved root causes, and only verification actually performed; unresolved language is either removed or explicitly labeled as historical.
+- **AC.6:** The embedded flaky test report has a machine-checkable resolution table containing each of the eight test names exactly once, five `retained/repaired` and three `removed` dispositions, resolved root causes, and only verification actually performed; unresolved language is either removed or explicitly labeled as historical.
 - **AC.7:** Formatting, crate checks, linting, relevant targeted tests, and the complete remote CI workflow pass.
 
 # Test Strategy
@@ -94,7 +94,7 @@ expected = {
     "provider_usage_publication_updates_mirror_before_callback_and_unload_cleans_it",
     "splash_picker_startup_option_wins_over_saved",
 }
-section = Path("flaky_test_report.md").read_text().split("## Resolutions", 1)[1]
+section = Path(".agents/makima-plans/91-flaky-tests.md").read_text().split("\n## Resolutions\n", 1)[1]
 lines = section.splitlines()
 header = next(line for line in lines if line.startswith("|"))
 assert [cell.strip() for cell in header.strip().strip("|").split("|")] == [
@@ -127,7 +127,7 @@ Before handoff, run a `plan_reviewer` pass and resolve all critical/high finding
 
 # Documentation Strategy
 
-No user-facing documentation is needed because runtime behavior and public contracts do not change. `flaky_test_report.md` is the canonical task artifact and must be updated with the final test dispositions, root-cause corrections, and measured verification results. Do not add a separate documentation file. The full report is also appended at the end of this file, so the plan and the hunt evidence stay together.
+No user-facing documentation is needed because runtime behavior and public contracts do not change. The report embedded below is the canonical task artifact. It contains the final test dispositions, root-cause corrections, and measured verification results. A separate report file is not needed.
 
 # Risks, Blockers, and Required Decisions
 
@@ -483,4 +483,3 @@ stderr block. Totals: 58 + 800 + 14720 + 3600 = 19,178 suite or single-test
 runs (the 3600 covers both post-fix campaigns: 500 + 100 + 3000).
 No retries were configured anywhere (`--retries=0`) so every recorded
 failure is a first-attempt failure.
-
