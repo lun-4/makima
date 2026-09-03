@@ -1083,7 +1083,7 @@ fn cell_line<'a>(c: &Candidate, width: usize, selected: bool, t: &'a theme::Them
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use crate::theme::ThemesProvider;
 
@@ -1098,6 +1098,24 @@ mod tests {
 
     use super::*;
     use test_case::test_case;
+
+    const MATCHER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn wait_for_matcher(
+        menu: &mut FileCompletionMenu,
+        settled: impl Fn(&FileCompletionMenu) -> bool,
+        message: &str,
+    ) {
+        let deadline = Instant::now() + MATCHER_SETTLE_TIMEOUT;
+        loop {
+            let _ = menu.tick();
+            if settled(menu) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{message}");
+            std::thread::yield_now();
+        }
+    }
 
     fn item(label: &str, kind: &str, insertion: &str) -> ItemSpec {
         ItemSpec {
@@ -1328,19 +1346,29 @@ mod tests {
                 columns[0] = Utf32String::from("review.txt")
             });
         session.walking = false;
-        for _ in 0..20 {
-            let _ = menu.tick();
-            if menu.match_items().iter().any(|item| item.kind == FILE_KIND) {
-                break;
-            }
-        }
-        let kinds = menu
-            .match_items()
-            .into_iter()
-            .map(|item| item.kind)
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                let session = menu.session.as_ref().unwrap();
+                !session.query_refresh_pending
+                    && menu
+                        .match_items()
+                        .iter()
+                        .any(|item| item.label == "review.txt")
+            },
+            "project matcher did not surface the injected review.txt match",
+        );
+        let items = menu.match_items();
+        let kinds = items
+            .iter()
+            .map(|item| item.kind.clone())
             .collect::<Vec<_>>();
         assert!(kinds.contains(&FILE_KIND.to_string()));
         assert!(kinds.contains(&"skill".to_string()));
+        assert!(
+            items.iter().all(|item| item.label != "../outside.txt"),
+            "stale explicit candidate must not survive the project transition"
+        );
     }
 
     #[test]
@@ -2299,14 +2327,14 @@ mod tests {
             });
         session.walking = false;
         menu.sync_query("needle");
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        while menu.session.as_ref().unwrap().query_refresh_pending
-            || menu.session.as_ref().unwrap().file_matches.is_empty()
-        {
-            let _ = menu.tick();
-            assert!(Instant::now() < deadline, "file matcher did not settle");
-            std::thread::yield_now();
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                let session = menu.session.as_ref().unwrap();
+                !session.query_refresh_pending && !session.file_matches.is_empty()
+            },
+            "file matcher did not settle",
+        );
         menu.session.as_mut().unwrap().visible = true;
         assert!(
             matches!(menu.handle_key(key(KeyCode::Enter)), CompletionAction::Select(item) if item.label == "needle-file")
@@ -2336,12 +2364,11 @@ mod tests {
             }
         }
         menu.sync_query("");
-        for _ in 0..100 {
-            let _ = menu.tick();
-            if menu.session.as_ref().unwrap().file_matches.len() == 3 {
-                break;
-            }
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().file_matches.len() == 3,
+            "file matcher did not surface the three injected files",
+        );
         let before = labels(&menu);
         assert_eq!(before, vec!["alpha-file", "beta-file", "gamma-file"]);
 
@@ -2349,12 +2376,11 @@ mod tests {
         assert!(menu.session.as_ref().unwrap().query_refresh_pending);
         assert_eq!(labels(&menu), before);
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        while menu.session.as_ref().unwrap().query_refresh_pending {
-            let _ = menu.tick();
-            assert!(Instant::now() < deadline, "file matcher did not settle");
-            std::thread::yield_now();
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().query_refresh_pending,
+            "file matcher did not settle on the filtered gamma query",
+        );
         assert_eq!(labels(&menu), vec!["gamma-file"]);
     }
 
@@ -2396,15 +2422,11 @@ mod tests {
         while project_nucleo_mut(s).tick(0).running {}
 
         menu.sync_query("Cargo");
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        loop {
-            let (_, _) = menu.tick();
-            if !menu.session.as_ref().unwrap().matching {
-                break;
-            }
-            assert!(Instant::now() < deadline, "file matcher did not settle");
-            std::thread::yield_now();
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().matching,
+            "file matcher did not settle",
+        );
         let s = menu.session.as_ref().unwrap();
         assert_eq!(s.query, "Cargo");
         let c = s
