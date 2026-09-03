@@ -4125,6 +4125,32 @@ fn session_close_idempotent_and_prompt_after_close_errors() {
     assert_eq!(out, SESSION_CLOSED_ERR);
 }
 
+#[test]
+fn session_prompt_timeout_cancels_blocked_turn() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "session_timeout_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local semaphore = maki.async.semaphore(1)
+                local permit = semaphore:acquire()
+                local sess = maki.agent.session(ctx, {{ semaphore = semaphore }})
+                local result, err = sess:prompt("x", {{ timeout = 1 }})
+                permit:release()
+                if result ~= nil then return "unexpected result" end
+                return err or "no error"
+            end
+        }})"#
+    );
+    host.load_source("session_timeout_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "session_timeout_probe", serde_json::json!({})).unwrap();
+    assert_eq!(out, "session prompt timed out after 1s");
+}
+
 #[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
 #[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
 #[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]

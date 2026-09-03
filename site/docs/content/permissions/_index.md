@@ -171,7 +171,7 @@ For MCP tools, both allow and deny decisions generalize to `*` (the entire tool)
 
 ## Auto Mode (bash)
 
-Auto mode puts a separate-context classifier model in front of **every** bash command. A silent, throwaway session (empty history, its own model unless `auto_model` pins one) reviews the command against a safety policy and returns accept or deny with a one-line reason. Approved commands run as usual. A clean deny asks you for permission first (unless YOLO is on, see below): the normal allow / deny / remember prompt appears and you decide. Auto mode only skips the prompt when the classifier fails (spawn, timeout, or a malformed verdict): the command is denied fail-closed with the classifier error.
+Auto mode puts a separate-context classifier model in front of **every** bash command. A silent, throwaway session (empty history, its own model unless `auto_model` pins one) reviews the command against a safety policy and returns accept or deny with a one-line reason. Approved commands run as usual. A deny or classifier failure asks you for permission first (unless YOLO is on, see below): the normal allow / deny / remember prompt appears and you decide. A classifier failure never approves a command by itself.
 
 The classifier sees only the command and working directory in a silent throwaway session. Its turn is never relayed into your main conversation, so nothing about the main run leaks into its decision and its reasoning does not clutter the thread. The default system prompt is the codex-guardian policy (bundled, `auto_classifier_prompt.lua`).
 
@@ -194,14 +194,14 @@ The tri-state verdict is strict:
 
 - **approve** (`approved: true`) runs the command. The tool view shows an `auto-mode: allowed` line so you can see the classifier let it through.
 - **deny** (`approved: false`) asks you for permission first: the same allow / deny / remember prompt as any other gated tool. The command then runs exactly as it would with auto mode off: allow once, allow for the session, or always-allow all work, and your existing permission rules still apply. With YOLO on there is no prompt and the deny rejects the command with the classifier's reason instead.
-- **error** (classifier failure, timeout, or a non-boolean verdict) denies the command fail-closed with the classifier error. No user prompt is involved, and the command never auto-runs.
+- **error** (classifier failure, timeout, or a non-boolean verdict) asks you for permission through the same fallback as deny. The command never auto-runs. With YOLO on, the error rejects the command without prompting.
 
 Things to watch:
 
-- A deny asks instead of rejecting, so a stricter classifier means more prompts, not more silent rejections. If the classifier is too strict, tune the prompt or disable auto mode.
-- Permission rules (allow once, allow for the session, always-allow, explicit denies) only enter through the deny prompt. approve and error verdicts are the classifier's call alone, so a session allow will not rescue a command when the classifier errors.
-- YOLO flips the deny behavior to the old one: reject outright with the classifier's reason, no prompt. This is YOLO's "no prompts, gates stay authoritative" reading, consistent with explicit deny rules still applying under YOLO.
-- `auto_model` is optional. Unset, the classifier runs on the same model as the current session; set it to pin a dedicated classifier model (a cheap one keeps the gate fast).
+- A deny or classifier error asks instead of rejecting, so a stricter or unreliable classifier means more prompts, not silent rejections. If that creates too much friction, tune the prompt, choose another `auto_model`, or disable auto mode.
+- Permission rules (allow once, allow for the session, always-allow, explicit denies) enter through the deny and error fallback prompts. An approve verdict remains the classifier's call alone.
+- YOLO makes deny and error verdicts reject outright with no prompt. This is YOLO's "no prompts, gates stay authoritative" reading, consistent with explicit deny rules still applying under YOLO.
+- `auto_model` is optional. Unset, the classifier runs on the same model as the current session; set it to pin a dedicated classifier model (a cheap one keeps the gate fast). `auto_timeout_secs` limits each classification without reducing the command's execution budget.
 
 The `/automode` toggle only flips `auto_mode`; it does not change the deny-to-prompt behavior.
 

@@ -652,8 +652,9 @@ async fn call_tool(
 }
 
 /// Run the normal interactive permission prompt for a tool call, without
-/// dispatching the tool. This is how a plugin escalates a classifier deny to
-/// the same allow/deny/remember choices a user would see with automode off.
+/// dispatching the tool. This is how a plugin escalates a classifier deny or
+/// failure to the same allow/deny/remember choices a user would see with
+/// automode off.
 /// Allow and deny rules apply exactly as they do for a plain tool call.
 ///
 /// @param ctx LuaCtx Agent context.
@@ -717,7 +718,7 @@ async fn permission_prompt(
 }
 
 /// Whether this session is in YOLO mode, where permission prompts are skipped
-/// and the bash automode classifier's deny is final (no escalation).
+/// and the bash automode classifier's deny or failure is final (no escalation).
 ///
 /// YOLO toggles at runtime (`/yolo`, `--yolo`), so query it per call rather
 /// than caching it.
@@ -1206,6 +1207,8 @@ impl Drop for LuaSession {
 /// tools).
 ///
 /// @param message string User message to send.
+/// @param opts table? Optional fields:
+///   `timeout` (integer?) - maximum wait in seconds. A timeout closes the session and returns no partial streamed text.
 /// @return (table?, string?) Result table on success, or `(nil, err)` on
 /// failure. A run cut short after streaming some text hands you both: the
 /// error and a `{ text = <what it streamed> }` table.
@@ -1219,9 +1222,20 @@ async fn prompt(
     lua: Lua,
     this: mlua::UserDataRef<LuaSession>,
     message: String,
+    opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
+    let parent_cancels = Arc::clone(&this.parent_cancels);
+    let id = this.id.clone();
+    let cancel_slot = this.cancel_slot;
+    let timeout = opts
+        .map(|opts| opts.get::<Option<u64>>("timeout"))
+        .transpose()?
+        .flatten();
+    if timeout == Some(0) {
+        return Ok(err_pair("timeout must be greater than zero"));
+    }
     drop(this);
     let Ok(ticket) = actor.admit_turn(
         AgentInput {
@@ -1240,7 +1254,24 @@ async fn prompt(
         return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
     };
     let turn_id = ticket.turn_id();
-    let outcome = ticket.wait().await;
+    let outcome = match timeout {
+        Some(seconds) => {
+            let outcome = futures_lite::future::race(async { Some(ticket.wait().await) }, async {
+                smol::Timer::after(Duration::from_secs(seconds)).await;
+                None
+            })
+            .await;
+            let Some(outcome) = outcome else {
+                state.close_with(&actor);
+                parent_cancels.retire(&id, cancel_slot);
+                return Ok(err_pair(format!(
+                    "session prompt timed out after {seconds}s"
+                )));
+            };
+            outcome
+        }
+        None => ticket.wait().await,
+    };
     // The actor retains every outcome and accumulates usage before the ticket
     // resolves, so the snapshot's cumulative usage is the per-session total the
     // old driver surfaced (`input_tokens`/`output_tokens` across all turns).

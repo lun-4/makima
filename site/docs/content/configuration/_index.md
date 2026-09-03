@@ -195,9 +195,10 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `auto_mode` | boolean | `false` | - | Classify every bash command before executing it (accept/deny with reason). |
 | `auto_model` | string | - | - | Model spec for the bash auto-mode classifier. Unset: inherits the current session model. |
+| `auto_timeout_secs` | integer | `30` | 5 | Stop the auto-mode classifier after this many seconds and fall back to normal permission handling. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
+| `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds of execution. Approval time is excluded. A call's `timeout` param overrides it. |
 
 ### `plugins.code_execution`
 

@@ -76,10 +76,18 @@ maki.api.register_tool({
 maki.api.register_tool({
   name = "probe_prompt",
   description = "run one blocking turn on the subagent session",
-  schema = { type = "object", properties = { message = { type = "string" } }, additionalProperties = false },
+  schema = {
+    type = "object",
+    properties = {
+      message = { type = "string" },
+      timeout = { type = "integer" },
+    },
+    additionalProperties = false,
+  },
   audiences = { "main" },
   handler = function(input)
-    local result, err = session_holder.sess:prompt(input.message)
+    local opts = input.timeout and { timeout = input.timeout } or nil
+    local result, err = session_holder.sess:prompt(input.message, opts)
     return maki.json.encode({ result = result, error = err })
   end,
 })
@@ -94,6 +102,18 @@ fn load_probe_host() -> (Arc<ToolRegistry>, PluginHost) {
 
 struct FailOnceProvider {
     calls: AtomicUsize,
+}
+
+struct PendingProvider {
+    dropped_tx: flume::Sender<()>,
+}
+
+struct DropSignal(flume::Sender<()>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
 }
 
 struct GatedProvider {
@@ -202,6 +222,29 @@ impl Provider for FailOnceProvider {
             } else {
                 Ok(common::canned_reply(RECOVERED_REPLY))
             }
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { unimplemented!() })
+    }
+}
+
+impl Provider for PendingProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _model: &'a Model,
+        _messages: &'a [Message],
+        _system: &'a str,
+        _tools: &'a Value,
+        _event_tx: &'a flume::Sender<ProviderEvent>,
+        _opts: RequestOptions,
+        _session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let _signal = DropSignal(self.dropped_tx.clone());
+            std::future::pending::<()>().await;
+            unreachable!()
         })
     }
 
@@ -402,6 +445,28 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
     .expect("later turn did not resolve");
     assert!(recovered["error"].is_null(), "got: {recovered}");
     assert_eq!(recovered["result"]["text"], json!(RECOVERED_REPLY));
+}
+
+#[test]
+fn prompt_timeout_cancels_in_flight_provider_request() {
+    let (reg, _host) = load_probe_host();
+    let (dropped_tx, dropped_rx) = flume::bounded(1);
+    let provider = Arc::new(PendingProvider { dropped_tx });
+    let (ctx, _parent_rx, _run_trigger) = ctx_with_provider(provider);
+
+    exec_tool(&reg, &ctx, "probe_spawn", json!({})).expect("spawn failed");
+    let result = exec_tool(
+        &reg,
+        &ctx,
+        "probe_prompt",
+        json!({ "message": "wait forever", "timeout": 1 }),
+    )
+    .expect("timed prompt did not resolve");
+
+    assert_eq!(result["error"], "session prompt timed out after 1s");
+    dropped_rx
+        .recv_timeout(TURN_TIMEOUT)
+        .expect("provider request remained alive after prompt timeout");
 }
 
 /// After a subagent finishes a run, its transcript must be surfaced to the
