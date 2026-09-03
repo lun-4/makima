@@ -5,7 +5,7 @@ local BENCHMARK_COMMAND = "bash autoresearch.sh"
 local CONTINUE_PROMPT =
   "If autoresearch mode is still active, continue its loop. Make one coherent change, run the benchmark, then keep or discard it with research_log. Otherwise stop immediately."
 local DEFAULT_MAX_ITERATIONS = 20
-local NANOS_PER_SECOND = 1_000_000_000
+local NANOS_PER_SECOND = 1000000000
 local STATE_VERSION = 1
 
 local sessions = {}

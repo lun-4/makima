@@ -1,7 +1,21 @@
+//! The TUI's root-actor backend.
+//!
+//! Implements [`ActorBackend`](maki_agent::actor::ActorBackend) for the root
+//! agent. The actor owns history, lifecycle, queueing, cancellation, and
+//! retained outcomes; this struct owns only the dynamic TUI preparation
+//! (initialization, cwd/instruction reload, MCP prompt expansion, prompt
+//! slots, model/tools, the answer receiver) and constructs the transient
+//! [`Agent`] for each executed turn.
+//!
+//! `run_id` is an `Arc<AtomicU64>` shared with `AgentHandles`; the app bumps
+//! it on each run and the backend reads it to stamp events that arrive with
+//! no correlation (standalone compacts).
+
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use maki_agent::agent;
+use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
@@ -12,40 +26,42 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
-    PromptRole, SessionMailbox, SharedMessages, ToolOutputLines, TurnFailure, TurnId, TurnOutcome,
+    CancelToken, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
+    SessionMailbox, ToolOutputLines, TurnId, TurnOutcome,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
-use tracing::error;
+use tracing::{info, warn};
 
 use super::ProviderSlot;
 use super::SystemPromptOverride;
-use super::cancel_map::RunCancelMap;
-use super::shared_queue::{QueueItem, QueueReceiver};
 
-pub(super) struct AgentLoop {
+/// Correlation prefix stamped on TUI root/turn admissions. Parsed back into a
+/// run id for event envelope correlation.
+pub(crate) const ROOT_CORRELATION_PREFIX: &str = "r";
+
+/// Parses an actor correlation string back into the TUI run id.
+pub(crate) fn correlation_to_run_id(correlation: &str) -> u64 {
+    correlation
+        .strip_prefix(ROOT_CORRELATION_PREFIX)
+        .and_then(|rest| rest.parse().ok())
+        .unwrap_or_default()
+}
+
+/// The TUI's root-actor backend.
+pub(crate) struct TuiActorBackend {
     agent_id: AgentId,
     model_slot: Arc<ProviderSlot>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
-    vars: Vars,
-    instructions: Instructions,
-    tools: Value,
-    mcp: Option<McpSession>,
-    history: History,
     btw_system: Arc<ArcSwap<String>>,
-    cancel_map: Arc<RunCancelMap>,
-    init_cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_tracker: Arc<FileReadTracker>,
-    min_run_id: u64,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
-    queue: Arc<QueueReceiver>,
     session_id: Option<SessionRef>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
@@ -54,64 +70,77 @@ pub(super) struct AgentLoop {
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
+    /// Live MCP session; recreated per spawn so deferred tools stay fresh.
+    mcp: Option<McpSession>,
+    /// Startup cancellation: races env/instruction/MCP initialization.
+    init_cancel: CancelToken,
+    initialized: bool,
+    /// App-visible current run id. Bumped by the app on each run; the backend
+    /// reads it to stamp compact/control events that carry no correlation.
+    run_id: Arc<AtomicU64>,
+    /// Signals the drain driver (in `AgentHandles`) that one work item
+    /// finished, so it can publish `QueueDrained` under the actor queue lock.
+    drain_tx: flume::Sender<u64>,
+    vars: Vars,
+    instructions: Instructions,
+    tools: Value,
 }
 
-impl AgentLoop {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
-        model_slot: Arc<ProviderSlot>,
-        config: AgentConfig,
-        tool_output_lines: ToolOutputLines,
-        initial_history: Vec<Message>,
-        shared_history: SharedMessages,
-        btw_system: Arc<ArcSwap<String>>,
-        mcp_handle: Option<McpHandle>,
-        permissions: Arc<PermissionManager>,
-        agent_tx: flume::Sender<Envelope>,
-        answer_rx: flume::Receiver<String>,
-        queue: Arc<QueueReceiver>,
-        cancel_map: Arc<RunCancelMap>,
-        init_cancel: CancelToken,
-        session_id: Option<SessionRef>,
-        mailbox: Option<SessionMailbox>,
-        timeouts: maki_providers::Timeouts,
-        lua_handle: EventHandle,
-        subagent_cancels: Arc<CancelMap<String>>,
-        model_policy: Arc<ModelPolicy>,
-        system_prompt: SystemPromptOverride,
-        file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
-    ) -> Self {
-        let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
-        Self {
-            agent_id: AgentId::generate(),
-            model_slot,
-            config,
-            tool_output_lines,
-            vars: Vars::default(),
-            instructions: Instructions::default(),
-            tools: Value::Null,
-            mcp,
-            history: History::restored(initial_history).with_mirror(shared_history),
-            btw_system,
-            cancel_map,
-            init_cancel,
-            permissions,
-            file_tracker: FileReadTracker::fresh(),
-            min_run_id: 0,
-            agent_tx,
-            answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
-            queue,
-            session_id,
-            mailbox,
-            timeouts,
-            lua_handle,
-            subagent_cancels,
-            model_policy,
-            system_prompt,
-            file_write_locks,
-        }
+#[allow(clippy::too_many_arguments)]
+pub(super) fn new_backend(
+    agent_id: AgentId,
+    model_slot: Arc<ProviderSlot>,
+    config: AgentConfig,
+    tool_output_lines: ToolOutputLines,
+    btw_system: Arc<ArcSwap<String>>,
+    mcp_handle: Option<McpHandle>,
+    initial_history: &[Message],
+    permissions: Arc<PermissionManager>,
+    agent_tx: flume::Sender<Envelope>,
+    answer_rx: flume::Receiver<String>,
+    session_id: Option<SessionRef>,
+    mailbox: Option<SessionMailbox>,
+    timeouts: maki_providers::Timeouts,
+    lua_handle: EventHandle,
+    subagent_cancels: Arc<CancelMap<String>>,
+    model_policy: Arc<ModelPolicy>,
+    system_prompt: SystemPromptOverride,
+    file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
+    init_cancel: CancelToken,
+    drain_tx: flume::Sender<u64>,
+    run_id: Arc<AtomicU64>,
+) -> TuiActorBackend {
+    let mcp = mcp_handle.map(|h| McpSession::new(h, initial_history));
+    TuiActorBackend {
+        agent_id,
+        model_slot,
+        config,
+        tool_output_lines,
+        btw_system,
+        permissions,
+        file_tracker: FileReadTracker::fresh(),
+        agent_tx,
+        answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
+        session_id,
+        mailbox,
+        timeouts,
+        lua_handle,
+        subagent_cancels,
+        model_policy,
+        system_prompt,
+        file_write_locks,
+        mcp,
+        init_cancel,
+        initialized: false,
+        run_id,
+        drain_tx,
+        vars: Vars::default(),
+        instructions: Instructions::default(),
+        tools: Value::Null,
     }
+}
 
+impl TuiActorBackend {
     /// Build the system prompt, honoring the CLI override and append.
     fn build_system_with(
         &self,
@@ -120,7 +149,7 @@ impl AgentLoop {
         model: &Model,
     ) -> String {
         let mut system = self.system_prompt.override_text.clone().unwrap_or_else(|| {
-            agent::build_system_prompt(
+            maki_agent::agent::build_system_prompt(
                 &self.vars,
                 &self.lua_handle.mode_registry(),
                 mode,
@@ -136,61 +165,13 @@ impl AgentLoop {
         system
     }
 
-    pub(super) async fn run(mut self) {
-        if !self.initialize().await {
-            return;
-        }
-
-        while let Ok(()) = self.queue.recv_notify().await {
-            let mut last_run_id = None;
-            while let Some(entry) = self.queue.pop() {
-                if entry.run_id() < self.min_run_id {
-                    continue;
-                }
-                last_run_id = Some(entry.run_id());
-                self.process_entry(entry).await;
-            }
-            if let Some(run_id) = last_run_id {
-                let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-                self.queue
-                    .publish_if_empty(|| event_tx.try_send(AgentEvent::QueueDrained));
-            }
-        }
-    }
-
-    async fn process_entry(&mut self, entry: QueueItem) {
-        let run_id = entry.run_id();
-        let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-
-        let result = match entry {
-            QueueItem::Message {
-                text,
-                image_count,
-                input,
-                displayed,
-                ..
-            } => {
-                if !displayed {
-                    let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
-                }
-                let turn_id = TurnId::generate();
-                if let Err(error) = self
-                    .do_agent_run(input, event_tx.clone(), run_id, turn_id)
-                    .await
-                {
-                    self.emit_turn_failure(&event_tx, turn_id, error);
-                }
-                return;
-            }
-            QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
-        };
-
-        if let Err(e) = result {
-            self.emit_error(run_id, e);
-        }
-    }
-
+    /// One-shot startup: env vars, instruction loading, `btw_system`, tool
+    /// building, and MCP readiness raced against the init cancel token.
+    /// Races cancellation so a canceled startup stops before any run enters.
     async fn initialize(&mut self) -> bool {
+        if self.initialized {
+            return true;
+        }
         self.vars = template::env_vars();
         self.reload_instructions().await;
         if self.init_cancel.is_cancelled() {
@@ -208,36 +189,17 @@ impl AgentLoop {
             }
             spawn_oauth_for_needs_auth(mcp);
         }
-        !self.init_cancel.is_cancelled()
+        self.initialized = !self.init_cancel.is_cancelled();
+        self.initialized
     }
 
-    async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
-        let slot = self.model_slot.load();
-        let current_provider =
-            Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>;
-        let (provider, model) = agent::resolve_compaction_model(
-            &current_provider,
-            &slot.model,
-            self.timeouts,
-            &self.model_policy,
-        );
-        agent::compact(
-            &*provider,
-            &model,
-            &mut self.history,
-            event_tx,
-            &self.config,
-        )
-        .await
-    }
-
-    async fn do_agent_run(
+    /// Per-run preparation: cwd change detection and instruction reload, MCP
+    /// prompt expansion into the preamble, prompt-slot collection and system
+    /// prompt construction, tool rebuild, and answer-receiver draining.
+    async fn prepare_run(
         &mut self,
-        mut input: AgentInput,
-        event_tx: EventSender,
-        run_id: u64,
-        turn_id: TurnId,
-    ) -> Result<(), AgentError> {
+        input: &mut AgentInput,
+    ) -> Result<(String, Value, Arc<maki_agent::prompt::ResolvedSlots>), AgentError> {
         let slot = self.model_slot.load();
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
@@ -245,7 +207,7 @@ impl AgentLoop {
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        self.rebuild_tools(&slot.model, input.workflow);
+        self.tools = self.build_tools(&slot.model, input.workflow);
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -276,14 +238,36 @@ impl AgentLoop {
         }
 
         let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
-        let modes = self.lua_handle.mode_registry();
         let system = self.build_system_with(&input.mode, &prompt_slots, &slot.model);
         self.publish_btw_system(&prompt_slots);
-        let (trigger, cancel) = CancelToken::new();
-        self.set_cancel_trigger(run_id, trigger);
+        self.tools = self.build_tools(&slot.model, input.workflow);
+        let tools = self.tools.clone();
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
+        Ok((system, tools, Arc::new(prompt_slots)))
+    }
+
+    /// The one place an executed turn constructs the transient [`Agent`].
+    /// Returns `Some` outcome when the run entered, `None` when setup failed
+    /// before `Agent::run` (the actor then synthesizes one `Failed` delivery).
+    async fn execute_agent(
+        &mut self,
+        history: &mut History,
+        context: &TurnContext,
+        mut input: AgentInput,
+        turn_id: TurnId,
+        run_id: u64,
+    ) -> Option<TurnOutcome> {
+        let (system, tools, prompt_slots) = match self.prepare_run(&mut input).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                info!(error = %error, %turn_id, "agent turn setup failed before run");
+                return None;
+            }
+        };
+        self.run_id.store(run_id, Ordering::Relaxed);
+        let slot = self.model_slot.load();
         let mut agent = Agent::new(
             AgentParams {
                 agent_id: self.agent_id,
@@ -296,8 +280,8 @@ impl AgentLoop {
                 mailbox: self.mailbox.clone(),
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
-                prompt_slots: Arc::new(prompt_slots),
-                modes: Arc::clone(&modes),
+                prompt_slots,
+                modes: Arc::clone(&self.lua_handle.mode_registry()),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
@@ -306,36 +290,26 @@ impl AgentLoop {
                 file_write_locks: Arc::clone(&self.file_write_locks),
             },
             AgentRunParams {
-                history: &mut self.history,
+                history,
                 system,
-                event_tx,
-                tools: self.tools.clone(),
+                event_tx: EventSender::new(self.agent_tx.clone(), run_id),
+                tools,
             },
         )
         .with_loaded_instructions(self.instructions.loaded.clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
-        .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
-        .with_cancel(cancel)
+        .with_interrupt_source(context.interrupt.clone().unwrap_or_else(noop_interrupt))
+        .with_cancel(context.cancel.clone())
+        .with_cancel_reason_source(context.cancel_reason.clone())
         .with_mcp(self.mcp.clone());
 
         let outcome = agent.run(turn_id, input).await;
         drop(agent);
-
-        self.clear_cancel_trigger(run_id);
-
-        if matches!(outcome, TurnOutcome::Cancelled { .. }) {
-            self.min_run_id = run_id + 1;
-        }
-
-        Ok(())
+        Some(outcome)
     }
 
     /// Base tools only. MCP definitions are injected per request by
     /// `Agent::request_tools`; baking them here would freeze the catalog.
-    fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
-        self.tools = self.build_tools(model, workflow);
-    }
-
     fn build_tools(&self, model: &Model, workflow: bool) -> Value {
         let examples = model.supports_tool_examples();
         let filter = ToolFilter::from_config(&self.config, model, &[]);
@@ -349,54 +323,163 @@ impl AgentLoop {
 
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
-        self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
+        self.instructions = smol::unblock(move || maki_agent::agent::load_instructions(&cwd)).await;
     }
 
-    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
-    /// the model. Everything else matches the live prompt.
-    fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
+    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints
+    /// would only confuse the model. Everything else matches the live prompt.
+    fn publish_btw_system(&mut self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
         let slot = self.model_slot.load();
         let system =
             self.build_system_with(&maki_agent::AgentMode::Build, prompt_slots, &slot.model);
         self.btw_system.store(Arc::new(system));
     }
 
-    fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {
-        // One trigger per run, and `clear_cancel_trigger` drops the whole
-        // key, so the slot is not worth carrying around.
-        let _ = self.cancel_map.insert(run_id, trigger);
+    /// Run id for control-event correlation. Controls carry no turn, so the
+    /// backend stamps them with the app's current run id.
+    fn current_run_id(&self) -> u64 {
+        self.run_id.load(Ordering::Relaxed)
+    }
+}
+
+impl ActorBackend for TuiActorBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        context: TurnContext,
+        input: AgentInput,
+        work: WorkKind,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
+            // Roots carry their own correlation run id in the work metadata;
+            // admitted turns correlate through the admission's correlation.
+            let run_id = match &work {
+                WorkKind::Root { run_id, .. } => *run_id,
+                WorkKind::Turn | WorkKind::Control | WorkKind::Compact => {
+                    correlation_to_run_id(&context.correlation)
+                }
+            };
+            let result = if matches!(&work, WorkKind::Control | WorkKind::Compact) {
+                // The TUI has no standalone controls/compacts; the runner
+                // only reaches here with a Turn or a started Root. Treat an
+                // unexpected work kind as a setup failure instead of panicking.
+                warn!(?work, "unexpected work kind in TUI run_turn");
+                BackendResult::SetupFailed {
+                    agent_id: context.agent_id,
+                    turn_id,
+                }
+            } else if !self.initialize().await {
+                BackendResult::SetupFailed {
+                    agent_id: context.agent_id,
+                    turn_id,
+                }
+            } else {
+                info!(
+                    agent_id = %context.agent_id,
+                    %turn_id,
+                    %run_id,
+                    "tui actor turn"
+                );
+                // A root admitted as a standalone turn carries the presentation
+                // metadata: draw the bubble exactly once when the UI has not drawn
+                // it yet. Immediate-dispatch roots (`displayed == true`) were drawn
+                // by `start_from_queue`, and folded roots never reach here (the
+                // active run consumes them through its interrupt source).
+                if let WorkKind::Root {
+                    displayed: false,
+                    text,
+                    image_count,
+                    ..
+                } = &work
+                {
+                    let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
+                        AgentEvent::QueueItemConsumed {
+                            text: text.clone(),
+                            image_count: *image_count,
+                        },
+                    );
+                }
+                match self
+                    .execute_agent(history, &context, input, turn_id, run_id)
+                    .await
+                {
+                    Some(outcome) => BackendResult::EnteredRun(outcome),
+                    None => BackendResult::SetupFailed {
+                        agent_id: context.agent_id,
+                        turn_id,
+                    },
+                }
+            };
+            let _ = self.drain_tx.try_send(run_id);
+            result
+        })
     }
 
-    fn clear_cancel_trigger(&self, run_id: u64) {
-        self.cancel_map.remove(&run_id);
+    fn run_control<'a>(
+        &'a mut self,
+        _history: &'a mut History,
+        _context: TurnContext,
+        control: &'a ControlWork,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        // The TUI has no standalone controls today; compaction is routed
+        // through the actor's compact work.
+        Box::pin(async move {
+            warn!(control = %control.name, "unexpected control for TUI backend");
+            BackendResult::ControlFailed
+        })
     }
 
-    fn emit_turn_failure(&self, event_tx: &EventSender, turn_id: TurnId, error: AgentError) {
-        error!(error = %error, agent_id = %self.agent_id, %turn_id, "accepted turn setup failed");
-        let outcome = TurnOutcome::Failed {
-            agent_id: self.agent_id,
-            turn_id,
-            usage: Default::default(),
-            num_turns: 0,
-            failure: TurnFailure::from_agent_error(&error),
-        };
-        if let Err(send_error) = event_tx.send(AgentEvent::TurnOutcome(outcome)) {
-            error!(
-                %send_error,
-                agent_id = %self.agent_id,
-                %turn_id,
-                "terminal outcome delivery failed"
+    fn run_compact<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        _context: TurnContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            // Idle compaction: the runner popped a `Compact` work item. Keep
+            // the existing `ControlComplete` / `ControlError` contract, both
+            // emitted by `agent::compact` itself. In-turn compaction never
+            // reaches here: the active `Agent` folds it through its interrupt
+            // source and emits `CompactionDone`.
+            let run_id = self.current_run_id();
+            let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+            let slot = self.model_slot.load();
+            let current_provider =
+                Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>;
+            let (provider, model) = maki_agent::agent::resolve_compaction_model(
+                &current_provider,
+                &slot.model,
+                self.timeouts,
+                &self.model_policy,
             );
+            let result =
+                maki_agent::agent::compact(&*provider, &model, history, &event_tx, &self.config)
+                    .await;
+            let _ = self.drain_tx.try_send(run_id);
+            match result {
+                Ok(()) => BackendResult::ControlDone,
+                Err(e) => {
+                    warn!(error = %e, "idle compaction failed");
+                    let _ = event_tx.send(AgentEvent::ControlError {
+                        message: e.user_message(),
+                    });
+                    BackendResult::ControlFailed
+                }
+            }
+        })
+    }
+}
+
+/// A no-op interrupt source used when the actor provides none (standalone
+/// control or compact execution).
+fn noop_interrupt() -> Arc<dyn maki_agent::InterruptSource> {
+    struct Noop;
+    impl maki_agent::InterruptSource for Noop {
+        fn poll(&self) -> Option<maki_agent::ExtractedCommand> {
+            None
         }
     }
-
-    fn emit_error(&self, run_id: u64, error: AgentError) {
-        error!(error = %error, "agent error");
-        let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-        let _ = event_tx.send(AgentEvent::ControlError {
-            message: error.user_message(),
-        });
-    }
+    Arc::new(Noop)
 }
 
 fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
