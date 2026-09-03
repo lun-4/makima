@@ -4,9 +4,15 @@
 
 local M = {}
 
+local function dispw(s)
+  return utf8.len(s) or #s
+end
+
 local CURRENT_LABEL = "current"
 local OPEN_LABEL = "open"
-
+local COUNT_WIDTH = 15
+local STATUS_WIDTH = 10
+local HEADER_STYLE = "path"
 local AGE_UNITS = {
   { 31536000, "y" },
   { 2592000, "mo" },
@@ -49,6 +55,48 @@ end
 
 -- Right column as {text, style}. Focused says "current", open-elsewhere says
 -- "open", everything else shows its age; selection restyles whatever label.
+function M.format_count(count)
+  return tostring(count or 0)
+end
+
+function M.row_right_columns(title_width, icon_width, confirm_width, inner_width, count, status)
+  local count_text = M.format_count(count)
+  local used = 2 + title_width + icon_width + confirm_width
+  local padding = math.max(inner_width - used - COUNT_WIDTH - 1 - STATUS_WIDTH, 1)
+  return count_text, padding, status
+end
+
+function M.row_spans(title_spans, count_text, count_style, padding, status, status_style)
+  local spans = {}
+  for _, span in ipairs(title_spans) do
+    spans[#spans + 1] = span
+  end
+  spans[#spans + 1] = { string.rep(" ", padding), count_style }
+  spans[#spans + 1] = { string.rep(" ", math.max(COUNT_WIDTH - dispw(count_text), 0)), count_style }
+  spans[#spans + 1] = { count_text, count_style }
+  spans[#spans + 1] = { " ", count_style }
+  spans[#spans + 1] = { string.rep(" ", math.max(STATUS_WIDTH - dispw(status), 0)), status_style }
+  spans[#spans + 1] = { status, status_style }
+  return spans
+end
+
+function M.header_spans(inner_width)
+  local title = "title"
+  local count = "messages"
+  local status = "age"
+  local used = 4 + dispw(title)
+  local padding = math.max(inner_width - used - COUNT_WIDTH - 1 - STATUS_WIDTH, 1)
+  return {
+    { "    " .. title, HEADER_STYLE },
+    { string.rep(" ", padding), HEADER_STYLE },
+    { string.rep(" ", math.max(COUNT_WIDTH - dispw(count), 0)), HEADER_STYLE },
+    { count, HEADER_STYLE },
+    { " ", HEADER_STYLE },
+    { string.rep(" ", STATUS_WIDTH - dispw(status)), HEADER_STYLE },
+    { status, HEADER_STYLE },
+  }
+end
+
 function M.right(s, selected)
   local text, style
   if s.focused then

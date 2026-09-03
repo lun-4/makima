@@ -1507,15 +1507,7 @@ impl<'t> EventLoop<'t> {
                     .sessions
                     .iter()
                     .enumerate()
-                    .map(|(i, rt)| {
-                        json!({
-                            "id": rt.id(),
-                            "title": rt.app.state.session.title,
-                            "status": SessionStatus::of(&rt.app).as_str(),
-                            "updated_at": rt.app.state.session.updated_at,
-                            "focused": i == self.focused,
-                        })
-                    })
+                    .map(|(i, rt)| live_session_row(rt, i == self.focused))
                     .collect();
                 let _ = reply_tx.send(Ok(json!(list)));
             }
@@ -2101,6 +2093,17 @@ impl<'t> EventLoop<'t> {
             focused: self.focused,
         }
     }
+}
+
+fn live_session_row(runtime: &SessionRuntime, focused: bool) -> serde_json::Value {
+    json!({
+        "id": runtime.id(),
+        "title": runtime.app.state.session.title,
+        "status": SessionStatus::of(&runtime.app).as_str(),
+        "updated_at": runtime.app.state.session.updated_at,
+        "message_count": runtime.app.state.session.messages().len(),
+        "focused": focused,
+    })
 }
 
 fn session_usage(
