@@ -465,7 +465,7 @@ fn prompt_timeout_cancels_in_flight_provider_request() {
 
     assert_eq!(result["error"], "session prompt timed out after 1s");
     dropped_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(TURN_TIMEOUT)
         .expect("provider request remained alive after prompt timeout");
 }
 

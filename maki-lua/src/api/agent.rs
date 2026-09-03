@@ -1208,7 +1208,7 @@ impl Drop for LuaSession {
 ///
 /// @param message string User message to send.
 /// @param opts table? Optional fields:
-///   `timeout` (integer?) - maximum wait in seconds. A timeout closes the session.
+///   `timeout` (integer?) - maximum wait in seconds. A timeout closes the session and returns no partial streamed text.
 /// @return (table?, string?) Result table on success, or `(nil, err)` on
 /// failure. A run cut short after streaming some text hands you both: the
 /// error and a `{ text = <what it streamed> }` table.

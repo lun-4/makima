@@ -1281,7 +1281,7 @@ tools).
 
 - `{message}` (`string`) User message to send.
 - `{opts?}` (`table?`) Optional fields:
-  - `timeout` (`integer?`) maximum wait in seconds. A timeout closes the session.
+  - `timeout` (`integer?`) maximum wait in seconds. A timeout closes the session and returns no partial streamed text.
 
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
 failure. A run cut short after streaming some text hands you both: the
