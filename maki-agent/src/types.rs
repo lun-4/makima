@@ -1058,6 +1058,25 @@ pub struct TurnCompleteEvent {
     pub context_window: u32,
 }
 
+#[derive(Clone)]
+pub struct SubagentCancel(Arc<dyn Fn() + Send + Sync>);
+
+impl SubagentCancel {
+    pub fn new(cancel: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(cancel))
+    }
+
+    pub fn cancel(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for SubagentCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SubagentCancel")
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SubagentInfo {
     pub parent_tool_use_id: String,
@@ -1072,6 +1091,9 @@ pub struct SubagentInfo {
     /// Queue into the subagent's background driver (async sessions only).
     #[serde(skip)]
     pub input_tx: Option<flume::Sender<String>>,
+    /// Cancel currently executing and queued work without closing the session.
+    #[serde(skip)]
+    pub cancel: Option<SubagentCancel>,
 }
 
 #[derive(Debug, Clone)]

@@ -366,6 +366,11 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
+    pub fn reopen(&mut self) {
+        self.finished = false;
+        self.started_at = Some(Instant::now());
+    }
+
     pub fn mark_finished(&mut self, role: DisplayRole, text: &str) {
         if self.finished {
             return;

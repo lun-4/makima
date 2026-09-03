@@ -84,6 +84,11 @@ pub(crate) fn set_local_tool_handles(f: impl Fn(&str) -> Option<ToolHandles> + '
     LOCAL_TOOL_HANDLES.with(|c| *c.borrow_mut() = Some(Box::new(f)));
 }
 
+pub(crate) fn clear_local_callbacks() {
+    LOCAL_DESCRIBE.with(|cell| cell.borrow_mut().take());
+    LOCAL_TOOL_HANDLES.with(|cell| cell.borrow_mut().take());
+}
+
 fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
     LOCAL_TOOL_HANDLES.with(|c| c.borrow().as_ref().and_then(|f| f(tool)))
 }
@@ -1830,6 +1835,27 @@ impl LuaToolInvocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_callbacks_release_captured_runtime_before_thread_teardown() {
+        let runtime = Arc::new(());
+        let weak = Arc::downgrade(&runtime);
+        let describe_runtime = Arc::clone(&runtime);
+        set_local_describe(move |_, _, _| {
+            let _ = &describe_runtime;
+            None
+        });
+        let handles_runtime = Arc::clone(&runtime);
+        set_local_tool_handles(move |_| {
+            let _ = &handles_runtime;
+            None
+        });
+        drop(runtime);
+
+        assert!(weak.upgrade().is_some());
+        clear_local_callbacks();
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]

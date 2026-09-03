@@ -1,5 +1,4 @@
 mod agent_loop;
-mod cancel_map;
 mod command_router;
 pub(crate) mod shared_queue;
 
@@ -9,28 +8,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+use maki_agent::actor::AgentActorHandle;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentConfig, AgentEvent, AgentId, CancelMap, Envelope, HistorySnapshot, McpCommand,
+    McpConfigErrors, McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_storage::id::SessionRef;
-
-use self::cancel_map::new_run_cancel_map;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, Message, Model, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions,
     StreamResponse,
 };
+use maki_storage::id::SessionRef;
 use tracing::{info, warn};
 
 use crate::app::App;
 use crate::provider_usage::{ProviderAuthGeneration, ProviderIdentity, ProviderInstanceGeneration};
 
-use self::agent_loop::AgentLoop;
+use self::agent_loop::new_backend;
 use self::command_router::spawn_command_router;
+use self::shared_queue::actor_queue;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,10 +205,13 @@ pub(crate) enum AgentCommand {
 }
 
 /// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old
-/// loop can never steal new input. The output channel (`agent_tx`/`agent_rx`)
+/// actor can never steal new input. The output channel (`agent_tx`/`agent_rx`)
 /// is per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
 /// restore reply, a click, an old agent winding down) can always deliver.
 /// Stale events are filtered by `run_id`, not by killing the channel.
+///
+/// The scheduler, history, lifecycle, and retained outcomes live in the
+/// actor owned here: `actor` is the handle, `task` the runner task.
 pub(crate) struct AgentHandles {
     pub(crate) cmd_tx: flume::Sender<AgentCommand>,
     pub(crate) agent_rx: flume::Receiver<Envelope>,
@@ -224,12 +226,14 @@ pub(crate) struct AgentHandles {
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
     mailbox: Option<SessionMailbox>,
+    subagent_cancels: Arc<CancelMap<String>>,
+    actor: Arc<AgentActorHandle>,
     task: smol::Task<()>,
 }
 
 impl AgentHandles {
     /// MCP is shared across sessions and agent respawns; the event loop starts it
-    /// once and shuts it down at exit. Only the agent loop task lives here.
+    /// once and shuts it down at exit. Only the actor task lives here.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         model_slot: &Arc<ProviderSlot>,
@@ -284,7 +288,16 @@ impl AgentHandles {
     }
 
     pub(crate) fn cancel(self) {
-        let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
+        self.actor.cancel_all();
+        self.subagent_cancels.cancel_all();
+    }
+
+    /// Shuts the old actor down after the app and queue are repointed, so
+    /// its close cannot poison the replacement. Everything the old agent
+    /// still owns drains through the retained per-tab output channel.
+    fn shutdown_actor(&self) {
+        self.actor.shutdown();
+        self.subagent_cancels.cancel_all();
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -312,7 +325,7 @@ impl AgentHandles {
         lua_handle: EventHandle,
     ) {
         // The output channel survives the respawn, so this bump is the only
-        // thing that makes the old loop's in-flight envelopes stale. It lives
+        // thing that makes the old actor's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
         let slot = model_slot.load();
@@ -336,21 +349,29 @@ impl AgentHandles {
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
-        // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
+        // the last old `QueueSender` alive and the old actor parks on its notify forever.
         self.apply_to_app(app);
         app.flush_restored_queue();
-        old.cancel();
+        // Shut the old actor down after the app and queue are repointed, so
+        // its close cannot poison the replacement. Everything the old agent
+        // still owns drains through the retained per-tab output channel.
+        old.shutdown_actor();
+        // Detach the old actor's task: `shutdown_actor` set the terminal
+        // lifecycle, so the runner finishes its active turn unwind and exits
+        // on its own. Dropping the `Task` would cancel that unwind mid-flight.
+        old.task.detach();
     }
 
     pub(crate) fn is_finished(&self) -> bool {
         self.task.is_finished()
     }
 
-    /// Hand back the agent task, dropping every channel so the loop can
+    /// Hand back the actor task, dropping every channel so the runner can
     /// wind down. The caller sends `CancelAll` first and then awaits all
     /// tabs at once via [`join_all`] instead of paying a serial timeout
     /// per tab.
     pub(crate) fn into_task(self) -> smol::Task<()> {
+        self.actor.shutdown();
         self.task
     }
 }
@@ -399,51 +420,74 @@ fn spawn_agent_internal(
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (queue_tx, queue_rx) = shared_queue::queue();
-    let queue_rx = Arc::new(queue_rx);
-    // Seeded empty because `AgentLoop::new` below publishes the real snapshot
-    // synchronously, before any handle escapes.
+    // Seeded empty because `AgentActorHandle::spawn` publishes the real
+    // snapshot synchronously, before any handle escapes.
     let shared_history: SharedMessages =
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
-    let (init_trigger, init_cancel) = CancelToken::new();
-    let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = session_id
         .as_ref()
         .map(|session_id| SessionMailbox::register(session_id.id()));
 
-    spawn_command_router(
-        cmd_rx,
-        Arc::clone(&cancel_map),
-        Arc::clone(&subagent_cancels),
-    );
+    let (init_trigger, init_cancel) = maki_agent::CancelToken::new();
 
-    let agent_loop = AgentLoop::new(
+    let (drain_tx, drain_rx) = flume::unbounded::<u64>();
+    let run_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let agent_id = AgentId::generate();
+    let backend = new_backend(
+        agent_id,
         Arc::clone(model_slot),
         config,
         tool_output_lines,
-        initial_history,
-        Arc::clone(&shared_history),
         Arc::clone(&btw_system),
         mcp_handle.clone(),
+        &initial_history,
         Arc::clone(permissions),
         agent_tx.clone(),
         answer_rx,
-        queue_rx,
-        cancel_map,
-        init_cancel,
         session_id,
         mailbox.clone(),
         timeouts,
         lua_handle,
-        subagent_cancels,
+        Arc::clone(&subagent_cancels),
         Arc::clone(&model_policy),
         system_prompt.clone(),
         Arc::new(maki_agent::tools::FileWriteLocks::new()),
+        init_cancel,
+        drain_tx,
+        Arc::clone(&run_id),
+    );
+    let (actor, task) = AgentActorHandle::spawn(
+        agent_id,
+        initial_history,
+        Some(Arc::clone(&shared_history)),
+        Box::new(backend),
+    );
+    let actor = Arc::new(actor);
+    let queue_tx = actor_queue(Arc::clone(&actor), Arc::clone(&run_id));
+
+    spawn_command_router(
+        cmd_rx,
+        Arc::clone(&actor),
+        Arc::clone(&subagent_cancels),
+        init_trigger,
     );
 
-    let task = smol::spawn(agent_loop.run());
+    // Drain driver: the actor's runner drains the queue; this task watches
+    // each completed item and publishes `QueueDrained` once, under the actor
+    // queue lock, correlated with the finishing item's run id.
+    let drain_actor = Arc::clone(&actor);
+    let drain_agent_tx = agent_tx.clone();
+    smol::spawn(async move {
+        while let Ok(run_id) = drain_rx.recv_async().await {
+            drain_actor.publish_if_empty(|| {
+                maki_agent::EventSender::new(drain_agent_tx.clone(), run_id)
+                    .try_send(AgentEvent::QueueDrained);
+            });
+        }
+    })
+    .detach();
 
     AgentHandles {
         cmd_tx,
@@ -459,6 +503,8 @@ fn spawn_agent_internal(
         model_policy,
         system_prompt,
         mailbox,
+        subagent_cancels,
+        actor,
         task,
     }
 }
@@ -483,11 +529,6 @@ mod tests {
 
     struct StubProvider;
 
-    struct AuthProvider {
-        reload_ok: bool,
-        rotate: bool,
-    }
-
     impl Provider for StubProvider {
         fn stream_message<'a>(
             &'a self,
@@ -505,6 +546,11 @@ mod tests {
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    struct AuthProvider {
+        reload_ok: bool,
+        rotate: bool,
     }
 
     impl Provider for AuthProvider {
@@ -695,8 +741,8 @@ mod tests {
             "each respawn must bump run_id exactly once"
         );
 
-        // The restored item is drained from the new queue by the live agent
-        // loop, which may pop it before this thread reads the shared queue, so
+        // The restored item is drained from the new queue by the live actor,
+        // which may consume it before this thread reads the shared queue, so
         // asserting `text_messages()` here would race. The channel is the
         // deterministic witness: `QueueItemConsumed` only leaves the new queue.
         pre_gen1_sender

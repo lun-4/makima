@@ -409,7 +409,7 @@ impl App {
         let chat = &self.chats[render_chat];
         let (mode_label, mode_style) = self.mode_label();
         let ctx = StatusBarContext {
-            status: &self.status,
+            status: self.status_for_chat(render_chat),
             mode_label,
             mode_style,
             model_id: chat
