@@ -308,7 +308,9 @@ fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        let metadata = match entry.metadata() {
+        // `DirEntry::metadata` is an lstat, so symlinks would never satisfy the
+        // file/dir filter below; `metadata(entry.path())` follows the link.
+        let metadata = match std::fs::metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
@@ -1423,6 +1425,47 @@ mod tests {
         let candidates = explicit_candidates(&resolver, &cwd, Some(&home), "~/not");
         assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[home]);
         assert_eq!(candidates[0].path, "~/notes.txt");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_one_level_follows_symlinks() {
+        let unique = format!("maki-file-completion-{}", std::process::id());
+        let tmp = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("real_dir")).unwrap();
+        std::fs::write(tmp.join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(tmp.join("real.txt"), tmp.join("link_file")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real_dir"), tmp.join("link_dir")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("missing_target"), tmp.join("dangling")).unwrap();
+
+        let candidates = discover_one_level(&tmp).unwrap();
+
+        std::fs::remove_file(tmp.join("link_file")).unwrap();
+        std::fs::remove_file(tmp.join("link_dir")).unwrap();
+        std::fs::remove_file(tmp.join("dangling")).unwrap();
+        std::fs::remove_file(tmp.join("real.txt")).unwrap();
+        std::fs::remove_dir_all(tmp.join("real_dir")).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let by_name = |name: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.path == name)
+                .unwrap_or_else(|| panic!("missing candidate {name:?}"))
+        };
+        assert!(
+            !by_name("link_file").is_directory,
+            "file symlink must classify as file"
+        );
+        assert!(
+            by_name("link_dir").is_directory,
+            "dir symlink must classify as directory"
+        );
+        assert!(
+            candidates.iter().all(|c| c.path != "dangling"),
+            "dangling symlink must be skipped"
+        );
     }
 
     #[test]
