@@ -538,7 +538,21 @@ maki.api.register_command({
   handler = open,
 })
 
-maki.api.create_autocmd("SessionPickerRequested", { callback = open })
+-- Autocmd callbacks run synchronously on the Lua thread; open() suspends
+-- (ui roundtrips, win:recv), so it must run as a coroutine. Hop through the
+-- /sessions command, which the host runs as a deadline-free async task. The
+-- maki.async.run wrapper lives only as long as the run_command roundtrip,
+-- so its abandon deadline never touches the open picker.
+maki.api.create_autocmd("SessionPickerRequested", {
+  callback = function()
+    maki.async.run(function()
+      local _, err = maki.api.run_command("/sessions")
+      if err then
+        maki.ui.flash(err)
+      end
+    end)
+  end,
+})
 maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
 
 maki.api.register_command({
