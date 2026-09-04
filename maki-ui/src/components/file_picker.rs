@@ -131,7 +131,12 @@ pub(super) fn spawn_file_walker(
                         }
                         let path = entry.path().strip_prefix(&root).unwrap_or(entry.path());
                         let mut name = path.to_string_lossy().into_owned();
-                        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                        // `file_type` is an lstat, so follow the symlink to learn
+                        // whether it points at a directory.
+                        let is_directory = entry.file_type().is_some_and(|ft| ft.is_dir())
+                            || entry.file_type().is_some_and(|ft| ft.is_symlink())
+                                && entry.path().metadata().is_ok_and(|m| m.is_dir());
+                        if is_directory {
                             name.push(std::path::MAIN_SEPARATOR);
                         }
                         injector.push((), |_, cols| {
