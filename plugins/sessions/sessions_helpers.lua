@@ -12,6 +12,9 @@ local CURRENT_LABEL = "current"
 local OPEN_LABEL = "open"
 local COUNT_WIDTH = 15
 local STATUS_WIDTH = 10
+local ROW_PREFIX_WIDTH = 2
+local ICON_WIDTH = 2
+local RIGHT_COLUMNS_WIDTH = COUNT_WIDTH + 1 + STATUS_WIDTH
 local HEADER_STYLE = "path"
 local AGE_UNITS = {
   { 31536000, "y" },
@@ -53,17 +56,47 @@ function M.row_style(s, selected)
   return "item"
 end
 
--- Right column as {text, style}. Focused says "current", open-elsewhere says
--- "open", everything else shows its age; selection restyles whatever label.
 function M.format_count(count)
   return tostring(count or 0)
 end
 
-function M.row_right_columns(title_width, icon_width, confirm_width, inner_width, count, status)
+-- Widest everything left of the separator (prefix, icon, title) may render
+-- and still leave the fixed right columns on screen.
+function M.title_width_budget(confirm_width, inner_width)
+  return math.max(inner_width - confirm_width - 1 - RIGHT_COLUMNS_WIDTH, 1)
+end
+
+function M.row_right_columns(left_width, inner_width, count)
   local count_text = M.format_count(count)
-  local used = 2 + title_width + icon_width + confirm_width
-  local padding = math.max(inner_width - used - COUNT_WIDTH - 1 - STATUS_WIDTH, 1)
-  return count_text, padding, status
+  local padding = math.max(inner_width - left_width - RIGHT_COLUMNS_WIDTH, 1)
+  return count_text, padding
+end
+
+function M.spans_width(spans)
+  local total = 0
+  for _, span in ipairs(spans) do
+    total = total + dispw(span[1])
+  end
+  return total
+end
+
+function M.clip_spans(spans, max_width)
+  local clipped, used = {}, 0
+  for _, span in ipairs(spans) do
+    if used >= max_width then
+      break
+    end
+    local width = dispw(span[1])
+    if used + width <= max_width then
+      clipped[#clipped + 1] = span
+      used = used + width
+    else
+      local text = span[1]
+      clipped[#clipped + 1] = { text:sub(1, utf8.offset(text, max_width - used + 1) - 1), span[2] }
+      used = max_width
+    end
+  end
+  return clipped
 end
 
 function M.row_spans(title_spans, count_text, count_style, padding, status, status_style)
@@ -84,19 +117,21 @@ function M.header_spans(inner_width)
   local title = "title"
   local count = "messages"
   local status = "age"
-  local used = 4 + dispw(title)
-  local padding = math.max(inner_width - used - COUNT_WIDTH - 1 - STATUS_WIDTH, 1)
+  local used = ROW_PREFIX_WIDTH + ICON_WIDTH + dispw(title)
+  local padding = math.max(inner_width - used - RIGHT_COLUMNS_WIDTH, 1)
   return {
-    { "    " .. title, HEADER_STYLE },
+    { string.rep(" ", ROW_PREFIX_WIDTH + ICON_WIDTH) .. title, HEADER_STYLE },
     { string.rep(" ", padding), HEADER_STYLE },
     { string.rep(" ", math.max(COUNT_WIDTH - dispw(count), 0)), HEADER_STYLE },
     { count, HEADER_STYLE },
     { " ", HEADER_STYLE },
-    { string.rep(" ", STATUS_WIDTH - dispw(status)), HEADER_STYLE },
+    { string.rep(" ", math.max(STATUS_WIDTH - dispw(status), 0)), HEADER_STYLE },
     { status, HEADER_STYLE },
   }
 end
 
+-- Right side labels: focused says "current", open-elsewhere says "open",
+-- everything else shows its age; selection restyles whatever label.
 function M.right(s, selected)
   local text, style
   if s.focused then

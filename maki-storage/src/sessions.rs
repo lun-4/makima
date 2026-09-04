@@ -1158,16 +1158,16 @@ struct JsonlHeader {
     cwd: String,
 }
 
+/// A `meta` line starts with this. Only meta lines get parsed during a scan;
+/// everything else is classified by prefix.
+const META_PREFIX: &[u8] = br#"{"t":"meta""#;
+
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ScanRecord {
     Meta {
         title: String,
         updated_at: u64,
-    },
-    Msg {
-        #[serde(rename = "d")]
-        _d: serde_json::Value,
     },
     #[serde(other)]
     Other,
@@ -1281,9 +1281,9 @@ fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, St
 fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let header: JsonlHeader = serde_json::from_str(line.trim_end()).ok()?;
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line).ok()?;
+    let header: JsonlHeader = serde_json::from_slice(line.trim_ascii_end()).ok()?;
     if header.v != LOG_FORMAT_VERSION {
         return None;
     }
@@ -1291,17 +1291,35 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
     let mut title = DEFAULT_TITLE.to_string();
     let mut updated_at = 0;
     let mut message_count = 0;
-    for line in reader.lines().map_while(Result::ok) {
-        match serde_json::from_str::<ScanRecord>(&line) {
-            Ok(ScanRecord::Msg { .. }) => message_count += 1,
-            Ok(ScanRecord::Meta {
+    // Messages are counted by prefix, the same trick the shrink check uses:
+    // parsing every payload just to count it made the picker scan allocate
+    // through megabytes of tool output. Only meta lines get parsed.
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            // A partial read would cache a wrong count and a stale title, so
+            // an unreadable file fails the scan: the session is left unlisted
+            // rather than appearing with a bogus count.
+            Err(_) => return None,
+        }
+        // Every record the writer emits is one line of complete JSON followed
+        // by a newline, so a newline-terminated prefix match is always a
+        // complete msg record. Only the final line can be torn by a crash and
+        // still match the prefix, so just that line needs a parse to stay in
+        // step with the loader, which skips malformed records.
+        if line.starts_with(MSG_PREFIX) && (line.ends_with(b"\n") || is_complete_msg_record(&line))
+        {
+            message_count += 1;
+        } else if line.starts_with(META_PREFIX)
+            && let Ok(ScanRecord::Meta {
                 title: next_title,
                 updated_at: next_updated_at,
-            }) => {
-                title = next_title;
-                updated_at = next_updated_at;
-            }
-            _ => {}
+            }) = serde_json::from_slice(line.trim_ascii_end())
+        {
+            title = next_title;
+            updated_at = next_updated_at;
         }
     }
 
@@ -1312,6 +1330,16 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
         updated_at,
         message_count,
     })
+}
+
+/// A torn tail can match the msg prefix without being a record the loader
+/// would keep, so an unterminated final line has to parse as a well-formed
+/// `t: "msg"` record with a `d` field before it counts.
+fn is_complete_msg_record(line: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    matches!(value.get("t").and_then(|t| t.as_str()), Some("msg")) && value.get("d").is_some()
 }
 
 fn scan_legacy_header(path: &Path) -> Option<ScannedHeader> {
@@ -1851,7 +1879,9 @@ mod tests {
     }
 
     fn append_raw_msg(path: &Path, message: Value) {
-        let record = serde_json::to_string(&serde_json::json!({"t":"msg","d": message})).unwrap();
+        // Tag first, matching the `LogRecord` layout the real appends write:
+        // the scan classifies lines by that prefix.
+        let record = format!(r#"{{"t":"msg","d":{message}}}"#);
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
         file.write_all(record.as_bytes()).unwrap();
         file.write_all(b"\n").unwrap();
@@ -3023,6 +3053,108 @@ mod tests {
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn scan_counts_msg_records_and_ignores_other_tags() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        s.push_message(user_message("two"));
+        s.set_subagent_messages("sub".into(), vec![user_message("hidden")]);
+        s.insert_tool_output("t1".into(), Value::String("output".into()));
+        write_legacy_jsonl(&jsonl_path(dir, s.id), &s);
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].message_count, 2);
+    }
+
+    #[test]
+    fn scan_counts_appended_messages_after_cache_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        let path = jsonl_path(dir, s.id);
+        write_legacy_jsonl(&path, &s);
+        assert_eq!(
+            TestSession::list_in("/project", dir).unwrap()[0].message_count,
+            1
+        );
+
+        append_raw_msg(&path, user_message("two"));
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list[0].message_count, 2, "changed file rescans its count");
+    }
+
+    #[test]
+    fn scan_ignores_msg_shaped_lines_that_are_not_msg_records() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        let path = jsonl_path(dir, s.id);
+        write_legacy_jsonl(&path, &s);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        for noise in [
+            r#"{"t":"msgx","d":{}}"#,
+            r#"{"t":"sub_msg","d":{}}"#,
+            r#"{"t":"msg2","d":{}}"#,
+            "not json at all",
+        ] {
+            writeln!(file, "{noise}").unwrap();
+        }
+        drop(file);
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].message_count, 1);
+    }
+
+    #[test]
+    fn scan_ignores_torn_msg_tail_like_the_loader() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        let path = jsonl_path(dir, s.id);
+        write_legacy_jsonl(&path, &s);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"t":"msg","d":{"trun"#).unwrap();
+        drop(file);
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list[0].message_count, 1, "a torn tail does not count");
+        assert_eq!(
+            TestSession::load_from(s.id, dir).unwrap().messages().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn scan_counts_complete_unterminated_final_record_like_the_loader() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        let path = jsonl_path(dir, s.id);
+        write_legacy_jsonl(&path, &s);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        // The crash happened between the record's closing brace and the
+        // newline the writer emits after it.
+        let record =
+            serde_json::to_string(&serde_json::json!({"t":"msg","d":{"role":"user"}})).unwrap();
+        file.write_all(record.as_bytes()).unwrap();
+        drop(file);
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list[0].message_count, 2);
+        assert_eq!(
+            TestSession::load_from(s.id, dir).unwrap().messages().len(),
+            2
+        );
     }
 
     #[test]

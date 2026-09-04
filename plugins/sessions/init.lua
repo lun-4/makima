@@ -153,28 +153,22 @@ local function render()
     if spinning then
       icon_style = "spinner:" .. icon_style
     end
-    local line = { { "  ", base }, { icon, icon_style } }
+    local confirm_width = board.confirm == s.id and dispw(CONFIRM_HINT) or 0
+    local title_spans = { { "  ", base }, { icon, icon_style } }
     for _, sp in
       ipairs(
         Spans.match_spans(s.title, s._match and s._match.indices or {}, base, selected and "match_selected" or "match")
       )
     do
-      line[#line + 1] = sp
+      title_spans[#title_spans + 1] = sp
     end
-    local confirm_width = 0
+    title_spans = Helpers.clip_spans(title_spans, Helpers.title_width_budget(confirm_width, inner))
     if board.confirm == s.id then
-      line[#line + 1] = { CONFIRM_HINT, selected and "match_selected" or "error" }
-      confirm_width = dispw(CONFIRM_HINT)
+      title_spans[#title_spans + 1] = { CONFIRM_HINT, selected and "match_selected" or "error" }
     end
-    local title_width = dispw(s.title)
-    local count, pad = Helpers.row_right_columns(title_width, dispw(icon), confirm_width, inner, s.message_count, right)
-    local right_style_count = selected and "selected" or "dim"
-    line[#line + 1] = { string.rep(" ", pad), base }
-    line[#line + 1] = { string.rep(" ", math.max(15 - dispw(count), 0)), right_style_count }
-    line[#line + 1] = { count, right_style_count }
-    line[#line + 1] = { " ", right_style_count }
-    line[#line + 1] = { string.rep(" ", 10 - dispw(right)), right_style }
-    line[#line + 1] = { right, right_style }
+    local count_text, pad = Helpers.row_right_columns(Helpers.spans_width(title_spans), inner, s.message_count)
+    local count_style = selected and "selected" or "dim"
+    local line = Helpers.row_spans(title_spans, count_text, count_style, pad, right, right_style)
     lines[#lines + 1] = line
     if selected then
       cursor_line = #lines
