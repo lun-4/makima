@@ -3072,6 +3072,42 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         .expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
 }
+
+/// `/go` nests `maki.api.run_command("/bogus")` from inside a real command
+/// invocation (dispatched through the registry, so the handler runs with an
+/// invocation context): the nested dispatch rejects the unknown command
+/// without touching the UI.
+#[test]
+fn nested_run_command_rejects_unknown_command() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/go",
+            tui_only = false,
+            handler = function()
+                local ok, err = maki.api.run_command("/bogus")
+                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let rx = host.ui_action_rx();
+
+    smol::block_on(registry.dispatch_input(&target, "/go".into()));
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("nested run_command did not flash its result");
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "nil|unknown command"));
+}
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"

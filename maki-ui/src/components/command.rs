@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_commands::{
     CommandRegistry, CompletionCandidate, CompletionItem, CompletionResult, CompletionSession,
-    RegistrySnapshot, ResolvedCommand, TargetHandle,
+    RegistrySnapshot, ResolvedCommand, SlashClass, TargetHandle, classify_input,
 };
 use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -495,11 +495,12 @@ impl CommandPalette {
             self.snapshot = snapshot;
             self.nucleo = Self::build_nucleo(&self.snapshot);
         }
-        let Some(stripped) = input.strip_prefix('/') else {
+        let SlashClass::Command(trimmed) = classify_input(input) else {
             self.filtered.clear();
             self.current_arg_count = 0;
             return;
         };
+        let stripped = &trimmed[1..]; // trimmed starts with exactly one '/'
 
         let parts: Vec<&str> = stripped.split_whitespace().collect();
         let cmd_word = parts.first().copied().unwrap_or(stripped);
@@ -1009,6 +1010,24 @@ mod tests {
 
         assert_eq!(palette.filtered.len(), 1);
         assert_eq!(palette.filtered[0].command.invoked_name(), "/dynamic");
+    }
+
+    #[test]
+    fn escaped_input_never_matches_commands() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![registration("/model", "Switch model")])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+
+        palette.sync("/model");
+        assert!(palette.is_active());
+
+        palette.sync("//model");
+        assert!(!palette.is_active());
+        assert!(palette.filtered.is_empty());
     }
 
     #[test]

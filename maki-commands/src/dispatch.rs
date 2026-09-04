@@ -56,7 +56,25 @@ impl CommandRegistry {
         content: CommandContent,
         depth: usize,
     ) -> CommandFuture<InputDispatch> {
+        let class = classify_input(&content.text);
+        if let SlashClass::EscapedLiteral(literal) = class {
+            let attachments = content.attachments.clone();
+            let text = Arc::from(literal);
+            return Box::pin(async move {
+                InputDispatch::LiteralInput(CommandContent { text, attachments })
+            });
+        }
         let Ok(resolved) = self.resolve_input_for(&target, &content.text) else {
+            if matches!(class, SlashClass::Command(_)) {
+                let trimmed = content.text.trim_start();
+                let name =
+                    Arc::from(ParsedInput::parse(trimmed).map_or(trimmed, |parsed| parsed.name));
+                return Box::pin(async move {
+                    InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
+                        name,
+                    )))
+                });
+            }
             return Box::pin(async move { InputDispatch::LiteralInput(content) });
         };
         let registry = self.clone();
@@ -162,6 +180,31 @@ impl CommandRegistry {
         })
     }
 }
+/// Lexical classification of user text: whether it is a command attempt,
+/// an escaped literal, or plain prose. The only place the escape-strip value
+/// is computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlashClass<'a> {
+    /// Single-slash command attempt: `/foo` or ` /foo` (trimmed).
+    Command(&'a str),
+    /// `//foo` → literal `/foo`; `///foo` → literal `//foo`. Exactly one
+    /// leading slash is stripped from the trimmed text.
+    EscapedLiteral(&'a str),
+    /// Not a command attempt.
+    Plain,
+}
+
+pub fn classify_input(text: &str) -> SlashClass<'_> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("//") {
+        SlashClass::EscapedLiteral(&trimmed[1..])
+    } else if trimmed.starts_with('/') {
+        SlashClass::Command(trimmed)
+    } else {
+        SlashClass::Plain
+    }
+}
+
 pub(super) struct ParsedInput<'a> {
     pub(super) name: &'a str,
     pub(super) arguments: &'a str,
@@ -384,8 +427,8 @@ pub enum ResolutionError {
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum CommandError {
-    #[error("unknown command")]
-    UnknownCommand,
+    #[error("unknown command {0}")]
+    UnknownCommand(Arc<str>),
     #[error("invalid arguments for {command}: expected {expected}")]
     InvalidArguments {
         command: Arc<str>,

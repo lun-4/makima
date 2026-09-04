@@ -37,9 +37,9 @@ Add `--verbose` to include full turn-by-turn messages in the output.
 
 ## Slash commands
 
-A prompt whose first token is an available slash command runs that command before Maki creates model input. Custom Markdown commands, MCP prompts, and Lua commands can produce a normal agent turn. A side-effect-only command succeeds with empty output. A known available command with invalid arguments exits with an error. Unknown and unavailable slash-prefixed text remains a model prompt.
+A prompt whose first token is an available slash command runs that command before Maki creates model input. Custom Markdown commands, MCP prompts, and Lua commands can produce a normal agent turn. A side-effect-only command succeeds with empty output. A known available command with invalid arguments exits with an error. Unknown and unavailable slash-prefixed text is rejected with an error; prefix a literal message that starts with `/` with another slash to send it as text (`//lmao` sends `/lmao`).
 
-SDK stream mode and ACP project the built-ins supported by their target capabilities. `/model` accepts an explicit model spec. One-shot print mode supports `/exit`. Commands that require TUI capabilities remain literal input in headless frontends. Local commands reject image attachments, while agent-turn commands preserve them.
+SDK stream mode and ACP project the built-ins supported by their target capabilities. `/model` accepts an explicit model spec. One-shot print mode supports `/exit`. Commands that require TUI capabilities are rejected in headless frontends. The `//` escape also works there, so `/help` becomes text via `//help`. Local commands reject image attachments, while agent-turn commands preserve them.
 
 See [Commands](/docs/commands/) for matching, collision priority, and the generated command list.
 

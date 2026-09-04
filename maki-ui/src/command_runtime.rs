@@ -129,6 +129,28 @@ impl CommandRuntime {
         self.send_outcome(target.id(), future);
     }
 
+    pub(crate) fn dispatch_input(&self, target: &TargetHandle, content: CommandContent) {
+        let future = self.registry.dispatch_input(target, content);
+        self.send_dispatched(target.id(), future);
+    }
+
+    fn send_dispatched(
+        &self,
+        target: maki_commands::InvocationTargetId,
+        future: CommandFuture<maki_commands::InputDispatch>,
+    ) {
+        let tx = self.event_tx.clone();
+        smol::spawn(async move {
+            let maki_commands::InputDispatch::Dispatched(outcome) = future.await else {
+                return;
+            };
+            let _ = tx
+                .send_async(CommandEvent::Outcome { target, outcome })
+                .await;
+        })
+        .detach();
+    }
+
     fn send_outcome(
         &self,
         target: maki_commands::InvocationTargetId,
