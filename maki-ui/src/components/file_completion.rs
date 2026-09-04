@@ -2237,12 +2237,11 @@ mod tests {
                 columns[0] = Utf32String::from("needle-file");
             });
         menu.sync_query("needle");
-        for _ in 0..100 {
-            let _ = menu.tick();
-            if !menu.session.as_ref().unwrap().matches.is_empty() {
-                break;
-            }
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().matches.is_empty(),
+            "heuristic matcher never surfaced the injected needle-file match",
+        );
         let session = menu.session.as_ref().unwrap();
         assert_eq!(labels(&menu), vec!["needle-file"]);
         assert_eq!(session.coarse_match_count, 1);
