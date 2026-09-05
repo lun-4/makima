@@ -2648,7 +2648,7 @@ impl App {
                 .poll(self.status_content_reader.load_full())
             | self.tick_file_picker()
             | self.tick_file_completion()
-            | self.command_palette.poll_arguments();
+            | self.command_palette.tick();
         dirty |= self.tick_chats();
         while let Some(shown) = self.chats[0].take_splash_event() {
             // The autocmd is fire-and-forget; repainting is the frame pull's
@@ -2699,6 +2699,7 @@ impl App {
                 .as_ref()
                 .map_or(Cadence::IDLE, SelectionState::cadence),
             self.file_completion.cadence(),
+            self.command_palette.cadence(),
             Cadence::any(self.chats.iter().map(Chat::cadence)),
             // Wake precisely at the 2s idle mark to promote a queued demand.
             Cadence::when(

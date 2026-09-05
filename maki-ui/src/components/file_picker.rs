@@ -23,6 +23,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::animation::spinner_frame;
 use crate::components::Overlay;
+use crate::components::coherent_completion::{CoherentCompletion, Publication};
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
@@ -55,6 +56,7 @@ struct Match {
 
 struct Session {
     nucleo: Nucleo<()>,
+    publication: CoherentCompletion,
     matches: Vec<Match>,
     coarse_match_count: u32,
     materialized_count: u32,
@@ -169,6 +171,7 @@ impl FilePickerModal {
 
         self.session = Some(Session {
             nucleo,
+            publication: CoherentCompletion::default(),
             matches: Vec::new(),
             coarse_match_count: 0,
             materialized_count: 0,
@@ -215,8 +218,7 @@ impl FilePickerModal {
         let Some(s) = &mut self.session else {
             return false;
         };
-        s.search.insert_text(text);
-        reparse_pattern(s);
+        edit_query(s, |search| search.insert_text(text));
         true
     }
 
@@ -228,7 +230,7 @@ impl FilePickerModal {
         match key.code {
             KeyCode::Esc => return FilePickerModalAction::Close,
             KeyCode::Enter => {
-                if !s.visible {
+                if !s.visible || !s.publication.ready() {
                     return FilePickerModalAction::Consumed;
                 }
                 if let Some(m) = s.matches.get(s.selected) {
@@ -238,17 +240,13 @@ impl FilePickerModal {
             }
             KeyCode::Up => move_selection(s, -1),
             KeyCode::Down => move_selection(s, 1),
-            KeyCode::Backspace => {
-                s.search.remove_char();
-                reparse_pattern(s);
-            }
+            KeyCode::Backspace => edit_query(s, TextBuffer::remove_char),
             KeyCode::Left => s.search.move_left(),
             KeyCode::Right => s.search.move_right(),
             KeyCode::Home => s.search.move_home(),
             KeyCode::End => s.search.move_end(),
             _ if key::DELETE_WORD.matches(key) => {
-                s.search.remove_word_before_cursor();
-                reparse_pattern(s);
+                edit_query(s, TextBuffer::remove_word_before_cursor);
             }
             _ if key::SCROLL_HALF_UP.matches(key) => {
                 move_selection(s, -((s.viewport_height / 2).max(1) as isize))
@@ -259,10 +257,7 @@ impl FilePickerModal {
             _ if key::SCROLL_LINE_UP.matches(key) => move_selection(s, -1),
             _ if key::SCROLL_LINE_DOWN.matches(key) => move_selection(s, 1),
             _ if super::is_ctrl(&key) => {}
-            KeyCode::Char(c) => {
-                s.search.push_char(c);
-                reparse_pattern(s);
-            }
+            KeyCode::Char(c) => edit_query(s, |search| search.push_char(c)),
             _ => {}
         }
         FilePickerModalAction::Consumed
@@ -278,7 +273,10 @@ impl FilePickerModal {
             // already bringing the loop back for them. Once it ends, every
             // keystroke leaves one last answer in flight, and the list sits on
             // the old query until someone looks.
-            Cadence::when(s.matching && !s.walking, Cadence::PENDING),
+            Cadence::when(
+                s.publication.needs_repaint(s.matching) && !s.walking,
+                Cadence::PENDING,
+            ),
         ])
     }
 
@@ -290,8 +288,11 @@ impl FilePickerModal {
 
         let status = s.nucleo.tick(0);
         s.matching = status.running;
+        let publication = s
+            .publication
+            .observe(status, s.nucleo.snapshot().pattern().column_pattern(0));
         // The title says "scanning…" while walking, so finishing redraws too.
-        let mut dirty = Dirty::from(status.changed);
+        let mut dirty = Dirty::NO;
 
         if s.walking {
             match s.done_rx.try_recv() {
@@ -325,11 +326,16 @@ impl FilePickerModal {
             }
         }
 
-        if status.changed
+        if publication != Publication::Wait
             && let Some(s) = self.session.as_mut()
         {
             refresh_matches(s);
+            if publication == Publication::Commit {
+                s.selected = 0;
+                s.scroll_offset = 0;
+            }
             clamp_selection(s);
+            dirty = Dirty::YES;
         }
 
         (dirty, None)
@@ -390,13 +396,23 @@ impl Overlay for FilePickerModal {
     }
 }
 
+fn edit_query(s: &mut Session, edit: impl FnOnce(&mut TextBuffer)) {
+    let previous = s.search.value();
+    edit(&mut s.search);
+    if s.search.value() != previous {
+        reparse_pattern(s);
+    }
+}
+
 fn reparse_pattern(s: &mut Session) {
     let query = s.search.value();
     s.nucleo
         .pattern
         .reparse(0, &query, CaseMatching::Smart, Normalization::Smart, false);
-    s.selected = 0;
-    s.scroll_offset = 0;
+    s.publication.query_reparsed(
+        s.nucleo.pattern.column_pattern(0),
+        s.nucleo.injector().injected_items() > 0,
+    );
 }
 
 fn refresh_matches(s: &mut Session) {
@@ -646,6 +662,7 @@ mod tests {
         let (done_tx, done_rx) = flume::bounded(1);
         picker.session = Some(Session {
             nucleo,
+            publication: CoherentCompletion::default(),
             matches: Vec::new(),
             coarse_match_count: 0,
             materialized_count: 0,
@@ -821,11 +838,139 @@ mod tests {
     }
 
     #[test]
-    fn enter_during_pending_is_consumed() {
-        let (mut picker, _done_tx) = pending_picker();
+    fn pending_query_consumes_enter_and_preserves_committed_state() {
+        let (mut picker, done_tx) = pending_picker();
+        inject_file(&picker, MAIN_PATH);
+        inject_file(&picker, README_PATH);
+        done_tx.send(()).unwrap();
+        let _ = tick_until(&mut picker, |s| s.matches.len() == 2).expect(NEVER_CONVERGED);
+        picker.session.as_mut().unwrap().visible = true;
+        let before_paths = picker
+            .session
+            .as_ref()
+            .unwrap()
+            .matches
+            .iter()
+            .map(|m| m.path.clone())
+            .collect::<Vec<_>>();
+        let before_counts = {
+            let s = picker.session.as_ref().unwrap();
+            (
+                s.coarse_match_count,
+                s.materialized_count,
+                s.final_match_count,
+            )
+        };
+        let area = Rect::new(0, 0, 80, 30);
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let rendered_rect = std::cell::Cell::new(Rect::default());
+        terminal
+            .draw(|frame| rendered_rect.set(picker.view(frame, area)))
+            .unwrap();
+        let before_rect = rendered_rect.get();
+        {
+            let session = picker.session.as_mut().unwrap();
+            session.selected = 1;
+            session.scroll_offset = 1;
+        }
+
+        for c in README_QUERY.chars() {
+            picker.handle_key(key(KeyCode::Char(c)));
+        }
+
+        let session = picker.session.as_ref().unwrap();
+        assert!(session.publication.pending());
+        assert_eq!(session.selected, 1);
+        assert_eq!(session.scroll_offset, 1);
+        assert_eq!(
+            session
+                .matches
+                .iter()
+                .map(|m| m.path.clone())
+                .collect::<Vec<_>>(),
+            before_paths
+        );
+        assert_eq!(
+            (
+                session.coarse_match_count,
+                session.materialized_count,
+                session.final_match_count
+            ),
+            before_counts
+        );
         assert!(matches!(
             picker.handle_key(key(KeyCode::Enter)),
             FilePickerModalAction::Consumed
+        ));
+        terminal
+            .draw(|frame| rendered_rect.set(picker.view(frame, area)))
+            .unwrap();
+        assert_eq!(rendered_rect.get(), before_rect);
+
+        let _ = tick_until(&mut picker, |s| s.publication.ready()).expect(NEVER_CONVERGED);
+        let session = picker.session.as_ref().unwrap();
+        assert_eq!(session.matches.len(), 1);
+        assert_eq!(session.matches[0].path, README_PATH);
+        assert_eq!(session.selected, 0);
+        assert_eq!(session.scroll_offset, 0);
+    }
+
+    #[test]
+    fn file_picker_query_commit_survives_in_flight_injection() {
+        let (mut picker, _done_tx) = pending_picker();
+        inject_file(&picker, "needle-first");
+        let _ = tick_until(&mut picker, |s| s.matches.len() == 1).expect(NEVER_CONVERGED);
+        let injector = picker.session.as_ref().unwrap().nucleo.injector();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let producer = std::thread::spawn(move || {
+            injector.push((), |_, columns| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                columns[0] = Utf32String::from("needle-later");
+            });
+        });
+        entered_rx.recv_timeout(CONVERGE_TIMEOUT).unwrap();
+
+        for c in "needle".chars() {
+            picker.handle_key(key(KeyCode::Char(c)));
+        }
+        let _ = tick_until(&mut picker, |s| s.publication.ready()).expect(NEVER_CONVERGED);
+        let session = picker.session.as_ref().unwrap();
+        assert!(session.walking);
+        assert_eq!(session.matches.len(), 1);
+        assert_eq!(session.matches[0].path, "needle-first");
+
+        release_tx.send(()).unwrap();
+        producer.join().unwrap();
+        let _ = tick_until(&mut picker, |s| s.matches.len() == 2).expect(NEVER_CONVERGED);
+    }
+
+    #[test]
+    fn no_op_edits_preserve_ready_selection() {
+        let (mut picker, done_tx) = pending_picker();
+        inject_file(&picker, MAIN_PATH);
+        done_tx.send(()).unwrap();
+        let _ = tick_until(&mut picker, |s| s.matches.len() == 1).expect(NEVER_CONVERGED);
+        picker.session.as_mut().unwrap().visible = true;
+
+        assert!(picker.handle_paste(""));
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Backspace)),
+            FilePickerModalAction::Consumed
+        ));
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            FilePickerModalAction::Consumed
+        ));
+
+        let session = picker.session.as_ref().unwrap();
+        assert!(session.publication.ready());
+        assert_eq!(session.matches.len(), 1);
+        assert_eq!(session.selected, 0);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            FilePickerModalAction::Select(path) if path == MAIN_PATH
         ));
     }
 

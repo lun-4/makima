@@ -762,6 +762,7 @@ fn ordinary_paste_synchronizes_argument_completion() {
     let generation = app.command_palette.argument_generation();
 
     app.update(Msg::Paste("/deploy staging".into()));
+    settle_command_palette(&mut app);
 
     assert!(app.command_palette.argument_generation() > generation);
 }
@@ -913,6 +914,9 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
+    if text.starts_with('/') {
+        settle_command_palette(app);
+    }
     app.update(Msg::Key(key(KeyCode::Enter)))
 }
 
@@ -934,8 +938,18 @@ fn cmd(name: &str) -> ParsedCommand {
     }
 }
 
+fn settle_command_palette(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while app.command_palette.cadence() == Cadence::PENDING {
+        let _ = app.tick();
+        assert!(Instant::now() < deadline, "command palette did not settle");
+        std::thread::yield_now();
+    }
+}
+
 fn type_slash(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('/'))));
+    settle_command_palette(app);
 }
 
 #[test]
@@ -943,9 +957,11 @@ fn typing_filters_palette() {
     let mut app = test_app();
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
+    settle_command_palette(&mut app);
     assert!(app.command_palette.is_active());
 
     app.update(Msg::Key(key(KeyCode::Char('z'))));
+    settle_command_palette(&mut app);
     assert!(!app.command_palette.is_active());
 }
 
@@ -954,6 +970,7 @@ fn enter_executes_new_command() {
     let mut app = test_app();
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
+    settle_command_palette(&mut app);
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::NewSession));
     assert!(!app.command_palette.is_active());
@@ -1022,6 +1039,7 @@ fn lifecycle_app() -> (
     );
     app.input_box.set_input("/deploy a".into());
     app.command_palette.sync("/deploy a");
+    settle_command_palette(&mut app);
     app.command_palette
         .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
     let items = vec![CommandArgumentItem {
@@ -1029,19 +1047,25 @@ fn lifecycle_app() -> (
         insertion: "alpha".into(),
         description: None,
     }];
-    for _ in 0..1000 {
-        if probe.try_finish_command_arguments(items.clone()).is_some() {
-            break;
-        }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while probe.try_finish_command_arguments(items.clone()).is_none() {
+        assert!(Instant::now() < deadline, "completion request was not sent");
         std::thread::yield_now();
     }
-    let _ = app.command_palette.poll_arguments();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while app.command_palette.poll_arguments() != Dirty::YES {
+        assert!(
+            Instant::now() < deadline,
+            "completion result was not applied"
+        );
+        std::thread::yield_now();
+    }
     let _ = probe.try_finish_command_argument_lifecycle();
     (app, probe, producer)
 }
 
 #[test]
-fn argument_completion_clears_old_rows_while_request_pending() {
+fn argument_completion_retains_old_rows_while_request_pending() {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     let (registry, _producer) = lua_registry(TestLuaCommand {
@@ -1074,7 +1098,7 @@ fn argument_completion_clears_old_rows_while_request_pending() {
     app.command_palette
         .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
     assert!(app.command_palette.completion_session_id().is_some());
-    assert!(!rendered(&mut app).contains("old-result"));
+    assert!(rendered(&mut app).contains("old-result"));
     let deadline = Instant::now() + Duration::from_secs(1);
     while probe.try_finish_command_arguments(Vec::new()).is_none() {
         assert!(
@@ -1109,6 +1133,7 @@ fn unmatched_completion_items_cancel_the_argument_session() {
     );
     app.input_box.set_input("/deploy z".into());
     app.command_palette.sync("/deploy z");
+    settle_command_palette(&mut app);
     app.command_palette
         .sync_arguments("/deploy z", 9, &app.state.mode.id_key());
 
@@ -1427,6 +1452,7 @@ fn scrolled_argument_completion_accepts_offscreen_candidate() {
     );
     app.input_box.set_input("/de a".into());
     app.command_palette.sync("/de a");
+    settle_command_palette(&mut app);
     app.command_palette.move_down();
     assert_eq!(
         app.command_palette
@@ -1501,6 +1527,7 @@ fn argument_completion_tab_preserves_command_for_next_request() {
     );
     app.input_box.set_input("/de a".into());
     app.command_palette.sync("/de a");
+    settle_command_palette(&mut app);
     app.command_palette.move_down();
     app.command_palette.set_argument_completions(
         (4, 5),
@@ -1961,6 +1988,7 @@ fn open_tasks_picker(app: &mut App) {
     for c in "/tasks".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
+    settle_command_palette(app);
     app.update(Msg::Key(key(KeyCode::Enter)));
 }
 
@@ -6797,8 +6825,26 @@ fn mixed_list_includes_skills_subagents_and_models() {
         .store(Some(Arc::new(vec!["zai/glm-5".into()])));
     seed_models(&backend, &["zai/glm-5"]);
     app.update(Msg::Key(key(KeyCode::Char('@'))));
-    converge_completion(&mut app);
-    let items = completion_match_items(&app);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let items = loop {
+        let _ = app.file_completion.tick();
+        let items = completion_match_items(&app);
+        if ["skill", "subagent", "model"]
+            .into_iter()
+            .all(|kind| items.iter().any(|item| item.kind == kind))
+        {
+            break items;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mixed completion sources did not settle: {:?}",
+            items
+                .iter()
+                .map(|item| (&item.kind, &item.label))
+                .collect::<Vec<_>>()
+        );
+        std::thread::yield_now();
+    };
     assert!(items.iter().any(|i| i.kind == "skill"));
     assert!(items.iter().any(|i| i.kind == "subagent"));
     assert!(items.iter().any(|i| i.kind == "model"));

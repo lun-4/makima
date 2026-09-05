@@ -8,6 +8,7 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
+use crate::components::coherent_completion::Published;
 use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
@@ -91,12 +92,16 @@ pub struct ListPicker<T> {
     confirming_delete: Option<usize>,
 }
 
-struct State<T> {
-    items: Vec<T>,
+struct FilteredItems {
     filtered: Vec<usize>,
     /// Per-`filtered`-entry label match codepoint indices; `None` when no
     /// query is active, `Some(empty)` when a word matched only the section.
     match_indices: Vec<Option<Vec<u32>>>,
+}
+
+struct State<T> {
+    items: Vec<T>,
+    publication: Published<String, FilteredItems>,
     selected: usize,
     search: TextBuffer,
     scroll_offset: usize,
@@ -109,10 +114,17 @@ impl<T: PickerItem> State<T> {
     fn new(items: Vec<T>) -> Self {
         let filtered: Vec<usize> = (0..items.len()).collect();
         let match_indices: Vec<Option<Vec<u32>>> = vec![None; filtered.len()];
+        let mut publication = Published::default();
+        publication.commit_sync(
+            String::new(),
+            FilteredItems {
+                filtered,
+                match_indices,
+            },
+        );
         Self {
             items,
-            filtered,
-            match_indices,
+            publication,
             selected: 0,
             search: TextBuffer::new(String::new()),
             scroll_offset: 0,
@@ -120,6 +132,22 @@ impl<T: PickerItem> State<T> {
             inner_area: Rect::default(),
             enabled: None,
         }
+    }
+
+    fn filtered(&self) -> &[usize] {
+        &self
+            .publication
+            .value()
+            .expect("synchronous commit")
+            .filtered
+    }
+
+    fn match_indices(&self) -> &[Option<Vec<u32>>] {
+        &self
+            .publication
+            .value()
+            .expect("synchronous commit")
+            .match_indices
     }
 
     fn replace_items(&mut self, items: Vec<T>) {
@@ -130,18 +158,25 @@ impl<T: PickerItem> State<T> {
 
     fn rebuild_filter(&mut self) {
         let query = self.search.value();
+        let filtered = self.build_filter(&query);
+        self.publication.commit_sync(query, filtered);
+    }
+
+    fn build_filter(&self, query: &str) -> FilteredItems {
         let options = CompletionMatchOptions {
             case_matching: CaseMatching::Smart,
             normalization: Normalization::Smart,
         };
         if query.split_whitespace().next().is_none() {
-            self.filtered = (0..self.items.len()).collect();
-            self.match_indices = vec![None; self.filtered.len()];
-            return;
+            let filtered: Vec<usize> = (0..self.items.len()).collect();
+            return FilteredItems {
+                match_indices: vec![None; filtered.len()],
+                filtered,
+            };
         }
         let mut kept = Vec::new();
         for (source_order, item) in self.items.iter().enumerate() {
-            if let Some(completion) = completion_match(&query, item.label(), options) {
+            if let Some(completion) = completion_match(query, item.label(), options) {
                 kept.push((source_order, completion));
                 continue;
             }
@@ -202,8 +237,8 @@ impl<T: PickerItem> State<T> {
                 runs.push(vec![(idx, completion)]);
             }
         }
-        self.filtered.clear();
-        self.match_indices.clear();
+        let mut filtered = Vec::new();
+        let mut match_indices = Vec::new();
         for mut run in runs {
             run.sort_by(|(left_idx, left), (right_idx, right)| {
                 compare_completion_matches(
@@ -217,18 +252,21 @@ impl<T: PickerItem> State<T> {
                     self.items[*right_idx].label(),
                 )
             });
-            self.filtered.extend(run.iter().map(|(idx, _)| *idx));
-            self.match_indices
-                .extend(run.into_iter().map(|(_, m)| Some(m.indices)));
+            filtered.extend(run.iter().map(|(idx, _)| *idx));
+            match_indices.extend(run.into_iter().map(|(_, m)| Some(m.indices)));
+        }
+        FilteredItems {
+            filtered,
+            match_indices,
         }
     }
 
     fn clamp_selection(&mut self) {
-        if self.filtered.is_empty() {
+        if self.filtered().is_empty() {
             self.selected = 0;
             self.scroll_offset = 0;
         } else {
-            self.selected = self.selected.min(self.filtered.len() - 1);
+            self.selected = self.selected.min(self.filtered().len() - 1);
             self.scroll_offset = self.scroll_offset.min(self.selected);
         }
     }
@@ -240,7 +278,7 @@ impl<T: PickerItem> State<T> {
     }
 
     fn move_up(&mut self) {
-        let len = self.filtered.len();
+        let len = self.filtered().len();
         if len == 0 {
             return;
         }
@@ -253,7 +291,7 @@ impl<T: PickerItem> State<T> {
     }
 
     fn page_up(&mut self) {
-        let len = self.filtered.len();
+        let len = self.filtered().len();
         if len == 0 {
             return;
         }
@@ -263,7 +301,7 @@ impl<T: PickerItem> State<T> {
     }
 
     fn page_down(&mut self) {
-        let len = self.filtered.len();
+        let len = self.filtered().len();
         if len == 0 {
             return;
         }
@@ -273,7 +311,7 @@ impl<T: PickerItem> State<T> {
     }
 
     fn move_down(&mut self) {
-        let len = self.filtered.len();
+        let len = self.filtered().len();
         if len == 0 {
             return;
         }
@@ -286,33 +324,33 @@ impl<T: PickerItem> State<T> {
     }
 
     fn ensure_visible(&mut self) {
-        if self.filtered.is_empty() {
+        if self.filtered().is_empty() {
             return;
         }
         if self.selected < self.scroll_offset {
             self.scroll_offset = self.selected;
         }
         let visual = visual_rows_in_range(
-            &self.filtered,
+            self.filtered(),
             &self.items,
             self.scroll_offset,
             self.selected + 1,
         );
         if visual > self.viewport_height {
             self.scroll_offset = find_scroll_offset_for(
-                &self.filtered,
+                self.filtered(),
                 &self.items,
                 self.selected,
                 self.viewport_height,
             );
         }
         let max_offset =
-            find_scroll_offset_for_bottom(&self.filtered, &self.items, self.viewport_height);
+            find_scroll_offset_for_bottom(self.filtered(), &self.items, self.viewport_height);
         self.scroll_offset = self.scroll_offset.min(max_offset);
     }
 
     fn selected_item_index(&self) -> Option<usize> {
-        self.filtered.get(self.selected).copied()
+        self.filtered().get(self.selected).copied()
     }
 }
 
@@ -383,7 +421,7 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn select(&mut self, index: usize) {
         if let Some(s) = self.state.as_mut() {
-            s.selected = index.min(s.filtered.len().saturating_sub(1));
+            s.selected = index.min(s.filtered().len().saturating_sub(1));
             s.ensure_visible();
         }
     }
@@ -393,7 +431,7 @@ impl<T: PickerItem> ListPicker<T> {
             return false;
         };
         let Some(selected) = s
-            .filtered
+            .filtered()
             .iter()
             .position(|&item_idx| predicate(&s.items[item_idx]))
         else {
@@ -603,11 +641,11 @@ impl<T: PickerItem> ListPicker<T> {
         if delta > 0 {
             s.scroll_offset = s.scroll_offset.saturating_sub(delta as usize);
         } else {
-            let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
+            let total_visual = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len());
             let max_offset = if total_visual <= s.viewport_height {
                 0
             } else {
-                find_scroll_offset_for_bottom(&s.filtered, &s.items, s.viewport_height)
+                find_scroll_offset_for_bottom(s.filtered(), &s.items, s.viewport_height)
             };
             s.scroll_offset = (s.scroll_offset + delta.unsigned_abs() as usize).min(max_offset);
         }
@@ -661,10 +699,10 @@ fn render_ready<T: PickerItem>(
     error_text: Option<&str>,
 ) -> Rect {
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
-    let content_rows = if s.filtered.is_empty() {
+    let content_rows = if s.filtered().is_empty() {
         1
     } else {
-        let rows = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len()) as u16;
+        let rows = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len()) as u16;
         match max_visible {
             Some(max) => rows.min(max),
             None => rows,
@@ -719,9 +757,9 @@ fn render_ready<T: PickerItem>(
     render_list(
         frame,
         list_area,
-        &s.filtered,
+        s.filtered(),
         &s.items,
-        &s.match_indices,
+        s.match_indices(),
         s.selected,
         s.scroll_offset,
         s.viewport_height,
@@ -733,9 +771,9 @@ fn render_ready<T: PickerItem>(
         frame.render_widget(Paragraph::new(line), areas[area_idx]);
     }
 
-    let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
+    let total_visual = visual_rows_in_range(s.filtered(), &s.items, 0, s.filtered().len());
     if total_visual as u16 > viewport_h {
-        let visual_offset = visual_rows_in_range(&s.filtered, &s.items, 0, s.scroll_offset);
+        let visual_offset = visual_rows_in_range(s.filtered(), &s.items, 0, s.scroll_offset);
         render_vertical_scrollbar(frame, list_area, total_visual as u16, visual_offset as u16);
     }
 
@@ -1177,13 +1215,13 @@ mod tests {
     fn search_filters_progressively() {
         let mut p = ListPicker::new();
         p.open(entries(&["Alpha", "Beta"]), " Test ");
-        assert_eq!(ready_state(&p).filtered, vec![0, 1]);
+        assert_eq!(ready_state(&p).filtered(), vec![0, 1]);
 
         p.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(ready_state(&p).filtered, vec![0, 1]);
+        assert_eq!(ready_state(&p).filtered(), vec![0, 1]);
 
         p.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(ready_state(&p).filtered, vec![0]);
+        assert_eq!(ready_state(&p).filtered(), vec![0]);
     }
 
     #[test]
@@ -1210,7 +1248,7 @@ mod tests {
         p.handle_key(key(KeyCode::Char('c')));
         p.handle_key(key(KeyCode::Char('l')));
         p.handle_key(key(KeyCode::Char('u')));
-        let filtered = ready_state(&p).filtered.clone();
+        let filtered = ready_state(&p).filtered().to_vec();
         assert!(filtered.contains(&0)); // claude-sonnet should match
         assert!(filtered.contains(&1)); // claude-opus should match
 
@@ -1220,7 +1258,7 @@ mod tests {
         p.handle_key(key(KeyCode::Char('c')));
         p.handle_key(key(KeyCode::Char('l')));
         p.handle_key(key(KeyCode::Char('u')));
-        let filtered = ready_state(&p).filtered.clone();
+        let filtered = ready_state(&p).filtered().to_vec();
         assert_eq!(filtered, vec![0]); // only claude-sonnet should match
     }
 
@@ -1234,7 +1272,7 @@ mod tests {
         let mut p = ListPicker::new();
         p.open(entries(&["axxapp", "apple"]), " Test ");
         set_query(&mut p, "app");
-        assert_eq!(ready_state(&p).filtered, vec![1, 0]);
+        assert_eq!(ready_state(&p).filtered(), vec![1, 0]);
     }
 
     #[test]
@@ -1242,7 +1280,7 @@ mod tests {
         let mut p = ListPicker::new();
         p.open(entries(&["bapp", "capp", "dapp"]), " Test ");
         set_query(&mut p, "app");
-        assert_eq!(ready_state(&p).filtered, vec![0, 1, 2]);
+        assert_eq!(ready_state(&p).filtered(), vec![0, 1, 2]);
     }
 
     #[test]
@@ -1250,7 +1288,7 @@ mod tests {
         let mut p = ListPicker::new();
         p.open(entries(&["app", "app", "bax"]), " Test ");
         set_query(&mut p, "app");
-        assert_eq!(ready_state(&p).filtered, vec![0, 1]);
+        assert_eq!(ready_state(&p).filtered(), vec![0, 1]);
     }
 
     #[test]
@@ -1259,8 +1297,8 @@ mod tests {
         p.open(entries(&["Alpha", "Beta", "Gamma"]), " Test ");
         set_query(&mut p, "  ");
         let s = ready_state(&p);
-        assert_eq!(s.filtered, vec![0, 1, 2]);
-        assert_eq!(s.match_indices, vec![None, None, None]);
+        assert_eq!(s.filtered(), vec![0, 1, 2]);
+        assert_eq!(s.match_indices(), vec![None, None, None]);
     }
 
     #[test]
@@ -1281,8 +1319,8 @@ mod tests {
         );
         set_query(&mut p, "gemini");
         let s = ready_state(&p);
-        assert_eq!(s.filtered, vec![1]);
-        assert_eq!(s.match_indices, vec![Some(Vec::new())]);
+        assert_eq!(s.filtered(), vec![1]);
+        assert_eq!(s.match_indices(), vec![Some(Vec::new())]);
     }
 
     #[test]
@@ -1308,7 +1346,7 @@ mod tests {
         set_query(&mut p, "app");
         // The group-A item keeps its position even though its score is the
         // lowest; a global score sort would reorder to [1, 2, 0].
-        assert_eq!(ready_state(&p).filtered, vec![0, 1, 2]);
+        assert_eq!(ready_state(&p).filtered(), vec![0, 1, 2]);
     }
 
     struct OptSection {
@@ -1349,7 +1387,7 @@ mod tests {
         // First-appearance grouping would hoist the second "A" item into the
         // first group and reorder to [0, 2, 1]; run-based keeps the tail
         // un-sectioned run in place (the login "Custom provider..." layout).
-        assert_eq!(ready_state(&p).filtered, vec![0, 1, 2]);
+        assert_eq!(ready_state(&p).filtered(), vec![0, 1, 2]);
     }
 
     #[test]
@@ -1372,8 +1410,8 @@ mod tests {
         // "claude" hits the label, "anthropic" only the section: the item is
         // kept with label-only indices.
         let s = ready_state(&p);
-        assert_eq!(s.filtered, vec![0]);
-        assert_eq!(s.match_indices, vec![Some(vec![0, 1, 2, 3, 4, 5])]);
+        assert_eq!(s.filtered(), vec![0]);
+        assert_eq!(s.match_indices(), vec![Some(vec![0, 1, 2, 3, 4, 5])]);
     }
 
     #[test]
@@ -1385,8 +1423,8 @@ mod tests {
         p.open(vec![Entry::new("ab\u{1F1FA}\u{1F1FC}cd")], " Test ");
         set_query(&mut p, "cd");
         let s = ready_state(&p);
-        assert_eq!(s.filtered, vec![0]);
-        assert_eq!(s.match_indices, vec![Some(vec![4, 5])]);
+        assert_eq!(s.filtered(), vec![0]);
+        assert_eq!(s.match_indices(), vec![Some(vec![4, 5])]);
     }
 
     #[test]
@@ -1394,7 +1432,7 @@ mod tests {
         let mut p = ListPicker::new();
         p.open(entries(&["apple", "apricot"]), " Test ");
         p.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(ready_state(&p).filtered, vec![0, 1]);
+        assert_eq!(ready_state(&p).filtered(), vec![0, 1]);
 
         let area = Rect::new(0, 0, 80, 40);
         let backend = TestBackend::new(area.width, area.height);
@@ -1862,7 +1900,7 @@ mod tests {
         p.open(entries(&["Alpha", "Beta", "Alpine"]), " Test ");
         p.handle_key(key(KeyCode::Char('a')));
         p.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(ready_state(&p).filtered, vec![0, 2]);
+        assert_eq!(ready_state(&p).filtered(), vec![0, 2]);
 
         p.handle_key(key(KeyCode::Down));
         let action = p.handle_key(key(KeyCode::Enter));
