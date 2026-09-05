@@ -1,6 +1,38 @@
 local M = {}
 
+local DIRTY_MARKER = "AUTORESEARCH_DIRTY="
 local STATE_VERSION = 1
+
+local function valid_pending(pending, state)
+  if pending == nil then
+    return true
+  end
+  if
+    type(pending) ~= "table"
+    or type(pending.run) ~= "number"
+    or pending.run ~= state.run_count
+    or pending.run < 1
+    or pending.run % 1 ~= 0
+  then
+    return false
+  end
+  if pending.error ~= nil then
+    return type(pending.error) == "string" and pending.error ~= "" and pending.metrics == nil and pending.primary == nil
+  end
+  if
+    type(pending.metrics) ~= "table"
+    or type(pending.primary) ~= "number"
+    or pending.metrics[state.primary_metric] ~= pending.primary
+  then
+    return false
+  end
+  for name, value in pairs(pending.metrics) do
+    if type(name) ~= "string" or type(value) ~= "number" then
+      return false
+    end
+  end
+  return true
+end
 
 function M.slugify(value)
   local slug = value:lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
@@ -14,8 +46,23 @@ function M.shell_quote(value)
   return "'" .. value:gsub("'", "'\\''") .. "'"
 end
 
-function M.has_output(value)
-  return value ~= "" and not value:match("^%s*Exit code: 0%s*$")
+function M.worktree_status_command()
+  return table.concat({
+    "status=$(git status --porcelain=v1 --untracked-files=all)",
+    'if [ -n "$status" ]; then',
+    '  printf "' .. DIRTY_MARKER .. '1\\n%s\\n" "$status"',
+    "else",
+    '  printf "' .. DIRTY_MARKER .. '0\\n"',
+    "fi",
+  }, "\n")
+end
+
+function M.has_changes(value)
+  local dirty = value:match(DIRTY_MARKER .. "([01])")
+  if not dirty then
+    return nil, "could not read worktree status"
+  end
+  return dirty == "1"
 end
 
 function M.initialization_command(branch)
@@ -91,7 +138,7 @@ function M.restore_state(value)
     or not value.accepted_commit:match("^[0-9a-fA-F]+$")
     or (value.accepted_metric ~= nil and type(value.accepted_metric) ~= "number")
     or (value.best_metric ~= nil and type(value.best_metric) ~= "number")
-    or (value.pending ~= nil and type(value.pending) ~= "table")
+    or not valid_pending(value.pending, value)
   then
     return nil, "invalid autoresearch session state"
   end

@@ -179,14 +179,15 @@ checkout while the loop is running.
 `autoresearch.sh` decides whether a measurement is trustworthy. For noisy
 workloads, it should warm up, collect enough samples, report a robust aggregate
 such as a median or trimmed mean, and fail on unacceptable variance. It should
-also fail when correctness checks or secondary guardrails regress.
+also fail when correctness checks or secondary guardrails regress, and clean up
+any ignored artifacts it creates.
 
 The footer shows the current run count, pending result, and best metric. Run
-`/autoresearch off` to return to build mode. The branch, accepted commit, loop
-counters, metrics, and pending result are stored with the session. Reopen the
-session on its autoresearch branch to continue. Run `/autoresearch reset` to
-clear the stored loop state before starting a different goal in the same
-session.
+`/autoresearch off` to return to build mode without clearing the loop. The
+branch, accepted commit, loop counters, metrics, and pending result are stored
+with the session. Reopen the session on its autoresearch branch to continue.
+Run `/autoresearch reset` to clear the stored loop state before starting a
+different goal in the same session.
 
 ## Persistence and other surfaces
 

@@ -32,7 +32,7 @@ The experiment history lives on a dedicated `autoresearch/<goal>` git branch. Ev
 ## Protocol
 
 1. Before editing anything, call `research_init` with the goal, primary metric, and whether to minimize or maximize it. Initialization requires a clean worktree and creates the dedicated branch.
-2. If `autoresearch.sh` does not exist, build it as the first experiment. It must run a representative deterministic workload, exit non-zero on failure, and print numeric results as `METRIC name=value`. Do not use a live network or time-dependent input. For noisy workloads, the script owns statistical validity: warm up, collect enough samples, report a robust aggregate such as a median or trimmed mean, and reject unacceptable variance. It must also fail when correctness checks or secondary guardrails regress.
+2. If `autoresearch.sh` does not exist, build it as the first experiment. It must run a representative deterministic workload, exit non-zero on failure, and print numeric results as `METRIC name=value`. Do not use a live network or time-dependent input. For noisy workloads, the script owns statistical validity: warm up, collect enough samples, report a robust aggregate such as a median or trimmed mean, and reject unacceptable variance. It must also fail when correctness checks or secondary guardrails regress, and clean up any ignored artifacts it creates.
 3. Make one coherent change at a time.
 4. Call `research_run`. Never invoke `autoresearch.sh` another way.
 5. Call `research_log` exactly once for every run:
@@ -148,16 +148,16 @@ local function persist_session(sid, state)
 end
 
 local function finish_loop(sid, summary, reason)
-  local switched, switch_error = maki.session.set_mode(sid, "build")
-  if not switched then
-    return summary .. "\n" .. reason .. "; could not return to build mode: " .. switch_error
-  end
   local cleared, clear_error = maki.session.set_data(sid, nil)
   if not cleared then
-    return summary .. "\n" .. reason .. "; returned to build mode but could not clear state: " .. clear_error
+    return summary .. "\n" .. reason .. "; could not clear state: " .. clear_error
   end
   sessions[sid] = nil
   repaint_status(sid, nil)
+  local switched, switch_error = maki.session.set_mode(sid, "build")
+  if not switched then
+    return summary .. "\n" .. reason .. "; state cleared but could not return to build mode: " .. switch_error
+  end
   return summary .. "\n" .. reason .. "; returned to build mode."
 end
 
@@ -502,13 +502,16 @@ maki.api.register_tool({
       end
       local status, status_error = run_git(
         ctx,
-        helpers.guarded_command(state, "git status --porcelain=v1 --untracked-files=all", false),
+        helpers.guarded_command(state, helpers.worktree_status_command(), false),
         "Inspect experiment changes"
       )
       if not status then
         return tool_error(status_error)
       end
-      local has_changes = helpers.has_output(status)
+      local has_changes, change_error = helpers.has_changes(status)
+      if has_changes == nil then
+        return tool_error(change_error)
+      end
       if not has_changes and state.accepted_metric ~= nil then
         return tool_error("kept experiments must contain a change to commit")
       end

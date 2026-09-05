@@ -13,9 +13,14 @@ case("shell_quote_apostrophe", function()
   eq(helpers.shell_quote("don't"), "'don'\\''t'")
 end)
 
-case("detect_empty_bash_output", function()
-  eq(helpers.has_output("Exit code: 0"), false)
-  eq(helpers.has_output(" M src/main.rs\n"), true)
+case("detect_worktree_changes", function()
+  local command = helpers.worktree_status_command()
+  assert(command:find("git status --porcelain=v1 --untracked-files=all", 1, true))
+  eq(helpers.has_changes("AUTORESEARCH_DIRTY=0\nExit code: 0"), false)
+  eq(helpers.has_changes("AUTORESEARCH_DIRTY=1\n M src/main.rs\nExit code: 0"), true)
+  local changed, err = helpers.has_changes("Exit code: 0")
+  eq(changed, nil)
+  assert(err:match("worktree status"))
 end)
 
 case("initialization_is_one_shell_transaction", function()
@@ -63,9 +68,34 @@ case("restore_and_render_session_state", function()
   eq(helpers.restore_state(state), state)
   eq(state.accepted_metric, 12.5)
   eq(helpers.status_content(state)[1][1], "AR 3/20 best latency=12.5")
-  state.pending = { run = 4 }
+  state.pending = { run = 3, metrics = { latency = 12 }, primary = 12 }
   eq(helpers.status_content(state)[1][1], "AR 3/20 pending")
+  eq(helpers.restore_state(state), state)
   assert(select(2, helpers.restore_state({ version = 1 })):match("invalid"))
+end)
+
+case("reject_invalid_pending_session_state", function()
+  local state = {
+    version = 1,
+    branch = "autoresearch/latency",
+    primary_metric = "latency",
+    direction = "minimize",
+    max_iterations = 20,
+    run_count = 3,
+    accepted_commit = "abc123",
+    pending = { run = 3 },
+  }
+  local restored, err = helpers.restore_state(state)
+  eq(restored, nil)
+  assert(err:match("invalid"))
+
+  state.pending = { run = 3, metrics = {}, primary = 12 }
+  restored, err = helpers.restore_state(state)
+  eq(restored, nil)
+  assert(err:match("invalid"))
+
+  state.pending = { run = 3, error = "benchmark failed" }
+  eq(helpers.restore_state(state), state)
 end)
 
 case("commit_message_records_metric_evidence", function()
