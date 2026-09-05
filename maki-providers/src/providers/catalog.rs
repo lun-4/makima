@@ -726,8 +726,9 @@ impl Provider for CatalogProvider {
                         &dialect::PREFER_HIGH,
                         &stream_model,
                     );
-                    let extra_headers: Vec<_> =
-                        session_header(&self.data.slug, session_id).into_iter().collect();
+                    let extra_headers: Vec<_> = session_header(&self.data.slug, session_id)
+                        .into_iter()
+                        .collect();
                     self.chat_compat
                         .do_stream(&stream_model, &extra_headers, &body, event_tx, auth)
                         .await

@@ -93,7 +93,9 @@ impl Opencode {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
         opts.thinking
             .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
-        let extra_headers: Vec<_> = session_header(provider_slug, session_id).into_iter().collect();
+        let extra_headers: Vec<_> = session_header(provider_slug, session_id)
+            .into_iter()
+            .collect();
         self.chat_compat
             .do_stream(model, &extra_headers, &body, event_tx, auth)
             .await
