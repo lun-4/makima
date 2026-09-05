@@ -223,7 +223,7 @@ async fn set_title(
 /// Returns the current thinking mode of the focused session and whether its
 /// model supports thinking at all (for hiding/graving the selector).
 ///
-/// @return (table|nil, string|nil) `{mode, supports_thinking}`, or nil and an error.
+/// @return (table|nil, string|nil) `{mode, supports_thinking, options}`, or nil and an error.
 /// @example
 /// local info = maki.session.thinking()
 #[lua_fn]
@@ -232,7 +232,7 @@ async fn thinking(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 }
 
 /// Sets the focused session's thinking mode. `mode` accepts any value
-/// `StoredThinking::parse_setting` understands: `off`, `adaptive`, an effort
+/// `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 /// level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 /// the choice is also persisted as the global default for new sessions.
 ///
@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_roundtrips_mode_and_support_flag() {
+    fn thinking_roundtrips_mode_support_flag_and_options() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let checker = std::thread::spawn(move || {
@@ -490,7 +490,11 @@ mod tests {
                 panic!("expected get_thinking request");
             };
             reply_tx
-                .send(Ok(json!({ "mode": "high", "supports_thinking": true })))
+                .send(Ok(json!({
+                    "mode": "high",
+                    "supports_thinking": true,
+                    "options": ["off", "adaptive", "low", "high"],
+                })))
                 .unwrap();
         });
         let (val, err): (Table, Option<String>) =
@@ -498,6 +502,8 @@ mod tests {
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("mode").unwrap(), "high");
         assert!(val.get::<bool>("supports_thinking").unwrap());
+        let options: Vec<String> = val.get("options").unwrap();
+        assert_eq!(options, ["off", "adaptive", "low", "high"]);
         checker.join().unwrap();
     }
 }

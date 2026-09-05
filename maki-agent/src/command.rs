@@ -13,7 +13,7 @@ use maki_commands::{
     CommandCompletion, CommandContent, CommandError, CommandFuture, CommandInvocation,
     CommandOutcome, CommandRegistry, CompletionKey, HostContextRequest, HostContextResponse,
     HostRequest, HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
-    TargetCapabilities, TargetCapability, ThinkingConfig,
+    TargetCapabilities, TargetCapability,
 };
 use maki_config::ModelPolicy;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
@@ -190,11 +190,6 @@ impl maki_commands::CommandHost for SessionCommandHost {
                     Ok(HostResponse::Context(
                         HostContextResponse::WorkingDirectory(cwd),
                     ))
-                });
-            }
-            HostRequest::Context(HostContextRequest::ThinkingConfig) => {
-                return Box::pin(async {
-                    Ok(HostResponse::Context(HostContextResponse::Unavailable))
                 });
             }
             HostRequest::Context(HostContextRequest::FastModeSupported) => {
@@ -400,30 +395,6 @@ fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, Command
     }
 }
 
-fn parse_thinking(input: &str, current: ThinkingConfig) -> Result<ThinkingConfig, CommandError> {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "" | "toggle" => Ok(if current == ThinkingConfig::Off {
-            ThinkingConfig::Adaptive
-        } else {
-            ThinkingConfig::Off
-        }),
-        "off" | "false" => Ok(ThinkingConfig::Off),
-        "on" | "true" | "adaptive" => Ok(ThinkingConfig::Adaptive),
-        "minimal" => Ok(ThinkingConfig::Minimal),
-        "low" => Ok(ThinkingConfig::Low),
-        "medium" => Ok(ThinkingConfig::Medium),
-        "high" => Ok(ThinkingConfig::High),
-        "xhigh" => Ok(ThinkingConfig::XHigh),
-        "max" => Ok(ThinkingConfig::Max),
-        budget => budget
-            .parse::<u32>()
-            .ok()
-            .filter(|budget| *budget > 0)
-            .map(ThinkingConfig::Budget)
-            .ok_or_else(|| CommandError::Producer(Arc::from("invalid thinking mode"))),
-    }
-}
-
 impl CommandBehavior for BuiltinBehavior {
     fn execute(
         &self,
@@ -522,18 +493,6 @@ impl CommandBehavior for BuiltinBehavior {
                     attachments: invocation.content.attachments.clone(),
                 },
                 maki_commands::BuiltinId::Yolo => BuiltinOperation::ToggleYolo,
-                maki_commands::BuiltinId::Thinking => {
-                    let HostContextResponse::ThinkingConfig(current) =
-                        host_context(&invocation, HostContextRequest::ThinkingConfig).await?
-                    else {
-                        return Err(CommandError::Producer(Arc::from(
-                            "thinking configuration is unavailable",
-                        )));
-                    };
-                    BuiltinOperation::SetThinking {
-                        config: parse_thinking(&arguments, current)?,
-                    }
-                }
                 maki_commands::BuiltinId::Fast => {
                     let HostContextResponse::FastModeSupported(true) =
                         host_context(&invocation, HostContextRequest::FastModeSupported).await?
@@ -851,9 +810,6 @@ mod tests {
                         }
                         HostContextRequest::WorkingDirectory => {
                             HostContextResponse::WorkingDirectory(PathBuf::from("/project"))
-                        }
-                        HostContextRequest::ThinkingConfig => {
-                            HostContextResponse::ThinkingConfig(ThinkingConfig::Off)
                         }
                         HostContextRequest::FastModeSupported => {
                             HostContextResponse::FastModeSupported(true)

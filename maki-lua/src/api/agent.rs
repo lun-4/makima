@@ -34,7 +34,6 @@ use maki_providers::{
     ContentBlock, Message, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
@@ -871,8 +870,8 @@ async fn session(
     }
 
     let thinking = match thinking_val {
-        Some(LuaValue::String(s)) => match StoredThinking::parse_setting(&s.to_str()?) {
-            Ok(stored) => ThinkingConfig::from(stored),
+        Some(LuaValue::String(s)) => match s.to_str()?.parse::<ThinkingConfig>() {
+            Ok(config) => config,
             Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
         },
         Some(LuaValue::Integer(n)) => match u32::try_from(n) {

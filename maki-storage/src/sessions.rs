@@ -9,11 +9,9 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
@@ -23,6 +21,8 @@ use tracing::{info, warn};
 use crate::id::{MakiId, MakiIdParseError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+pub use maki_domain::{Effort, MIN_THINKING_BUDGET, StoredThinking, ThinkingParseError};
 
 use crate::{StateDir, StorageError, atomic_write, now_epoch, session_lock};
 
@@ -270,147 +270,6 @@ pub struct StoredRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     pub effect: StoredEffect,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ThinkingParseError {
-    #[error(
-        "unknown thinking value {0:?} (use off, adaptive, minimal, low, medium, high, xhigh, max, or a token budget)"
-    )]
-    Unknown(String),
-    #[error("thinking budget must be greater than zero")]
-    BudgetZero,
-}
-
-/// Floor for every token budget sent to a provider; some APIs reject smaller values.
-pub const MIN_THINKING_BUDGET: u32 = 1024;
-
-/// Thinking effort level. Declaration order is intensity order: the `Ord`
-/// derive and [`Effort::ALL`] rely on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Effort {
-    Minimal,
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Max,
-}
-
-impl Effort {
-    pub const ALL: [Self; 6] = [
-        Self::Minimal,
-        Self::Low,
-        Self::Medium,
-        Self::High,
-        Self::XHigh,
-        Self::Max,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-            Self::Max => "max",
-        }
-    }
-
-    /// Percentage of the model's max thinking budget this level spends.
-    pub const fn percent(self) -> u32 {
-        match self {
-            Self::Minimal => 10,
-            Self::Low => 20,
-            Self::Medium => 40,
-            Self::High => 60,
-            Self::XHigh => 80,
-            Self::Max => 100,
-        }
-    }
-
-    /// `percent` of `max`, clamped to `[MIN_THINKING_BUDGET, max]`.
-    /// A `max` below the floor is raised to it.
-    pub fn budget(self, max: u32) -> u32 {
-        let max = max.max(MIN_THINKING_BUDGET);
-        let tokens = (u64::from(max) * u64::from(self.percent()) / 100) as u32;
-        tokens.clamp(MIN_THINKING_BUDGET, max)
-    }
-
-    /// Inverse of [`Self::budget`]: the lowest level whose percentage covers
-    /// `n` tokens out of `max`. Budgets at or above `max` map to `Max`.
-    pub fn from_budget(n: u32, max: u32) -> Self {
-        let pct = u64::from(n).saturating_mul(100) / u64::from(max.max(1));
-        Self::ALL
-            .into_iter()
-            .find(|e| u64::from(e.percent()) >= pct)
-            .unwrap_or(Self::Max)
-    }
-
-    /// Nearest level a provider accepts: exact match keeps `self`, otherwise
-    /// the closest lower supported level, otherwise the lowest supported.
-    /// An empty `supported` list returns `self` unchanged (dynamic model
-    /// listings may not declare supported efforts).
-    pub fn snap(self, supported: &[Self]) -> Self {
-        if supported.is_empty() || supported.contains(&self) {
-            return self;
-        }
-        supported
-            .iter()
-            .rev()
-            .find(|&&e| e < self)
-            .copied()
-            .unwrap_or(supported[0])
-    }
-}
-
-impl fmt::Display for Effort {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Effort {
-    type Err = ThinkingParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|e| e.as_str() == s)
-            .ok_or_else(|| ThinkingParseError::Unknown(s.to_string()))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase", tag = "kind")]
-pub enum StoredThinking {
-    Off,
-    Adaptive,
-    Effort { level: Effort },
-    Budget { tokens: u32 },
-}
-
-impl StoredThinking {
-    /// The one string-to-thinking parser: `/thinking`, `always_thinking`
-    /// config, and the Lua agent API all delegate here.
-    pub fn parse_setting(input: &str) -> Result<Self, ThinkingParseError> {
-        match input.trim() {
-            "off" => Ok(Self::Off),
-            "adaptive" => Ok(Self::Adaptive),
-            other => {
-                if let Ok(level) = other.parse::<Effort>() {
-                    return Ok(Self::Effort { level });
-                }
-                match other.parse::<u32>() {
-                    Ok(0) => Err(ThinkingParseError::BudgetZero),
-                    Ok(n) => Ok(Self::Budget { tokens: n }),
-                    Err(_) => Err(ThinkingParseError::Unknown(other.to_string())),
-                }
-            }
-        }
-    }
 }
 
 /// Global user preferences persisted across sessions, distinct from per-session

@@ -817,6 +817,7 @@ impl Provider for DynamicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ThinkingConfigExt;
     #[cfg(unix)]
     use std::fs::{self, File};
     #[cfg(unix)]

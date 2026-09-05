@@ -50,6 +50,7 @@ tree-sitter-rust = { workspace = true }
 [workspace]
 members = [
   "maki-acp",
+  "maki-domain",
   "maki-agent",
   "maki-config",
   "maki-commands",
@@ -77,6 +78,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 maki-agent = { path = "maki-agent" }
+maki-domain = { path = "maki-domain" }
 maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
 maki-commands = { path = "maki-commands" }

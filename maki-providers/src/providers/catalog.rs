@@ -8,6 +8,7 @@
 //! their own [`CatalogProvider`] instance, created from the same
 //! [`ProviderData`].
 
+use crate::types::ThinkingConfigExt;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;

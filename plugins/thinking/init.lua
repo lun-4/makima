@@ -3,17 +3,6 @@
 -- set_thinking, and choosing a level (or passing an argument) saves it as the
 -- default for new sessions.
 
-local THINKING_LEVELS = {
-  "off",
-  "adaptive",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-}
-
 local function index_of(list, value)
   for i, v in ipairs(list) do
     if v == value then
@@ -23,13 +12,13 @@ local function index_of(list, value)
   return nil
 end
 
-local function wrap_index(cursor, delta)
-  return (cursor - 1 + delta) % #THINKING_LEVELS + 1
+local function wrap_index(cursor, delta, levels)
+  return (cursor - 1 + delta) % #levels + 1
 end
 
-local function render_ladder(active)
+local function render_ladder(active, levels)
   local spans = {}
-  for i, level in ipairs(THINKING_LEVELS) do
+  for i, level in ipairs(levels) do
     if i > 1 then
       spans[#spans + 1] = { "  ", "dim" }
     end
@@ -58,9 +47,14 @@ local function open_selector()
     return
   end
 
-  local cursor = index_of(THINKING_LEVELS, info.mode) or 1
+  local levels = info.options or {}
+  if #levels == 0 then
+    maki.ui.flash("Thinking: host returned no options")
+    return
+  end
+  local cursor = index_of(levels, info.mode) or 1
   local buf = maki.ui.buf()
-  buf:set_lines({ render_ladder(cursor) })
+  buf:set_lines({ render_ladder(cursor, levels) })
 
   local win = maki.ui.open_win(buf, {
     title = "Thinking",
@@ -79,14 +73,14 @@ local function open_selector()
     end
     if ev.type == "key" then
       if ev.key == "left" or ev.key == "h" then
-        cursor = wrap_index(cursor, -1)
-        buf:set_lines({ render_ladder(cursor) })
+        cursor = wrap_index(cursor, -1, levels)
+        buf:set_lines({ render_ladder(cursor, levels) })
       elseif ev.key == "right" or ev.key == "l" then
-        cursor = wrap_index(cursor, 1)
-        buf:set_lines({ render_ladder(cursor) })
+        cursor = wrap_index(cursor, 1, levels)
+        buf:set_lines({ render_ladder(cursor, levels) })
       elseif ev.key == "enter" then
         win:close()
-        set_thinking(THINKING_LEVELS[cursor])
+        set_thinking(levels[cursor])
         return
       elseif ev.key == "esc" then
         win:close()
@@ -102,6 +96,19 @@ maki.api.register_command({
   argument_hint = "[effort]",
   nargs = "?",
   tui_only = true,
+  completion = {
+    get_items = function()
+      local info, err = maki.session.thinking()
+      if err or not info.supports_thinking or not info.options then
+        return {}
+      end
+      local items = {}
+      for _, option in ipairs(info.options) do
+        items[#items + 1] = { label = option, insertion = option }
+      end
+      return items
+    end,
+  },
   handler = function(opts)
     local args = tostring(opts.args or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if args ~= "" then

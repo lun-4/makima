@@ -23,7 +23,6 @@ pub use spec::{
     COMPACT_COMMAND_NAME, CommandDocs, CommandFuture, CommandId, CommandSpec, CompletionKey,
     CompletionSessionId, HostContextRequest, HostContextResponse, InvocationTargetId,
     MAX_COMMAND_DEPTH, ProducerId, Registration, TargetCapabilities, TargetCapability,
-    ThinkingConfig,
 };
 
 #[cfg(test)]

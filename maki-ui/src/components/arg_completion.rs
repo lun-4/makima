@@ -1,12 +1,11 @@
 use std::sync::{Arc, Mutex};
 
+use crate::theme::{ThemesProvider, apply_theme};
 use arc_swap::ArcSwapOption;
 use maki_commands::{
     CancellationToken, CommandCompletion, CommandFuture, CompletionContext, CompletionError,
     CompletionItem, CompletionLifecycleEvent, CompletionSessionId, InvocationTargetId,
 };
-
-use crate::theme::{ThemesProvider, apply_theme};
 
 pub(crate) struct ModelArgSource {
     models: Arc<ArcSwapOption<Vec<String>>>,
