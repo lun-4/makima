@@ -116,7 +116,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(out, "| Command | Description | Arguments | TUI-only |").unwrap();
     writeln!(out, "|---------|-------------|-----------|----------|").unwrap();
-    for cmd in &lua_util::load_builtin_plugin_commands() {
+    for cmd in lua_util::load_builtin_plugin_commands() {
         write_row(
             &mut out,
             &cmd.name,
@@ -165,7 +165,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`."
+        "- **`/thinking`**: bare opens the selector; an optional setting applies and persists the default. Completion lists the finite options supplied by the host. Positive numeric token budgets are accepted as arguments but are not suggested. Config: `always_thinking`."
     )
     .unwrap();
     writeln!(

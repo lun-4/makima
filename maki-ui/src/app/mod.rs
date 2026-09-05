@@ -4,6 +4,7 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
+use maki_providers::ThinkingConfigExt;
 mod btw;
 mod image_paste;
 pub(crate) mod mode;
@@ -70,11 +71,12 @@ use maki_commands::{
     HostContextRequest, HostContextResponse, HostRequest, HostResponse, TargetHandle,
 };
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
+use maki_domain::ThinkingConfig;
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, Role, ThinkingConfig, add_cost, format_tokens};
+use maki_providers::{ContentBlock, Message, Model, Role, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -87,35 +89,6 @@ const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
 
 pub(crate) use crate::agent::QueuedMessage;
 
-fn command_thinking(config: ThinkingConfig) -> maki_commands::ThinkingConfig {
-    use maki_providers::Effort;
-    match config {
-        ThinkingConfig::Off => maki_commands::ThinkingConfig::Off,
-        ThinkingConfig::Adaptive => maki_commands::ThinkingConfig::Adaptive,
-        ThinkingConfig::Effort(Effort::Minimal) => maki_commands::ThinkingConfig::Minimal,
-        ThinkingConfig::Effort(Effort::Low) => maki_commands::ThinkingConfig::Low,
-        ThinkingConfig::Effort(Effort::Medium) => maki_commands::ThinkingConfig::Medium,
-        ThinkingConfig::Effort(Effort::High) => maki_commands::ThinkingConfig::High,
-        ThinkingConfig::Effort(Effort::XHigh) => maki_commands::ThinkingConfig::XHigh,
-        ThinkingConfig::Effort(Effort::Max) => maki_commands::ThinkingConfig::Max,
-        ThinkingConfig::Budget(budget) => maki_commands::ThinkingConfig::Budget(budget),
-    }
-}
-
-fn provider_thinking(config: maki_commands::ThinkingConfig) -> ThinkingConfig {
-    use maki_providers::Effort;
-    match config {
-        maki_commands::ThinkingConfig::Off => ThinkingConfig::Off,
-        maki_commands::ThinkingConfig::Adaptive => ThinkingConfig::Adaptive,
-        maki_commands::ThinkingConfig::Minimal => ThinkingConfig::Effort(Effort::Minimal),
-        maki_commands::ThinkingConfig::Low => ThinkingConfig::Effort(Effort::Low),
-        maki_commands::ThinkingConfig::Medium => ThinkingConfig::Effort(Effort::Medium),
-        maki_commands::ThinkingConfig::High => ThinkingConfig::Effort(Effort::High),
-        maki_commands::ThinkingConfig::XHigh => ThinkingConfig::Effort(Effort::XHigh),
-        maki_commands::ThinkingConfig::Max => ThinkingConfig::Effort(Effort::Max),
-        maki_commands::ThinkingConfig::Budget(budget) => ThinkingConfig::Budget(budget),
-    }
-}
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
@@ -2136,9 +2109,6 @@ impl App {
                     HostContextRequest::WorkingDirectory => HostContextResponse::WorkingDirectory(
                         PathBuf::from(&self.state.session.cwd),
                     ),
-                    HostContextRequest::ThinkingConfig => {
-                        HostContextResponse::ThinkingConfig(command_thinking(self.state.thinking))
-                    }
                     HostContextRequest::FastModeSupported => {
                         HostContextResponse::FastModeSupported(self.state.model.supports_fast())
                     }
@@ -2234,15 +2204,6 @@ impl App {
                     }
                     .into(),
                 );
-                vec![]
-            }
-            BuiltinOperation::SetThinking { config } => {
-                if !self.state.model.supports_thinking() {
-                    self.flash("Thinking requires a model that supports it".into());
-                } else {
-                    self.state.thinking = provider_thinking(config);
-                    self.flash(format!("Thinking: {}", self.state.thinking));
-                }
                 vec![]
             }
             BuiltinOperation::ToggleFast => {

@@ -20,7 +20,7 @@ use maki_agent::{
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
-use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
+use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
@@ -5235,51 +5235,6 @@ fn bash_prefix_overrides_mode() {
 }
 
 #[test]
-fn thinking_toggle_cycles_off_adaptive() {
-    let mut app = test_app();
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Adaptive);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-}
-
-#[test]
-fn thinking_explicit_args() {
-    let mut app = test_app();
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "8192".into(),
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Budget(8192));
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "high".into(),
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
-}
-
-#[test]
-fn thinking_unsupported_model_flashes_error() {
-    let mut app = test_app();
-    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-    assert!(app.status_bar.flash_text().is_some());
-}
-
-#[test]
 fn thinking_restored_from_session_meta() {
     let tmp = TempDir::new().unwrap();
     let storage = StateDir::from_path(tmp.path().to_path_buf());
@@ -6610,16 +6565,16 @@ fn popup_closes_when_token_removed() {
 #[test]
 fn command_palette_takes_precedence() {
     let (_tmp, mut app, _backend) = completion_app();
-    // `/thinking ` takes an argument, so the palette stays matched while an
+    // `/model ` takes an argument, so the palette stays matched while an
     // `@` token is added to that argument space.
-    for c in "/thinking ".chars() {
+    for c in "/model ".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
     assert!(app.command_palette.is_active());
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     assert!(
         app.command_palette.is_active(),
-        "palette stays matched on /thinking"
+        "palette stays matched on /model"
     );
     assert!(
         !app.file_completion.is_active(),

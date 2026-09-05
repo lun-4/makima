@@ -10,8 +10,9 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub use maki_storage::sessions::Effort;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
+pub use maki_domain::{Effort, ThinkingConfig};
+use maki_domain::{FALLBACK_MAX_THINKING_BUDGET, MIN_THINKING_BUDGET};
+use maki_storage::sessions::TitleSource;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
@@ -397,8 +398,7 @@ pub const THINKING_USAGE: &str =
 /// Effort levels are percentages, so they need a ceiling even when the model
 /// never told us its output window. 32k matches common frontier thinking
 /// caps. Explicit user budgets never go through this.
-const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
-
+///
 /// First Claude version that speaks adaptive thinking. Opus got there a
 /// generation early, at 4.7; the other families joined at 5.
 const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
@@ -544,25 +544,31 @@ pub mod dialect {
     };
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ThinkingConfig {
-    #[default]
-    Off,
-    Adaptive,
-    Effort(Effort),
-    Budget(u32),
-}
-
 /// Resolved thinking value for token-budget APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Budgeted {
+pub enum Budgeted {
     Off,
     Adaptive,
     Tokens(u32),
 }
 
-impl ThinkingConfig {
-    pub fn is_enabled(self) -> bool {
+pub trait ThinkingConfigExt {
+    fn effort_str(self, dialect: &EffortDialect, model: &Model) -> Option<&'static str>;
+    fn apply_to_body(self, body: &mut Value, model: &Model);
+    fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model);
+    fn apply_google_thinking(self, body: &mut Value, max: u32);
+    fn apply_local_thinking(self, body: &mut Value, model: &Model);
+    fn parse(input: &str, current: Self) -> Result<Self, &'static str>
+    where
+        Self: Sized;
+    fn status_label(self) -> Option<Cow<'static, str>>;
+    fn enabled(self) -> bool;
+    fn budgeted(self, max: Option<u32>) -> Budgeted;
+    fn requires_adaptive(model_id: &str) -> bool;
+}
+
+impl ThinkingConfigExt for ThinkingConfig {
+    fn enabled(self) -> bool {
         !matches!(self, Self::Off)
     }
 
@@ -570,7 +576,7 @@ impl ThinkingConfig {
     /// here and nowhere else (never chain snaps). `None` means send nothing:
     /// `Off` without an explicit off string, or `Adaptive` on APIs with their
     /// own default behavior.
-    pub fn effort_str(self, dialect: &EffortDialect, model: &Model) -> Option<&'static str> {
+    fn effort_str(self, dialect: &EffortDialect, model: &Model) -> Option<&'static str> {
         let level = match self {
             Self::Off => return dialect.off,
             Self::Adaptive => dialect.adaptive?,
@@ -588,7 +594,7 @@ impl ThinkingConfig {
     /// The token budget to send, clamped to `[MIN_THINKING_BUDGET, max]` here
     /// and nowhere else. An unknown `max` never caps: the user's number goes
     /// through as asked, and effort levels scale the fallback ceiling.
-    fn budget(self, max: Option<u32>) -> Budgeted {
+    fn budgeted(self, max: Option<u32>) -> Budgeted {
         match self {
             Self::Off => Budgeted::Off,
             Self::Adaptive => Budgeted::Adaptive,
@@ -605,8 +611,8 @@ impl ThinkingConfig {
     /// Anthropic messages API body. Adaptive-thinking models get the native
     /// adaptive knob plus `output_config.effort`; legacy models get a plain
     /// token budget.
-    pub fn apply_to_body(self, body: &mut Value, model: &Model) {
-        if Self::requires_adaptive(&model.id) {
+    fn apply_to_body(self, body: &mut Value, model: &Model) {
+        if <Self as ThinkingConfigExt>::requires_adaptive(&model.id) {
             if matches!(self, Self::Off) {
                 return;
             }
@@ -619,7 +625,7 @@ impl ThinkingConfig {
             }
             return;
         }
-        match self.budget(model.max_thinking_budget()) {
+        match self.budgeted(model.max_thinking_budget()) {
             Budgeted::Off => {}
             Budgeted::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
             Budgeted::Tokens(n) => {
@@ -628,9 +634,7 @@ impl ThinkingConfig {
         }
     }
 
-    /// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
-    /// version check, not an allowlist, so future releases and new families
-    /// work automatically.
+    /// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400.
     fn requires_adaptive(model_id: &str) -> bool {
         claude_version(model_id).is_some_and(|(family, version)| {
             version
@@ -642,14 +646,14 @@ impl ThinkingConfig {
         })
     }
 
-    pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
+    fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
         if let Some(effort) = self.effort_str(dialect, model) {
             body["reasoning_effort"] = json!(effort);
         }
     }
 
-    pub fn apply_google_thinking(self, body: &mut Value, max: u32) {
-        match self.budget(Some(max)) {
+    fn apply_google_thinking(self, body: &mut Value, max: u32) {
+        match self.budgeted(Some(max)) {
             Budgeted::Off => {}
             Budgeted::Adaptive => {
                 body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
@@ -660,21 +664,21 @@ impl ThinkingConfig {
         }
     }
 
-    pub fn apply_local_thinking(self, body: &mut Value, model: &Model) {
+    fn apply_local_thinking(self, body: &mut Value, model: &Model) {
         let max = model.max_thinking_budget();
         if let Some(fields) = &model.thinking_fields
             && let Some((fragment, keep_budget)) = fields.fragment(self, max)
             && let Some(object) = body.as_object_mut()
         {
             merge_body(object, fragment);
-            if keep_budget && let Budgeted::Tokens(budget) = self.budget(max) {
+            if keep_budget && let Budgeted::Tokens(budget) = self.budgeted(max) {
                 body[LOCAL_BUDGET_FIELD] = json!(budget);
             }
             return;
         }
         // No fragment means the model has no way to spell this mode, so the
         // budget field takes over: a request must never end up saying nothing.
-        let budget = match self.budget(max) {
+        let budget = match self.budgeted(max) {
             Budgeted::Off => 0,
             Budgeted::Adaptive => -1,
             Budgeted::Tokens(n) => i64::from(n),
@@ -682,58 +686,23 @@ impl ThinkingConfig {
         body[LOCAL_BUDGET_FIELD] = json!(budget);
     }
 
-    pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
+    fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
         if input.is_empty() {
-            return Ok(if current.is_enabled() {
+            return Ok(if current.enabled() {
                 Self::Off
             } else {
                 Self::Adaptive
             });
         }
-        StoredThinking::parse_setting(input)
-            .map(Into::into)
-            .map_err(|_| THINKING_USAGE)
+        ThinkingConfig::parse_setting(input).map_err(|_| THINKING_USAGE)
     }
 
-    pub fn status_label(self) -> Option<Cow<'static, str>> {
+    fn status_label(self) -> Option<Cow<'static, str>> {
         match self {
             Self::Off => None,
             Self::Adaptive => Some(Cow::Borrowed("thinking")),
             Self::Effort(e) => Some(Cow::Owned(format!("thinking: {e}"))),
             Self::Budget(n) => Some(Cow::Owned(format!("thinking: {n}"))),
-        }
-    }
-}
-
-impl std::fmt::Display for ThinkingConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Off => f.write_str("off"),
-            Self::Adaptive => f.write_str("adaptive"),
-            Self::Effort(e) => f.write_str(e.as_str()),
-            Self::Budget(n) => write!(f, "{n}"),
-        }
-    }
-}
-
-impl From<StoredThinking> for ThinkingConfig {
-    fn from(s: StoredThinking) -> Self {
-        match s {
-            StoredThinking::Off => Self::Off,
-            StoredThinking::Adaptive => Self::Adaptive,
-            StoredThinking::Effort { level } => Self::Effort(level),
-            StoredThinking::Budget { tokens } => Self::Budget(tokens),
-        }
-    }
-}
-
-impl From<ThinkingConfig> for StoredThinking {
-    fn from(c: ThinkingConfig) -> Self {
-        match c {
-            ThinkingConfig::Off => Self::Off,
-            ThinkingConfig::Adaptive => Self::Adaptive,
-            ThinkingConfig::Effort(e) => Self::Effort { level: e },
-            ThinkingConfig::Budget(n) => Self::Budget { tokens: n },
         }
     }
 }
@@ -754,7 +723,7 @@ impl RequestOptions {
         Self {
             thinking: if !model.supports_thinking() {
                 ThinkingConfig::Off
-            } else if model.requires_thinking() && !self.thinking.is_enabled() {
+            } else if model.requires_thinking() && !self.thinking.enabled() {
                 ThinkingConfig::Effort(Effort::Minimal)
             } else {
                 self.thinking
@@ -1072,7 +1041,7 @@ mod tests {
     #[test_case(ThinkingConfig::Effort(Max),     None,       Budgeted::Tokens(32_768) ; "unknown_max_effort_scales_fallback")]
     #[test_case(ThinkingConfig::Effort(Minimal), None,       Budgeted::Tokens(3_276)  ; "unknown_max_minimal_effort")]
     fn thinking_budget_resolver(config: ThinkingConfig, max: Option<u32>, expected: Budgeted) {
-        assert_eq!(config.budget(max), expected);
+        assert_eq!(config.budgeted(max), expected);
     }
 
     #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]

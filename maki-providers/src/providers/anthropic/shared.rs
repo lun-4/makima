@@ -1,3 +1,4 @@
+use crate::types::ThinkingConfigExt;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
 

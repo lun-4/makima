@@ -26,6 +26,7 @@ use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
 use maki_config::{ModelPolicy, UiConfig};
+use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, ModelRequest, ProviderUsageAck,
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
@@ -33,14 +34,13 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
-use maki_providers::{Message, Model, ThinkingConfig, TokenUsage};
+use maki_providers::{Message, Model, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock;
 use maki_storage::sessions::{
-    Prefs, SESSIONS_DIR, SessionError, StoredThinking, StoredTokenUsage, normalize_title,
-    write_prefs,
+    Prefs, SESSIONS_DIR, SessionError, StoredTokenUsage, normalize_title, write_prefs,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -1572,9 +1572,11 @@ impl<'t> EventLoop<'t> {
             }
             SessionRequest::GetThinking => {
                 let app = &self.sessions[self.focused].app;
+                let options = maki_domain::THINKING_OPTIONS.to_vec();
                 let reply = Ok(json!({
                     "mode": app.state.thinking.to_string(),
                     "supports_thinking": app.state.model.supports_thinking(),
+                    "options": options,
                 }));
                 let _ = reply_tx.send(reply);
             }
@@ -1587,18 +1589,19 @@ impl<'t> EventLoop<'t> {
                     if !self.sessions[idx].app.state.model.supports_thinking() {
                         return Err("Thinking requires a model that supports it".into());
                     }
-                    let parsed =
-                        StoredThinking::parse_setting(&thinking).map_err(|e| e.to_string())?;
+                    let parsed = thinking
+                        .parse::<DomainThinkingConfig>()
+                        .map_err(|e| e.to_string())?;
                     if set_default {
                         write_prefs(
                             &self.ctx.storage,
                             &Prefs {
-                                default_thinking: Some(parsed),
+                                default_thinking: Some(parsed.into()),
                             },
                         )
                         .map_err(|e| e.to_string())?;
                     }
-                    self.sessions[idx].app.state.thinking = ThinkingConfig::from(parsed);
+                    self.sessions[idx].app.state.thinking = parsed;
                     let mode = self.sessions[idx].app.state.thinking.to_string();
                     self.sessions[idx].app.flash(format!("Thinking: {mode}"));
                     Ok(json!({ "mode": mode }))

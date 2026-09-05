@@ -2780,6 +2780,7 @@ name = "maki-commands"
 version = "0.4.11-makima"
 dependencies = [
  "futures-lite",
+ "maki-domain",
  "thiserror 2.0.20",
 ]
 
@@ -2825,6 +2826,15 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "test-case",
+]
+
+[[package]]
+name = "maki-domain"
+version = "0.4.11-makima"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2976,6 +2986,7 @@ dependencies = [
  "jiff",
  "keyring",
  "maki-config",
+ "maki-domain",
  "maki-storage",
  "serde",
  "serde_json",
@@ -3001,6 +3012,7 @@ dependencies = [
  "fs2",
  "getrandom 0.3.4",
  "isahc",
+ "maki-domain",
  "serde",
  "serde_json",
  "tempfile",
@@ -3031,6 +3043,7 @@ dependencies = [
  "maki-agent",
  "maki-commands",
  "maki-config",
+ "maki-domain",
  "maki-highlight",
  "maki-lua",
  "maki-markdown",
