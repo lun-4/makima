@@ -29,7 +29,7 @@ use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::providers::opencode::{USAGE_PATH, parse_usage};
+use crate::providers::opencode::{USAGE_PATH, parse_usage, session_header};
 use crate::providers::{ResolvedAuth, Timeouts, http_client};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
@@ -685,7 +685,7 @@ impl Provider for CatalogProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = match &self.auth {
@@ -726,8 +726,14 @@ impl Provider for CatalogProvider {
                         &dialect::PREFER_HIGH,
                         &stream_model,
                     );
+                    let extra_headers: Vec<_> =
+                        if OPENCODE_FAMILY_SLUGS.contains(&self.data.slug.as_str()) {
+                            session_header(session_id).into_iter().collect()
+                        } else {
+                            Vec::new()
+                        };
                     self.chat_compat
-                        .do_stream(&stream_model, &[], &body, event_tx, auth)
+                        .do_stream(&stream_model, &extra_headers, &body, event_tx, auth)
                         .await
                 }
                 EndpointType::Messages => {
@@ -746,20 +752,22 @@ impl Provider for CatalogProvider {
                     body["model"] = serde_json::json!(model.id);
                     body["stream"] = serde_json::json!(true);
                     let json_body = serde_json::to_vec(&body)?;
-                    let request = auth
-                        .configure_request(
-                            isahc::Request::builder()
-                                .method("POST")
-                                .uri(format!(
-                                    "{}{}",
-                                    auth.base_url.as_deref().unwrap_or(""),
-                                    MESSAGES_PATH
-                                ))
-                                .header("user-agent", super::user_agent())
-                                .header("content-type", "application/json")
-                                .header("anthropic-version", "2023-06-01"),
-                        )
-                        .body(json_body)?;
+                    let mut request = isahc::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "{}{}",
+                            auth.base_url.as_deref().unwrap_or(""),
+                            MESSAGES_PATH
+                        ))
+                        .header("user-agent", super::user_agent())
+                        .header("content-type", "application/json")
+                        .header("anthropic-version", "2023-06-01");
+                    if OPENCODE_FAMILY_SLUGS.contains(&self.data.slug.as_str())
+                        && let Some((key, value)) = session_header(session_id)
+                    {
+                        request = request.header(key, value);
+                    }
+                    let request = auth.configure_request(request).body(json_body)?;
                     tracing::debug!(model = %model.id, "sending Anthropic-format request via catalog");
                     let response = self.client.send_async(request).await?;
                     let status = response.status().as_u16();
@@ -966,9 +974,12 @@ pub struct CatalogMetaView {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
 
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
-    use std::sync::Arc;
 
     use super::{
         Authentication, CatalogData, CatalogMeta, EndpointType, FREE_MODELS_OPT_IN, ProviderData,
@@ -978,6 +989,7 @@ mod tests {
     use crate::provider::Provider;
     use crate::providers::Timeouts;
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
+    use maki_storage::id::SessionRef;
     use test_case::test_case;
 
     #[test]
@@ -1035,16 +1047,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gated_free_fallback_hides_models_and_refuses_streaming() {
-        let (_tmp, state_dir) = temp_state_dir();
-        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_52814");
-        let provider =
-            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
-        assert!(smol::block_on(provider.list_models()).unwrap().is_empty());
-
-        let model = Model {
-            id: "free-model".into(),
+    fn fake_model(id: &str) -> Model {
+        Model {
+            id: id.into(),
             provider: Arc::from("opencode-go"),
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
@@ -1055,7 +1060,87 @@ mod tests {
             max_output_tokens: None,
             context_window: 0,
             thinking_fields: None,
-        };
+        }
+    }
+
+    fn spawn_chat_server() -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                request.push_str(&line);
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            request.push_str(&String::from_utf8(body).unwrap());
+
+            let response = "data: [DONE]\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            request
+        });
+        (base_url, handle)
+    }
+
+    // This is the highest supported integration level for fake catalog metadata.
+    // Agent tests cannot construct CatalogProvider because its required catalog types are private.
+    // TODO: Find a way to make this test work with a real agent driving a fake provider.
+    #[test]
+    fn opencode_go_stream_sends_session_header() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let (base_url, request) = spawn_chat_server();
+        let mut data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_SESSION_HEADER");
+        data.base_url = Some(base_url);
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
+        let session = SessionRef::generate();
+        let (tx, _rx) = flume::unbounded();
+
+        smol::block_on(provider.stream_message(
+            &fake_model("free-model"),
+            &[],
+            "",
+            &serde_json::json!([]),
+            &tx,
+            RequestOptions::default(),
+            Some(&session),
+        ))
+        .unwrap();
+
+        let request = request.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("post /chat/completions http/1.1\r\n"));
+        assert!(request.contains(&format!(
+            "x-opencode-session: {}\r\n",
+            session.as_str().to_ascii_lowercase()
+        )));
+        assert!(request.contains(r#""model":"free-model""#));
+    }
+
+    #[test]
+    fn gated_free_fallback_hides_models_and_refuses_streaming() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_52814");
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert!(smol::block_on(provider.list_models()).unwrap().is_empty());
+
+        let model = fake_model("free-model");
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(provider.stream_message(
             &model,

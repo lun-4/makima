@@ -22,6 +22,7 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, 
 use super::{ResolvedAuth, user_agent, with_prefix};
 
 const MESSAGES_PATH: &str = "/messages";
+const SESSION_HEADER: &str = "x-opencode-session";
 pub(crate) const USAGE_PATH: &str = "/usage";
 const EMPTY_USAGE_ERROR: &str =
     "Opencode Go usage response contained no usage lanes; the endpoint schema likely changed";
@@ -86,12 +87,14 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        session_id: Option<&SessionRef>,
     ) -> Result<StreamResponse, AgentError> {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
         opts.thinking
             .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
+        let extra_headers: Vec<_> = session_header(session_id).into_iter().collect();
         self.chat_compat
-            .do_stream(model, &[], &body, event_tx, auth)
+            .do_stream(model, &extra_headers, &body, event_tx, auth)
             .await
     }
 
@@ -105,6 +108,7 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        session_id: Option<&SessionRef>,
     ) -> Result<StreamResponse, AgentError> {
         let system_blocks = vec![shared::SystemBlock {
             r#type: "text",
@@ -121,20 +125,20 @@ impl Opencode {
         body["model"] = json!(model.id);
         body["stream"] = json!(true);
         let json_body = serde_json::to_vec(&body)?;
-        let request = auth
-            .configure_request(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!(
-                        "{}{}",
-                        auth.base_url.as_deref().unwrap_or(""),
-                        MESSAGES_PATH
-                    ))
-                    .header("user-agent", user_agent())
-                    .header("content-type", "application/json")
-                    .header("anthropic-version", "2023-06-01"),
-            )
-            .body(json_body)?;
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "{}{}",
+                auth.base_url.as_deref().unwrap_or(""),
+                MESSAGES_PATH
+            ))
+            .header("user-agent", user_agent())
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01");
+        if let Some((key, value)) = session_header(session_id) {
+            request = request.header(key, value);
+        }
+        let request = auth.configure_request(request).body(json_body)?;
 
         debug!(model = %model.id, "sending Anthropic-format request via catalog");
 
@@ -182,7 +186,7 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let model_for_stream = model.clone();
@@ -206,13 +210,13 @@ impl Provider for Opencode {
             match api_format {
                 EndpointType::ChatCompletions => {
                     self.handle_catalog_chat_completions(
-                        &model, messages, system, tools, event_tx, &auth, &opts,
+                        &model, messages, system, tools, event_tx, &auth, &opts, session_id,
                     )
                     .await
                 }
                 EndpointType::Messages => {
                     self.handle_catalog_messages(
-                        &model, messages, system, tools, event_tx, &auth, &opts,
+                        &model, messages, system, tools, event_tx, &auth, &opts, session_id,
                     )
                     .await
                 }
@@ -227,6 +231,10 @@ impl Provider for Opencode {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+pub(super) fn session_header(session_id: Option<&SessionRef>) -> Option<(&'static str, &str)> {
+    session_id.map(|id| (SESSION_HEADER, id.as_str()))
 }
 
 #[derive(Deserialize)]
@@ -294,6 +302,16 @@ mod tests {
     const ROLLING_RESET_MS: u64 = 1_787_983_276_964;
     const WEEKLY_RESET_MS: u64 = 1_788_134_400_964;
     const MONTHLY_RESET_MS: u64 = 1_789_744_986_964;
+
+    #[test]
+    fn session_header_uses_stable_session_reference() {
+        let session = SessionRef::generate();
+        assert_eq!(
+            session_header(Some(&session)),
+            Some((SESSION_HEADER, session.as_str()))
+        );
+        assert_eq!(session_header(None), None);
+    }
 
     #[test]
     fn parse_usage_maps_lanes_to_windows() {
