@@ -143,9 +143,14 @@ impl Provider for LocalEndpoint {
             if matches!(self.protocol, Some(Protocol::OpenaiResponses)) {
                 let mut buf = String::new();
                 let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-                let mut body = responses::build_body(model, messages, system, tools, None);
+                let mut body = responses::build_body(responses::ResponsesRequestArgs {
+                    model,
+                    messages,
+                    system,
+                    tools,
+                    thinking: Some((opts.thinking, &crate::dialect::STANDARD)),
+                });
                 body["return_progress"] = serde_json::Value::Bool(true);
-                // TODO: wire thinking budget into responses API when llama.cpp supports it
                 return responses::do_stream(
                     self.compat.client(),
                     model,

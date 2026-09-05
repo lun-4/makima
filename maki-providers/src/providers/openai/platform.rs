@@ -288,13 +288,13 @@ impl Provider for OpenAi {
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             if is_codex_model(&model.id) {
-                let body = super::responses::build_body(
+                let body = super::responses::build_body(super::responses::ResponsesRequestArgs {
                     model,
                     messages,
                     system,
                     tools,
-                    Some(opts.thinking),
-                );
+                    thinking: Some((opts.thinking, &dialect::STANDARD)),
+                });
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
