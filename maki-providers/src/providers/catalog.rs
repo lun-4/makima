@@ -727,11 +727,7 @@ impl Provider for CatalogProvider {
                         &stream_model,
                     );
                     let extra_headers: Vec<_> =
-                        if OPENCODE_FAMILY_SLUGS.contains(&self.data.slug.as_str()) {
-                            session_header(session_id).into_iter().collect()
-                        } else {
-                            Vec::new()
-                        };
+                        session_header(&self.data.slug, session_id).into_iter().collect();
                     self.chat_compat
                         .do_stream(&stream_model, &extra_headers, &body, event_tx, auth)
                         .await
@@ -762,9 +758,7 @@ impl Provider for CatalogProvider {
                         .header("user-agent", super::user_agent())
                         .header("content-type", "application/json")
                         .header("anthropic-version", "2023-06-01");
-                    if OPENCODE_FAMILY_SLUGS.contains(&self.data.slug.as_str())
-                        && let Some((key, value)) = session_header(session_id)
-                    {
+                    if let Some((key, value)) = session_header(&self.data.slug, session_id) {
                         request = request.header(key, value);
                     }
                     let request = auth.configure_request(request).body(json_body)?;

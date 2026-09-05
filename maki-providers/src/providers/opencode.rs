@@ -12,7 +12,7 @@ use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
 use crate::providers::catalog::{
-    CatalogMeta, EndpointType, config_error, init_shared_catalog_if_needed,
+    CatalogMeta, EndpointType, OPENCODE_FAMILY_SLUGS, config_error, init_shared_catalog_if_needed,
 };
 use crate::providers::http_client;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -87,12 +87,13 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        provider_slug: &str,
         session_id: Option<&SessionRef>,
     ) -> Result<StreamResponse, AgentError> {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
         opts.thinking
             .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
-        let extra_headers: Vec<_> = session_header(session_id).into_iter().collect();
+        let extra_headers: Vec<_> = session_header(provider_slug, session_id).into_iter().collect();
         self.chat_compat
             .do_stream(model, &extra_headers, &body, event_tx, auth)
             .await
@@ -108,6 +109,7 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        provider_slug: &str,
         session_id: Option<&SessionRef>,
     ) -> Result<StreamResponse, AgentError> {
         let system_blocks = vec![shared::SystemBlock {
@@ -135,7 +137,7 @@ impl Opencode {
             .header("user-agent", user_agent())
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01");
-        if let Some((key, value)) = session_header(session_id) {
+        if let Some((key, value)) = session_header(provider_slug, session_id) {
             request = request.header(key, value);
         }
         let request = auth.configure_request(request).body(json_body)?;
@@ -210,13 +212,29 @@ impl Provider for Opencode {
             match api_format {
                 EndpointType::ChatCompletions => {
                     self.handle_catalog_chat_completions(
-                        &model, messages, system, tools, event_tx, &auth, &opts, session_id,
+                        &model,
+                        messages,
+                        system,
+                        tools,
+                        event_tx,
+                        &auth,
+                        &opts,
+                        sub_provider,
+                        session_id,
                     )
                     .await
                 }
                 EndpointType::Messages => {
                     self.handle_catalog_messages(
-                        &model, messages, system, tools, event_tx, &auth, &opts, session_id,
+                        &model,
+                        messages,
+                        system,
+                        tools,
+                        event_tx,
+                        &auth,
+                        &opts,
+                        sub_provider,
+                        session_id,
                     )
                     .await
                 }
@@ -233,8 +251,15 @@ impl Provider for Opencode {
     }
 }
 
-pub(super) fn session_header(session_id: Option<&SessionRef>) -> Option<(&'static str, &str)> {
-    session_id.map(|id| (SESSION_HEADER, id.as_str()))
+pub(super) fn session_header<'a>(
+    provider_slug: &str,
+    session_id: Option<&'a SessionRef>,
+) -> Option<(&'static str, &'a str)> {
+    OPENCODE_FAMILY_SLUGS
+        .contains(&provider_slug)
+        .then_some(session_id)
+        .flatten()
+        .map(|id| (SESSION_HEADER, id.as_str()))
 }
 
 #[derive(Deserialize)]
@@ -304,13 +329,18 @@ mod tests {
     const MONTHLY_RESET_MS: u64 = 1_789_744_986_964;
 
     #[test]
-    fn session_header_uses_stable_session_reference() {
+    fn session_header_is_limited_to_opencode_providers() {
         let session = SessionRef::generate();
         assert_eq!(
-            session_header(Some(&session)),
+            session_header("opencode", Some(&session)),
             Some((SESSION_HEADER, session.as_str()))
         );
-        assert_eq!(session_header(None), None);
+        assert_eq!(
+            session_header("opencode-go", Some(&session)),
+            Some((SESSION_HEADER, session.as_str()))
+        );
+        assert_eq!(session_header("nvidia", Some(&session)), None);
+        assert_eq!(session_header("opencode", None), None);
     }
 
     #[test]
