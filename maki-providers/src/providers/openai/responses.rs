@@ -40,6 +40,8 @@ pub(crate) fn build_body<'a, 'b>(args: ResponsesRequestArgs<'a, 'b>) -> Value {
     #[derive(Serialize)]
     struct ReasoningRequest {
         effort: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<&'static str>,
     }
 
     #[derive(Serialize)]
@@ -58,6 +60,7 @@ pub(crate) fn build_body<'a, 'b>(args: ResponsesRequestArgs<'a, 'b>) -> Value {
     let reasoning = thinking
         .and_then(|(thinking, effort_dialect)| thinking.effort_str(effort_dialect, model))
         .map(|effort| ReasoningRequest {
+            summary: (effort != "none").then_some("auto"),
             effort: effort.into(),
         });
     serde_json::to_value(ResponsesRequest {

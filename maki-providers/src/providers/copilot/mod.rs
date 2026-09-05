@@ -1347,7 +1347,10 @@ mod tests {
             tools: &json!([]),
             thinking: Some((ThinkingConfig::Effort(Effort::Medium), &dialect)),
         });
-        assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort": "medium", "summary": "auto"})
+        );
         assert!(body.get("reasoning_effort").is_none());
     }
 
