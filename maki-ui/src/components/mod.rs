@@ -1,6 +1,7 @@
 pub(crate) mod arg_completion;
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
+mod coherent_completion;
 pub mod command;
 pub(crate) mod file_completion;
 pub(crate) mod file_picker;

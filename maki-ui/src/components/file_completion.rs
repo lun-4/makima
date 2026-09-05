@@ -23,6 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tracing::warn;
 use unicode_width::UnicodeWidthChar;
 
+use crate::components::coherent_completion::{CoherentCompletion, Publication};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -212,12 +213,13 @@ enum Discovery {
 struct Session {
     discovery: Discovery,
     query: String,
-    query_refresh_pending: bool,
+    publication: CoherentCompletion,
     intent: QueryIntent,
     /// Non-file candidates from Lua sources, as `(matchable label, item)`.
     /// Re-fuzzy-matched against each new query in `sync_query`.
     ref_items: Vec<(String, CompletionItem)>,
     ref_matches: Vec<Candidate>,
+    pending_ref_matches: Option<Vec<Candidate>>,
     file_matches: Vec<Candidate>,
     matches: Vec<Candidate>,
     coarse_match_count: u32,
@@ -453,7 +455,7 @@ impl FileCompletionMenu {
         let session = Session {
             discovery,
             query: String::new(),
-            query_refresh_pending: false,
+            publication: CoherentCompletion::default(),
             intent: QueryIntent {
                 payload: String::new(),
                 kind: None,
@@ -461,6 +463,7 @@ impl FileCompletionMenu {
             },
             ref_items,
             ref_matches: Vec::new(),
+            pending_ref_matches: None,
             file_matches: Vec::new(),
             matches: Vec::new(),
             coarse_match_count: 0,
@@ -535,7 +538,8 @@ impl FileCompletionMenu {
             };
             session.walking = false;
             session.matching = false;
-            session.query_refresh_pending = false;
+            session.publication.synchronous_commit();
+            session.pending_ref_matches = None;
             session.ref_matches.clear();
             session.file_matches.clear();
         } else {
@@ -543,6 +547,7 @@ impl FileCompletionMenu {
                 let Some((nucleo, done_rx, cancel)) =
                     (self.walker_spawner)(&session.root.to_string_lossy())
                 else {
+                    self.session = None;
                     return;
                 };
                 session.discovery = Discovery::Project {
@@ -554,20 +559,7 @@ impl FileCompletionMenu {
                 session.started_at = Instant::now();
                 session.file_matches.clear();
             }
-            if let Discovery::Project { nucleo, .. } = &mut session.discovery {
-                nucleo.pattern.reparse(
-                    0,
-                    &query.to_lowercase(),
-                    CaseMatching::Smart,
-                    Normalization::Smart,
-                    false,
-                );
-            }
-            let query_changed = session.query != query;
-            if query_changed {
-                session.query_refresh_pending = matches!(&session.discovery, Discovery::Project { nucleo, .. } if nucleo.injector().injected_items() > 0);
-            }
-            session.ref_matches = fuzzy_match(
+            let new_ref_matches = fuzzy_match(
                 &parse_query(query),
                 session
                     .ref_items
@@ -576,20 +568,44 @@ impl FileCompletionMenu {
                     .enumerate()
                     .map(|(order, (label, item))| (label, item, order)),
             );
+            let query_changed = session.query != query || was_explicit;
+            if let Discovery::Project { nucleo, .. } = &mut session.discovery {
+                nucleo.pattern.reparse(
+                    0,
+                    &query.to_lowercase(),
+                    CaseMatching::Smart,
+                    Normalization::Smart,
+                    false,
+                );
+                if query_changed {
+                    session.publication.query_reparsed(
+                        nucleo.pattern.column_pattern(0),
+                        nucleo.injector().injected_items() > 0,
+                    );
+                }
+            }
+            if session.publication.pending() {
+                session.pending_ref_matches = Some(new_ref_matches);
+            } else {
+                session.ref_matches = new_ref_matches;
+                session.pending_ref_matches = None;
+            }
         }
         session.intent = parse_query(query);
         session.query = query.to_string();
-        session.selected = 0;
-        session.scroll_offset = 0;
-        session.coarse_match_count = 0;
-        session.materialized_count = 0;
-        session.final_match_count = 0;
-        session.truncated = false;
+        if explicit || session.publication.ready() {
+            session.selected = 0;
+            session.scroll_offset = 0;
+            session.coarse_match_count = 0;
+            session.materialized_count = 0;
+            session.final_match_count = 0;
+            session.truncated = false;
+        }
         if explicit {
             refresh_explicit_matches(session);
             rebuild_combined(session);
             session.visible = !session.matches.is_empty();
-        } else if !session.query_refresh_pending {
+        } else if session.publication.ready() {
             rebuild_combined(session);
         }
     }
@@ -602,7 +618,7 @@ impl FileCompletionMenu {
         match key.code {
             KeyCode::Esc => return CompletionAction::Close,
             KeyCode::Enter | KeyCode::Tab => {
-                if !s.visible || s.query_refresh_pending {
+                if !s.visible || !s.publication.ready() {
                     return CompletionAction::Passthrough;
                 }
                 return match s.matches.get(s.selected) {
@@ -628,7 +644,10 @@ impl FileCompletionMenu {
         };
         Cadence::any([
             Cadence::when(s.visible && s.walking, Cadence::SPINNER),
-            Cadence::when(s.matching && !s.walking, Cadence::PENDING),
+            Cadence::when(
+                s.publication.needs_repaint(s.matching) && !s.walking,
+                Cadence::PENDING,
+            ),
         ])
     }
 
@@ -638,15 +657,16 @@ impl FileCompletionMenu {
         };
 
         let mut dirty = Dirty::NO;
-        let mut status_changed = false;
+        let mut publication = Publication::Wait;
         if let Discovery::Project {
             nucleo, done_rx, ..
         } = &mut s.discovery
         {
             let status = nucleo.tick(0);
             s.matching = status.running;
-            status_changed = status.changed;
-            dirty = Dirty::from(status.changed);
+            publication = s
+                .publication
+                .observe(status, nucleo.snapshot().pattern().column_pattern(0));
             if s.walking {
                 match done_rx.try_recv() {
                     Ok(()) => {
@@ -681,18 +701,20 @@ impl FileCompletionMenu {
             }
         }
 
-        if let Some(s) = self.session.as_mut() {
-            let refresh_finished = s.query_refresh_pending && !s.matching;
-            if refresh_finished {
-                refresh_file_matches(s);
-                rebuild_combined(s);
-                clamp_selection(s);
-                s.query_refresh_pending = false;
-            } else if !s.query_refresh_pending && status_changed {
-                refresh_file_matches(s);
-                rebuild_combined(s);
-                clamp_selection(s);
+        if publication != Publication::Wait
+            && let Some(s) = self.session.as_mut()
+        {
+            refresh_file_matches(s);
+            if publication == Publication::Commit {
+                if let Some(ref_matches) = s.pending_ref_matches.take() {
+                    s.ref_matches = ref_matches;
+                }
+                s.selected = 0;
+                s.scroll_offset = 0;
             }
+            rebuild_combined(s);
+            clamp_selection(s);
+            dirty = Dirty::YES;
         }
 
         (dirty, None)
@@ -1083,6 +1105,7 @@ fn cell_line<'a>(c: &Candidate, width: usize, selected: bool, t: &'a theme::Them
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -1137,7 +1160,8 @@ mod tests {
 
     fn session_with_items(items: Vec<ItemSpec>) -> FileCompletionMenu {
         let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
-        let (_, done_rx) = flume::bounded(1);
+        let (done_tx, done_rx) = flume::bounded(1);
+        std::mem::forget(done_tx);
         let mut menu = FileCompletionMenu::new();
         let ref_items = items
             .into_iter()
@@ -1158,7 +1182,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
             query: String::new(),
-            query_refresh_pending: false,
+            publication: CoherentCompletion::default(),
             intent: QueryIntent {
                 payload: String::new(),
                 kind: None,
@@ -1166,6 +1190,7 @@ mod tests {
             },
             ref_items,
             ref_matches: Vec::new(),
+            pending_ref_matches: None,
             file_matches: Vec::new(),
             matches: Vec::new(),
             coarse_match_count: 0,
@@ -1233,6 +1258,24 @@ mod tests {
         assert!(cancellations.lock().unwrap()[0].load(Ordering::Relaxed));
         menu.sync_query("src");
         assert_eq!(spawns.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_project_restart_closes_stale_explicit_session() {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "outside.txt".into(),
+                is_directory: false,
+            }],
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(resolver, Arc::new(|_| None), None);
+        menu.open("/project", Vec::new(), "../out", (0, 7));
+        assert!(menu.has_selectable());
+
+        menu.sync_query("project");
+
+        assert!(!menu.is_active());
     }
 
     #[test]
@@ -1352,7 +1395,7 @@ mod tests {
             &mut menu,
             |menu| {
                 let session = menu.session.as_ref().unwrap();
-                !session.query_refresh_pending
+                !session.publication.pending()
                     && menu
                         .match_items()
                         .iter()
@@ -2268,12 +2311,11 @@ mod tests {
                 });
         }
         menu.sync_query("");
-        for _ in 0..100 {
-            let _ = menu.tick();
-            if menu.session.as_ref().unwrap().file_matches.len() == 2 {
-                break;
-            }
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().file_matches.len() == 2,
+            "file matcher did not surface both files",
+        );
         let session = menu.session.as_ref().unwrap();
         let labels: Vec<_> = session
             .file_matches
@@ -2354,7 +2396,11 @@ mod tests {
         session.selected = 99;
         project_nucleo_mut(session).tick(0);
         menu.sync_query("needle");
-        let _ = menu.tick();
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().publication.ready(),
+            "file matcher did not settle",
+        );
         assert_eq!(menu.session.as_ref().unwrap().selected, 0);
     }
 
@@ -2373,7 +2419,7 @@ mod tests {
             &mut menu,
             |menu| {
                 let session = menu.session.as_ref().unwrap();
-                !session.query_refresh_pending && !session.file_matches.is_empty()
+                !session.publication.pending() && !session.file_matches.is_empty()
             },
             "file matcher did not settle",
         );
@@ -2392,8 +2438,12 @@ mod tests {
     }
 
     #[test]
-    fn query_refresh_keeps_previous_result_set_until_matching_finishes() {
-        let mut menu = session_with_items(Vec::new());
+    fn query_refresh_keeps_mixed_snapshot_and_geometry_until_current_pattern() {
+        let mut menu = session_with_items(vec![
+            item("alpha-file-plugin", "skill", "@alpha-file-plugin"),
+            item("gamma-file-plugin", "skill", "@gamma-file-plugin"),
+        ]);
+        menu.sync_query("file");
         {
             let session = menu.session.as_mut().unwrap();
             session.walking = false;
@@ -2405,25 +2455,113 @@ mod tests {
                     });
             }
         }
-        menu.sync_query("");
         wait_for_matcher(
             &mut menu,
             |menu| menu.session.as_ref().unwrap().file_matches.len() == 3,
             "file matcher did not surface the three injected files",
         );
         let before = labels(&menu);
-        assert_eq!(before, vec!["alpha-file", "beta-file", "gamma-file"]);
+        assert_eq!(before.len(), 5);
+        let input_area = Rect::new(0, 10, 40, 3);
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        menu.session.as_mut().unwrap().visible = true;
+        let rendered_rect = Cell::new(Rect::default());
+        terminal
+            .draw(|frame| rendered_rect.set(menu.view(frame, input_area).unwrap()))
+            .unwrap();
+        let before_rect = rendered_rect.get();
+        {
+            let session = menu.session.as_mut().unwrap();
+            session.selected = 2;
+            session.scroll_offset = 1;
+        }
 
         menu.sync_query("gamma");
-        assert!(menu.session.as_ref().unwrap().query_refresh_pending);
+        let session = menu.session.as_ref().unwrap();
+        assert!(session.publication.pending());
+        assert_eq!(session.selected, 2);
+        assert_eq!(session.scroll_offset, 1);
         assert_eq!(labels(&menu), before);
+        terminal
+            .draw(|frame| rendered_rect.set(menu.view(frame, input_area).unwrap()))
+            .unwrap();
+        let pending_rect = rendered_rect.get();
+        assert_eq!(pending_rect, before_rect);
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Enter)),
+            CompletionAction::Passthrough
+        ));
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Tab)),
+            CompletionAction::Passthrough
+        ));
 
         wait_for_matcher(
             &mut menu,
-            |menu| !menu.session.as_ref().unwrap().query_refresh_pending,
+            |menu| !menu.session.as_ref().unwrap().publication.pending(),
             "file matcher did not settle on the filtered gamma query",
         );
-        assert_eq!(labels(&menu), vec!["gamma-file"]);
+        assert_eq!(labels(&menu), vec!["gamma-file", "gamma-file-plugin"]);
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.selected, 0);
+        assert_eq!(session.scroll_offset, 0);
+    }
+
+    #[test]
+    fn reference_only_query_publishes_immediately() {
+        let mut menu = session_with_items(vec![item("skill:review", "skill", "@skill:review")]);
+
+        menu.sync_query("review");
+
+        let session = menu.session.as_ref().unwrap();
+        assert!(session.publication.ready());
+        assert_eq!(labels(&menu), vec!["skill:review"]);
+    }
+
+    #[test]
+    fn file_completion_query_commit_survives_in_flight_injection() {
+        let mut menu = session_with_items(Vec::new());
+        let injector = {
+            let session = menu.session.as_mut().unwrap();
+            project_nucleo_mut(session).injector().clone()
+        };
+        injector.push((), |_, columns| {
+            columns[0] = Utf32String::from("needle-first");
+        });
+        wait_for_matcher(
+            &mut menu,
+            |menu| labels(menu) == ["needle-first"],
+            "initial file did not publish",
+        );
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let producer = std::thread::spawn(move || {
+            injector.push((), |_, columns| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                columns[0] = Utf32String::from("needle-later");
+            });
+        });
+        entered_rx.recv_timeout(MATCHER_SETTLE_TIMEOUT).unwrap();
+
+        menu.sync_query("needle");
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().publication.ready(),
+            "current pattern did not commit during injection",
+        );
+        let session = menu.session.as_ref().unwrap();
+        assert!(session.walking);
+        assert_eq!(labels(&menu), vec!["needle-first"]);
+
+        release_tx.send(()).unwrap();
+        producer.join().unwrap();
+        wait_for_matcher(
+            &mut menu,
+            |menu| labels(menu).len() == 2,
+            "later discovery did not stream",
+        );
+        assert_eq!(labels(&menu), vec!["needle-first", "needle-later"]);
     }
 
     #[test]

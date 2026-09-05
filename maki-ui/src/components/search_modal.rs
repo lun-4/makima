@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 
 use crate::components::Overlay;
+use crate::components::coherent_completion::Published;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
@@ -39,7 +40,7 @@ pub enum SearchAction {
 
 pub struct SearchModal {
     search: TextBuffer,
-    matches: Vec<SearchMatch>,
+    publication: Published<String, Vec<SearchMatch>>,
     selected: usize,
     scroll_offset: usize,
     viewport_height: usize,
@@ -52,7 +53,7 @@ impl SearchModal {
     pub fn new() -> Self {
         Self {
             search: TextBuffer::new(String::new()),
-            matches: Vec::new(),
+            publication: Published::default(),
             selected: 0,
             scroll_offset: 0,
             viewport_height: 0,
@@ -60,6 +61,10 @@ impl SearchModal {
             saved_scroll: None,
             matcher: Matcher::new(Config::DEFAULT),
         }
+    }
+
+    fn matches(&self) -> &[SearchMatch] {
+        self.publication.value().map_or(&[], Vec::as_slice)
     }
 
     pub fn open(&mut self, scroll_top: u16, auto_scroll: bool) {
@@ -75,7 +80,7 @@ impl SearchModal {
     fn reset(&mut self) {
         self.open = false;
         self.search.clear();
-        self.matches.clear();
+        self.publication.commit_sync(String::new(), Vec::new());
         self.selected = 0;
         self.scroll_offset = 0;
         self.saved_scroll = None;
@@ -93,7 +98,7 @@ impl SearchModal {
         match key.code {
             KeyCode::Esc => SearchAction::Close(self.saved_scroll.take()),
             KeyCode::Enter => {
-                if let Some(m) = self.matches.get(self.selected) {
+                if let Some(m) = self.matches().get(self.selected) {
                     SearchAction::Select(m.segment_index)
                 } else {
                     SearchAction::Close(self.saved_scroll.take())
@@ -119,18 +124,18 @@ impl SearchModal {
     }
 
     fn move_up(&mut self) {
-        if !self.matches.is_empty() {
+        if !self.matches().is_empty() {
             self.selected = self
                 .selected
                 .checked_sub(1)
-                .unwrap_or(self.matches.len() - 1);
+                .unwrap_or(self.matches().len() - 1);
             self.ensure_visible();
         }
     }
 
     fn move_down(&mut self) {
-        if !self.matches.is_empty() {
-            self.selected = (self.selected + 1) % self.matches.len();
+        if !self.matches().is_empty() {
+            self.selected = (self.selected + 1) % self.matches().len();
             self.ensure_visible();
         }
     }
@@ -148,16 +153,21 @@ impl SearchModal {
 
     pub fn update_matches(&mut self, segment_texts: &[&str]) {
         let query = self.search.value();
-        self.matches.clear();
+        let matches = self.build_matches(&query, segment_texts);
+        self.publication.commit_sync(query, matches);
         self.selected = 0;
         self.scroll_offset = 0;
+    }
 
+    fn build_matches(&mut self, query: &str, segment_texts: &[&str]) -> Vec<SearchMatch> {
         if query.trim().is_empty() {
-            return;
+            return Vec::new();
         }
 
+        let mut matches = Vec::new();
+
         let atom = Atom::new(
-            &query,
+            query,
             CaseMatching::Smart,
             Normalization::Smart,
             AtomKind::Fuzzy,
@@ -175,7 +185,7 @@ impl SearchModal {
             let haystack = Utf32Str::new(text, &mut buf);
             if let Some(score) = atom.indices(haystack, &mut self.matcher, &mut indices) {
                 let (display_line, display_indices) = pick_display_line(text, &indices);
-                self.matches.push(SearchMatch {
+                matches.push(SearchMatch {
                     segment_index: idx,
                     score,
                     display_indices,
@@ -184,11 +194,12 @@ impl SearchModal {
             }
         }
 
-        self.matches.sort_by_key(|m| Reverse(m.score));
+        matches.sort_by_key(|m| Reverse(m.score));
+        matches
     }
 
     pub fn current_segment_index(&self) -> Option<usize> {
-        self.matches.get(self.selected).map(|m| m.segment_index)
+        self.matches().get(self.selected).map(|m| m.segment_index)
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -196,10 +207,10 @@ impl SearchModal {
             return Rect::default();
         }
 
-        let content_rows = if self.matches.is_empty() && !self.search.value().is_empty() {
+        let content_rows = if self.matches().is_empty() && !self.search.value().is_empty() {
             1
         } else {
-            self.matches.len() as u16
+            self.matches().len() as u16
         };
 
         let modal = Modal {
@@ -217,7 +228,7 @@ impl SearchModal {
         self.render_list(frame, list_area, viewport_h);
         self.render_search(frame, search_area);
 
-        let total = self.matches.len() as u16;
+        let total = self.matches().len() as u16;
         if total > viewport_h as u16 {
             render_vertical_scrollbar(frame, list_area, total, self.scroll_offset as u16);
         }
@@ -228,7 +239,7 @@ impl SearchModal {
     fn render_list(&self, frame: &mut Frame, area: Rect, viewport_height: usize) {
         let t = theme::current();
 
-        if self.matches.is_empty() {
+        if self.matches().is_empty() {
             if !self.search.value().is_empty() {
                 let line = Line::from(Span::styled(NO_MATCHES, t.item_desc));
                 frame.render_widget(Paragraph::new(vec![line]), area);
@@ -238,10 +249,10 @@ impl SearchModal {
 
         let max_label_width = area.width.saturating_sub(LABEL_INDENT.len() as u16) as usize;
         let mut lines: Vec<Line> = Vec::new();
-        let end = (self.scroll_offset + viewport_height).min(self.matches.len());
+        let end = (self.scroll_offset + viewport_height).min(self.matches().len());
 
         for i in self.scroll_offset..end {
-            let m = &self.matches[i];
+            let m = &self.matches()[i];
             let is_selected = i == self.selected;
             let line = build_highlighted_line(
                 &m.display_line,
@@ -374,9 +385,14 @@ mod tests {
     #[test]
     fn matching_finds_correct_segments() {
         let modal = modal_with_query("hello", &["hello world", "foo bar", "say hello"]);
-        assert_eq!(modal.matches.len(), 2);
-        assert!(modal.matches.iter().all(|m| !m.display_indices.is_empty()));
-        let seg: Vec<usize> = modal.matches.iter().map(|m| m.segment_index).collect();
+        assert_eq!(modal.matches().len(), 2);
+        assert!(
+            modal
+                .matches()
+                .iter()
+                .all(|m| !m.display_indices.is_empty())
+        );
+        let seg: Vec<usize> = modal.matches().iter().map(|m| m.segment_index).collect();
         assert!(seg.contains(&0));
         assert!(seg.contains(&2));
     }
@@ -384,8 +400,8 @@ mod tests {
     #[test]
     fn matches_sorted_by_score_descending() {
         let modal = modal_with_query("fb", &["foobar", "fb", "f---b"]);
-        assert!(modal.matches.len() >= 2);
-        for w in modal.matches.windows(2) {
+        assert!(modal.matches().len() >= 2);
+        for w in modal.matches().windows(2) {
             assert!(w[0].score >= w[1].score);
         }
     }
@@ -410,7 +426,7 @@ mod tests {
     fn enter_selects_current_match() {
         let mut modal = modal_with_query("hello", &["hello world", "foo bar", "say hello"]);
         modal.handle_key(key_event(KeyCode::Down));
-        let expected_seg = modal.matches[1].segment_index;
+        let expected_seg = modal.matches()[1].segment_index;
 
         match modal.handle_key(key_event(KeyCode::Enter)) {
             SearchAction::Select(idx) => assert_eq!(idx, expected_seg),
@@ -430,9 +446,9 @@ mod tests {
     #[test]
     fn close_clears_state() {
         let mut modal = modal_with_query("hello", &["hello world"]);
-        assert!(!modal.matches.is_empty());
+        assert!(!modal.matches().is_empty());
         modal.close();
-        assert!(modal.matches.is_empty());
+        assert!(modal.matches().is_empty());
         assert!(modal.search.value().is_empty());
         assert!(!modal.is_open());
     }
@@ -441,10 +457,10 @@ mod tests {
     #[test_case("second", "header\nsecond line\nthird", "second line" ; "match_on_middle_line")]
     fn display_line_picks_matched_line(query: &str, text: &str, expected: &str) {
         let modal = modal_with_query(query, &[text]);
-        assert_eq!(modal.matches.len(), 1);
-        assert_eq!(modal.matches[0].display_line, expected);
+        assert_eq!(modal.matches().len(), 1);
+        assert_eq!(modal.matches()[0].display_line, expected);
         assert!(
-            modal.matches[0]
+            modal.matches()[0]
                 .display_indices
                 .iter()
                 .all(|&i| i < expected.len() as u32)
@@ -455,7 +471,7 @@ mod tests {
     #[test_case("you>",  &["you> request", "maki> response", "bash> output"], 0 ; "you_prefix")]
     fn search_role_prefix_matches(query: &str, texts: &[&str], expected_idx: usize) {
         let modal = modal_with_query(query, texts);
-        assert_eq!(modal.matches.len(), 1);
-        assert_eq!(modal.matches[0].segment_index, expected_idx);
+        assert_eq!(modal.matches().len(), 1);
+        assert_eq!(modal.matches()[0].segment_index, expected_idx);
     }
 }
