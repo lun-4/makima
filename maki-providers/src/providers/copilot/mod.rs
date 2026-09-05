@@ -601,7 +601,6 @@ impl Copilot {
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let mut body = responses::build_body(model, messages, system, tools);
         let reasoning_info = crate::model_registry::provider_info::<CopilotModelInfo>(
             "copilot", &model.id,
         )
@@ -613,9 +612,18 @@ impl Copilot {
                 .map(CopilotModel::reasoning_info)
                 .map(Arc::new)
         });
-        if let Some(info) = reasoning_info {
-            apply_responses_reasoning(&mut body, thinking, model, &effort_dialect(&info));
-        }
+        let effort_dialect = reasoning_info
+            .as_deref()
+            .map(effort_dialect)
+            .unwrap_or(dialect::PREFER_HIGH);
+        let thinking = Some((thinking, &effort_dialect));
+        let body = responses::build_body(responses::ResponsesRequestArgs {
+            model,
+            messages,
+            system,
+            tools,
+            thinking,
+        });
         let resolved = super::ResolvedAuth {
             base_url: Some(auth.endpoint.clone()),
             headers: copilot_headers(&auth, Some("conversation-agent")),
@@ -1055,17 +1063,6 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
     }
 }
 
-fn apply_responses_reasoning(
-    body: &mut Value,
-    thinking: ThinkingConfig,
-    model: &Model,
-    dialect: &EffortDialect,
-) {
-    if let Some(effort) = thinking.effort_str(dialect, model) {
-        body["reasoning"] = json!({"effort": effort});
-    }
-}
-
 fn guess_endpoint(model_id: &str) -> Endpoint {
     if model_id.starts_with("claude-") {
         Endpoint::Messages
@@ -1337,18 +1334,26 @@ mod tests {
         };
         let dialect = effort_dialect(&info);
 
-        let mut body = json!({});
-        apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
-        assert_eq!(body, json!({"reasoning": {"effort": "none"}}));
+        let mut body = responses::build_body(responses::ResponsesRequestArgs {
+            model: &model,
+            messages: &[],
+            system: "",
+            tools: &json!([]),
+            thinking: Some((ThinkingConfig::Off, &dialect)),
+        });
+        assert_eq!(body["reasoning"], json!({"effort": "none"}));
 
-        let mut body = json!({});
-        apply_responses_reasoning(
-            &mut body,
-            ThinkingConfig::Effort(Effort::Medium),
-            &model,
-            &dialect,
+        body = responses::build_body(responses::ResponsesRequestArgs {
+            model: &model,
+            messages: &[],
+            system: "",
+            tools: &json!([]),
+            thinking: Some((ThinkingConfig::Effort(Effort::Medium), &dialect)),
+        });
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort": "medium", "summary": "auto"})
         );
-        assert_eq!(body, json!({"reasoning": {"effort": "medium"}}));
         assert!(body.get("reasoning_effort").is_none());
     }
 

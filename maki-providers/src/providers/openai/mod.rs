@@ -7,6 +7,7 @@ pub use platform::OpenAi;
 use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
 
 const GPT_5_6_CONTEXT_WINDOW: u32 = 372_000;
+const GPT_6_ASTRA_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
@@ -23,6 +24,22 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
+        ModelEntry {
+            prefixes: &["gpt-6-astra"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 10.00,
+                output: 50.00,
+                cache_write: 12.50,
+                cache_read: 1.00,
+                fast: None,
+            },
+            max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
+            context_window: GPT_6_ASTRA_CONTEXT_WINDOW,
+        },
         ModelEntry {
             prefixes: &["gpt-5.6-luna"],
             tier: ModelTier::Weak,

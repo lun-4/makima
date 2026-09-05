@@ -4,36 +4,75 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use isahc::{HttpClient, Request};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::providers::ResolvedAuth;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, EffortDialect, Message, ProviderEvent, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 const RESPONSES_PATH: &str = "/responses";
 
-pub(crate) fn build_body(
-    model: &crate::model::Model,
-    messages: &[Message],
-    system: &str,
-    tools: &Value,
-) -> Value {
-    let input = convert_input(messages);
-    let wire_tools = convert_tools(tools);
+pub(crate) struct ResponsesRequestArgs<'a, 'b> {
+    pub model: &'a crate::model::Model,
+    pub messages: &'a [Message],
+    pub system: &'a str,
+    pub tools: &'a Value,
+    pub thinking: Option<(ThinkingConfig, &'b EffortDialect<'b>)>,
+}
 
-    let mut body = json!({
-        "model": model.id,
-        "instructions": system,
-        "input": input,
-        "stream": true,
-        "store": false,
-    });
-    if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
-        body["tools"] = wire_tools;
+pub(crate) fn build_body<'a, 'b>(args: ResponsesRequestArgs<'a, 'b>) -> Value {
+    let ResponsesRequestArgs {
+        model,
+        messages,
+        system,
+        tools: tool_definitions,
+        thinking,
+    } = args;
+    let wire_tools = convert_tools(tool_definitions);
+    let tools = match wire_tools {
+        Value::Array(tools) if !tools.is_empty() => Some(Value::Array(tools)),
+        _ => None,
+    };
+    #[derive(Serialize)]
+    struct ReasoningRequest {
+        effort: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<&'static str>,
     }
-    body
+
+    #[derive(Serialize)]
+    struct ResponsesRequest {
+        model: String,
+        instructions: String,
+        input: Value,
+        stream: bool,
+        store: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tools: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<ReasoningRequest>,
+    }
+
+    let reasoning = thinking
+        .and_then(|(thinking, effort_dialect)| thinking.effort_str(effort_dialect, model))
+        .map(|effort| ReasoningRequest {
+            summary: (effort != "none").then_some("auto"),
+            effort: effort.into(),
+        });
+    serde_json::to_value(ResponsesRequest {
+        model: model.id.clone(),
+        instructions: system.into(),
+        input: convert_input(messages),
+        stream: true,
+        store: false,
+        tools,
+        reasoning,
+    })
+    .expect("Responses request is serializable")
 }
 
 pub(crate) fn convert_input(messages: &[Message]) -> Value {
