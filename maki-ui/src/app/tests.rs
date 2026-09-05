@@ -6589,7 +6589,7 @@ fn completion_match_items(app: &App) -> Vec<CompletionItem> {
 }
 
 fn subagent_match_names(app: &App) -> Vec<String> {
-    completion_match_items(app)
+    let mut names: Vec<_> = completion_match_items(app)
         .into_iter()
         .filter(|i| i.kind == "subagent")
         .map(|i| {
@@ -6598,7 +6598,9 @@ fn subagent_match_names(app: &App) -> Vec<String> {
                 .map(|s| s.to_string())
                 .unwrap_or(i.label)
         })
-        .collect()
+        .collect();
+    names.sort();
+    names
 }
 
 /// Seed the `subagent` source with the types valid for `mode` (the task
@@ -6641,7 +6643,7 @@ fn at_a_prefix_lists_subagents() {
     converge_completion(&mut app);
     assert_eq!(
         subagent_match_names(&app),
-        vec!["research".to_string(), "general".to_string()]
+        vec!["general".to_string(), "research".to_string()]
     );
 }
 
@@ -6655,7 +6657,7 @@ fn at_subagent_prefix_lists_subagents() {
     converge_completion(&mut app);
     assert_eq!(
         subagent_match_names(&app),
-        vec!["research".to_string(), "general".to_string()]
+        vec!["general".to_string(), "research".to_string()]
     );
 }
 
