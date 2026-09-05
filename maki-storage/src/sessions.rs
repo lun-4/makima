@@ -11,7 +11,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -33,6 +33,9 @@ const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const CWD_INDEX_STEM: &str = "cwd_latest";
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
 const SCAN_CACHE_STEM: &str = "scan_cache";
+const SCAN_CACHE_VERSION: u32 = 1;
+#[cfg(test)]
+const TAIL_BUF: u64 = 4096;
 const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
@@ -242,6 +245,7 @@ pub struct SessionSummary {
     pub title: String,
     pub updated_at: u64,
     pub cwd: String,
+    pub message_count: usize,
     pub open_elsewhere: bool,
 }
 
@@ -1154,6 +1158,10 @@ struct JsonlHeader {
     cwd: String,
 }
 
+/// A `meta` line starts with this. Only meta lines get parsed during a scan;
+/// everything else is classified by prefix.
+const META_PREFIX: &[u8] = br#"{"t":"meta""#;
+
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ScanRecord {
@@ -1177,20 +1185,30 @@ struct ScanCacheEntry {
 }
 
 #[derive(Serialize, Deserialize)]
+struct ScanCacheFile {
+    version: u32,
+    entries: ScanCache,
+}
+
+#[derive(Serialize, Deserialize)]
 struct ScannedHeader {
     id: MakiId,
     cwd: String,
     title: String,
     updated_at: u64,
+    message_count: usize,
 }
 
 type ScanCache = HashMap<String, ScanCacheEntry>;
 
-fn load_scan_cache(dir: &Path) -> ScanCache {
-    fs::read(dir.join(SCAN_CACHE_FILE))
-        .ok()
-        .and_then(|data| serde_json::from_slice(&data).ok())
-        .unwrap_or_default()
+fn load_scan_cache(dir: &Path) -> (ScanCache, bool) {
+    let Some(data) = fs::read(dir.join(SCAN_CACHE_FILE)).ok() else {
+        return (ScanCache::new(), false);
+    };
+    match serde_json::from_slice::<ScanCacheFile>(&data) {
+        Ok(cache) if cache.version == SCAN_CACHE_VERSION => (cache.entries, false),
+        _ => (ScanCache::new(), true),
+    }
 }
 
 fn file_signature(path: &Path) -> Option<(u64, u64)> {
@@ -1204,9 +1222,9 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
 }
 
 fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
-    let mut cache = load_scan_cache(dir);
+    let (mut cache, cache_needs_rewrite) = load_scan_cache(dir);
     let mut fresh = ScanCache::new();
-    let mut dirty = false;
+    let mut dirty = cache_needs_rewrite;
     let mut out = Vec::new();
     for path in session_entries(dir)? {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -1241,6 +1259,7 @@ fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, St
                 cwd: h.cwd.clone(),
                 // Recomputed from the lock file on every scan: the summary
                 // cache must not pin a stale open-elsewhere flag.
+                message_count: h.message_count,
                 open_elsewhere: session_lock::open_elsewhere(dir, &h.id),
             });
         }
@@ -1248,7 +1267,10 @@ fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, St
     }
     // Leftover cache entries belong to deleted files; rewriting prunes them.
     if (dirty || !cache.is_empty())
-        && let Ok(data) = serde_json::to_vec(&fresh)
+        && let Ok(data) = serde_json::to_vec(&ScanCacheFile {
+            version: SCAN_CACHE_VERSION,
+            entries: fresh,
+        })
         && let Err(e) = atomic_write(&dir.join(SCAN_CACHE_FILE), &data)
     {
         warn!(error = %e, "failed to write session scan cache");
@@ -1256,53 +1278,68 @@ fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, St
     Ok(out)
 }
 
-const TAIL_BUF: u64 = 4096;
-
 fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
-    let mut file = File::open(path).ok()?;
-    let header: JsonlHeader = {
-        let mut reader = BufReader::new(&file);
-        let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
-        serde_json::from_str(line.trim_end()).ok()?
-    };
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line).ok()?;
+    let header: JsonlHeader = serde_json::from_slice(line.trim_ascii_end()).ok()?;
     if header.v != LOG_FORMAT_VERSION {
         return None;
     }
 
-    let (title, updated_at) =
-        read_last_meta(&mut file).unwrap_or_else(|| (DEFAULT_TITLE.to_string(), 0));
+    let mut title = DEFAULT_TITLE.to_string();
+    let mut updated_at = 0;
+    let mut message_count = 0;
+    // Messages are counted by prefix, the same trick the shrink check uses:
+    // parsing every payload just to count it made the picker scan allocate
+    // through megabytes of tool output. Only meta lines get parsed.
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            // A partial read would cache a wrong count and a stale title, so
+            // an unreadable file fails the scan: the session is left unlisted
+            // rather than appearing with a bogus count.
+            Err(_) => return None,
+        }
+        // Every record the writer emits is one line of complete JSON followed
+        // by a newline, so a newline-terminated prefix match is always a
+        // complete msg record. Only the final line can be torn by a crash and
+        // still match the prefix, so just that line needs a parse to stay in
+        // step with the loader, which skips malformed records.
+        if line.starts_with(MSG_PREFIX) && (line.ends_with(b"\n") || is_complete_msg_record(&line))
+        {
+            message_count += 1;
+        } else if line.starts_with(META_PREFIX)
+            && let Ok(ScanRecord::Meta {
+                title: next_title,
+                updated_at: next_updated_at,
+            }) = serde_json::from_slice(line.trim_ascii_end())
+        {
+            title = next_title;
+            updated_at = next_updated_at;
+        }
+    }
 
     Some(ScannedHeader {
         id: header.id,
         cwd: header.cwd,
         title,
         updated_at,
+        message_count,
     })
 }
 
-fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
-    let len = file.seek(SeekFrom::End(0)).ok()?;
-    let mut tail = TAIL_BUF.min(len);
-    loop {
-        file.seek(SeekFrom::End(-(tail as i64))).ok()?;
-        let mut buf = vec![0u8; tail as usize];
-        file.read_exact(&mut buf).ok()?;
-
-        let content = buf.strip_suffix(b"\n").unwrap_or(&buf);
-        if let Some(nl) = content.iter().rposition(|&b| b == b'\n') {
-            let last_line = &content[nl + 1..];
-            if let Ok(ScanRecord::Meta { title, updated_at }) = serde_json::from_slice(last_line) {
-                return Some((title, updated_at));
-            }
-            return None;
-        }
-
-        if tail >= len {
-            return None;
-        }
-        tail = (tail * 2).min(len);
-    }
+/// A torn tail can match the msg prefix without being a record the loader
+/// would keep, so an unterminated final line has to parse as a well-formed
+/// `t: "msg"` record with a `d` field before it counts.
+fn is_complete_msg_record(line: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    matches!(value.get("t").and_then(|t| t.as_str()), Some("msg")) && value.get("d").is_some()
 }
 
 fn scan_legacy_header(path: &Path) -> Option<ScannedHeader> {
@@ -1311,11 +1348,15 @@ fn scan_legacy_header(path: &Path) -> Option<ScannedHeader> {
     if h.version != SESSION_VERSION {
         return None;
     }
+    let message_count = serde_json::from_slice::<serde_json::Value>(&data)
+        .ok()
+        .and_then(|value| value.get("messages")?.as_array().map(Vec::len))?;
     Some(ScannedHeader {
         id: h.id,
         cwd: h.cwd,
         title: h.title,
         updated_at: h.updated_at,
+        message_count,
     })
 }
 
@@ -1838,7 +1879,9 @@ mod tests {
     }
 
     fn append_raw_msg(path: &Path, message: Value) {
-        let record = serde_json::to_string(&serde_json::json!({"t":"msg","d": message})).unwrap();
+        // Tag first, matching the `LogRecord` layout the real appends write:
+        // the scan classifies lines by that prefix.
+        let record = format!(r#"{{"t":"msg","d":{message}}}"#);
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
         file.write_all(record.as_bytes()).unwrap();
         file.write_all(b"\n").unwrap();
@@ -2546,6 +2589,7 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert!(list.iter().all(|s| s.id != s2.id));
         assert!(list.iter().all(|s| s.cwd == "/project-a"));
+        assert!(list.iter().all(|s| s.message_count == 0));
     }
 
     #[test]
@@ -2609,7 +2653,8 @@ mod tests {
         let cache_path = dir.join(SCAN_CACHE_FILE);
         let mut cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
         let entry = cache
-            .as_object_mut()
+            .get_mut("entries")
+            .and_then(Value::as_object_mut)
             .unwrap()
             .get_mut(&format!("{id}.jsonl"))
             .expect("session missing from scan cache");
@@ -2657,7 +2702,12 @@ mod tests {
         assert_eq!(list[0].title, "renamed");
         let cache: Value =
             serde_json::from_slice(&fs::read(dir.join(SCAN_CACHE_FILE)).unwrap()).unwrap();
-        assert_eq!(cache.as_object().unwrap().len(), 1, "deleted entry pruned");
+        assert_eq!(cache["version"], 1);
+        assert_eq!(
+            cache["entries"].as_object().unwrap().len(),
+            1,
+            "deleted entry pruned"
+        );
     }
 
     #[test]
@@ -2673,6 +2723,7 @@ mod tests {
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list[0].title, NORMALIZED);
+        assert_eq!(list[0].message_count, 1);
         assert_eq!(TestSession::load_from(s.id, dir).unwrap().title, NORMALIZED);
     }
 
@@ -3002,6 +3053,108 @@ mod tests {
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn scan_counts_msg_records_and_ignores_other_tags() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        s.push_message(user_message("two"));
+        s.set_subagent_messages("sub".into(), vec![user_message("hidden")]);
+        s.insert_tool_output("t1".into(), Value::String("output".into()));
+        write_legacy_jsonl(&jsonl_path(dir, s.id), &s);
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].message_count, 2);
+    }
+
+    #[test]
+    fn scan_counts_appended_messages_after_cache_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        let path = jsonl_path(dir, s.id);
+        write_legacy_jsonl(&path, &s);
+        assert_eq!(
+            TestSession::list_in("/project", dir).unwrap()[0].message_count,
+            1
+        );
+
+        append_raw_msg(&path, user_message("two"));
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list[0].message_count, 2, "changed file rescans its count");
+    }
+
+    #[test]
+    fn scan_ignores_msg_shaped_lines_that_are_not_msg_records() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        let path = jsonl_path(dir, s.id);
+        write_legacy_jsonl(&path, &s);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        for noise in [
+            r#"{"t":"msgx","d":{}}"#,
+            r#"{"t":"sub_msg","d":{}}"#,
+            r#"{"t":"msg2","d":{}}"#,
+            "not json at all",
+        ] {
+            writeln!(file, "{noise}").unwrap();
+        }
+        drop(file);
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].message_count, 1);
+    }
+
+    #[test]
+    fn scan_ignores_torn_msg_tail_like_the_loader() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        let path = jsonl_path(dir, s.id);
+        write_legacy_jsonl(&path, &s);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"t":"msg","d":{"trun"#).unwrap();
+        drop(file);
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list[0].message_count, 1, "a torn tail does not count");
+        assert_eq!(
+            TestSession::load_from(s.id, dir).unwrap().messages().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn scan_counts_complete_unterminated_final_record_like_the_loader() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/project");
+        s.push_message(user_message("one"));
+        let path = jsonl_path(dir, s.id);
+        write_legacy_jsonl(&path, &s);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        // The crash happened between the record's closing brace and the
+        // newline the writer emits after it.
+        let record =
+            serde_json::to_string(&serde_json::json!({"t":"msg","d":{"role":"user"}})).unwrap();
+        file.write_all(record.as_bytes()).unwrap();
+        drop(file);
+
+        let list = TestSession::list_in("/project", dir).unwrap();
+        assert_eq!(list[0].message_count, 2);
+        assert_eq!(
+            TestSession::load_from(s.id, dir).unwrap().messages().len(),
+            2
+        );
     }
 
     #[test]

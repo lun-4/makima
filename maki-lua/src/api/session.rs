@@ -27,9 +27,10 @@ async fn roundtrip(
 
 /// Lists sessions stored for the current project. Answered from a
 /// background scan, so a slow disk never blocks the UI. `open_elsewhere` is
-/// true while another makima instance has the session open.
+/// true while another makima instance has the session open. `message_count`
+/// counts main transcript messages only and excludes subagent histories.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example
 /// local stored, err = maki.session.list()
 #[lua_fn]
@@ -40,9 +41,10 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// Lists stored sessions across every project directory, most recently
 /// updated first. Answered from a background scan, so a slow disk never
 /// blocks the UI. `open_elsewhere` is true while another makima instance has
-/// the session open.
+/// the session open. `message_count` counts main transcript messages only
+/// and excludes subagent histories.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example
 /// local stored, err = maki.session.list_all()
 #[lua_fn]
@@ -54,7 +56,9 @@ async fn list_all(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 /// "needs_input", or "idle". A mailbox follow-up stays "working" without an
 /// intermediate "idle" status.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+/// `message_count` counts main transcript messages only and excludes subagent histories.
+///
+/// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, message_count, focused}`, or nil and an error.
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]

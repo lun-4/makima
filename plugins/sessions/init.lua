@@ -133,8 +133,8 @@ local function render()
   for _, ln in ipairs(input:render(prefix, dispw(prefix), inner).lines) do
     lines[#lines + 1] = ln
   end
-  lines[#lines + 1] = {}
-  -- The query and its blank spacer stay pinned while the list scrolls.
+  lines[#lines + 1] = Helpers.header_spans(inner)
+  -- The query and header stay pinned while the list scrolls.
   if #lines ~= board.reserved then
     board.reserved = #lines
     board.win:set_config({ reserved_top = board.reserved })
@@ -153,22 +153,22 @@ local function render()
     if spinning then
       icon_style = "spinner:" .. icon_style
     end
-    local line = { { "  ", base }, { icon, icon_style } }
+    local confirm_width = board.confirm == s.id and dispw(CONFIRM_HINT) or 0
+    local title_spans = { { "  ", base }, { icon, icon_style } }
     for _, sp in
       ipairs(
         Spans.match_spans(s.title, s._match and s._match.indices or {}, base, selected and "match_selected" or "match")
       )
     do
-      line[#line + 1] = sp
+      title_spans[#title_spans + 1] = sp
     end
-    local used = 2 + dispw(icon) + dispw(s.title)
+    title_spans = Helpers.clip_spans(title_spans, Helpers.title_width_budget(confirm_width, inner))
     if board.confirm == s.id then
-      line[#line + 1] = { CONFIRM_HINT, selected and "match_selected" or "error" }
-      used = used + dispw(CONFIRM_HINT)
+      title_spans[#title_spans + 1] = { CONFIRM_HINT, selected and "match_selected" or "error" }
     end
-    local pad = math.max(inner - used - dispw(right), 1)
-    line[#line + 1] = { string.rep(" ", pad), base }
-    line[#line + 1] = { right, right_style }
+    local count_text, pad = Helpers.row_right_columns(Helpers.spans_width(title_spans), inner, s.message_count)
+    local count_style = selected and "selected" or "dim"
+    local line = Helpers.row_spans(title_spans, count_text, count_style, pad, right, right_style)
     lines[#lines + 1] = line
     if selected then
       cursor_line = #lines

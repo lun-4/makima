@@ -202,4 +202,98 @@ case("age_buckets", function()
   eq(sh.age(NOW + HOUR), "just now", "future timestamps clamp to now")
 end)
 
+case("message_count_formatting", function()
+  eq(sh.format_count(0), "0")
+  eq(sh.format_count(1), "1")
+  eq(sh.format_count(12), "12")
+  eq(sh.format_count(nil), "0")
+end)
+
+case("picker_row_contains_count_then_status", function()
+  local spans = sh.row_spans({ { "title", "item" } }, "42", "dim", 5, "1d ago", "selected")
+  local texts = {}
+  for _, span in ipairs(spans) do
+    texts[#texts + 1] = span[1]
+  end
+  eq(table.concat(texts), "title" .. string.rep(" ", 18) .. "42" .. string.rep(" ", 5) .. "1d ago")
+  eq(spans[2][2], "dim", "pad shares the count style")
+  eq(spans[3][2], "dim", "count keeps the selection-driven style")
+  eq(spans[4][1], "42")
+  eq(spans[5][1], " ", "one space separates the count and status columns")
+  eq(spans[6][2], "selected", "status padding keeps its own style")
+  eq(spans[7][2], "selected")
+  eq(#spans, 7)
+end)
+
+case("picker_row_right_columns_remain_separated_at_narrow_width", function()
+  local count_text, padding = sh.row_right_columns(9, 80, 5)
+  eq(count_text, "5")
+  eq(padding, 45, "a short title pushes the columns to the right edge")
+  local _, edge = sh.row_right_columns(80 - 27, 80, 5)
+  eq(edge, 1, "the budget edge leaves exactly one separator")
+  local _, clamped = sh.row_right_columns(200, 80, 5)
+  eq(clamped, 1, "the separator never underflows below one space")
+end)
+
+case("picker_row_clips_long_titles_before_the_columns", function()
+  local inner, icon_width, confirm_width = 60, 2, 0
+  local budget = sh.title_width_budget(confirm_width, inner)
+  eq(budget, inner - 1 - 26)
+  local title = string.rep("x", 100)
+  local clipped = sh.clip_spans({ { "  ", "item" }, { "● ", "accent" }, { title, "item" } }, budget)
+  local left = sh.spans_width(clipped)
+  local count_text, padding = sh.row_right_columns(left, inner, 7)
+  local row = sh.row_spans(clipped, count_text, "dim", padding, "1d ago", "dim")
+  eq(sh.spans_width(row), inner, "the clipped row fills the width exactly, columns intact")
+  eq(padding, 1)
+  eq(utf8.len(clipped[3][1]), budget - 4, "only the title tail is cut")
+end)
+
+case("picker_header_shares_row_columns_and_theme_style", function()
+  local inner = 80
+  local header = sh.header_spans(inner)
+  eq(sh.spans_width(header), inner)
+  for _, span in ipairs(header) do
+    eq(span[2], "path")
+  end
+  eq(header[1][1], "    title")
+  eq(header[4][1], "messages")
+  eq(header[7][1], "age")
+
+  local count_text, padding = sh.row_right_columns(9, inner, 5)
+  local row = sh.row_spans(
+    { { "  ", "item" }, { "  ", "dim" }, { "title", "item" } },
+    count_text,
+    "dim",
+    padding,
+    "1d ago",
+    "dim"
+  )
+  eq(sh.spans_width(row), inner)
+  -- Both label the same 15-cell count column and 10-cell age column, so the
+  -- width up to and including the count label must match.
+  local function width_through_count(spans, count_index)
+    local total = 0
+    for i, span in ipairs(spans) do
+      total = total + (utf8.len(span[1]) or #span[1])
+      if i == count_index then
+        return total
+      end
+    end
+  end
+  eq(width_through_count(header, 4), width_through_count(row, 6))
+end)
+
+case("merge_preserves_message_count", function()
+  local all = sh.merge({}, { stored_row({ id = "a1", message_count = 7 }) })
+  eq(all[1].message_count, 7, "stored-only rows keep their scanned count")
+  eq(all[1].status, "idle")
+end)
+
+case("live_rows_override_stored_message_count", function()
+  local all = sh.merge({ live_row({ id = "a1", message_count = 3 }) }, { stored_row({ id = "a1", message_count = 7 }) })
+  eq(all[1].message_count, 3, "the live copy beats the stored count")
+  eq(#all, 1)
+end)
+
 th.report()
