@@ -86,12 +86,17 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        session_id: Option<&SessionRef>,
     ) -> Result<StreamResponse, AgentError> {
         let mut body = self.chat_compat.build_body(model, messages, system, tools);
         opts.thinking
             .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
+        let mut extra_headers = vec![];
+        if let Some(session_id) = session_id {
+            extra_headers.push(("x-opencode-session", session_id.as_str()));
+        }
         self.chat_compat
-            .do_stream(model, &[], &body, event_tx, auth)
+            .do_stream(model, &extra_headers, &body, event_tx, auth)
             .await
     }
 
@@ -105,6 +110,7 @@ impl Opencode {
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
+        session_id: Option<&SessionRef>,
     ) -> Result<StreamResponse, AgentError> {
         let system_blocks = vec![shared::SystemBlock {
             r#type: "text",
@@ -121,19 +127,22 @@ impl Opencode {
         body["model"] = json!(model.id);
         body["stream"] = json!(true);
         let json_body = serde_json::to_vec(&body)?;
+        let mut request_builder = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "{}{}",
+                auth.base_url.as_deref().unwrap_or(""),
+                MESSAGES_PATH
+            ))
+            .header("user-agent", user_agent())
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01");
+        if let Some(session_id) = session_id {
+            request_builder =
+                request_builder.header("x-opencode-session", session_id.as_str());
+        }
         let request = auth
-            .configure_request(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!(
-                        "{}{}",
-                        auth.base_url.as_deref().unwrap_or(""),
-                        MESSAGES_PATH
-                    ))
-                    .header("user-agent", user_agent())
-                    .header("content-type", "application/json")
-                    .header("anthropic-version", "2023-06-01"),
-            )
+            .configure_request(request_builder)
             .body(json_body)?;
 
         debug!(model = %model.id, "sending Anthropic-format request via catalog");
@@ -182,7 +191,7 @@ impl Provider for Opencode {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let model_for_stream = model.clone();
@@ -207,12 +216,14 @@ impl Provider for Opencode {
                 EndpointType::ChatCompletions => {
                     self.handle_catalog_chat_completions(
                         &model, messages, system, tools, event_tx, &auth, &opts,
+                        session_id,
                     )
                     .await
                 }
                 EndpointType::Messages => {
                     self.handle_catalog_messages(
                         &model, messages, system, tools, event_tx, &auth, &opts,
+                        session_id,
                     )
                     .await
                 }
