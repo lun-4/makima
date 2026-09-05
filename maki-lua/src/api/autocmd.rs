@@ -133,6 +133,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"SplashHidden"`, and `"StoreChanged"`. Plugins can
 /// also fire their own events with `exec_autocmds`.
 ///
+/// `"SessionPickerRequested"` opens the `/sessions` picker, but only
+/// asynchronously: the callback defers through `maki.async.run`, so the
+/// picker is not open when the event returns.
+///
 /// Except `"SessionPickerRequested"` and `"StoreChanged"`, each host event
 /// carries `data.session_id`. For `"SessionReset"` that
 /// is the session being left behind; the other events name the session now

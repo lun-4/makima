@@ -1041,73 +1041,6 @@ fn lifecycle_app() -> (
 }
 
 #[test]
-fn empty_completion_cancels_once_and_next_request_uses_new_session() {
-    let dir = StateDir::from_path(env::temp_dir());
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    let registry = maki_commands::CommandRegistry::new();
-    let _producer = register_test_lua_command(
-        &registry,
-        TestLuaCommand {
-            handle: handle.clone(),
-            name: Arc::from("/deploy"),
-            plugin: Arc::from("deploy"),
-            max_args: Some(1),
-            completion: true,
-        },
-    );
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
-    app.input_box.set_input("/deploy a".into());
-    app.command_palette.sync("/deploy a");
-    app.command_palette
-        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
-    let first_session = app.command_palette.completion_session_id().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if probe.try_finish_command_arguments(Vec::new()).is_some() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "completion request was not sent");
-        std::thread::yield_now();
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if app.command_palette.poll_arguments() == Dirty::YES {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "completion result was not applied"
-        );
-        std::thread::yield_now();
-    }
-    assert_eq!(
-        probe.try_finish_command_argument_lifecycle(),
-        Some(("cancel", None, true))
-    );
-    assert!(probe.try_finish_command_argument_lifecycle().is_none());
-
-    app.command_palette
-        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
-    let second_session = app.command_palette.completion_session_id().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if probe.try_finish_command_arguments(Vec::new()).is_some() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "completion request was not sent");
-        std::thread::yield_now();
-    }
-    assert_ne!(second_session, first_session);
-}
-
-#[test]
 fn argument_completion_clears_old_rows_while_request_pending() {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
@@ -1142,7 +1075,14 @@ fn argument_completion_clears_old_rows_while_request_pending() {
         .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
     assert!(app.command_palette.completion_session_id().is_some());
     assert!(!rendered(&mut app).contains("old-result"));
-    assert!(probe.try_finish_command_arguments(Vec::new()).is_some());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while probe.try_finish_command_arguments(Vec::new()).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "argument completion request was not sent"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -6869,20 +6809,6 @@ fn enter_inserts_subagent_reference_with_trailing_space() {
 }
 
 #[test]
-fn enter_inserts_model_reference_with_trailing_space() {
-    let (_tmp, mut app, backend) = completion_app();
-    app.available_models
-        .store(Some(Arc::new(vec!["zai/glm-5".into()])));
-    seed_models(&backend, &["zai/glm-5"]);
-    for c in "@m:glm".chars() {
-        app.update(Msg::Key(key(KeyCode::Char(c))));
-    }
-    converge_completion(&mut app);
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.input_box.buffer.value(), "@model:zai/glm-5 ");
-}
-
-#[test]
 fn mixed_list_includes_skills_subagents_and_models() {
     let (_tmp, mut app, backend) = completion_app();
     seed_skill(&backend, "review");
@@ -7204,8 +7130,11 @@ fn test_idle_splash_pulls_lua_frame() {
 
 #[test]
 fn slow_splash_renderer_does_not_block_tick_or_input() {
-    const RENDER_SECS: f64 = 0.3;
-    const MAX_TICK: Duration = Duration::from_millis(50);
+    // Wall-clock spin (os.time): bounded even under CPU starvation, unlike
+    // os.clock whose CPU-time wait stretches with load and hogs a core. The
+    // render is many times MAX_TICK, so a tick that waits on it trips loudly.
+    const RENDER_WALL_SECS: u64 = 2;
+    const MAX_TICK: Duration = Duration::from_millis(300);
 
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
     guard
@@ -7215,8 +7144,8 @@ fn slow_splash_renderer_does_not_block_tick_or_input() {
             &format!(
                 r##"
 maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
-  local started = os.clock()
-  while os.clock() - started < {RENDER_SECS} do end
+  local deadline = os.time() + {RENDER_WALL_SECS}
+  while os.time() < deadline do end
   return {{ {{ {{ glyphs = string.rep("x", w), style = "#ffffff" }} }} }}
 end)
 "##

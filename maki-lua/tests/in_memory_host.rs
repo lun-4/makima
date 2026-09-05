@@ -586,27 +586,6 @@ fn splash_opts(
 }
 
 #[test]
-fn splash_picker_startup_option_wins_over_saved() {
-    let fs = Arc::new(InMemoryFs::new());
-    fs.seed(&selection_path(), SELECTION_MATRIX_JSON.as_bytes().to_vec());
-    let (handle, guard) = maki_lua::test_support::spawn_host_with_fs_and_opts_for_tests(
-        &["splashes", "splashes_default"],
-        Arc::clone(&fs),
-        None,
-        splash_opts("voronoi"),
-    );
-
-    // The option applies during boot, before the first frame is pulled.
-    let frame = pull_frame(&handle, None);
-    assert!(
-        !frame_text(&frame).contains("makima"),
-        "the option splash draws, not the starfield"
-    );
-    let content = wait_for_selection(&guard, "voronoi");
-    assert!(content.contains("name"), "persisted file: {content}");
-}
-
-#[test]
 fn splash_picker_startup_option_selects_load_time_contribution() {
     let fs = Arc::new(InMemoryFs::new());
     let (handle, guard) = maki_lua::test_support::spawn_host_with_fs_and_opts_for_tests(

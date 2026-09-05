@@ -850,6 +850,21 @@ fn final_session_owner_drop_cancels_once() {
 }
 
 #[test]
+fn cancelled_completion_session_reopens_with_fresh_id() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    let completion = Arc::new(CompletionProbe::default());
+    let session = completion_session(&registry, &producer, completion.clone());
+    let first = session.id();
+    session.cancel().unwrap();
+
+    let reopened = completion_session(&registry, &producer, completion);
+    let second = reopened.id();
+
+    assert_ne!(first, second);
+}
+
+#[test]
 fn final_owner_drop_cancels_in_flight_completion() {
     let registry = CommandRegistry::new();
     let producer = registry.create_producer(ProducerPrecedence::Application);

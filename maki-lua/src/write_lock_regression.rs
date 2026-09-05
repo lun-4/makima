@@ -598,11 +598,12 @@ fn dispatch_async(
 }
 
 /// Records the order of backend operations and can park the first `read`
-/// (proof that the first handler is mid-mutation) or the first `stat` (the
-/// memory delete's existence check) behind a release token. Everything else
-/// delegates to the in-memory backend. The parked handler holds its write
-/// lock, so a second same-path dispatch must stay blocked at the gate: the
-/// event log then proves the lock, not luck, ordered the mutations.
+/// (proof that the first handler is mid-mutation) or the first `stat` of the
+/// exact armed path (the memory delete's note existence check) behind a
+/// release token. Everything else delegates to the in-memory backend. The
+/// parked handler holds its write lock, so a second same-path dispatch must
+/// stay blocked at the gate: the event log then proves the lock, not luck,
+/// ordered the mutations.
 struct ProbeFs {
     fs: InMemoryFs,
     events: Arc<Mutex<Vec<String>>>,
@@ -611,7 +612,7 @@ struct ProbeFs {
     read_arrival_rx: flume::Receiver<()>,
     read_release_tx: flume::Sender<()>,
     read_release_rx: flume::Receiver<()>,
-    stat_armed: Arc<AtomicBool>,
+    stat_gate: Mutex<Option<PathBuf>>,
     stat_arrival_tx: flume::Sender<()>,
     stat_arrival_rx: flume::Receiver<()>,
     stat_release_tx: flume::Sender<()>,
@@ -632,7 +633,7 @@ impl ProbeFs {
             read_arrival_rx,
             read_release_tx,
             read_release_rx,
-            stat_armed: Arc::new(AtomicBool::new(false)),
+            stat_gate: Mutex::new(None),
             stat_arrival_tx,
             stat_arrival_rx,
             stat_release_tx,
@@ -644,8 +645,8 @@ impl ProbeFs {
         self.read_armed.store(true, Ordering::SeqCst);
     }
 
-    fn arm_stat_gate(&self) {
-        self.stat_armed.store(true, Ordering::SeqCst);
+    fn arm_stat_gate(&self, target: PathBuf) {
+        *self.stat_gate.lock().expect("stat gate poisoned") = Some(target);
     }
 
     async fn wait_read(&self) {
@@ -700,7 +701,7 @@ impl FsBackend for ProbeFs {
         path: PathBuf,
     ) -> crate::api::fs::BoxFuture<'_, std::io::Result<crate::api::fs::FsMeta>> {
         let fs = &self.fs;
-        let armed = Arc::clone(&self.stat_armed);
+        let stat_gate = &self.stat_gate;
         let arrival = self.stat_arrival_tx.clone();
         let release = self.stat_release_rx.clone();
         let events = Arc::clone(&self.events);
@@ -709,7 +710,12 @@ impl FsBackend for ProbeFs {
                 .lock()
                 .expect("probe events poisoned")
                 .push("stat".into());
-            if armed.swap(false, Ordering::SeqCst) {
+            let gated = stat_gate
+                .lock()
+                .expect("stat gate poisoned")
+                .take_if(|target| *target == path)
+                .is_some();
+            if gated {
                 arrival.send(()).ok();
                 release.recv_async().await.ok();
             }
@@ -909,7 +915,7 @@ fn memory_write_and_delete_serialize_on_shared_lock() {
             .expect("seeded note exists")
             .to_path_buf();
         probe.clear_events();
-        probe.arm_stat_gate();
+        probe.arm_stat_gate(note_path.clone());
 
         let ctx_a = ctx.clone();
         let a = smol::spawn(async move {

@@ -1417,7 +1417,16 @@ mod tests {
         assert!(
             handle.provider_usage_changed(snapshot, Some(crate::ProviderUsageInvalidation(2)),)
         );
-        assert!(actions.try_recv().is_err());
+        assert!(
+            matches!(
+                actions.recv_timeout(Duration::from_secs(1)),
+                Ok(UiAction::ProviderUsageAck(crate::ProviderUsageAck {
+                    invalidation: crate::ProviderUsageInvalidation(2),
+                    ..
+                }))
+            ),
+            "post-unload invalidation must ack without a Flash from the unloaded callback"
+        );
     }
 
     /// End-to-end: a plugin registers a keymap override, the override is published

@@ -308,7 +308,9 @@ fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        let metadata = match entry.metadata() {
+        // `DirEntry::metadata` is an lstat, so symlinks would never satisfy the
+        // file/dir filter below; `metadata(entry.path())` follows the link.
+        let metadata = match std::fs::metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
@@ -1083,7 +1085,7 @@ fn cell_line<'a>(c: &Candidate, width: usize, selected: bool, t: &'a theme::Them
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use crate::theme::ThemesProvider;
 
@@ -1098,6 +1100,24 @@ mod tests {
 
     use super::*;
     use test_case::test_case;
+
+    const MATCHER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn wait_for_matcher(
+        menu: &mut FileCompletionMenu,
+        settled: impl Fn(&FileCompletionMenu) -> bool,
+        message: &str,
+    ) {
+        let deadline = Instant::now() + MATCHER_SETTLE_TIMEOUT;
+        loop {
+            let _ = menu.tick();
+            if settled(menu) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{message}");
+            std::thread::yield_now();
+        }
+    }
 
     fn item(label: &str, kind: &str, insertion: &str) -> ItemSpec {
         ItemSpec {
@@ -1328,19 +1348,29 @@ mod tests {
                 columns[0] = Utf32String::from("review.txt")
             });
         session.walking = false;
-        for _ in 0..20 {
-            let _ = menu.tick();
-            if menu.match_items().iter().any(|item| item.kind == FILE_KIND) {
-                break;
-            }
-        }
-        let kinds = menu
-            .match_items()
-            .into_iter()
-            .map(|item| item.kind)
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                let session = menu.session.as_ref().unwrap();
+                !session.query_refresh_pending
+                    && menu
+                        .match_items()
+                        .iter()
+                        .any(|item| item.label == "review.txt")
+            },
+            "project matcher did not surface the injected review.txt match",
+        );
+        let items = menu.match_items();
+        let kinds = items
+            .iter()
+            .map(|item| item.kind.clone())
             .collect::<Vec<_>>();
         assert!(kinds.contains(&FILE_KIND.to_string()));
         assert!(kinds.contains(&"skill".to_string()));
+        assert!(
+            items.iter().all(|item| item.label != "../outside.txt"),
+            "stale explicit candidate must not survive the project transition"
+        );
     }
 
     #[test]
@@ -1395,6 +1425,47 @@ mod tests {
         let candidates = explicit_candidates(&resolver, &cwd, Some(&home), "~/not");
         assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[home]);
         assert_eq!(candidates[0].path, "~/notes.txt");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_one_level_follows_symlinks() {
+        let unique = format!("maki-file-completion-{}", std::process::id());
+        let tmp = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("real_dir")).unwrap();
+        std::fs::write(tmp.join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(tmp.join("real.txt"), tmp.join("link_file")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real_dir"), tmp.join("link_dir")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("missing_target"), tmp.join("dangling")).unwrap();
+
+        let candidates = discover_one_level(&tmp).unwrap();
+
+        std::fs::remove_file(tmp.join("link_file")).unwrap();
+        std::fs::remove_file(tmp.join("link_dir")).unwrap();
+        std::fs::remove_file(tmp.join("dangling")).unwrap();
+        std::fs::remove_file(tmp.join("real.txt")).unwrap();
+        std::fs::remove_dir_all(tmp.join("real_dir")).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let by_name = |name: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.path == name)
+                .unwrap_or_else(|| panic!("missing candidate {name:?}"))
+        };
+        assert!(
+            !by_name("link_file").is_directory,
+            "file symlink must classify as file"
+        );
+        assert!(
+            by_name("link_dir").is_directory,
+            "dir symlink must classify as directory"
+        );
+        assert!(
+            candidates.iter().all(|c| c.path != "dangling"),
+            "dangling symlink must be skipped"
+        );
     }
 
     #[test]
@@ -2166,12 +2237,11 @@ mod tests {
                 columns[0] = Utf32String::from("needle-file");
             });
         menu.sync_query("needle");
-        for _ in 0..100 {
-            let _ = menu.tick();
-            if !menu.session.as_ref().unwrap().matches.is_empty() {
-                break;
-            }
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().matches.is_empty(),
+            "heuristic matcher never surfaced the injected needle-file match",
+        );
         let session = menu.session.as_ref().unwrap();
         assert_eq!(labels(&menu), vec!["needle-file"]);
         assert_eq!(session.coarse_match_count, 1);
@@ -2299,14 +2369,14 @@ mod tests {
             });
         session.walking = false;
         menu.sync_query("needle");
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        while menu.session.as_ref().unwrap().query_refresh_pending
-            || menu.session.as_ref().unwrap().file_matches.is_empty()
-        {
-            let _ = menu.tick();
-            assert!(Instant::now() < deadline, "file matcher did not settle");
-            std::thread::yield_now();
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                let session = menu.session.as_ref().unwrap();
+                !session.query_refresh_pending && !session.file_matches.is_empty()
+            },
+            "file matcher did not settle",
+        );
         menu.session.as_mut().unwrap().visible = true;
         assert!(
             matches!(menu.handle_key(key(KeyCode::Enter)), CompletionAction::Select(item) if item.label == "needle-file")
@@ -2336,12 +2406,11 @@ mod tests {
             }
         }
         menu.sync_query("");
-        for _ in 0..100 {
-            let _ = menu.tick();
-            if menu.session.as_ref().unwrap().file_matches.len() == 3 {
-                break;
-            }
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().file_matches.len() == 3,
+            "file matcher did not surface the three injected files",
+        );
         let before = labels(&menu);
         assert_eq!(before, vec!["alpha-file", "beta-file", "gamma-file"]);
 
@@ -2349,12 +2418,11 @@ mod tests {
         assert!(menu.session.as_ref().unwrap().query_refresh_pending);
         assert_eq!(labels(&menu), before);
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        while menu.session.as_ref().unwrap().query_refresh_pending {
-            let _ = menu.tick();
-            assert!(Instant::now() < deadline, "file matcher did not settle");
-            std::thread::yield_now();
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().query_refresh_pending,
+            "file matcher did not settle on the filtered gamma query",
+        );
         assert_eq!(labels(&menu), vec!["gamma-file"]);
     }
 
@@ -2396,15 +2464,11 @@ mod tests {
         while project_nucleo_mut(s).tick(0).running {}
 
         menu.sync_query("Cargo");
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        loop {
-            let (_, _) = menu.tick();
-            if !menu.session.as_ref().unwrap().matching {
-                break;
-            }
-            assert!(Instant::now() < deadline, "file matcher did not settle");
-            std::thread::yield_now();
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().matching,
+            "file matcher did not settle",
+        );
         let s = menu.session.as_ref().unwrap();
         assert_eq!(s.query, "Cargo");
         let c = s

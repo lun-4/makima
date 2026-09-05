@@ -690,6 +690,10 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"SplashHidden"`, and `"StoreChanged"`. Plugins can
 also fire their own events with `exec_autocmds`.
 
+`"SessionPickerRequested"` opens the `/sessions` picker, but only
+asynchronously: the callback defers through `maki.async.run`, so the
+picker is not open when the event returns.
+
 Except `"SessionPickerRequested"` and `"StoreChanged"`, each host event
 carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
@@ -3330,9 +3334,10 @@ maki.session.list()
 
 Lists sessions stored for the current project. Answered from a
 background scan, so a slow disk never blocks the UI. `open_elsewhere` is
-true while another makima instance has the session open.
+true while another makima instance has the session open. `message_count`
+counts main transcript messages only and excludes subagent histories.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 
 **Example:**
 
@@ -3351,9 +3356,10 @@ maki.session.list_all()
 Lists stored sessions across every project directory, most recently
 updated first. Answered from a background scan, so a slow disk never
 blocks the UI. `open_elsewhere` is true while another makima instance has
-the session open.
+the session open. `message_count` counts main transcript messages only
+and excludes subagent histories.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 
 **Example:**
 
@@ -3373,7 +3379,9 @@ Lists the sessions currently running in this UI. Status is "working",
 "needs_input", or "idle". A mailbox follow-up stays "working" without an
 intermediate "idle" status.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+`message_count` counts main transcript messages only and excludes subagent histories.
+
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, message_count, focused}`, or nil and an error.
 
 **Example:**
 
