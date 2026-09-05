@@ -41,15 +41,6 @@ impl CommandRegistry {
         self.dispatch_input_at(target.clone(), content, 0)
     }
 
-    pub fn dispatch_input_with_depth(
-        &self,
-        target: &TargetHandle,
-        content: CommandContent,
-        depth: usize,
-    ) -> CommandFuture<InputDispatch> {
-        self.dispatch_input_at(target.clone(), content, depth)
-    }
-
     pub(super) fn dispatch_input_at(
         &self,
         target: TargetHandle,
@@ -64,18 +55,25 @@ impl CommandRegistry {
                 InputDispatch::LiteralInput(CommandContent { text, attachments })
             });
         }
-        let Ok(resolved) = self.resolve_input_for(&target, &content.text) else {
-            if matches!(class, SlashClass::Command(_)) {
-                let trimmed = content.text.trim_start();
-                let name =
-                    Arc::from(ParsedInput::parse(trimmed).map_or(trimmed, |parsed| parsed.name));
+        let resolved = match self.resolve_input_for(&target, &content.text) {
+            Ok(resolved) => resolved,
+            Err(ResolutionError::StaleTarget) => {
+                return Box::pin(async move {
+                    InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::StaleTarget))
+                });
+            }
+            Err(ResolutionError::UnknownCommand(name))
+                if matches!(class, SlashClass::Command(_)) =>
+            {
                 return Box::pin(async move {
                     InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
                         name,
                     )))
                 });
             }
-            return Box::pin(async move { InputDispatch::LiteralInput(content) });
+            Err(ResolutionError::UnknownCommand(_)) => {
+                return Box::pin(async move { InputDispatch::LiteralInput(content) });
+            }
         };
         let registry = self.clone();
         Box::pin(async move {

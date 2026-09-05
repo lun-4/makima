@@ -900,6 +900,7 @@ async fn run_command(
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
     let depth = command_depth(&lua).saturating_add(1);
+    let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));
     if let Some(invocation) = command_invocation(&lua) {
         let result = invocation
             .invocation
@@ -925,6 +926,7 @@ fn nested_dispatch_result(result: InputDispatch) -> Result<(), String> {
         InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_))) => {
             Err("unknown command".to_owned())
         }
+        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(error.to_string()),
         InputDispatch::Dispatched(_) => Ok(()),
         InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
     }

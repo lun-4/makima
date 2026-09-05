@@ -960,6 +960,18 @@ fn enter_executes_new_command() {
 }
 
 #[test]
+fn leading_whitespace_palette_command_preserves_arguments() {
+    let mut app = test_app();
+
+    let actions = type_and_submit(&mut app, "  /btw describe this");
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Btw(question, images)] if question == "describe this" && images.is_empty()
+    ));
+}
+
+#[test]
 fn confirmed_btw_preserves_pending_images() {
     let mut app = test_app();
     app.input_box.attach_image(ImageSource::new(

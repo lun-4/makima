@@ -3028,9 +3028,8 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
 
 const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
 
-/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. The
-/// command line travels untouched, since the UI is the side that parses it, and
-/// a handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
+/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. A
+/// handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
 /// counting toward the cap.
 #[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
@@ -3043,7 +3042,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
             name = "/go",
             tui_only = false,
             handler = function()
-                local ok, err = maki.api.run_command("/cd ~/src")
+                local ok, err = maki.api.run_command("  //cd ~/src  ")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end,
         })
@@ -3077,6 +3076,91 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
 /// invocation (dispatched through the registry, so the handler runs with an
 /// invocation context): the nested dispatch rejects the unknown command
 /// without touching the UI.
+#[test]
+fn nested_run_command_strips_extra_leading_slashes() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/target",
+            tui_only = false,
+            nargs = 1,
+            handler = function(opts)
+                maki.ui.flash("target|" .. opts.args)
+            end,
+        })
+        maki.api.register_command({
+            name = "/go",
+            tui_only = false,
+            handler = function()
+                local ok, err = maki.api.run_command("  //target value  ")
+                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let rx = host.ui_action_rx();
+
+    smol::block_on(registry.dispatch_input(&target, "/go".into()));
+
+    let messages: Vec<String> = (0..2)
+        .map(|_| {
+            let action = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("nested run_command did not finish");
+            let maki_lua::UiAction::Flash(message) = action else {
+                panic!("nested run_command emitted an unexpected UI action");
+            };
+            message
+        })
+        .collect();
+    assert!(messages.iter().any(|message| message == "target|value"));
+    assert!(messages.iter().any(|message| message == "true|nil"));
+}
+
+#[test]
+fn nested_run_command_reports_recursion_limit() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/cycle",
+            tui_only = false,
+            handler = function()
+                local ok, err = maki.api.run_command("/cycle")
+                if not ok then
+                    maki.ui.flash(err)
+                end
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let rx = host.ui_action_rx();
+
+    smol::block_on(registry.dispatch_input(&target, "/cycle".into()));
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("recursive run_command did not report an error");
+    assert!(
+        matches!(action, maki_lua::UiAction::Flash(msg) if msg == "maximum command recursion depth exceeded")
+    );
+}
+
 #[test]
 fn nested_run_command_rejects_unknown_command() {
     let host = PluginHost::new(fresh_registry()).unwrap();

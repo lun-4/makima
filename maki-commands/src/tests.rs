@@ -479,7 +479,7 @@ fn dispatch_rejects_foreign_command_and_target_without_execution() {
 
     assert!(matches!(
         futures_lite::future::block_on(registry.dispatch_input(&foreign_target, "/local".into())),
-        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_)))
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::StaleTarget))
     ));
     assert!(matches!(
         futures_lite::future::block_on(registry.dispatch_command(
