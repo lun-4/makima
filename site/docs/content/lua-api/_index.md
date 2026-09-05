@@ -3319,8 +3319,8 @@ end
 ## maki.session {#maki-session}
 
 Host session primitives. The interactive UI can run several sessions
-at once; these functions let plugins list, create, focus, rename, and
-delete them. Session management returns `nil, "no interactive UI
+at once; these functions let plugins list, create, focus, configure,
+rename, and delete them. Session management returns `nil, "no interactive UI
 attached"` without a UI. `notify` instead targets a live agent mailbox
 directly, so it also works under ACP and SDK frontends.
 
@@ -3455,6 +3455,29 @@ local _, err = maki.session.focus(id)
 
 ---
 
+### `maki.session.set_mode()` {#maki-session-set_mode}
+
+```lua
+maki.session.set_mode({id}, {mode})
+```
+
+Changes the active mode of a live session without focusing it.
+
+**Parameters:**
+
+- `{id}` (`string`) Live session id.
+- `{mode}` (`string`) Mode id ("build", "plan", or a custom name).
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.session.set_mode(id, "build")
+```
+
+---
+
 ### `maki.session.delete()` {#maki-session-delete}
 
 ```lua
@@ -3554,6 +3577,53 @@ observation waits for the session's next agent run.
 
 ```lua
 maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
+```
+
+---
+
+### `maki.session.get_data()` {#maki-session-get_data}
+
+```lua
+maki.session.get_data({session})
+```
+
+Returns this plugin's persisted JSON-compatible data for a live session.
+Plugins cannot read another plugin's data.
+
+**Parameters:**
+
+- `{session}` (`string`) Live session id.
+
+**Returns:** (`any|nil`, `string|nil`) Stored value, nil if unset, or nil and an error.
+
+**Example:**
+
+```lua
+local state, err = maki.session.get_data(session_id)
+```
+
+---
+
+### `maki.session.set_data()` {#maki-session-set_data}
+
+```lua
+maki.session.set_data({session}, {value})
+```
+
+Replaces this plugin's persisted data for a live session. Values must be
+JSON-compatible. Passing nil clears the data.
+
+**Parameters:**
+
+- `{session}` (`string`) Live session id.
+- `{value}` (`any`) JSON-compatible value, or nil to clear.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.set_data(session_id, { run = 3 })
 ```
 
 ---

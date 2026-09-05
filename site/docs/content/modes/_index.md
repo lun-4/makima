@@ -133,6 +133,62 @@ With all three enabled, a typical loop is:
    or concede through the plan review form.
 4. Switch to build mode (`/build`) to implement with the full toolset.
 
+## Autoresearch
+
+The opt-in `autoresearch` plugin runs a bounded optimization loop against a
+deterministic benchmark:
+
+```lua
+maki.setup({
+  plugins = {
+    autoresearch = {
+      enabled = true,
+      max_iterations = 20,
+      timeout_secs = 120,
+    },
+  },
+})
+```
+
+Start it with a goal:
+
+```text
+/autoresearch reduce parser latency
+```
+
+The agent establishes which numeric metric decides success and whether lower or
+higher is better. It then:
+
+1. Requires a clean worktree and creates an `autoresearch/<goal>` branch.
+2. Builds `autoresearch.sh` if the project does not have one. The script prints
+   numeric results as `METRIC name=value`.
+3. Makes one change and runs the fixed benchmark.
+4. Lets the agent keep a justified result or reset a rejected result to the last
+   accepted commit. The primary metric guides this decision but does not prevent
+   a tradeoff justified by secondary metrics or constraints.
+5. Queues another iteration until it reaches `max_iterations` or decides to
+   stop, then returns the session to build mode.
+
+Every accepted code change is a separate commit such as `autoresearch: run 4
+latency_ms=12.5 delta=-1.2 reduce parser allocation`, so `git log` is the
+experiment record. The first accepted measurement is marked `baseline`. A
+rejected iteration runs `git reset --hard` and `git clean -fd`. The initial
+clean-worktree check makes that rollback predictable, but do not edit the same
+checkout while the loop is running.
+
+`autoresearch.sh` decides whether a measurement is trustworthy. For noisy
+workloads, it should warm up, collect enough samples, report a robust aggregate
+such as a median or trimmed mean, and fail on unacceptable variance. It should
+also fail when correctness checks or secondary guardrails regress, and clean up
+any ignored artifacts it creates.
+
+The footer shows the current run count, pending result, and best metric. Run
+`/autoresearch off` to return to build mode without clearing the loop. The
+branch, accepted commit, loop counters, metrics, and pending result are stored
+with the session. Reopen the session on its autoresearch branch to continue.
+Run `/autoresearch reset` to clear the stored loop state before starting a
+different goal in the same session.
+
 ## Persistence and other surfaces
 
 The active mode is persisted with the session, so a custom mode survives a

@@ -3,6 +3,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use maki_providers::Message;
 use maki_storage::id::MakiId;
+use serde_json::Value;
 use thiserror::Error;
 
 const MAILBOX_CAPACITY: usize = 100;
@@ -14,6 +15,7 @@ static MAILBOXES: LazyLock<Mutex<HashMap<MakiId, Weak<Mutex<State>>>>> =
 struct State {
     pending: VecDeque<Message>,
     wake: bool,
+    plugin_data: HashMap<String, Value>,
 }
 
 #[derive(Debug, Error)]
@@ -32,12 +34,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl SessionMailbox {
     pub fn register(session_id: MakiId) -> Self {
+        Self::register_with_data(session_id, HashMap::new())
+    }
+
+    pub fn register_with_data(session_id: MakiId, plugin_data: HashMap<String, Value>) -> Self {
         let mut mailboxes = lock(&MAILBOXES);
         if let Some(state) = mailboxes.get(&session_id).and_then(Weak::upgrade) {
             return Self { session_id, state };
         }
 
-        let state = Arc::new(Mutex::new(State::default()));
+        let state = Arc::new(Mutex::new(State {
+            plugin_data,
+            ..State::default()
+        }));
         mailboxes.insert(session_id, Arc::downgrade(&state));
         Self { session_id, state }
     }
@@ -73,6 +82,48 @@ impl SessionMailbox {
         }
         state.wake = false;
         state.pending.drain(..).collect()
+    }
+
+    pub fn plugin_data(session_id: MakiId, plugin: &str) -> Result<Option<Value>, MailboxError> {
+        let state = Self::state(session_id)?;
+        let value = lock(&state).plugin_data.get(plugin).cloned();
+        Ok(value)
+    }
+
+    pub fn set_plugin_data(
+        session_id: MakiId,
+        plugin: String,
+        value: Option<Value>,
+    ) -> Result<(), MailboxError> {
+        let state = Self::state(session_id)?;
+        let mut state = lock(&state);
+        if let Some(value) = value {
+            state.plugin_data.insert(plugin, value);
+        } else {
+            state.plugin_data.remove(&plugin);
+        }
+        Ok(())
+    }
+
+    pub fn plugin_data_snapshot(
+        session_id: MakiId,
+    ) -> Result<HashMap<String, Value>, MailboxError> {
+        let state = Self::state(session_id)?;
+        let plugin_data = lock(&state).plugin_data.clone();
+        Ok(plugin_data)
+    }
+
+    pub fn snapshot_plugin_data(&self) -> HashMap<String, Value> {
+        lock(&self.state).plugin_data.clone()
+    }
+
+    fn state(session_id: MakiId) -> Result<Arc<Mutex<State>>, MailboxError> {
+        let mut mailboxes = lock(&MAILBOXES);
+        let Some(state) = mailboxes.get(&session_id).and_then(Weak::upgrade) else {
+            mailboxes.remove(&session_id);
+            return Err(MailboxError(session_id));
+        };
+        Ok(state)
     }
 }
 
@@ -165,6 +216,28 @@ mod tests {
 
         assert_eq!(second.drain().len(), 1);
         assert!(first.drain().is_empty());
+    }
+
+    #[test]
+    fn plugin_data_is_seeded_shared_and_removable() {
+        let id = MakiId::generate();
+        let mut initial = HashMap::new();
+        initial.insert("research".into(), serde_json::json!({"run": 2}));
+        let mailbox = SessionMailbox::register_with_data(id, initial);
+
+        assert_eq!(
+            SessionMailbox::plugin_data(id, "research").unwrap(),
+            Some(serde_json::json!({"run": 2}))
+        );
+        SessionMailbox::set_plugin_data(id, "research".into(), Some(serde_json::json!({"run": 3})))
+            .unwrap();
+        assert_eq!(
+            SessionMailbox::plugin_data_snapshot(id).unwrap()["research"],
+            serde_json::json!({"run": 3})
+        );
+        SessionMailbox::set_plugin_data(id, "research".into(), None).unwrap();
+        assert!(SessionMailbox::plugin_data_snapshot(id).unwrap().is_empty());
+        drop(mailbox);
     }
 
     #[test]

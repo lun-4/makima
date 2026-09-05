@@ -14,8 +14,8 @@ use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentId, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, ModeDefSpec, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    McpSnapshot, McpSnapshotReader, ModeDefSpec, SessionMailbox, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -2172,7 +2172,7 @@ fn top_bar_shows_active_chat_running_count_and_cwd() {
         .map_or_else(|| app.status_bar.cwd_branch(), |(_, branch)| branch);
     assert!(bar.contains(branch), "branch shown: {bar}");
     // No per-subagent rows in the bar.
-    assert!(!bar.contains("research"), "no name rows: {bar}");
+    assert!(!bar.contains("↳"), "no subagent badge: {bar}");
 
     // A second running subagent bumps the count.
     app.update(subagent_msg(
@@ -3716,6 +3716,26 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
         .map(|d| d.count())
         .unwrap_or(0);
     assert_eq!(entries, 0);
+}
+
+#[test]
+fn checkpoint_copies_live_plugin_data_into_session_meta() {
+    let mut app = test_app();
+    let id = app.state.session.id;
+    let _mailbox = SessionMailbox::register(id);
+    SessionMailbox::set_plugin_data(
+        id,
+        "autoresearch".into(),
+        Some(serde_json::json!({"run": 3})),
+    )
+    .unwrap();
+
+    app.checkpoint();
+
+    assert_eq!(
+        app.state.session.meta.plugin_data["autoresearch"],
+        serde_json::json!({"run": 3})
+    );
 }
 
 #[test]

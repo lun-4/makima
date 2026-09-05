@@ -412,6 +412,7 @@ pub enum SessionRequest {
     Prompt { id: Option<String>, text: String },
     Focus { id: String },
     Delete { id: String },
+    SetMode { id: String, mode: String },
     SetTitle { id: String, title: String },
     GetThinking,
     SetThinking { set_default: bool, thinking: String },

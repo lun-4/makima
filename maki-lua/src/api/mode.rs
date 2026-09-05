@@ -26,6 +26,16 @@ fn mode_err(err: ModeError) -> String {
     }
 }
 
+pub(crate) fn resolve_mode(lua: &Lua, name: String) -> LuaResult<Result<String, String>> {
+    let id = ModeId::parse(&name);
+    let reg = registry(lua)?;
+    if reg.contains(id.key()) {
+        Ok(Ok(id.key().to_owned()))
+    } else {
+        Ok(Err(mode_err(ModeError::Unknown(name))))
+    }
+}
+
 /// Evaluate a Lua `system_prompt` function (or pass a plain string through)
 /// with the `{ cwd, plan_path }` context.
 fn eval_system_prompt(lua: &Lua, value: Value) -> LuaResult<Option<String>> {
@@ -127,17 +137,11 @@ fn set_inner(
     tx: Option<flume::Sender<UiAction>>,
     name: String,
 ) -> LuaResult<Pair<bool>> {
-    let id = ModeId::parse(&name);
-    let reg = registry(lua)?;
-    if !reg.contains(id.key()) {
-        return Ok(err_pair(mode_err(ModeError::Unknown(name))));
-    }
-    match ui_send(
-        tx.as_ref(),
-        UiAction::SetMode {
-            id: id.key().to_owned(),
-        },
-    ) {
+    let id = match resolve_mode(lua, name)? {
+        Ok(id) => id,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    match ui_send(tx.as_ref(), UiAction::SetMode { id }) {
         Ok(()) => Ok((Some(true), None)),
         Err(e) => Ok(err_pair(e)),
     }

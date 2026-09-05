@@ -43,6 +43,7 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 | Command | Description | Arguments | TUI-only |
 |---------|-------------|-----------|----------|
 | `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | no |
+| `/autoresearch` | Start or stop a bounded benchmark-driven research loop | [off | reset | goal] | yes |
 | `/build` | Switch to build mode (full tool access) |  | no |
 | `/memory` | View, edit, and delete memory files |  | yes |
 | `/plan` | Switch to plan mode (analyse and write only the plan file) |  | no |

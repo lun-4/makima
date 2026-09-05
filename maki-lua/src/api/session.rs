@@ -2,12 +2,15 @@
 //! the UI event loop, which owns live runtimes and storage. `notify` posts
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
+use std::sync::Arc;
+
 use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
+use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::pair::{Pair, err_pair};
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
@@ -107,6 +110,27 @@ async fn focus(
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
 }
 
+/// Changes the active mode of a live session without focusing it.
+///
+/// @param id string Live session id.
+/// @param mode string Mode id ("build", "plan", or a custom name).
+/// @return (boolean|nil, string|nil) true on success, or nil and an error.
+/// @example
+/// local _, err = maki.session.set_mode(id, "build")
+#[lua_fn]
+async fn set_mode(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    id: String,
+    mode: String,
+) -> LuaResult<Pair<Value>> {
+    let mode = match crate::api::mode::resolve_mode(&lua, mode)? {
+        Ok(mode) => mode,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await
+}
+
 /// Deletes a session and its stored history, cancelling it first if it
 /// is running. The focused session cannot be deleted.
 ///
@@ -200,6 +224,56 @@ fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>
     Ok((Some(true), None))
 }
 
+/// Returns this plugin's persisted JSON-compatible data for a live session.
+/// Plugins cannot read another plugin's data.
+///
+/// @param session string Live session id.
+/// @return (any|nil, string|nil) Stored value, nil if unset, or nil and an error.
+/// @example
+/// local state, err = maki.session.get_data(session_id)
+#[lua_fn]
+fn get_data(lua: &Lua, #[ctx] plugin: Arc<str>, session: String) -> LuaResult<Pair<Value>> {
+    let session_id: MakiId = match session.parse() {
+        Ok(id) => id,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    match SessionMailbox::plugin_data(session_id, &plugin) {
+        Ok(Some(value)) => Ok((Some(json_to_lua(lua, &value)?), None)),
+        Ok(None) => Ok((Some(Value::Nil), None)),
+        Err(error) => Ok(err_pair(error)),
+    }
+}
+
+/// Replaces this plugin's persisted data for a live session. Values must be
+/// JSON-compatible. Passing nil clears the data.
+///
+/// @param session string Live session id.
+/// @param value any JSON-compatible value, or nil to clear.
+/// @return (boolean|nil, string|nil) true, or nil and an error.
+/// @example
+/// maki.session.set_data(session_id, { run = 3 })
+#[lua_fn]
+fn set_data(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    session: String,
+    value: Value,
+) -> LuaResult<Pair<bool>> {
+    let session_id: MakiId = match session.parse() {
+        Ok(id) => id,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    let value = if value.is_nil() {
+        None
+    } else {
+        Some(lua_to_json(lua, &value)?)
+    };
+    match SessionMailbox::set_plugin_data(session_id, plugin.to_string(), value) {
+        Ok(()) => Ok((Some(true), None)),
+        Err(error) => Ok(err_pair(error)),
+    }
+}
+
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -256,12 +330,12 @@ async fn set_thinking(
 
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
-    /// at once; these functions let plugins list, create, focus, rename, and
-    /// delete them. Session management returns `nil, "no interactive UI
+    /// at once; these functions let plugins list, create, focus, configure,
+    /// rename, and delete them. Session management returns `nil, "no interactive UI
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
-    "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx), thinking(tx), set_thinking(tx)]
+    "maki.session" => pub(crate) fn create_session_table(plugin: Arc<str>, tx: Option<flume::Sender<UiAction>>),
+    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), focus(tx), set_mode(tx), delete(tx), new(tx), prompt(tx), notify(), get_data(plugin), set_data(plugin), set_title(tx), thinking(tx), set_thinking(tx)]
 }
 
 #[cfg(test)]
@@ -274,7 +348,8 @@ mod tests {
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_session_table(&lua, tx).unwrap();
+        lua.set_app_data(Arc::new(maki_agent::ModeRegistry::builtin()));
+        let t = create_session_table(&lua, Arc::from("test"), tx).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
     }
@@ -286,6 +361,32 @@ mod tests {
             smol::block_on(lua.load("return session.live()").eval_async()).unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
+    }
+
+    #[test]
+    fn plugin_data_roundtrips_with_ownership() {
+        let id = MakiId::generate();
+        let _mailbox = SessionMailbox::register(id);
+        let lua = lua_with_session(None);
+        lua.globals().set("sid", id.to_string()).unwrap();
+
+        let (saved, err): (bool, Option<String>) = lua
+            .load("return session.set_data(sid, { run = 3 })")
+            .eval()
+            .unwrap();
+        assert!(saved);
+        assert_eq!(err, None);
+        let (state, err): (Table, Option<String>) =
+            lua.load("return session.get_data(sid)").eval().unwrap();
+        assert_eq!(state.get::<u32>("run").unwrap(), 3);
+        assert_eq!(err, None);
+
+        let other = create_session_table(&lua, Arc::from("other"), None).unwrap();
+        lua.globals().set("other", other).unwrap();
+        let (value, err): (Value, Option<String>) =
+            lua.load("return other.get_data(sid)").eval().unwrap();
+        assert!(value.is_nil());
+        assert_eq!(err, None);
     }
 
     #[test]
@@ -341,6 +442,32 @@ mod tests {
             smol::block_on(lua.load("return session.focus('abc')").eval_async()).unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
+    }
+
+    #[test]
+    fn set_mode_targets_the_requested_session() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::SetMode { id, mode },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected set mode request");
+            };
+            assert_eq!(id, "background");
+            assert_eq!(mode, "build");
+            reply_tx.send(Ok(json!(true))).unwrap();
+        });
+        let (value, error): (bool, Option<String>) = smol::block_on(
+            lua.load("return session.set_mode('background', 'build')")
+                .eval_async(),
+        )
+        .unwrap();
+        checker.join().unwrap();
+        assert!(value);
+        assert_eq!(error, None);
     }
 
     #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]

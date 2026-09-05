@@ -70,6 +70,10 @@ impl SessionStore {
         self.session.update_title_if_default();
         self.save();
     }
+
+    fn sync_plugin_data(&mut self, mailbox: &SessionMailbox) {
+        self.session.meta.plugin_data = mailbox.snapshot_plugin_data();
+    }
 }
 
 pub struct HeadlessParams {
@@ -416,8 +420,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             (id, SessionRef::from(id))
         }
     };
-    let mailbox = SessionMailbox::register(session_id);
-
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
         params.permissions_config.clone(),
@@ -452,6 +454,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
 
             let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
+            let mailbox = SessionMailbox::register_with_data(
+                session_id,
+                store
+                    .as_ref()
+                    .map(|store| store.session.meta.plugin_data.clone())
+                    .unwrap_or_default(),
+            );
             let mut history = History::restored(params.initial_history);
             let mut working_dir = PathBuf::from(working_dir);
             let permissions = permissions;
@@ -619,6 +628,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 cancel_task.cancel().await;
 
                 if let Some(store) = &mut store {
+                    store.sync_plugin_data(&mailbox);
                     store.record_turn(history.as_slice(), model.spec());
                 }
                 run_id += 1;
@@ -665,6 +675,7 @@ mod tests {
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+    const PLUGIN: &str = "autoresearch";
 
     fn session_id() -> MakiId {
         SESSION_ID.parse().unwrap()
@@ -742,6 +753,43 @@ mod tests {
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, "other/model");
+    }
+
+    #[test]
+    fn reopening_restores_and_persists_plugin_data() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store
+            .session
+            .meta
+            .plugin_data
+            .insert(PLUGIN.into(), serde_json::json!({ "run": 1 }));
+        store.save();
+        drop(store);
+
+        let mut store = store_in(&tmp);
+        let mailbox = SessionMailbox::register_with_data(
+            session_id(),
+            store.session.meta.plugin_data.clone(),
+        );
+        assert_eq!(
+            SessionMailbox::plugin_data(session_id(), PLUGIN).unwrap(),
+            Some(serde_json::json!({ "run": 1 }))
+        );
+
+        SessionMailbox::set_plugin_data(
+            session_id(),
+            PLUGIN.into(),
+            Some(serde_json::json!({ "run": 2 })),
+        )
+        .unwrap();
+        store.sync_plugin_data(&mailbox);
+        store.record_turn(&[], MODEL_SPEC.into());
+
+        assert_eq!(
+            load(&tmp).meta.plugin_data[PLUGIN],
+            serde_json::json!({ "run": 2 })
+        );
     }
 
     #[test]
