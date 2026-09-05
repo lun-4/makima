@@ -67,7 +67,8 @@ use maki_agent::{
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
-    HostContextRequest, HostContextResponse, HostRequest, HostResponse, TargetHandle,
+    HostContextRequest, HostContextResponse, HostRequest, HostResponse, SlashClass, TargetHandle,
+    classify_input,
 };
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
 use maki_lua::{
@@ -1549,7 +1550,7 @@ impl App {
         self.exit_request = ExitRequest::None;
     }
 
-    pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
+    pub(crate) fn handle_submit(&mut self, mut sub: Submission) -> Vec<Action> {
         // Any main-input submit releases a manual Alt+M hold, so the deferred
         // panel re-promotes once the user has placed their message.
         self.submit_released = true;
@@ -1582,7 +1583,31 @@ impl App {
                 visible: prefix.visible,
             }];
         }
-        self.submit_or_queue(sub.into())
+        match classify_input(&sub.text) {
+            SlashClass::Plain => self.submit_or_queue(sub.into()),
+            SlashClass::EscapedLiteral(literal) => {
+                sub.text = literal.to_owned();
+                self.submit_or_queue(sub.into())
+            }
+            SlashClass::Command(_) => {
+                let attachments = sub
+                    .images
+                    .iter()
+                    .map(|image| CommandAttachment {
+                        media_type: Arc::from(image.media_type.mime()),
+                        data: Arc::clone(&image.data),
+                    })
+                    .collect::<Arc<[_]>>();
+                self.command_runtime.dispatch_input(
+                    &self.command_target,
+                    CommandContent {
+                        text: Arc::from(sub.text.as_str()),
+                        attachments,
+                    },
+                );
+                vec![]
+            }
+        }
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {

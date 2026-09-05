@@ -20,7 +20,7 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
     TextOutput, ToolOutput,
 };
-use maki_commands::{ArgumentArity, CommandContent, InputDispatch};
+use maki_commands::{ArgumentArity, CommandContent, CommandError, CommandOutcome, InputDispatch};
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
@@ -859,7 +859,10 @@ fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResul
     register_command_from_lua(lua, &spec, plugin)
 }
 
-/// Runs a slash command by name, exactly as typing it in the input would.
+/// Runs a slash command by name, as the explicit name-based executor: the
+/// leading slash is optional, extra leading slashes are stripped, and the
+/// name must resolve to a registered command (unknown names error, and the
+/// `//` input escape does not apply to this API).
 /// Works for built-ins, custom `/project:` and `/user:` commands, MCP
 /// prompts, and commands other plugins registered.
 ///
@@ -897,15 +900,13 @@ async fn run_command(
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
     let depth = command_depth(&lua).saturating_add(1);
+    let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));
     if let Some(invocation) = command_invocation(&lua) {
         let result = invocation
             .invocation
             .dispatch(CommandContent::from(cmdline.as_str()))
             .await;
-        try_pair!(match result {
-            InputDispatch::Dispatched(_) => Ok(()),
-            InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
-        });
+        try_pair!(nested_dispatch_result(result));
     } else {
         let reply = try_pair!(
             ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
@@ -918,6 +919,17 @@ async fn run_command(
         try_pair!(reply);
     }
     Ok((Some(true), None))
+}
+
+fn nested_dispatch_result(result: InputDispatch) -> Result<(), String> {
+    match result {
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_))) => {
+            Err("unknown command".to_owned())
+        }
+        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(error.to_string()),
+        InputDispatch::Dispatched(_) => Ok(()),
+        InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
+    }
 }
 
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -2332,5 +2344,26 @@ mod tests {
         };
         let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         smol::block_on(inv.start(&ctx));
+    }
+
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
+            Arc::from("/bogus")
+        ))),
+        Err("unknown command".to_owned()) ;
+        "unknown command is rejected"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::Completed),
+        Ok(()) ;
+        "dispatched command succeeds"
+    )]
+    #[test_case::test_case(
+        InputDispatch::LiteralInput(CommandContent::from("prose")),
+        Err("unknown command".to_owned()) ;
+        "literal input is not a command"
+    )]
+    fn nested_dispatch_result_maps_outcomes(result: InputDispatch, expected: Result<(), String>) {
+        assert_eq!(nested_dispatch_result(result), expected);
     }
 }

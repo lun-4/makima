@@ -1550,18 +1550,37 @@ mod tests {
     }
 
     #[test]
-    fn unknown_slash_prompt_is_sent_to_agent_literal() {
+    fn unknown_slash_prompt_is_rejected() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
-        smol::block_on(handle_prompt(
+        let error = smol::block_on(handle_prompt(
             &mut srv,
             &prompt_request("/does-not-exist value", false),
             &RequestId::Number(1),
         ))
+        .unwrap_err();
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(error.message, "unknown command /does-not-exist");
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
+    fn escaped_slash_prompt_is_sent_literal() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+
+        smol::block_on(handle_prompt(
+            &mut srv,
+            &prompt_request("//does-not-exist value", true),
+            &RequestId::Number(2),
+        ))
         .unwrap();
+        let input = input_rx.try_recv().unwrap();
+        assert_eq!(input.message, "/does-not-exist value");
+        assert_eq!(input.images.len(), 1);
         assert_eq!(
-            input_rx.try_recv().unwrap().message,
-            "/does-not-exist value"
+            input.images[0].media_type,
+            maki_providers::ImageMediaType::Png
         );
+        assert_eq!(input.images[0].data.as_ref(), "aGVsbG8=");
     }
 
     #[test]
@@ -1587,18 +1606,18 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_interactive_command_is_sent_to_agent_literal() {
+    fn unavailable_interactive_command_is_rejected() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
 
-        smol::block_on(handle_prompt(
+        let error = smol::block_on(handle_prompt(
             &mut srv,
             &prompt_request("/help", true),
             &RequestId::Number(3),
         ))
-        .unwrap();
-        let input = input_rx.try_recv().unwrap();
-        assert_eq!(input.message, "/help");
-        assert_eq!(input.images.len(), 1);
+        .unwrap_err();
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(error.message, "unknown command /help");
+        assert!(input_rx.is_empty());
     }
 
     #[test]

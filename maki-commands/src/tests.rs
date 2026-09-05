@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::completion::CompletionInvalidation;
+use test_case::test_case;
 
 const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -278,7 +279,7 @@ fn projection_and_dispatch_share_capability_filter() {
     assert!(registry.presented_commands(&portable).unwrap().is_empty());
     assert!(matches!(
         futures_lite::future::block_on(registry.dispatch_input(&portable, "/picker".into())),
-        InputDispatch::LiteralInput(_)
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_)))
     ));
     assert_eq!(registry.presented_commands(&interactive).unwrap().len(), 1);
     assert!(matches!(
@@ -478,7 +479,7 @@ fn dispatch_rejects_foreign_command_and_target_without_execution() {
 
     assert!(matches!(
         futures_lite::future::block_on(registry.dispatch_input(&foreign_target, "/local".into())),
-        InputDispatch::LiteralInput(_)
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::StaleTarget))
     ));
     assert!(matches!(
         futures_lite::future::block_on(registry.dispatch_command(
@@ -925,4 +926,59 @@ fn accepting_completion_is_terminal_and_fires_once() {
             .as_slice(),
         [CompletionLifecycleEvent::Accept(item)] if item.insertion.as_ref() == "candidate"
     ));
+}
+
+#[test_case("/lmao" => SlashClass::Command("/lmao") ; "single slash is a command")]
+#[test_case(" /lmao" => SlashClass::Command("/lmao") ; "leading whitespace is trimmed")]
+#[test_case("//lmao" => SlashClass::EscapedLiteral("/lmao") ; "double slash strips one slash")]
+#[test_case("///lmao" => SlashClass::EscapedLiteral("//lmao") ; "triple slash strips one slash")]
+#[test_case("//" => SlashClass::EscapedLiteral("/") ; "bare double slash")]
+#[test_case("prose" => SlashClass::Plain ; "prose is plain")]
+#[test_case("" => SlashClass::Plain ; "empty is plain")]
+#[test_case("\u{200B}/lmao" => SlashClass::Plain ; "invisible prefix is not trimmed")]
+fn classify_input_cases(input: &str) -> SlashClass<'_> {
+    classify_input(input)
+}
+
+#[test_case("/lmao" => matches InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(name))) if name.as_ref() == "/lmao" ; "unknown slash is rejected with its name")]
+#[test_case(" /lmao" => matches InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(name))) if name.as_ref() == "/lmao" ; "leading whitespace rejected with trimmed name")]
+#[test_case("/" => matches InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(name))) if name.as_ref() == "/" ; "bare slash is rejected")]
+#[test_case("//lmao" => matches InputDispatch::LiteralInput(content) if content.text.as_ref() == "/lmao" ; "escaped literal strips exactly one slash")]
+#[test_case("///lmao" => matches InputDispatch::LiteralInput(content) if content.text.as_ref() == "//lmao" ; "triple slash strips exactly one slash")]
+#[test_case(" //lmao" => matches InputDispatch::LiteralInput(content) if content.text.as_ref() == "/lmao" ; "leading whitespace escaped literal is trimmed")]
+#[test_case("literal input" => matches InputDispatch::LiteralInput(content) if content.text.as_ref() == "literal input" ; "prose stays literal")]
+#[test_case("/real" => matches InputDispatch::Dispatched(CommandOutcome::Completed) ; "registered command still dispatches")]
+#[test_case("//real" => matches InputDispatch::LiteralInput(content) if content.text.as_ref() == "/real" ; "escaped registered command stays literal")]
+fn dispatch_input_classifies_and_rejects(text: &str) -> InputDispatch {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    producer
+        .replace(vec![registration("/real", TargetCapabilities::NONE)])
+        .unwrap();
+    let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+    futures_lite::future::block_on(registry.dispatch_input(&target, text.into()))
+}
+
+#[test]
+fn escaped_literal_preserves_attachments() {
+    let registry = CommandRegistry::new();
+    let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+    let attachments = Arc::from([CommandAttachment {
+        media_type: Arc::from("image/png"),
+        data: Arc::from("bytes"),
+    }]);
+    let content = CommandContent {
+        text: Arc::from("//lmao"),
+        attachments,
+    };
+
+    match futures_lite::future::block_on(registry.dispatch_input(&target, content)) {
+        InputDispatch::LiteralInput(literal) => {
+            assert_eq!(literal.text.as_ref(), "/lmao");
+            assert_eq!(literal.attachments.len(), 1);
+            assert_eq!(literal.attachments[0].media_type.as_ref(), "image/png");
+            assert_eq!(literal.attachments[0].data.as_ref(), "bytes");
+        }
+        other => panic!("expected LiteralInput, got {other:?}"),
+    }
 }

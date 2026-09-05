@@ -960,6 +960,18 @@ fn enter_executes_new_command() {
 }
 
 #[test]
+fn leading_whitespace_palette_command_preserves_arguments() {
+    let mut app = test_app();
+
+    let actions = type_and_submit(&mut app, "  /btw describe this");
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Btw(question, images)] if question == "describe this" && images.is_empty()
+    ));
+}
+
+#[test]
 fn confirmed_btw_preserves_pending_images() {
     let mut app = test_app();
     app.input_box.attach_image(ImageSource::new(
@@ -4015,11 +4027,29 @@ fn startup_session_picker_emits_plugin_request() {
 }
 
 #[test]
-fn slash_noncommand_sends_as_prompt() {
+fn slash_noncommand_is_rejected_and_flashes() {
     let mut app = test_app();
     let actions = type_and_submit(&mut app, "/nonexistent");
-    assert!(app.status_bar.flash_text().is_none());
-    assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
+    assert!(actions.is_empty());
+    app.execute_pending_commands();
+    assert!(
+        app.status_bar
+            .flash_text()
+            .is_some_and(|text| text.contains("unknown command"))
+    );
+    assert!(!actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
+}
+
+#[test_case("//lmao", "/lmao" ; "escaped literal strips one slash")]
+#[test_case("///lmao", "//lmao" ; "triple slash strips one slash")]
+fn slash_escape_sends_literal_input(text: &str, expected: &str) {
+    let mut app = test_app();
+    let actions = type_and_submit(&mut app, text);
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::SendMessage(input) if input.message.as_str() == expected
+    ));
 }
 
 fn build_rewind_app() -> App {

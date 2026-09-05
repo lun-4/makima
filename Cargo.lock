@@ -2780,6 +2780,7 @@ name = "maki-commands"
 version = "0.4.11-makima"
 dependencies = [
  "futures-lite",
+ "test-case",
  "thiserror 2.0.20",
 ]
 

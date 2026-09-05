@@ -874,11 +874,11 @@ pub fn run(params: SdkParams) -> Result<()> {
                         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => {
                             emit_command_result(&writer, &shared, true, error.to_string())?
                         }
-                        InputDispatch::LiteralInput(_) => {
+                        InputDispatch::LiteralInput(content) => {
                             let input = AgentInput {
-                                message: prompt,
+                                message: content.text.to_string(),
                                 mode: mode.agent_mode(&cwd),
-                                images,
+                                images: command_attachments::into_images(&content.attachments)?,
                                 preamble: Vec::new(),
                                 thinking: Default::default(),
                                 fast,
@@ -1838,15 +1838,27 @@ mod tests {
             maki_providers::ImageMediaType::Gif,
             Arc::from("AAAA"),
         )];
+        assert!(matches!(
+            commands.dispatch_input("/unknown literal", &images),
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
+                name
+            ))) if name.as_ref() == "/unknown"
+        ));
         let InputDispatch::LiteralInput(content) =
-            commands.dispatch_input("/unknown literal", &images)
+            commands.dispatch_input("//unknown literal", &images)
         else {
-            panic!("unknown command did not remain literal input");
+            panic!("escaped unknown command did not remain literal input");
         };
         assert_eq!(content.text.as_ref(), "/unknown literal");
         assert_eq!(content.attachments.len(), 1);
         assert_eq!(content.attachments[0].media_type.as_ref(), "image/gif");
         assert_eq!(content.attachments[0].data.as_ref(), "AAAA");
+        let InputDispatch::LiteralInput(content) =
+            commands.dispatch_input("///unknown literal", &[])
+        else {
+            panic!("triple-slash input did not remain literal");
+        };
+        assert_eq!(content.text.as_ref(), "//unknown literal");
         assert!(matches!(
             commands.dispatch_input("ordinary literal", &[]),
             InputDispatch::LiteralInput(_)
@@ -1854,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_unsupported_builtin_is_literal_input() {
+    fn sdk_unsupported_builtin_is_rejected() {
         let commands = sdk_commands(CommandRegistry::new());
         assert!(matches!(
             smol::block_on(
@@ -1862,7 +1874,9 @@ mod tests {
                     .registry
                     .dispatch_input(&commands.target, "/help".into())
             ),
-            InputDispatch::LiteralInput(_)
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
+                name
+            ))) if name.as_ref() == "/help"
         ));
     }
 

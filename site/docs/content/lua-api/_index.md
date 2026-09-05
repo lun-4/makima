@@ -574,7 +574,10 @@ end
 maki.api.run_command({cmdline})
 ```
 
-Runs a slash command by name, exactly as typing it in the input would.
+Runs a slash command by name, as the explicit name-based executor: the
+leading slash is optional, extra leading slashes are stripped, and the
+name must resolve to a registered command (unknown names error, and the
+`//` input escape does not apply to this API).
 Works for built-ins, custom `/project:` and `/user:` commands, MCP
 prompts, and commands other plugins registered.
 
