@@ -601,7 +601,7 @@ impl Copilot {
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let mut body = responses::build_body(model, messages, system, tools);
+        let mut body = responses::build_body(model, messages, system, tools, None);
         let reasoning_info = crate::model_registry::provider_info::<CopilotModelInfo>(
             "copilot", &model.id,
         )

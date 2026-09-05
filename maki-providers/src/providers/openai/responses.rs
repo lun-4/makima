@@ -9,7 +9,8 @@ use tracing::{debug, warn};
 
 use crate::providers::ResolvedAuth;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage, dialect,
 };
 
 const RESPONSES_PATH: &str = "/responses";
@@ -19,6 +20,7 @@ pub(crate) fn build_body(
     messages: &[Message],
     system: &str,
     tools: &Value,
+    thinking: Option<ThinkingConfig>,
 ) -> Value {
     let input = convert_input(messages);
     let wire_tools = convert_tools(tools);
@@ -32,6 +34,11 @@ pub(crate) fn build_body(
     });
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
+    }
+    if let Some(thinking) = thinking
+        && let Some(effort) = thinking.effort_str(&dialect::STANDARD, model)
+    {
+        body["reasoning"] = json!({"effort": effort});
     }
     body
 }

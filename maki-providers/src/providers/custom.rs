@@ -283,7 +283,7 @@ impl Provider for CustomOpenAiProvider {
             let auth = self.auth.lock().unwrap().clone();
 
             if self.protocol == Protocol::OpenaiResponses {
-                let body = responses::build_body(model, messages, system, tools);
+                let body = responses::build_body(model, messages, system, tools, None);
                 // TODO: wire thinking budget into responses API when llama.cpp supports it
                 return responses::do_stream(
                     self.compat.client(),
