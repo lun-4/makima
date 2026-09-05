@@ -5,7 +5,7 @@ use maki_config::{Effect, ModelPolicy};
 use maki_providers::provider::adjust_model;
 use maki_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
 use maki_storage::StateDir;
-use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
+use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule, read_prefs};
 
 use crate::AppSession;
 
@@ -93,6 +93,7 @@ impl SessionState {
             thinking: session
                 .meta
                 .thinking
+                .or_else(|| read_prefs(storage).default_thinking)
                 .map(Into::into)
                 .filter(|_| model.supports_thinking())
                 .unwrap_or_default(),
@@ -210,8 +211,8 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::Permiss
 mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
-    use maki_providers::{FastPricing, ModelPricing};
-    use maki_storage::sessions::StoredThinking;
+    use maki_providers::{FastPricing, ModelPricing, ThinkingSupport};
+    use maki_storage::sessions::{Effort, Prefs, StoredThinking, write_prefs};
     use test_case::test_case;
 
     const RECORDED_COST: f64 = 0.42;
@@ -379,5 +380,57 @@ mod tests {
             ThinkingConfig::Adaptive,
             "resumed thinking config should be preserved when the model supports it",
         );
+    }
+
+    fn with_prefs(prefs: &Prefs) -> (tempfile::TempDir, StateDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        write_prefs(&storage, prefs).unwrap();
+        (tmp, storage)
+    }
+
+    fn prefs_high() -> Prefs {
+        Prefs {
+            default_thinking: Some(StoredThinking::Effort {
+                level: Effort::High,
+            }),
+        }
+    }
+
+    #[test]
+    fn new_session_uses_pref_thinking_default() {
+        let (_tmp, storage) = with_prefs(&prefs_high());
+        let session = AppSession::new("test-model", "/tmp");
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        assert_eq!(state.thinking, ThinkingConfig::Effort(Effort::High));
+    }
+
+    #[test]
+    fn explicit_session_thinking_beats_pref() {
+        let (_tmp, storage) = with_prefs(&prefs_high());
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
+    }
+
+    #[test]
+    fn pref_thinking_ignored_when_model_unsupported() {
+        let (_tmp, storage) = with_prefs(&prefs_high());
+        let model = Model {
+            thinking_override: Some(ThinkingSupport::No),
+            ..test_model()
+        };
+        let session = AppSession::new("test-model", "/tmp");
+        let state = SessionState::from_session(session, &model, &storage, &ModelPolicy::default());
+        assert_eq!(state.thinking, ThinkingConfig::Off);
+    }
+
+    #[test]
+    fn new_session_without_pref_stays_off() {
+        let state = resumed(AppSession::new("test-model", "/tmp"), &test_model());
+        assert_eq!(state.thinking, ThinkingConfig::Off);
     }
 }
