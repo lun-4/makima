@@ -612,8 +612,11 @@ impl Copilot {
                 .map(CopilotModel::reasoning_info)
                 .map(Arc::new)
         });
-        let effort_dialect = reasoning_info.as_deref().map(effort_dialect);
-        let thinking = effort_dialect.as_ref().map(|dialect| (thinking, dialect));
+        let effort_dialect = reasoning_info
+            .as_deref()
+            .map(effort_dialect)
+            .unwrap_or(dialect::PREFER_HIGH);
+        let thinking = Some((thinking, &effort_dialect));
         let body = responses::build_body(responses::ResponsesRequestArgs {
             model,
             messages,
