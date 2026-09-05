@@ -7110,8 +7110,11 @@ fn test_idle_splash_pulls_lua_frame() {
 
 #[test]
 fn slow_splash_renderer_does_not_block_tick_or_input() {
-    const RENDER_SECS: f64 = 0.3;
-    const MAX_TICK: Duration = Duration::from_millis(50);
+    // Wall-clock spin (os.time): bounded even under CPU starvation, unlike
+    // os.clock whose CPU-time wait stretches with load and hogs a core. The
+    // render is many times MAX_TICK, so a tick that waits on it trips loudly.
+    const RENDER_WALL_SECS: u64 = 2;
+    const MAX_TICK: Duration = Duration::from_millis(300);
 
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
     guard
@@ -7121,8 +7124,8 @@ fn slow_splash_renderer_does_not_block_tick_or_input() {
             &format!(
                 r##"
 maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
-  local started = os.clock()
-  while os.clock() - started < {RENDER_SECS} do end
+  local deadline = os.time() + {RENDER_WALL_SECS}
+  while os.time() < deadline do end
   return {{ {{ {{ glyphs = string.rep("x", w), style = "#ffffff" }} }} }}
 end)
 "##
