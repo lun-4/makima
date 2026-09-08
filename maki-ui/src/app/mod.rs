@@ -356,6 +356,7 @@ pub struct App {
     pub(super) file_completion: FileCompletionMenu,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
+    plan_picker_open: bool,
     pub(super) status_bar: StatusBar,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -514,6 +515,7 @@ impl App {
             file_completion: FileCompletionMenu::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
+            plan_picker_open: false,
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
             state,
@@ -1029,6 +1031,10 @@ impl App {
             return Some(vec![]);
         }
 
+        if self.model_picker.is_open() {
+            return Some(self.handle_model_picker_key(key));
+        }
+
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
         if self.plan_form_active() {
             let action = self.plan_form.handle_key(key);
@@ -1170,22 +1176,6 @@ impl App {
             });
         }
 
-        if self.model_picker.is_open() {
-            return Some(match self.model_picker.handle_key(key) {
-                ModelPickerAction::Consumed => vec![],
-                ModelPickerAction::Select(spec) => {
-                    vec![Action::ChangeModel(spec)]
-                }
-                ModelPickerAction::AssignTier(spec, tier) => {
-                    vec![Action::AssignTier(spec, tier)]
-                }
-                ModelPickerAction::UnassignTier(spec, tier) => {
-                    vec![Action::UnassignTier(spec, tier)]
-                }
-                ModelPickerAction::Close => vec![],
-            });
-        }
-
         if self.login_picker.is_open() {
             let action = self.login_picker.handle_key(key);
             return Some(self.login_picker_actions(action));
@@ -1209,6 +1199,29 @@ impl App {
         }
 
         None
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match self.model_picker.handle_key(key) {
+            ModelPickerAction::Consumed => vec![],
+            ModelPickerAction::Select(spec) => {
+                if self.plan_picker_open {
+                    self.plan_picker_open = false;
+                    self.plan_form.set_implementation_model(spec);
+                    vec![]
+                } else {
+                    vec![Action::ChangeModel(spec)]
+                }
+            }
+            ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
+            ModelPickerAction::UnassignTier(spec, tier) => {
+                vec![Action::UnassignTier(spec, tier)]
+            }
+            ModelPickerAction::Close => {
+                self.plan_picker_open = false;
+                vec![]
+            }
+        }
     }
 
     fn plan_toggle_ready(&self) -> bool {
@@ -1295,6 +1308,7 @@ impl App {
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
             BuiltinAction::ModelPicker => {
+                self.plan_picker_open = false;
                 self.model_picker.open(&self.state.model.spec());
                 return vec![Action::RefreshModels];
             }
@@ -2866,6 +2880,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        self.plan_picker_open = false;
         self.close_command_palette();
         self.file_completion.close();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
@@ -3052,6 +3067,14 @@ impl App {
     }
 
     fn route_text_paste(&mut self, text: &str) {
+        if self.permission_active() {
+            self.permission_prompt.handle_paste(text);
+            return;
+        }
+        if self.model_picker.is_open() {
+            self.model_picker.handle_paste(text);
+            return;
+        }
         if self.plan_form_active() {
             return;
         }
@@ -3083,7 +3106,10 @@ impl App {
         try_picker!(self.task_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.theme_picker);
-        try_picker!(self.model_picker);
+        if self.model_picker.is_open() {
+            self.model_picker.handle_paste(text);
+            return;
+        }
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
@@ -3104,6 +3130,16 @@ impl App {
                 self.plan_form.hide();
                 vec![]
             }
+            PlanFormAction::OpenModelPicker => {
+                self.plan_picker_open = true;
+                let spec = self
+                    .plan_form
+                    .implementation_model()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.state.model.spec());
+                self.model_picker.open(&spec);
+                vec![Action::RefreshModels]
+            }
             PlanFormAction::OpenEditor => match self.state.plan.path() {
                 Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
                 None => {
@@ -3111,12 +3147,18 @@ impl App {
                     vec![]
                 }
             },
-            PlanFormAction::Implement => self.implement_plan(false),
-            PlanFormAction::ClearAndImplement => self.implement_plan(true),
+            PlanFormAction::Implement => vec![Action::ImplementPlan {
+                clear_context: false,
+                model: self.plan_form.implementation_model().map(str::to_owned),
+            }],
+            PlanFormAction::ClearAndImplement => vec![Action::ImplementPlan {
+                clear_context: true,
+                model: self.plan_form.implementation_model().map(str::to_owned),
+            }],
         }
     }
 
-    fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+    pub(crate) fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
         let parallel = self.plan_form.parallel();
         let plan_snapshot = self.state.plan.path().map(|path| {
             (

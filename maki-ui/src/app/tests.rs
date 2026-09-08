@@ -4096,6 +4096,17 @@ fn help_modal_consumes_keys_and_esc_closes() {
     ; "plan_form"
 )]
 #[test_case(
+    |app: &mut App| {
+        app.state.mode = Mode::Plan;
+        app.plan_form.on_plan_ready();
+        app.plan_picker_open = true;
+        app.model_picker.open(&app.state.model.spec());
+    },
+    &[KeybindContext::ModelPicker],
+    &[KeybindContext::FormInput, KeybindContext::Editing]
+    ; "plan_model_picker"
+)]
+#[test_case(
     |app: &mut App| { app.status = Status::Streaming; app.run_id = 1; app.queue_and_notify(queued_msg("q")); app.queue.set_focus_at(0); },
     &[KeybindContext::QueueFocus],
     &[KeybindContext::Editing]
@@ -5201,6 +5212,11 @@ fn mcp_toggle_dispatches_action() {
     ; "consumed_by_plan_form"
 )]
 #[test_case(
+    |app: &mut App| { app.state.mode = Mode::Plan; app.plan_form.on_plan_ready(); app.plan_picker_open = true; app.model_picker.open(&app.state.model.spec()); },
+    ""
+    ; "routed_to_plan_model_picker"
+)]
+#[test_case(
     |app: &mut App| { open_tasks_picker(app); },
     ""
     ; "routed_to_open_picker"
@@ -5620,14 +5636,6 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 
 // --- Plan form integration tests ---
 
-fn implement_msg(parallel: bool) -> String {
-    if parallel {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}")
-    } else {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.")
-    }
-}
-
 fn plan_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -5773,14 +5781,9 @@ fn plan_submit_mode_disables_auto_open() {
     assert!(!app.state.plan.is_ready());
 }
 
-#[test_case(1, Mode::Build, true,  true  ; "clear_and_implement")]
-#[test_case(2, Mode::Build, false, true  ; "implement_keeps_context")]
-fn plan_form_menu_options(
-    downs: usize,
-    expected_mode: Mode,
-    has_new_session: bool,
-    has_send_message: bool,
-) {
+#[test_case(1, true  ; "clear_and_implement")]
+#[test_case(2, false ; "implement_keeps_context")]
+fn plan_form_menu_options(downs: usize, has_new_session: bool) {
     let mut app = plan_app();
     assert!(app.plan_form.is_visible());
 
@@ -5788,37 +5791,65 @@ fn plan_form_menu_options(
         app.update(Msg::Key(key(KeyCode::Down)));
     }
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.plan_form.is_visible(), has_new_session);
-    assert_eq!(
-        app.state.mode,
-        if has_new_session {
-            Mode::Plan
-        } else {
-            expected_mode
-        }
-    );
-    assert_eq!(app.state.plan == PlanState::None, !has_new_session);
-    assert_eq!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ReplaceSession(_))),
-        has_new_session
-    );
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ImplementPlan {
+            clear_context,
+            model: None,
+        }] if *clear_context == has_new_session
+    ));
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.state.plan.is_ready());
+}
+
+fn implement_msg(parallel: bool) -> String {
+    if parallel {
+        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}")
+    } else {
+        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.")
+    }
+}
+
+#[test_case(true  ; "clear_and_implement")]
+#[test_case(false ; "implement_keeps_context")]
+fn implement_plan_applies_model_then_implements(clear_context: bool) {
+    let mut app = plan_app();
+    let actions = app.implement_plan(clear_context);
+
     let expected_msg = implement_msg(PlanForm::new().parallel());
-    let immediate = actions
-        .iter()
-        .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg));
-    assert_eq!(immediate, has_send_message && !has_new_session);
-    if has_new_session {
-        let Action::ReplaceSession(request) = &actions[0] else {
+    if clear_context {
+        let [Action::ReplaceSession(request)] = actions.as_slice() else {
             panic!("expected replacement request");
         };
+        assert_eq!(
+            request.session.meta.mode,
+            Some(maki_storage::sessions::StoredMode::Build)
+        );
         assert_eq!(
             request
                 .post_commit
                 .as_ref()
                 .map(|post| post.prompt.as_str()),
             Some(expected_msg.as_str())
+        );
+        assert_eq!(
+            request
+                .post_commit
+                .as_ref()
+                .and_then(|post| post.plan.as_ref().map(|(_, path)| path.as_str())),
+            Some("test-plan.md")
+        );
+        assert!(app.plan_form.is_visible());
+        assert!(app.state.plan.is_ready());
+    } else {
+        assert_eq!(app.state.mode, Mode::Build);
+        assert_eq!(app.state.plan, PlanState::None);
+        assert!(!app.plan_form.is_visible());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
         );
     }
 }
@@ -5830,12 +5861,13 @@ fn plan_form_implement_toggled_parallel() {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let expected_msg = implement_msg(!PlanForm::new().parallel());
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
-    );
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ImplementPlan {
+            clear_context: false,
+            model: None,
+        }]
+    ));
 }
 
 #[test]
@@ -9449,6 +9481,51 @@ fn run_builtin_model_picker_opens_and_refreshes() {
     let actions = app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.model_picker.is_open());
     assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+#[test]
+fn plan_form_ctrl_m_opens_model_picker() {
+    let mut app = plan_app();
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    assert!(app.model_picker.is_open());
+    assert!(app.plan_picker_open);
+}
+
+#[test]
+fn plan_form_model_selection_is_staged() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec!["zai/glm-5".into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    let _ = app.model_picker.refresh();
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.plan_form.implementation_model(), Some("zai/glm-5"));
+    assert_eq!(app.state.model.spec(), "anthropic/test-model");
+}
+
+#[test]
+fn plan_form_renders_implementation_model() {
+    let mut app = plan_app();
+    let rows = rendered_area(&mut app);
+    let text = rows.join("\n");
+    assert!(text.contains("Implementation model: anthropic/test-model"));
+    let (_msg, bottom, _status, _input, _splits) = app.layout_geometry(RENDER_AREA);
+    assert_eq!(bottom.height, app.plan_form.height());
+}
+
+#[test]
+fn plan_form_model_selection_cancellation_preserves_choice() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec!["zai/glm-5".into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    app.plan_form.set_implementation_model("zai/glm-5".into());
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(app.plan_form.implementation_model(), Some("zai/glm-5"));
 }
 
 #[test]

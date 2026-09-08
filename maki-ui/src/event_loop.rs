@@ -2385,6 +2385,19 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx].app.flash(error);
                 }
             }
+            Action::ImplementPlan {
+                clear_context,
+                model,
+            } => {
+                if let Some(spec) = model
+                    && let Err(error) = self.change_model(idx, &spec)
+                {
+                    self.sessions[idx].app.flash(error);
+                    return;
+                }
+                let actions = self.sessions[idx].app.implement_plan(clear_context);
+                self.dispatch(idx, actions);
+            }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
@@ -2462,20 +2475,17 @@ impl<'t> EventLoop<'t> {
     }
 
     fn change_model(&mut self, idx: usize, spec: &str) -> Result<(), String> {
-        if !self.ctx.model_policy.allows(spec) {
-            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
-        }
-        let mut new_model =
-            Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
-        let new_provider = from_model(&mut new_model, self.ctx.timeouts)
-            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
         let app = &mut self.sessions[idx].app;
-        app.update_model(&new_model);
-        app.record_recent_model(spec);
-        self.ctx
-            .model_slot
-            .install(new_model, Arc::from(new_provider));
-        Ok(())
+        apply_model_change(
+            app,
+            &self.ctx.model_slot,
+            &self.ctx.model_policy,
+            spec,
+            |model| {
+                from_model(model, self.ctx.timeouts)
+                    .map_err(|error| format!("{PROVIDER_INIT_ERR}: {error}"))
+            },
+        )
     }
 
     fn refresh_models(&self) {
@@ -2690,11 +2700,27 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+fn apply_model_change(
+    app: &mut App,
+    model_slot: &Arc<ProviderSlot>,
+    model_policy: &ModelPolicy,
+    spec: &str,
+    create_provider: impl FnOnce(&mut Model) -> Result<Box<dyn Provider>, String>,
+) -> Result<(), String> {
+    if !model_policy.allows(spec) {
+        return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
+    }
+    let mut model =
+        Model::from_spec(spec).map_err(|error| format!("{INVALID_MODEL_ERR}: {error}"))?;
+    let provider = create_provider(&mut model)?;
+    app.update_model(&model);
+    app.record_recent_model(spec);
+    model_slot.install(model, Arc::from(provider));
+    Ok(())
+}
+
 fn ring_bell() {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(b"\x07");
-    let _ = out.flush();
+    print!("\x07");
 }
 
 #[cfg(test)]

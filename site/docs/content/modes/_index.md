@@ -111,8 +111,12 @@ maki.setup({
   review form, with **accept** (hands off to implementation), **refine** (keep
   planning), or **cancel**. It only exists in plan mode because plan's toolset
   lists it. While `plan_submit` is in an active mode's toolset, the built-in
-  auto-hooks that open the review form on a plan-file write are skipped; the
-  model calls `plan_submit` explicitly when the plan is ready.
+   auto-hooks that open the review form on a plan-file write are skipped; the
+   model calls `plan_submit` explicitly when the plan is ready. The review form
+   shows the current implementation model as a selectable row. Press `Ctrl+M`
+   or select that row to search for another model. A choice is staged without
+   changing the active model or recents; Escape cancels it. Approving the plan
+   applies the selected model and keeps it as the session model.
 
 The built-in `task` tool grows a `plan_reviewer` subagent type when the plan
 override is active: a read-only audit that verifies the plan follows the shared
