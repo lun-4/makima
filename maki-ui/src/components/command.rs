@@ -257,7 +257,7 @@ impl CommandPalette {
                 self.argument_publication.is_pending(),
             ) {
                 if self.argument_grid.selected() != selected {
-                    self.notify_lifecycle(PaletteLifecycle::Highlight);
+                    self.notify_keyboard_highlight();
                 }
                 return CommandAction::Consumed;
             }
@@ -272,7 +272,7 @@ impl CommandPalette {
                     } else {
                         self.argument_selected - 1
                     };
-                    self.notify_lifecycle(PaletteLifecycle::Highlight);
+                    self.notify_keyboard_highlight();
                     CommandAction::Consumed
                 } else {
                     self.move_up();
@@ -289,7 +289,7 @@ impl CommandPalette {
                         } else {
                             self.argument_selected + 1
                         };
-                    self.notify_lifecycle(PaletteLifecycle::Highlight);
+                    self.notify_keyboard_highlight();
                     CommandAction::Consumed
                 } else {
                     self.move_down();
@@ -965,6 +965,17 @@ impl CommandPalette {
             self.argument_grid.reset();
             self.notify_lifecycle(PaletteLifecycle::Cancel);
         }
+    }
+
+    fn notify_keyboard_highlight(&mut self) {
+        let selected_item = self
+            .argument_items
+            .get(self.argument_selection())
+            .map(|item| item.item.clone());
+        if let Some(pending) = self.pending_arguments.as_mut() {
+            pending.last_highlighted_item = selected_item;
+        }
+        self.notify_lifecycle(PaletteLifecycle::Highlight);
     }
 
     fn notify_lifecycle(&mut self, event: PaletteLifecycle) -> bool {
@@ -1977,6 +1988,48 @@ mod tests {
             events.as_slice(),
             [maki_commands::CompletionLifecycleEvent::Highlight(item)]
                 if item.label.as_ref() == "new"
+        ));
+        drop(events);
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_after_keyboard_navigation_highlights_new_selection() {
+        let (mut palette, started, release, events) = gated_directory_palette();
+        let input = "/cd ";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started.recv().unwrap();
+        publisher
+            .publish(
+                ["first", "second"]
+                    .into_iter()
+                    .map(|label| CompletionItem {
+                        label: Arc::from(label),
+                        insertion: Arc::from(label),
+                        description: None,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let _ = palette.poll_arguments();
+        palette.argument_grid.set_layout(2, 2, 1);
+        palette.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), input);
+        events.lock().unwrap().clear();
+
+        publisher
+            .publish(vec![CompletionItem {
+                label: Arc::from("first"),
+                insertion: Arc::from("first"),
+                description: None,
+            }])
+            .unwrap();
+        publisher.finish().unwrap();
+        let _ = palette.poll_arguments();
+        let events = events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [maki_commands::CompletionLifecycleEvent::Highlight(item)]
+                if item.label.as_ref() == "first"
         ));
         drop(events);
         release.send(()).unwrap();
