@@ -71,27 +71,29 @@ This checklist describes current correctness requirements. A change that intenti
 48. Suspension guard drop is synchronous and non-blocking. The managed execution poll gate is the only authority that reacquires the semaphore.
 49. A completed child waiter must not resume Lua/model/tool continuation until the parent lease reports ownership restored.
 50. Dropping a wait cancels its watcher, not the child. Timeout closes the child subtree according to current Session semantics.
-51. Parent cancellation signals all registered watchers but does not bypass the global limit for backend cleanup.
-52. Abnormal managed-execution drop closes lease registration, signals watchers, releases physical capacity, and revokes authority without creating an ownership cycle.
-53. Manager shutdown owns and eventually joins or reaps actor runners and wait watchers. A timeout transfers ownership to the reaper rather than leaking tasks.
+51. A context-free managed `Session:prompt` uses an ordinary exact-ticket wait. It remains manager-capacity limited, yields no parent permit, and closes the child subtree on timeout.
+52. Parent cancellation signals all registered watchers but does not bypass the global limit for backend cleanup.
+53. Abnormal managed-execution drop closes lease registration, signals watchers, releases physical capacity, and revokes authority without creating an ownership cycle.
+54. Manager shutdown owns and eventually joins or reaps actor runners and wait watchers. A timeout transfers ownership to the reaper rather than leaking tasks.
 
 ## History, events, and compatibility
 
-54. The actor exclusively owns mutable conversation history. Optional `SharedMessages` is a mirror, not a competing owner.
-55. Restored history is sanitized and published synchronously before an actor handle escapes.
-56. Presentation-only failure/notification text must not be inserted into provider history as model output.
-57. Structured child outcomes and history must retain the live child's `AgentId`; stale root `run_id` filtering must not discard later events from a reusable child.
-58. Terminal child deduplication keys by `(AgentId, TurnId)`, not a task id alone. Reusing a child must allow later distinct turns through.
-59. Root `run_id` remains presentation and stale-event correlation. It must not become runtime identity, topology, or authorization.
-60. Managed sessions use only the manager's per-outer-session concurrency limit. The deprecated process-wide task semaphore applies only to unmanaged compatibility sessions; never enforce both.
-61. Session/task APIs may adapt actor state, result text, capture values, and cumulative usage, but they must not become a second lifecycle source.
+55. The actor exclusively owns mutable conversation history. Optional `SharedMessages` is a mirror, not a competing owner.
+56. Restored history is sanitized and published synchronously before an actor handle escapes.
+57. Presentation-only failure/notification text must not be inserted into provider history as model output.
+58. Structured child outcomes and history must retain the live child's `AgentId`; stale root `run_id` filtering must not discard later events from a reusable child.
+59. Terminal child deduplication keys by `(AgentId, TurnId)`, not a task id alone. Reusing a child must allow later distinct turns through.
+60. Root `run_id` remains presentation and stale-event correlation. It must not become runtime identity, topology, or authorization.
+61. Managed sessions use only the manager's per-outer-session concurrency limit. The deprecated process-wide task semaphore applies only to unmanaged compatibility sessions; never enforce both.
+62. `maki.async.run` inherits only the originating turn's managed authority. Timer fires intentionally inherit none and must fail closed for managed operations.
+63. Session/task APIs may adapt actor state, result text, capture values, and cumulative usage, but they must not become a second lifecycle source.
 
 ## Current scope boundary
 
-62. Do not assume that model, prompt, tools, permissions, modes, or request options are manager-owned per-agent state yet.
-63. Do not assume agent graph topology, ids, queued work, outcomes, or notifications survive process restart.
-64. Do not expose proposal-only first-class Lua agent, graph navigation, preset, subscription, or public wait APIs as implemented behavior.
-65. Do not weaken these current invariants to imitate a future design. Land the future ownership model first, migrate all affected callers, and update these docs with the new verified contract.
+64. Do not assume that model, prompt, tools, permissions, modes, or request options are manager-owned per-agent state yet.
+65. Do not assume agent graph topology, ids, queued work, outcomes, or notifications survive process restart.
+66. Do not expose proposal-only first-class Lua agent, graph navigation, preset, subscription, or public wait APIs as implemented behavior.
+67. Do not weaken these current invariants to imitate a future design. Land the future ownership model first, migrate all affected callers, and update these docs with the new verified contract.
 
 ## Verification expectations
 

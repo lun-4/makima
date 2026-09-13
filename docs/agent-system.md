@@ -218,6 +218,8 @@ A parent that blocks on its own descendant must not consume the last permit and 
 
 Dropping a prompt wait cancels the watcher, not the child. A prompt timeout closes the child's subtree. Parent cancellation signals its watchers and still reacquires capacity before polling backend cleanup, so cleanup cannot run outside the global limit.
 
+A managed `Session:prompt` called without a current managed invocation uses an ordinary exact-ticket wait. The child remains subject to manager capacity, but there is no parent permit to yield. A timeout still closes the child's managed subtree.
+
 This machinery is an internal compatibility primitive, not the future public agent wait API.
 
 There is a current race to account for when changing this path: turn retirement removes the actor's ticket registration before resolving the ticket, while managed wait registration verifies ownership through that registration. A sufficiently fast child can therefore terminalize between `admit_and_wait_for_descendant` admission and watcher registration, producing `TicketActorMismatch` even though the passed ticket itself belongs to the actor. The actor's direct `TurnTicket::wait` and `wait_outcome` paths do not have this race. Do not describe managed admit-and-wait as fully race-free until registration accepts an already-retained matching outcome or otherwise closes this window.
@@ -263,6 +265,8 @@ Session runtime replacement is prepared inertly and activated as a transaction. 
 - Interactive child cancellation uses reusable actor cancellation and keeps the session available for later turns.
 
 A descendant's cancellation token is independent of the spawning parent turn. Background children can outlive that parent turn. Structured outcomes and history are stamped for TUI routing, while presentation notifications must not be inserted into provider history.
+
+`maki.async.run` inherits the originating task's exact managed authority, so its worker may act only while that turn remains active. Timer fires intentionally start without registration-time managed authority because they may run after the turn ends.
 
 The bundled task API and current Session result shapes remain compatibility surfaces. Their ids are not graph identity.
 

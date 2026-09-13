@@ -95,8 +95,6 @@ const NOT_LIVE_ERR: &str = "session not live";
 const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
     "session lock ownership is unavailable; replacement is disabled";
-const REPLACEMENT_PENDING_ERR: &str =
-    "session replacement is already waiting for lock verification";
 
 static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -368,7 +366,6 @@ impl Drop for HeartbeatCompletion {
 
 fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
     runtime.session_lock = None;
-    runtime.pending_replacement = None;
     runtime.lock_lost = true;
     runtime
         .app
@@ -393,17 +390,14 @@ fn apply_heartbeat_completion(runtime: &mut SessionRuntime, mut completion: Hear
     }
 }
 
-fn complete_runtime_heartbeat(runtime: &mut SessionRuntime) -> Option<PendingReplacement> {
+fn complete_runtime_heartbeat(runtime: &mut SessionRuntime) {
     let Some(SessionLockState::InFlight(completion_rx)) = runtime.session_lock.take() else {
-        return None;
+        return;
     };
-    let completion = collect_heartbeat(completion_rx, None)?;
+    let Some(completion) = collect_heartbeat(completion_rx, None) else {
+        return;
+    };
     apply_heartbeat_completion(runtime, completion);
-    if runtime.lock_lost {
-        None
-    } else {
-        runtime.pending_replacement.take()
-    }
 }
 
 fn start_runtime_heartbeat(
@@ -459,42 +453,41 @@ fn collect_heartbeat(
     }
 }
 
-enum LockReleaseOutcome {
-    Completed {
-        result: io::Result<()>,
-        lock_lost: bool,
-    },
+enum LockSettlement {
+    Held(ClaimedSessionLock),
+    Lost,
     TimedOut,
+    None,
 }
 
-fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
-    match release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT) {
-        LockReleaseOutcome::Completed { result, .. } => result,
-        LockReleaseOutcome::TimedOut => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "session lock heartbeat did not finish before shutdown timeout",
-        )),
+fn settle_lock_state(state: Option<SessionLockState>, timeout: Duration) -> LockSettlement {
+    match state {
+        Some(SessionLockState::Held(lease)) => LockSettlement::Held(lease),
+        Some(SessionLockState::InFlight(completion_rx)) => {
+            let Some(mut completion) = collect_heartbeat(completion_rx, Some(timeout)) else {
+                return LockSettlement::TimedOut;
+            };
+            match completion.result {
+                Ok(session_lock::LockBeat::Lost) => LockSettlement::Lost,
+                Ok(session_lock::LockBeat::Held | session_lock::LockBeat::Claimed) | Err(_) => {
+                    LockSettlement::Held(
+                        completion.lease.take().expect("heartbeat completion lease"),
+                    )
+                }
+            }
+        }
+        None => LockSettlement::None,
     }
 }
 
-fn release_lock_state_with_timeout(
-    state: Option<SessionLockState>,
-    timeout: Duration,
-) -> LockReleaseOutcome {
-    let (lease, lock_lost) = match state {
-        Some(SessionLockState::Held(lease)) => (Some(lease), false),
-        Some(SessionLockState::InFlight(completion_rx)) => {
-            let Some(mut completion) = collect_heartbeat(completion_rx, Some(timeout)) else {
-                return LockReleaseOutcome::TimedOut;
-            };
-            let lock_lost = matches!(completion.result, Ok(session_lock::LockBeat::Lost));
-            (completion.lease.take(), lock_lost)
-        }
-        None => (None, false),
-    };
-    LockReleaseOutcome::Completed {
-        result: lease.map_or(Ok(()), ClaimedSessionLock::release),
-        lock_lost,
+fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
+    match settle_lock_state(state, AGENT_SHUTDOWN_TIMEOUT) {
+        LockSettlement::Held(lease) => lease.release(),
+        LockSettlement::Lost | LockSettlement::None => Ok(()),
+        LockSettlement::TimedOut => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "session lock heartbeat did not finish before shutdown timeout",
+        )),
     }
 }
 
@@ -526,7 +519,6 @@ struct SessionRuntime {
     session_lock: Option<SessionLockState>,
     lock_lost: bool,
     restore_pending: bool,
-    pending_replacement: Option<PendingReplacement>,
 }
 
 struct PendingReplacement {
@@ -598,25 +590,20 @@ impl PreparedSessionRuntime {
             session_lock,
             lock_lost: false,
             restore_pending: resumed,
-            pending_replacement: None,
         }
     }
 }
 
-fn defer_replacement_for_heartbeat(
-    runtime: &mut SessionRuntime,
-    pending: PendingReplacement,
-) -> Option<PendingReplacement> {
-    let same_id = runtime.id() == pending.prepared.app.session_id();
-    if same_id && matches!(runtime.session_lock, Some(SessionLockState::InFlight(_))) {
-        if runtime.pending_replacement.is_none() {
-            runtime.pending_replacement = Some(pending);
-        } else {
-            runtime.app.flash(REPLACEMENT_PENDING_ERR.into());
-        }
-        None
+fn ensure_replacement_lock_available(
+    current: &SessionRuntime,
+    target_id: MakiId,
+) -> Result<(), &'static str> {
+    if current.id() == target_id
+        && matches!(current.session_lock, Some(SessionLockState::InFlight(_)))
+    {
+        Err(LOCK_UNAVAILABLE_REPLACEMENT_ERR)
     } else {
-        Some(pending)
+        Ok(())
     }
 }
 
@@ -665,16 +652,10 @@ impl SessionRuntime {
     }
 
     fn update(&mut self, msg: Msg) -> Vec<Action> {
-        if self.pending_replacement.is_some() && matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
-            return Vec::new();
-        }
         self.app.update(msg)
     }
 
     fn submit_text(&mut self, text: String) -> Result<SubmitOutcome, String> {
-        if self.pending_replacement.is_some() {
-            return Err(REPLACEMENT_PENDING_ERR.into());
-        }
         Ok(self.app.submit_prompt(QueuedMessage {
             text,
             images: Vec::new(),
@@ -1306,10 +1287,7 @@ impl<'t> EventLoop<'t> {
                 else {
                     return;
                 };
-                let pending = complete_runtime_heartbeat(&mut self.sessions[idx]);
-                if let Some(pending) = pending {
-                    self.commit_replacement(idx, pending);
-                }
+                complete_runtime_heartbeat(&mut self.sessions[idx]);
             }
         }
     }
@@ -2208,6 +2186,12 @@ impl<'t> EventLoop<'t> {
     }
 
     fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
+        if let Err(error) =
+            ensure_replacement_lock_available(&self.sessions[idx], request.session.id)
+        {
+            self.sessions[idx].app.flash(error.into());
+            return;
+        }
         let pending = match self.prepare_replacement(idx, request) {
             Ok(pending) => pending,
             Err(error) => {
@@ -2215,9 +2199,7 @@ impl<'t> EventLoop<'t> {
                 return;
             }
         };
-        if let Some(pending) = defer_replacement_for_heartbeat(&mut self.sessions[idx], pending) {
-            self.commit_replacement(idx, pending);
-        }
+        self.commit_replacement(idx, pending);
     }
 
     fn set_focused(&mut self, next: usize) {
@@ -2548,6 +2530,7 @@ impl<'t> EventLoop<'t> {
         let heartbeat_deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
         let mut tabs = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
+        let mut session_leases = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
                 mut app,
@@ -2557,26 +2540,18 @@ impl<'t> EventLoop<'t> {
                 ..
             } = rt;
             let heartbeat_timeout = heartbeat_deadline.saturating_duration_since(Instant::now());
-            let lock_released_safely = match release_lock_state_with_timeout(
-                session_lock,
-                heartbeat_timeout,
-            ) {
-                LockReleaseOutcome::Completed {
-                    result,
-                    lock_lost: heartbeat_lock_lost,
-                } => {
-                    if let Err(error) = result {
-                        warn!(id = %app.state.session.id, %error, "session lock release failed");
+            let settled_lock = settle_lock_state(session_lock, heartbeat_timeout);
+            match settled_lock {
+                LockSettlement::Held(lease) => {
+                    if !lock_lost {
+                        app.checkpoint_now();
                     }
-                    !heartbeat_lock_lost
+                    session_leases.push((app.state.session.id, lease));
                 }
-                LockReleaseOutcome::TimedOut => {
+                LockSettlement::TimedOut => {
                     warn!(id = %app.state.session.id, "session lock heartbeat timed out during shutdown");
-                    false
                 }
-            };
-            if !lock_lost && lock_released_safely {
-                app.checkpoint_now();
+                LockSettlement::Lost | LockSettlement::None => {}
             }
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
@@ -2597,12 +2572,19 @@ impl<'t> EventLoop<'t> {
             }
         }
         let storage_drain_ms = lap();
+        for (id, lease) in session_leases {
+            if let Err(error) = lease.release() {
+                warn!(%id, %error, "session lock release failed");
+            }
+        }
+        let release_locks_ms = lap();
         info!(
             kill_mcp_ms,
             save_sessions_ms,
             join_agents_ms,
             mcp_shutdown_ms,
             storage_drain_ms,
+            release_locks_ms,
             total_ms = started.elapsed().as_millis() as u64,
             "ui shutdown phases"
         );
@@ -3406,11 +3388,9 @@ mod tests {
         release_runtime(runtime);
     }
 
-    #[test_case(session_lock::LockBeat::Held ; "held_commits")]
-    #[test_case(session_lock::LockBeat::Lost ; "lost_reports_lock_loss")]
-    fn same_id_replacement_waits_for_in_flight_heartbeat(beat: session_lock::LockBeat) {
+    #[test]
+    fn same_id_replacement_rejects_in_flight_lease() {
         const OUTGOING_DRAFT: &str = "draft before replacement";
-        const PROGRAMMATIC_PROMPT: &str = "programmatic submission";
         const RESTORED_DRAFT: &str = "replacement restored prompt";
 
         let harness = RuntimeHarness::new();
@@ -3420,85 +3400,70 @@ mod tests {
         runtime.app.input_box.set_input(OUTGOING_DRAFT.into());
         session.meta.input_draft = Some(RESTORED_DRAFT.into());
         let generation = runtime.generation;
+        let target = runtime.app.command_target.id();
+        let (manager, root) = runtime.handles.manager_and_root();
+        let provider = harness.ctx().model_slot.load().provider.identity();
+        let target_count = harness.target_count();
         let (internal_tx, internal_rx) = flume::unbounded();
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
         start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            (lease, Ok(beat))
+            (lease, Ok(session_lock::LockBeat::Held))
         });
         entered_rx.recv().unwrap();
-        let prepared = harness.ctx().prepare_runtime_with_provider_and_permissions(
-            session,
-            None,
-            runtime.app.permissions.as_ref(),
+
+        assert_eq!(
+            ensure_replacement_lock_available(&runtime, id),
+            Err(LOCK_UNAVAILABLE_REPLACEMENT_ERR)
         );
-        let pending = PendingReplacement {
-            prepared,
-            kind: SessionReplacementKind::Rewind,
-            post_commit: None,
-        };
-
-        assert!(defer_replacement_for_heartbeat(&mut runtime, pending).is_none());
-        assert!(runtime.pending_replacement.is_some());
-        assert_eq!(runtime.id(), id);
-
-        let edit_actions = runtime.update(Msg::Key(crate::components::key(
-            crossterm::event::KeyCode::Char('x'),
-        )));
-        assert!(edit_actions.is_empty());
-        assert_eq!(runtime.app.input_box.buffer.value(), OUTGOING_DRAFT);
-        let submit_actions = runtime.update(Msg::Key(crate::components::key(
-            crossterm::event::KeyCode::Enter,
-        )));
-        assert!(submit_actions.is_empty());
+        assert_eq!(runtime.generation, generation);
+        assert_eq!(runtime.app.command_target.id(), target);
+        assert_eq!(
+            runtime.handles.manager_and_root().0.generation(),
+            manager.generation()
+        );
+        assert_eq!(runtime.handles.manager_and_root().1, root);
+        assert_eq!(
+            harness.ctx().model_slot.load().provider.identity(),
+            provider
+        );
+        assert_eq!(harness.target_count(), target_count);
         assert_eq!(runtime.app.input_box.buffer.value(), OUTGOING_DRAFT);
         assert!(matches!(
-            runtime.submit_text(PROGRAMMATIC_PROMPT.into()),
-            Err(ref error) if error == REPLACEMENT_PENDING_ERR
+            runtime.session_lock,
+            Some(SessionLockState::InFlight(_))
         ));
-        assert!(runtime.handles.queue.is_empty());
 
         release_tx.send(()).unwrap();
         let InternalEvent::SessionHeartbeat(event_generation) = internal_rx.recv().unwrap() else {
             panic!("expected heartbeat completion");
         };
         assert_eq!(event_generation, generation);
+        complete_runtime_heartbeat(&mut runtime);
         assert!(matches!(
             runtime.session_lock,
-            Some(SessionLockState::InFlight(_))
+            Some(SessionLockState::Held(_))
         ));
+        ensure_replacement_lock_available(&runtime, id).unwrap();
 
-        let pending = complete_runtime_heartbeat(&mut runtime);
-        if beat == session_lock::LockBeat::Held {
-            let old = replace_session_runtime(
-                &mut runtime,
-                pending.expect("replacement remains pending").prepared,
-                &harness.ctx().sessions_dir,
-                &harness.ctx().model_slot,
-            );
-            let old = match old {
-                Ok(old) => old,
-                Err(error) => panic!("verified lease should transfer: {error}"),
-            };
-            assert_eq!(runtime.id(), id);
-            assert!(!runtime.lock_lost);
-            assert_eq!(runtime.app.input_box.buffer.value(), RESTORED_DRAFT);
-            let actions = runtime.update(Msg::Key(crate::components::key(
-                crossterm::event::KeyCode::Enter,
-            )));
-            assert!(matches!(
-                actions.as_slice(),
-                [Action::SendMessage(input)] if input.message == RESTORED_DRAFT
-            ));
-            release_runtime(old);
-        } else {
-            assert!(pending.is_none());
-            assert!(runtime.pending_replacement.is_none());
-            assert!(runtime.lock_lost);
-            assert_eq!(runtime.app.exit_request, ExitRequest::Error);
-        }
+        let prepared = harness.ctx().prepare_runtime_with_provider_and_permissions(
+            session,
+            None,
+            runtime.app.permissions.as_ref(),
+        );
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+        assert_eq!(runtime.id(), id);
+        assert_ne!(runtime.generation, generation);
+        assert_eq!(runtime.app.input_box.buffer.value(), RESTORED_DRAFT);
+        release_runtime(old);
         release_runtime(runtime);
     }
 
@@ -3542,20 +3507,24 @@ mod tests {
         let (cleanup_done_tx, cleanup_done_rx) = flume::bounded(1);
         let cleanup = std::thread::spawn(move || {
             cleanup_started_tx.send(()).unwrap();
-            let result = release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT);
+            let result = settle_lock_state(state, AGENT_SHUTDOWN_TIMEOUT);
             cleanup_done_tx.send(result).unwrap();
         });
         cleanup_started_rx.recv().unwrap();
         assert!(cleanup_done_rx.try_recv().is_err());
 
         release_tx.send(()).unwrap();
-        let LockReleaseOutcome::Completed { result, lock_lost } = cleanup_done_rx.recv().unwrap()
-        else {
-            panic!("heartbeat cleanup timed out");
+        let LockSettlement::Held(lease) = cleanup_done_rx.recv().unwrap() else {
+            panic!("heartbeat cleanup did not retain held lease");
         };
-        result.unwrap();
-        assert!(!lock_lost);
         cleanup.join().unwrap();
+        assert!(
+            session_lock::claim(&harness.ctx().sessions_dir, &id)
+                .unwrap()
+                .is_none(),
+            "settlement released the held lease"
+        );
+        lease.release().unwrap();
         assert!(!session_lock::open_elsewhere(
             &harness.ctx().sessions_dir,
             &id
@@ -3566,6 +3535,50 @@ mod tests {
             .release()
             .unwrap();
         release_runtime(runtime);
+    }
+
+    #[test]
+    fn shutdown_retains_held_lock_through_storage_drain() {
+        const FINAL_MESSAGE: &str = "final checkpoint";
+
+        let mut harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let id = runtime.id();
+        runtime.app.input_box.set_input(FINAL_MESSAGE.into());
+        let LockSettlement::Held(lease) =
+            settle_lock_state(runtime.session_lock.take(), RUNTIME_SHUTDOWN_TIMEOUT)
+        else {
+            panic!("runtime must retain its held lease");
+        };
+        runtime.app.checkpoint_now();
+
+        let manager = runtime.handles.manager_and_root().0;
+        drop(runtime);
+        shutdown_manager(&manager);
+        let ctx = harness.ctx.take().unwrap();
+        let storage = ctx.storage.clone();
+        let sessions_dir = storage.path().join(SESSIONS_DIR);
+        let storage_writer = Arc::clone(&ctx.storage_writer);
+        drop(ctx);
+        assert!(
+            session_lock::claim(&sessions_dir, &id).unwrap().is_none(),
+            "lock released before storage drain"
+        );
+        Arc::try_unwrap(storage_writer)
+            .unwrap_or_else(|_| panic!("test owns storage writer"))
+            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+        assert!(
+            session_lock::claim(&sessions_dir, &id).unwrap().is_none(),
+            "lock released by storage drain"
+        );
+
+        lease.release().unwrap();
+        let claimed = session_lock::claim(&sessions_dir, &id)
+            .unwrap()
+            .expect("lock claim succeeds after release");
+        claimed.release().unwrap();
+        let stored = AppSession::load(id, &storage).unwrap();
+        assert_eq!(stored.meta.input_draft.as_deref(), Some(FINAL_MESSAGE));
     }
 
     #[test]
@@ -3598,27 +3611,17 @@ mod tests {
         let (cleanup_done_tx, cleanup_done_rx) = flume::bounded(1);
         let cleanup = std::thread::spawn(move || {
             cleanup_done_tx
-                .send(release_lock_state_with_timeout(
-                    state,
-                    AGENT_SHUTDOWN_TIMEOUT,
-                ))
+                .send(settle_lock_state(state, AGENT_SHUTDOWN_TIMEOUT))
                 .unwrap();
         });
         assert!(cleanup_done_rx.try_recv().is_err());
         heartbeat_release_tx.send(()).unwrap();
-        let LockReleaseOutcome::Completed {
-            result,
-            lock_lost: heartbeat_lock_lost,
-        } = cleanup_done_rx.recv().unwrap()
-        else {
-            panic!("heartbeat cleanup timed out");
-        };
-        result.unwrap();
+        assert!(matches!(
+            cleanup_done_rx.recv().unwrap(),
+            LockSettlement::Lost
+        ));
         cleanup.join().unwrap();
 
-        if !runtime.lock_lost && !heartbeat_lock_lost {
-            runtime.app.checkpoint_now();
-        }
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
@@ -3661,19 +3664,8 @@ mod tests {
         });
         entered_rx.recv().unwrap();
 
-        let outcome = release_lock_state_with_timeout(runtime.session_lock.take(), Duration::ZERO);
-        assert!(matches!(&outcome, LockReleaseOutcome::TimedOut));
-        if !runtime.lock_lost
-            && matches!(
-                &outcome,
-                LockReleaseOutcome::Completed {
-                    lock_lost: false,
-                    ..
-                }
-            )
-        {
-            runtime.app.checkpoint_now();
-        }
+        let outcome = settle_lock_state(runtime.session_lock.take(), Duration::ZERO);
+        assert!(matches!(&outcome, LockSettlement::TimedOut));
         heartbeat_release_tx.send(()).unwrap();
         smol::block_on(async {
             while session_lock::open_elsewhere(&harness.ctx().sessions_dir, &id) {

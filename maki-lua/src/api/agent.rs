@@ -872,12 +872,12 @@ async fn session(
         crate::runtime::current_managed_turn(&lua),
     ) {
         (Some(expected), Some(active)) if expected.same_authority(&active) => Some(active),
-        (Some(_), _) => {
+        (None, None) => None,
+        _ => {
             return Ok(err_pair(
                 "managed agent authority is not active in this invocation",
             ));
         }
-        (None, _) => None,
     };
     drop(ctx);
     let model_spec: Option<String> = opts.get("model_spec")?;
@@ -920,11 +920,11 @@ async fn session(
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) =
         try_pair!(build_session_provider(&model_spec, inherit_provider, &agent_ctx).await);
-    // A standalone task shows its model via SubagentInfo on the header;
-    // a dispatching caller (batch) gets the same thing as a live annotation.
-    if !silent && let Some(sink) = &agent_ctx.live_sink {
-        let _ = sink.send(ToolLive::Annotation(model.spec()));
+    if let Some(current) = &managed_turn {
+        try_pair!(current.validate_active());
     }
+    let model_annotation = model.spec();
+    let model_id = model.id.clone();
 
     let mut tools_json: JsonValue = match tools_val {
         Some(val) => {
@@ -997,16 +997,6 @@ async fn session(
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
 
-    smol::spawn(relay_session_events(
-        sub_rx,
-        parent_tx.clone(),
-        Arc::clone(&subagent_info),
-        agent_ctx.live_sink.clone(),
-        silent,
-        None,
-    ))
-    .detach();
-
     // Register a cancel trigger so the child token does not fire on drop
     // and kill the subagent at birth. The fallback key gets its own id:
     // it keys `subagent_cancels`, so sharing the session id would make two
@@ -1024,7 +1014,6 @@ async fn session(
     let (child_trigger, child_cancel) = CancelToken::new();
 
     let name = name.unwrap_or_default();
-    info!(name = %name, model = %model.id, "subagent session opened");
 
     // UI input relay: tab submits from the parent dispatch into this session.
     // Each message is admitted to the actor as its own turn (no second FIFO;
@@ -1076,7 +1065,7 @@ async fn session(
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
         ui_id: ui_id.clone(),
-        parent_event_tx: parent_tx,
+        parent_event_tx: parent_tx.clone(),
         input_tx: ui_input_tx.clone(),
         cancel,
         parent_agent_id,
@@ -1142,6 +1131,22 @@ async fn session(
             },
         )
     };
+    // A standalone task shows its model via SubagentInfo on the header;
+    // a dispatching caller (batch) gets the same thing as a live annotation.
+    if !silent && let Some(sink) = &agent_ctx.live_sink {
+        let _ = sink.send(ToolLive::Annotation(model_annotation));
+    }
+    info!(name = %name, model = %model_id, "subagent session opened");
+    smol::spawn(relay_session_events(
+        sub_rx,
+        parent_tx.clone(),
+        Arc::clone(&subagent_info),
+        agent_ctx.live_sink.clone(),
+        silent,
+        None,
+    ))
+    .detach();
+
     let agent_id = actor.agent_id();
     *cancel_actor.lock().unwrap() = Some(actor.clone());
     let thinking = state.thinking;
@@ -1381,6 +1386,12 @@ impl Drop for LuaSession {
 /// kept across calls, so you can have a multi-turn conversation. This is a
 /// blocking compatibility wrapper over `send` + the completion notifier; the
 /// async `send`/`status` pair is preferred for background work.
+///
+/// In a managed invocation, `prompt` validates the current turn and temporarily
+/// yields its manager permit while the child runs. Without a current managed
+/// invocation, the same managed session uses an ordinary exact-turn wait. The
+/// child still uses manager capacity, but no parent permit is yielded. A timeout
+/// closes the child's managed subtree.
 ///
 /// The returned table has fields: `text` (string), `duration_ms` (integer),
 /// `input_tokens` (integer), `output_tokens` (integer). `text` is an empty

@@ -30,6 +30,9 @@ const RETAIN_ASYNC_TOOL_NAME: &str = "managed_session_retain_async";
 const RELEASE_ASYNC_TOOL_NAME: &str = "managed_session_release_async";
 const RETAIN_NESTED_TOOL_NAME: &str = "managed_session_retain_nested";
 const RETRY_NESTED_TOOL_NAME: &str = "managed_session_retry_nested";
+const CAPTURE_UNMANAGED_CTX_TOOL_NAME: &str = "capture_unmanaged_ctx";
+const REJECT_FOREIGN_CTX_TOOL_NAME: &str = "reject_foreign_unmanaged_ctx";
+const MANAGED_AUTHORITY_ERROR: &str = "managed agent authority is not active in this invocation";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
 const NESTED_RESULT: &str = "nested child result";
 const MANAGED_NESTED_SPAWN_ERR: &str = "managed general subagents must use the blocking task tool";
@@ -72,6 +75,35 @@ local retained_task_id
 local managed_authority_turn = 0
 local release_async_worker
 local finish_async_wait
+local retained_unmanaged_ctx
+
+maki.api.register_tool({
+  name = "capture_unmanaged_ctx",
+  description = "retain an unmanaged invocation context",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function(_, ctx)
+    retained_unmanaged_ctx = ctx
+    return "ok"
+  end,
+})
+
+maki.api.register_tool({
+  name = "reject_foreign_unmanaged_ctx",
+  description = "reject an unmanaged context inside a managed invocation",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function()
+    local session, err = maki.agent.session(retained_unmanaged_ctx, {
+      audience = {},
+      model_spec = "not/a/model",
+    })
+    if session ~= nil or err ~= "managed agent authority is not active in this invocation" then
+      return { llm_output = "unexpected foreign context result: " .. tostring(err), is_error = true }
+    end
+    return "ok"
+  end,
+})
 
 maki.api.register_tool({
   name = "managed_session_join",
@@ -935,6 +967,69 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
             second_ticket.wait().await,
             TurnOutcome::Completed { .. }
         ));
+
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        let (mut unmanaged_context, unmanaged_events, _cancel) = common::ctx_with_canned_provider();
+        let (live_tx, live_rx) = flume::unbounded();
+        unmanaged_context.live_sink = Some(live_tx);
+        let capture = registry
+            .get(CAPTURE_UNMANAGED_CTX_TOOL_NAME)
+            .unwrap()
+            .tool
+            .parse(&json!({}))
+            .unwrap();
+        assert!(capture.execute(&unmanaged_context).await.output.is_ok());
+
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(LuaToolBackend {
+                    registry,
+                    context: unmanaged_context,
+                    completed: completed_tx,
+                    tool_name: REJECT_FOREIGN_CTX_TOOL_NAME,
+                }),
+            )
+            .unwrap();
+        let before = manager.node(root.id()).unwrap();
+        assert_eq!(manager.snapshot().len(), 1);
+        assert!(before.children.is_empty());
+        let ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
+
+        assert_eq!(
+            completed_rx.recv_async().await.unwrap(),
+            Ok(()),
+            "{MANAGED_AUTHORITY_ERROR}"
+        );
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        let after = manager.node(root.id()).unwrap();
+        assert_eq!(manager.snapshot().len(), 1);
+        assert_eq!(after.agent_id, before.agent_id);
+        assert_eq!(after.parent_id, before.parent_id);
+        assert_eq!(after.root_id, before.root_id);
+        assert_eq!(after.depth, before.depth);
+        assert_eq!(after.children, before.children);
+        assert_eq!(after.graph_lifecycle, before.graph_lifecycle);
+        assert_eq!(after.metadata, before.metadata);
+        assert!(unmanaged_events.is_empty());
+        assert!(live_rx.is_empty());
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

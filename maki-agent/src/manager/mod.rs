@@ -125,6 +125,8 @@ pub(crate) struct ManagerInner {
     prompt_wait_registration_gate: Mutex<Option<TestGate>>,
     #[cfg(test)]
     descendant_cut_gate: Mutex<Option<TestGate>>,
+    #[cfg(test)]
+    managed_acquire_gate: Mutex<Option<TestGate>>,
 }
 
 #[derive(Clone)]
@@ -163,6 +165,8 @@ impl AgentManagerHandle {
             prompt_wait_registration_gate: Mutex::new(None),
             #[cfg(test)]
             descendant_cut_gate: Mutex::new(None),
+            #[cfg(test)]
+            managed_acquire_gate: Mutex::new(None),
         })))
     }
 }
@@ -833,7 +837,7 @@ impl AgentManagerHandle {
     }
 
     pub async fn shutdown(&self, timeout: Duration) -> ShutdownReport {
-        let (ids, actors) = {
+        let (ids, actors, finished_tombstone_tasks) = {
             let mut graph = self.lock_graph();
             graph.shutting_down = true;
             self.0.shutdown.store(true, Ordering::Release);
@@ -841,10 +845,7 @@ impl AgentManagerHandle {
                 .nodes
                 .iter()
                 .filter_map(|(&id, node)| {
-                    (node.lifecycle.consumes_capacity()
-                        || node.reservation_pending
-                        || node.task.is_some())
-                    .then_some(id)
+                    (node.lifecycle.consumes_capacity() || node.reservation_pending).then_some(id)
                 })
                 .collect();
             for id in &ids {
@@ -856,10 +857,23 @@ impl AgentManagerHandle {
                 .iter()
                 .filter_map(|id| graph.nodes[id].actor.clone())
                 .collect::<Vec<_>>();
-            (ids, actors)
+            let finished_tombstone_tasks = graph
+                .nodes
+                .values_mut()
+                .filter(|node| {
+                    !node.lifecycle.consumes_capacity()
+                        && !node.reservation_pending
+                        && node.task.as_ref().is_some_and(smol::Task::is_finished)
+                })
+                .filter_map(|node| node.task.take())
+                .collect::<Vec<_>>();
+            (ids, actors, finished_tombstone_tasks)
         };
         for actor in &actors {
             actor.shutdown();
+        }
+        for task in finished_tombstone_tasks {
+            task.await;
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1021,16 +1035,31 @@ impl AgentManagerHandle {
             vec![agent_id]
         };
         let mut actors = Vec::new();
+        let mut reserved_marked_count = 0;
         for id in ids {
             let Some(node) = graph.nodes.get_mut(&id) else {
                 continue;
             };
             if node.lifecycle == GraphLifecycle::Reserved {
                 node.cancel_on_commit = true;
+                reserved_marked_count += 1;
             } else if let Some(actor) = &node.actor {
                 actors.push(actor.clone());
             }
         }
+        graph.revision += 1;
+        let revision = graph.revision;
+        let captured_actor_count = actors.len();
+        drop(graph);
+        info!(
+            manager_generation = self.0.generation,
+            target = %agent_id,
+            subtree,
+            revision,
+            captured_actor_count,
+            reserved_marked_count,
+            "agent cancellation cut captured"
+        );
         Ok(actors)
     }
 
@@ -1059,16 +1088,23 @@ impl AgentManagerHandle {
         if !include_root {
             ids.remove(0);
         }
-        for id in &ids {
-            if let Some(node) = graph.nodes.get_mut(id) {
-                node.lifecycle = GraphLifecycle::Closing;
-            }
-        }
-        graph.revision += u64::from(!ids.is_empty());
-        Ok(ids
+        let mut transitioned = false;
+        let actors = ids
             .into_iter()
-            .filter_map(|id| graph.nodes.get(&id)?.actor.clone())
-            .collect())
+            .filter_map(|id| {
+                let node = graph.nodes.get_mut(&id)?;
+                if !node.lifecycle.consumes_capacity() {
+                    return None;
+                }
+                if node.lifecycle != GraphLifecycle::Closing {
+                    node.lifecycle = GraphLifecycle::Closing;
+                    transitioned = true;
+                }
+                node.actor.clone()
+            })
+            .collect();
+        graph.revision += u64::from(transitioned);
+        Ok(actors)
     }
 
     fn subtree_ids(graph: &GraphState, root: AgentId) -> Vec<AgentId> {
@@ -1128,6 +1164,20 @@ impl AgentManagerHandle {
     #[cfg(test)]
     fn wait_at_descendant_cut_gate(&self) {
         self.wait_at_test_gate(&self.0.descendant_cut_gate);
+    }
+
+    #[cfg(test)]
+    fn set_managed_acquire_gate(&self, entered: flume::Sender<()>, release: flume::Receiver<()>) {
+        *self
+            .0
+            .managed_acquire_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(TestGate { entered, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_managed_acquire_gate(&self) {
+        self.wait_at_test_gate(&self.0.managed_acquire_gate);
     }
 
     #[cfg(test)]
@@ -1549,6 +1599,8 @@ pub(crate) async fn enter_managed_turn(
     if inner.shutdown.load(Ordering::Acquire) {
         return Err(crate::TurnCancellationReason::Shutdown);
     }
+    #[cfg(test)]
+    AgentManagerHandle(Arc::clone(&inner)).wait_at_managed_acquire_gate();
     let permit = cancel.race(inner.limiter.acquire_arc()).await?;
     if inner.shutdown.load(Ordering::Acquire) {
         return Err(crate::TurnCancellationReason::Shutdown);
