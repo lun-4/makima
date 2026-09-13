@@ -826,6 +826,7 @@ data: [DONE]\n";
             while let Ok(e) = rx.try_recv() {
                 match e {
                     ProviderEvent::ThinkingDelta { text } => thinking.push(text),
+                    ProviderEvent::ThinkingBlockEnd => {}
                     ProviderEvent::TextDelta { text } => text_deltas.push(text),
                     ProviderEvent::ToolUseStart { .. } => {}
                     ProviderEvent::PromptProgress { .. } => {}

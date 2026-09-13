@@ -340,6 +340,9 @@ pub enum ProviderEvent {
     ThinkingDelta {
         text: String,
     },
+    /// The current reasoning block is complete; the next `ThinkingDelta`
+    /// belongs to a new block.
+    ThinkingBlockEnd,
     ToolUseStart {
         id: String,
         name: String,

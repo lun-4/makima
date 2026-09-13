@@ -11,6 +11,9 @@ use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteE
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
 const MIN_FENCE_LEN: usize = 3;
+/// ACP has no block-boundary primitive, so consecutive thinking chunks are
+/// kept visually separate with a paragraph break.
+const THINKING_SEPARATOR: &str = "\n\n";
 /// Model pricing is quoted in US dollars, so that is the reported currency.
 const CURRENCY: &str = "USD";
 
@@ -77,6 +80,10 @@ pub fn thinking_delta(text: &str) -> SessionUpdate {
     SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
         text.to_string(),
     ))))
+}
+
+pub fn thinking_block_end() -> SessionUpdate {
+    thinking_delta(THINKING_SEPARATOR)
 }
 
 pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {
@@ -341,10 +348,16 @@ fn replay_assistant(
     cwd: &Path,
     home: Option<&Path>,
 ) {
+    let mut prev_thinking = false;
     for block in &msg.content {
         match block {
             MsgBlock::Text { text } => updates.push(text_delta(text)),
-            MsgBlock::Thinking { thinking, .. } => updates.push(thinking_delta(thinking)),
+            MsgBlock::Thinking { thinking, .. } => {
+                if prev_thinking {
+                    updates.push(thinking_block_end());
+                }
+                updates.push(thinking_delta(thinking));
+            }
             MsgBlock::ToolUse {
                 id, name, input, ..
             } => {
@@ -352,6 +365,7 @@ fn replay_assistant(
             }
             _ => {}
         }
+        prev_thinking = matches!(block, MsgBlock::Thinking { .. });
     }
 }
 
@@ -505,6 +519,33 @@ mod tests {
     #[test]
     fn replay_hides_synthetic_messages() {
         assert!(updates_json(&[Message::synthetic("injected".into())]).is_empty());
+    }
+
+    #[test]
+    fn thinking_block_end_emits_separator() {
+        let json = serde_json::to_value(thinking_block_end()).unwrap();
+        assert_eq!(json["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(json["content"]["text"], THINKING_SEPARATOR);
+    }
+
+    #[test]
+    fn replay_separates_consecutive_thinking_blocks() {
+        let msg = assistant(vec![
+            MsgBlock::Thinking {
+                thinking: "first".into(),
+                signature: None,
+            },
+            MsgBlock::Thinking {
+                thinking: "second".into(),
+                signature: None,
+            },
+        ]);
+        let json = updates_json(&[msg]);
+        assert_eq!(json.len(), 3);
+        assert_eq!(json[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(json[0]["content"]["text"], "first");
+        assert_eq!(json[1]["content"]["text"], THINKING_SEPARATOR);
+        assert_eq!(json[2]["content"]["text"], "second");
     }
 
     #[test]

@@ -219,6 +219,25 @@ fn thinking_delta_separate_from_text() {
 }
 
 #[test]
+fn thinking_block_end_starts_new_block() {
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel.thinking_delta("first");
+    panel.end_thinking_block();
+    panel.thinking_delta("second");
+    panel.flush();
+
+    assert_eq!(panel.messages.len(), 2);
+    assert_eq!(panel.messages[0].role, DisplayRole::Thinking);
+    assert_eq!(panel.messages[0].text, "first");
+    assert_eq!(panel.messages[1].role, DisplayRole::Thinking);
+    assert_eq!(panel.messages[1].text, "second");
+}
+
+#[test]
 fn scroll_up_pins_viewport_during_streaming() {
     let mut panel = MessagesPanel::new(
         UiConfig::default(),

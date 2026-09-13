@@ -753,6 +753,9 @@ pub enum AgentEvent {
     ThinkingDelta {
         text: String,
     },
+    /// The current reasoning block is complete; the next `ThinkingDelta`
+    /// belongs to a new block.
+    ThinkingBlockEnd,
     ToolPending {
         id: String,
         name: String,

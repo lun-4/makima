@@ -32,6 +32,8 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+const SETTLE_POLL: Duration = Duration::from_millis(1);
 const TASK_ID: &str = "task1";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
@@ -964,13 +966,25 @@ fn cmd(name: &str) -> ParsedCommand {
     }
 }
 
-fn settle_command_palette(app: &mut App) {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while app.command_palette.cadence() == Cadence::PENDING {
-        let _ = app.tick();
-        assert!(Instant::now() < deadline, "command palette did not settle");
-        std::thread::yield_now();
+/// Waits until `cond` holds. The deadline is a hang detector with generous
+/// headroom, not a runtime budget: the matcher and probe threads answering
+/// these conditions legitimately stall for seconds under CI contention.
+fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting: {what}");
+        std::thread::sleep(SETTLE_POLL);
     }
+}
+
+fn settle_command_palette(app: &mut App) {
+    wait_for(
+        || {
+            let _ = app.tick();
+            app.command_palette.cadence() != Cadence::PENDING
+        },
+        "command palette did not settle",
+    );
 }
 
 fn type_slash(app: &mut App) {
@@ -1085,19 +1099,14 @@ fn lifecycle_app() -> (
         insertion: "alpha".into(),
         description: None,
     }];
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while probe.try_finish_command_arguments(items.clone()).is_none() {
-        assert!(Instant::now() < deadline, "completion request was not sent");
-        std::thread::yield_now();
-    }
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while app.command_palette.poll_arguments() != Dirty::YES {
-        assert!(
-            Instant::now() < deadline,
-            "completion result was not applied"
-        );
-        std::thread::yield_now();
-    }
+    wait_for(
+        || probe.try_finish_command_arguments(items.clone()).is_some(),
+        "completion request was not sent",
+    );
+    wait_for(
+        || app.command_palette.poll_arguments() == Dirty::YES,
+        "completion result was not applied",
+    );
     let _ = probe.try_finish_command_argument_lifecycle();
     (app, probe, producer)
 }
@@ -1137,14 +1146,10 @@ fn argument_completion_retains_old_rows_while_request_pending() {
         .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
     assert!(app.command_palette.completion_session_id().is_some());
     assert!(rendered(&mut app).contains("old-result"));
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while probe.try_finish_command_arguments(Vec::new()).is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "argument completion request was not sent"
-        );
-        std::thread::yield_now();
-    }
+    wait_for(
+        || probe.try_finish_command_arguments(Vec::new()).is_some(),
+        "argument completion request was not sent",
+    );
 }
 
 #[test]
@@ -1175,32 +1180,22 @@ fn unmatched_completion_items_cancel_the_argument_session() {
     app.command_palette
         .sync_arguments("/deploy z", 9, &app.state.mode.id_key());
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if probe
-            .try_finish_command_arguments(vec![CommandArgumentItem {
-                label: "alpha".into(),
-                insertion: "alpha".into(),
-                description: None,
-            }])
-            .is_some()
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "completion request was not sent");
-        std::thread::yield_now();
-    }
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if app.command_palette.poll_arguments() == Dirty::YES {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "completion result was not applied"
-        );
-        std::thread::yield_now();
-    }
+    wait_for(
+        || {
+            probe
+                .try_finish_command_arguments(vec![CommandArgumentItem {
+                    label: "alpha".into(),
+                    insertion: "alpha".into(),
+                    description: None,
+                }])
+                .is_some()
+        },
+        "completion request was not sent",
+    );
+    wait_for(
+        || app.command_palette.poll_arguments() == Dirty::YES,
+        "completion result was not applied",
+    );
 
     assert!(app.command_palette.completion_session_id().is_none());
     assert_eq!(
@@ -1599,32 +1594,22 @@ fn argument_completion_tab_preserves_command_for_next_request() {
 
     app.update(Msg::Key(key(KeyCode::Char('x'))));
     assert_eq!(app.input_box.buffer.value(), "/de candidate-0x");
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if probe
-            .try_finish_command_arguments(vec![CommandArgumentItem {
-                label: "candidate-0x".into(),
-                insertion: "candidate-0x".into(),
-                description: None,
-            }])
-            .is_some()
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "completion request was not sent");
-        std::thread::yield_now();
-    }
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if app.command_palette.poll_arguments() == Dirty::YES {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "completion result was not applied"
-        );
-        std::thread::yield_now();
-    }
+    wait_for(
+        || {
+            probe
+                .try_finish_command_arguments(vec![CommandArgumentItem {
+                    label: "candidate-0x".into(),
+                    insertion: "candidate-0x".into(),
+                    description: None,
+                }])
+                .is_some()
+        },
+        "completion request was not sent",
+    );
+    wait_for(
+        || app.command_palette.poll_arguments() == Dirty::YES,
+        "completion result was not applied",
+    );
     assert_eq!(
         app.command_palette
             .confirm("/de candidate-0x")
@@ -6938,15 +6923,13 @@ fn seed_skill(backend: &maki_lua::TestCompletionBackend, name: &str) {
 /// Lets the completion popup's walker finish and nucleo converge, waiting until
 /// the popup is actually offering a selectable item.
 fn converge_completion(app: &mut App) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let _ = app.file_completion.tick();
-        if app.file_completion.has_selectable() {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    panic!("@-completion popup never offered a selectable item");
+    wait_for(
+        || {
+            let _ = app.file_completion.tick();
+            app.file_completion.has_selectable()
+        },
+        "@-completion popup never offered a selectable item",
+    );
 }
 
 #[test]
