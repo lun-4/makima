@@ -249,7 +249,9 @@ impl CommandPalette {
         if !self.is_active() {
             return CommandAction::Passthrough;
         }
-        if self.is_typed_path_grid() {
+        if self.is_typed_path_grid()
+            && (self.argument_publication.is_pending() || !self.argument_items.is_empty())
+        {
             let selected = self.argument_grid.selected();
             if self.argument_grid.handle_key(
                 &key,
@@ -1908,6 +1910,39 @@ mod tests {
             release_tx,
             events,
         )
+    }
+
+    #[test_case(None; "empty")]
+    #[test_case(Some("other"); "nonmatching")]
+    fn settled_path_completion_without_visible_rows_allows_cursor_keys(label: Option<&str>) {
+        let (mut palette, started, release, _) = gated_directory_palette();
+        let input = "/cd missing";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started.recv().unwrap();
+        publisher
+            .publish(
+                label
+                    .map(|label| CompletionItem {
+                        label: Arc::from(label),
+                        insertion: Arc::from(label),
+                        description: None,
+                    })
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap();
+        publisher.finish().unwrap();
+        release.send(()).unwrap();
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+        assert!(palette.argument_items.is_empty());
+        assert!(!palette.argument_publication.is_pending());
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), input),
+            CommandAction::Passthrough
+        ));
     }
 
     #[test_case(None; "empty")]
