@@ -2848,9 +2848,11 @@ fn register_command_typed_arguments_registers_descriptor_completion_and_context(
                     .command_generation_for_test("typed_completion", "/typed"),
                 argument_name: Some(Arc::from("count")),
                 argument_kind: Some("integer".into()),
-                preceding_values: Arc::from([maki_commands::ArgumentValue::Enum(Arc::from(
-                    "fast",
-                ))]),
+                preceding_arguments: Arc::from([maki_commands::ParsedArgument {
+                    name: Arc::from("mode"),
+                    values: Arc::from([maki_commands::ArgumentValue::Enum(Arc::from("fast"))]),
+                    variadic: false,
+                }]),
             },
             maki_agent::CancelToken::none(),
         )
@@ -2875,7 +2877,11 @@ fn register_command_typed_arguments_registers_descriptor_completion_and_context(
                 .command_generation_for_test("typed_completion", "/typed"),
             argument_name: Some(Arc::from("count")),
             argument_kind: Some("integer".into()),
-            preceding_values: Arc::from([maki_commands::ArgumentValue::Enum(Arc::from("fast"))]),
+            preceding_arguments: Arc::from([maki_commands::ParsedArgument {
+                name: Arc::from("mode"),
+                values: Arc::from([maki_commands::ArgumentValue::Enum(Arc::from("fast"))]),
+                variadic: false,
+            }]),
         },
         maki_lua::CommandArgumentLifecycle::Cancel,
         None,
@@ -2960,7 +2966,7 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
             .command_generation_for_test("completion_plugin", "/deploy"),
         argument_name: None,
         argument_kind: None,
-        preceding_values: Arc::from([]),
+        preceding_arguments: Arc::from([]),
     };
     let items = handle
         .collect_command_argument_items(context.clone(), maki_agent::CancelToken::none())
@@ -3012,7 +3018,7 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
                     .command_generation_for_test("completion_plugin", "/static"),
                 argument_name: None,
                 argument_kind: None,
-                preceding_values: Arc::from([]),
+                preceding_arguments: Arc::from([]),
             },
             maki_agent::CancelToken::none(),
         )
@@ -3149,7 +3155,7 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
                     .command_generation_for_test("slow_completion", "/slow"),
                 argument_name: None,
                 argument_kind: None,
-                preceding_values: Arc::from([]),
+                preceding_arguments: Arc::from([]),
             },
             maki_agent::CancelToken::none(),
         )

@@ -582,22 +582,16 @@ fn command_argument_ctx(
             }
         })
     };
-    if let Some(schema) = schema {
-        let mut value_index = 0;
-        for argument in schema.iter().take(context.index + 1) {
+    if schema.is_some() {
+        for argument in context.preceding_arguments.iter() {
             if argument.variadic {
                 let sequence = lua.create_table()?;
-                for (index, item) in context.preceding_values[value_index..].iter().enumerate() {
+                for (index, item) in argument.values.iter().enumerate() {
                     sequence.set(index + 1, value(item)?)?;
                 }
-                if sequence.raw_len() > 0 {
-                    values.set(argument.name.as_ref(), sequence)?;
-                }
-                break;
-            }
-            if let Some(item) = context.preceding_values.get(value_index) {
+                values.set(argument.name.as_ref(), sequence)?;
+            } else if let Some(item) = argument.values.first() {
                 values.set(argument.name.as_ref(), value(item)?)?;
-                value_index += 1;
             }
         }
     }
@@ -785,6 +779,61 @@ mod tests {
         let lua = Lua::new();
         install(&lua);
         lua
+    }
+
+    #[test]
+    fn command_argument_values_preserve_names_after_invalid_prefixes() {
+        let lua = Lua::new();
+        let schema = [
+            maki_commands::PositionalArgument::required(
+                "count",
+                maki_commands::ArgumentKind::Integer,
+            ),
+            maki_commands::PositionalArgument::required(
+                "source",
+                maki_commands::ArgumentKind::String,
+            ),
+            maki_commands::PositionalArgument {
+                name: Arc::from("paths"),
+                kind: maki_commands::ArgumentKind::String,
+                optional: false,
+                variadic: true,
+                completion: maki_commands::CompletionPolicy::Default,
+            },
+        ];
+        let preceding_values = maki_commands::parse_completion_prefix_arguments(
+            "invalid source.txt first second target",
+            &schema,
+            2,
+            Some(&(32..38)),
+        );
+        let context = CommandArgumentContext {
+            command: Arc::from("/copy"),
+            plugin: Arc::from("test"),
+            args: "invalid source.txt first second target".into(),
+            arg: "target".into(),
+            index: 2,
+            mode: "insert".into(),
+            session: 1,
+            generation: 1,
+            command_generation: 1,
+            argument_name: Some(Arc::from("paths")),
+            argument_kind: Some("string".into()),
+            preceding_arguments: preceding_values,
+        };
+
+        let ctx = command_argument_ctx(&lua, &context, Some(&schema)).unwrap();
+        let values: Table = ctx.get("values").unwrap();
+        assert_eq!(values.get::<Value>("count").unwrap(), Value::Nil);
+        assert_eq!(values.get::<String>("source").unwrap(), "source.txt");
+        let paths: Table = values.get("paths").unwrap();
+        assert_eq!(
+            paths
+                .sequence_values::<String>()
+                .collect::<LuaResult<Vec<_>>>()
+                .unwrap(),
+            ["first", "second"]
+        );
     }
 
     fn register_source(lua: &Lua, prefix: &str, items: &[(&str, &str, &str)]) {
@@ -1172,7 +1221,7 @@ mod tests {
                 command_generation: 0,
                 argument_name: None,
                 argument_kind: None,
-                preceding_values: Arc::from([]),
+                preceding_arguments: Arc::from([]),
             },
             None,
         ));

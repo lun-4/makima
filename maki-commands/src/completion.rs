@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 
 use crate::arguments::{
-    ArgumentKind, ArgumentValue, CommandArguments, CompletionEdit, CompletionPolicy, QuoteStyle,
-    encode_completion_value, parse_completion_prefix,
+    ArgumentKind, CommandArguments, CompletionEdit, CompletionPolicy, ParsedArgument, QuoteStyle,
+    encode_completion_value, parse_completion_prefix_arguments,
 };
 use crate::completion_providers::CompletionProviders;
 use crate::dispatch::ResolvedCommand;
@@ -155,7 +155,7 @@ pub struct CompletionContext {
     pub argument_name: Option<Arc<str>>,
     pub argument_kind: Option<ArgumentKind>,
     pub argument_range: Option<Range<usize>>,
-    pub preceding_values: Arc<[ArgumentValue]>,
+    pub preceding_arguments: Arc<[ParsedArgument]>,
     pub completion_policy: CompletionPolicy,
     pub enum_default: Option<Arc<str>>,
     pub next_argument_index: Option<usize>,
@@ -220,7 +220,7 @@ impl CompletionItem {
 type CompletionArgumentMetadata = (
     Option<Arc<str>>,
     Option<ArgumentKind>,
-    Arc<[ArgumentValue]>,
+    Arc<[ParsedArgument]>,
     CompletionPolicy,
     Option<Arc<str>>,
     Option<usize>,
@@ -247,8 +247,8 @@ fn completion_argument_metadata(
     let descriptor = schema
         .get(argument_index)
         .or_else(|| schema.last().filter(|argument| argument.variadic));
-    let preceding_values =
-        parse_completion_prefix(arguments, schema, argument_index, argument_range);
+    let preceding_arguments =
+        parse_completion_prefix_arguments(arguments, schema, argument_index, argument_range);
     let next_argument_index = (argument_index + 1 < schema.len()).then_some(argument_index + 1);
     let navigation = if next_argument_index.is_some() {
         CompletionNavigation::NextArgument
@@ -258,7 +258,7 @@ fn completion_argument_metadata(
     (
         descriptor.map(|argument| Arc::clone(&argument.name)),
         descriptor.map(|argument| argument.kind.clone()),
-        preceding_values,
+        preceding_arguments,
         descriptor.map_or(CompletionPolicy::Default, |argument| argument.completion),
         descriptor.and_then(|argument| argument.kind.default_value().map(Arc::from)),
         next_argument_index,
@@ -666,7 +666,7 @@ impl CompletionSession {
             let (
                 argument_name,
                 argument_kind,
-                preceding_values,
+                preceding_arguments,
                 completion_policy,
                 enum_default,
                 next_argument_index,
@@ -687,7 +687,7 @@ impl CompletionSession {
                 argument_name,
                 argument_kind,
                 argument_range: input.argument_range,
-                preceding_values,
+                preceding_arguments,
                 completion_policy,
                 enum_default,
                 next_argument_index,

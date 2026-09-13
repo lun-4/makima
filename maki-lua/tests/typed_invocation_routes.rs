@@ -294,7 +294,7 @@ fn callbacks_none_lifecycle_rejects_retired_generation() {
             .command_generation_for_test("lifecycle_generation", "/deploy"),
         argument_name: Some(Arc::from("value")),
         argument_kind: Some("string".into()),
-        preceding_values: Arc::from([]),
+        preceding_arguments: Arc::from([]),
     };
     host.load_source(
         "lifecycle_generation",

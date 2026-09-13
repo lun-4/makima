@@ -227,7 +227,7 @@ fn lifecycle_ctx(host: &maki_lua::test_support::PluginHostGuard) -> CommandArgum
             .command_generation_for_test("splashes", "/splash"),
         argument_name: None,
         argument_kind: None,
-        preceding_values: Arc::from([]),
+        preceding_arguments: Arc::from([]),
     }
 }
 

@@ -34,8 +34,8 @@ use maki_commands::{
     ArgumentValue, CommandArguments, CommandBehavior, CommandCompletion, CommandDocs, CommandError,
     CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec,
     CompletionContext, CompletionError, CompletionItem, CompletionLifecycleEvent,
-    CompletionSessionId, ParsedArguments, Producer, ProducerPrecedence, Registration,
-    RegistrationError, TargetCapabilities, TargetCapability,
+    CompletionSessionId, ParsedArgument, ParsedArguments, Producer, ProducerPrecedence,
+    Registration, RegistrationError, TargetCapabilities, TargetCapability,
 };
 use maki_config::RawConfig;
 
@@ -316,7 +316,7 @@ pub struct CommandArgumentContext {
     pub command_generation: u64,
     pub argument_name: Option<Arc<str>>,
     pub argument_kind: Option<String>,
-    pub preceding_values: Arc<[ArgumentValue]>,
+    pub preceding_arguments: Arc<[ParsedArgument]>,
 }
 
 pub(crate) struct CommandArgumentRequest {
@@ -1755,7 +1755,7 @@ impl LuaCommandCompletion {
                 .argument_kind
                 .as_ref()
                 .map(|kind| kind.type_name().to_owned()),
-            preceding_values: context.preceding_values.clone(),
+            preceding_arguments: context.preceding_arguments.clone(),
         };
         (context, request_trigger)
     }
@@ -4260,7 +4260,7 @@ mod tests {
                 command_generation: 0,
                 argument_name: None,
                 argument_kind: None,
-                preceding_values: Arc::from([]),
+                preceding_arguments: Arc::from([]),
             },
             callbacks: None,
             event,

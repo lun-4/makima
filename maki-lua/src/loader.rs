@@ -1291,7 +1291,7 @@ mod tests {
                     command_generation: 0,
                     argument_name: None,
                     argument_kind: None,
-                    preceding_values: Arc::from([]),
+                    preceding_arguments: Arc::from([]),
                 },
                 maki_agent::CancelToken::none(),
             )

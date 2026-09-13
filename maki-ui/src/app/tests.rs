@@ -149,7 +149,7 @@ impl maki_commands::CommandCompletion for TestLuaCompletion {
                 .argument_kind
                 .as_ref()
                 .map(|kind| kind.type_name().to_owned()),
-            preceding_values: context.preceding_values.clone(),
+            preceding_arguments: context.preceding_arguments.clone(),
         };
         let Some(rx) = self.handle.collect_command_argument_items(context, cancel) else {
             return Box::pin(async { Ok(Vec::new()) });
@@ -214,7 +214,7 @@ impl maki_commands::CommandCompletion for TestLuaCompletion {
                     .argument_kind
                     .as_ref()
                     .map(|kind| kind.type_name().to_owned()),
-                preceding_values: context.preceding_values.clone(),
+                preceding_arguments: context.preceding_arguments.clone(),
             },
             event,
             item,

@@ -480,18 +480,6 @@ impl fmt::Display for CountExpectation {
     }
 }
 
-pub fn parse_completion_prefix(
-    input: &str,
-    schema: &[PositionalArgument],
-    argument_index: usize,
-    argument_range: Option<&std::ops::Range<usize>>,
-) -> Arc<[ArgumentValue]> {
-    parse_completion_prefix_arguments(input, schema, argument_index, argument_range)
-        .iter()
-        .flat_map(|argument| argument.values.iter().cloned())
-        .collect()
-}
-
 pub fn parse_completion_prefix_arguments(
     input: &str,
     schema: &[PositionalArgument],

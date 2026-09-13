@@ -97,7 +97,7 @@ struct ContextProbe {
     context: Mutex<Option<CompletionContext>>,
 }
 
-type VariadicCompletionCall = (Arc<str>, Arc<[ArgumentValue]>);
+type VariadicCompletionCall = (Arc<str>, Arc<[ParsedArgument]>);
 
 struct VariadicCompletionProbe {
     calls: Arc<Mutex<Vec<VariadicCompletionCall>>>,
@@ -112,7 +112,7 @@ impl CommandCompletion for VariadicCompletionProbe {
         self.calls
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .push((Arc::clone(&context.argument), context.preceding_values));
+            .push((Arc::clone(&context.argument), context.preceding_arguments));
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -757,6 +757,7 @@ fn variadic_replace_provider_registers_and_repeats_for_each_slot() {
         calls[1]
             .1
             .iter()
+            .flat_map(|argument| argument.values.iter())
             .map(|value| match value {
                 ArgumentValue::Directory(path) => path.to_string_lossy(),
                 _ => unreachable!(),
