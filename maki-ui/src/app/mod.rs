@@ -34,8 +34,7 @@ use crate::components::btw_modal::BtwModal;
 use crate::components::command::ParsedCommand;
 use crate::components::command::{CommandAction, CommandPalette, ConfirmedCommand};
 use crate::components::file_completion::{
-    CompletionAction, CompletionItem, CompletionMode, FileCompletionMenu, at_token_query,
-    at_token_range,
+    CompletionAction, CompletionItem, FileCompletionMenu, at_token_query, at_token_range,
 };
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
@@ -1451,9 +1450,7 @@ impl App {
             CommandAction::Passthrough => {}
         }
 
-        if self.file_completion.mode() == Some(CompletionMode::Reference)
-            && self.handle_completion_key(key)
-        {
+        if self.file_completion.is_active() && self.handle_completion_key(key) {
             return vec![];
         }
 
@@ -1606,11 +1603,7 @@ impl App {
         let query = at_token_query(&buf.lines()[buf.y()], buf.x()).unwrap_or_default();
         let cwd = self.state.session.cwd.clone();
         self.file_completion.set_token_byte_range(range);
-        if self.file_completion.is_active()
-            && !self
-                .file_completion
-                .needs_reopen(&cwd, CompletionMode::Reference)
-        {
+        if self.file_completion.is_active() && !self.file_completion.needs_reopen(&cwd) {
             self.file_completion.sync_query(&query);
             return;
         }
@@ -1623,27 +1616,12 @@ impl App {
 
     /// Replaces the `@` token with a final completion and closes the popup.
     fn insert_completion(&mut self, item: CompletionItem) {
-        if matches!(
-            self.file_completion.mode(),
-            Some(CompletionMode::File | CompletionMode::Directory)
-        ) {
-            self.apply_completion_replacement(item.insertion, true);
-        } else {
-            self.apply_completion(item, true);
-        }
+        self.apply_completion(item, true);
     }
 
     /// Replaces the `@` token with an explicit directory and refreshes its children.
     fn advance_completion(&mut self, item: CompletionItem) {
-        let replacement = if matches!(
-            self.file_completion.mode(),
-            Some(CompletionMode::File | CompletionMode::Directory)
-        ) {
-            item.insertion
-        } else {
-            item.advance_replacement()
-        };
-        self.apply_completion_replacement(replacement, false);
+        self.apply_completion_replacement(item.advance_replacement(), false);
         self.sync_file_completion();
     }
 
@@ -2570,6 +2548,8 @@ impl App {
                     .session_mut()
                     .set_cwd(path.to_string_lossy().into_owned());
                 self.status_bar.set_cwd(path.clone());
+                let input = self.input_box.buffer.value();
+                self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
                 if self.file_completion.is_active() {
                     self.sync_file_completion();
                 }
@@ -3192,23 +3172,6 @@ impl App {
             images: vec![],
         })
     }
-}
-
-#[cfg(test)]
-fn directory_argument_range_for_test(
-    line: &str,
-    cursor: usize,
-) -> Option<(String, (usize, usize))> {
-    let remainder = line.strip_prefix("/cd")?;
-    let separator = remainder.chars().next().filter(|c| c.is_whitespace())?;
-    let command_end = line.len() - remainder.len() + separator.len_utf8();
-    if cursor < command_end || !line.is_char_boundary(cursor) {
-        return None;
-    }
-    let start = line.len() - remainder.trim_start().len();
-    let end = line.trim_end().len().max(start);
-    let query_end = cursor.clamp(start, end);
-    Some((line[start..query_end].to_owned(), (start, end)))
 }
 
 fn is_streaming_stop_key(key: KeyEvent) -> bool {

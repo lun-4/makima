@@ -84,6 +84,7 @@ pub struct CommandPalette {
     argument_generation: u64,
     argument_revision: u64,
     completion_session: Option<CompletionSession>,
+    completion_session_cwd: Option<Arc<str>>,
     pending_arguments: Option<PendingArguments>,
     accepted_argument_input: Option<String>,
     dismissed_argument_input: Option<String>,
@@ -199,6 +200,7 @@ impl CommandPalette {
             argument_generation: 0,
             argument_revision: 0,
             completion_session: None,
+            completion_session_cwd: None,
             pending_arguments: None,
             accepted_argument_input: None,
             dismissed_argument_input: None,
@@ -630,6 +632,7 @@ impl CommandPalette {
         let same_session = self.completion_session.as_ref().is_some_and(|session| {
             session.command().command_id() == command.command_id()
                 && session.command().invoked_name() == command.invoked_name()
+                && self.completion_session_cwd.as_deref() == Some(self.cwd.as_ref())
         });
         if !same_session {
             self.notify_lifecycle(PaletteLifecycle::Cancel);
@@ -643,6 +646,10 @@ impl CommandPalette {
                     Arc::clone(&self.cwd),
                 )
                 .ok();
+            self.completion_session_cwd = self
+                .completion_session
+                .as_ref()
+                .map(|_| Arc::clone(&self.cwd));
         }
         let Some(session) = self.completion_session.clone() else {
             self.argument_publication.clear();
@@ -709,6 +716,7 @@ impl CommandPalette {
                     pending.key.range,
                     latest.candidates,
                     true,
+                    pending.snapshot_applied,
                     &mut pending.last_highlighted_item,
                 );
                 self.argument_revision = latest.revision;
@@ -746,6 +754,7 @@ impl CommandPalette {
                     pending.key.range,
                     items,
                     !pending.snapshot_applied,
+                    pending.snapshot_applied,
                     &mut pending.last_highlighted_item,
                 );
                 dirty
@@ -763,6 +772,7 @@ impl CommandPalette {
         range: (usize, usize),
         items: Vec<CompletionCandidate>,
         highlight: bool,
+        preserve_selection: bool,
         last_highlighted_item: &mut Option<CompletionItem>,
     ) -> Dirty {
         let mut matches = Vec::new();
@@ -804,12 +814,27 @@ impl CommandPalette {
                 &b.item.label,
             )
         });
+        let previous_item = preserve_selection
+            .then(|| self.argument_items.get(self.argument_selection()))
+            .flatten()
+            .map(|item| item.item.clone());
         self.argument_items = matches;
         self.argument_range = (!self.argument_items.is_empty()).then_some(range);
-        self.argument_selected = 0;
-        self.argument_scroll_offset = 0;
-        self.argument_grid.reset();
-        let selected_item = self.argument_items.first().map(|item| item.item.clone());
+        let selected = previous_item
+            .as_ref()
+            .and_then(|item| {
+                self.argument_items
+                    .iter()
+                    .position(|candidate| candidate.item == *item)
+            })
+            .unwrap_or(0);
+        self.argument_selected = selected;
+        self.argument_scroll_offset = self.argument_scroll_offset.min(selected);
+        self.argument_grid.set_selected(selected);
+        let selected_item = self
+            .argument_items
+            .get(selected)
+            .map(|item| item.item.clone());
         if selected_item.is_none() {
             *last_highlighted_item = None;
             self.notify_lifecycle(PaletteLifecycle::Cancel);
@@ -934,17 +959,19 @@ impl CommandPalette {
             PaletteLifecycle::Accept => {
                 if let Some(candidate) = self
                     .argument_items
-                    .get_mut(selected)
-                    .and_then(|item| item.candidate.take())
+                    .get(selected)
+                    .and_then(|item| item.candidate.clone())
                     && session.accept(candidate).is_err()
                 {
                     return false;
                 }
                 self.completion_session = None;
+                self.completion_session_cwd = None;
             }
             PaletteLifecycle::Cancel => {
                 let _ = session.cancel();
                 self.completion_session = None;
+                self.completion_session_cwd = None;
             }
         }
         true
@@ -1844,6 +1871,11 @@ mod tests {
             palette.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), input),
             super::CommandAction::Consumed
         ));
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), input),
+            super::CommandAction::Consumed
+        ));
+        assert!(palette.argument_items[0].candidate.is_some());
         assert_eq!(input, "/cd old");
         release_tx.send(()).unwrap();
     }

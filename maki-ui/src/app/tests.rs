@@ -7841,64 +7841,79 @@ fn cd_completion_switches_back_to_reference_sources() {
     converge_completion(&mut app);
     app.input_box.set_input(String::new());
     app.update(Msg::Paste("@skill:rev".into()));
-    assert_eq!(app.file_completion.mode(), Some(CompletionMode::Reference));
+    assert!(app.file_completion.is_active());
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.input_box.buffer.value(), "@skill:review");
     assert!(!app.file_completion.is_active());
 }
 
-#[test_case("/cd ./al", CompletionMode::Directory, false ; "active_directory")]
-#[test_case("/cd ./al", CompletionMode::Directory, true ; "dismissed_directory")]
-#[test_case("@./al", CompletionMode::Reference, false ; "active_reference")]
-#[test_case("@./al", CompletionMode::Reference, true ; "dismissed_reference")]
-fn cd_completion_cwd_change_refreshes_only_active_popup(
-    input: &str,
-    mode: CompletionMode,
-    dismissed: bool,
-) {
+#[test_case(false ; "active")]
+#[test_case(true ; "dismissed")]
+fn cd_completion_cwd_change_refreshes_typed_popup(dismissed: bool) {
     let (tmp, mut app, _backend) = completion_app();
     let next = TempDir::new().unwrap();
     std::fs::create_dir(tmp.path().join("alpha")).unwrap();
     std::fs::create_dir(next.path().join("alpine")).unwrap();
+    let input = "/cd ./al";
     app.update(Msg::Paste(input.into()));
     converge_completion(&mut app);
-    if mode == CompletionMode::Directory {
-        assert_eq!(
-            app.command_palette.argument_match_items()[0].label,
-            "./alpha/".into()
-        );
-    } else {
-        assert_eq!(app.file_completion.match_items()[0].label, "./alpha/");
-    }
+    assert_eq!(
+        app.command_palette.argument_match_items()[0].label,
+        "./alpha/".into()
+    );
     if dismissed {
         app.update(Msg::Key(key(KeyCode::Esc)));
     }
+
     app.change_directory(next.path().to_path_buf());
-    assert_eq!(app.state.session.cwd, next.path().to_string_lossy());
-    if mode == CompletionMode::Directory {
-        assert_eq!(app.command_palette.is_active(), !dismissed);
-        assert_eq!(app.input_box.buffer.value(), input);
-    } else {
-        assert_eq!(app.file_completion.is_active(), !dismissed);
-        assert_eq!(app.input_box.buffer.value(), input);
-        if !dismissed {
-            assert!(
-                !app.file_completion
-                    .needs_reopen(&app.state.session.cwd, mode)
-            );
-            assert_eq!(app.file_completion.match_items()[0].label, "./alpine/");
-        }
+    if !dismissed {
+        converge_completion(&mut app);
+    }
+
+    assert_eq!(
+        app.state.session.cwd,
+        next.path().canonicalize().unwrap().to_string_lossy()
+    );
+    assert_eq!(app.command_palette.is_active(), !dismissed);
+    assert_eq!(app.input_box.buffer.value(), input);
+    if !dismissed {
+        assert_eq!(
+            app.command_palette.argument_match_items()[0].label,
+            "./alpine/".into()
+        );
+    }
+}
+
+#[test_case(false ; "active")]
+#[test_case(true ; "dismissed")]
+fn cd_completion_cwd_change_refreshes_reference_popup(dismissed: bool) {
+    let (tmp, mut app, _backend) = completion_app();
+    let next = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    std::fs::create_dir(next.path().join("alpine")).unwrap();
+    let input = "@./al";
+    app.update(Msg::Paste(input.into()));
+    converge_completion(&mut app);
+    assert_eq!(app.file_completion.match_items()[0].label, "./alpha/");
+    if dismissed {
+        app.update(Msg::Key(key(KeyCode::Esc)));
+    }
+
+    app.change_directory(next.path().to_path_buf());
+
+    assert_eq!(
+        app.state.session.cwd,
+        next.path().canonicalize().unwrap().to_string_lossy()
+    );
+    assert_eq!(app.file_completion.is_active(), !dismissed);
+    assert_eq!(app.input_box.buffer.value(), input);
+    if !dismissed {
+        assert!(!app.file_completion.needs_reopen(&app.state.session.cwd));
+        assert_eq!(app.file_completion.match_items()[0].label, "./alpine/");
     }
     let _ = app.tick();
-    assert_eq!(
-        if mode == CompletionMode::Directory {
-            app.command_palette.is_active()
-        } else {
-            app.file_completion.is_active()
-        },
-        !dismissed
-    );
+    assert_eq!(app.file_completion.is_active(), !dismissed);
 }
 
 #[test]
@@ -7995,37 +8010,6 @@ fn cd_completion_ctrl_left_requeries_before_accepting() {
     assert_eq!(
         app.state.session.cwd,
         tmp.path().join("release apple").to_string_lossy()
-    );
-}
-
-#[test_case("/cd ", 4, Some(("", (4, 4))) ; "empty_argument")]
-#[test_case("/cd \t ", 4, Some(("", (6, 6))) ; "only_whitespace")]
-#[test_case("/cd   alpha", 4, Some(("", (6, 11))) ; "cursor_in_prefix_whitespace")]
-#[test_case("/cd alpha", 4, Some(("", (4, 9))) ; "argument_start")]
-#[test_case("/cd alpha", 6, Some(("al", (4, 9))) ; "argument_middle")]
-#[test_case("/cd alpha", 9, Some(("alpha", (4, 9))) ; "argument_end")]
-#[test_case("/cd alpha \t", 11, Some(("alpha", (4, 9))) ; "cursor_after_trimmed_suffix")]
-#[test_case("/cd release notes", 12, Some(("release ", (4, 17))) ; "internal_space")]
-#[test_case("/cd @release notes", 18, Some(("@release notes", (4, 18))) ; "literal_at")]
-#[test_case("/cd 日本語 @notes \t", 10, Some(("日本", (4, 20))) ; "unicode_byte_cursor")]
-#[test_case("/cd\u{2003}日本 \u{2003}", 12, Some(("日本", (6, 12))) ; "unicode_separator_and_suffix")]
-#[test_case("", 0, None ; "empty_line")]
-#[test_case("/cd", 3, None ; "missing_separator")]
-#[test_case("/cdir alpha", 11, None ; "different_command")]
-#[test_case("/CD alpha", 9, None ; "case_sensitive_command")]
-#[test_case(" /cd alpha", 10, None ; "leading_space")]
-#[test_case("/cd alpha", 3, None ; "cursor_before_argument")]
-#[test_case("/cd alpha", 10, None ; "cursor_past_line")]
-#[test_case("/cd 日本", 5, None ; "cursor_inside_unicode_argument")]
-#[test_case("/cd\u{2003}alpha", 4, None ; "cursor_inside_unicode_separator")]
-fn cd_completion_argument_range(
-    line: &str,
-    cursor: usize,
-    expected: Option<(&str, (usize, usize))>,
-) {
-    assert_eq!(
-        directory_argument_range_for_test(line, cursor),
-        expected.map(|(query, range)| (query.to_owned(), range))
     );
 }
 

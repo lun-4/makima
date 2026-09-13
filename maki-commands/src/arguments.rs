@@ -389,6 +389,7 @@ fn lex(input: &str, tolerant: bool) -> Result<Vec<ParsedToken>, LexError> {
                             index += escaped.len_utf8();
                         } else {
                             value.push('\\');
+                            value.push(escaped);
                             index += escaped.len_utf8();
                         }
                     } else {
@@ -444,7 +445,7 @@ pub const MAX_EXACT_INTEGER: i64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ArgumentParseError {
-    #[error("argument {index} ({name}) expected {expected}: {message}")]
+    #[error("argument {index} ({name}) expected {expected} at bytes {span:?}: {message}")]
     Invalid {
         index: usize,
         name: Arc<str>,
@@ -745,7 +746,7 @@ pub fn resolve_path(
         return Ok(if spelling == "~" {
             home.to_path_buf()
         } else {
-            home.join(&spelling[2..])
+            home.join(spelling[1..].trim_start_matches(['/', '\\']))
         });
     }
     if spelling.starts_with('~') {
@@ -769,6 +770,23 @@ mod tests {
     fn lexer_decodes_quotes_and_fragments() {
         let tokens = lex_strict(r#"one "two three"'four'"#).unwrap();
         assert_eq!(tokens[0].value.as_ref(), "one");
+    }
+
+    #[test]
+    fn lexer_preserves_unrecognized_double_quote_escapes() {
+        for (input, expected) in [
+            (r#""a\nb""#, r"a\nb"),
+            (r#""my\ dir""#, r"my\ dir"),
+            (r#""文\字""#, r"文\字"),
+            (r#""a\"b""#, "a\"b"),
+            (r#""a\\b""#, r"a\b"),
+        ] {
+            let strict = lex_strict(input).unwrap();
+            let tolerant = lex_tolerant(input).unwrap();
+
+            assert_eq!(strict, tolerant);
+            assert_eq!(strict[0].value.as_ref(), expected);
+        }
     }
 
     #[test]
@@ -842,11 +860,23 @@ mod tests {
     }
 
     #[test]
-    fn encoded_completion_values_roundtrip_through_lexer() {
+    fn resolve_path_normalizes_home_separators() {
+        let cwd = Path::new("/cwd");
+        let home = Path::new("/home/tester");
+
+        assert_eq!(resolve_path(cwd, Some(home), "~").unwrap(), home);
         assert_eq!(
-            resolve_path(Path::new("/cwd"), Some(Path::new("/home")), "~").unwrap(),
-            PathBuf::from("/home")
+            resolve_path(cwd, Some(home), "~//projects").unwrap(),
+            home.join("projects")
         );
+        assert_eq!(
+            resolve_path(cwd, Some(home), r"~\projects").unwrap(),
+            home.join("projects")
+        );
+    }
+
+    #[test]
+    fn encoded_completion_values_roundtrip_through_lexer() {
         for value in ["plain", "two words", r#"a\\b\"c"#] {
             let edit = encode_completion_value(value, 3..3, QuoteStyle::None);
             let tokens = lex_strict(&edit.text).unwrap();
