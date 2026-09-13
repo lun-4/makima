@@ -1638,15 +1638,7 @@ fn command_has_args(command: &ResolvedCommand) -> bool {
 }
 
 fn positional_accepts(arguments: &[PositionalArgument], count: usize) -> bool {
-    let min = arguments
-        .iter()
-        .filter(|argument| !argument.optional)
-        .count();
-    let max = arguments
-        .last()
-        .filter(|argument| argument.variadic)
-        .map_or(Some(arguments.len()), |_| None);
-    count >= min && max.is_none_or(|max| count <= max)
+    arguments.last().is_some_and(|argument| argument.variadic) || count <= arguments.len()
 }
 
 fn command_args(input: &str) -> &str {
@@ -2204,6 +2196,43 @@ mod tests {
             ));
         }
         release_tx.send(()).unwrap();
+    }
+
+    #[test_case(false; "required_scalar")]
+    #[test_case(true; "required_variadic")]
+    fn required_typed_command_is_discoverable_and_completable(variadic: bool) {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        let mut destination = PositionalArgument::required("destination", ArgumentKind::Directory);
+        destination.variadic = variadic;
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/copy"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        PositionalArgument::required("source", ArgumentKind::File),
+                        destination,
+                    ])),
+                    docs: CommandDocs {
+                        summary: Arc::from("Copy files"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(Noop),
+                argument_completions: vec![None, None],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        palette.sync("/cop");
+        settle(&mut palette);
+        assert_eq!(palette.filtered[0].command.invoked_name(), "/copy");
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), "/cop"),
+            CommandAction::Complete { text, .. } if text == "/copy "
+        ));
     }
 
     #[test]
