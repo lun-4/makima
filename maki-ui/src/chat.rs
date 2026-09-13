@@ -104,6 +104,7 @@ impl Chat {
                 self.messages_panel.clear_prompt_progress();
                 self.messages_panel.thinking_delta(&text);
             }
+            AgentEvent::ThinkingBlockEnd => self.messages_panel.end_thinking_block(),
             AgentEvent::TextDelta { text } => {
                 self.messages_panel.clear_prompt_progress();
                 self.messages_panel.text_delta(&text);
@@ -1052,6 +1053,35 @@ mod tests {
         assert_eq!(display[1].role, DisplayRole::Assistant);
     }
 
+    #[test]
+    fn history_to_display_splits_consecutive_thinking_blocks() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "first".into(),
+                    signature: None,
+                },
+                ContentBlock::Thinking {
+                    thinking: "second".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            ..Default::default()
+        }];
+        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        assert_eq!(display.len(), 3);
+        assert_eq!(display[0].role, DisplayRole::Thinking);
+        assert_eq!(display[0].text, "first");
+        assert_eq!(display[1].role, DisplayRole::Thinking);
+        assert_eq!(display[1].text, "second");
+        assert_eq!(display[2].role, DisplayRole::Assistant);
+        assert_eq!(display[2].text, "answer");
+    }
+
     const RESTORE_OUTPUT: &str = "rendered output";
 
     fn tool_msg_with_input(tool: &str) -> DisplayMessage {
@@ -1156,5 +1186,33 @@ mod tests {
         chat.flush();
         assert_eq!(chat.message_count(), 4);
         assert_eq!(chat.last_message_text(), "new");
+    }
+
+    #[test]
+    fn chat_thinking_block_end_flushes_panel() {
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+            Arc::new(InMemoryThemesProvider::bundled()),
+        );
+
+        chat.handle_event(
+            AgentEvent::ThinkingDelta {
+                text: "first".into(),
+            },
+            None,
+        );
+        chat.handle_event(AgentEvent::ThinkingBlockEnd, None);
+        chat.handle_event(
+            AgentEvent::ThinkingDelta {
+                text: "second".into(),
+            },
+            None,
+        );
+        chat.flush();
+
+        assert_eq!(chat.message_count(), 2);
+        assert_eq!(chat.last_message_text(), "second");
     }
 }

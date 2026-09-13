@@ -209,6 +209,10 @@ impl MessagesPanel {
         self.streaming_thinking.push(text);
     }
 
+    pub fn end_thinking_block(&mut self) {
+        self.flush_thinking();
+    }
+
     pub fn text_delta(&mut self, text: &str) {
         self.flush_thinking();
         self.streaming_text.push(text);

@@ -999,6 +999,7 @@ fn start_event_pump(
             let update = match event {
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
+                AgentEvent::ThinkingBlockEnd => translate::thinking_block_end(),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => {
                     translate::tool_start(&event, &cwd, home.as_deref())
@@ -1435,6 +1436,70 @@ mod tests {
                 );
                 smol::Timer::after(std::time::Duration::from_millis(5)).await;
             }
+        });
+    }
+
+    #[test]
+    fn event_pump_emits_thinking_separator() {
+        let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+        let (out_tx, out_rx) = flume::unbounded::<Value>();
+        let (answer_tx, _answer_rx) = flume::unbounded::<String>();
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let session_id = SessionRef::from(MakiId::generate());
+
+        start_event_pump(
+            event_rx,
+            session_id,
+            out_tx,
+            Arc::clone(&pending),
+            true,
+            answer_tx,
+            PathBuf::from("."),
+            maki_storage::paths::home(),
+            None,
+        );
+
+        event_tx
+            .send(Envelope {
+                event: AgentEvent::ThinkingDelta {
+                    text: "first".to_string(),
+                },
+                subagent: None,
+                run_id: 0,
+            })
+            .unwrap();
+        event_tx
+            .send(Envelope {
+                event: AgentEvent::ThinkingBlockEnd,
+                subagent: None,
+                run_id: 0,
+            })
+            .unwrap();
+
+        smol::block_on(async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            let mut seen = Vec::new();
+            while seen.len() < 2 {
+                if let Ok(update) = out_rx.try_recv() {
+                    seen.push(update);
+                } else {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the pump dropped the thinking separator"
+                    );
+                    smol::Timer::after(std::time::Duration::from_millis(5)).await;
+                }
+            }
+            assert_eq!(
+                seen[0]["params"]["update"]["sessionUpdate"],
+                "agent_thought_chunk"
+            );
+            assert_eq!(seen[0]["params"]["update"]["content"]["text"], "first");
+            assert_eq!(
+                seen[1]["params"]["update"]["sessionUpdate"],
+                "agent_thought_chunk"
+            );
+            assert_eq!(seen[1]["params"]["update"]["content"]["text"], "\n\n");
         });
     }
 

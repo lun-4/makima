@@ -438,6 +438,14 @@ impl StreamSynth {
         self.current_block.take().map(|_| self.block_stop())
     }
 
+    fn thinking_block_end(&mut self) -> Vec<Value> {
+        if self.current_block == Some(BlockKind::Thinking) {
+            self.close_block().into_iter().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn block_stop(&self) -> Value {
         serde_json::json!({
             "type": "content_block_stop",
@@ -1388,6 +1396,12 @@ impl EventPump {
                     self.emit_stream(events)?;
                 }
             }
+            AgentEvent::ThinkingBlockEnd => {
+                if self.include_partial_messages {
+                    let events = self.synth.thinking_block_end();
+                    self.emit_stream(events)?;
+                }
+            }
             AgentEvent::ToolStart(ts) => {
                 let name = ts.tool.to_string();
                 let input = ts.raw_input.clone().unwrap_or(Value::Null);
@@ -1949,6 +1963,24 @@ mod tests {
         assert_eq!(events[0]["index"], 0);
         assert_eq!(events[1]["index"], 1);
         assert_eq!(events[1]["content_block"]["type"], "thinking");
+    }
+
+    #[test]
+    fn thinking_block_end_closes_thinking_block() {
+        let mut synth = StreamSynth::new();
+        synth.thinking_delta(MODEL, "a");
+
+        let events = synth.thinking_block_end();
+        assert_eq!(types(&events), ["content_block_stop"]);
+        assert_eq!(events[0]["index"], 0);
+
+        let events = synth.thinking_delta(MODEL, "b");
+        assert_eq!(
+            types(&events),
+            ["content_block_start", "content_block_delta"]
+        );
+        assert_eq!(events[0]["index"], 1);
+        assert_eq!(events[0]["content_block"]["type"], "thinking");
     }
 
     #[test]
