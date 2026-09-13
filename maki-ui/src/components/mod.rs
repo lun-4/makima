@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
-use maki_providers::{ImageSource, Message, ModelTier};
+use maki_providers::{ImageSource, ModelTier};
 use ratatui::text::{Line, Span};
 
 pub(crate) const CHEVRON: &str = "❯ ";
@@ -187,9 +187,27 @@ impl ModalScroll {
     }
 }
 
-pub struct LoadedSession {
-    pub messages: Vec<Message>,
-    pub model_spec: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionReplacementKind {
+    Reset {
+        ended_id: maki_storage::id::MakiId,
+    },
+    #[cfg(test)]
+    Load,
+    Rewind,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionReplacementRequest {
+    pub(crate) session: crate::AppSession,
+    pub(crate) kind: SessionReplacementKind,
+    pub(crate) post_commit: Option<ReplacementPostCommit>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplacementPostCommit {
+    pub(crate) plan: Option<(String, String)>,
+    pub(crate) prompt: String,
 }
 
 use std::path::PathBuf;
@@ -208,8 +226,7 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
-    NewSession,
-    LoadSession(Box<LoadedSession>),
+    ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
     RefreshProvider {
         slug: String,

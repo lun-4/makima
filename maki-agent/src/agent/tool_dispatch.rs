@@ -24,6 +24,7 @@ const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+const UNAVAILABLE_TOOL_PREFIX: &str = "tool not available for this agent";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
 pub(super) struct RecentCalls(VecDeque<(String, u64)>);
@@ -103,6 +104,10 @@ pub async fn run(
     };
 
     if let Some(entry) = entry {
+        if !entry.tool.audience().contains(ctx.audience) {
+            warn!(tool = %name, audience = ?ctx.audience, "tool blocked by audience");
+            return done_error(format!("{UNAVAILABLE_TOOL_PREFIX}: {name}"));
+        }
         let invocation = match entry.tool.parse(input) {
             Ok(inv) => inv,
             Err(e) => {
@@ -529,6 +534,7 @@ async fn dispatch_mcp(
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -541,6 +547,7 @@ mod tests {
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
     use crate::tools::registry::ToolSource;
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
+    use crate::tools::{ToolAudience, ToolInvocation};
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -840,6 +847,65 @@ mod tests {
             let text = done.output.as_text();
             assert!(text.starts_with(UNKNOWN_TOOL_PREFIX));
             assert!(text.contains("nonexistent.tool"));
+        });
+    }
+
+    #[test]
+    fn registered_tool_outside_current_audience_is_rejected() {
+        struct MainOnlyTool;
+
+        impl Tool for MainOnlyTool {
+            fn name(&self) -> &str {
+                "main_only"
+            }
+
+            fn description(&self, _ctx: &DescriptionContext<'_>) -> Cow<'_, str> {
+                "main only".into()
+            }
+
+            fn schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+
+            fn audience(&self) -> ToolAudience {
+                ToolAudience::MAIN
+            }
+
+            fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+                panic!("audience rejection must happen before parsing")
+            }
+        }
+
+        smol::block_on(async {
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(MainOnlyTool),
+                    ToolSource::Lua {
+                        plugin: "audience-test".into(),
+                    },
+                )
+                .unwrap();
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            ctx.registry = Arc::new(registry);
+            ctx.audience = ToolAudience::RESEARCH_SUB;
+
+            let done = run(
+                &ctx.registry,
+                None,
+                "t1".into(),
+                "main_only",
+                &serde_json::json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: main_only")
+            );
         });
     }
 

@@ -30,6 +30,10 @@ pub const MIN_MAX_INPUT_LINES: u32 = 1;
 pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
+pub const DEFAULT_MAX_CONCURRENT_AGENT_TURNS: usize = 8;
+pub const DEFAULT_MAX_AGENT_DEPTH: usize = 4;
+pub const DEFAULT_MAX_CHILDREN_PER_AGENT: usize = 16;
+pub const DEFAULT_MAX_LIVE_AGENTS: usize = 64;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -43,6 +47,7 @@ pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
 pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
 pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
+pub const MIN_AGENT_LIMIT: usize = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
 const MAX_COMPACTION_PERCENT: u8 = 99;
 const COMPACTION_BUFFER_EXPECTED: &str =
@@ -539,6 +544,10 @@ pub struct AgentFileConfig {
     pub max_output_bytes: Option<usize>,
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
+    pub max_concurrent_agent_turns: Option<usize>,
+    pub max_agent_depth: Option<usize>,
+    pub max_children_per_agent: Option<usize>,
+    pub max_live_agents: Option<usize>,
     pub compaction_buffer: Option<CompactionBuffer>,
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
@@ -553,6 +562,10 @@ impl AgentFileConfig {
             max_output_bytes,
             max_output_lines,
             max_continuation_turns,
+            max_concurrent_agent_turns,
+            max_agent_depth,
+            max_children_per_agent,
+            max_live_agents,
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
@@ -1152,6 +1165,18 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
     pub max_continuation_turns: u32,
 
+    #[config(default = DEFAULT_MAX_CONCURRENT_AGENT_TURNS, min = MIN_AGENT_LIMIT, desc = "Max agent turns running concurrently")]
+    pub max_concurrent_agent_turns: usize,
+
+    #[config(default = DEFAULT_MAX_AGENT_DEPTH, min = MIN_AGENT_LIMIT, desc = "Max nesting depth for child agents")]
+    pub max_agent_depth: usize,
+
+    #[config(default = DEFAULT_MAX_CHILDREN_PER_AGENT, min = MIN_AGENT_LIMIT, desc = "Max child agents created by one agent")]
+    pub max_children_per_agent: usize,
+
+    #[config(default = DEFAULT_MAX_LIVE_AGENTS, min = MIN_AGENT_LIMIT, desc = "Max live agents in one outer session")]
+    pub max_live_agents: usize,
+
     #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
     pub compaction_buffer: CompactionBuffer,
 
@@ -1197,6 +1222,14 @@ impl AgentConfig {
             max_continuation_turns: file
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
+            max_concurrent_agent_turns: file
+                .max_concurrent_agent_turns
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_AGENT_TURNS),
+            max_agent_depth: file.max_agent_depth.unwrap_or(DEFAULT_MAX_AGENT_DEPTH),
+            max_children_per_agent: file
+                .max_children_per_agent
+                .unwrap_or(DEFAULT_MAX_CHILDREN_PER_AGENT),
+            max_live_agents: file.max_live_agents.unwrap_or(DEFAULT_MAX_LIVE_AGENTS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
@@ -2157,6 +2190,16 @@ mod tests {
         assert_eq!(config.ui.notifications, NotificationMethod::Auto);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         assert_eq!(
+            config.agent.max_concurrent_agent_turns,
+            DEFAULT_MAX_CONCURRENT_AGENT_TURNS
+        );
+        assert_eq!(config.agent.max_agent_depth, DEFAULT_MAX_AGENT_DEPTH);
+        assert_eq!(
+            config.agent.max_children_per_agent,
+            DEFAULT_MAX_CHILDREN_PER_AGENT
+        );
+        assert_eq!(config.agent.max_live_agents, DEFAULT_MAX_LIVE_AGENTS);
+        assert_eq!(
             config.provider.connect_timeout,
             Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)
         );
@@ -2194,6 +2237,24 @@ mod tests {
         let config = raw.into_config(false).unwrap();
         assert_eq!(config.agent.max_output_lines, 5000);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn agent_limits_construct_from_file() {
+        let raw: RawConfig = toml::from_str(
+            "[agent]\n\
+             max_concurrent_agent_turns = 2\n\
+             max_agent_depth = 3\n\
+             max_children_per_agent = 5\n\
+             max_live_agents = 7\n",
+        )
+        .unwrap();
+        let config = raw.into_config(false).unwrap();
+
+        assert_eq!(config.agent.max_concurrent_agent_turns, 2);
+        assert_eq!(config.agent.max_agent_depth, 3);
+        assert_eq!(config.agent.max_children_per_agent, 5);
+        assert_eq!(config.agent.max_live_agents, 7);
     }
 
     #[test]
@@ -2416,11 +2477,19 @@ mod tests {
     #[test_case("max_output_bytes",  0 ; "zero_output_bytes")]
     #[test_case("max_output_lines",  0 ; "zero_output_lines")]
     #[test_case("max_output_bytes",  500 ; "below_min_output_bytes")]
+    #[test_case("max_concurrent_agent_turns", 0 ; "zero_concurrent_agent_turns")]
+    #[test_case("max_agent_depth", 0 ; "zero_agent_depth")]
+    #[test_case("max_children_per_agent", 0 ; "zero_children_per_agent")]
+    #[test_case("max_live_agents", 0 ; "zero_live_agents")]
     fn validate_rejects_invalid_agent(field: &str, value: usize) {
         let mut config = AgentConfig::default();
         match field {
             "max_output_bytes" => config.max_output_bytes = value,
             "max_output_lines" => config.max_output_lines = value,
+            "max_concurrent_agent_turns" => config.max_concurrent_agent_turns = value,
+            "max_agent_depth" => config.max_agent_depth = value,
+            "max_children_per_agent" => config.max_children_per_agent = value,
+            "max_live_agents" => config.max_live_agents = value,
             _ => unreachable!(),
         }
         let err = config.validate().unwrap_err();

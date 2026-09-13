@@ -101,6 +101,7 @@ pub enum PermissionPrompt {
         tool: ToolKey,
         scopes: Vec<String>,
         subagent_id: Option<String>,
+        agent_id: Option<maki_agent::AgentId>,
         allow_scopes: Vec<String>,
         state: PromptState,
         buffer: TextBuffer,
@@ -126,12 +127,24 @@ impl PermissionPrompt {
         Self::Closed
     }
 
+    #[cfg(test)]
     pub fn open(
         &mut self,
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
         subagent_id: Option<String>,
+    ) {
+        self.open_for_agent(id, tool, scopes, subagent_id, None);
+    }
+
+    pub fn open_for_agent(
+        &mut self,
+        id: String,
+        tool: ToolKey,
+        scopes: Vec<String>,
+        subagent_id: Option<String>,
+        agent_id: Option<maki_agent::AgentId>,
     ) {
         let allow_scopes = generalized_scopes(&tool, &scopes);
         let allow_scopes = if allow_scopes == scopes {
@@ -144,6 +157,7 @@ impl PermissionPrompt {
             tool,
             scopes,
             subagent_id,
+            agent_id,
             allow_scopes,
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
@@ -157,9 +171,9 @@ impl PermissionPrompt {
         }
     }
 
-    pub fn subagent_id(&self) -> Option<&str> {
+    pub fn agent_id(&self) -> Option<maki_agent::AgentId> {
         match self {
-            Self::Open { subagent_id, .. } => subagent_id.as_deref(),
+            Self::Open { agent_id, .. } => *agent_id,
             Self::Closed => None,
         }
     }

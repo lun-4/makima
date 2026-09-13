@@ -4,7 +4,7 @@ use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_commands::{
     CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
-    HostRequest, HostResponse, ResolvedCommand, TargetCapabilities, TargetHandle,
+    HostRequest, HostResponse, PreparedTarget, ResolvedCommand, TargetCapabilities, TargetHandle,
 };
 
 pub(crate) enum CommandEvent {
@@ -22,6 +22,30 @@ pub(crate) enum CommandEvent {
 struct UiCommandHost {
     target: std::sync::OnceLock<maki_commands::InvocationTargetId>,
     tx: flume::Sender<CommandEvent>,
+}
+
+pub(crate) struct PreparedCommandTarget {
+    target: PreparedTarget,
+    host: Arc<UiCommandHost>,
+}
+
+impl PreparedCommandTarget {
+    pub(crate) fn handle(&self) -> &TargetHandle {
+        self.target.handle()
+    }
+
+    pub(crate) fn snapshot(&self) -> maki_commands::RegistrySnapshot {
+        self.target.snapshot()
+    }
+
+    pub(crate) fn activate(self) -> TargetHandle {
+        let target = self.target.activate();
+        self.host
+            .target
+            .set(target.id())
+            .expect("new command host target is unset");
+        target
+    }
 }
 
 impl CommandHost for UiCommandHost {
@@ -101,18 +125,22 @@ impl CommandRuntime {
         )
     }
 
-    pub(crate) fn bind_target(&self) -> TargetHandle {
+    pub(crate) fn prepare_target(&self) -> PreparedCommandTarget {
         let host = Arc::new(UiCommandHost {
             target: std::sync::OnceLock::new(),
             tx: self.event_tx.clone(),
         });
-        let target = self
-            .registry
-            .bind_target(TargetCapabilities::ALL, host.clone());
-        host.target
-            .set(target.id())
-            .expect("new command host target is unset");
-        target
+        PreparedCommandTarget {
+            target: self
+                .registry
+                .prepare_target(TargetCapabilities::ALL, host.clone()),
+            host,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_target(&self) -> TargetHandle {
+        self.prepare_target().activate()
     }
 
     pub(crate) fn dispatch_command(

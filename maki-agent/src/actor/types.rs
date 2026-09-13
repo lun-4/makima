@@ -6,7 +6,20 @@ use maki_providers::TokenUsage;
 
 use crate::InterruptSource;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
+use crate::manager::{CurrentManagedTurn, ManagerInner};
 use crate::types::{AgentId, TurnId, TurnOutcome};
+
+#[derive(Clone)]
+pub(crate) struct ManagedTurnAdmission {
+    pub(crate) manager: std::sync::Weak<ManagerInner>,
+    pub(crate) agent_id: AgentId,
+}
+
+impl ManagedTurnAdmission {
+    pub(crate) fn new(manager: std::sync::Weak<ManagerInner>, agent_id: AgentId) -> Self {
+        Self { manager, agent_id }
+    }
+}
 
 /// What category of work the backend is asked to execute. Controls and
 /// compacts never produce a [`TurnOutcome`]; turns and started roots settle
@@ -43,6 +56,7 @@ pub struct TurnContext {
     /// Extracts root/compact work out of the actor's queue while the run is
     /// active, so it can fold them instead of waiting for the turn to end.
     pub interrupt: Option<std::sync::Arc<dyn InterruptSource>>,
+    pub managed_turn: Option<CurrentManagedTurn>,
 }
 
 /// The terminal result of one backend execution. `EnteredRun` is the only

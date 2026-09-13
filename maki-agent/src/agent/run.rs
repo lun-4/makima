@@ -102,6 +102,7 @@ pub struct AgentParams {
     /// Same-process per-path mutation locks, cloned from the parent context
     /// for subagents so concurrent same-path mutations stay serialized.
     pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
+    pub managed_turn: Option<crate::CurrentManagedTurn>,
 }
 
 pub struct AgentRunParams<'h> {
@@ -151,6 +152,7 @@ pub struct Agent<'h> {
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
+    managed_turn: Option<crate::CurrentManagedTurn>,
 }
 
 impl<'h> Agent<'h> {
@@ -195,6 +197,7 @@ impl<'h> Agent<'h> {
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
             file_write_locks: params.file_write_locks,
+            managed_turn: params.managed_turn,
         }
     }
 
@@ -588,6 +591,7 @@ impl<'h> Agent<'h> {
             model_policy: Arc::clone(&self.model_policy),
             file_write_locks: Arc::clone(&self.file_write_locks),
             write_lock_chain: Arc::new(Vec::new()),
+            managed_turn: self.managed_turn.clone(),
         }
     }
 
@@ -916,6 +920,7 @@ mod tests {
                 question_mode: crate::tools::QuestionMode::Tui,
                 model_policy: Arc::new(ModelPolicy::default()),
                 file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
+                managed_turn: None,
             },
             AgentRunParams {
                 history,

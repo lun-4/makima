@@ -184,7 +184,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 ### `task_spawn` {#task_spawn}
 
-Start a background subagent and return its task_id immediately. Each task's messages run FIFO, acquiring concurrency capacity only when each turn starts. The result is returned automatically when the subagent finishes, so wait for the reply instead of polling task_get. Queue messages with task_send and finish with task_despawn. Also callable from a code_execution script as a Python async function.
+Start a background subagent and return its task_id immediately. Each task's messages run FIFO, acquiring concurrency capacity only when each turn starts. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Managed general subagents must use the blocking task tool for nested work so their turn capacity is yielded while the child runs. Unmanaged callers retain task_spawn/task_get compatibility. Queue messages with task_send and finish with task_despawn. Also callable from a code_execution script as a Python async function.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -196,7 +196,7 @@ Start a background subagent and return its task_id immediately. Each task's mess
 
 ### `task_get` {#task_get}
 
-Poll a background subagent. Returns { status = "running" | "done" | "closed", result?, error? }. Normally unnecessary: a spawned subagent's result arrives automatically, so wait for that reply instead of polling task_get. Does not block the main agent. Also callable from a code_execution script as a Python async function.
+Poll a background subagent. Returns { status = "running" | "done" | "closed", result?, error? }. Managed general subagents cannot spawn background nested tasks and must use the blocking task tool instead. Unmanaged callers retain task_spawn/task_get compatibility. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Does not block the caller. Also callable from a code_execution script as a Python async function.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

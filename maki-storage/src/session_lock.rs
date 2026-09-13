@@ -1,23 +1,32 @@
 //! Cross-process session locks. One `<id>.lock` file per session inside the
-//! sessions dir: the file holds the holder's PID, its mtime is the heartbeat.
+//! sessions dir holds only the holder's PID so older binaries respect it. A
+//! `<id>.lock.owner` sidecar holds the PID and owner token used by newer leases.
+//! Both are coordinated under the canonical file lock; its mtime is the
+//! heartbeat. Graceful release writes the ephemeral `released` marker, which
+//! the next claim replaces.
 //! A session whose lock is fresh and held by another process is open
 //! elsewhere and cannot be continued from here.
 //!
 //! Only write paths (`heartbeat`) mutate lock state. Readers (`open_elsewhere`)
 //! never reclaim: a stale lock is cleaned up by the next claimant's heartbeat.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use crate::id::MakiId;
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 pub const STALE_AFTER: Duration = Duration::from_secs(5);
 pub const OPEN_ELSEWHERE_MSG: &str = "session is open in another terminal; close it there first";
+
+const RELEASED_RECORD: &str = "released";
+const OWNER_SUFFIX: &str = ".owner";
 
 /// Reasons a stored session cannot be continued from this run.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -43,8 +52,198 @@ pub fn lock_path(dir: &Path, id: &MakiId) -> PathBuf {
     dir.join(format!("{id}.lock"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockOwner {
+    pid: u32,
+    token: Option<String>,
+}
+
+fn parse_pid(record: &str) -> Option<u32> {
+    record.trim().parse().ok()
+}
+
+fn parse_owner(record: &str) -> Option<LockOwner> {
+    let mut fields = record.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let token = fields.next()?.to_owned();
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(LockOwner {
+        pid,
+        token: Some(token),
+    })
+}
+
+fn owner_path(path: &Path) -> PathBuf {
+    let mut owner = path.as_os_str().to_owned();
+    owner.push(OWNER_SUFFIX);
+    owner.into()
+}
+
+fn read_pid(file: &mut File) -> io::Result<Option<u32>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut record = String::new();
+    file.read_to_string(&mut record)?;
+    Ok(parse_pid(&record))
+}
+
+fn read_owner(path: &Path, file: &mut File) -> io::Result<Option<LockOwner>> {
+    let Some(pid) = read_pid(file)? else {
+        return Ok(None);
+    };
+    let record = match read_owner_sidecar(path) {
+        Ok(record) => record,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(LockOwner { pid, token: None }));
+        }
+        Err(error) => return Err(error),
+    };
+    let owner = match parse_owner(&record) {
+        Some(owner) if owner.pid == pid => owner,
+        Some(_) | None => LockOwner { pid, token: None },
+    };
+    Ok(Some(owner))
+}
+
+fn read_owner_sidecar(path: &Path) -> io::Result<String> {
+    #[cfg(test)]
+    if let Some(error) = take_sidecar_read_error(path) {
+        return Err(error);
+    }
+    fs::read_to_string(owner_path(path))
+}
+
 fn holder_pid(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+    parse_pid(&fs::read_to_string(path).ok()?)
+}
+
+fn write_record(file: &mut File, record: &[u8]) -> io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(record)?;
+    file.sync_data()
+}
+
+fn write_owner(path: &Path, file: &mut File, owner: &LockOwner) -> io::Result<()> {
+    let token = owner.token.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "claimed lock owner requires a token",
+        )
+    })?;
+    fs::write(owner_path(path), format!("{} {token}", owner.pid))?;
+    write_record(file, owner.pid.to_string().as_bytes())
+}
+
+fn owner_token() -> io::Result<String> {
+    let mut token = [0_u8; 16];
+    getrandom::fill(&mut token)
+        .map_err(|error| io::Error::other(format!("generate lock owner token: {error}")))?;
+    Ok(token.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(test)]
+type ReleaseHook = (PathBuf, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+fn sidecar_read_error() -> &'static Mutex<Option<(PathBuf, io::ErrorKind)>> {
+    static ERROR: OnceLock<Mutex<Option<(PathBuf, io::ErrorKind)>>> = OnceLock::new();
+    ERROR.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn take_sidecar_read_error(path: &Path) -> Option<io::Error> {
+    let mut error = sidecar_read_error()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if error.as_ref().is_some_and(|(expected, _)| expected == path) {
+        let (_, kind) = error.take().expect("matching sidecar read error");
+        return Some(io::Error::new(kind, "injected sidecar read failure"));
+    }
+    None
+}
+
+#[cfg(test)]
+fn release_before_write_hook() -> &'static Mutex<Option<ReleaseHook>> {
+    static HOOK: OnceLock<Mutex<Option<ReleaseHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn run_release_before_write_hook(path: &Path) {
+    let mut hook = release_before_write_hook()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
+        let (_, callback) = hook.take().expect("matching release hook");
+        drop(hook);
+        callback();
+    }
+}
+
+/// The sole identity-bearing lease for a claimed session lock.
+#[derive(Debug)]
+pub struct ClaimedSessionLock {
+    path: PathBuf,
+    owner: LockOwner,
+    released: bool,
+}
+
+impl ClaimedSessionLock {
+    /// Refresh the lease only while the on-disk lock still has this lease's identity.
+    pub fn heartbeat(&mut self) -> io::Result<LockBeat> {
+        let Some(mut file) = open_existing_locked(&self.path)? else {
+            return Ok(LockBeat::Lost);
+        };
+        if read_owner(&self.path, &mut file)?.as_ref() != Some(&self.owner) {
+            file.unlock()?;
+            return Ok(LockBeat::Lost);
+        }
+        write_record(&mut file, self.owner.pid.to_string().as_bytes())?;
+        file.unlock()?;
+        Ok(LockBeat::Held)
+    }
+
+    /// Mark this lease's locked inode released without mutating its pathname.
+    pub fn release(mut self) -> io::Result<()> {
+        self.release_inner()
+    }
+
+    fn release_inner(&mut self) -> io::Result<()> {
+        let Some(mut file) = open_existing_locked(&self.path)? else {
+            self.released = true;
+            return Ok(());
+        };
+        if read_owner(&self.path, &mut file)?.as_ref() == Some(&self.owner) {
+            #[cfg(test)]
+            run_release_before_write_hook(&self.path);
+            write_record(&mut file, RELEASED_RECORD.as_bytes())?;
+        }
+        file.unlock()?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for ClaimedSessionLock {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.release_inner();
+        }
+    }
+}
+
+fn open_existing_locked(path: &Path) -> io::Result<Option<File>> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    file.try_lock_exclusive()?;
+    Ok(Some(file))
 }
 
 /// Outcome of a `heartbeat` call.
@@ -74,10 +273,8 @@ fn is_fresh(mtime: SystemTime, now: SystemTime) -> bool {
     skew <= STALE_AFTER
 }
 
-/// Claim the lock if it is absent, stale, malformed, or ours; never clobber a
-/// fresh foreign one. Doubles as the periodic heartbeat: callers that keep
-/// beating after an initial claim detect losing the lock through [`LockBeat::Lost`].
-pub fn heartbeat(dir: &Path, id: &MakiId) -> io::Result<LockBeat> {
+/// Claim the lock if it is absent, stale, or malformed, returning its sole lease.
+pub fn claim(dir: &Path, id: &MakiId) -> io::Result<Option<ClaimedSessionLock>> {
     let path = lock_path(dir, id);
     let mut file = OpenOptions::new()
         .read(true)
@@ -87,32 +284,56 @@ pub fn heartbeat(dir: &Path, id: &MakiId) -> io::Result<LockBeat> {
         .open(&path)?;
     if let Err(error) = file.try_lock_exclusive() {
         if error.kind() == io::ErrorKind::WouldBlock {
-            return Ok(LockBeat::Lost);
+            return Ok(None);
         }
         return Err(error);
     }
-    let pid = std::process::id();
-    let holder = holder_pid(&path);
-    let foreign = holder.is_some_and(|holder| holder != pid);
-    if foreign
+    let stored_owner = read_owner(&path, &mut file)?;
+    if stored_owner.is_some()
         && fs::metadata(&path)
             .and_then(|metadata| metadata.modified())
             .is_ok_and(|mtime| is_fresh(mtime, SystemTime::now()))
     {
         file.unlock()?;
+        return Ok(None);
+    }
+    let owner = LockOwner {
+        pid: std::process::id(),
+        token: Some(owner_token()?),
+    };
+    write_owner(&path, &mut file, &owner)?;
+    file.unlock()?;
+    Ok(Some(ClaimedSessionLock {
+        path,
+        owner,
+        released: false,
+    }))
+}
+
+fn deferred_leases() -> &'static Mutex<HashMap<PathBuf, ClaimedSessionLock>> {
+    static LEASES: OnceLock<Mutex<HashMap<PathBuf, ClaimedSessionLock>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Compatibility heartbeat for frontends that do not yet retain a lease.
+pub fn heartbeat(dir: &Path, id: &MakiId) -> io::Result<LockBeat> {
+    let path = lock_path(dir, id);
+    let mut leases = deferred_leases()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(lease) = leases.get_mut(&path) {
+        let beat = lease.heartbeat()?;
+        if beat == LockBeat::Held {
+            return Ok(beat);
+        }
+        leases.remove(&path);
         return Ok(LockBeat::Lost);
     }
-    use std::io::{Seek, SeekFrom, Write};
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(pid.to_string().as_bytes())?;
-    file.sync_data()?;
-    file.unlock()?;
-    Ok(if foreign {
-        LockBeat::Claimed
-    } else {
-        LockBeat::Held
-    })
+    let Some(lease) = claim(dir, id)? else {
+        return Ok(LockBeat::Lost);
+    };
+    leases.insert(path, lease);
+    Ok(LockBeat::Claimed)
 }
 
 /// True when another process holds a fresh lock for the session. Read-only:
@@ -130,17 +351,16 @@ pub fn open_elsewhere(dir: &Path, id: &MakiId) -> bool {
         .is_ok_and(|mtime| is_fresh(mtime, SystemTime::now()))
 }
 
-/// Drop the lock if we hold it. Best effort: a foreign lock is left for its
-/// staleness window to clear.
+/// Compatibility release for frontends that do not yet retain a lease.
 pub fn release(dir: &Path, id: &MakiId) {
     let path = lock_path(dir, id);
-    let Ok(file) = File::open(&path) else {
-        return;
-    };
-    if file.try_lock_exclusive().is_ok() && holder_pid(&path) == Some(std::process::id()) {
-        let _ = fs::remove_file(&path);
+    let lease = deferred_leases()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&path);
+    if let Some(lease) = lease {
+        let _ = lease.release();
     }
-    let _ = file.unlock();
 }
 
 #[cfg(test)]
@@ -192,6 +412,98 @@ mod tests {
     fn is_fresh_threshold(age_secs: u64, fresh: bool) {
         let now = SystemTime::now();
         assert_eq!(is_fresh(now - Duration::from_secs(age_secs), now), fresh);
+    }
+
+    fn legacy_holder_pid(path: &Path) -> Option<u32> {
+        fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    fn legacy_claim(path: &Path, pid: u32) -> io::Result<LockBeat> {
+        let mut file = File::options().read(true).write(true).open(path)?;
+        file.try_lock_exclusive()?;
+        let holder = legacy_holder_pid(path);
+        let foreign = holder.is_some_and(|holder| holder != pid);
+        if foreign
+            && fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|mtime| is_fresh(mtime, SystemTime::now()))
+        {
+            file.unlock()?;
+            return Ok(LockBeat::Lost);
+        }
+        write_record(&mut file, pid.to_string().as_bytes())?;
+        file.unlock()?;
+        Ok(if foreign {
+            LockBeat::Claimed
+        } else {
+            LockBeat::Held
+        })
+    }
+
+    #[test]
+    fn legacy_pid_only_record_parses_without_owner_token() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        fake_lock(dir.path(), &id);
+        let mut file = File::options().read(true).write(true).open(&path).unwrap();
+
+        assert_eq!(
+            read_owner(&path, &mut file).unwrap(),
+            Some(LockOwner {
+                pid: FAKE_PID,
+                token: None,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_sidecar_is_treated_as_tokenless() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        fake_lock(dir.path(), &id);
+        fs::write(owner_path(&path), "malformed owner record").unwrap();
+        let mut file = File::options().read(true).write(true).open(&path).unwrap();
+
+        assert_eq!(
+            read_owner(&path, &mut file).unwrap(),
+            Some(LockOwner {
+                pid: FAKE_PID,
+                token: None,
+            })
+        );
+    }
+
+    #[test]
+    fn claimed_record_is_pid_only_with_token_in_sidecar() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+        let owner = parse_owner(&fs::read_to_string(owner_path(&path)).unwrap()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+        assert_eq!(legacy_holder_pid(&path), Some(std::process::id()));
+        assert_eq!(owner.pid, std::process::id());
+        assert_eq!(owner.token.as_deref().map(str::len), Some(32));
+        lease.release().unwrap();
+    }
+
+    #[test]
+    fn legacy_parser_and_claim_respect_fresh_new_lease() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+
+        assert_eq!(legacy_holder_pid(&path), Some(std::process::id()));
+        assert_eq!(legacy_claim(&path, FAKE_PID).unwrap(), LockBeat::Lost);
+        assert!(claim(dir.path(), &id).unwrap().is_none());
+        lease.release().unwrap();
     }
 
     #[test]
@@ -280,12 +592,154 @@ mod tests {
     }
 
     #[test]
-    fn release_removes_own_lock() {
+    fn heartbeat_contention_does_not_report_ownership_loss() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        let blocker = File::options().read(true).write(true).open(path).unwrap();
+        blocker.lock_exclusive().unwrap();
+
+        assert_eq!(
+            lease.heartbeat().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        blocker.unlock().unwrap();
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
+    }
+
+    #[test]
+    fn heartbeat_recovers_after_sidecar_read_failure() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        *sidecar_read_error().lock().unwrap() = Some((path, io::ErrorKind::PermissionDenied));
+
+        assert_eq!(
+            lease.heartbeat().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
+    }
+
+    #[test]
+    fn stale_guard_heartbeat_does_not_recreate_absent_lock() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Lost);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_guard_heartbeat_does_not_overwrite_replaced_sidecar() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        let replacement_owner = format!("{} replacement", std::process::id());
+        fs::write(owner_path(&path), &replacement_owner).unwrap();
+
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Lost);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(owner_path(&path)).unwrap(),
+            replacement_owner
+        );
+    }
+
+    #[test]
+    fn stale_guard_heartbeat_does_not_overwrite_replaced_lock() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        let replacement_pid = FAKE_PID.to_string();
+        let replacement_owner = format!("{FAKE_PID} replacement");
+        fs::write(&path, &replacement_pid).unwrap();
+        fs::write(owner_path(&path), &replacement_owner).unwrap();
+
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Lost);
+        assert_eq!(fs::read_to_string(&path).unwrap(), replacement_pid);
+        assert_eq!(
+            fs::read_to_string(owner_path(&path)).unwrap(),
+            replacement_owner
+        );
+    }
+
+    #[test]
+    fn stale_guard_release_does_not_recreate_absent_lock() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+        fs::remove_file(&path).unwrap();
+
+        lease.release().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_guard_release_does_not_delete_replaced_lock() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+        let replacement_pid = FAKE_PID.to_string();
+        let replacement_owner = format!("{FAKE_PID} replacement");
+        fs::write(&path, &replacement_pid).unwrap();
+        fs::write(owner_path(&path), &replacement_owner).unwrap();
+
+        lease.release().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), replacement_pid);
+        assert_eq!(
+            fs::read_to_string(owner_path(&path)).unwrap(),
+            replacement_owner
+        );
+    }
+
+    #[test]
+    fn release_does_not_modify_path_replaced_after_owner_check() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+        let replacement = format!("{} replacement", std::process::id());
+        let replaced_path = path.clone();
+        *release_before_write_hook().lock().unwrap() = Some((
+            path.clone(),
+            Box::new(move || {
+                fs::remove_file(&replaced_path).unwrap();
+                fs::write(&replaced_path, &replacement).unwrap();
+            }),
+        ));
+
+        lease.release().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            format!("{} replacement", std::process::id())
+        );
+    }
+
+    #[test]
+    fn release_marker_is_immediately_claimable() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
         heartbeat(dir.path(), &id).unwrap();
         release(dir.path(), &id);
-        assert!(!lock_path(dir.path(), &id).exists());
+
+        let path = lock_path(dir.path(), &id);
+        assert_eq!(fs::read_to_string(&path).unwrap(), RELEASED_RECORD);
+        assert!(!open_elsewhere(dir.path(), &id));
+        claim(dir.path(), &id).unwrap().unwrap().release().unwrap();
     }
 
     #[test]

@@ -288,6 +288,7 @@ impl TuiActorBackend {
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
                 file_write_locks: Arc::clone(&self.file_write_locks),
+                managed_turn: context.managed_turn.clone(),
             },
             AgentRunParams {
                 history,

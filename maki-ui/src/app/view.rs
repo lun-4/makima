@@ -21,11 +21,19 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use super::{App, Mode, Status, mouse::MIDDLE_SCROLL_ANCHOR};
 
 const SUBAGENT_INPUT_HINT: &str = "sends to this subagent \u{b7} TAB mode \u{b7} ESC cancel";
+const DESPAWNED_SUBAGENT_INPUT_HINT: &str =
+    "DESPAWNED \u{b7} sends to this subagent \u{b7} TAB mode \u{b7} ESC cancel";
 
 /// Target hint shown under the input box so a user typing on a subagent chat
 /// knows their Enter goes to that subagent, not the main agent.
-fn subagent_input_hint(is_subagent: bool) -> Option<Line<'static>> {
-    is_subagent.then(|| Line::from(SUBAGENT_INPUT_HINT))
+fn subagent_input_hint(is_subagent: bool, despawned: bool) -> Option<Line<'static>> {
+    is_subagent.then(|| {
+        Line::from(if despawned {
+            DESPAWNED_SUBAGENT_INPUT_HINT
+        } else {
+            SUBAGENT_INPUT_HINT
+        })
+    })
 }
 
 struct ViewLayout {
@@ -173,14 +181,10 @@ impl App {
         }
     }
 
-    fn resolve_render_chat(&self) -> usize {
-        if self.task_picker.is_open() {
-            self.task_picker
-                .selected_index()
-                .unwrap_or(self.active_chat)
-        } else {
-            self.active_chat
-        }
+    pub(super) fn resolve_render_chat(&self) -> usize {
+        self.task_picker
+            .selected_item()
+            .map_or(self.active_chat, |entry| entry.chat_index)
     }
 
     fn render_background(&self, frame: &mut Frame) {
@@ -298,7 +302,7 @@ impl App {
                     Placeholder::Blank,
                     self.separator_style(),
                     !self.any_overlay_open(),
-                    subagent_input_hint(true),
+                    subagent_input_hint(true, self.active_subagent_closed()),
                     &self.state.session.cwd,
                 );
             }
@@ -634,12 +638,18 @@ impl App {
 mod tests {
     use ratatui::text::Line;
 
-    use super::{SUBAGENT_INPUT_HINT, subagent_input_hint};
+    use super::{DESPAWNED_SUBAGENT_INPUT_HINT, SUBAGENT_INPUT_HINT, subagent_input_hint};
 
     #[test]
     fn subagent_input_hint_cases() {
-        let hint = subagent_input_hint(true).expect("subagent gets a target hint");
-        assert_eq!(hint, Line::from(SUBAGENT_INPUT_HINT));
-        assert!(subagent_input_hint(false).is_none());
+        assert_eq!(
+            subagent_input_hint(true, false),
+            Some(Line::from(SUBAGENT_INPUT_HINT))
+        );
+        assert_eq!(
+            subagent_input_hint(true, true),
+            Some(Line::from(DESPAWNED_SUBAGENT_INPUT_HINT))
+        );
+        assert!(subagent_input_hint(false, false).is_none());
     }
 }

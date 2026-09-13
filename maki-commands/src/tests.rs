@@ -35,6 +35,35 @@ impl CommandBehavior for CountingBehavior {
 
 struct Host;
 
+#[test]
+fn prepared_target_is_stale_until_activation() {
+    let registry = CommandRegistry::new();
+    let prepared = registry.prepare_target(TargetCapabilities::NONE, Arc::new(Host));
+    let id = prepared.handle().id();
+
+    assert!(matches!(
+        registry.snapshot_for(prepared.handle()),
+        Err(CommandError::StaleTarget)
+    ));
+
+    let target = prepared.activate();
+    assert_eq!(target.id(), id);
+    assert!(registry.snapshot_for(&target).is_ok());
+}
+
+#[test]
+fn dropped_prepared_target_is_never_published() {
+    let registry = CommandRegistry::new();
+    let prepared = registry.prepare_target(TargetCapabilities::NONE, Arc::new(Host));
+    let handle = prepared.handle().clone();
+    drop(prepared);
+
+    assert!(matches!(
+        registry.snapshot_for(&handle),
+        Err(CommandError::StaleTarget)
+    ));
+}
+
 #[derive(Default)]
 struct CompletionProbe {
     completions: AtomicU64,

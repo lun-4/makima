@@ -188,13 +188,17 @@ impl App {
         if !msg.images.is_empty() {
             return SubmitOutcome::Rejected(NO_SUBAGENT_IMAGE_ERR.into());
         }
-        let Some(subagent_id) = self.chats[self.active_chat].subagent_id.clone() else {
+        let Some(_) = self.chats[self.active_chat].subagent_id else {
             return SubmitOutcome::Started(self.start_from_queue(&msg));
+        };
+        let Some(agent_id) = self.chats[self.active_chat].agent_id else {
+            return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         };
         let Some(input_tx) = self
             .subagent_channels
-            .get(&subagent_id)
-            .and_then(|c| c.input_tx.as_ref())
+            .get(&agent_id)
+            .filter(|channels| !channels.closed)
+            .and_then(|channels| channels.input_tx.as_ref())
         else {
             // Live-channel gone (subagent finished); never silently reroute to
             // the main agent. Surface the rejection via the caller's flash.

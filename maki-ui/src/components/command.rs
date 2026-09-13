@@ -124,6 +124,22 @@ impl CommandPalette {
         let snapshot = registry
             .snapshot_for(&target)
             .expect("new command target is live");
+        Self::from_snapshot(registry, target, snapshot)
+    }
+
+    pub(crate) fn prepared(
+        registry: CommandRegistry,
+        target: TargetHandle,
+        snapshot: RegistrySnapshot,
+    ) -> Self {
+        Self::from_snapshot(registry, target, snapshot)
+    }
+
+    fn from_snapshot(
+        registry: CommandRegistry,
+        target: TargetHandle,
+        snapshot: RegistrySnapshot,
+    ) -> Self {
         let nucleo = Self::build_nucleo(&snapshot);
         Self {
             command_selected: 0,

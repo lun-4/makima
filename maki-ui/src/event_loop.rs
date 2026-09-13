@@ -8,9 +8,10 @@
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
@@ -21,6 +22,8 @@ use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use maki_agent::command::CustomCommand;
+#[cfg(test)]
+use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
@@ -38,34 +41,35 @@ use maki_providers::{Message, Model, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::session_lock;
+use maki_storage::session_lock::{self, ClaimedSessionLock};
 use maki_storage::sessions::{
     Prefs, SESSIONS_DIR, SessionError, StoredTokenUsage, normalize_title, write_prefs,
 };
 use serde_json::json;
 use tracing::{info, warn};
 
-fn claim_lock(dir: &std::path::Path, id: &MakiId) -> Result<()> {
-    match session_lock::heartbeat(dir, id)? {
-        session_lock::LockBeat::Lost => Err(eyre!(
-            "session is open in another terminal; close it there first"
-        )),
-        session_lock::LockBeat::Claimed | session_lock::LockBeat::Held => Ok(()),
-    }
+fn claim_lock(dir: &std::path::Path, id: &MakiId) -> Result<ClaimedSessionLock> {
+    session_lock::claim(dir, id)?.ok_or_else(|| eyre!(session_lock::OPEN_ELSEWHERE_MSG))
 }
 
 use crate::AppSession;
 use crate::agent::{
-    AgentCommand, AgentHandles, ProviderChange, ProviderSlot, SystemPromptOverride,
-    shared_queue::QueueItem,
+    AgentCommand, AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot,
+    SystemPromptOverride, shared_queue::QueueItem,
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
-use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
+use crate::app::{
+    App, Msg, Notification, PreparedApp, QueuedMessage, SubmitOutcome, session_has_content,
+    turn_response,
+};
 use crate::color_compat;
 use crate::command_runtime::{CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{
+    Action, ExitRequest, ReplacementPostCommit, SessionReplacementKind, SessionReplacementRequest,
+    Status,
+};
 use crate::input::InputReader;
 use crate::provider_usage::{
     ProviderIdentity, ProviderUsageCoordinator, ProviderUsageFetch, ProviderUsageFetchId,
@@ -88,6 +92,13 @@ const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
+const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
+    "session lock ownership is unavailable; replacement is disabled";
+const REPLACEMENT_PENDING_ERR: &str =
+    "session replacement is already waiting for lock verification";
+
+static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -337,18 +348,343 @@ fn parse_session_id(id: &str) -> Result<MakiId, String> {
     id.parse().map_err(|e: MakiIdParseError| e.to_string())
 }
 
+enum SessionLockState {
+    Held(ClaimedSessionLock),
+    InFlight(flume::Receiver<HeartbeatCompletion>),
+}
+
+struct HeartbeatCompletion {
+    result: io::Result<session_lock::LockBeat>,
+    lease: Option<ClaimedSessionLock>,
+}
+
+impl Drop for HeartbeatCompletion {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = lease.release();
+        }
+    }
+}
+
+fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
+    runtime.session_lock = None;
+    runtime.pending_replacement = None;
+    runtime.lock_lost = true;
+    runtime
+        .app
+        .flash("Session lock lost to another process; stopping without saving".into());
+    runtime.app.exit_request = ExitRequest::Error;
+    let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);
+    warn!(id = %runtime.id(), "session lock lost to another process; stopping without saving");
+}
+
+fn apply_heartbeat_completion(runtime: &mut SessionRuntime, mut completion: HeartbeatCompletion) {
+    match completion.result {
+        Ok(session_lock::LockBeat::Held | session_lock::LockBeat::Claimed) => {
+            let lease = completion.lease.take().expect("heartbeat completion lease");
+            runtime.session_lock = Some(SessionLockState::Held(lease));
+        }
+        Ok(session_lock::LockBeat::Lost) => mark_runtime_lock_lost(runtime),
+        Err(ref error) => {
+            let lease = completion.lease.take().expect("heartbeat completion lease");
+            runtime.session_lock = Some(SessionLockState::Held(lease));
+            warn!(id = %runtime.id(), %error, "session lock heartbeat failed");
+        }
+    }
+}
+
+fn complete_runtime_heartbeat(runtime: &mut SessionRuntime) -> Option<PendingReplacement> {
+    let Some(SessionLockState::InFlight(completion_rx)) = runtime.session_lock.take() else {
+        return None;
+    };
+    let completion = collect_heartbeat(completion_rx, None)?;
+    apply_heartbeat_completion(runtime, completion);
+    if runtime.lock_lost {
+        None
+    } else {
+        runtime.pending_replacement.take()
+    }
+}
+
+fn start_runtime_heartbeat(
+    runtime: &mut SessionRuntime,
+    internal_tx: &flume::Sender<InternalEvent>,
+) {
+    start_runtime_heartbeat_with(runtime, internal_tx, |mut lease| {
+        let result = lease.heartbeat();
+        (lease, result)
+    });
+}
+
+fn start_runtime_heartbeat_with<F>(
+    runtime: &mut SessionRuntime,
+    internal_tx: &flume::Sender<InternalEvent>,
+    heartbeat: F,
+) where
+    F: FnOnce(ClaimedSessionLock) -> (ClaimedSessionLock, io::Result<session_lock::LockBeat>)
+        + Send
+        + 'static,
+{
+    let lease = match runtime.session_lock.take() {
+        Some(SessionLockState::Held(lease)) => lease,
+        state => {
+            runtime.session_lock = state;
+            return;
+        }
+    };
+    let runtime_generation = runtime.generation;
+    let internal_tx = internal_tx.clone();
+    let (completion_tx, completion_rx) = flume::bounded(1);
+    smol::spawn(async move {
+        let (lease, result) = smol::unblock(move || heartbeat(lease)).await;
+        let completion = HeartbeatCompletion {
+            result,
+            lease: Some(lease),
+        };
+        if completion_tx.send(completion).is_ok() {
+            let _ = internal_tx.send(InternalEvent::SessionHeartbeat(runtime_generation));
+        }
+    })
+    .detach();
+    runtime.session_lock = Some(SessionLockState::InFlight(completion_rx));
+}
+
+fn collect_heartbeat(
+    completion_rx: flume::Receiver<HeartbeatCompletion>,
+    timeout: Option<Duration>,
+) -> Option<HeartbeatCompletion> {
+    match timeout {
+        Some(timeout) => completion_rx.recv_timeout(timeout).ok(),
+        None => completion_rx.try_recv().ok(),
+    }
+}
+
+enum LockReleaseOutcome {
+    Completed {
+        result: io::Result<()>,
+        lock_lost: bool,
+    },
+    TimedOut,
+}
+
+fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
+    match release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT) {
+        LockReleaseOutcome::Completed { result, .. } => result,
+        LockReleaseOutcome::TimedOut => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "session lock heartbeat did not finish before shutdown timeout",
+        )),
+    }
+}
+
+fn release_lock_state_with_timeout(
+    state: Option<SessionLockState>,
+    timeout: Duration,
+) -> LockReleaseOutcome {
+    let (lease, lock_lost) = match state {
+        Some(SessionLockState::Held(lease)) => (Some(lease), false),
+        Some(SessionLockState::InFlight(completion_rx)) => {
+            let Some(mut completion) = collect_heartbeat(completion_rx, Some(timeout)) else {
+                return LockReleaseOutcome::TimedOut;
+            };
+            let lock_lost = matches!(completion.result, Ok(session_lock::LockBeat::Lost));
+            (completion.lease.take(), lock_lost)
+        }
+        None => (None, false),
+    };
+    LockReleaseOutcome::Completed {
+        result: lease.map_or(Ok(()), ClaimedSessionLock::release),
+        lock_lost,
+    }
+}
+
+fn checkpoint_runtime(runtime: &mut SessionRuntime) {
+    if !runtime.lock_lost {
+        runtime.app.checkpoint();
+    }
+}
+
+fn rollback_startup_runtimes(mut runtimes: Vec<SessionRuntime>) {
+    for runtime in &mut runtimes {
+        if let Err(error) = release_lock_state(runtime.session_lock.take()) {
+            warn!(id = %runtime.id(), %error, "startup rollback lock release failed");
+        }
+    }
+    for runtime in runtimes {
+        runtime.handles.shutdown().detach();
+    }
+}
+
 struct SessionRuntime {
+    generation: u64,
     app: App,
     handles: AgentHandles,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
     notifications: RunNotificationState,
+    session_lock: Option<SessionLockState>,
+    lock_lost: bool,
+    restore_pending: bool,
+    pending_replacement: Option<PendingReplacement>,
+}
+
+struct PendingReplacement {
+    prepared: PreparedSessionRuntime,
+    kind: SessionReplacementKind,
+    post_commit: Option<ReplacementPostCommit>,
+}
+
+struct PreparedProvider {
+    model: Model,
+    provider: Arc<dyn Provider>,
+}
+
+struct PreparedSessionRuntime {
+    app: PreparedApp,
+    handles: PreparedAgentHandles,
+    shell_tx: flume::Sender<ShellEvent>,
+    shell_rx: flume::Receiver<ShellEvent>,
+    resumed: bool,
+    provider: Option<PreparedProvider>,
+}
+
+impl PreparedSessionRuntime {
+    #[cfg(test)]
+    fn snapshot(
+        &self,
+    ) -> (
+        MakiId,
+        maki_commands::InvocationTargetId,
+        maki_agent::AgentManagerHandle,
+        maki_agent::AgentId,
+    ) {
+        let (manager, root_id) = self.handles.manager_and_root();
+        (
+            self.app.session_id(),
+            self.app.command_target_id(),
+            manager,
+            root_id,
+        )
+    }
+
+    fn activate(
+        self,
+        model_slot: &ProviderSlot,
+        session_lock: Option<SessionLockState>,
+    ) -> SessionRuntime {
+        let Self {
+            app,
+            handles,
+            shell_tx,
+            shell_rx,
+            resumed,
+            provider,
+        } = self;
+        if let Some(provider) = provider {
+            model_slot.install(provider.model, provider.provider);
+        }
+        let handles = handles.activate();
+        let mut app = app.activate();
+        handles.apply_to_app(&mut app);
+        SessionRuntime {
+            generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
+            app,
+            handles,
+            shell_tx,
+            shell_rx,
+            last_status: SessionStatus::Idle,
+            notifications: RunNotificationState::default(),
+            session_lock,
+            lock_lost: false,
+            restore_pending: resumed,
+            pending_replacement: None,
+        }
+    }
+}
+
+fn defer_replacement_for_heartbeat(
+    runtime: &mut SessionRuntime,
+    pending: PendingReplacement,
+) -> Option<PendingReplacement> {
+    let same_id = runtime.id() == pending.prepared.app.session_id();
+    if same_id && matches!(runtime.session_lock, Some(SessionLockState::InFlight(_))) {
+        if runtime.pending_replacement.is_none() {
+            runtime.pending_replacement = Some(pending);
+        } else {
+            runtime.app.flash(REPLACEMENT_PENDING_ERR.into());
+        }
+        None
+    } else {
+        Some(pending)
+    }
+}
+
+fn replace_session_runtime(
+    current: &mut SessionRuntime,
+    prepared: PreparedSessionRuntime,
+    sessions_dir: &std::path::Path,
+    model_slot: &ProviderSlot,
+) -> Result<SessionRuntime, String> {
+    let target_id = prepared.app.session_id();
+    let exit_on_done = current.app.exit_on_done;
+    let same_id = current.id() == target_id;
+    if current.lock_lost {
+        return Err(LOCK_LOST_REPLACEMENT_ERR.into());
+    }
+    let target_lock = if same_id {
+        match current.session_lock.take() {
+            Some(SessionLockState::Held(lease)) => Some(SessionLockState::Held(lease)),
+            state => {
+                current.session_lock = state;
+                return Err(LOCK_UNAVAILABLE_REPLACEMENT_ERR.into());
+            }
+        }
+    } else {
+        Some(SessionLockState::Held(
+            claim_lock(sessions_dir, &target_id).map_err(|error| error.to_string())?,
+        ))
+    };
+    let mut runtime = prepared.activate(model_slot, target_lock);
+    runtime.app.exit_on_done = exit_on_done;
+    runtime
+        .app
+        .input_box
+        .replace_history_from(&mut current.app.input_box);
+    let old = std::mem::replace(current, runtime);
+    old.app
+        .command_runtime
+        .finish_theme_preview(old.app.command_target.id(), false);
+    current.activate_deferred();
+    Ok(old)
 }
 
 impl SessionRuntime {
     fn id(&self) -> MakiId {
         self.app.state.session.id
+    }
+
+    fn update(&mut self, msg: Msg) -> Vec<Action> {
+        if self.pending_replacement.is_some() && matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
+            return Vec::new();
+        }
+        self.app.update(msg)
+    }
+
+    fn submit_text(&mut self, text: String) -> Result<SubmitOutcome, String> {
+        if self.pending_replacement.is_some() {
+            return Err(REPLACEMENT_PENDING_ERR.into());
+        }
+        Ok(self.app.submit_prompt(QueuedMessage {
+            text,
+            images: Vec::new(),
+        }))
+    }
+
+    fn activate_deferred(&mut self) {
+        if std::mem::take(&mut self.restore_pending) {
+            self.app.restore_resumed_session();
+        }
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -374,6 +710,7 @@ impl SessionRuntime {
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
     storage: StateDir,
+    sessions_dir: PathBuf,
     config: AgentConfig,
     ui_config: UiConfig,
     input_history_size: usize,
@@ -396,10 +733,59 @@ struct SpawnCtx {
 }
 
 impl SpawnCtx {
-    fn spawn_runtime(&self, session: AppSession) -> SessionRuntime {
-        let resumed = !session.messages().is_empty();
-        let permissions = Arc::new(self.permissions.fork());
-        let handles = AgentHandles::spawn(
+    fn prepare_runtime(&self, session: AppSession) -> PreparedSessionRuntime {
+        self.prepare_runtime_with_provider(session, None)
+    }
+
+    fn prepare_replacement_runtime(
+        &self,
+        session: AppSession,
+        permissions: &PermissionManager,
+    ) -> Result<PreparedSessionRuntime, String> {
+        let provider = self.prepare_replacement_provider(&session)?;
+        Ok(self.prepare_runtime_with_provider_and_permissions(session, provider, permissions))
+    }
+
+    fn prepare_replacement_provider(
+        &self,
+        session: &AppSession,
+    ) -> Result<Option<PreparedProvider>, String> {
+        let model_spec = &session.model;
+        if model_spec == &self.model_slot.load().model.spec()
+            || !self.model_policy.allows(model_spec)
+        {
+            return Ok(None);
+        }
+        let mut model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
+        let provider = from_model(&mut model, self.timeouts).map_err(|error| error.to_string())?;
+        Ok(Some(PreparedProvider {
+            model,
+            provider: Arc::from(provider),
+        }))
+    }
+
+    fn prepare_runtime_with_provider(
+        &self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+    ) -> PreparedSessionRuntime {
+        self.prepare_runtime_with_provider_and_permissions(session, provider, &self.permissions)
+    }
+
+    fn prepare_runtime_with_provider_and_permissions(
+        &self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+        permissions: &PermissionManager,
+    ) -> PreparedSessionRuntime {
+        let resumed = session_has_content(&session);
+        let model = provider
+            .as_ref()
+            .map(|provider| &provider.model)
+            .unwrap_or(&self.model_slot.load().model)
+            .clone();
+        let permissions = Arc::new(permissions.fork());
+        let handles = AgentHandles::prepare(
             &self.model_slot,
             session.messages().to_vec(),
             self.config.clone(),
@@ -413,13 +799,13 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             self.system_prompt.clone(),
         );
-        let mut app = App::new(
-            &self.model_slot.load().model,
+        let app = App::prepare(
+            &model,
             session,
             self.storage.clone(),
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
-            handles.mcp_config_errors.clone(),
+            self.mcp_config_errors.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
             self.status_content_reader.clone(),
@@ -432,19 +818,22 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
         );
-        handles.apply_to_app(&mut app);
-        if resumed {
-            app.restore_resumed_session();
-        }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
-        SessionRuntime {
+        PreparedSessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
-            last_status: SessionStatus::Idle,
-            notifications: RunNotificationState::default(),
+            resumed,
+            provider,
         }
+    }
+
+    fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
+        let id = session.id;
+        let prepared = self.prepare_runtime(session);
+        let session_lock = claim_lock(&self.sessions_dir, &id)?;
+        Ok(prepared.activate(&self.model_slot, Some(SessionLockState::Held(session_lock))))
     }
 }
 
@@ -460,6 +849,7 @@ enum InternalEvent {
         provider: ProviderIdentity,
         result: ProviderUsageFetchResult,
     },
+    SessionHeartbeat(u64),
 }
 
 pub(crate) struct EventLoop<'t> {
@@ -674,6 +1064,7 @@ impl<'t> EventLoop<'t> {
         let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
         let ctx = SpawnCtx {
             storage,
+            sessions_dir: sessions_dir.clone(),
             config,
             ui_config,
             input_history_size,
@@ -696,17 +1087,21 @@ impl<'t> EventLoop<'t> {
             command_runtime,
         };
 
-        let mut runtimes: Vec<SessionRuntime> = sessions
-            .into_iter()
-            .map(|session| ctx.spawn_runtime(session))
-            .collect();
+        let mut runtimes = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            match ctx.spawn_runtime(session) {
+                Ok(runtime) => runtimes.push(runtime),
+                Err(error) => {
+                    rollback_startup_runtimes(runtimes);
+                    return Err(error);
+                }
+            }
+        }
+        for runtime in &mut runtimes {
+            runtime.activate_deferred();
+        }
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
-        }
-        for rt in &runtimes {
-            if let Err(e) = claim_lock(&sessions_dir, &rt.id()) {
-                warn!(id = %rt.id(), error = %e, "session lock claim failed");
-            }
         }
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
@@ -903,6 +1298,19 @@ impl<'t> EventLoop<'t> {
                 });
                 self.handle_provider_usage_outputs(outputs);
             }
+            InternalEvent::SessionHeartbeat(runtime_generation) => {
+                let Some(idx) = self
+                    .sessions
+                    .iter()
+                    .position(|runtime| runtime.generation == runtime_generation)
+                else {
+                    return;
+                };
+                let pending = complete_runtime_heartbeat(&mut self.sessions[idx]);
+                if let Some(pending) = pending {
+                    self.commit_replacement(idx, pending);
+                }
+            }
         }
     }
 
@@ -990,8 +1398,8 @@ impl<'t> EventLoop<'t> {
     }
 
     fn checkpoint_all(&mut self) {
-        for rt in &mut self.sessions {
-            rt.app.checkpoint();
+        for runtime in &mut self.sessions {
+            checkpoint_runtime(runtime);
         }
     }
 
@@ -1004,20 +1412,9 @@ impl<'t> EventLoop<'t> {
         let now = Instant::now();
         if now.duration_since(self.last_heartbeat) >= session_lock::HEARTBEAT_INTERVAL {
             self.last_heartbeat = now;
-            let sessions_dir = self.sessions_dir.clone();
-            let ids: Vec<MakiId> = self.sessions.iter().map(|rt| rt.id()).collect();
-            smol::unblock(move || {
-                for id in &ids {
-                    match session_lock::heartbeat(&sessions_dir, id) {
-                        Ok(session_lock::LockBeat::Lost) => {
-                            warn!(id = %id, "session lock lost to another process")
-                        }
-                        Err(e) => warn!(id = %id, error = %e, "session lock heartbeat failed"),
-                        Ok(_) => {}
-                    }
-                }
-            })
-            .detach();
+            for runtime in &mut self.sessions {
+                start_runtime_heartbeat(runtime, &self.internal_tx);
+            }
         }
         let mut login_actions: Vec<(usize, Vec<Action>)> = Vec::new();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
@@ -1528,7 +1925,7 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     let rt = self.remove_runtime(i);
-                    rt.handles.cancel();
+                    rt.handles.shutdown().detach();
                 }
                 self.ctx.storage_writer.delete(id, move |res| {
                     let reply = match res {
@@ -1566,7 +1963,14 @@ impl<'t> EventLoop<'t> {
                     let slot = self.ctx.model_slot.load();
                     AppSession::new(&slot.model.spec(), &self.session_cwd)
                 };
-                let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+                let runtime = match self.ctx.spawn_runtime(session) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let idx = self.push_runtime(runtime);
                 let id = self.sessions[idx].id();
                 if let Some(prompt) = prompt {
                     let _ = self.submit_text(idx, prompt);
@@ -1681,17 +2085,13 @@ impl<'t> EventLoop<'t> {
     }
 
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
-        let msg = QueuedMessage {
-            text,
-            images: Vec::new(),
-        };
-        match self.sessions[idx].app.submit_prompt(msg) {
+        match self.sessions[idx].submit_text(text)? {
             SubmitOutcome::Started(actions) => {
                 self.dispatch(idx, actions);
                 Ok(json!("started"))
             }
             SubmitOutcome::Queued => Ok(json!("queued")),
-            SubmitOutcome::Rejected(e) => Err(e),
+            SubmitOutcome::Rejected(error) => Err(error),
         }
     }
 
@@ -1704,13 +2104,10 @@ impl<'t> EventLoop<'t> {
     /// removable, so `sessions` stays non-empty.
     fn remove_runtime(&mut self, idx: usize) -> SessionRuntime {
         debug_assert_ne!(idx, self.focused);
-        let rt = self.sessions.remove(idx);
-        let id = rt.id();
-        let sessions_dir = self.sessions_dir.clone();
-        smol::unblock(move || {
-            session_lock::release(&sessions_dir, &id);
-        })
-        .detach();
+        let mut rt = self.sessions.remove(idx);
+        if let Err(error) = release_lock_state(rt.session_lock.take()) {
+            warn!(id = %rt.id(), %error, "session lock release failed");
+        }
         if idx < self.focused {
             self.focused -= 1;
         }
@@ -1723,16 +2120,104 @@ impl<'t> EventLoop<'t> {
                 .suppress_status_content
                 .store(true, Ordering::Release);
         }
-        let id = rt.id();
-        let sessions_dir = self.sessions_dir.clone();
-        smol::unblock(move || {
-            if let Err(e) = claim_lock(&sessions_dir, &id) {
-                warn!(id = %id, error = %e, "session lock claim failed");
-            }
-        })
-        .detach();
         self.sessions.push(rt);
-        self.sessions.len() - 1
+        let idx = self.sessions.len() - 1;
+        self.sessions[idx].activate_deferred();
+        idx
+    }
+
+    fn replace_runtime(&mut self, idx: usize, session: AppSession) -> Result<(), String> {
+        if self.sessions[idx].lock_lost {
+            return Err(LOCK_LOST_REPLACEMENT_ERR.into());
+        }
+        self.sessions[idx].app.checkpoint_now();
+        let prepared = self
+            .ctx
+            .prepare_replacement_runtime(session, self.sessions[idx].app.permissions.as_ref())?;
+        self.replace_prepared_runtime(idx, prepared)
+    }
+
+    fn replace_prepared_runtime(
+        &mut self,
+        idx: usize,
+        prepared: PreparedSessionRuntime,
+    ) -> Result<(), String> {
+        let old = replace_session_runtime(
+            &mut self.sessions[idx],
+            prepared,
+            &self.sessions_dir,
+            &self.ctx.model_slot,
+        )?;
+        let SessionRuntime {
+            app,
+            handles,
+            session_lock,
+            ..
+        } = old;
+        if let Err(error) = release_lock_state(session_lock) {
+            warn!(%error, "old session lock release failed");
+        }
+        drop(app);
+        handles.shutdown().detach();
+        Ok(())
+    }
+
+    fn prepare_replacement(
+        &self,
+        idx: usize,
+        request: SessionReplacementRequest,
+    ) -> Result<PendingReplacement, String> {
+        let SessionReplacementRequest {
+            session,
+            kind,
+            post_commit,
+        } = request;
+        let prepared = self
+            .ctx
+            .prepare_replacement_runtime(session, self.sessions[idx].app.permissions.as_ref())?;
+        Ok(PendingReplacement {
+            prepared,
+            kind,
+            post_commit,
+        })
+    }
+
+    fn commit_replacement(&mut self, idx: usize, pending: PendingReplacement) {
+        let PendingReplacement {
+            prepared,
+            kind,
+            post_commit,
+        } = pending;
+        match self.replace_prepared_runtime(idx, prepared) {
+            Ok(()) => {
+                if let SessionReplacementKind::Reset { ended_id } = kind {
+                    self.sessions[idx].app.lua_event_handle.fire_autocmd(
+                        "SessionReset",
+                        serde_json::json!({ "session_id": ended_id }),
+                    );
+                }
+                if let Some(post_commit) = post_commit {
+                    let actions = self.sessions[idx]
+                        .app
+                        .apply_replacement_post_commit(post_commit);
+                    self.dispatch(idx, actions);
+                }
+            }
+            Err(error) => self.sessions[idx].app.flash(error),
+        }
+    }
+
+    fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
+        let pending = match self.prepare_replacement(idx, request) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.sessions[idx].app.flash(error);
+                return;
+            }
+        };
+        if let Some(pending) = defer_replacement_for_heartbeat(&mut self.sessions[idx], pending) {
+            self.commit_replacement(idx, pending);
+        }
     }
 
     fn set_focused(&mut self, next: usize) {
@@ -1760,26 +2245,16 @@ impl<'t> EventLoop<'t> {
         if let Some(block) = session_lock::resume_block(&session.cwd, &cwd, open_elsewhere) {
             return Err(block.to_string());
         }
-        let focused = &mut self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
-            let old_id = focused.id();
-            let actions = focused.app.load_loaded_session(session);
-            let sessions_dir = self.sessions_dir.clone();
-            smol::unblock(move || {
-                session_lock::release(&sessions_dir, &old_id);
-            })
-            .detach();
-            let sessions_dir = self.sessions_dir.clone();
-            smol::unblock(move || {
-                if let Err(e) = session_lock::heartbeat(&sessions_dir, &id) {
-                    warn!(id = %id, error = %e, "session lock claim failed");
-                }
-            })
-            .detach();
-            self.dispatch(self.focused, actions);
-            return Ok(());
+        if SessionStatus::of(&self.sessions[self.focused].app) == SessionStatus::Idle
+            && !self.sessions[self.focused].app.has_content()
+        {
+            return self.replace_runtime(self.focused, session);
         }
-        let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+        let runtime = self
+            .ctx
+            .spawn_runtime(session)
+            .map_err(|error| error.to_string())?;
+        let idx = self.push_runtime(runtime);
         self.set_focused(idx);
         Ok(())
     }
@@ -1791,7 +2266,7 @@ impl<'t> EventLoop<'t> {
         while let Some(ev) = pending.take() {
             let (msg, leftover) = self.translate(ev);
             if let Some(msg) = msg {
-                let actions = self.sessions[self.focused].app.update(msg);
+                let actions = self.sessions[self.focused].update(msg);
                 self.dispatch(self.focused, actions);
                 if self.sessions[self.focused].app.take_pending_bell() {
                     ring_bell();
@@ -1895,22 +2370,6 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
-        let rt = &mut self.sessions[idx];
-        rt.reset_run_notifications();
-        let lua_handle = rt.app.lua_event_handle.clone();
-        let permissions = Arc::clone(&rt.app.permissions);
-        rt.handles.respawn(
-            history,
-            &self.ctx.model_slot,
-            self.ctx.config.clone(),
-            self.ctx.ui_config.tool_output_lines,
-            &permissions,
-            &mut rt.app,
-            lua_handle,
-        );
-    }
-
     fn handle_action(&mut self, idx: usize, action: Action) {
         match action {
             Action::SendMessage(input) => {
@@ -1938,22 +2397,7 @@ impl<'t> EventLoop<'t> {
                     .cmd_tx
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
-            Action::NewSession => {
-                self.respawn_agent(idx, Vec::new());
-            }
-            Action::LoadSession(loaded) => {
-                let loaded = *loaded;
-                if loaded.model_spec != self.ctx.model_slot.load().model.spec()
-                    && self.ctx.model_policy.allows(&loaded.model_spec)
-                    && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
-                    && let Ok(new_provider) = from_model(&mut new_model, self.ctx.timeouts)
-                {
-                    self.ctx
-                        .model_slot
-                        .install(new_model, Arc::from(new_provider));
-                }
-                self.respawn_agent(idx, loaded.messages);
-            }
+            Action::ReplaceSession(request) => self.request_replacement(idx, *request),
             Action::ChangeModel(spec) => {
                 if let Err(error) = self.change_model(idx, &spec) {
                     self.sessions[idx].app.flash(error);
@@ -2094,9 +2538,6 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
-        for rt in &self.sessions {
-            session_lock::release(&self.sessions_dir, &rt.id());
-        }
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
@@ -2104,17 +2545,43 @@ impl<'t> EventLoop<'t> {
             let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
         let kill_mcp_ms = lap();
+        let heartbeat_deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
         let mut tabs = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
-                mut app, handles, ..
+                mut app,
+                handles,
+                session_lock,
+                lock_lost,
+                ..
             } = rt;
-            app.checkpoint_now();
+            let heartbeat_timeout = heartbeat_deadline.saturating_duration_since(Instant::now());
+            let lock_released_safely = match release_lock_state_with_timeout(
+                session_lock,
+                heartbeat_timeout,
+            ) {
+                LockReleaseOutcome::Completed {
+                    result,
+                    lock_lost: heartbeat_lock_lost,
+                } => {
+                    if let Err(error) = result {
+                        warn!(id = %app.state.session.id, %error, "session lock release failed");
+                    }
+                    !heartbeat_lock_lost
+                }
+                LockReleaseOutcome::TimedOut => {
+                    warn!(id = %app.state.session.id, "session lock heartbeat timed out during shutdown");
+                    false
+                }
+            };
+            if !lock_lost && lock_released_safely {
+                app.checkpoint_now();
+            }
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
             tabs.push(Arc::unwrap_or_clone(app.state.session));
-            agent_tasks.push(handles.into_task());
+            agent_tasks.push(handles.shutdown());
         }
         let save_sessions_ms = lap();
         crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
@@ -2253,13 +2720,1144 @@ mod tests {
     use super::*;
     use crate::selection::SelectionZone;
     use crossterm::event::KeyModifiers;
-    use maki_agent::{AgentId, DoneReason, TurnId, TurnOutcome};
-    use maki_providers::TokenUsage;
+    use maki_agent::{AgentError, AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
+    use maki_config::PermissionsConfig;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::{ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+    const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+    struct StubProvider;
+
+    impl Provider for StubProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct RuntimeHarness {
+        _temp_dir: TempDir,
+        ctx: Option<SpawnCtx>,
+    }
+
+    impl RuntimeHarness {
+        fn new() -> Self {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let storage = StateDir::from_path(temp_dir.path().to_path_buf());
+            let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
+            let available_models = Arc::new(ArcSwapOption::empty());
+            let command_registry = maki_commands::CommandRegistry::new();
+            let command_runtime = Arc::new(CommandRuntime::new_for_test(
+                &[],
+                command_registry,
+                Arc::new(ModelArgSource::new(Arc::clone(&available_models))),
+                Arc::new(ThemeArgSource::new(
+                    crate::theme::default_provider().clone(),
+                )),
+            ));
+            let model = crate::components::test_model();
+            let (model_slot, _provider_change_rx) =
+                ProviderSlot::new(model, Arc::new(StubProvider));
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                temp_dir.path().to_path_buf(),
+                Arc::default(),
+            ));
+            let storage_writer =
+                Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
+            let ctx = SpawnCtx {
+                storage,
+                sessions_dir,
+                config: AgentConfig::default(),
+                ui_config: UiConfig::default(),
+                input_history_size: 100,
+                permissions,
+                timeouts: Timeouts::default(),
+                keymap_reader: KeymapReader::empty(),
+                hint_reader: HintReader::empty(),
+                status_content_reader: StatusContentReader::empty(),
+                lua_event_handle: EventHandle::disconnected_for_test(),
+                mcp_handle: None,
+                mcp_config_errors: McpConfigErrors::new(temp_dir.path().to_path_buf()),
+                model_slot,
+                available_models,
+                storage_writer,
+                model_policy: Arc::new(ModelPolicy::default()),
+                system_prompt: SystemPromptOverride::default(),
+                command_runtime,
+            };
+            Self {
+                _temp_dir: temp_dir,
+                ctx: Some(ctx),
+            }
+        }
+
+        fn ctx(&self) -> &SpawnCtx {
+            self.ctx.as_ref().unwrap()
+        }
+
+        fn session(&self) -> AppSession {
+            let cwd = self._temp_dir.path().to_string_lossy();
+            AppSession::new("test-model", cwd.as_ref())
+        }
+
+        fn prepare(&self) -> PreparedSessionRuntime {
+            self.ctx().prepare_runtime(self.session())
+        }
+
+        fn runtime(&self, session: AppSession) -> SessionRuntime {
+            self.ctx().spawn_runtime(session).unwrap()
+        }
+
+        fn target_count(&self) -> usize {
+            self.ctx().command_runtime.registry.target_count()
+        }
+    }
+
+    impl Drop for RuntimeHarness {
+        fn drop(&mut self) {
+            let Some(ctx) = self.ctx.take() else {
+                return;
+            };
+            let storage_writer = Arc::clone(&ctx.storage_writer);
+            drop(ctx);
+            let Ok(storage_writer) = Arc::try_unwrap(storage_writer) else {
+                panic!("runtime harness owns storage writer");
+            };
+            storage_writer.shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+        }
+    }
+
+    fn shutdown_manager(manager: &maki_agent::AgentManagerHandle) {
+        let report = smol::block_on(manager.shutdown(RUNTIME_SHUTDOWN_TIMEOUT));
+        assert!(report.timed_out.is_empty());
+    }
+
+    fn release_runtime(runtime: SessionRuntime) {
+        let SessionRuntime {
+            handles,
+            session_lock,
+            ..
+        } = runtime;
+        release_lock_state(session_lock).unwrap();
+        let manager = handles.manager_and_root().0;
+        drop(handles);
+        shutdown_manager(&manager);
+    }
+
+    #[test]
+    fn prepared_runtime_is_inert_until_activate() {
+        let harness = RuntimeHarness::new();
+        let target_count = harness.target_count();
+        let prepared = harness.prepare();
+        let (session_id, _, manager, root_id) = prepared.snapshot();
+
+        assert_eq!(harness.target_count(), target_count);
+        assert!(SessionMailbox::notify(session_id, "early".into(), false).is_err());
+        assert_eq!(manager.root_id().unwrap(), root_id);
+        assert!(
+            manager
+                .snapshot()
+                .iter()
+                .any(|node| node.agent_id == root_id)
+        );
+
+        drop(prepared);
+        shutdown_manager(&manager);
+    }
+
+    #[test]
+    fn activation_publishes_target_mailbox_and_runtime_identities() {
+        let harness = RuntimeHarness::new();
+        let target_count = harness.target_count();
+        let prepared = harness.prepare();
+        let (session_id, target_id, manager, root_id) = prepared.snapshot();
+        let runtime = prepared.activate(&harness.ctx().model_slot, None);
+        let (active_manager, active_root_id) = runtime.handles.manager_and_root();
+
+        assert_eq!(harness.target_count(), target_count + 1);
+        assert_eq!(runtime.id(), session_id);
+        assert_eq!(runtime.app.command_target.id(), target_id);
+        assert_eq!(active_manager.generation(), manager.generation());
+        assert_eq!(active_root_id, root_id);
+        assert!(SessionMailbox::notify(session_id, "ready".into(), false).is_ok());
+
+        drop(runtime);
+        shutdown_manager(&manager);
+        assert_eq!(harness.target_count(), target_count);
+        assert!(SessionMailbox::notify(session_id, "late".into(), false).is_err());
+    }
+
+    #[test]
+    fn replacement_restore_effects_activate_once_after_publication() {
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.push_message(Message::user("history".into()));
+        session.meta.queued_messages = vec!["restored".into()];
+        let prepared = harness.ctx().prepare_runtime(session);
+        let mut runtime = prepared.activate(&harness.ctx().model_slot, None);
+
+        assert!(runtime.handles.queue.is_empty());
+        assert!(runtime.restore_pending);
+        runtime.activate_deferred();
+        runtime.activate_deferred();
+
+        let envelope = runtime
+            .handles
+            .agent_rx
+            .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+            .expect("restored queue item was not consumed");
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::QueueItemConsumed { ref text, .. } if text == "restored"
+        ));
+        assert!(runtime.handles.queue.is_empty());
+        assert!(!runtime.restore_pending);
+
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn committed_rewind_does_not_restore_failed_turn_queue() {
+        const RECOVERY_TEXT: &str = "retained after failure";
+        const REWOUND_TEXT: &str = "rewound prompt";
+
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.push_message(Message::user(REWOUND_TEXT.into()));
+        let mut app = crate::app::tests::test_app();
+        app.apply_loaded_session(session.clone(), &harness.ctx().model_slot.load().model);
+        app.status = Status::Streaming;
+        app.run_id = 1;
+        assert!(matches!(
+            app.submit_prompt(QueuedMessage {
+                text: RECOVERY_TEXT.into(),
+                images: Vec::new(),
+            }),
+            SubmitOutcome::Queued
+        ));
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::ControlError {
+                message: "failed".into(),
+            },
+            subagent: None,
+            run_id: 1,
+        })));
+
+        app.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Esc,
+        )));
+        app.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Esc,
+        )));
+        let actions = app.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Enter,
+        )));
+        let Action::ReplaceSession(request) = actions.into_iter().next().unwrap() else {
+            panic!("expected replacement request");
+        };
+        let mut runtime = harness.runtime(session);
+        let prepared = harness.ctx().prepare_runtime(request.session);
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert!(runtime.handles.queue.is_empty());
+        assert!(
+            runtime
+                .handles
+                .agent_rx
+                .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+                .is_err()
+        );
+
+        let actions = runtime.app.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Enter,
+        )));
+        let Action::SendMessage(input) = actions.into_iter().next().unwrap() else {
+            panic!("expected send message action");
+        };
+        assert_eq!(input.message, REWOUND_TEXT);
+
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn empty_history_replacement_restores_and_checkpoints_draft() {
+        const DRAFT: &str = "first prompt";
+
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.meta.input_draft = Some(DRAFT.into());
+        let prepared = harness.ctx().prepare_runtime(session);
+        let mut runtime = prepared.activate(&harness.ctx().model_slot, None);
+
+        assert!(runtime.restore_pending);
+        runtime.activate_deferred();
+        assert_eq!(runtime.app.input_box.buffer.value(), DRAFT);
+
+        runtime.app.checkpoint_now();
+        assert_eq!(
+            runtime.app.state.session.meta.input_draft.as_deref(),
+            Some(DRAFT)
+        );
+
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn replacement_preparation_installs_the_session_provider_on_activation() {
+        const REPLACEMENT_MODEL: &str = "synthetic/hf:test-model";
+
+        let harness = RuntimeHarness::new();
+        let previous_provider = harness.ctx().model_slot.load().provider.identity();
+        let mut session = harness.session();
+        session.model = REPLACEMENT_MODEL.into();
+        let provider = PreparedProvider {
+            model: Model::from_spec(REPLACEMENT_MODEL).unwrap(),
+            provider: Arc::new(StubProvider),
+        };
+        let prepared = harness
+            .ctx()
+            .prepare_runtime_with_provider(session, Some(provider));
+        let runtime = prepared.activate(&harness.ctx().model_slot, None);
+        let installed = harness.ctx().model_slot.load();
+
+        assert_eq!(runtime.app.state.model.spec(), REPLACEMENT_MODEL);
+        assert_eq!(installed.model.spec(), REPLACEMENT_MODEL);
+        assert_ne!(installed.provider.identity(), previous_provider);
+
+        drop(installed);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn failed_replacement_provider_preparation_preserves_current_runtime() {
+        const INVALID_MODEL: &str = "unsupported-provider/test-model";
+
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let current_id = runtime.id();
+        let current_target = runtime.app.command_target.id();
+        let (current_manager, current_root) = runtime.handles.manager_and_root();
+        let current_provider = harness.ctx().model_slot.load().provider.identity();
+        let mut session = harness.session();
+        session.model = INVALID_MODEL.into();
+
+        runtime.app.checkpoint_now();
+        assert!(
+            harness
+                .ctx()
+                .prepare_replacement_runtime(session, runtime.app.permissions.as_ref())
+                .is_err()
+        );
+
+        assert_eq!(runtime.id(), current_id);
+        assert_eq!(runtime.app.command_target.id(), current_target);
+        assert_eq!(
+            runtime.handles.manager_and_root().0.generation(),
+            current_manager.generation()
+        );
+        assert_eq!(runtime.handles.manager_and_root().1, current_root);
+        assert!(runtime.session_lock.is_some());
+        assert_eq!(
+            harness.ctx().model_slot.load().provider.identity(),
+            current_provider
+        );
+
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn one_manager_per_runtime() {
+        let harness = RuntimeHarness::new();
+        let first = harness.prepare();
+        let second = harness.prepare();
+        let (_, _, first_manager, first_root_id) = first.snapshot();
+        let (_, _, second_manager, second_root_id) = second.snapshot();
+
+        assert_ne!(first_manager.generation(), second_manager.generation());
+        assert_ne!(first_root_id, second_root_id);
+
+        drop((first, second));
+        shutdown_manager(&first_manager);
+        shutdown_manager(&second_manager);
+    }
+
+    #[test]
+    fn empty_replacement_loads_session_permission_rules_during_preparation() {
+        let harness = RuntimeHarness::new();
+        let mut current = harness.runtime(harness.session());
+        current.app.permissions.apply_decision(
+            &maki_config::ToolKey::native("bash"),
+            &["cargo test".into()],
+            &PermissionAnswer::AllowSession,
+        );
+        current.app.checkpoint();
+        let mut replacement = harness.session();
+        replacement.meta.session_rules = current.app.state.session.meta.session_rules.clone();
+        assert!(replacement.messages().is_empty());
+
+        let prepared = harness.ctx().prepare_runtime(replacement);
+
+        assert!(
+            prepared
+                .app
+                .session_rule_allows(&maki_config::ToolKey::native("bash"), "cargo test")
+        );
+        drop(prepared);
+        release_runtime(current);
+    }
+
+    #[test_case(false, true, false ; "rewind_preserves_enabled")]
+    #[test_case(true, false, false ; "rewind_preserves_disabled")]
+    #[test_case(false, true, true ; "reset_preserves_enabled")]
+    #[test_case(true, false, true ; "reset_preserves_disabled")]
+    fn replacement_preserves_outgoing_yolo(startup_yolo: bool, current_yolo: bool, reset: bool) {
+        let harness = RuntimeHarness::new();
+        if startup_yolo {
+            harness.ctx().permissions.toggle_yolo();
+        }
+        let session = harness.session();
+        let mut runtime = harness.runtime(session.clone());
+        if runtime.app.permissions.is_yolo() != current_yolo {
+            runtime.app.permissions.toggle_yolo();
+        }
+        runtime.app.permissions.apply_decision(
+            &maki_config::ToolKey::native("bash"),
+            &["outgoing".into()],
+            &PermissionAnswer::AllowSession,
+        );
+        let mut replacement = if reset { harness.session() } else { session };
+        replacement.meta.session_rules = vec![maki_storage::sessions::StoredRule {
+            tool: "bash".into(),
+            scope: Some("target".into()),
+            effect: maki_storage::sessions::StoredEffect::Allow,
+        }];
+        let prepared = harness.ctx().prepare_runtime_with_provider_and_permissions(
+            replacement,
+            None,
+            runtime.app.permissions.as_ref(),
+        );
+
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert_eq!(runtime.app.permissions.is_yolo(), current_yolo);
+        let rules = runtime.app.permissions.session_rules_snapshot();
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.scope.as_deref() == Some("target"))
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.scope.as_deref() == Some("outgoing"))
+        );
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test_case(false ; "rewind")]
+    #[test_case(true ; "reset")]
+    fn replacement_preserves_unsaved_input_history(reset: bool) {
+        const PROMPT: &str = "not saved to disk";
+
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let mut runtime = harness.runtime(session.clone());
+        runtime.app.input_box.set_input(PROMPT.into());
+        assert_eq!(runtime.app.input_box.submit().unwrap().text, PROMPT);
+        let replacement = if reset { harness.session() } else { session };
+        let prepared = harness.ctx().prepare_runtime(replacement);
+
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+        runtime.app.input_box.history_up();
+
+        assert_eq!(runtime.app.input_box.buffer.value(), PROMPT);
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn committed_replacement_restores_outgoing_accepted_theme_preview() {
+        const ORIGINAL_THEME: &str = "dracula";
+        const PREVIEW_THEME: &str = "tokyonight";
+
+        let _guard = crate::theme::theme_test_guard();
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let provider = Arc::clone(&runtime.app.theme_provider);
+        provider.select(ORIGINAL_THEME);
+        let target = runtime.app.command_target.id();
+        let command = runtime
+            .app
+            .command_runtime
+            .registry
+            .resolve_for(&runtime.app.command_target, "/theme")
+            .unwrap();
+        let completion = runtime
+            .app
+            .command_runtime
+            .registry
+            .open_completion(command, target)
+            .unwrap();
+        let maki_commands::CompletionResult::Items(candidates) = smol::block_on(
+            completion.complete(Arc::from(""), Arc::from(""), 0, Arc::from("insert")),
+        ) else {
+            panic!("expected theme completion items");
+        };
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.item().insertion.as_ref() == PREVIEW_THEME)
+            .unwrap();
+        completion.highlight(candidate).unwrap();
+        completion.accept(candidate.clone()).unwrap();
+        assert_eq!(provider.current_theme_name(), PREVIEW_THEME);
+
+        let prepared = harness.prepare();
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert_eq!(provider.current_theme_name(), ORIGINAL_THEME);
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn replacement_preserves_exit_on_done() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        runtime.app.exit_on_done = true;
+        let prepared = harness.prepare();
+
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert!(runtime.app.exit_on_done);
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn lost_session_lock_stops_without_saving() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let path = session_lock::lock_path(&harness.ctx().sessions_dir, &runtime.id());
+        std::fs::write(&path, format!("{} replacement", std::process::id())).unwrap();
+
+        let lease = match runtime.session_lock.take().unwrap() {
+            SessionLockState::Held(mut lease) => {
+                assert_eq!(lease.heartbeat().unwrap(), session_lock::LockBeat::Lost);
+                lease
+            }
+            SessionLockState::InFlight(_) => panic!("heartbeat was already in flight"),
+        };
+        apply_heartbeat_completion(
+            &mut runtime,
+            HeartbeatCompletion {
+                result: Ok(session_lock::LockBeat::Lost),
+                lease: Some(lease),
+            },
+        );
+
+        assert!(runtime.lock_lost);
+        assert!(runtime.session_lock.is_none());
+        assert_eq!(runtime.app.exit_request, ExitRequest::Error);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn prepared_replacement_cannot_reset_lock_lost_or_save() {
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        let id = session.id;
+        let path = session_lock::lock_path(&harness.ctx().sessions_dir, &id);
+        session.save(&harness.ctx().storage).unwrap();
+        let stored_before = AppSession::load(id, &harness.ctx().storage).unwrap();
+        let mut runtime = harness.runtime(session.clone());
+        let lease = match runtime.session_lock.take().unwrap() {
+            SessionLockState::Held(lease) => lease,
+            SessionLockState::InFlight(_) => panic!("heartbeat was already in flight"),
+        };
+        std::fs::write(&path, format!("{} replacement", std::process::id())).unwrap();
+        runtime.lock_lost = true;
+        runtime
+            .app
+            .state
+            .session_mut()
+            .push_message(Message::user("must not save".into()));
+        let prepared = harness.ctx().prepare_runtime(session);
+
+        let error = match replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        ) {
+            Ok(old) => {
+                release_runtime(old);
+                panic!("lock-lost replacement must fail");
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error, LOCK_LOST_REPLACEMENT_ERR);
+        assert!(runtime.lock_lost);
+        assert!(runtime.session_lock.is_none());
+        checkpoint_runtime(&mut runtime);
+        assert_eq!(
+            AppSession::load(id, &harness.ctx().storage)
+                .unwrap()
+                .messages()
+                .len(),
+            stored_before.messages().len()
+        );
+        lease.release().unwrap();
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn heartbeat_runs_off_thread_and_only_one_is_in_flight() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            (lease, Ok(session_lock::LockBeat::Held))
+        });
+        entered_rx.recv().unwrap();
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::InFlight(_))
+        ));
+
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_probe = Arc::clone(&second_ran);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            second_probe.store(true, Ordering::SeqCst);
+            (lease, Ok(session_lock::LockBeat::Held))
+        });
+        assert!(!second_ran.load(Ordering::SeqCst));
+
+        release_tx.send(()).unwrap();
+        let InternalEvent::SessionHeartbeat(generation) = internal_rx.recv().unwrap() else {
+            panic!("expected heartbeat completion");
+        };
+        assert_eq!(generation, runtime.generation);
+        let Some(SessionLockState::InFlight(task)) = runtime.session_lock.take() else {
+            panic!("expected in-flight heartbeat task");
+        };
+        let completion = collect_heartbeat(task, None).unwrap();
+        apply_heartbeat_completion(&mut runtime, completion);
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::Held(_))
+        ));
+        release_runtime(runtime);
+    }
+
+    #[test_case(session_lock::LockBeat::Held ; "held_commits")]
+    #[test_case(session_lock::LockBeat::Lost ; "lost_reports_lock_loss")]
+    fn same_id_replacement_waits_for_in_flight_heartbeat(beat: session_lock::LockBeat) {
+        const OUTGOING_DRAFT: &str = "draft before replacement";
+        const PROGRAMMATIC_PROMPT: &str = "programmatic submission";
+        const RESTORED_DRAFT: &str = "replacement restored prompt";
+
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        let id = session.id;
+        let mut runtime = harness.runtime(session.clone());
+        runtime.app.input_box.set_input(OUTGOING_DRAFT.into());
+        session.meta.input_draft = Some(RESTORED_DRAFT.into());
+        let generation = runtime.generation;
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            (lease, Ok(beat))
+        });
+        entered_rx.recv().unwrap();
+        let prepared = harness.ctx().prepare_runtime_with_provider_and_permissions(
+            session,
+            None,
+            runtime.app.permissions.as_ref(),
+        );
+        let pending = PendingReplacement {
+            prepared,
+            kind: SessionReplacementKind::Rewind,
+            post_commit: None,
+        };
+
+        assert!(defer_replacement_for_heartbeat(&mut runtime, pending).is_none());
+        assert!(runtime.pending_replacement.is_some());
+        assert_eq!(runtime.id(), id);
+
+        let edit_actions = runtime.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Char('x'),
+        )));
+        assert!(edit_actions.is_empty());
+        assert_eq!(runtime.app.input_box.buffer.value(), OUTGOING_DRAFT);
+        let submit_actions = runtime.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Enter,
+        )));
+        assert!(submit_actions.is_empty());
+        assert_eq!(runtime.app.input_box.buffer.value(), OUTGOING_DRAFT);
+        assert!(matches!(
+            runtime.submit_text(PROGRAMMATIC_PROMPT.into()),
+            Err(ref error) if error == REPLACEMENT_PENDING_ERR
+        ));
+        assert!(runtime.handles.queue.is_empty());
+
+        release_tx.send(()).unwrap();
+        let InternalEvent::SessionHeartbeat(event_generation) = internal_rx.recv().unwrap() else {
+            panic!("expected heartbeat completion");
+        };
+        assert_eq!(event_generation, generation);
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::InFlight(_))
+        ));
+
+        let pending = complete_runtime_heartbeat(&mut runtime);
+        if beat == session_lock::LockBeat::Held {
+            let old = replace_session_runtime(
+                &mut runtime,
+                pending.expect("replacement remains pending").prepared,
+                &harness.ctx().sessions_dir,
+                &harness.ctx().model_slot,
+            );
+            let old = match old {
+                Ok(old) => old,
+                Err(error) => panic!("verified lease should transfer: {error}"),
+            };
+            assert_eq!(runtime.id(), id);
+            assert!(!runtime.lock_lost);
+            assert_eq!(runtime.app.input_box.buffer.value(), RESTORED_DRAFT);
+            let actions = runtime.update(Msg::Key(crate::components::key(
+                crossterm::event::KeyCode::Enter,
+            )));
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::SendMessage(input)] if input.message == RESTORED_DRAFT
+            ));
+            release_runtime(old);
+        } else {
+            assert!(pending.is_none());
+            assert!(runtime.pending_replacement.is_none());
+            assert!(runtime.lock_lost);
+            assert_eq!(runtime.app.exit_request, ExitRequest::Error);
+        }
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn graceful_cleanup_joins_in_flight_heartbeat_and_releases_lock() {
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let id = session.id;
+        let mut runtime = harness.runtime(session.clone());
+        let (internal_tx, _internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            (lease, Ok(session_lock::LockBeat::Held))
+        });
+        entered_rx.recv().unwrap();
+
+        let prepared = harness.ctx().prepare_runtime(session);
+        let error = match replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        ) {
+            Ok(old) => {
+                release_runtime(old);
+                panic!("in-flight same-id replacement must fail");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error, LOCK_UNAVAILABLE_REPLACEMENT_ERR);
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::InFlight(_))
+        ));
+
+        let state = runtime.session_lock.take();
+        let (cleanup_started_tx, cleanup_started_rx) = flume::bounded(1);
+        let (cleanup_done_tx, cleanup_done_rx) = flume::bounded(1);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_started_tx.send(()).unwrap();
+            let result = release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT);
+            cleanup_done_tx.send(result).unwrap();
+        });
+        cleanup_started_rx.recv().unwrap();
+        assert!(cleanup_done_rx.try_recv().is_err());
+
+        release_tx.send(()).unwrap();
+        let LockReleaseOutcome::Completed { result, lock_lost } = cleanup_done_rx.recv().unwrap()
+        else {
+            panic!("heartbeat cleanup timed out");
+        };
+        result.unwrap();
+        assert!(!lock_lost);
+        cleanup.join().unwrap();
+        assert!(!session_lock::open_elsewhere(
+            &harness.ctx().sessions_dir,
+            &id
+        ));
+        session_lock::claim(&harness.ctx().sessions_dir, &id)
+            .unwrap()
+            .unwrap()
+            .release()
+            .unwrap();
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn shutdown_does_not_checkpoint_after_in_flight_heartbeat_loses_lock() {
+        const BASELINE: &str = "stored before heartbeat";
+        const UNSAVED: &str = "must not reach storage";
+
+        let mut harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        let id = session.id;
+        session.push_message(Message::user(BASELINE.into()));
+        session.save(&harness.ctx().storage).unwrap();
+        let mut runtime = harness.runtime(session);
+        runtime
+            .app
+            .state
+            .session_mut()
+            .push_message(Message::user(UNSAVED.into()));
+        let (internal_tx, _internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (heartbeat_release_tx, heartbeat_release_rx) = flume::bounded(1);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            heartbeat_release_rx.recv().unwrap();
+            (lease, Ok(session_lock::LockBeat::Lost))
+        });
+        entered_rx.recv().unwrap();
+
+        let state = runtime.session_lock.take();
+        let (cleanup_done_tx, cleanup_done_rx) = flume::bounded(1);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_done_tx
+                .send(release_lock_state_with_timeout(
+                    state,
+                    AGENT_SHUTDOWN_TIMEOUT,
+                ))
+                .unwrap();
+        });
+        assert!(cleanup_done_rx.try_recv().is_err());
+        heartbeat_release_tx.send(()).unwrap();
+        let LockReleaseOutcome::Completed {
+            result,
+            lock_lost: heartbeat_lock_lost,
+        } = cleanup_done_rx.recv().unwrap()
+        else {
+            panic!("heartbeat cleanup timed out");
+        };
+        result.unwrap();
+        cleanup.join().unwrap();
+
+        if !runtime.lock_lost && !heartbeat_lock_lost {
+            runtime.app.checkpoint_now();
+        }
+        let manager = runtime.handles.manager_and_root().0;
+        drop(runtime);
+        shutdown_manager(&manager);
+        let ctx = harness.ctx.take().unwrap();
+        let storage = ctx.storage.clone();
+        let storage_writer = Arc::clone(&ctx.storage_writer);
+        drop(ctx);
+        Arc::try_unwrap(storage_writer)
+            .unwrap_or_else(|_| panic!("test owns storage writer"))
+            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+
+        let stored = AppSession::load(id, &storage).unwrap();
+        assert_eq!(stored.messages().len(), 1);
+        assert_eq!(stored.messages()[0].user_text(), Some(BASELINE));
+    }
+
+    #[test]
+    fn shutdown_does_not_checkpoint_when_in_flight_heartbeat_times_out() {
+        const BASELINE: &str = "stored before heartbeat";
+        const UNSAVED: &str = "must not reach storage";
+
+        let mut harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        let id = session.id;
+        session.push_message(Message::user(BASELINE.into()));
+        session.save(&harness.ctx().storage).unwrap();
+        let mut runtime = harness.runtime(session);
+        runtime
+            .app
+            .state
+            .session_mut()
+            .push_message(Message::user(UNSAVED.into()));
+        let (internal_tx, _internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (heartbeat_release_tx, heartbeat_release_rx) = flume::bounded(1);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            heartbeat_release_rx.recv().unwrap();
+            (lease, Ok(session_lock::LockBeat::Held))
+        });
+        entered_rx.recv().unwrap();
+
+        let outcome = release_lock_state_with_timeout(runtime.session_lock.take(), Duration::ZERO);
+        assert!(matches!(&outcome, LockReleaseOutcome::TimedOut));
+        if !runtime.lock_lost
+            && matches!(
+                &outcome,
+                LockReleaseOutcome::Completed {
+                    lock_lost: false,
+                    ..
+                }
+            )
+        {
+            runtime.app.checkpoint_now();
+        }
+        heartbeat_release_tx.send(()).unwrap();
+        smol::block_on(async {
+            while session_lock::open_elsewhere(&harness.ctx().sessions_dir, &id) {
+                smol::future::yield_now().await;
+            }
+        });
+
+        let manager = runtime.handles.manager_and_root().0;
+        drop(runtime);
+        shutdown_manager(&manager);
+        let ctx = harness.ctx.take().unwrap();
+        let storage = ctx.storage.clone();
+        let storage_writer = Arc::clone(&ctx.storage_writer);
+        drop(ctx);
+        Arc::try_unwrap(storage_writer)
+            .unwrap_or_else(|_| panic!("test owns storage writer"))
+            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+
+        let stored = AppSession::load(id, &storage).unwrap();
+        assert_eq!(stored.messages().len(), 1);
+        assert_eq!(stored.messages()[0].user_text(), Some(BASELINE));
+    }
+
+    #[test]
+    fn stale_heartbeat_signal_cannot_poison_replacement() {
+        let harness = RuntimeHarness::new();
+        let stale = harness.runtime(harness.session());
+        let stale_generation = stale.generation;
+        let replacement = harness.runtime(harness.session());
+        let replacement_generation = replacement.generation;
+        let replacement_id = replacement.id();
+        let mut runtimes = vec![replacement];
+
+        assert!(
+            runtimes
+                .iter_mut()
+                .find(|runtime| runtime.generation == stale_generation)
+                .is_none()
+        );
+        assert_eq!(runtimes[0].generation, replacement_generation);
+        assert_eq!(runtimes[0].id(), replacement_id);
+        assert!(!runtimes[0].lock_lost);
+        assert!(matches!(
+            runtimes[0].session_lock,
+            Some(SessionLockState::Held(_))
+        ));
+        release_runtime(stale);
+        release_runtime(runtimes.pop().unwrap());
+    }
+
+    #[test]
+    fn startup_rollback_releases_previously_claimed_locks() {
+        let harness = RuntimeHarness::new();
+        let first = harness.runtime(harness.session());
+        let second = harness.runtime(harness.session());
+        let first_id = first.id();
+        let second_id = second.id();
+
+        rollback_startup_runtimes(vec![first, second]);
+
+        assert!(!session_lock::open_elsewhere(
+            &harness.ctx().sessions_dir,
+            &first_id
+        ));
+        assert!(!session_lock::open_elsewhere(
+            &harness.ctx().sessions_dir,
+            &second_id
+        ));
+    }
+
+    #[test]
+    fn same_id_replacement_transfers_the_exact_lock_without_io() {
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let id = session.id;
+        let mut runtime = harness.runtime(session.clone());
+        let path = session_lock::lock_path(&harness.ctx().sessions_dir, &id);
+        let owner_before = std::fs::read(&path).unwrap();
+        let prepared = harness.ctx().prepare_runtime(session);
+
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert!(old.session_lock.is_none());
+        assert!(runtime.session_lock.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), owner_before);
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn different_id_activation_releases_old_lock_only_after_swap() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let old_id = runtime.id();
+        let old_path = session_lock::lock_path(&harness.ctx().sessions_dir, &old_id);
+        let target = harness.session();
+        let target_id = target.id;
+        let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target_id);
+        let prepared = harness.ctx().prepare_runtime(target);
+
+        let mut old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert_eq!(runtime.id(), target_id);
+        assert!(runtime.session_lock.is_some());
+        assert!(target_path.exists());
+        assert!(old.session_lock.is_some());
+        assert!(old_path.exists());
+        release_lock_state(old.session_lock.take()).unwrap();
+        assert!(!session_lock::open_elsewhere(
+            &harness.ctx().sessions_dir,
+            &old_id
+        ));
+        assert!(
+            session_lock::claim(&harness.ctx().sessions_dir, &old_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(target_path.exists());
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn different_id_claim_failure_preserves_the_complete_runtime() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let old_id = runtime.id();
+        let old_target = runtime.app.command_target.id();
+        let (old_manager, old_root) = runtime.handles.manager_and_root();
+        let old_provider = harness.ctx().model_slot.load().provider.identity();
+        let old_target_count = harness.target_count();
+        let old_lock_path = session_lock::lock_path(&harness.ctx().sessions_dir, &old_id);
+        let old_owner = std::fs::read(&old_lock_path).unwrap();
+        let target = harness.session();
+        let target_id = target.id;
+        let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target_id);
+        std::fs::write(&target_path, "4294967294").unwrap();
+        let prepared = harness.ctx().prepare_runtime(target);
+        let (_, _, candidate_manager, _) = prepared.snapshot();
+
+        let error = match replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        ) {
+            Ok(old) => {
+                release_runtime(old);
+                panic!("foreign target lock must reject replacement");
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains(session_lock::OPEN_ELSEWHERE_MSG));
+        assert_eq!(runtime.id(), old_id);
+        assert_eq!(runtime.app.command_target.id(), old_target);
+        assert_eq!(
+            runtime.handles.manager_and_root().0.generation(),
+            old_manager.generation()
+        );
+        assert_eq!(runtime.handles.manager_and_root().1, old_root);
+        assert_eq!(
+            harness.ctx().model_slot.load().provider.identity(),
+            old_provider
+        );
+        assert_eq!(harness.target_count(), old_target_count);
+        assert_eq!(std::fs::read(&old_lock_path).unwrap(), old_owner);
+        assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "4294967294");
+        shutdown_manager(&candidate_manager);
+        std::fs::remove_file(target_path).unwrap();
+        release_runtime(runtime);
+    }
 
     const MIDDLE_SCROLL_STEP: Duration = Duration::from_millis(100);
     const MIDDLE_SCROLL_CADENCE: Duration = Duration::from_millis(25);

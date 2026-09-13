@@ -134,11 +134,6 @@ impl App {
         }
     }
 
-    pub(super) fn enter_plan(&mut self) {
-        self.state.plan.allocate_path(&self.storage);
-        self.state.mode = Mode::Plan;
-    }
-
     /// Cycles to the next registered mode; the default two-mode case keeps
     /// Tab toggling build<->plan.
     pub(super) fn toggle_mode(&mut self) -> Vec<super::Action> {

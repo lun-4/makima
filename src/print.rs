@@ -375,6 +375,7 @@ pub fn run(
                 | AgentEvent::PermissionRequest { .. }
                 | AgentEvent::Question { .. }
                 | AgentEvent::SubagentHistory { .. }
+                | AgentEvent::SubagentClosed
                 | AgentEvent::ToolSnapshot { .. }
                 | AgentEvent::ToolHeaderSnapshot { .. }
                 | AgentEvent::LiveToolBuf { .. }

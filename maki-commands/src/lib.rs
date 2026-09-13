@@ -15,8 +15,8 @@ pub use dispatch::{
     RegistrationError, ResolutionError, ResolvedCommand, ResolvedInput, SlashClass, classify_input,
 };
 pub use registry::{
-    CommandRegistry, PresentedCommand, Producer, ProducerPrecedence, RegistrySnapshot,
-    RegistrySubscription, TargetHandle,
+    CommandRegistry, PreparedTarget, PresentedCommand, Producer, ProducerPrecedence,
+    RegistrySnapshot, RegistrySubscription, TargetHandle,
 };
 pub use spec::{
     ArgumentArity, BUILTIN_COMMANDS, BuiltinDefinition, BuiltinId, BuiltinOperation,

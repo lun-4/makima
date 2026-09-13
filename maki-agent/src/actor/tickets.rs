@@ -14,6 +14,7 @@ use crate::types::{TurnId, TurnOutcome};
 #[derive(Clone)]
 pub struct TurnTicket {
     turn_id: TurnId,
+    actor_identity: Arc<()>,
     shared: Arc<Shared>,
 }
 
@@ -23,9 +24,10 @@ struct Shared {
 }
 
 impl TurnTicket {
-    pub(crate) fn new(turn_id: TurnId) -> Self {
+    pub(crate) fn new(turn_id: TurnId, actor_identity: Arc<()>) -> Self {
         Self {
             turn_id,
+            actor_identity,
             shared: Arc::new(Shared {
                 outcome: Mutex::new(None),
                 event: Event::new(),
@@ -35,8 +37,12 @@ impl TurnTicket {
 
     /// A ticket for a root-started turn. Root inputs carry no [`TurnId`]
     /// until they start, so nothing external can ever wait on it.
-    pub(crate) fn new_anonymous() -> Self {
-        Self::new(TurnId::generate())
+    pub(crate) fn new_anonymous(actor_identity: Arc<()>) -> Self {
+        Self::new(TurnId::generate(), actor_identity)
+    }
+
+    pub(crate) fn belongs_to(&self, actor_identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.actor_identity, actor_identity)
     }
 
     pub fn turn_id(&self) -> TurnId {

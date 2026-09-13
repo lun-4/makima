@@ -1427,6 +1427,7 @@ impl EventPump {
             | AgentEvent::CompactionDone
             | AgentEvent::AuthRequired
             | AgentEvent::SubagentHistory { .. }
+            | AgentEvent::SubagentClosed
             | AgentEvent::Question { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }

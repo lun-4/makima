@@ -139,6 +139,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     deadline: Some(now + ASYNC_RUN_DEFAULT_DEADLINE),
                     live_ctx: None,
                     owner: None,
+                    managed_turn: None,
                     command_depth: 0,
                     command_invocation: None,
                     timer_id: Some(timer_id),
