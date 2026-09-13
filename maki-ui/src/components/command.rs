@@ -86,8 +86,8 @@ pub struct CommandPalette {
     completion_session: Option<CompletionSession>,
     completion_session_cwd: Option<Arc<str>>,
     pending_arguments: Option<PendingArguments>,
-    accepted_argument_input: Option<String>,
-    dismissed_argument_input: Option<String>,
+    accepted_argument_input: Option<(String, usize)>,
+    dismissed_argument_input: Option<(String, usize)>,
     command_publication: Published<CommandRequest, ()>,
     pending_command: Option<(u64, CommandRequest)>,
     argument_publication: Published<ArgumentRequest, ()>,
@@ -231,8 +231,14 @@ impl CommandPalette {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, input: &str) -> CommandAction {
-        if self.accepted_argument_input.as_deref() == Some(input)
-            || self.dismissed_argument_input.as_deref() == Some(input)
+        if self
+            .accepted_argument_input
+            .as_ref()
+            .is_some_and(|(accepted, _)| accepted == input)
+            || self
+                .dismissed_argument_input
+                .as_ref()
+                .is_some_and(|(dismissed, _)| dismissed == input)
         {
             return if key.code == KeyCode::Enter {
                 self.confirm_close(input)
@@ -292,8 +298,10 @@ impl CommandPalette {
             }
             KeyCode::Esc => {
                 if self.argument_range.is_some() || self.completion_session.is_some() {
+                    let dismissed_start = self.argument_range.map(|(start, _)| start);
                     self.cancel_arguments();
-                    self.dismissed_argument_input = Some(input.to_owned());
+                    self.dismissed_argument_input =
+                        dismissed_start.map(|start| (input.to_owned(), start));
                     self.filtered.clear();
                     self.argument_items.clear();
                     self.argument_range = None;
@@ -589,14 +597,9 @@ impl CommandPalette {
             self.cancel_arguments();
             return false;
         }
-        if self.accepted_argument_input.as_deref() == Some(input)
-            || self.dismissed_argument_input.as_deref() == Some(input)
-        {
-            return false;
-        }
-        let abandoned = self.accepted_argument_input.take().is_some()
-            || self.dismissed_argument_input.take().is_some();
         let Some((command, typed)) = self.argument_command(input) else {
+            let abandoned = self.accepted_argument_input.take().is_some()
+                || self.dismissed_argument_input.take().is_some();
             self.cancel_arguments();
             return abandoned;
         };
@@ -609,6 +612,21 @@ impl CommandPalette {
         } else {
             argument_at_cursor(input, cursor)
         };
+        let suppressed = argument_at_cursor.as_ref().is_some_and(|(start, ..)| {
+            self.accepted_argument_input
+                .as_ref()
+                .is_some_and(|(accepted, accepted_start)| {
+                    accepted == input && accepted_start == start
+                })
+                || self.dismissed_argument_input.as_ref().is_some_and(
+                    |(dismissed, dismissed_start)| dismissed == input && dismissed_start == start,
+                )
+        });
+        if suppressed {
+            return false;
+        }
+        let abandoned = self.accepted_argument_input.take().is_some()
+            || self.dismissed_argument_input.take().is_some();
         let Some((start, end, argument, index)) = argument_at_cursor else {
             self.cancel_arguments();
             return abandoned;
@@ -871,7 +889,7 @@ impl CommandPalette {
         }
         self.reset_argument_state();
         if tab {
-            self.accepted_argument_input = Some(text.clone());
+            self.accepted_argument_input = Some((text.clone(), range.0));
             return CommandAction::Complete {
                 text,
                 cursor: edit.cursor,
@@ -881,7 +899,7 @@ impl CommandPalette {
         if exact {
             self.confirm_close(input)
         } else {
-            self.accepted_argument_input = Some(text.clone());
+            self.accepted_argument_input = Some((text.clone(), range.0));
             CommandAction::AcceptArgument {
                 text,
                 cursor: edit.cursor,
@@ -1646,7 +1664,10 @@ fn typed_argument_at_cursor(
     {
         return None;
     }
-    if cursor < args_start || !input.is_char_boundary(cursor) {
+    if cursor < args_start
+        || !input.is_char_boundary(cursor)
+        || input[..cursor].contains(['\n', '\r'])
+    {
         return None;
     }
     let relative_cursor = cursor - args_start;
@@ -1741,6 +1762,7 @@ mod tests {
         ArgumentMatch, CaseMatching, CommandAction, CommandPalette, CommandRequest,
         CompletionMatchOptions, MATCHER_SETTLE_POLL, MATCHER_SETTLE_TIMEOUT, Normalization,
         argument_at_cursor, argument_visible_rows, command_args, completion_match,
+        typed_argument_at_cursor,
     };
     struct Noop;
 
@@ -2454,6 +2476,13 @@ mod tests {
     }
 
     #[test]
+    fn typed_argument_parser_rejects_later_prompt_lines() {
+        let schema = [PositionalArgument::required("value", ArgumentKind::String)];
+        let input = "/test first\nsecond";
+        assert!(typed_argument_at_cursor(input, input.len(), &schema).is_none());
+    }
+
+    #[test]
     fn argument_parser_handles_multibyte_whitespace() {
         let input = "/test\u{3000}alpha\u{3000}beta";
 
@@ -2473,6 +2502,23 @@ mod tests {
             argument_at_cursor(input, input.len()),
             Some((8, 13, "alpha".into(), 0))
         );
+    }
+
+    #[test_case(true; "accepted")]
+    #[test_case(false; "dismissed")]
+    fn completion_suppression_is_scoped_to_argument_slot(accepted: bool) {
+        let mut palette = argument_palette(0);
+        let input = "/test one two";
+        let marker = Some((input.to_owned(), 6));
+        if accepted {
+            palette.accepted_argument_input = marker;
+        } else {
+            palette.dismissed_argument_input = marker;
+        }
+
+        assert!(palette.sync_arguments(input, input.len(), "insert"));
+        assert!(palette.accepted_argument_input.is_none());
+        assert!(palette.dismissed_argument_input.is_none());
     }
 
     #[test]
