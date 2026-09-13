@@ -1671,7 +1671,11 @@ fn typed_argument_at_cursor(
         return None;
     }
     let relative_cursor = cursor - args_start;
-    let tokens = lex_tolerant(args).ok()?;
+    let line_end = args.find(['\n', '\r']).unwrap_or(args.len());
+    if relative_cursor > line_end {
+        return None;
+    }
+    let tokens = lex_tolerant(&args[..line_end]).ok()?;
     let (start, end, index) = tokens
         .iter()
         .enumerate()
@@ -1681,13 +1685,7 @@ fn typed_argument_at_cursor(
         .map(|(index, token)| (token.range.start, token.range.end, index))
         .unwrap_or_else(|| {
             let index = tokens.partition_point(|token| token.range.end < relative_cursor);
-            let start = tokens
-                .get(index)
-                .map_or(relative_cursor, |token| token.range.start);
-            let end = tokens
-                .get(index)
-                .map_or(relative_cursor, |token| token.range.end);
-            (start, end, index)
+            (relative_cursor, relative_cursor, index)
         });
     let prefix_end = relative_cursor.clamp(start, end);
     let decoded_argument = lex_tolerant(&args[start..prefix_end])
@@ -1750,7 +1748,8 @@ mod tests {
         CommandDocs, CommandError, CommandFuture, CommandInvocation, CommandOutcome,
         CommandRegistry, CommandSpec, CompletionContext, CompletionError, CompletionItem,
         CompletionItemNavigation, CompletionPolicy, CompletionPublisher, HostResponse,
-        PositionalArgument, ProducerPrecedence, Registration, TargetCapabilities,
+        PositionalArgument, ProducerPrecedence, QuoteStyle, Registration, TargetCapabilities,
+        encode_completion_value,
     };
     use maki_config::DEFAULT_AUTOCOMPLETE_HEIGHT;
     use ratatui::Terminal;
@@ -2480,6 +2479,44 @@ mod tests {
         let schema = [PositionalArgument::required("value", ArgumentKind::String)];
         let input = "/test first\nsecond";
         assert!(typed_argument_at_cursor(input, input.len(), &schema).is_none());
+    }
+
+    #[test]
+    fn typed_argument_parser_limits_unfinished_quote_to_first_line() {
+        let schema = [PositionalArgument::required(
+            "path",
+            ArgumentKind::Directory,
+        )];
+        let input = "/test \"pro\nkeep this text";
+        let cursor = input.find("pro").unwrap() + 3;
+        assert_eq!(
+            typed_argument_at_cursor(input, cursor, &schema),
+            Some((6, 10, "pro".into(), 0))
+        );
+    }
+
+    #[test]
+    fn completion_in_argument_gap_inserts_without_replacing_next_argument() {
+        let schema = [
+            PositionalArgument::required("source", ArgumentKind::String),
+            PositionalArgument::required("destination", ArgumentKind::String),
+        ];
+        let input = "/copy  destination";
+        let cursor = 6;
+        let (start, end, query, index) = typed_argument_at_cursor(input, cursor, &schema).unwrap();
+        assert_eq!((start, end, query.as_str(), index), (6, 6, "", 0));
+        let edit = encode_completion_value("source", start..end, QuoteStyle::None);
+        let completed = format!("{}{}{}", &input[..start], edit.text, &input[end..]);
+        assert_eq!(completed, "/copy source destination");
+        let parsed = CommandArguments::Positional(schema.into())
+            .parse_invocation(command_args(&completed))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.get("source").unwrap().as_str(), Some("source"));
+        assert_eq!(
+            parsed.get("destination").unwrap().as_str(),
+            Some("destination")
+        );
     }
 
     #[test]
