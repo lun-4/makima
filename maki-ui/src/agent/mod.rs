@@ -2,17 +2,18 @@ mod agent_loop;
 mod command_router;
 pub(crate) mod shared_queue;
 
+#[cfg(test)]
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
-use maki_agent::actor::AgentActorHandle;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentId, CancelMap, Envelope, HistorySnapshot, McpCommand,
-    McpConfigErrors, McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentConfig, AgentEvent, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
+    McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, PreparedSessionMailbox,
+    SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -212,6 +213,42 @@ pub(crate) enum AgentCommand {
 ///
 /// The scheduler, history, lifecycle, and retained outcomes live in the
 /// actor owned here: `actor` is the handle, `task` the runner task.
+pub(crate) struct PreparedAgentHandles {
+    handles: Option<AgentHandles>,
+    mailbox: Option<PreparedSessionMailbox>,
+}
+
+impl PreparedAgentHandles {
+    #[cfg(test)]
+    pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, maki_agent::AgentId) {
+        let handles = self.handles.as_ref().expect("prepared handles");
+        (handles.manager.clone(), handles.root_id)
+    }
+
+    pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
+        self.handles
+            .as_ref()
+            .expect("prepared handles")
+            .mcp_reader()
+    }
+
+    pub(crate) fn activate(mut self) -> AgentHandles {
+        if let Some(mailbox) = self.mailbox.take() {
+            let activated = mailbox.activate();
+            self.handles.as_mut().expect("prepared handles").mailbox = Some(activated);
+        }
+        self.handles.take().expect("prepared handles")
+    }
+}
+
+impl Drop for PreparedAgentHandles {
+    fn drop(&mut self) {
+        if let Some(handles) = self.handles.take() {
+            handles.shutdown_actor();
+        }
+    }
+}
+
 pub(crate) struct AgentHandles {
     pub(crate) cmd_tx: flume::Sender<AgentCommand>,
     pub(crate) agent_rx: flume::Receiver<Envelope>,
@@ -220,20 +257,25 @@ pub(crate) struct AgentHandles {
     pub(crate) history: SharedMessages,
     pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) mcp_handle: Option<McpHandle>,
+    #[cfg(test)]
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
+    #[cfg(test)]
     pub(crate) timeouts: maki_providers::Timeouts,
+    #[cfg(test)]
     model_policy: Arc<ModelPolicy>,
+    #[cfg(test)]
     system_prompt: SystemPromptOverride,
     mailbox: Option<SessionMailbox>,
     subagent_cancels: Arc<CancelMap<String>>,
-    actor: Arc<AgentActorHandle>,
-    task: smol::Task<()>,
+    manager: AgentManagerHandle,
+    root_id: maki_agent::AgentId,
 }
 
 impl AgentHandles {
     /// MCP is shared across sessions and agent respawns; the event loop starts it
     /// once and shuts it down at exit. Only the actor task lives here.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         model_slot: &Arc<ProviderSlot>,
@@ -249,6 +291,38 @@ impl AgentHandles {
         model_policy: Arc<ModelPolicy>,
         system_prompt: SystemPromptOverride,
     ) -> Self {
+        Self::prepare(
+            model_slot,
+            initial_history,
+            config,
+            tool_output_lines,
+            permissions,
+            session_id,
+            timeouts,
+            lua_handle,
+            mcp_handle,
+            mcp_config_errors,
+            model_policy,
+            system_prompt,
+        )
+        .activate()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare(
+        model_slot: &Arc<ProviderSlot>,
+        initial_history: Vec<Message>,
+        config: AgentConfig,
+        tool_output_lines: ToolOutputLines,
+        permissions: &Arc<PermissionManager>,
+        session_id: Option<SessionRef>,
+        timeouts: maki_providers::Timeouts,
+        lua_handle: EventHandle,
+        mcp_handle: Option<McpHandle>,
+        mcp_config_errors: McpConfigErrors,
+        model_policy: Arc<ModelPolicy>,
+        system_prompt: SystemPromptOverride,
+    ) -> PreparedAgentHandles {
         spawn_agent_internal(
             flume::unbounded(),
             model_slot,
@@ -264,6 +338,11 @@ impl AgentHandles {
             model_policy,
             system_prompt,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, maki_agent::AgentId) {
+        (self.manager.clone(), self.root_id)
     }
 
     pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
@@ -287,16 +366,15 @@ impl AgentHandles {
         }
     }
 
-    pub(crate) fn cancel(self) {
-        self.actor.cancel_all();
-        self.subagent_cancels.cancel_all();
-    }
-
     /// Shuts the old actor down after the app and queue are repointed, so
     /// its close cannot poison the replacement. Everything the old agent
     /// still owns drains through the retained per-tab output channel.
     fn shutdown_actor(&self) {
-        self.actor.shutdown();
+        let manager = self.manager.clone();
+        smol::spawn(async move {
+            let _ = manager.shutdown(Duration::from_secs(3)).await;
+        })
+        .detach();
         self.subagent_cancels.cancel_all();
     }
 
@@ -313,6 +391,7 @@ impl AgentHandles {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn respawn(
         &mut self,
@@ -346,7 +425,8 @@ impl AgentHandles {
             lua_handle,
             Arc::clone(&self.model_policy),
             self.system_prompt.clone(),
-        );
+        )
+        .activate();
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old actor parks on its notify forever.
@@ -356,23 +436,17 @@ impl AgentHandles {
         // its close cannot poison the replacement. Everything the old agent
         // still owns drains through the retained per-tab output channel.
         old.shutdown_actor();
-        // Detach the old actor's task: `shutdown_actor` set the terminal
-        // lifecycle, so the runner finishes its active turn unwind and exits
-        // on its own. Dropping the `Task` would cancel that unwind mid-flight.
-        old.task.detach();
     }
 
     pub(crate) fn is_finished(&self) -> bool {
-        self.task.is_finished()
+        self.manager.runner_finished(self.root_id).unwrap_or(true)
     }
 
-    /// Hand back the actor task, dropping every channel so the runner can
-    /// wind down. The caller sends `CancelAll` first and then awaits all
-    /// tabs at once via [`join_all`] instead of paying a serial timeout
-    /// per tab.
-    pub(crate) fn into_task(self) -> smol::Task<()> {
-        self.actor.shutdown();
-        self.task
+    pub(crate) fn shutdown(self) -> smol::Task<()> {
+        self.subagent_cancels.cancel_all();
+        smol::spawn(async move {
+            let _ = self.manager.shutdown(Duration::from_secs(3)).await;
+        })
     }
 }
 
@@ -417,7 +491,9 @@ fn spawn_agent_internal(
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
-) -> AgentHandles {
+) -> PreparedAgentHandles {
+    #[cfg(not(test))]
+    let _ = mcp_config_errors;
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     // Seeded empty because `AgentActorHandle::spawn` publishes the real
@@ -426,50 +502,64 @@ fn spawn_agent_internal(
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
-    let mailbox = session_id
+    let prepared_mailbox = session_id
         .as_ref()
-        .map(|session_id| SessionMailbox::register(session_id.id()));
+        .map(|session_id| SessionMailbox::prepare(session_id.id()));
+    let mailbox = prepared_mailbox
+        .as_ref()
+        .map(PreparedSessionMailbox::mailbox);
 
     let (init_trigger, init_cancel) = maki_agent::CancelToken::new();
 
     let (drain_tx, drain_rx) = flume::unbounded::<u64>();
     let run_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let agent_id = AgentId::generate();
-    let backend = new_backend(
-        agent_id,
-        Arc::clone(model_slot),
-        config,
-        tool_output_lines,
-        Arc::clone(&btw_system),
-        mcp_handle.clone(),
-        &initial_history,
-        Arc::clone(permissions),
-        agent_tx.clone(),
-        answer_rx,
-        session_id,
-        mailbox.clone(),
-        timeouts,
-        lua_handle,
-        Arc::clone(&subagent_cancels),
-        Arc::clone(&model_policy),
-        system_prompt.clone(),
-        Arc::new(maki_agent::tools::FileWriteLocks::new()),
-        init_cancel,
-        drain_tx,
-        Arc::clone(&run_id),
-    );
-    let (actor, task) = AgentActorHandle::spawn(
-        agent_id,
-        initial_history,
-        Some(Arc::clone(&shared_history)),
-        Box::new(backend),
-    );
-    let actor = Arc::new(actor);
+    let limits = AgentLimits {
+        max_concurrent_agent_turns: config.max_concurrent_agent_turns,
+        max_agent_depth: config.max_agent_depth,
+        max_children_per_agent: config.max_children_per_agent,
+        max_live_agents: config.max_live_agents,
+    };
+    let manager = AgentManagerHandle::new(limits).expect("validated agent limits");
+    let root = manager
+        .create_root_with(
+            initial_history.clone(),
+            Some(Arc::clone(&shared_history)),
+            |agent_id| {
+                Ok::<Box<dyn maki_agent::ActorBackend>, String>(Box::new(new_backend(
+                    agent_id,
+                    Arc::clone(model_slot),
+                    config,
+                    tool_output_lines,
+                    Arc::clone(&btw_system),
+                    mcp_handle.clone(),
+                    &initial_history,
+                    Arc::clone(permissions),
+                    agent_tx.clone(),
+                    answer_rx,
+                    session_id,
+                    mailbox.clone(),
+                    timeouts,
+                    lua_handle,
+                    Arc::clone(&subagent_cancels),
+                    Arc::clone(&model_policy),
+                    system_prompt.clone(),
+                    Arc::new(maki_agent::tools::FileWriteLocks::new()),
+                    init_cancel,
+                    drain_tx,
+                    Arc::clone(&run_id),
+                )))
+            },
+        )
+        .expect("root agent factory");
+    let root_id = root.id();
+    let actor = Arc::new(root.actor().expect("committed root actor"));
     let queue_tx = actor_queue(Arc::clone(&actor), Arc::clone(&run_id));
 
     spawn_command_router(
         cmd_rx,
         Arc::clone(&actor),
+        manager.clone(),
+        root_id,
         Arc::clone(&subagent_cancels),
         init_trigger,
     );
@@ -489,23 +579,30 @@ fn spawn_agent_internal(
     })
     .detach();
 
-    AgentHandles {
-        cmd_tx,
-        agent_rx,
-        agent_tx,
-        answer_tx,
-        history: shared_history,
-        btw_system,
-        mcp_handle,
-        mcp_config_errors,
-        queue: queue_tx,
-        timeouts,
-        model_policy,
-        system_prompt,
-        mailbox,
-        subagent_cancels,
-        actor,
-        task,
+    PreparedAgentHandles {
+        handles: Some(AgentHandles {
+            cmd_tx,
+            agent_rx,
+            agent_tx,
+            answer_tx,
+            history: shared_history,
+            btw_system,
+            mcp_handle,
+            #[cfg(test)]
+            mcp_config_errors,
+            queue: queue_tx,
+            #[cfg(test)]
+            timeouts,
+            #[cfg(test)]
+            model_policy,
+            #[cfg(test)]
+            system_prompt,
+            mailbox,
+            subagent_cancels,
+            manager,
+            root_id,
+        }),
+        mailbox: prepared_mailbox,
     }
 }
 

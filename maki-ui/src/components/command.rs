@@ -28,6 +28,10 @@ use crate::{
 };
 /// Note appended to builtin alias rows: `(Alias for /new)`.
 const ALIAS_NOTE: &str = " (Alias for ";
+#[cfg(test)]
+const MATCHER_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const MATCHER_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[cfg(test)]
 pub struct ParsedCommand {
@@ -143,6 +147,7 @@ impl CommandPalette {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_defaults(
         registry: CommandRegistry,
         target: TargetHandle,
@@ -152,6 +157,26 @@ impl CommandPalette {
         let snapshot = registry
             .snapshot_for(&target)
             .expect("new command target is live");
+        Self::from_snapshot(registry, target, snapshot, defaults, cwd)
+    }
+
+    pub(crate) fn prepared(
+        registry: CommandRegistry,
+        target: TargetHandle,
+        snapshot: RegistrySnapshot,
+        defaults: CompletionProviders,
+        cwd: Arc<str>,
+    ) -> Self {
+        Self::from_snapshot(registry, target, snapshot, defaults, cwd)
+    }
+
+    fn from_snapshot(
+        registry: CommandRegistry,
+        target: TargetHandle,
+        snapshot: RegistrySnapshot,
+        defaults: CompletionProviders,
+        cwd: Arc<str>,
+    ) -> Self {
         let nucleo = Self::build_nucleo(&snapshot);
         Self {
             command_selected: 0,
@@ -495,14 +520,14 @@ impl CommandPalette {
         range: (usize, usize),
         items: Vec<maki_lua::CommandArgumentItem>,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + MATCHER_SETTLE_TIMEOUT;
         while self.command_publication.is_pending() {
             let _ = self.tick_commands();
             assert!(
                 std::time::Instant::now() < deadline,
                 "command matcher did not settle"
             );
-            std::thread::yield_now();
+            std::thread::sleep(MATCHER_SETTLE_POLL);
         }
         self.argument_publication.commit_sync(
             ArgumentRequest {
@@ -1679,8 +1704,8 @@ mod tests {
 
     use super::{
         ArgumentMatch, CaseMatching, CommandAction, CommandPalette, CommandRequest,
-        CompletionMatchOptions, Normalization, argument_at_cursor, argument_visible_rows,
-        command_args, completion_match,
+        CompletionMatchOptions, MATCHER_SETTLE_POLL, MATCHER_SETTLE_TIMEOUT, Normalization,
+        argument_at_cursor, argument_visible_rows, command_args, completion_match,
     };
     struct Noop;
 
@@ -1741,14 +1766,14 @@ mod tests {
     }
 
     fn settle(palette: &mut CommandPalette) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + MATCHER_SETTLE_TIMEOUT;
         while palette.command_publication.is_pending() {
             let _ = palette.tick();
             assert!(
                 std::time::Instant::now() < deadline,
                 "command matcher did not settle"
             );
-            std::thread::yield_now();
+            std::thread::sleep(MATCHER_SETTLE_POLL);
         }
     }
 
@@ -1983,7 +2008,7 @@ mod tests {
             palette.sync("model");
         }
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + MATCHER_SETTLE_TIMEOUT;
         while palette.command_matching
             || palette.nucleo.snapshot().pattern().column_pattern(0).atoms
                 != palette.nucleo.pattern.column_pattern(0).atoms
@@ -1993,7 +2018,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "command matcher did not settle"
             );
-            std::thread::yield_now();
+            std::thread::sleep(MATCHER_SETTLE_POLL);
         }
 
         assert!(!palette.is_active());

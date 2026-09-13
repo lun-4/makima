@@ -37,6 +37,7 @@ async fn forward_provider_events(
                 AgentEvent::TextDelta { text }
             }
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
+            ProviderEvent::ThinkingBlockEnd => AgentEvent::ThinkingBlockEnd,
             ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
                 id,
                 name: canonical_tool_name(&name).to_owned(),
@@ -178,5 +179,30 @@ mod tests {
         canonicalize_tool_names(&mut message);
         let names: Vec<&str> = message.tool_uses().map(|(_, name, _)| name).collect();
         assert_eq!(names, ["bash", "read", "my_functions.x"]);
+    }
+
+    #[test]
+    fn forward_provider_events_maps_thinking_block_end() {
+        smol::block_on(async {
+            let (prx_tx, prx_rx) = flume::unbounded();
+            let (event_tx, event_rx) = flume::unbounded();
+            prx_tx
+                .send(ProviderEvent::ThinkingDelta { text: "a".into() })
+                .unwrap();
+            prx_tx.send(ProviderEvent::ThinkingBlockEnd).unwrap();
+            prx_tx
+                .send(ProviderEvent::ThinkingDelta { text: "b".into() })
+                .unwrap();
+            drop(prx_tx);
+
+            let sender = EventSender::new(event_tx, 0);
+            forward_provider_events(prx_rx, &sender).await;
+
+            let events: Vec<AgentEvent> = event_rx.drain().map(|e| e.event).collect();
+            assert_eq!(events.len(), 3);
+            assert!(matches!(&events[0], AgentEvent::ThinkingDelta { text } if text == "a"));
+            assert!(matches!(&events[1], AgentEvent::ThinkingBlockEnd));
+            assert!(matches!(&events[2], AgentEvent::ThinkingDelta { text } if text == "b"));
+        });
     }
 }

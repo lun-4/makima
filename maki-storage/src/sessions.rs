@@ -2493,7 +2493,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_from_removes_the_lock_file() {
+    fn delete_from_releases_the_session_lock() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s: TestSession = Session::new("m", "/project");
@@ -2502,7 +2502,9 @@ mod tests {
         assert!(session_lock::lock_path(dir, &s.id).exists());
 
         TestSession::delete_from(s.id, dir).unwrap();
-        assert!(!session_lock::lock_path(dir, &s.id).exists());
+        assert!(!session_lock::open_elsewhere(dir, &s.id));
+        let lease = session_lock::claim(dir, &s.id).unwrap().unwrap();
+        lease.release().unwrap();
     }
 
     /// Rewrites the scan-cache title of `id` without touching the session
@@ -3003,9 +3005,8 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         // The crash happened between the record's closing brace and the
         // newline the writer emits after it.
-        let record =
-            serde_json::to_string(&serde_json::json!({"t":"msg","d":{"role":"user"}})).unwrap();
-        file.write_all(record.as_bytes()).unwrap();
+        file.write_all(br#"{"t":"msg","d":{"role":"user"}}"#)
+            .unwrap();
         drop(file);
 
         let list = TestSession::list_in("/project", dir).unwrap();

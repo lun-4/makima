@@ -362,7 +362,7 @@ pub fn run(
                         result_text.push_str(text);
                     }
                 }
-                AgentEvent::ThinkingDelta { .. } => {}
+                AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
                 AgentEvent::ToolPending { .. }
                 | AgentEvent::ToolStart(_)
                 | AgentEvent::ToolOutput { .. }
@@ -375,6 +375,7 @@ pub fn run(
                 | AgentEvent::PermissionRequest { .. }
                 | AgentEvent::Question { .. }
                 | AgentEvent::SubagentHistory { .. }
+                | AgentEvent::SubagentClosed
                 | AgentEvent::ToolSnapshot { .. }
                 | AgentEvent::ToolHeaderSnapshot { .. }
                 | AgentEvent::LiveToolBuf { .. }

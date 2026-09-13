@@ -209,6 +209,10 @@ impl MessagesPanel {
         self.streaming_thinking.push(text);
     }
 
+    pub fn end_thinking_block(&mut self) {
+        self.flush_thinking();
+    }
+
     pub fn text_delta(&mut self, text: &str) {
         self.flush_thinking();
         self.streaming_text.push(text);
@@ -824,6 +828,7 @@ impl MessagesPanel {
         self.idle_splash.frame()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_splash_frame(&mut self, frame: Option<maki_lua::SplashFrame>) {
         self.idle_splash.set_frame(frame);
     }

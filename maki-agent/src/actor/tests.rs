@@ -12,11 +12,8 @@ use super::types::{
     ActorLifecycle, ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind,
 };
 use super::{ActorBackend, ActorError, ActorWork, AgentActorHandle, TurnAdmission};
-use crate::types::{
-    AgentId, AgentInput, AgentMode, DoneReason, EventSender, TurnCancellationReason, TurnId,
-    TurnOutcome,
-};
-use crate::{ExtractedCommand, SharedMessages};
+use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnOutcome};
+use crate::{AgentEvent, AgentInput, AgentMode, ExtractedCommand, SharedMessages};
 
 /// Shared observations the scripted backend records for the test to assert.
 #[derive(Default)]
@@ -495,6 +492,221 @@ fn cancel_all_is_reusable() {
 }
 
 #[test]
+fn cancel_existing_catches_turn_between_pop_and_active_install() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let (popped, release) = handle.pause_after_next_pop();
+        let cancelled = handle
+            .admit_turn(input("cancelled"), None, "cancelled".into())
+            .unwrap();
+
+        popped.recv_async().await.unwrap();
+        handle.cancel_existing();
+        release.send(()).unwrap();
+
+        assert!(matches!(
+            cancelled.wait().await,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+
+        let surviving = handle
+            .admit_turn(input("surviving"), None, "surviving".into())
+            .unwrap();
+        assert!(matches!(
+            surviving.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn cancel_existing_catches_control_between_pop_and_backend_entry() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let (popped, release) = handle.pause_after_next_pop();
+        handle
+            .push_control(ControlWork {
+                name: "cancelled".into(),
+                correlation: "cancelled".into(),
+            })
+            .unwrap();
+
+        popped.recv_async().await.unwrap();
+        handle.cancel_existing();
+        release.send(()).unwrap();
+        until(|| handle.snapshot().queued == 0).await;
+        assert!(state.controls.lock().unwrap().is_empty());
+
+        handle
+            .push_control(ControlWork {
+                name: "surviving".into(),
+                correlation: "surviving".into(),
+            })
+            .unwrap();
+        until(|| !state.controls.lock().unwrap().is_empty()).await;
+        assert_eq!(state.controls.lock().unwrap().as_slice(), ["surviving"]);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn cancel_existing_catches_compact_between_pop_and_backend_entry() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let (popped, release) = handle.pause_after_next_pop();
+        handle.push_compact(1).unwrap();
+
+        popped.recv_async().await.unwrap();
+        handle.cancel_existing();
+        release.send(()).unwrap();
+        until(|| handle.snapshot().queued == 0).await;
+        assert_eq!(state.compacts.load(Ordering::SeqCst), 0);
+
+        handle.push_compact(2).unwrap();
+        handle
+            .push_control(ControlWork {
+                name: "fence".into(),
+                correlation: "fence".into(),
+            })
+            .unwrap();
+        until(|| !state.controls.lock().unwrap().is_empty()).await;
+        assert_eq!(state.compacts.load(Ordering::SeqCst), 1);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn cancel_turn_catches_exact_turn_between_pop_and_active_install() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        assert!(matches!(
+            handle.cancel_turn(crate::types::TurnId::generate()),
+            Err(ActorError::UnknownTurn(_))
+        ));
+
+        let (popped, release) = handle.pause_after_next_pop();
+        let cancelled = handle
+            .admit_turn(input("cancelled"), None, "same-correlation".into())
+            .unwrap();
+        let cancelled_id = cancelled.turn_id();
+        popped.recv_async().await.unwrap();
+        handle.cancel_turn(cancelled_id).unwrap();
+        release.send(()).unwrap();
+
+        assert!(matches!(
+            cancelled.wait().await,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            handle.cancel_turn(cancelled_id),
+            Err(ActorError::UnknownTurn(id)) if id == cancelled_id
+        ));
+
+        let surviving = handle
+            .admit_turn(input("surviving"), None, "same-correlation".into())
+            .unwrap();
+        assert!(matches!(
+            surviving.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn cancel_turn_terminalizes_only_the_queued_exact_ticket() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let first = handle
+            .admit_turn(input("first"), None, "shared".into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let second = handle
+            .admit_turn(input("second"), None, "shared".into())
+            .unwrap();
+
+        handle.cancel_turn(second.turn_id()).unwrap();
+        assert!(matches!(
+            second.wait().await,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        gate.open();
+        assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
+
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn terminal_ticket_is_retired_before_notification() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let (handle, task) = spawn(backend);
+        let (retired, release) = handle.pause_after_next_finalization_retire();
+        let ticket = handle
+            .admit_turn(input("work"), None, "work".into())
+            .unwrap();
+        let turn_id = ticket.turn_id();
+
+        let cancel_handle = handle.clone();
+        let cancel = std::thread::spawn(move || {
+            retired.recv().unwrap();
+            let result = cancel_handle.cancel_turn(turn_id);
+            release.send(()).unwrap();
+            result
+        });
+
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        assert!(matches!(
+            cancel.join().unwrap(),
+            Err(ActorError::UnknownTurn(id)) if id == turn_id
+        ));
+        assert!(
+            !handle
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .cancelled_turns
+                .contains(&turn_id)
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn entered_run_is_never_emitted_twice() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
@@ -526,13 +738,19 @@ fn setup_failure_delivered_exactly_once() {
             .admit_turn(input("work"), Some(EventSender::new(tx, 0)), "w".into())
             .unwrap();
         let outcome = ticket.wait().await;
-        let events: Vec<_> = rx.drain().collect();
-        assert_eq!(
-            events.len(),
-            1,
-            "synthesized outcome delivered exactly once"
+        let event = rx
+            .try_recv()
+            .expect("ticket resolved before outcome delivery");
+        assert!(matches!(
+            event.event,
+            AgentEvent::TurnOutcome(TurnOutcome::Failed { .. })
+        ));
+        assert!(
+            rx.is_empty(),
+            "synthesized outcome delivered more than once"
         );
         assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+        assert_eq!(handle.snapshot().status, ActorStatus::Idle);
         handle.close();
         task.await;
     });
@@ -724,12 +942,10 @@ fn close_rejects_new_admissions() {
         let backend = ScriptedBackend::new();
         let (handle, task) = spawn(backend);
         handle.close();
-        assert_eq!(
-            handle
-                .admit_turn(input("late"), None, "late".into())
-                .unwrap_err(),
-            ActorError::Closed
-        );
+        assert!(matches!(
+            handle.admit_turn(input("late"), None, "late".into()),
+            Err(ActorError::Closed)
+        ));
         assert_eq!(handle.snapshot().lifecycle, ActorLifecycle::Closed);
         task.await;
     });
@@ -748,7 +964,7 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         Some(ExtractedCommand::Compact(1))
     ));
     // A control at the front is incompatible: poll must not consume it.
-    assert_eq!(queue.pop_interrupt(), None);
+    assert!(queue.pop_interrupt().is_none());
     assert_eq!(queue.len(), 1);
     // A turn at the front shields a root behind it.
     let admission = TurnAdmission {
@@ -757,7 +973,7 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         event_sender: None,
         correlation: "t".into(),
         root: false,
-        ticket: super::TurnTicket::new(crate::types::TurnId::generate()),
+        ticket: super::TurnTicket::new(crate::types::TurnId::generate(), Arc::new(())),
     };
     queue.push(ActorWork::Turn(admission));
     queue.push(ActorWork::Root(RootWork {
@@ -768,7 +984,7 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         image_count: 0,
         correlation: "r2".into(),
     }));
-    assert_eq!(queue.pop_interrupt(), None);
+    assert!(queue.pop_interrupt().is_none());
     assert_eq!(
         queue.len(),
         3,
@@ -905,8 +1121,8 @@ fn targeted_cancel_matching_queued_correlation_and_reuse() {
                 ..
             }
         ));
-        // The matching root was dropped; only t1 and t3 remain queued.
-        assert_eq!(handle.snapshot().queued, 2);
+        // The matching root was dropped; t1 is active and only t3 remains queued.
+        assert_eq!(handle.snapshot().queued, 1);
         gate.open();
         assert!(matches!(t1.wait().await, TurnOutcome::Completed { .. }));
         assert!(matches!(t3.wait().await, TurnOutcome::Completed { .. }));
@@ -1052,9 +1268,8 @@ fn remove_visible_at_skips_hidden_and_removes_deferred() {
             .unwrap();
         handle.push_compact(3).unwrap();
 
-        // Panel shows [deferred-root, compact].
         let queue = handle.snapshot().queue;
-        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.len(), 3);
 
         // Removing visible index 0 removes the deferred root, not the hidden
         // displayed root.
@@ -1130,6 +1345,7 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
+        task.detach();
 
         // Precancel r7 before any work with that correlation exists. Compact 7
         // queued afterwards is dropped; compact 8 is unrelated and runs.

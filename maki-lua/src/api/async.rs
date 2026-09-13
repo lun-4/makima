@@ -84,6 +84,10 @@ lua_class! {
 /// you do not wait for it. If you need the result, pass an {on_finish}
 /// callback.
 ///
+/// A task started from a managed agent invocation inherits that exact turn's
+/// authority. It may use the authority only while the originating turn remains
+/// active; retained work fails closed after the turn ends.
+///
 /// @param fn function Zero-argument function to execute.
 /// @param on_finish function? Optional callback `function(err, result)`. Called once {fn} completes.
 /// @example

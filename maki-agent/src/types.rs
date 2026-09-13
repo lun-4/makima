@@ -753,6 +753,9 @@ pub enum AgentEvent {
     ThinkingDelta {
         text: String,
     },
+    /// The current reasoning block is complete; the next `ThinkingDelta`
+    /// belongs to a new block.
+    ThinkingBlockEnd,
     ToolPending {
         id: String,
         name: String,
@@ -808,6 +811,8 @@ pub enum AgentEvent {
         tool_use_id: String,
         messages: Vec<Message>,
     },
+    /// A live child was permanently closed and no longer accepts input.
+    SubagentClosed,
     ToolSnapshot {
         id: String,
         snapshot: BufferSnapshot,
@@ -1079,6 +1084,14 @@ impl std::fmt::Debug for SubagentCancel {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubagentInfo {
+    #[serde(skip)]
+    pub agent_id: AgentId,
+    #[serde(skip)]
+    pub parent_agent_id: Option<AgentId>,
+    #[serde(skip)]
+    pub parent_is_root: bool,
+    #[serde(skip)]
+    pub auto_deliver: bool,
     pub parent_tool_use_id: String,
     #[serde(rename = "parent_name")]
     pub name: String,

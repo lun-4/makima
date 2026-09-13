@@ -250,6 +250,14 @@ impl UserData for LuaCtx {
             Ok((Some(audience.name().unwrap_or("main").to_string()), None))
         });
 
+        methods.add_method("_maki_managed", |lua, this, ()| {
+            let Some(expected) = this.agent().and_then(|agent| agent.managed_turn.as_ref()) else {
+                return Ok(false);
+            };
+            Ok(crate::runtime::current_managed_turn(lua)
+                .is_some_and(|active| expected.same_authority(&active)))
+        });
+
         // The session that called this tool, which under concurrent
         // sessions is not always the focused one `maki.session.current()`
         // reports. Nil without an error when the run has no session, as in
