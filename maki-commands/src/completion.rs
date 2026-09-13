@@ -231,6 +231,7 @@ fn completion_argument_metadata(
     command: &ResolvedCommand,
     arguments: &str,
     argument_index: usize,
+    argument_range: Option<&Range<usize>>,
 ) -> CompletionArgumentMetadata {
     let CommandArguments::Positional(schema) = &command.spec().arguments else {
         return (
@@ -246,7 +247,8 @@ fn completion_argument_metadata(
     let descriptor = schema
         .get(argument_index)
         .or_else(|| schema.last().filter(|argument| argument.variadic));
-    let preceding_values = parse_completion_prefix(arguments, schema, argument_index);
+    let preceding_values =
+        parse_completion_prefix(arguments, schema, argument_index, argument_range);
     let next_argument_index = (argument_index + 1 < schema.len()).then_some(argument_index + 1);
     let navigation = if next_argument_index.is_some() {
         CompletionNavigation::NextArgument
@@ -673,6 +675,7 @@ impl CompletionSession {
                 &state.command,
                 &input.arguments,
                 input.argument_index,
+                input.argument_range.as_ref(),
             );
             let context = CompletionContext {
                 command_id: state.command.command_id(),

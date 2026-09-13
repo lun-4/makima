@@ -369,6 +369,23 @@ async fn host_context(
     }
 }
 
+fn parsed_string_argument(
+    invocation: &CommandInvocation,
+    name: &str,
+) -> Result<Option<Arc<str>>, CommandError> {
+    invocation
+        .parsed_arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get(name))
+        .map(|value| match value {
+            ArgumentValue::String(value) => Ok(Arc::clone(value)),
+            _ => Err(CommandError::Producer(Arc::from(format!(
+                "invalid builtin argument type for {name}"
+            )))),
+        })
+        .transpose()
+}
+
 fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
     if argument.contains('/') {
         Model::from_spec(argument)
@@ -407,6 +424,8 @@ impl CommandBehavior for BuiltinBehavior {
             });
         }
         let arguments = invocation.arguments.trim().to_owned();
+        let model = parsed_string_argument(&invocation, "model");
+        let theme = parsed_string_argument(&invocation, "theme");
         let id = self.id;
         Box::pin(async move {
             let operation = match id {
@@ -415,7 +434,7 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::New => BuiltinOperation::ResetSession,
                 maki_commands::BuiltinId::Help => BuiltinOperation::ToggleHelp,
                 maki_commands::BuiltinId::Queue => BuiltinOperation::FocusQueue,
-                maki_commands::BuiltinId::Model if arguments.is_empty() => {
+                maki_commands::BuiltinId::Model if model.as_ref().is_ok_and(Option::is_none) => {
                     if !invocation.target_supports(TargetCapability::InteractiveUi) {
                         return Err(CommandError::Producer(Arc::from(
                             NONINTERACTIVE_MODEL_USAGE,
@@ -424,7 +443,10 @@ impl CommandBehavior for BuiltinBehavior {
                     BuiltinOperation::OpenModelPicker
                 }
                 maki_commands::BuiltinId::Model => {
-                    let specs = if arguments.contains('/') {
+                    let model = model?.ok_or_else(|| {
+                        CommandError::Producer(Arc::from("model argument is unavailable"))
+                    })?;
+                    let specs = if model.contains('/') {
                         Arc::from([])
                     } else {
                         let HostContextResponse::Values(specs) =
@@ -437,13 +459,16 @@ impl CommandBehavior for BuiltinBehavior {
                         specs
                     };
                     BuiltinOperation::SetModel {
-                        spec: resolve_model(&arguments, &specs)?,
+                        spec: resolve_model(&model, &specs)?,
                     }
                 }
-                maki_commands::BuiltinId::Theme if arguments.is_empty() => {
+                maki_commands::BuiltinId::Theme if theme.as_ref().is_ok_and(Option::is_none) => {
                     BuiltinOperation::OpenThemePicker
                 }
                 maki_commands::BuiltinId::Theme => {
+                    let theme = theme?.ok_or_else(|| {
+                        CommandError::Producer(Arc::from("theme argument is unavailable"))
+                    })?;
                     let HostContextResponse::Values(names) =
                         host_context(&invocation, HostContextRequest::ThemeNames).await?
                     else {
@@ -451,9 +476,9 @@ impl CommandBehavior for BuiltinBehavior {
                             "theme resolution is unavailable",
                         )));
                     };
-                    let Resolution::Unique(index) = fuzzy_resolve(&arguments, &names) else {
+                    let Resolution::Unique(index) = fuzzy_resolve(&theme, &names) else {
                         return Err(CommandError::Producer(Arc::from(format!(
-                            "theme is unknown or ambiguous: {arguments}"
+                            "theme is unknown or ambiguous: {theme}"
                         ))));
                     };
                     BuiltinOperation::SetTheme {
@@ -945,8 +970,10 @@ mod tests {
         for input in [
             "/model",
             "/model openai/gpt-5",
+            r#"/model "openai/"'gpt-5'"#,
             "/theme",
             "/theme dark",
+            r#"/theme "da"'rk'"#,
             "/btw explain this",
             "/fast",
         ] {
@@ -964,7 +991,13 @@ mod tests {
                 maki_commands::BuiltinOperation::SetModel {
                     spec: Arc::from("openai/gpt-5"),
                 },
+                maki_commands::BuiltinOperation::SetModel {
+                    spec: Arc::from("openai/gpt-5"),
+                },
                 maki_commands::BuiltinOperation::OpenThemePicker,
+                maki_commands::BuiltinOperation::SetTheme {
+                    name: Arc::from("dark"),
+                },
                 maki_commands::BuiltinOperation::SetTheme {
                     name: Arc::from("dark"),
                 },

@@ -97,8 +97,10 @@ struct ContextProbe {
     context: Mutex<Option<CompletionContext>>,
 }
 
+type VariadicCompletionCall = (Arc<str>, Arc<[ArgumentValue]>);
+
 struct VariadicCompletionProbe {
-    calls: Arc<Mutex<Vec<Arc<str>>>>,
+    calls: Arc<Mutex<Vec<VariadicCompletionCall>>>,
 }
 
 impl CommandCompletion for VariadicCompletionProbe {
@@ -110,7 +112,7 @@ impl CommandCompletion for VariadicCompletionProbe {
         self.calls
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .push(Arc::clone(&context.argument));
+            .push((Arc::clone(&context.argument), context.preceding_values));
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -732,25 +734,37 @@ fn variadic_replace_provider_registers_and_repeats_for_each_slot() {
     let command = registry.resolve_for(&target, "/paths").unwrap();
     let session = registry.open_completion(command, target.id()).unwrap();
 
-    for arguments in ["one", "one two"] {
+    for (argument, range) in [("one", 0..3), ("two", 4..7), ("one", 0..3)] {
         let _ = futures_lite::future::block_on(session.complete_input(CompletionInput {
-            arguments: Arc::from(arguments),
-            argument: Arc::from(arguments.rsplit(' ').next().unwrap_or(arguments)),
-            argument_index: arguments.split_whitespace().count().saturating_sub(1),
-            argument_range: Some(0..arguments.len()),
+            arguments: Arc::from("one two three "),
+            argument: Arc::from(argument),
+            argument_index: 0,
+            argument_range: Some(range),
             mode: Arc::from("insert"),
         }));
     }
 
+    let calls = calls.lock().unwrap();
     assert_eq!(
         calls
-            .lock()
-            .unwrap()
             .iter()
-            .map(AsRef::as_ref)
+            .map(|(argument, _)| argument.as_ref())
             .collect::<Vec<_>>(),
-        ["one", "two"]
+        ["one", "two", "one"]
     );
+    assert!(calls[0].1.is_empty());
+    assert_eq!(
+        calls[1]
+            .1
+            .iter()
+            .map(|value| match value {
+                ArgumentValue::Directory(path) => path.to_string_lossy(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        ["one"]
+    );
+    assert!(calls[2].1.is_empty());
 }
 
 #[test]

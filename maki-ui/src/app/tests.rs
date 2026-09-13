@@ -8013,6 +8013,20 @@ fn cd_completion_ctrl_left_requeries_before_accepting() {
     );
 }
 
+#[test]
+fn cd_completion_cursor_in_whitespace_before_path_does_not_panic() {
+    let (_tmp, mut app, _backend) = completion_app();
+    let input = "/cd  ./alpha";
+    app.input_box.set_input(input.into());
+    app.input_box.buffer.set_cursor_byte_offset(4);
+    app.command_palette.sync(input);
+    app.sync_command_arguments(input, 4);
+
+    assert!(app.typed_path_completion_context().is_some());
+    app.sync_file_completion();
+    assert!(!app.file_completion.is_active());
+}
+
 #[test_case("/cd ", "  " ; "trailing_spaces")]
 #[test_case("/cd \t ", " \t\nkeep @skill:review" ; "whitespace_and_following_line")]
 fn cd_completion_preserves_text_outside_path(prefix: &str, remainder: &str) {

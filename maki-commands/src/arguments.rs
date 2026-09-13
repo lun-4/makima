@@ -484,8 +484,9 @@ pub fn parse_completion_prefix(
     input: &str,
     schema: &[PositionalArgument],
     argument_index: usize,
+    argument_range: Option<&std::ops::Range<usize>>,
 ) -> Arc<[ArgumentValue]> {
-    parse_completion_prefix_arguments(input, schema, argument_index)
+    parse_completion_prefix_arguments(input, schema, argument_index, argument_range)
         .iter()
         .flat_map(|argument| argument.values.iter().cloned())
         .collect()
@@ -495,26 +496,25 @@ pub fn parse_completion_prefix_arguments(
     input: &str,
     schema: &[PositionalArgument],
     argument_index: usize,
+    argument_range: Option<&std::ops::Range<usize>>,
 ) -> Arc<[ParsedArgument]> {
     let Ok(tokens) = lex_tolerant(input) else {
         return Arc::from([]);
     };
-    // The active query is the token being completed. With a trailing
-    // whitespace the cursor is in an empty slot after all complete tokens, so
-    // every token is a preceding value. Without it, the last token is the
-    // partial active query and everything before it is preceding. The active
-    // slot is the `argument_index`-th schema slot; when it is variadic every
-    // token after the fixed prefix is a value of that slot, so the whole
-    // preceding token set is consumed by it.
-    let active_is_last = !input.ends_with(char::is_whitespace) && !tokens.is_empty();
-    let variadic_active = schema
-        .get(argument_index)
-        .is_some_and(|argument| argument.variadic);
-    let preceding_count = if variadic_active {
-        tokens.len().saturating_sub(usize::from(active_is_last))
-    } else {
-        argument_index.min(tokens.len())
-    };
+    let preceding_count = argument_range.map_or_else(
+        || {
+            let active_is_last = !input.ends_with(char::is_whitespace) && !tokens.is_empty();
+            let variadic_active = schema
+                .get(argument_index)
+                .is_some_and(|argument| argument.variadic);
+            if variadic_active {
+                tokens.len().saturating_sub(usize::from(active_is_last))
+            } else {
+                argument_index.min(tokens.len())
+            }
+        },
+        |range| tokens.partition_point(|token| token.range.end <= range.start),
+    );
     let mut parsed: Vec<ParsedArgument> = Vec::new();
     for (index, token) in tokens.iter().take(preceding_count).enumerate() {
         let Some(argument) = schema
@@ -888,6 +888,36 @@ mod tests {
     }
 
     #[test]
+    fn variadic_completion_prefix_uses_active_range() {
+        let mut schema = vec![PositionalArgument::required("items", ArgumentKind::String)];
+        schema[0].variadic = true;
+
+        for (input, active_range, expected) in [
+            ("one two three", 0..3, Vec::<&str>::new()),
+            ("one two three", 4..7, vec!["one"]),
+            ("one two three ", 0..3, Vec::new()),
+            ("one two three ", 4..7, vec!["one"]),
+        ] {
+            let parsed = parse_completion_prefix_arguments(input, &schema, 0, Some(&active_range));
+            let values = parsed
+                .first()
+                .map(|argument| {
+                    argument
+                        .values
+                        .iter()
+                        .map(|value| match value {
+                            ArgumentValue::String(value) => value.as_ref(),
+                            _ => unreachable!(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            assert_eq!(values, expected);
+        }
+    }
+
+    #[test]
     fn variadic_completion_prefix_includes_earlier_variadic_values() {
         let mut schema: Vec<PositionalArgument> = vec![
             PositionalArgument::required(
@@ -899,7 +929,7 @@ mod tests {
         ];
         schema[1].variadic = true;
 
-        let parsed = parse_completion_prefix_arguments("fast one ", &schema, 1);
+        let parsed = parse_completion_prefix_arguments("fast one ", &schema, 1, None);
         assert_eq!(parsed.len(), 2);
         assert_eq!(
             parsed[0].name.as_ref(),

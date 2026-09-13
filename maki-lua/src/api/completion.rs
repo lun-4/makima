@@ -24,8 +24,6 @@ use crate::api::util::pair::Pair;
 use crate::runtime::{
     CommandArgumentContext, CommandArgumentLifecycle, CommandArgumentLifecycleRequest,
 };
-use maki_commands::parse_completion_prefix_arguments;
-
 const TRAILING_PUNCTUATION: &[char] = &[
     ',', '.', '!', '?', ')', ']', '}', '"', '\'', '\u{ff0c}', '\u{ff0e}', '\u{3002}', '\u{ff01}',
     '\u{ff1f}', '\u{ff09}', '\u{ff3d}', '\u{ff5d}', '\u{ff02}', '\u{ff07}',
@@ -571,31 +569,36 @@ fn command_argument_ctx(
         ctx.set("type", kind.as_str())?;
     }
     let values = lua.create_table()?;
-    let preceding_arguments = schema
-        .map(|schema| parse_completion_prefix_arguments(&context.args, schema, context.index))
-        .unwrap_or_default();
-    for argument in preceding_arguments.iter() {
-        let value = |value: &maki_commands::ArgumentValue| -> LuaResult<Value> {
-            Ok(match value {
-                maki_commands::ArgumentValue::String(value)
-                | maki_commands::ArgumentValue::Enum(value) => {
-                    Value::String(lua.create_string(value.as_ref())?)
-                }
-                maki_commands::ArgumentValue::Integer(value) => Value::Integer(*value),
-                maki_commands::ArgumentValue::File(value)
-                | maki_commands::ArgumentValue::Directory(value) => {
-                    Value::String(lua.create_string(value.to_string_lossy().as_ref())?)
-                }
-            })
-        };
-        if argument.variadic {
-            let sequence = lua.create_table()?;
-            for (index, item) in argument.values.iter().enumerate() {
-                sequence.set(index + 1, value(item)?)?;
+    let value = |value: &maki_commands::ArgumentValue| -> LuaResult<Value> {
+        Ok(match value {
+            maki_commands::ArgumentValue::String(value)
+            | maki_commands::ArgumentValue::Enum(value) => {
+                Value::String(lua.create_string(value.as_ref())?)
             }
-            values.set(argument.name.as_ref(), sequence)?;
-        } else if let Some(item) = argument.values.first() {
-            values.set(argument.name.as_ref(), value(item)?)?;
+            maki_commands::ArgumentValue::Integer(value) => Value::Integer(*value),
+            maki_commands::ArgumentValue::File(value)
+            | maki_commands::ArgumentValue::Directory(value) => {
+                Value::String(lua.create_string(value.to_string_lossy().as_ref())?)
+            }
+        })
+    };
+    if let Some(schema) = schema {
+        let mut value_index = 0;
+        for argument in schema.iter().take(context.index + 1) {
+            if argument.variadic {
+                let sequence = lua.create_table()?;
+                for (index, item) in context.preceding_values[value_index..].iter().enumerate() {
+                    sequence.set(index + 1, value(item)?)?;
+                }
+                if sequence.raw_len() > 0 {
+                    values.set(argument.name.as_ref(), sequence)?;
+                }
+                break;
+            }
+            if let Some(item) = context.preceding_values.get(value_index) {
+                values.set(argument.name.as_ref(), value(item)?)?;
+                value_index += 1;
+            }
         }
     }
     ctx.set("values", values)?;

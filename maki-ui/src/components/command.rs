@@ -661,12 +661,14 @@ impl CommandPalette {
         let (tx, rx) = flume::bounded(1);
         let latest_snapshot = Arc::new(std::sync::Mutex::new(None::<CompletionSnapshot>));
         let sink_snapshot = Arc::clone(&latest_snapshot);
+        let arguments = command_args(input);
+        let arguments_start = input.len() - arguments.len();
         let request = session.complete_input_with_sink(
             CompletionInput {
-                arguments: Arc::from(command_args(input)),
+                arguments: Arc::from(arguments),
                 argument: Arc::from(argument.as_str()),
                 argument_index: index,
-                argument_range: Some(start..end),
+                argument_range: Some(start - arguments_start..end - arguments_start),
                 mode: Arc::from(mode),
             },
             Some(CompletionSnapshotSink::new(move |snapshot| {

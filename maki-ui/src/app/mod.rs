@@ -1575,12 +1575,10 @@ impl App {
         if self.input_box.buffer.y() != 0 {
             return None;
         }
-        let (kind, range, _) = self.command_palette.typed_path_argument(
+        let (kind, range, query) = self.command_palette.typed_path_argument(
             &self.input_box.buffer.lines()[0],
             self.input_box.buffer.cursor_byte_offset(),
         )?;
-        let query_end = self.input_box.buffer.cursor_byte_offset().min(range.1);
-        let query = self.input_box.buffer.lines()[0][range.0..query_end].to_owned();
         Some((kind, query, range))
     }
 
