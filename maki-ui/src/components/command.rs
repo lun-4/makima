@@ -846,9 +846,7 @@ impl CommandPalette {
             if finished {
                 self.notify_lifecycle(PaletteLifecycle::Cancel);
             }
-        } else if (!finished || !preserve_selection)
-            && selected_item.as_ref() != last_highlighted_item.as_ref()
-        {
+        } else if selected_item.as_ref() != last_highlighted_item.as_ref() {
             *last_highlighted_item = selected_item;
             self.notify_lifecycle(PaletteLifecycle::Highlight);
         }
@@ -1919,6 +1917,47 @@ mod tests {
             .unwrap();
         let _ = palette.poll_arguments();
         assert_eq!(palette.argument_match_items()[0].label.as_ref(), "match");
+        release.send(()).unwrap();
+    }
+
+    #[test_case(None; "empty_to_nonempty")]
+    #[test_case(Some("old"); "replaced_selection")]
+    fn final_snapshot_highlights_changed_selection(initial: Option<&str>) {
+        let (mut palette, started, release, events) = gated_directory_palette();
+        let input = "/cd ";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started.recv().unwrap();
+        publisher
+            .publish(
+                initial
+                    .map(|label| CompletionItem {
+                        label: Arc::from(label),
+                        insertion: Arc::from(label),
+                        description: None,
+                    })
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap();
+        let _ = palette.poll_arguments();
+        events.lock().unwrap().clear();
+
+        publisher
+            .publish(vec![CompletionItem {
+                label: Arc::from("new"),
+                insertion: Arc::from("new"),
+                description: None,
+            }])
+            .unwrap();
+        publisher.finish().unwrap();
+        let _ = palette.poll_arguments();
+        let events = events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [maki_commands::CompletionLifecycleEvent::Highlight(item)]
+                if item.label.as_ref() == "new"
+        ));
+        drop(events);
         release.send(()).unwrap();
     }
 
