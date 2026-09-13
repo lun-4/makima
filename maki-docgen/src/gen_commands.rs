@@ -78,6 +78,21 @@ fn write_row(
     .unwrap();
 }
 
+fn write_plugin_row(out: &mut String, command: &lua_util::LuaPluginCommand) {
+    write_row(
+        out,
+        &command.name,
+        &command.description,
+        &command.arguments,
+        command.argument_hint.as_deref(),
+        if command.tui_only {
+            TargetCapabilities::from_capability(maki_commands::TargetCapability::InteractiveUi)
+        } else {
+            TargetCapabilities::NONE
+        },
+    );
+}
+
 pub fn generate() -> color_eyre::Result<String> {
     let mut out = String::new();
     writeln!(out, "+++").unwrap();
@@ -162,19 +177,8 @@ pub fn generate() -> color_eyre::Result<String> {
         "|---------|-------------|------|-----------|----------|"
     )
     .unwrap();
-    for cmd in lua_util::load_builtin_plugin_commands()? {
-        write_row(
-            &mut out,
-            &cmd.name,
-            &cmd.description,
-            &cmd.arguments,
-            None,
-            if cmd.tui_only {
-                TargetCapabilities::from_capability(maki_commands::TargetCapability::InteractiveUi)
-            } else {
-                TargetCapabilities::NONE
-            },
-        );
+    for command in lua_util::load_builtin_plugin_commands()? {
+        write_plugin_row(&mut out, &command);
     }
 
     writeln!(out).unwrap();
@@ -362,6 +366,23 @@ mod tests {
     use maki_commands::{BUILTIN_COMMANDS, CommandArguments, TargetCapabilities};
 
     use super::generate;
+
+    #[test]
+    fn plugin_row_preserves_explicit_argument_hint() {
+        let command = crate::lua_util::LuaPluginCommand {
+            name: "/custom".into(),
+            description: "Custom".into(),
+            argument_hint: Some("<title>".into()),
+            arguments: CommandArguments::Raw { required: false },
+            tui_only: false,
+        };
+        let mut generated = String::new();
+        super::write_plugin_row(&mut generated, &command);
+        assert_eq!(
+            generated,
+            "| `/custom` | Custom | raw (optional) | <title> | no |\n"
+        );
+    }
 
     #[test]
     fn markdown_cells_escape_table_delimiters_and_newlines() {

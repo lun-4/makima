@@ -253,6 +253,14 @@ fn parse_command(node: Node<'_>, source: &str) -> Result<LuaPluginCommand> {
     })
 }
 
+fn table_fields<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
 fn parse_arguments(node: Node<'_>, source: &str) -> Result<CommandArguments> {
     if node.kind() != "table_constructor" {
         return Err(node_error(
@@ -261,8 +269,7 @@ fn parse_arguments(node: Node<'_>, source: &str) -> Result<CommandArguments> {
             "registration field `arguments` must be an inline table",
         ));
     }
-    let mut cursor = node.walk();
-    let fields: Vec<_> = node.named_children(&mut cursor).collect();
+    let fields: Vec<_> = table_fields(node).collect();
     if fields.iter().any(|field| {
         field
             .child_by_field_name("name")
@@ -328,8 +335,7 @@ fn parse_argument(node: Node<'_>, source: &str) -> Result<PositionalArgument> {
     let mut choices = None;
     let mut optional = false;
     let mut variadic = false;
-    let mut cursor = node.walk();
-    for field in node.named_children(&mut cursor) {
+    for field in table_fields(node) {
         let key = table_field_name(field, source)?;
         let value = field.child_by_field_name("value").ok_or_else(|| {
             node_error(
@@ -392,8 +398,7 @@ fn parse_choices(node: Node<'_>, source: &str) -> Result<Vec<String>> {
         ));
     }
     let mut choices = Vec::new();
-    let mut cursor = node.walk();
-    for field in node.named_children(&mut cursor) {
+    for field in table_fields(node) {
         let value = table_entry_value(field)
             .ok_or_else(|| node_error(field, source, "enum choices must contain strings"))?;
         choices.push(string_field(value, source, "enum choice")?);
@@ -807,8 +812,19 @@ mod tests {
                 description = "Typed",
                 tui_only = false,
                 arguments = {
+                    -- Source path
                     { name = "source", type = "file" },
-                    { name = "mode", type = "enum", choices = { "fast", "safe" }, optional = true },
+                    {
+                        name = "mode",
+                        -- Supported modes
+                        type = "enum",
+                        choices = {
+                            "fast",
+                            -- Safest mode
+                            "safe",
+                        },
+                        optional = true,
+                    },
                     { name = "paths", type = "directory", variadic = true },
                 },
             })

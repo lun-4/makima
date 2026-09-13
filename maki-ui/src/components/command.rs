@@ -243,14 +243,18 @@ impl CommandPalette {
         if !self.is_active() {
             return CommandAction::Passthrough;
         }
-        if self.is_typed_path_grid()
-            && self.argument_grid.handle_key(
+        if self.is_typed_path_grid() {
+            let selected = self.argument_grid.selected();
+            if self.argument_grid.handle_key(
                 &key,
                 self.argument_items.len(),
                 self.argument_publication.is_pending(),
-            )
-        {
-            return CommandAction::Consumed;
+            ) {
+                if self.argument_grid.selected() != selected {
+                    self.notify_lifecycle(PaletteLifecycle::Highlight);
+                }
+                return CommandAction::Consumed;
+            }
         }
         match key.code {
             KeyCode::Up => {
@@ -717,8 +721,8 @@ impl CommandPalette {
                     &pending.key.query,
                     pending.key.range,
                     latest.candidates,
-                    true,
                     pending.snapshot_applied,
+                    latest.finished,
                     &mut pending.last_highlighted_item,
                 );
                 self.argument_revision = latest.revision;
@@ -755,8 +759,8 @@ impl CommandPalette {
                     &pending.key.query,
                     pending.key.range,
                     items,
-                    !pending.snapshot_applied,
                     pending.snapshot_applied,
+                    true,
                     &mut pending.last_highlighted_item,
                 );
                 dirty
@@ -773,8 +777,8 @@ impl CommandPalette {
         query: &str,
         range: (usize, usize),
         items: Vec<CompletionCandidate>,
-        highlight: bool,
         preserve_selection: bool,
+        finished: bool,
         last_highlighted_item: &mut Option<CompletionItem>,
     ) -> Dirty {
         let mut matches = Vec::new();
@@ -839,8 +843,12 @@ impl CommandPalette {
             .map(|item| item.item.clone());
         if selected_item.is_none() {
             *last_highlighted_item = None;
-            self.notify_lifecycle(PaletteLifecycle::Cancel);
-        } else if highlight && selected_item.as_ref() != last_highlighted_item.as_ref() {
+            if finished {
+                self.notify_lifecycle(PaletteLifecycle::Cancel);
+            }
+        } else if (!finished || !preserve_selection)
+            && selected_item.as_ref() != last_highlighted_item.as_ref()
+        {
             *last_highlighted_item = selected_item;
             self.notify_lifecycle(PaletteLifecycle::Highlight);
         }
@@ -1741,6 +1749,7 @@ mod tests {
     struct GatedDirectoryCompletion {
         started: mpsc::SyncSender<CompletionPublisher>,
         release: Arc<Mutex<mpsc::Receiver<()>>>,
+        events: Arc<Mutex<Vec<maki_commands::CompletionLifecycleEvent>>>,
     }
 
     impl CommandCompletion for GatedDirectoryCompletion {
@@ -1773,6 +1782,16 @@ mod tests {
                 release.lock().unwrap().recv().unwrap();
                 Ok(())
             })
+        }
+
+        fn lifecycle(
+            &self,
+            _context: &CompletionContext,
+            event: &maki_commands::CompletionLifecycleEvent,
+            _cancellation: &CancellationToken,
+        ) -> Result<(), CompletionError> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
         }
     }
 
@@ -1823,6 +1842,117 @@ mod tests {
         }
     }
 
+    type GatedPalette = (
+        CommandPalette,
+        mpsc::Receiver<CompletionPublisher>,
+        mpsc::SyncSender<()>,
+        Arc<Mutex<Vec<maki_commands::CompletionLifecycleEvent>>>,
+    );
+
+    fn gated_directory_palette() -> GatedPalette {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let events = Arc::default();
+        let provider = Arc::new(GatedDirectoryCompletion {
+            started: started_tx,
+            release: Arc::new(Mutex::new(release_rx)),
+            events: Arc::clone(&events),
+        });
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/cd"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        PositionalArgument::optional("path", ArgumentKind::Directory)
+                            .with_completion(CompletionPolicy::Replace),
+                    ])),
+                    docs: CommandDocs {
+                        summary: Arc::from("Change directory"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(Noop),
+                argument_completions: vec![Some(provider)],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        (
+            CommandPalette::new(registry, target),
+            started_rx,
+            release_tx,
+            events,
+        )
+    }
+
+    #[test_case(None; "empty")]
+    #[test_case(Some("other"); "nonmatching")]
+    fn intermediate_snapshot_without_visible_rows_keeps_session(label: Option<&str>) {
+        let (mut palette, started, release, _) = gated_directory_palette();
+        let input = "/cd match";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started.recv().unwrap();
+        publisher
+            .publish(
+                label
+                    .map(|label| CompletionItem {
+                        label: Arc::from(label),
+                        insertion: Arc::from(label),
+                        description: None,
+                    })
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap();
+        let _ = palette.poll_arguments();
+        assert!(palette.argument_items.is_empty());
+
+        publisher
+            .publish(vec![CompletionItem {
+                label: Arc::from("match"),
+                insertion: Arc::from("match"),
+                description: None,
+            }])
+            .unwrap();
+        let _ = palette.poll_arguments();
+        assert_eq!(palette.argument_match_items()[0].label.as_ref(), "match");
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn path_grid_navigation_notifies_highlight() {
+        let (mut palette, started, release, events) = gated_directory_palette();
+        let input = "/cd ";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started.recv().unwrap();
+        publisher
+            .publish(
+                ["first", "second"]
+                    .into_iter()
+                    .map(|label| CompletionItem {
+                        label: Arc::from(label),
+                        insertion: Arc::from(label),
+                        description: None,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let _ = palette.poll_arguments();
+        palette.argument_grid.set_layout(2, 2, 1);
+        events.lock().unwrap().clear();
+
+        palette.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), input);
+        assert!(matches!(
+            events.lock().unwrap().as_slice(),
+            [maki_commands::CompletionLifecycleEvent::Highlight(item)]
+                if item.label.as_ref() == "second"
+        ));
+        release.send(()).unwrap();
+    }
+
     #[test]
     fn stale_directory_candidate_is_not_advanced_before_snapshot_poll() {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -1830,6 +1960,7 @@ mod tests {
         let provider = Arc::new(GatedDirectoryCompletion {
             started: started_tx,
             release: Arc::new(Mutex::new(release_rx)),
+            events: Arc::default(),
         });
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Plugin);
@@ -1889,6 +2020,7 @@ mod tests {
         let provider = Arc::new(GatedDirectoryCompletion {
             started: started_tx,
             release: Arc::new(Mutex::new(release_rx)),
+            events: Arc::default(),
         });
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Plugin);
