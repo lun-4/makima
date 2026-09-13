@@ -828,6 +828,7 @@ impl MessagesPanel {
         self.idle_splash.frame()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_splash_frame(&mut self, frame: Option<maki_lua::SplashFrame>) {
         self.idle_splash.set_frame(frame);
     }

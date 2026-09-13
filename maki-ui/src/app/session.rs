@@ -5,16 +5,23 @@ use std::time::{Duration, Instant};
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
-use crate::components::{Action, LoadedSession};
+use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
 use maki_agent::agent::estimate_message_tokens;
-use maki_providers::{Model, TokenUsage};
+#[cfg(test)]
+use maki_providers::Model;
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
 
 use crate::AppSession;
 
-use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, Mode, PendingInput, PlanState, Status};
+#[cfg(test)]
+use super::PendingInput;
+#[cfg(test)]
+use super::session_state::SessionState;
+use super::session_state::rules_to_stored;
+#[cfg(test)]
+use super::session_state::stored_to_rules;
+use super::{App, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
@@ -160,6 +167,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn reset_ui_chrome(&mut self) {
         let _ = self.cancel_middle_scroll();
         let splash_frame = self.chats.first().and_then(Chat::splash_frame).cloned();
@@ -175,6 +183,8 @@ impl App {
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
+        self.live_chat_index.clear();
+        self.terminal_subagents.clear();
         self.status = super::Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
@@ -265,8 +275,6 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
-        self.permissions
-            .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
         self.restore_display();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
@@ -274,39 +282,22 @@ impl App {
         }
     }
 
-    /// The one funnel for handing a history over. When the UI installs one the
-    /// agent did not give it (rewind, load, new session), the mirror handle
-    /// goes away in the same breath, so no later checkpoint can bring the
-    /// agent's stale copy back. Only `respawn_agent` hands a live mirror in.
-    fn install_local_history(&mut self) -> LoadedSession {
-        self.shared_history = None;
-        LoadedSession {
-            messages: self.state.session.messages().to_vec(),
-            model_spec: self.state.session.model.clone(),
-        }
-    }
-
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
         self.checkpoint_now();
-        self.rotate_command_target();
-        self.reset_ui_chrome();
-        self.state.token_usage = TokenUsage::default();
-        self.state.cost = None;
-        self.state.context_size = 0;
-        self.state.plan = PlanState::None;
-        if self.state.mode == Mode::Plan {
-            self.enter_plan();
-        }
-        // Fire before the swap. A handler cleaning up after the session
-        // that just ended needs its id, and the stamp always reads
-        // whichever session is current.
-        self.fire_session_autocmd("SessionReset", serde_json::json!({}));
-        self.state.session = Arc::new(AppSession::new(
-            &self.state.session.model,
-            &self.state.session.cwd,
-        ));
-        self.install_local_history();
-        vec![Action::NewSession]
+        let ended_id = self.state.session.id;
+        let mut session = AppSession::new(&self.state.session.model, &self.state.session.cwd);
+        session.meta.mode = Some(self.state.mode.clone().into());
+        session.meta.session_rules = self.state.session.meta.session_rules.clone();
+        session.meta.thinking = Some(self.state.thinking.into());
+        session.meta.fast = self.state.fast;
+        session.meta.workflow = self.state.workflow;
+        vec![Action::ReplaceSession(Box::new(
+            SessionReplacementRequest {
+                session,
+                kind: SessionReplacementKind::Reset { ended_id },
+                post_commit: None,
+            },
+        ))]
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
@@ -320,37 +311,30 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        // The live size came from the provider, so it also counts the system
-        // prompt and the tool schemas, a baseline the estimator cannot see.
-        // Subtract only what we drop, or the gauge collapses until the next
-        // turn measures it again. An emptied history is a fresh session though,
-        // baseline included.
+        self.checkpoint_now();
         let baseline = self
             .state
             .context_size
             .saturating_sub(estimate_message_tokens(self.state.session.messages()));
-        let session = self.state.session_mut();
+        let mut session = self.state.session.as_ref().clone();
         session.truncate_messages(entry.turn_index);
         session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
         session.update_title_if_default();
-        let kept = estimate_message_tokens(self.state.session.messages());
-        self.state.context_size = if kept == 0 { 0 } else { baseline + kept };
-
-        self.reset_ui_chrome();
-        self.restore_display();
-
-        self.refresh_at_ref_labels(&entry.prompt_text);
-        self.input_box.set_input(entry.prompt_text);
-        self.input_box.buffer.move_to_end();
-
-        vec![Action::LoadSession(Box::new(self.install_local_history()))]
+        let kept = estimate_message_tokens(session.messages());
+        session.meta.context_size = if kept == 0 { 0 } else { baseline + kept };
+        session.meta.input_draft = Some(entry.prompt_text);
+        session.meta.queued_messages.clear();
+        vec![Action::ReplaceSession(Box::new(
+            SessionReplacementRequest {
+                session,
+                kind: SessionReplacementKind::Rewind,
+                post_commit: None,
+            },
+        ))]
     }
 
-    pub(crate) fn apply_loaded_session(
-        &mut self,
-        session: AppSession,
-        fallback_model: &Model,
-    ) -> LoadedSession {
+    #[cfg(test)]
+    pub(crate) fn apply_loaded_session(&mut self, session: AppSession, fallback_model: &Model) {
         self.checkpoint_now();
         self.rotate_command_target();
         self.permissions
@@ -362,14 +346,20 @@ impl App {
         }
         self.reset_ui_chrome();
         self.restore_display();
-
-        self.install_local_history()
+        self.shared_history = None;
     }
 
     /// Applies an already-loaded session, for callers that loaded it
     /// themselves (e.g. to run their own checks first).
+    #[cfg(test)]
     pub(crate) fn load_loaded_session(&mut self, session: AppSession) -> Vec<Action> {
-        let loaded = self.apply_loaded_session(session, &self.state.model.clone());
-        vec![Action::LoadSession(Box::new(loaded))]
+        self.checkpoint_now();
+        vec![Action::ReplaceSession(Box::new(
+            SessionReplacementRequest {
+                session,
+                kind: SessionReplacementKind::Load,
+                post_commit: None,
+            },
+        ))]
     }
 }

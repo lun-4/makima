@@ -7,6 +7,7 @@ pub mod child_guard;
 pub use child_guard::ChildGuard;
 pub mod headless;
 pub mod mailbox;
+pub mod manager;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
@@ -29,8 +30,13 @@ pub use agent::{
 pub use cancel::{
     CancelMap, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
 };
-pub use mailbox::{MailboxError, SessionMailbox};
+pub use mailbox::{MailboxError, PreparedSessionMailbox, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
+pub use manager::{
+    AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentRef,
+    CurrentManagedTurn, GraphLifecycle, ManagedPromptWait, ManagerError, PromptWaitError,
+    ShutdownReport, TurnPermitLease,
+};
 pub mod command;
 pub mod diff;
 pub mod permissions;

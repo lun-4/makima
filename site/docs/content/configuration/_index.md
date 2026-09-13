@@ -146,6 +146,10 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `max_output_bytes` | usize | `51200` | 1024 | Max tool output size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
+| `max_concurrent_agent_turns` | usize | `8` | 1 | Max agent turns running concurrently |
+| `max_agent_depth` | usize | `4` | 1 | Max nesting depth for child agents |
+| `max_children_per_agent` | usize | `16` | 1 | Max child agents created by one agent |
+| `max_live_agents` | usize | `64` | 1 | Max live agents in one outer session |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
@@ -265,7 +269,7 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
-| `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
+| `max_concurrent` | integer | `8` | 1 | Deprecated. Process-wide fallback limit for unmanaged frontends; managed TUI sessions use agent.max_concurrent_agent_turns. |
 
 ### `plugins.webfetch`
 

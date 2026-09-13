@@ -19,6 +19,13 @@ use common::{CannedProvider, canned_reply, ctx_with_provider, exec_tool_text, to
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const PLAN_REVIEWER_ONLY_ERR: &str = "plan_reviewer is only available in plan mode";
+const TASK_FAMILY: [&str; 5] = [
+    "task",
+    "task_spawn",
+    "task_get",
+    "task_send",
+    "task_despawn",
+];
 
 /// Wrap the real `maki.agent.session` to reuse the parent (canned) provider, and
 /// stub the model/system lookups so no real model resolution or file read is
@@ -141,6 +148,12 @@ fn plan_reviewer_is_read_only_even_when_asked_to_write() {
         !names.iter().any(|n| n == "write"),
         "reviewer must exclude write tools (read-only enforced): {names:?}"
     );
+    for task_tool in TASK_FAMILY {
+        assert!(
+            !names.iter().any(|name| name == task_tool),
+            "reviewer (research_sub) must exclude {task_tool}: {names:?}"
+        );
+    }
 }
 
 #[test]

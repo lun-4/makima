@@ -53,9 +53,9 @@ pub struct Chat {
     pub cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
-    /// For subagent chats, the `parent_tool_use_id` that owns this tab, so
-    /// submits in this tab can be routed to that subagent's driver.
+    /// Compatibility identity retained for display and persistence.
     pub subagent_id: Option<String>,
+    pub agent_id: Option<maki_agent::AgentId>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     finished: bool,
@@ -75,6 +75,7 @@ impl Chat {
             context_size: 0,
             model_id: None,
             subagent_id: None,
+            agent_id: None,
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle, theme_provider),
             finished: false,
@@ -198,7 +199,7 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::SubagentHistory { .. } => {}
+            AgentEvent::SubagentHistory { .. } | AgentEvent::SubagentClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
@@ -275,6 +276,7 @@ impl Chat {
         self.messages_panel.splash_frame()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_splash_frame(&mut self, frame: Option<maki_lua::SplashFrame>) {
         self.messages_panel.set_splash_frame(frame);
     }

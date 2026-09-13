@@ -21,7 +21,9 @@ use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
-use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_agent::{
+    BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+};
 use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value as LuaValue, ffi};
 
 use crate::coalesced_latest::{CoalescedLatest, CoalescedWork};
@@ -446,6 +448,7 @@ enum KillReason {
 pub(crate) struct TaskCell {
     pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
+    pub(crate) managed_turn: Option<CurrentManagedTurn>,
     /// End of the current kill grace, armed by the first watchdog poke that
     /// sees a doomed task and cleared at every yield.
     kill_at: Cell<Option<Instant>>,
@@ -493,6 +496,7 @@ impl TaskCell {
         Self {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
+            managed_turn: None,
             kill_at: Cell::new(None),
             kill_grace: KILL_GRACE,
             deadline: Cell::new(deadline),
@@ -1133,6 +1137,10 @@ impl<F: Future> Future for ScopedFuture<F> {
     }
 }
 
+pub(crate) fn current_managed_turn(lua: &Lua) -> Option<CurrentManagedTurn> {
+    lock_cell(&active_task(lua)).managed_turn.clone()
+}
+
 pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
     lua.app_data_ref::<TaskHandle>()
         .map(|r| Arc::clone(&*r))
@@ -1200,17 +1208,18 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, command_depth, command_invocation) = match &handle {
+    let (cancel, live_ctx, managed_turn, command_depth, command_invocation) = match &handle {
         Some(h) => {
             let cell = lock_cell(h);
             (
                 cell.cancel.clone(),
                 cell.live.clone(),
+                cell.managed_turn.clone(),
                 cell.command_depth,
                 cell.command_invocation.clone(),
             )
         }
-        None => (CancelToken::none(), None, 0, None),
+        None => (CancelToken::none(), None, None, 0, None),
     };
 
     let mut task = PendingAsyncTask {
@@ -1219,6 +1228,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
         live_ctx,
         owner: None,
+        managed_turn,
         command_depth,
         command_invocation,
         timer_id: None,
@@ -1376,6 +1386,7 @@ pub(crate) struct PendingAsyncTask {
     pub deadline: Option<Instant>,
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
+    pub managed_turn: Option<CurrentManagedTurn>,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
     /// Timer fires pass their id as the first callback argument.
@@ -1492,6 +1503,7 @@ fn spawn_async_task(
         let _gate_guard = g.acquire().await;
 
         let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
+        cell.managed_turn = task.managed_turn;
         cell.command_depth = task.command_depth;
         cell.command_invocation = task.command_invocation;
         let scope = TaskScope::new(&lua, cell);
@@ -3061,7 +3073,8 @@ async fn run_tool_call(
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
-    let live_sink = ctx.agent().and_then(|a| a.live_sink.clone());
+    let live_sink = ctx.agent().and_then(|agent| agent.live_sink.clone());
+    let managed_turn = ctx.agent().and_then(|agent| agent.managed_turn.clone());
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -3074,6 +3087,7 @@ async fn run_tool_call(
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
+    cell.managed_turn = managed_turn;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
@@ -4515,6 +4529,7 @@ mod tests {
             deadline,
             live_ctx: None,
             owner: None,
+            managed_turn: None,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,
@@ -5048,6 +5063,7 @@ mod tests {
             deadline: None,
             live_ctx: None,
             owner: None,
+            managed_turn: None,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,

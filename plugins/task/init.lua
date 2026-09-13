@@ -8,9 +8,10 @@
 --   task_get     -> { status, result?, error? } (manual polling)
 --   task_send    -> { queued = true }           (queue a message / nudge)
 --   task_despawn -> { ok = true }               (cancel + flush history)
--- A spawned subagent's result is returned automatically when it finishes, so the
--- agent waits for that reply; task_get is only for manual polling. The unified
--- `task` tool remains as a blocking composite over the four.
+-- A direct child of the root agent returns its result automatically when it
+-- finishes. Managed general subagents must use the blocking `task` tool so
+-- `session:prompt` yields their turn permit. Unmanaged callers retain the four-tool
+-- lifecycle for compatibility.
 --
 -- Rust exposes primitives only (`maki.agent.session`, `maki.json.schema_validator`,
 -- `maki.async.semaphore`).
@@ -39,6 +40,9 @@ local NUDGE_SUMMARY =
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
 local UNKNOWN_TASK_ERR = "unknown task_id"
+local TASK_ACCESS_ERR = "task is owned by another agent branch"
+local RECURSIVE_UNMANAGED_TASK_ERR = "blocking task is unavailable from an unmanaged subagent; use task_spawn"
+local MANAGED_NESTED_SPAWN_ERR = "managed general subagents must use the blocking task tool"
 local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
@@ -52,10 +56,11 @@ Subagent types (set via `subagent_type`):
 - `plan_reviewer`: Read-only audit of a finished plan. Only available in plan mode. Evaluates shape, test-to-acceptance-criteria coverage, and severity of risks, and answers with VERDICT: pass|fail.
 
 Subagents run in the background, so the main agent is never blocked by one. Use
-`task_spawn` to start a subagent; its result is returned automatically when it
-finishes, so wait for that reply rather than polling `task_get`. Use `task_send`
-to queue more work and `task_despawn` to cancel a running subagent. The unified
-`task` tool is a blocking composite over those four and keeps working for one-shot use.
+`task_spawn` to start a subagent. A direct child of the root agent returns its
+result automatically, so the root may wait for that reply. A managed general
+subagent must use the blocking `task` tool for nested work so its turn capacity is
+yielded while the child runs. Unmanaged callers retain `task_spawn`, `task_get`,
+`task_send`, and `task_despawn` compatibility.
 
 Notes:
 1. Launch multiple tasks concurrently when possible.
@@ -88,7 +93,11 @@ Report findings classified by severity (critical / high / medium / low), quoting
 ]] .. plan_spec
 
 local opts = maki.api.register_options({
-  max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
+  max_concurrent = {
+    default = 8,
+    min = 1,
+    desc = "Deprecated. Process-wide fallback limit for unmanaged frontends; managed TUI sessions use agent.max_concurrent_agent_turns.",
+  },
   allow_model = {
     default = false,
     desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
@@ -254,7 +263,7 @@ local function prepare(input, ctx)
     nil
 end
 
-local function ctx_opts(spec, input, turn_semaphore)
+local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
   return {
     model_spec = spec.model.spec,
     system = spec.system,
@@ -263,6 +272,7 @@ local function ctx_opts(spec, input, turn_semaphore)
     audience = spec.audience,
     name = input.description,
     semaphore = turn_semaphore,
+    auto_deliver = auto_deliver,
   }
 end
 
@@ -295,7 +305,7 @@ end
 
 local function spawn(spec, input, ctx)
   local ok, sess, sess_err = pcall(function()
-    return maki.agent.session(ctx, ctx_opts(spec, input, semaphore))
+    return maki.agent.session(ctx, ctx_opts(spec, input, semaphore, true))
   end)
   if not ok then
     return nil, sess_err
@@ -304,8 +314,13 @@ local function spawn(spec, input, ctx)
     return nil, sess_err
   end
   local task_id = sess:session_id()
+  if tasks[task_id] then
+    sess:close()
+    return nil, "duplicate task_id"
+  end
   local task = {
     sess = sess,
+    owner = sess:_maki_task_owner(),
     closed = false,
     validator = spec.local_tools ~= nil,
   }
@@ -332,6 +347,9 @@ local spawn_schema = {
 }
 
 local function spawn_handler(input, ctx)
+  if ctx:audience() == "general_sub" and ctx:_maki_managed() then
+    return { llm_output = MANAGED_NESTED_SPAWN_ERR, is_error = true }
+  end
   local spec, err = prepare(input, ctx)
   if err then
     return err
@@ -346,6 +364,17 @@ local function spawn_handler(input, ctx)
   return { llm_output = maki.json.encode({ task_id = task_id }) }
 end
 
+local function resolve_task(task_id)
+  local task = tasks[task_id]
+  if not task then
+    return nil, UNKNOWN_TASK_ERR
+  end
+  if not task.owner:_maki_can_control() then
+    return nil, TASK_ACCESS_ERR
+  end
+  return task, nil
+end
+
 -- task_get -------------------------------------------------------------------
 
 local get_schema = {
@@ -358,9 +387,9 @@ local get_schema = {
 }
 
 local function get_handler(input)
-  local task = tasks[input.task_id]
+  local task, access_err = resolve_task(input.task_id)
   if not task then
-    return { llm_output = UNKNOWN_TASK_ERR, is_error = true }
+    return { llm_output = access_err, is_error = true }
   end
   local status, err = task.sess:status()
   if err then
@@ -389,9 +418,9 @@ local send_schema = {
 }
 
 local function send_handler(input)
-  local task = tasks[input.task_id]
+  local task, access_err = resolve_task(input.task_id)
   if not task then
-    return { llm_output = UNKNOWN_TASK_ERR, is_error = true }
+    return { llm_output = access_err, is_error = true }
   end
   local ok, err = enqueue(task, input.message)
   if not ok then
@@ -412,9 +441,9 @@ local despawn_schema = {
 }
 
 local function despawn_handler(input)
-  local task = tasks[input.task_id]
+  local task, access_err = resolve_task(input.task_id)
   if not task then
-    return { llm_output = UNKNOWN_TASK_ERR, is_error = true }
+    return { llm_output = access_err, is_error = true }
   end
   fail_task(task, TASK_CLOSED_ERR)
   tasks[input.task_id] = nil
@@ -428,18 +457,19 @@ local function handler(input, ctx)
     return err
   end
 
-  local permit = semaphore:acquire()
-
-  -- pcall so a raised error cannot leak the permit or leave a session open.
   local ok, out = pcall(function()
     local ok, sess, sess_err = pcall(function()
-      return maki.agent.session(ctx, ctx_opts(spec, input))
+      return maki.agent.session(ctx, ctx_opts(spec, input, semaphore, false))
     end)
     if not ok then
       error(sess_err, 0)
     end
     if sess_err then
       error(sess_err, 0)
+    end
+    if ctx:audience() == "general_sub" and not sess:_maki_managed() then
+      sess:close()
+      return { llm_output = RECURSIVE_UNMANAGED_TASK_ERR, is_error = true }
     end
 
     local message = input.prompt
@@ -495,7 +525,6 @@ local function handler(input, ctx)
     }
   end)
 
-  permit:release()
   if not ok then
     error(out, 0)
   end
@@ -520,9 +549,9 @@ end
 
 maki.api.register_tool({
   name = "task_spawn",
-  description = "Start a background subagent and return its task_id immediately. Each task's messages run FIFO, acquiring concurrency capacity only when each turn starts. The result is returned automatically when the subagent finishes, so wait for the reply instead of polling task_get. Queue messages with task_send and finish with task_despawn. Also callable from a code_execution script as a Python async function.",
+  description = "Start a background subagent and return its task_id immediately. Each task's messages run FIFO, acquiring concurrency capacity only when each turn starts. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Managed general subagents must use the blocking task tool for nested work so their turn capacity is yielded while the child runs. Unmanaged callers retain task_spawn/task_get compatibility. Queue messages with task_send and finish with task_despawn. Also callable from a code_execution script as a Python async function.",
   kind = "execute",
-  audiences = { "main", "interpreter", "workflow" },
+  audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},
   schema = spawn_schema,
   handler = spawn_handler,
@@ -532,9 +561,9 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "task_get",
-  description = 'Poll a background subagent. Returns { status = "running" | "done" | "closed", result?, error? }. Normally unnecessary: a spawned subagent\'s result arrives automatically, so wait for that reply instead of polling task_get. Does not block the main agent. Also callable from a code_execution script as a Python async function.',
+  description = 'Poll a background subagent. Returns { status = "running" | "done" | "closed", result?, error? }. Managed general subagents cannot spawn background nested tasks and must use the blocking task tool instead. Unmanaged callers retain task_spawn/task_get compatibility. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Does not block the caller. Also callable from a code_execution script as a Python async function.',
   kind = "execute",
-  audiences = { "main", "interpreter", "workflow" },
+  audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},
   schema = get_schema,
   handler = get_handler,
@@ -548,7 +577,7 @@ maki.api.register_tool({
   name = "task_send",
   description = "Queue a message to a background subagent in per-task FIFO order and return immediately. A done subagent processes it as a new turn, acquiring concurrency capacity when the turn starts. Returns { queued = true }, or a session error if queueing fails. Also callable from a code_execution script as a Python async function.",
   kind = "execute",
-  audiences = { "main", "interpreter", "workflow" },
+  audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},
   schema = send_schema,
   handler = send_handler,
@@ -562,7 +591,7 @@ maki.api.register_tool({
   name = "task_despawn",
   description = "Cancel a background subagent, discard messages not yet admitted, flush its chat transcript, and release active turn permits. Returns { ok = true }. Also callable from a code_execution script as a Python async function.",
   kind = "execute",
-  audiences = { "main", "interpreter", "workflow" },
+  audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},
   schema = despawn_schema,
   handler = despawn_handler,
@@ -576,7 +605,7 @@ maki.api.register_tool({
   name = "task",
   description = description,
   kind = "execute",
-  audiences = { "main", "workflow" },
+  audiences = { "main", "general_sub", "workflow" },
   examples = examples,
   schema = schema,
   handler = handler,

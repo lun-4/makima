@@ -23,6 +23,8 @@ use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -488,13 +490,37 @@ fn subagent_info_with_tx(
     subagent_info_full(parent_id, name, answer_tx, None)
 }
 
+thread_local! {
+    static SUBAGENT_IDS: RefCell<HashMap<String, AgentId>> = RefCell::new(HashMap::new());
+}
+
 fn subagent_info_full(
     parent_id: &str,
     name: &str,
     answer_tx: Option<flume::Sender<String>>,
     input_tx: Option<flume::Sender<String>>,
 ) -> SubagentInfo {
+    let agent_id = SUBAGENT_IDS.with(|agent_ids| {
+        *agent_ids
+            .borrow_mut()
+            .entry(parent_id.to_owned())
+            .or_insert_with(AgentId::generate)
+    });
+    subagent_info_for_agent(agent_id, parent_id, name, answer_tx, input_tx)
+}
+
+fn subagent_info_for_agent(
+    agent_id: AgentId,
+    parent_id: &str,
+    name: &str,
+    answer_tx: Option<flume::Sender<String>>,
+    input_tx: Option<flume::Sender<String>>,
+) -> SubagentInfo {
     SubagentInfo {
+        agent_id,
+        parent_agent_id: None,
+        parent_is_root: true,
+        auto_deliver: true,
         parent_tool_use_id: parent_id.into(),
         name: name.into(),
         prompt: None,
@@ -986,7 +1012,7 @@ fn enter_executes_new_command() {
     app.update(Msg::Key(key(KeyCode::Char('n'))));
     settle_command_palette(&mut app);
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(matches!(&actions[0], Action::NewSession));
+    assert!(matches!(&actions[0], Action::ReplaceSession(_)));
     assert!(!app.command_palette.is_active());
 }
 
@@ -1205,15 +1231,11 @@ fn esc_closes_palette_and_cancels_lifecycle() {
 }
 
 #[test]
-fn reset_session_cancels_completion_lifecycle_once() {
+fn reset_session_request_keeps_completion_lifecycle_active() {
     let (mut app, probe, _producer) = lifecycle_app();
 
     app.reset_session();
 
-    assert_eq!(
-        probe.try_finish_command_argument_lifecycle(),
-        Some(("cancel", None, true))
-    );
     assert!(probe.try_finish_command_argument_lifecycle().is_none());
 }
 
@@ -1247,22 +1269,24 @@ fn programmatic_overlay_close_cancels_completion_lifecycle_once() {
 /// The event exists so plugins can drop what belonged to the session that
 /// ended. Naming its replacement makes every such handler a no-op.
 #[test]
-fn session_reset_names_the_session_that_ended() {
+fn reset_session_request_defers_autocmd_and_names_ended_session() {
     let mut app = test_app();
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
-    let ended = app.state.session.id.to_string();
+    let ended_id = app.state.session.id;
 
-    app.reset_session();
+    let actions = app.reset_session();
 
-    let (event, data) = probe.try_recv_autocmd().expect("SessionReset fired");
-    assert_eq!(event, "SessionReset");
-    assert_eq!(data["session_id"], serde_json::json!(ended));
-    assert_ne!(
-        app.state.session.id.to_string(),
-        ended,
-        "reset must have installed a different session, or this proves nothing"
+    assert!(probe.try_recv_autocmd().is_none());
+    assert_eq!(app.state.session.id, ended_id);
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    assert_eq!(
+        request.kind,
+        crate::components::SessionReplacementKind::Reset { ended_id }
     );
+    assert_ne!(request.session.id, ended_id);
 }
 
 #[test]
@@ -1277,35 +1301,32 @@ fn reset_session_clears_plan() {
     app.help_modal.toggle();
     let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
     app.btw_modal.open("q", rx);
+    let old_id = app.state.session.id;
+    let old_target = app.command_target.id();
     let actions = app.reset_session();
-    assert!(matches!(&actions[0], Action::NewSession));
-    assert_eq!(app.status, Status::Idle);
-    assert_eq!(app.state.token_usage.input, 0);
-    assert_eq!(app.chats[0].context_size, 0);
-    assert_eq!(app.state.mode, Mode::Build);
-    assert_eq!(app.state.plan, PlanState::None);
-    assert!(app.queue.is_empty());
-    assert!(app.recoverable_queue.is_empty());
-    assert_eq!(app.chats.len(), 1);
-    assert_eq!(app.chats[0].name, "Main");
-    assert_eq!(app.active_chat, 0);
-    assert!(app.chat_index.is_empty());
-    assert!(app.queue.focus().is_none());
-    assert!(!app.help_modal.is_open());
-    assert!(!app.btw_modal.is_open());
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    assert_ne!(request.session.id, old_id);
+    assert!(request.session.messages().is_empty());
+    assert_eq!(request.session.meta.context_size, 0);
+    assert_eq!(app.state.session.id, old_id);
+    assert_eq!(app.command_target.id(), old_target);
+    assert_eq!(app.state.token_usage.input, 500);
+    assert_eq!(app.chats[0].context_size, 1000);
+    assert!(!app.queue.is_empty());
+    assert!(app.help_modal.is_open());
+    assert!(app.btw_modal.is_open());
 }
 
 #[test]
-fn replacing_session_rotates_command_target() {
+fn replacement_request_does_not_rotate_command_target() {
     let mut app = test_app();
-    let reset_target = app.command_target.id();
+    let target = app.command_target.id();
 
     app.reset_session();
-    assert_ne!(app.command_target.id(), reset_target);
 
-    let load_target = app.command_target.id();
-    app.apply_loaded_session(AppSession::new("test-model", "/tmp/test"), &test_model());
-    assert_ne!(app.command_target.id(), load_target);
+    assert_eq!(app.command_target.id(), target);
 }
 
 #[test]
@@ -1313,10 +1334,13 @@ fn reset_session_assigns_new_plan_path_in_plan_mode() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from("old-plan.md"));
-    app.reset_session();
-    assert_eq!(app.state.mode, Mode::Plan);
-    assert!(app.state.plan.path().is_some());
-    assert_ne!(app.state.plan.path(), Some(Path::new("old-plan.md")));
+    let actions = app.reset_session();
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    assert_eq!(app.state.plan.path(), Some(Path::new("old-plan.md")));
+    assert_eq!(request.session.meta.mode, Some(StoredMode::Plan));
+    assert!(request.session.meta.plan_path.is_none());
 }
 
 #[test]
@@ -1324,9 +1348,16 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
     let mut app = test_app();
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Drafting(PathBuf::from("leftover.md"));
-    app.reset_session();
-    assert_eq!(app.state.mode, Mode::Build);
-    assert_eq!(app.state.plan, PlanState::None);
+    let actions = app.reset_session();
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    assert_eq!(
+        app.state.plan,
+        PlanState::Drafting(PathBuf::from("leftover.md"))
+    );
+    assert_eq!(request.session.meta.mode, Some(StoredMode::Build));
+    assert!(request.session.meta.plan_path.is_none());
 }
 
 #[test]
@@ -1339,9 +1370,13 @@ fn load_session_clears_plan() {
     let id = app.state.session.id;
     app.state.mode = Mode::Build;
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
-    app.load_loaded_session(AppSession::load(id, &app.storage).unwrap());
-    assert_eq!(app.state.mode, Mode::Build);
-    assert_eq!(app.state.plan.path(), None);
+    let actions = app.load_loaded_session(AppSession::load(id, &app.storage).unwrap());
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    assert_eq!(app.state.plan.path(), Some(Path::new("old-plan.md")));
+    assert_eq!(request.session.meta.mode, Some(StoredMode::Build));
+    assert!(request.session.meta.plan_path.is_none());
 }
 
 #[test]
@@ -2022,6 +2057,27 @@ fn open_tasks_picker_highlights_active_chat_after_sort() {
 }
 
 #[test]
+fn task_picker_preview_tracks_selected_chat_across_concurrent_reorder() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    finish_subagent(&mut app, "task1", false);
+    app.active_chat = 1;
+    app.open_tasks();
+
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
+    assert_eq!(app.resolve_render_chat(), 1);
+
+    finish_subagent(&mut app, "task2", false);
+
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
+    assert_eq!(app.resolve_render_chat(), 1);
+}
+
+#[test]
 fn ago_formats_relative_start_time() {
     let now = Instant::now();
     assert_eq!(ago(now), "just now");
@@ -2496,7 +2552,7 @@ fn cancel_clears_pending_input() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.pending_input = PendingInput::AuthRetry { agent_id: None };
     cancel_app(&mut app);
     assert_eq!(app.pending_input, PendingInput::None);
 }
@@ -4182,12 +4238,12 @@ fn cd_command_behavior() {
         0,
     );
     let flash = app.status_bar.flash_text().unwrap();
-    assert!(flash.starts_with("cd /tmp"), "flash={flash:?}");
     // Use `canonicalize_clean` (resolves symlinks like the OS does) rather
     // than `absolute` which preserves symlinks. On macOS `/tmp` is a symlink
     // to `/private/tmp`; production `cmd_cd` reads back `current_dir()` which
     // returns the resolved form, so the test expectation must match.
     let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
+    assert_eq!(flash, format!("cd {}", resolved.display()));
     assert_eq!(app.state.session.cwd, resolved.to_string_lossy());
 
     app.execute_command(
@@ -4252,7 +4308,7 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
 
     let actions = app.run_cmdline(cmdline, 0).unwrap();
 
-    assert!(matches!(&actions[..], [Action::NewSession]));
+    assert!(matches!(&actions[..], [Action::ReplaceSession(_)]));
 }
 
 #[test]
@@ -4495,14 +4551,22 @@ fn rewind_to_middle_truncates_and_populates_input() {
     };
     let actions = app.rewind_to(entry);
 
-    assert_eq!(app.state.session.messages().len(), 2);
+    assert_eq!(app.state.session.messages().len(), 5);
     assert!(app.state.session.tool_outputs().contains_key("tool-1"));
-    assert_eq!(app.input_box.buffer.value(), "second prompt");
+    assert!(app.input_box.buffer.value().is_empty());
     assert_eq!(app.run_id, old_run_id);
-    let Action::LoadSession(ref loaded) = actions[0] else {
-        panic!("expected LoadSession");
+    let Action::ReplaceSession(ref request) = actions[0] else {
+        panic!("expected replacement request");
     };
-    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(
+        request.kind,
+        crate::components::SessionReplacementKind::Rewind
+    );
+    assert_eq!(request.session.messages().len(), 2);
+    assert_eq!(
+        request.session.meta.input_draft.as_deref(),
+        Some("second prompt")
+    );
 }
 
 #[test]
@@ -4518,13 +4582,17 @@ fn rewind_to_first_turn_clears_everything() {
     };
     let actions = app.rewind_to(entry);
 
-    assert!(app.state.session.messages().is_empty());
-    assert!(!app.state.session.tool_outputs().contains_key("tool-1"));
+    assert!(!app.state.session.messages().is_empty());
+    assert!(app.state.session.tool_outputs().contains_key("tool-1"));
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
-    assert_eq!(app.state.context_size, 0);
-    assert_eq!(app.chats[0].context_size, 0);
-    assert!(matches!(&actions[0], Action::LoadSession(_)));
+    assert_eq!(app.state.context_size, 100_000);
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    assert!(request.session.messages().is_empty());
+    assert!(!request.session.tool_outputs().contains_key("tool-1"));
+    assert_eq!(request.session.meta.context_size, 0);
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -4608,7 +4676,7 @@ fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     app.update(agent_msg(AgentEvent::AuthRequired));
     assert!(matches!(
         app.pending_input,
-        PendingInput::AuthRetry { subagent_id: None }
+        PendingInput::AuthRetry { agent_id: None }
     ));
 
     let actions = submit(&mut app);
@@ -4645,7 +4713,7 @@ fn auth_required_in_subagent_shows_in_both_chats() {
     assert_eq!(app.chats[0].last_message_text(), AUTH_EXPIRED_MSG);
     assert!(matches!(
         app.pending_input,
-        PendingInput::AuthRetry { subagent_id: Some(ref id) } if id == "sub1"
+        PendingInput::AuthRetry { agent_id: Some(_) }
     ));
 }
 
@@ -4704,7 +4772,7 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
     app.answer_tx = Some(main_tx);
 
     app.pending_input = PendingInput::AuthRetry {
-        subagent_id: Some("nonexistent".into()),
+        agent_id: Some(AgentId::generate()),
     };
     app.update(Msg::Key(key(KeyCode::Enter)));
 
@@ -5356,20 +5424,39 @@ fn plan_form_menu_options(
         app.update(Msg::Key(key(KeyCode::Down)));
     }
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(!app.plan_form.is_visible());
-    assert_eq!(app.state.mode, expected_mode);
-    assert_eq!(app.state.plan, PlanState::None);
+    assert_eq!(app.plan_form.is_visible(), has_new_session);
     assert_eq!(
-        actions.iter().any(|a| matches!(a, Action::NewSession)),
-        has_new_session
+        app.state.mode,
+        if has_new_session {
+            Mode::Plan
+        } else {
+            expected_mode
+        }
     );
-    let expected_msg = implement_msg(PlanForm::new().parallel());
+    assert_eq!(app.state.plan == PlanState::None, !has_new_session);
     assert_eq!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg)),
-        has_send_message
+            .any(|a| matches!(a, Action::ReplaceSession(_))),
+        has_new_session
     );
+    let expected_msg = implement_msg(PlanForm::new().parallel());
+    let immediate = actions
+        .iter()
+        .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg));
+    assert_eq!(immediate, has_send_message && !has_new_session);
+    if has_new_session {
+        let Action::ReplaceSession(request) = &actions[0] else {
+            panic!("expected replacement request");
+        };
+        assert_eq!(
+            request
+                .post_commit
+                .as_ref()
+                .map(|post| post.prompt.as_str()),
+            Some(expected_msg.as_str())
+        );
+    }
 }
 
 #[test]
@@ -5627,12 +5714,12 @@ fn streaming_cancel_wins_over_esc_override() {
 }
 
 #[test]
-fn reset_session_closes_plan_form() {
+fn reset_session_request_keeps_plan_form_until_commit() {
     let mut app = plan_app();
     assert!(app.plan_form.is_visible());
 
     app.reset_session();
-    assert!(!app.plan_form.is_visible());
+    assert!(app.plan_form.is_visible());
 }
 
 #[test]
@@ -5741,6 +5828,96 @@ fn subagent_history_finishes_workflow_chat() {
         1,
     ));
     assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+#[test]
+fn stamped_child_tool_done_does_not_finish_the_child_turn() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let info = subagent_info(TASK_ID, "worker");
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: "child-tool".into(),
+            tool: "read".into(),
+            summary: "reading".into(),
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+            render_header: None,
+        })),
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            id: "child-tool".into(),
+            tool: "read".into(),
+            output: ToolOutput::Plain("read complete".into()),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+        })),
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.chats.len(), 2);
+    assert!(!app.chats[1].is_finished());
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
+            agent_id: info.agent_id,
+            turn_id: TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+#[test]
+fn outer_task_done_does_not_duplicate_stamped_child_completion() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let info = subagent_info(TASK_ID, "worker");
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "answer".into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
+            agent_id: info.agent_id,
+            turn_id: TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    let count_after_outcome = app.chats[1].message_count();
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: TASK_ID.into(),
+        tool: "task".into(),
+        output: ToolOutput::Plain("answer".into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }))));
+
+    assert_eq!(app.chats[1].message_count(), count_after_outcome);
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
@@ -5869,14 +6046,16 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
         TASK_ID,
         Some("worker"),
     ));
-    app.update(agent_msg_with_run_id(
+    app.update(subagent_msg_with_run_id(
         AgentEvent::SubagentHistory {
             tool_use_id: TASK_ID.into(),
             messages: vec![],
         },
+        TASK_ID,
+        Some("worker"),
         1,
     ));
-    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+    assert!(!app.chats[1].is_finished());
 
     let failure = TurnFailure {
         kind: TurnFailureKind::Provider,
@@ -5898,6 +6077,50 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
     ));
     assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[1].last_message_text(), "provider unavailable");
+}
+
+#[test_case(false, true,  false ; "grandchild")]
+#[test_case(true,  false, false ; "auto_delivery_disabled")]
+#[test_case(true,  true,  true  ; "eligible_direct_child")]
+fn failed_subagent_delivery_obeys_ownership_policy(
+    parent_is_root: bool,
+    auto_deliver: bool,
+    expect_delivery: bool,
+) {
+    const FAILURE_MESSAGE: &str = "provider unavailable";
+
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (input_tx, _input_rx) = flume::unbounded();
+    let mut info = subagent_info_full(TASK_ID, "worker", None, Some(input_tx));
+    info.parent_is_root = parent_is_root;
+    info.auto_deliver = auto_deliver;
+    let outcome = TurnOutcome::Failed {
+        agent_id: info.agent_id,
+        turn_id: TurnId::generate(),
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        failure: TurnFailure {
+            kind: TurnFailureKind::Provider,
+            diagnostic: FAILURE_MESSAGE.into(),
+            user_message: FAILURE_MESSAGE.into(),
+            retryable: false,
+        },
+    };
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TurnOutcome(outcome),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
+    assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
+    assert_eq!(
+        app.queue.text_messages().len(),
+        usize::from(expect_delivery)
+    );
 }
 
 #[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
@@ -6236,8 +6459,9 @@ fn cancel_subagent_retains_channel() {
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.subagent_channels.contains_key(TASK_ID));
+    assert!(app.subagent_channels.contains_key(&agent_id));
 }
 
 #[test]
@@ -6292,8 +6516,6 @@ const TYPED_DRAFT: &str = "hi";
 const UNSENT_DRAFT: &str = "half typed thought";
 const LIVE_AGENT_TEXT: &str = "live agent turn";
 const STORED_SESSION_TEXT: &str = "other session talk";
-const SWITCHED_DRAFT: &str = "draft typed after switching";
-const BUMP_TITLE: &str = "title bump ";
 const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
@@ -6400,13 +6622,19 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
         prompt_preview: "2: second".into(),
         prompt_text: "second prompt".into(),
     };
-    app.rewind_to(entry);
-    assert!(app.shared_history.is_none(), "mirror handle is dropped");
-    app.checkpoint();
+    let actions = app.rewind_to(entry);
+    assert!(
+        app.shared_history.is_some(),
+        "live mirror remains installed"
+    );
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    assert_eq!(request.session.messages().len(), 1);
 
     let id = app.state.session.id;
     drain_writer(app, writer);
-    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
+    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 2);
 }
 
 #[test]
@@ -6416,17 +6644,17 @@ fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
     app.checkpoint();
     let old_id = app.state.session.id;
 
-    app.reset_session();
-    app.checkpoint();
-    let new_id = app.state.session.id;
+    let actions = app.reset_session();
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    let new_id = request.session.id;
     assert_ne!(new_id, old_id);
+    assert_eq!(app.state.session.id, old_id);
 
     drain_writer(app, writer);
     assert_eq!(AppSession::load(old_id, &dir).unwrap().messages().len(), 1);
-    assert!(
-        AppSession::load(new_id, &dir).is_err(),
-        "an empty session has no content to persist",
-    );
+    assert!(AppSession::load(new_id, &dir).is_err());
 }
 
 /// Two traps in one switch. `install_local_history` has to drop the mirror
@@ -6446,28 +6674,22 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
     app.checkpoint();
     let (live_id, sent_revision) = (app.state.session.id, app.state.session.revision());
 
-    app.load_loaded_session(AppSession::load(stored.id, &dir).unwrap());
-    assert_eq!(app.state.session.id, stored.id);
-    // Walk the loaded session up to the revision already sent for the live one,
-    // so the checkpoint below lands on the exact collision.
-    let session = app.state.session_mut();
-    while session.revision() + 1 < sent_revision {
-        session.set_title(format!("{BUMP_TITLE}{}", session.revision()));
-    }
-    app.input_box.set_input(SWITCHED_DRAFT.into());
-    app.checkpoint();
+    let actions = app.load_loaded_session(AppSession::load(stored.id, &dir).unwrap());
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+    assert_eq!(app.state.session.id, live_id);
+    assert_eq!(app.state.session.revision(), sent_revision);
+    assert_eq!(request.session.id, stored.id);
+    assert_eq!(request.session.messages().len(), 1);
     assert_eq!(
-        app.state.session.revision(),
-        sent_revision,
-        "both sessions must sit at the same revision for this to test anything"
+        request.session.messages()[0].user_text(),
+        Some(STORED_SESSION_TEXT)
     );
 
     drain_writer(app, writer);
-    let loaded = AppSession::load(stored.id, &dir).unwrap();
-    assert_eq!(loaded.meta.input_draft.as_deref(), Some(SWITCHED_DRAFT));
-    assert_eq!(loaded.messages().len(), 1);
-    assert_eq!(loaded.messages()[0].user_text(), Some(STORED_SESSION_TEXT));
     let previous = AppSession::load(live_id, &dir).unwrap();
+    assert_eq!(previous.meta.input_draft.as_deref(), Some(UNSENT_DRAFT));
     assert_eq!(previous.messages()[0].user_text(), Some(LIVE_AGENT_TEXT));
 }
 
@@ -7304,6 +7526,77 @@ fn app_with_subagent_input_tx(id: &str) -> (App, flume::Receiver<String>) {
 }
 
 #[test]
+fn duplicate_compatibility_ids_route_by_agent_id() {
+    const COMPATIBILITY_ID: &str = "duplicate";
+    const FIRST_TEXT: &str = "first";
+    const SECOND_TEXT: &str = "second";
+
+    let first_id = AgentId::generate();
+    let second_id = AgentId::generate();
+    let (first_input_tx, first_input_rx) = flume::unbounded();
+    let (second_input_tx, second_input_rx) = flume::unbounded();
+    let first_cancelled = Arc::new(AtomicBool::new(false));
+    let second_cancelled = Arc::new(AtomicBool::new(false));
+    let mut first = subagent_info_for_agent(
+        first_id,
+        COMPATIBILITY_ID,
+        "first agent",
+        None,
+        Some(first_input_tx),
+    );
+    let mut second = subagent_info_for_agent(
+        second_id,
+        COMPATIBILITY_ID,
+        "second agent",
+        None,
+        Some(second_input_tx),
+    );
+    first.cancel = Some(maki_agent::SubagentCancel::new({
+        let cancelled = Arc::clone(&first_cancelled);
+        move || cancelled.store(true, Ordering::SeqCst)
+    }));
+    second.cancel = Some(maki_agent::SubagentCancel::new({
+        let cancelled = Arc::clone(&second_cancelled);
+        move || cancelled.store(true, Ordering::SeqCst)
+    }));
+
+    let mut app = streaming_app();
+    for (info, text) in [(first, FIRST_TEXT), (second, SECOND_TEXT)] {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::TextDelta { text: text.into() },
+            subagent: Some(info),
+            run_id: 1,
+        })));
+    }
+
+    assert_eq!(app.chats.len(), 3);
+    let first_index = app.live_chat_index[&first_id];
+    let second_index = app.live_chat_index[&second_id];
+    assert_ne!(first_index, second_index);
+    app.chats[first_index].flush();
+    app.chats[second_index].flush();
+    assert_eq!(app.chats[first_index].last_message_text(), FIRST_TEXT);
+    assert_eq!(app.chats[second_index].last_message_text(), SECOND_TEXT);
+
+    app.update(done_event());
+    assert_eq!(app.live_chat_index[&first_id], first_index);
+    assert_eq!(app.live_chat_index[&second_id], second_index);
+
+    app.active_chat = second_index;
+    assert!(matches!(
+        app.submit_prompt(queued_msg("continue")),
+        SubmitOutcome::Queued
+    ));
+    assert_eq!(second_input_rx.try_recv().unwrap(), "continue");
+    assert!(first_input_rx.try_recv().is_err());
+
+    app.last_esc = Some(Instant::now());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(second_cancelled.load(Ordering::SeqCst));
+    assert!(!first_cancelled.load(Ordering::SeqCst));
+}
+
+#[test]
 fn submit_in_subagent_chat_routes_to_subagent_queue() {
     let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
     let outcome = app.submit_prompt(queued_msg("do more"));
@@ -7328,17 +7621,457 @@ fn submit_in_subagent_chat_with_images_is_rejected() {
 }
 
 #[test]
-fn submit_in_finished_subagent_chat_is_rejected() {
+fn submit_after_subagent_completion_routes_to_reusable_child() {
+    let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let input_tx = app.subagent_channels[&agent_id].input_tx.clone();
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
+            agent_id,
+            turn_id: TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }),
+        subagent: Some(subagent_info_for_agent(
+            agent_id, TASK_ID, "research", None, input_tx,
+        )),
+        run_id: 1,
+    })));
+
+    assert!(app.chats[app.active_chat].is_finished());
+    assert!(matches!(
+        app.submit_prompt(queued_msg("continue")),
+        SubmitOutcome::Queued
+    ));
+    assert_eq!(input_rx.try_recv().unwrap(), "continue");
+}
+
+#[test]
+fn subagent_closed_marks_despawned_and_rejects_input() {
+    const LATE_FAILURE: &str = "late failure";
+
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
-    // The subagent's driver channel is gone: it finished. Focus stays on it.
-    app.subagent_channels.remove(TASK_ID);
+    let chat_idx = app.active_chat;
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    app.open_tasks();
+    assert!(!app.active_subagent_closed());
+    assert!(app.task_picker.item(chat_idx).unwrap().is_spinning());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert!(app.active_subagent_closed());
+    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.task_picker.item(chat_idx).unwrap().is_finished());
+    assert!(!app.task_picker.item(chat_idx).unwrap().is_spinning());
+    assert_eq!(app.chats[chat_idx].last_message_text(), CANCELLED_TEXT);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TurnOutcome(TurnOutcome::Failed {
+            agent_id,
+            turn_id: TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            failure: TurnFailure {
+                kind: TurnFailureKind::Provider,
+                diagnostic: LATE_FAILURE.into(),
+                user_message: LATE_FAILURE.into(),
+                retryable: false,
+            },
+        }),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    assert!(app.chats[chat_idx].is_finished());
+    assert_eq!(app.chats[chat_idx].last_message_text(), CANCELLED_TEXT);
+
     match app.submit_prompt(queued_msg("poke")) {
         SubmitOutcome::Rejected(e) => assert_eq!(e, queue::NO_SUBAGENT_ERR),
-        _ => panic!("finished subagent must reject, not start a main turn"),
+        _ => panic!("closed subagent must reject, not start a main turn"),
     }
     assert!(
         app.queue.text_messages().is_empty(),
         "nothing may reach the main queue"
+    );
+}
+
+#[test]
+fn subagent_closed_replaces_active_permission_with_live_root_request() {
+    const CHILD_PERMISSION_ID: &str = "child-permission";
+    const ROOT_PERMISSION_ID: &str = "root-permission";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let permission = |id: &str| AgentEvent::PermissionRequest {
+        id: id.into(),
+        tool: maki_config::ToolKey::native(PERM_TOOL),
+        scopes: vec![PERM_SCOPE.into()],
+    };
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: permission(CHILD_PERMISSION_ID),
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.pending_input = PendingInput::AuthRetry {
+        agent_id: Some(agent_id),
+    };
+    app.update(agent_msg(permission(ROOT_PERMISSION_ID)));
+    assert_eq!(app.permission_prompt.agent_id(), Some(agent_id));
+    assert_eq!(app.input_queue.len(), 1);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert!(app.permission_active());
+    assert_eq!(app.permission_prompt.agent_id(), None);
+    assert!(app.input_queue.is_empty());
+    assert_eq!(app.pending_input, PendingInput::None);
+}
+
+#[test]
+fn subagent_closed_prunes_deferred_permission_before_live_root_request() {
+    const CHILD_PERMISSION_ID: &str = "deferred-child-permission";
+    const ROOT_PERMISSION_ID: &str = "deferred-root-permission";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let permission = |id: &str| AgentEvent::PermissionRequest {
+        id: id.into(),
+        tool: maki_config::ToolKey::native(PERM_TOOL),
+        scopes: vec![PERM_SCOPE.into()],
+    };
+    app.last_input = Some(Instant::now());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: permission(CHILD_PERMISSION_ID),
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.update(agent_msg(permission(ROOT_PERMISSION_ID)));
+    assert_eq!(app.input_queue.len(), 2);
+    assert!(!app.permission_prompt.is_open());
+    app.last_input = None;
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert!(app.permission_active());
+    assert_eq!(app.permission_prompt.agent_id(), None);
+    assert!(app.input_queue.is_empty());
+}
+
+#[test_case(false, DONE_TEXT, &DisplayRole::Done ; "completed")]
+#[test_case(true, "failed", &DisplayRole::Error ; "failed")]
+fn subagent_closed_preserves_terminal_status(
+    failed: bool,
+    expected_text: &str,
+    expected_role: &DisplayRole,
+) {
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    if failed {
+        app.chats[chat_idx].mark_failed(expected_text);
+    } else {
+        app.chats[chat_idx].mark_finished(DisplayRole::Done, expected_text);
+    }
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert!(app.chats[chat_idx].is_finished());
+    assert_eq!(app.chats[chat_idx].last_message_text(), expected_text);
+    assert_eq!(app.chats[chat_idx].last_message_role(), Some(expected_role));
+}
+
+#[test]
+fn final_history_after_subagent_closed_only_persists_messages() {
+    const FINAL_REPLY: &str = "final reply";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let chat_count = app.chats.len();
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let messages = vec![Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: FINAL_REPLY.into(),
+        }],
+        ..Default::default()
+    }];
+    app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: messages.clone(),
+        },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(
+        serde_json::to_value(app.state.session.subagent_messages()[TASK_ID].as_ref()).unwrap(),
+        serde_json::to_value(&messages).unwrap()
+    );
+    assert_eq!(app.chats.len(), chat_count);
+    assert_eq!(app.live_chat_index.get(&agent_id), Some(&chat_idx));
+    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.active_subagent_closed());
+    assert!(app.queue.text_messages().is_empty());
+}
+
+#[test]
+fn turn_complete_after_subagent_closed_only_accounts_usage() {
+    const MODEL: &str = "delayed-model";
+    const COST: f64 = 0.125;
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let chat_count = app.chats.len();
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let usage = TokenUsage {
+        input: 100,
+        output: 25,
+        cache_creation: 10,
+        cache_read: 5,
+    };
+    app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: turn_complete(usage, MODEL, Some(COST)),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.state.token_usage, usage);
+    assert_eq!(app.chats[chat_idx].cost, Some(COST));
+    assert_eq!(app.chats.len(), chat_count);
+    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.active_subagent_closed());
+    assert!(app.queue.text_messages().is_empty());
+
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let session_id = app.state.session.id;
+    app.state.session_mut().save(&dir).unwrap();
+    let persisted = AppSession::load(session_id, &dir).unwrap();
+    assert_eq!(persisted.usage_by_model().len(), 1);
+    assert_eq!(persisted.usage_by_model()[MODEL], usage.billed(Some(COST)));
+}
+
+#[test]
+fn turn_complete_after_root_cancel_accounts_without_restoring_child() {
+    const MODEL: &str = "cancelled-child-model";
+    const COST: f64 = 0.25;
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let usage = TokenUsage {
+        input: 80,
+        output: 20,
+        cache_creation: 4,
+        cache_read: 2,
+    };
+
+    app.handle_cancel();
+    assert!(app.live_chat_index.is_empty());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: turn_complete(usage, MODEL, Some(COST)),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.state.token_usage, usage);
+    assert_eq!(
+        app.state.session.usage_by_model()[MODEL],
+        usage.billed(Some(COST))
+    );
+    assert!(app.live_chat_index.is_empty());
+    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.queue.text_messages().is_empty());
+}
+
+#[test]
+fn progress_after_subagent_closed_does_not_reopen_chat() {
+    const LATE_PROGRESS: &str = "late progress";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+
+    for event in [
+        AgentEvent::SubagentClosed,
+        AgentEvent::TextDelta {
+            text: LATE_PROGRESS.into(),
+        },
+    ] {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event,
+            subagent: Some(info.clone()),
+            run_id: 1,
+        })));
+    }
+
+    app.chats[chat_idx].flush();
+    assert!(app.chats[chat_idx].is_finished());
+    assert_eq!(app.chats[chat_idx].last_message_text(), DONE_TEXT);
+}
+
+#[test]
+fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
+    const IN_PROGRESS: &str = "in progress";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: IN_PROGRESS.into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert!(!app.chats[app.active_chat].is_finished());
+
+    app.handle_cancel();
+    let chat_count = app.chats.len();
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.chats.len(), chat_count);
+    assert!(app.live_chat_index.is_empty());
+}
+
+#[test]
+fn subagent_closed_prunes_only_its_delivery_state() {
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let other_agent_id = AgentId::generate();
+    let turn_id = TurnId::generate();
+    let other_turn_id = TurnId::generate();
+    app.delivered_subagent_histories
+        .insert(agent_id, b"closed history".to_vec());
+    app.delivered_subagent_histories
+        .insert(other_agent_id, b"live history".to_vec());
+    app.stamped_subagent_outcomes.insert((agent_id, turn_id));
+    app.stamped_subagent_outcomes
+        .insert((other_agent_id, other_turn_id));
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert!(!app.delivered_subagent_histories.contains_key(&agent_id));
+    assert_eq!(
+        app.delivered_subagent_histories.get(&other_agent_id),
+        Some(&b"live history".to_vec())
+    );
+    assert!(
+        !app.stamped_subagent_outcomes
+            .iter()
+            .any(|(stamped_agent_id, _)| *stamped_agent_id == agent_id)
+    );
+    assert!(
+        app.stamped_subagent_outcomes
+            .contains(&(other_agent_id, other_turn_id))
     );
 }
 
@@ -7368,27 +8101,81 @@ fn paste_in_subagent_chat_edits_input_and_submits_to_subagent() {
 }
 
 #[test]
-fn subagent_completion_queues_reply_to_main() {
+fn subagent_completion_queues_each_distinct_history_once() {
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
-    // Terminal completion flushes the subagent's history; the driver surfaces
-    // the assistant reply in the history messages.
-    let messages = vec![Message {
+    let message = |text: &str| Message {
         role: Role::Assistant,
-        content: vec![ContentBlock::Text {
-            text: "the answer".into(),
-        }],
+        content: vec![ContentBlock::Text { text: text.into() }],
         ..Default::default()
-    }];
-    app.update(subagent_msg(
-        AgentEvent::SubagentHistory {
-            tool_use_id: TASK_ID.to_string(),
-            messages,
-        },
-        TASK_ID,
+    };
+    let history_event = |messages| {
+        subagent_msg(
+            AgentEvent::SubagentHistory {
+                tool_use_id: TASK_ID.to_string(),
+                messages,
+            },
+            TASK_ID,
+            None,
+        )
+    };
+    let first_messages = vec![message("the answer")];
+    app.update(history_event(first_messages.clone()));
+    app.update(history_event(first_messages));
+
+    let first = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}the answer");
+    assert_eq!(app.queue.text_messages(), std::slice::from_ref(&first));
+
+    let changed_messages = vec![message("revised answer")];
+    app.update(history_event(changed_messages.clone()));
+    app.update(history_event(changed_messages.clone()));
+    let second = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}revised answer");
+    assert_eq!(app.queue.text_messages(), [first.clone(), second.clone()]);
+
+    let mut grown_messages = changed_messages;
+    grown_messages.push(message("the follow-up"));
+    app.update(history_event(grown_messages));
+    let third = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}the follow-up");
+    assert_eq!(app.queue.text_messages(), [first, second, third]);
+}
+
+#[test]
+fn grandchild_history_is_visible_but_not_promoted_to_root() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let parent_id = AgentId::generate();
+    let grandchild_id = AgentId::generate();
+    let (input_tx, _input_rx) = flume::unbounded();
+    let mut grandchild = subagent_info_for_agent(
+        grandchild_id,
+        "grandchild-task",
+        "grandchild",
         None,
-    ));
-    let expected = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}the answer");
-    assert_eq!(app.queue.text_messages(), [expected]);
+        Some(input_tx),
+    );
+    grandchild.parent_agent_id = Some(parent_id);
+    grandchild.parent_is_root = false;
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: "grandchild-task".into(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "nested answer".into(),
+                }],
+                ..Default::default()
+            }],
+        },
+        subagent: Some(grandchild),
+        run_id: 1,
+    })));
+
+    assert_eq!(
+        app.chats.len(),
+        2,
+        "grandchild remains visible as a flat row"
+    );
+    assert!(app.queue.text_messages().is_empty());
 }
 
 #[test]
@@ -7789,7 +8576,7 @@ fn perm_demand(id: &str, tool: maki_config::ToolKey, scopes: Vec<String>) -> Inp
             id: id.into(),
             tool,
             scopes,
-            subagent_id: None,
+            agent_id: None,
         }),
     }
 }

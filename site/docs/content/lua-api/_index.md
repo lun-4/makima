@@ -1224,8 +1224,13 @@ and tool set.
     usage into the parent session's UI or event stream. The session still
     completes and `:prompt()` still returns its result (including a commit
     set via a `local_tools` handler). Use for hidden one-shot classification.
+  - `auto_deliver` (`boolean?`) queue completed output for the root agent only
+    for asynchronous direct-root children. Blocking `prompt()` returns its
+    result to the caller. Nested asynchronous completion is not automatically
+    delivered to the parent. Default: `true`.
   - `semaphore` (`maki.async.Semaphore?`) concurrency limit acquired by the
-    driver immediately before each turn and released when that turn ends.
+    driver immediately before each unmanaged turn and released when that turn
+    ends. Managed sessions ignore it and use the parent manager's limit.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
@@ -1282,6 +1287,12 @@ loop runs to completion, calling tools as needed. Conversation history is
 kept across calls, so you can have a multi-turn conversation. This is a
 blocking compatibility wrapper over `send` + the completion notifier; the
 async `send`/`status` pair is preferred for background work.
+
+In a managed invocation, `prompt` validates the current turn and temporarily
+yields its manager permit while the child runs. Without a current managed
+invocation, the same managed session uses an ordinary exact-turn wait. The
+child still uses manager capacity, but no parent permit is yielded. A timeout
+closes the child's managed subtree.
 
 The returned table has fields: `text` (string), `duration_ms` (integer),
 `input_tokens` (integer), `output_tokens` (integer). `text` is an empty
@@ -1391,6 +1402,10 @@ maki.async.run({fn}, {on_finish?})
 Fire off a function as a new async task. It runs in the background and
 you do not wait for it. If you need the result, pass an {on_finish}
 callback.
+
+A task started from a managed agent invocation inherits that exact turn's
+authority. It may use the authority only while the originating turn remains
+active; retained work fails closed after the turn ends.
 
 **Parameters:**
 
@@ -3868,8 +3883,9 @@ Recurring callbacks on the runtime's timer pump.
 Use `set` for anything that must happen every N seconds: demo loops,
 periodic refreshes, watchdogs. Each fire runs as a fresh task, so
 callbacks may sleep or do I/O, and fires land exactly on schedule
-instead of being polled each frame. Timers registered by a plugin are
-dropped when the plugin is unloaded.
+instead of being polled each frame. Timer fires do not inherit managed
+agent authority from their registration task. Timers registered by a
+plugin are dropped when the plugin is unloaded.
 
 ```lua
 local id = maki.timer.set(5, function()
@@ -3888,8 +3904,9 @@ maki.timer.set({seconds}, {callback})
 Schedule {callback} to run every {seconds} on the runtime's timer pump.
 
 Each fire runs as a fresh task, so the callback may be async (`sleep`,
-fs, ...) and fires exactly when due: no per-frame polling. The callback
-receives the timer's id as its first argument - use it with
+fs, ...) and fires exactly when due: no per-frame polling. Timer fires do
+not inherit managed agent authority from the task that registered them.
+The callback receives the timer's id as its first argument - use it with
 `maki.timer.del` to stop the timer. Do not capture the returned id in the
 callback instead: `local id = maki.timer.set(5, function()
 maki.timer.del(id) end)` captures nil (a Luau value-capture quirk), which

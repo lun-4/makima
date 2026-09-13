@@ -139,6 +139,7 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     deadline: Some(now + ASYNC_RUN_DEFAULT_DEADLINE),
                     live_ctx: None,
                     owner: None,
+                    managed_turn: None,
                     command_depth: 0,
                     command_invocation: None,
                     timer_id: Some(timer_id),
@@ -155,8 +156,9 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
 /// Schedule {callback} to run every {seconds} on the runtime's timer pump.
 ///
 /// Each fire runs as a fresh task, so the callback may be async (`sleep`,
-/// fs, ...) and fires exactly when due: no per-frame polling. The callback
-/// receives the timer's id as its first argument - use it with
+/// fs, ...) and fires exactly when due: no per-frame polling. Timer fires do
+/// not inherit managed agent authority from the task that registered them.
+/// The callback receives the timer's id as its first argument - use it with
 /// `maki.timer.del` to stop the timer. Do not capture the returned id in the
 /// callback instead: `local id = maki.timer.set(5, function()
 /// maki.timer.del(id) end)` captures nil (a Luau value-capture quirk), which
@@ -220,8 +222,9 @@ lua_table! {
     /// Use `set` for anything that must happen every N seconds: demo loops,
     /// periodic refreshes, watchdogs. Each fire runs as a fresh task, so
     /// callbacks may sleep or do I/O, and fires land exactly on schedule
-    /// instead of being polled each frame. Timers registered by a plugin are
-    /// dropped when the plugin is unloaded.
+    /// instead of being polled each frame. Timer fires do not inherit managed
+    /// agent authority from their registration task. Timers registered by a
+    /// plugin are dropped when the plugin is unloaded.
     ///
     /// ```lua
     /// local id = maki.timer.set(5, function()
@@ -337,6 +340,31 @@ mod tests {
             store.due(now).is_empty(),
             "no double fire at the same instant"
         );
+    }
+
+    #[test]
+    fn due_timer_task_does_not_inherit_managed_authority() {
+        let (lua, _tbl) = setup();
+        let callback = lua
+            .create_function(|_lua, _args: mlua::MultiValue| Ok::<(), mlua::Error>(()))
+            .unwrap();
+        let key = lua.create_registry_value(callback.clone()).unwrap();
+        let timer_id = lua.app_data_mut::<TimerStore>().unwrap().add(
+            Arc::from("p"),
+            key,
+            callback,
+            Duration::from_secs(1),
+        );
+        lua.app_data_mut::<TimerStore>()
+            .unwrap()
+            .entries
+            .get_mut(&timer_id)
+            .unwrap()
+            .next_fire = Instant::now();
+
+        let tasks = due_tasks(&lua);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].managed_turn.is_none());
     }
 
     #[test]

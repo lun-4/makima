@@ -66,6 +66,12 @@ struct TargetCore {
 #[derive(Clone)]
 pub struct TargetHandle(Arc<TargetCore>);
 
+pub struct PreparedTarget {
+    registry: Arc<RegistryInner>,
+    handle: TargetHandle,
+    record: TargetRecord,
+}
+
 struct SubscriptionCore {
     generation: AtomicU64,
     waker: Mutex<Option<Waker>>,
@@ -174,19 +180,39 @@ impl CommandRegistry {
         capabilities: TargetCapabilities,
         host: Arc<dyn CommandHost>,
     ) -> TargetHandle {
-        let mut state = self
-            .0
+        self.prepare_target(capabilities, host).activate()
+    }
+
+    pub fn prepare_target(
+        &self,
+        capabilities: TargetCapabilities,
+        host: Arc<dyn CommandHost>,
+    ) -> PreparedTarget {
+        let id = InvocationTargetId::new(
+            self.0.id,
+            self.0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take_id(),
+        );
+        PreparedTarget {
+            registry: Arc::clone(&self.0),
+            handle: TargetHandle(Arc::new(TargetCore {
+                id,
+                registry: Arc::downgrade(&self.0),
+            })),
+            record: TargetRecord { capabilities, host },
+        }
+    }
+
+    pub fn target_count(&self) -> usize {
+        self.0
             .state
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let id = InvocationTargetId::new(self.0.id, state.take_id());
-        state
+            .unwrap_or_else(|error| error.into_inner())
             .targets
-            .insert(id, TargetRecord { capabilities, host });
-        TargetHandle(Arc::new(TargetCore {
-            id,
-            registry: Arc::downgrade(&self.0),
-        }))
+            .len()
     }
 
     pub fn claim_standard_commands(&self) -> bool {
@@ -298,16 +324,7 @@ impl CommandRegistry {
             .unwrap_or_else(|error| error.into_inner());
         let capabilities =
             target_capabilities(&state, self.0.id, target).ok_or(CommandError::StaleTarget)?;
-        let commands = state
-            .projection
-            .iter()
-            .filter(|command| capabilities.contains_all(command.spec().required_capabilities))
-            .cloned()
-            .collect();
-        Ok(RegistrySnapshot {
-            generation: state.generation,
-            commands,
-        })
+        Ok(snapshot_for_capabilities(&state, capabilities))
     }
 
     pub fn presented_commands(
@@ -343,6 +360,33 @@ impl CommandRegistry {
 impl Default for CommandRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl PreparedTarget {
+    pub fn handle(&self) -> &TargetHandle {
+        &self.handle
+    }
+
+    pub fn snapshot(&self) -> RegistrySnapshot {
+        let state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        snapshot_for_capabilities(&state, self.record.capabilities)
+    }
+
+    pub fn activate(self) -> TargetHandle {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = state.targets.insert(self.handle.id(), self.record);
+        debug_assert!(previous.is_none());
+        drop(state);
+        self.handle
     }
 }
 
@@ -409,6 +453,22 @@ fn target_capabilities(
     target: &TargetHandle,
 ) -> Option<TargetCapabilities> {
     target_record(state, registry_id, target).map(|record| record.capabilities)
+}
+
+fn snapshot_for_capabilities(
+    state: &RegistryState,
+    capabilities: TargetCapabilities,
+) -> RegistrySnapshot {
+    let commands = state
+        .projection
+        .iter()
+        .filter(|command| capabilities.contains_all(command.spec().required_capabilities))
+        .cloned()
+        .collect();
+    RegistrySnapshot {
+        generation: state.generation,
+        commands,
+    }
 }
 
 impl Producer {
