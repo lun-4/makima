@@ -1705,16 +1705,9 @@ fn parse_argument_completion(lua: &Lua, spec: &Table) -> LuaResult<ArgumentCompl
             "register_command: completion requires exactly one of 'items' or 'get_items'",
         ));
     }
-    let completion = if let Some(items) = items {
-        lua.create_registry_value(items)?
-    } else {
-        lua.create_registry_value(get_items.expect("validated get_items"))?
-    };
-    let hook = |name| -> LuaResult<Option<RegistryKey>> {
-        spec.get::<Option<Function>>(name)?
-            .map(|function| lua.create_registry_value(function))
-            .transpose()
-    };
+    let on_highlight = spec.get::<Option<Function>>("on_highlight")?;
+    let on_accept = spec.get::<Option<Function>>("on_accept")?;
+    let on_cancel = spec.get::<Option<Function>>("on_cancel")?;
     let navigation = match spec.get::<Option<String>>("navigation")? {
         None => None,
         Some(value) if value == "directory" => Some(ArgumentCompletionNavigation::Directory),
@@ -1724,13 +1717,35 @@ fn parse_argument_completion(lua: &Lua, spec: &Table) -> LuaResult<ArgumentCompl
             ));
         }
     };
-    Ok(ArgumentCompletion {
+    let completion = if let Some(items) = items {
+        lua.create_registry_value(items)?
+    } else {
+        lua.create_registry_value(get_items.expect("validated get_items"))?
+    };
+    let mut staged = ArgumentCompletion {
         completion,
-        on_highlight: hook("on_highlight")?,
-        on_accept: hook("on_accept")?,
-        on_cancel: hook("on_cancel")?,
+        on_highlight: None,
+        on_accept: None,
+        on_cancel: None,
         navigation,
-    })
+    };
+    let result = (|| {
+        staged.on_highlight = on_highlight
+            .map(|function| lua.create_registry_value(function))
+            .transpose()?;
+        staged.on_accept = on_accept
+            .map(|function| lua.create_registry_value(function))
+            .transpose()?;
+        staged.on_cancel = on_cancel
+            .map(|function| lua.create_registry_value(function))
+            .transpose()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        remove_argument_completion(lua, staged);
+        return Err(error);
+    }
+    Ok(staged)
 }
 
 fn parse_completion_policy(value: LuaValue) -> LuaResult<CompletionPolicy> {
@@ -1823,18 +1838,29 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
             )));
         }
     }
-    let (arguments, argument_completions) = parse_arguments(lua, spec)?;
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
-    let handler_key = lua.create_registry_value(handler)?;
+    if lua.app_data_ref::<CommandHandlerMap>().is_none() {
+        return Err(mlua::Error::runtime("register_command: not initialized"));
+    }
+    let (arguments, argument_completions) = parse_arguments(lua, spec)?;
+    let handler_key = match lua.create_registry_value(handler) {
+        Ok(key) => key,
+        Err(error) => {
+            for completion in argument_completions.into_iter().flatten() {
+                remove_argument_completion(lua, completion);
+            }
+            return Err(error);
+        }
+    };
     let name: Arc<str> = Arc::from(name.as_str());
     let description: Arc<str> = Arc::from(description.as_str());
 
     let mut previous = {
         let mut map = lua
             .app_data_mut::<CommandHandlerMap>()
-            .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
+            .expect("command handler map checked before staging registry keys");
         let commands = map.entry(Arc::clone(&plugin)).or_default();
         commands.insert(
             Arc::clone(&name),
@@ -2134,6 +2160,77 @@ impl LuaToolInvocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collect_twice(lua: &Lua) {
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+    }
+
+    #[test]
+    fn failed_completion_hook_validation_releases_callback_capture() {
+        let lua = Lua::new();
+        lua.set_app_data(CommandHandlerMap::new());
+        let captured = Arc::new(());
+        {
+            let held = Arc::clone(&captured);
+            let get_items = lua
+                .create_function(move |lua, ()| {
+                    let _ = &held;
+                    lua.create_table()
+                })
+                .unwrap();
+            let completion = lua.create_table().unwrap();
+            completion.set("get_items", get_items).unwrap();
+            completion.set("on_accept", true).unwrap();
+            let descriptor = lua.create_table().unwrap();
+            descriptor.set("name", "value").unwrap();
+            descriptor.set("type", "string").unwrap();
+            descriptor.set("completion", completion).unwrap();
+            let arguments = lua.create_table().unwrap();
+            arguments.raw_set(1, descriptor).unwrap();
+            let spec = lua.create_table().unwrap();
+            spec.set("name", "/test").unwrap();
+            spec.set("tui_only", false).unwrap();
+            spec.set("arguments", arguments).unwrap();
+            spec.set("handler", lua.create_function(|_, ()| Ok(())).unwrap())
+                .unwrap();
+            register_command_from_lua(&lua, &spec, Arc::from("test"))
+                .expect_err("invalid completion hook");
+        }
+        collect_twice(&lua);
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    #[test]
+    fn missing_handler_releases_parsed_completion_capture() {
+        let lua = Lua::new();
+        lua.set_app_data(CommandHandlerMap::new());
+        let captured = Arc::new(());
+        {
+            let held = Arc::clone(&captured);
+            let get_items = lua
+                .create_function(move |lua, ()| {
+                    let _ = &held;
+                    lua.create_table()
+                })
+                .unwrap();
+            let completion = lua.create_table().unwrap();
+            completion.set("get_items", get_items).unwrap();
+            let descriptor = lua.create_table().unwrap();
+            descriptor.set("name", "value").unwrap();
+            descriptor.set("type", "string").unwrap();
+            descriptor.set("completion", completion).unwrap();
+            let arguments = lua.create_table().unwrap();
+            arguments.raw_set(1, descriptor).unwrap();
+            let spec = lua.create_table().unwrap();
+            spec.set("name", "/test").unwrap();
+            spec.set("tui_only", false).unwrap();
+            spec.set("arguments", arguments).unwrap();
+            register_command_from_lua(&lua, &spec, Arc::from("test")).expect_err("missing handler");
+        }
+        collect_twice(&lua);
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
 
     #[test]
     fn local_callbacks_release_captured_runtime_before_thread_teardown() {

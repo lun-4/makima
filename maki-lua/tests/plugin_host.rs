@@ -3670,6 +3670,48 @@ fn register_command_validation_rejects(src: &str, expected_err: &str) {
 }
 
 #[test]
+fn failed_command_reregistration_preserves_previous_generation() {
+    let registry = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    host.load_source(
+        "stable_cmd",
+        r#"
+        maki.api.register_command({
+            name = "/stable",
+            tui_only = false,
+            handler = function() maki.ui.flash("stable") end,
+        })
+        local ok = pcall(maki.api.register_command, {
+            name = "/stable",
+            tui_only = false,
+            arguments = {
+                { name = "value", type = "string", completion = {
+                    get_items = function() return {} end,
+                    on_accept = true,
+                } },
+            },
+            handler = function() maki.ui.flash("replacement") end,
+        })
+        assert(not ok)
+        "#,
+    )
+    .unwrap();
+    let commands = host.command_registry();
+    let target = commands.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let actions = host.ui_action_rx();
+
+    smol::block_on(commands.dispatch_input(&target, "/stable".into()));
+
+    assert!(matches!(
+        actions.recv_timeout(Duration::from_secs(5)).unwrap(),
+        maki_lua::UiAction::Flash(message) if message == "stable"
+    ));
+}
+
+#[test]
 fn reload_replaces_commands() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
