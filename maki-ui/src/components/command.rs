@@ -1378,8 +1378,13 @@ impl CommandPalette {
         {
             return None;
         }
-        let command = if self.typed_argument_owned {
-            self.argument_command(input).map(|(command, _)| command)
+        let exact_typed = self
+            .argument_command(input)
+            .and_then(|(command, typed)| typed.then_some(command));
+        let command = if exact_typed.is_some()
+            && (self.typed_argument_owned || !command_args(input).is_empty())
+        {
+            exact_typed
         } else {
             self.selected_command()
                 .or_else(|| self.argument_command(input).map(|(command, _)| command))
@@ -1983,6 +1988,30 @@ mod tests {
             release_tx,
             events,
         )
+    }
+
+    #[test_case("/cd missing ", "/cd missing ".len(); "trailing_space")]
+    #[test_case("/cd missing extra", "/cd missing extra".len(); "extra_argument")]
+    #[test_case("/cd missing  ", "/cd missing ".len(); "cursor_after_last_argument")]
+    fn typed_command_keeps_ownership_beyond_final_argument(input: &str, cursor: usize) {
+        let (mut palette, _started, _release, _) =
+            gated_directory_palette_with_policy(CompletionPolicy::Disabled);
+        palette.sync("/cd");
+        settle(&mut palette);
+        palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), "/cd");
+        assert_eq!(
+            palette.selected_command().unwrap().invoked_name(),
+            "/cdebug"
+        );
+
+        palette.sync(input);
+        settle(&mut palette);
+        palette.sync_arguments(input, cursor, "insert");
+
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), input),
+            CommandAction::Execute(command) if command.command.invoked_name() == "/cd"
+        ));
     }
 
     #[test_case(KeyCode::Enter, "chosen", true; "exact_enter")]
