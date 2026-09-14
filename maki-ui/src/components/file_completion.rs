@@ -219,7 +219,7 @@ impl CompletionItem {
     }
 
     fn path(mut path: String, directory: bool) -> Self {
-        if directory && !path.ends_with(['/', '\\']) {
+        if directory && !path.ends_with(DIRECTORY_SUFFIX) {
             path.push(DIRECTORY_SUFFIX);
         }
         let kind = if directory { DIRECTORY_KIND } else { FILE_KIND };
@@ -434,9 +434,9 @@ impl PathDiscovery {
         } else {
             path
         };
-        let lists_path = value.ends_with(['/', '\\']) || matches!(value, "~" | "." | "..");
+        let lists_path = value.ends_with(DIRECTORY_SUFFIX) || matches!(value, "~" | "." | "..");
         if lists_path {
-            let display_prefix = if value.ends_with(['/', '\\']) {
+            let display_prefix = if value.ends_with(DIRECTORY_SUFFIX) {
                 value.to_string()
             } else {
                 format!("{value}{DIRECTORY_SUFFIX}")
@@ -531,11 +531,11 @@ impl PathDiscovery {
             return Ok((cwd.to_path_buf(), String::new(), String::new()));
         }
         let path = maki_commands::resolve_path(cwd, self.home.as_deref(), value)?;
-        let lists_path = value.ends_with(['/', '\\'])
+        let lists_path = value.ends_with(DIRECTORY_SUFFIX)
             || value == "~"
             || matches!(value.rsplit(['/', '\\']).next(), Some("." | ".."));
         if lists_path {
-            let display_prefix = if value.ends_with(['/', '\\']) {
+            let display_prefix = if value.ends_with(DIRECTORY_SUFFIX) {
                 value.to_string()
             } else {
                 format!("{value}{DIRECTORY_SUFFIX}")
@@ -1097,7 +1097,7 @@ fn refresh_file_matches(s: &mut Session) {
     s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
-        let directory = path.ends_with(['/', '\\']);
+        let directory = path.ends_with(DIRECTORY_SUFFIX);
         let item = if directory {
             CompletionItem::directory(path)
         } else {

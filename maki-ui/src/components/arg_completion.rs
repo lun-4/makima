@@ -94,7 +94,7 @@ impl CommandCompletion for PathArgSource {
         _context: &CompletionContext,
         item: &CompletionItem,
     ) -> CompletionItemNavigation {
-        if item.insertion.ends_with(['/', '\\']) {
+        if item.insertion.ends_with(std::path::MAIN_SEPARATOR) {
             CompletionItemNavigation::Directory
         } else {
             CompletionItemNavigation::Terminal
@@ -473,7 +473,11 @@ mod tests {
         }
     }
 
-    fn session_fixture(source: Arc<PathArgSource>, cwd: &str) -> maki_commands::CompletionSession {
+    fn session_fixture(
+        source: Arc<PathArgSource>,
+        cwd: &str,
+        kind: maki_commands::ArgumentKind,
+    ) -> maki_commands::CompletionSession {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Application);
         producer
@@ -482,10 +486,7 @@ mod tests {
                     name: Arc::from("/cd"),
                     aliases: Vec::new().into(),
                     arguments: maki_commands::CommandArguments::Positional(Arc::from([
-                        maki_commands::PositionalArgument::optional(
-                            "path",
-                            maki_commands::ArgumentKind::Directory,
-                        ),
+                        maki_commands::PositionalArgument::optional("path", kind),
                     ])),
                     docs: CommandDocs {
                         summary: Arc::from("Change working directory."),
@@ -538,7 +539,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("release apple")).unwrap();
         std::fs::write(tmp.path().join("release.txt"), b"x").unwrap();
         let source = Arc::new(PathArgSource::new(None));
-        let session = session_fixture(source, &cwd);
+        let session = session_fixture(source, &cwd, maki_commands::ArgumentKind::Directory);
 
         let mut items = candidates(&session, "./release ");
         let names: Vec<&str> = items
@@ -547,6 +548,34 @@ mod tests {
             .collect();
         assert!(names.contains(&"./release apple/"));
         assert!(!names.contains(&"./release.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_file_with_trailing_backslash_has_terminal_navigation() {
+        let (resolver, source) = fixture_source(vec![file("report\\")], None);
+        let session = session_fixture(
+            source.into(),
+            "/workspace/project",
+            maki_commands::ArgumentKind::File,
+        );
+
+        let result = smol::block_on(session.complete(
+            Arc::from("report"),
+            Arc::from("report"),
+            0,
+            Arc::from("default"),
+        ));
+        let maki_commands::CompletionResult::Items(items) = result else {
+            panic!("unexpected completion result: {result:?}");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from("/workspace/project")]
+        );
+        assert_eq!(items[0].item().insertion.as_ref(), "report\\");
+        assert_eq!(items[0].navigation(), CompletionItemNavigation::Terminal);
     }
 
     #[test]
@@ -561,7 +590,11 @@ mod tests {
             ],
             None,
         );
-        let session = session_fixture(source.into(), "/workspace/project");
+        let session = session_fixture(
+            source.into(),
+            "/workspace/project",
+            maki_commands::ArgumentKind::Directory,
+        );
 
         let mut items = candidates(&session, "ar");
         let names: Vec<&str> = items
@@ -612,7 +645,11 @@ mod tests {
             .map(|index| directory(&format!("entry-{index}")))
             .collect();
         let (_resolver, source) = fixture_source(entries, None);
-        let session = session_fixture(source.into(), "/workspace/project");
+        let session = session_fixture(
+            source.into(),
+            "/workspace/project",
+            maki_commands::ArgumentKind::Directory,
+        );
 
         let items = candidates(&session, "");
 
@@ -671,7 +708,11 @@ mod tests {
             Arc::clone(&resolver) as Arc<dyn FileResolver>,
             None,
         )));
-        let session = session_fixture(source, "/workspace/project");
+        let session = session_fixture(
+            source,
+            "/workspace/project",
+            maki_commands::ArgumentKind::Directory,
+        );
         let (snapshots_tx, snapshots_rx) = mpsc::channel();
         let query: Arc<str> = Arc::from(query);
         let worker = {
@@ -715,7 +756,11 @@ mod tests {
     #[test]
     fn cancelled_typed_path_request_returns_empty_without_io() {
         let (resolver, source) = fixture_source(vec![file("alpha.txt")], None);
-        let session = session_fixture(source.into(), "/workspace/project");
+        let session = session_fixture(
+            source.into(),
+            "/workspace/project",
+            maki_commands::ArgumentKind::Directory,
+        );
         session.cancel().unwrap();
 
         let result = smol::block_on(session.complete(
