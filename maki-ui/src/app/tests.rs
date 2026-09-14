@@ -7273,11 +7273,16 @@ fn seed_skill(backend: &maki_lua::TestCompletionBackend, name: &str) {
 /// Lets the completion popup's walker finish and nucleo converge, waiting until
 /// the popup is actually offering a selectable item.
 fn converge_completion(app: &mut App) {
+    let reference = app.input_box.buffer.value().starts_with('@');
     wait_for(
         || {
             let _ = app.file_completion.tick();
             let _ = app.command_palette.poll_arguments();
-            app.file_completion.has_selectable() || app.command_palette.has_argument_selectable()
+            if reference {
+                app.file_completion.has_selectable()
+            } else {
+                app.command_palette.has_argument_selectable()
+            }
         },
         "completion popup never offered a selectable item",
     );
@@ -7625,6 +7630,39 @@ fn cd_completion_keeps_paths_raw(directory: &str, query: &str) {
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.state.session.cwd, path.to_string_lossy());
+}
+
+#[test]
+fn quoted_directory_descent_keeps_cursor_inside_quotes() {
+    let (tmp, mut app, _backend) = completion_app();
+    let parent = tmp.path().join("release notes");
+    let child = parent.join("draft copy");
+    std::fs::create_dir_all(&child).unwrap();
+
+    app.update(Msg::Paste("/cd release".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+
+    let descended = format!("/cd \"release notes{}\"", std::path::MAIN_SEPARATOR);
+    assert_eq!(app.input_box.buffer.value(), descended);
+    assert_eq!(
+        app.input_box.buffer.cursor_byte_offset(),
+        descended.len() - 1
+    );
+
+    app.update(Msg::Paste("draft copy".into()));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!(
+            "/cd \"release notes{}draft copy\"",
+            std::path::MAIN_SEPARATOR
+        )
+    );
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.state.session.cwd, child.to_string_lossy());
 }
 
 #[test_case(KeyCode::Right, 1 ; "right")]

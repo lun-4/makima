@@ -930,10 +930,12 @@ impl CommandPalette {
             argument_quote_style(input, range),
         );
         let text = self.replace_argument(input, &edit.text);
-        CommandAction::Complete {
-            text,
-            cursor: edit.cursor,
-        }
+        let cursor = if edit.text.ends_with(['\'', '"']) {
+            edit.cursor - 1
+        } else {
+            edit.cursor
+        };
+        CommandAction::Complete { text, cursor }
     }
 
     fn active_argument_kind(&self) -> Option<ArgumentKind> {

@@ -19,7 +19,7 @@ pub use completion::{
     CancellationToken, CommandCompletion, CompletionCandidate, CompletionContext, CompletionError,
     CompletionInput, CompletionItem, CompletionItemNavigation, CompletionLifecycleEvent,
     CompletionNavigation, CompletionPublisher, CompletionResult, CompletionSession,
-    CompletionSnapshot, CompletionSnapshotSink,
+    CompletionSnapshot, CompletionSnapshotSink, MAX_COMPLETION_CANDIDATES,
 };
 pub use completion_providers::{CompletionKind, CompletionProviders};
 pub use dispatch::{

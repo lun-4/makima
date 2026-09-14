@@ -361,6 +361,19 @@ impl Drop for Session {
 
 pub(crate) trait FileResolver: Send + Sync {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>>;
+
+    fn visit_dir(
+        &self,
+        path: &Path,
+        visitor: &mut dyn FnMut(FileCandidate) -> bool,
+    ) -> io::Result<()> {
+        for candidate in self.read_dir(path)? {
+            if !visitor(candidate) {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -369,6 +382,14 @@ struct RealFileResolver;
 impl FileResolver for RealFileResolver {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
         discover_one_level(path)
+    }
+
+    fn visit_dir(
+        &self,
+        path: &Path,
+        visitor: &mut dyn FnMut(FileCandidate) -> bool,
+    ) -> io::Result<()> {
+        visit_one_level(path, visitor)
     }
 }
 
@@ -461,29 +482,40 @@ impl PathDiscovery {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn typed_candidates(
         &self,
         cwd: &Path,
         value: &str,
         directory_only: bool,
     ) -> io::Result<Vec<(String, bool)>> {
+        let mut candidates = Vec::new();
+        self.visit_typed_candidates(cwd, value, directory_only, &mut |candidate| {
+            candidates.push(candidate);
+            true
+        })?;
+        Ok(candidates)
+    }
+
+    pub(crate) fn visit_typed_candidates(
+        &self,
+        cwd: &Path,
+        value: &str,
+        directory_only: bool,
+        visitor: &mut dyn FnMut((String, bool)) -> bool,
+    ) -> io::Result<()> {
         let (parent, prefix, display_prefix) = self
             .typed_query(cwd, value)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        Ok(self
-            .read_dir(&parent)?
-            .into_iter()
-            .filter(|candidate| {
-                (!directory_only || candidate.is_directory)
-                    && (prefix.is_empty() || candidate.path.starts_with(&prefix))
-            })
-            .map(|candidate| {
-                (
-                    format!("{display_prefix}{}", candidate.path),
-                    candidate.is_directory,
-                )
-            })
-            .collect())
+        self.resolver.visit_dir(&parent, &mut |candidate| {
+            if (directory_only && !candidate.is_directory)
+                || (!prefix.is_empty() && !candidate.path.starts_with(&prefix))
+            {
+                return true;
+            }
+            let is_directory = candidate.is_directory;
+            visitor((format!("{display_prefix}{}", candidate.path), is_directory))
+        })
     }
 
     fn typed_query(
@@ -521,13 +553,20 @@ impl PathDiscovery {
 
 fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
     let mut entries = Vec::new();
+    visit_one_level(path, &mut |candidate| {
+        entries.push(candidate);
+        true
+    })?;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+fn visit_one_level(path: &Path, visitor: &mut dyn FnMut(FileCandidate) -> bool) -> io::Result<()> {
     for entry in std::fs::read_dir(path)? {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        // `DirEntry::metadata` is an lstat, so symlinks would never satisfy the
-        // file/dir filter below; `metadata(entry.path())` follows the link.
         let metadata = match std::fs::metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(_) => continue,
@@ -535,13 +574,14 @@ fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
         if !metadata.is_file() && !metadata.is_dir() {
             continue;
         }
-        entries.push(FileCandidate {
+        if !visitor(FileCandidate {
             path: entry.file_name().to_string_lossy().into_owned(),
             is_directory: metadata.is_dir(),
-        });
+        }) {
+            break;
+        }
     }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(entries)
+    Ok(())
 }
 
 type Walker = (Nucleo<()>, flume::Receiver<()>, Arc<AtomicBool>);

@@ -14,6 +14,8 @@ use crate::dispatch::ResolvedCommand;
 use crate::registry::{RegistryInner, normalize};
 use crate::spec::{CommandFuture, CommandId, CompletionSessionId, InvocationTargetId, ProducerId};
 
+pub const MAX_COMPLETION_CANDIDATES: usize = 640;
+
 pub(super) struct CompletionSessionCore {
     pub(super) id: CompletionSessionId,
     pub(super) producer_id: ProducerId,
@@ -388,6 +390,20 @@ impl CompletionPublisher {
     }
 
     pub fn finish(&self) -> Result<CompletionSnapshot, CompletionError> {
+        self.finish_inner(None)
+    }
+
+    pub fn finish_with(
+        &self,
+        items: Vec<CompletionItem>,
+    ) -> Result<CompletionSnapshot, CompletionError> {
+        self.finish_inner(Some(items))
+    }
+
+    fn finish_inner(
+        &self,
+        items: Option<Vec<CompletionItem>>,
+    ) -> Result<CompletionSnapshot, CompletionError> {
         let core = self.core.upgrade().ok_or(CompletionError::StaleSession)?;
         let (snapshot, sink) = {
             let mut state = core.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -398,6 +414,9 @@ impl CompletionPublisher {
                 .ok_or(CompletionError::StaleRequest)?;
             if entry.terminated || entry.finished {
                 return Err(CompletionError::StaleRequest);
+            }
+            if let Some(items) = items {
+                entry.items = items;
             }
             entry.finished = true;
             let finished = current.providers.iter().all(|provider| provider.finished);
@@ -524,6 +543,7 @@ fn compose_items(
             }
         }
     }
+    result.truncate(MAX_COMPLETION_CANDIDATES);
     result
 }
 

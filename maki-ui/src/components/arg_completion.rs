@@ -8,9 +8,11 @@ use crate::theme::{ThemesProvider, apply_theme};
 use arc_swap::ArcSwapOption;
 use maki_commands::{
     CancellationToken, CommandCompletion, CommandFuture, CompletionContext, CompletionError,
-    CompletionItem, CompletionItemNavigation, CompletionLifecycleEvent, CompletionSessionId,
-    InvocationTargetId,
+    CompletionItem, CompletionItemNavigation, CompletionLifecycleEvent, CompletionPublisher,
+    CompletionSessionId, InvocationTargetId, MAX_COMPLETION_CANDIDATES,
 };
+
+const PATH_COMPLETION_BATCH_SIZE: usize = 64;
 
 pub(crate) struct ModelArgSource {
     models: Arc<ArcSwapOption<Vec<String>>>,
@@ -51,18 +53,6 @@ impl PathArgSource {
 }
 
 impl CommandCompletion for PathArgSource {
-    fn navigation(
-        &self,
-        _context: &CompletionContext,
-        item: &CompletionItem,
-    ) -> CompletionItemNavigation {
-        if item.insertion.ends_with(['/', '\\']) {
-            CompletionItemNavigation::Directory
-        } else {
-            CompletionItemNavigation::Terminal
-        }
-    }
-
     fn complete(
         &self,
         context: CompletionContext,
@@ -76,27 +66,88 @@ impl CommandCompletion for PathArgSource {
             Some(maki_commands::ArgumentKind::Directory)
         );
         Box::pin(async move {
-            if cancellation.is_cancelled() {
-                return Ok(Vec::new());
-            }
-            let entries =
-                smol::unblock(move || discovery.typed_candidates(&cwd, &query, directory_only))
-                    .await
+            smol::unblock(move || {
+                let mut items = Vec::new();
+                discovery
+                    .visit_typed_candidates(&cwd, &query, directory_only, &mut |candidate| {
+                        if cancellation.is_cancelled() || items.len() == MAX_COMPLETION_CANDIDATES {
+                            return false;
+                        }
+                        items.push(path_completion_item(candidate));
+                        true
+                    })
                     .map_err(|_| CompletionError::Unavailable)?;
-            Ok(entries
-                .into_iter()
-                .map(|(mut insertion, is_directory)| {
-                    if is_directory {
-                        insertion.push(std::path::MAIN_SEPARATOR);
-                    }
-                    CompletionItem {
-                        label: Arc::from(insertion.as_str()),
-                        insertion: Arc::from(insertion),
-                        description: None,
-                    }
-                })
-                .collect())
+                Ok(items)
+            })
+            .await
         })
+    }
+
+    fn navigation(
+        &self,
+        _context: &CompletionContext,
+        item: &CompletionItem,
+    ) -> CompletionItemNavigation {
+        if item.insertion.ends_with(['/', '\\']) {
+            CompletionItemNavigation::Directory
+        } else {
+            CompletionItemNavigation::Terminal
+        }
+    }
+
+    fn complete_incremental(
+        &self,
+        context: CompletionContext,
+        cancellation: CancellationToken,
+        publisher: CompletionPublisher,
+    ) -> CommandFuture<Result<(), CompletionError>> {
+        let cwd = PathBuf::from(context.cwd.as_ref());
+        let discovery = self.discovery.clone();
+        let query = context.argument.to_string();
+        let directory_only = matches!(
+            context.argument_kind,
+            Some(maki_commands::ArgumentKind::Directory)
+        );
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            smol::unblock(move || {
+                let mut items = Vec::new();
+                discovery
+                    .visit_typed_candidates(&cwd, &query, directory_only, &mut |candidate| {
+                        if cancellation.is_cancelled() || items.len() == MAX_COMPLETION_CANDIDATES {
+                            return false;
+                        }
+                        items.push(path_completion_item(candidate));
+                        if items.len().is_multiple_of(PATH_COMPLETION_BATCH_SIZE) {
+                            items.sort_by(|left, right| left.insertion.cmp(&right.insertion));
+                            if publisher.publish(items.clone()).is_err() {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .map_err(|_| CompletionError::Unavailable)?;
+                if !cancellation.is_cancelled() {
+                    items.sort_by(|left, right| left.insertion.cmp(&right.insertion));
+                    publisher.finish_with(items)?;
+                }
+                Ok(())
+            })
+            .await
+        })
+    }
+}
+
+fn path_completion_item((mut insertion, is_directory): (String, bool)) -> CompletionItem {
+    if is_directory {
+        insertion.push(std::path::MAIN_SEPARATOR);
+    }
+    CompletionItem {
+        label: Arc::from(insertion.as_str()),
+        insertion: Arc::from(insertion),
+        description: None,
     }
 }
 
@@ -254,12 +305,15 @@ impl CommandCompletion for ThemeArgSource {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
 
     use maki_commands::{
         CommandArguments, CommandBehavior, CommandDocs, CommandError, CommandFuture,
-        CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionResult,
-        HostResponse, ProducerPrecedence, Registration, TargetCapabilities,
+        CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionInput,
+        CompletionResult, CompletionSnapshotSink, HostResponse, ProducerPrecedence, Registration,
+        TargetCapabilities,
     };
 
     use crate::components::file_completion::{FileCandidate, FileResolver, PathDiscovery};
@@ -536,6 +590,98 @@ mod tests {
         assert_eq!(
             resolver.reads.lock().unwrap().last().unwrap(),
             &PathBuf::from("/tmp")
+        );
+    }
+
+    #[test]
+    fn typed_path_provider_stops_at_materialization_limit() {
+        let entries = (0..MAX_COMPLETION_CANDIDATES + 100)
+            .map(|index| directory(&format!("entry-{index}")))
+            .collect();
+        let (_resolver, source) = fixture_source(entries, None);
+        let session = session_fixture(source.into(), "/workspace/project");
+
+        let items = candidates(&session, "");
+
+        assert_eq!(items.len(), MAX_COMPLETION_CANDIDATES);
+    }
+
+    struct GatedResolver {
+        visited: AtomicUsize,
+        reached_batch: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl FileResolver for GatedResolver {
+        fn read_dir(&self, _path: &Path) -> std::io::Result<Vec<FileCandidate>> {
+            unreachable!()
+        }
+
+        fn visit_dir(
+            &self,
+            _path: &Path,
+            visitor: &mut dyn FnMut(FileCandidate) -> bool,
+        ) -> std::io::Result<()> {
+            for index in 0..MAX_COMPLETION_CANDIDATES {
+                if index == PATH_COMPLETION_BATCH_SIZE {
+                    self.reached_batch.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                self.visited.fetch_add(1, Ordering::Relaxed);
+                if !visitor(directory(&format!("entry-{index}"))) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_path_publishes_partial_snapshot_and_stops_after_cancellation() {
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let resolver = Arc::new(GatedResolver {
+            visited: AtomicUsize::new(0),
+            reached_batch: reached_tx,
+            release: Mutex::new(release_rx),
+        });
+        let source = Arc::new(PathArgSource::with_discovery(PathDiscovery::with_resolver(
+            Arc::clone(&resolver) as Arc<dyn FileResolver>,
+            None,
+        )));
+        let session = session_fixture(source, "/workspace/project");
+        let (snapshots_tx, snapshots_rx) = mpsc::channel();
+        let worker = {
+            let session = session.clone();
+            thread::spawn(move || {
+                smol::block_on(session.complete_input_with_sink(
+                    CompletionInput {
+                        arguments: Arc::from(""),
+                        argument: Arc::from(""),
+                        argument_index: 0,
+                        argument_range: Some(0..0),
+                        mode: Arc::from("default"),
+                    },
+                    Some(CompletionSnapshotSink::new(move |snapshot| {
+                        snapshots_tx.send(snapshot).unwrap();
+                    })),
+                ))
+            })
+        };
+
+        reached_rx.recv().unwrap();
+        let first = snapshots_rx.recv().unwrap();
+        assert_eq!(first.candidates.len(), PATH_COMPLETION_BATCH_SIZE);
+        session.cancel().unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            CompletionResult::Cancelled
+        ));
+        assert_eq!(
+            resolver.visited.load(Ordering::Relaxed),
+            PATH_COMPLETION_BATCH_SIZE + 1
         );
     }
 

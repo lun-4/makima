@@ -491,6 +491,31 @@ fn start_snapshot(session: &CompletionSession) -> thread::JoinHandle<CompletionR
 }
 
 #[test]
+fn completion_snapshot_caps_composed_candidates() {
+    let (provider, started, mut release, _events) =
+        gated_snapshot_provider(CompletionItemNavigation::Terminal);
+    let (_registry, session) = snapshot_session(
+        provider,
+        CompletionPolicy::Replace,
+        CompletionProviders::default(),
+    );
+    let worker = start_snapshot(&session);
+    let publisher = started.recv().unwrap();
+    let items = (0..MAX_COMPLETION_CANDIDATES + 100)
+        .map(|index| completion_item(&format!("item-{index}")))
+        .collect();
+
+    let snapshot = publisher.publish(items).unwrap();
+
+    assert_eq!(snapshot.candidates.len(), MAX_COMPLETION_CANDIDATES);
+    publisher.finish().unwrap();
+    release.send();
+    assert!(
+        matches!(worker.join().unwrap(), CompletionResult::Items(items) if items.len() == MAX_COMPLETION_CANDIDATES)
+    );
+}
+
+#[test]
 fn completion_snapshot_replacement_rejects_removed_value_before_validate_highlight_and_accept() {
     let (provider, started, mut release, events) =
         gated_snapshot_provider(CompletionItemNavigation::Terminal);
