@@ -1586,27 +1586,28 @@ fn parse_arguments(
             };
             let kind = parse_argument_kind(&argument)?;
             let completion_value = argument.get::<LuaValue>("completion")?;
-            let completion = match &completion_value {
-                LuaValue::Table(table) => Some(parse_argument_completion(lua, table)?),
-                LuaValue::Nil | LuaValue::Boolean(false) | LuaValue::String(_) => None,
+            let (completion, policy) = match &completion_value {
+                LuaValue::Table(table) => {
+                    let mode = table.get::<Option<LuaValue>>("mode")?;
+                    let policy = table.get::<Option<LuaValue>>("policy")?;
+                    if mode.is_some() && policy.is_some() {
+                        return Err(mlua::Error::runtime(
+                            "register_command: argument completion accepts only one of 'mode' or 'policy'",
+                        ));
+                    }
+                    let policy = mode
+                        .or(policy)
+                        .map_or(Ok(CompletionPolicy::Replace), parse_completion_policy)?;
+                    (Some(parse_argument_completion(lua, table)?), policy)
+                }
+                LuaValue::Nil | LuaValue::Boolean(false) | LuaValue::String(_) => {
+                    (None, parse_completion_policy(completion_value)?)
+                }
                 _ => {
                     return Err(mlua::Error::runtime(
                         "register_command: argument 'completion' must be false, a policy string, or a table",
                     ));
                 }
-            };
-            let policy = if let LuaValue::Table(table) = &completion_value {
-                let mode = table.get::<Option<LuaValue>>("mode")?;
-                let policy = table.get::<Option<LuaValue>>("policy")?;
-                if mode.is_some() && policy.is_some() {
-                    return Err(mlua::Error::runtime(
-                        "register_command: argument completion accepts only one of 'mode' or 'policy'",
-                    ));
-                }
-                mode.or(policy)
-                    .map_or(Ok(CompletionPolicy::Replace), parse_completion_policy)?
-            } else {
-                parse_completion_policy(completion_value)?
             };
             parsed.push(PositionalArgument {
                 name: Arc::from(name),
@@ -2196,6 +2197,48 @@ mod tests {
                 .unwrap();
             register_command_from_lua(&lua, &spec, Arc::from("test"))
                 .expect_err("invalid completion hook");
+        }
+        collect_twice(&lua);
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    #[test_case::test_case(true, "replace"; "conflicting_mode_and_policy")]
+    #[test_case::test_case(false, "invalid"; "invalid_policy")]
+    fn failed_completion_policy_validation_releases_callback_capture(
+        include_mode: bool,
+        policy: &str,
+    ) {
+        let lua = Lua::new();
+        lua.set_app_data(CommandHandlerMap::new());
+        let captured = Arc::new(());
+        {
+            let held = Arc::clone(&captured);
+            let get_items = lua
+                .create_function(move |lua, ()| {
+                    let _ = &held;
+                    lua.create_table()
+                })
+                .unwrap();
+            let completion = lua.create_table().unwrap();
+            completion.set("get_items", get_items).unwrap();
+            completion.set("policy", policy).unwrap();
+            if include_mode {
+                completion.set("mode", "replace").unwrap();
+            }
+            let descriptor = lua.create_table().unwrap();
+            descriptor.set("name", "value").unwrap();
+            descriptor.set("type", "string").unwrap();
+            descriptor.set("completion", completion).unwrap();
+            let arguments = lua.create_table().unwrap();
+            arguments.raw_set(1, descriptor).unwrap();
+            let spec = lua.create_table().unwrap();
+            spec.set("name", "/test").unwrap();
+            spec.set("tui_only", false).unwrap();
+            spec.set("arguments", arguments).unwrap();
+            spec.set("handler", lua.create_function(|_, ()| Ok(())).unwrap())
+                .unwrap();
+            register_command_from_lua(&lua, &spec, Arc::from("test"))
+                .expect_err("invalid completion policy");
         }
         collect_twice(&lua);
         assert_eq!(Arc::strong_count(&captured), 1);
