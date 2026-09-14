@@ -543,7 +543,6 @@ fn compose_items(
             }
         }
     }
-    result.truncate(MAX_COMPLETION_CANDIDATES);
     result
 }
 

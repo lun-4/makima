@@ -491,7 +491,7 @@ fn start_snapshot(session: &CompletionSession) -> thread::JoinHandle<CompletionR
 }
 
 #[test]
-fn completion_snapshot_caps_composed_candidates() {
+fn completion_snapshot_preserves_composed_candidates_for_consumer_filtering() {
     let (provider, started, mut release, _events) =
         gated_snapshot_provider(CompletionItemNavigation::Terminal);
     let (_registry, session) = snapshot_session(
@@ -501,17 +501,18 @@ fn completion_snapshot_caps_composed_candidates() {
     );
     let worker = start_snapshot(&session);
     let publisher = started.recv().unwrap();
-    let items = (0..MAX_COMPLETION_CANDIDATES + 100)
+    let item_count = MAX_COMPLETION_CANDIDATES + 100;
+    let items = (0..item_count)
         .map(|index| completion_item(&format!("item-{index}")))
         .collect();
 
     let snapshot = publisher.publish(items).unwrap();
 
-    assert_eq!(snapshot.candidates.len(), MAX_COMPLETION_CANDIDATES);
+    assert_eq!(snapshot.candidates.len(), item_count);
     publisher.finish().unwrap();
     release.send();
     assert!(
-        matches!(worker.join().unwrap(), CompletionResult::Items(items) if items.len() == MAX_COMPLETION_CANDIDATES)
+        matches!(worker.join().unwrap(), CompletionResult::Items(items) if items.len() == item_count)
     );
 }
 

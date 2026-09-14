@@ -6,8 +6,8 @@ use maki_commands::{
     ArgumentKind, CommandArguments, CommandId, CommandRegistry, CompletionCandidate,
     CompletionInput, CompletionItem, CompletionItemNavigation, CompletionProviders,
     CompletionResult, CompletionSession, CompletionSnapshot, CompletionSnapshotSink,
-    PositionalArgument, QuoteStyle, RegistrySnapshot, ResolvedCommand, SlashClass, TargetHandle,
-    classify_input, encode_completion_value, lex_strict, lex_tolerant,
+    MAX_COMPLETION_CANDIDATES, PositionalArgument, QuoteStyle, RegistrySnapshot, ResolvedCommand,
+    SlashClass, TargetHandle, classify_input, encode_completion_value, lex_strict, lex_tolerant,
 };
 use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -852,6 +852,7 @@ impl CommandPalette {
                 &b.item.label,
             )
         });
+        matches.truncate(MAX_COMPLETION_CANDIDATES);
         let previous_item = preserve_selection
             .then(|| self.argument_items.get(self.argument_selection()))
             .flatten()
@@ -1778,9 +1779,9 @@ mod tests {
         ArgumentKind, CancellationToken, CommandArguments, CommandBehavior, CommandCompletion,
         CommandDocs, CommandError, CommandFuture, CommandInvocation, CommandOutcome,
         CommandRegistry, CommandSpec, CompletionContext, CompletionError, CompletionItem,
-        CompletionItemNavigation, CompletionPolicy, CompletionPublisher, HostResponse,
-        PositionalArgument, ProducerPrecedence, QuoteStyle, Registration, TargetCapabilities,
-        encode_completion_value,
+        CompletionItemNavigation, CompletionKind, CompletionPolicy, CompletionProviders,
+        CompletionPublisher, HostResponse, PositionalArgument, ProducerPrecedence, QuoteStyle,
+        Registration, TargetCapabilities, encode_completion_value,
     };
     use maki_config::DEFAULT_AUTOCOMPLETE_HEIGHT;
     use ratatui::Terminal;
@@ -1790,11 +1791,24 @@ mod tests {
 
     use super::{
         ArgumentMatch, CaseMatching, CommandAction, CommandPalette, CommandRequest,
-        CompletionMatchOptions, MATCHER_SETTLE_POLL, MATCHER_SETTLE_TIMEOUT, Normalization,
-        argument_at_cursor, argument_visible_rows, command_args, completion_match,
-        typed_argument_at_cursor,
+        CompletionMatchOptions, MATCHER_SETTLE_POLL, MATCHER_SETTLE_TIMEOUT,
+        MAX_COMPLETION_CANDIDATES, Normalization, argument_at_cursor, argument_visible_rows,
+        command_args, completion_match, typed_argument_at_cursor,
     };
     struct Noop;
+
+    struct StaticCompletion(Vec<CompletionItem>);
+
+    impl CommandCompletion for StaticCompletion {
+        fn complete(
+            &self,
+            _context: CompletionContext,
+            _cancellation: CancellationToken,
+        ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+            let items = self.0.clone();
+            Box::pin(async move { Ok(items) })
+        }
+    }
 
     struct GatedDirectoryCompletion {
         started: mpsc::SyncSender<CompletionPublisher>,
@@ -2801,6 +2815,98 @@ mod tests {
             argument_visible_rows(3, 20, 20, DEFAULT_AUTOCOMPLETE_HEIGHT),
             3
         );
+    }
+
+    #[test]
+    fn typed_enum_completion_keeps_exact_match_beyond_visible_limit() {
+        let choices = (0..=MAX_COMPLETION_CANDIDATES)
+            .map(|index| Arc::from(format!("choice{index:03}")))
+            .collect::<Vec<_>>();
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/choose"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        PositionalArgument::required("value", ArgumentKind::Enum(choices.into())),
+                    ])),
+                    docs: CommandDocs {
+                        summary: Arc::from("Choose value"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(Noop),
+                argument_completions: vec![None],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        let input = "/choose choice640";
+        palette.sync_arguments(input, input.len(), "insert");
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+
+        assert_eq!(palette.argument_items.len(), 1);
+        assert_eq!(palette.argument_items[0].item.label.as_ref(), "choice640");
+    }
+
+    #[test]
+    fn extended_completion_keeps_custom_match_after_full_defaults() {
+        let defaults = (0..MAX_COMPLETION_CANDIDATES)
+            .map(|index| CompletionItem {
+                label: Arc::from(format!("default{index:03}")),
+                insertion: Arc::from(format!("default{index:03}")),
+                description: None,
+            })
+            .collect();
+        let custom = Arc::new(StaticCompletion(vec![CompletionItem {
+            label: Arc::from("special"),
+            insertion: Arc::from("special"),
+            description: None,
+        }]));
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/choose"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        PositionalArgument::required("value", ArgumentKind::String)
+                            .with_completion(CompletionPolicy::Extend),
+                    ])),
+                    docs: CommandDocs {
+                        summary: Arc::from("Choose value"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(Noop),
+                argument_completions: vec![Some(custom)],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::with_defaults(
+            registry,
+            target,
+            CompletionProviders::default()
+                .with(CompletionKind::String, Arc::new(StaticCompletion(defaults))),
+            Arc::from(""),
+        );
+        let input = "/choose special";
+        palette.sync_arguments(input, input.len(), "insert");
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+
+        assert_eq!(palette.argument_items.len(), 1);
+        assert_eq!(palette.argument_items[0].item.label.as_ref(), "special");
     }
 
     #[test]
