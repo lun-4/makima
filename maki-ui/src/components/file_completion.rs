@@ -495,7 +495,9 @@ impl PathDiscovery {
             return Ok((cwd.to_path_buf(), String::new(), String::new()));
         }
         let path = maki_commands::resolve_path(cwd, self.home.as_deref(), value)?;
-        let lists_path = value.ends_with(['/', '\\']) || matches!(value, "~" | "." | "..");
+        let lists_path = value.ends_with(['/', '\\'])
+            || value == "~"
+            || matches!(value.rsplit(['/', '\\']).next(), Some("." | ".."));
         if lists_path {
             let display_prefix = if value.ends_with(['/', '\\']) {
                 value.to_string()
@@ -1654,6 +1656,14 @@ mod tests {
     #[test_case("~/ar", "/home/tester", "~/archive"; "home_prefix")]
     #[test_case("nested/", "/workspace/project/nested", "nested/archive"; "relative_directory")]
     #[test_case("nested/ar", "/workspace/project/nested", "nested/archive"; "relative_prefix")]
+    #[test_case("nested/.", "/workspace/project/nested/.", "nested/./archive"; "nested_current_directory")]
+    #[test_case("nested/./", "/workspace/project/nested/.", "nested/./archive"; "nested_current_directory_separator")]
+    #[test_case("nested/..", "/workspace/project/nested/..", "nested/../archive"; "nested_parent_directory")]
+    #[test_case("nested/../", "/workspace/project/nested/..", "nested/../archive"; "nested_parent_directory_separator")]
+    #[test_case("/outside/.", "/outside/.", "/outside/./archive"; "absolute_current_directory")]
+    #[test_case("/outside/./", "/outside/.", "/outside/./archive"; "absolute_current_directory_separator")]
+    #[test_case("/outside/..", "/outside/..", "/outside/../archive"; "absolute_parent_directory")]
+    #[test_case("/outside/../", "/outside/..", "/outside/../archive"; "absolute_parent_directory_separator")]
     fn typed_paths_use_resolver(query: &str, parent: &str, expected: &str) {
         let resolver = Arc::new(CountingResolver {
             reads: std::sync::Mutex::new(Vec::new()),
