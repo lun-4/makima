@@ -686,7 +686,6 @@ pub struct CompletionEdit {
     pub cursor: usize,
 }
 
-#[allow(dead_code)]
 pub fn encode_completion_value(
     value: &str,
     range: std::ops::Range<usize>,

@@ -1026,6 +1026,18 @@ fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
     }
 }
 
+fn wait_for_receiver<T>(receiver: &flume::Receiver<T>, what: &str) -> T {
+    let mut value = None;
+    wait_for(
+        || {
+            value = receiver.try_recv().ok();
+            value.is_some()
+        },
+        what,
+    );
+    value.unwrap()
+}
+
 fn settle_command_palette(app: &mut App) {
     wait_for(
         || {
@@ -4598,10 +4610,7 @@ fn copy_typed_command_scenario(policy: Option<&str>) {
     }
 
     fixture.app.update(Msg::Key(key(KeyCode::Enter)));
-    let message = fixture
-        .actions
-        .recv_timeout(Duration::from_secs(5))
-        .expect("copy handler did not record invocation");
+    let message = wait_for_receiver(&fixture.actions, "copy handler did not record invocation");
     let expected_flash = match policy {
         Some(policy) => format!("source file.txt|destination folder/|{policy}"),
         None => "source file.txt|destination folder/|".to_owned(),
@@ -4643,10 +4652,10 @@ fn copy_typed_completion_destination_policy(
     settle_command_palette(&mut fixture.app);
     fixture.app.update(Msg::Key(key(KeyCode::Enter)));
 
-    let message = fixture
-        .actions
-        .recv_timeout(Duration::from_secs(5))
-        .expect("copy policy handler did not record invocation");
+    let message = wait_for_receiver(
+        &fixture.actions,
+        "copy policy handler did not record invocation",
+    );
     assert!(matches!(message, maki_lua::UiAction::Flash(value) if value == expected_flash));
     assert_eq!(copy_tree(fixture.root.path()), before_tree);
 }
