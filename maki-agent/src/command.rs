@@ -386,6 +386,23 @@ fn parsed_string_argument(
         .transpose()
 }
 
+fn parsed_directory_argument(
+    invocation: &CommandInvocation,
+    name: &str,
+) -> Result<Option<PathBuf>, CommandError> {
+    invocation
+        .parsed_arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get(name))
+        .map(|value| match value {
+            ArgumentValue::Directory(path) => Ok(path.clone()),
+            _ => Err(CommandError::Producer(Arc::from(format!(
+                "invalid builtin argument type for {name}"
+            )))),
+        })
+        .transpose()
+}
+
 fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
     if argument.contains('/') {
         Model::from_spec(argument)
@@ -426,6 +443,7 @@ impl CommandBehavior for BuiltinBehavior {
         let arguments = invocation.arguments.trim().to_owned();
         let model = parsed_string_argument(&invocation, "model");
         let theme = parsed_string_argument(&invocation, "theme");
+        let directory = parsed_directory_argument(&invocation, "path");
         let id = self.id;
         Box::pin(async move {
             let operation = match id {
@@ -495,20 +513,20 @@ impl CommandBehavior for BuiltinBehavior {
                             "working-directory resolution is unavailable",
                         )));
                     };
-                    let path = invocation
-                        .parsed_arguments
-                        .as_ref()
-                        .and_then(|arguments| arguments.get("path"))
-                        .map(|value| match value {
-                            ArgumentValue::Directory(path) => path.to_string_lossy().into_owned(),
-                            _ => String::new(),
-                        })
-                        .filter(|path| !path.is_empty())
+                    let path = directory?
                         .map(|path| {
-                            resolve_path(&cwd, maki_storage::paths::home().as_deref(), &path)
+                            resolve_path(
+                                &cwd,
+                                maki_storage::paths::home().as_deref(),
+                                &path.to_string_lossy(),
+                            )
                         })
                         .transpose()
-                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?
+                        .map_err(|error| {
+                            CommandError::Producer(Arc::from(format!(
+                                "argument path (directory): {error}"
+                            )))
+                        })?
                         .unwrap_or_else(|| maki_storage::paths::home().unwrap_or_default());
                     BuiltinOperation::ChangeDirectory { path }
                 }
@@ -957,6 +975,43 @@ mod tests {
         };
         assert_eq!(turn.content.text.as_ref(), "Review src/lib.rs");
         assert_eq!(turn.content.attachments, attachments);
+    }
+
+    #[test]
+    fn cd_parses_bare_quoted_and_rejects_extra_arguments() {
+        let registry = maki_commands::CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let host = Arc::new(RecordingCommandHost::default());
+        let target = registry.bind_target(TargetCapabilities::ALL, host.clone());
+
+        for input in ["/cd", r#"/cd "release notes""#] {
+            assert!(matches!(
+                smol::block_on(registry.dispatch_input(&target, input.into())),
+                maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+            ));
+        }
+        assert!(matches!(
+            smol::block_on(registry.dispatch_input(&target, "/cd one two".into())),
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
+                CommandError::TypedArguments { .. }
+            ))
+        ));
+
+        let operations = host.0.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(operations.len(), 2);
+        assert_eq!(
+            operations[0],
+            BuiltinOperation::ChangeDirectory {
+                path: maki_storage::paths::home().unwrap_or_default(),
+            }
+        );
+        assert_eq!(
+            operations[1],
+            BuiltinOperation::ChangeDirectory {
+                path: PathBuf::from("/project/release notes"),
+            }
+        );
     }
 
     #[test]

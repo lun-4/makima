@@ -1688,7 +1688,8 @@ fn parse_argument_kind(argument: &Table) -> LuaResult<ArgumentKind> {
                 .into_iter()
                 .map(Arc::<str>::from)
                 .collect::<Vec<_>>();
-            if choices.is_empty() {
+            let mut unique = std::collections::HashSet::new();
+            if choices.is_empty() || choices.iter().any(|choice| !unique.insert(choice.as_ref())) {
                 return Err(mlua::Error::runtime(ARGUMENT_ENUM_ERR));
             }
             Ok(ArgumentKind::Enum(choices.into()))

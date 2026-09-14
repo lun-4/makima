@@ -1064,7 +1064,6 @@ pub enum CompletionResult {
     Items(Vec<CompletionCandidate>),
     Stale,
     Cancelled,
-    Failed,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]

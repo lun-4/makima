@@ -438,11 +438,19 @@ fn parse_choices(node: Node<'_>, source: &str) -> Result<Vec<String>> {
             .ok_or_else(|| node_error(field, source, "enum choices must contain strings"))?;
         choices.push(string_field(value, source, "enum choice")?);
     }
+    let mut unique = std::collections::HashSet::new();
     if choices.is_empty() {
         return Err(node_error(
             node,
             source,
             "enum argument `choices` must not be empty",
+        ));
+    }
+    if choices.iter().any(|choice| !unique.insert(choice.as_str())) {
+        return Err(node_error(
+            node,
+            source,
+            "enum argument `choices` must contain distinct strings",
         ));
     }
     Ok(choices)
@@ -899,6 +907,11 @@ mod tests {
         "{ name = 'value', type = 'enum', choices = { 'x' }, typo = true }",
         "unknown registration argument field `typo`"
         ; "unknown_enum_field"
+    )]
+    #[test_case(
+        "{ name = 'value', type = 'enum', choices = { 'x', 'x' } }",
+        "enum argument `choices` must contain distinct strings"
+        ; "duplicate_enum_choice"
     )]
     fn rejects_unknown_typed_argument_fields(descriptor: &str, expected: &str) {
         let source = format!(

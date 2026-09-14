@@ -97,6 +97,31 @@ struct ContextProbe {
     context: Mutex<Option<CompletionContext>>,
 }
 
+struct UnavailableCompletion;
+
+impl CommandCompletion for UnavailableCompletion {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        Box::pin(async { Err(CompletionError::Unavailable) })
+    }
+}
+
+struct StaticCompletion(&'static str);
+
+impl CommandCompletion for StaticCompletion {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        let item = completion_item(self.0);
+        Box::pin(async move { Ok(vec![item]) })
+    }
+}
+
 type VariadicCompletionCall = (Arc<str>, Arc<[ParsedArgument]>);
 
 struct VariadicCompletionProbe {
@@ -713,6 +738,36 @@ fn typed_dispatch_parses_quoted_arguments_before_behavior() {
         InputDispatch::Dispatched(CommandOutcome::Completed)
     ));
     assert_eq!(executions.load(Ordering::Relaxed), 1);
+}
+
+#[test_case(CompletionPolicy::Replace, CompletionProviders::default(), &[]; "replace_unavailable_is_empty")]
+#[test_case(
+    CompletionPolicy::Extend,
+    CompletionProviders::default().with(CompletionKind::String, Arc::new(StaticCompletion("default"))),
+    &["default"]
+    ; "extend_unavailable_retains_defaults"
+)]
+fn unavailable_provider_follows_completion_policy(
+    policy: CompletionPolicy,
+    defaults: CompletionProviders,
+    expected: &[&str],
+) {
+    let (_registry, session) = snapshot_session(Arc::new(UnavailableCompletion), policy, defaults);
+    let CompletionResult::Items(items) = futures_lite::future::block_on(session.complete(
+        Arc::from(""),
+        Arc::from(""),
+        0,
+        Arc::from("insert"),
+    )) else {
+        panic!("unavailable provider should complete with policy-composed items");
+    };
+    assert_eq!(
+        items
+            .iter()
+            .map(|candidate| candidate.item().insertion.as_ref())
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
 
 #[test]

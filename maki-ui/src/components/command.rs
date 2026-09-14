@@ -236,25 +236,27 @@ impl CommandPalette {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, input: &str) -> CommandAction {
-        if self
+        let accepted = self
             .accepted_argument_input
             .as_ref()
-            .is_some_and(|(accepted, _)| accepted == input)
-            || self
-                .dismissed_argument_input
-                .as_ref()
-                .is_some_and(|(dismissed, _)| dismissed == input)
-        {
-            return if key.code == KeyCode::Enter {
-                if let Some(command) = self.accepted_argument_command.clone() {
-                    let args = command_args(input).trim().to_owned();
-                    self.close();
-                    CommandAction::Execute(ConfirmedCommand { command, args })
-                } else {
-                    self.confirm_close(input)
+            .is_some_and(|(accepted, _)| accepted == input);
+        let dismissed = self
+            .dismissed_argument_input
+            .as_ref()
+            .is_some_and(|(dismissed, _)| dismissed == input);
+        if accepted || dismissed {
+            return match key.code {
+                KeyCode::Enter => {
+                    if let Some(command) = self.accepted_argument_command.clone() {
+                        let args = command_args(input).trim().to_owned();
+                        self.close();
+                        CommandAction::Execute(ConfirmedCommand { command, args })
+                    } else {
+                        self.confirm_close(input)
+                    }
                 }
-            } else {
-                CommandAction::Passthrough
+                KeyCode::Tab if dismissed => CommandAction::Consumed,
+                _ => CommandAction::Passthrough,
             };
         }
         if !self.is_active() && !self.typed_argument_owned {
@@ -817,7 +819,7 @@ impl CommandPalette {
                 );
                 dirty
             }
-            CompletionResult::Stale | CompletionResult::Cancelled | CompletionResult::Failed => {
+            CompletionResult::Stale | CompletionResult::Cancelled => {
                 self.finish_empty_arguments(pending);
                 Dirty::YES
             }

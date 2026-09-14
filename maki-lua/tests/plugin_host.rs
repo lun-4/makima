@@ -2919,6 +2919,7 @@ fn register_command_removed_fields_include_migration_hint(field: &str, expected:
 #[test_case::test_case("{ name = 'value', type = 'string', typo = true }", "unknown argument field 'typo'"; "unknown_scalar_field")]
 #[test_case::test_case("{ name = 'value', type = 'string', choices = { 'x' } }", "unknown argument field 'choices'"; "choices_on_scalar")]
 #[test_case::test_case("{ name = 'value', type = 'enum', choices = { 'x' }, typo = true }", "unknown argument field 'typo'"; "unknown_enum_field")]
+#[test_case::test_case("{ name = 'value', type = 'enum', choices = { 'x', 'x' } }", "non-empty array of strings"; "duplicate_enum_choice")]
 #[test_case::test_case("{ name = 'value', type = 'string', completion = { items = {}, typo = true } }", "unknown completion field 'typo'"; "unknown_completion_field")]
 fn register_command_rejects_unknown_typed_argument_fields(descriptor: &str, expected: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();

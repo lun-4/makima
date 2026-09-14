@@ -7795,8 +7795,12 @@ fn cd_completion_closed_popup_preserves_argument_ownership(close: KeyCode, expec
     app.update(Msg::Key(key(close)));
     assert!(!app.command_palette.is_active());
     assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
+    let mode = app.state.mode.clone();
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(app.input_box.buffer.value(), expected);
+    if close == KeyCode::Esc {
+        assert_eq!(app.state.mode, mode);
+    }
     assert!(!app.command_palette.is_active());
     assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
     app.update(Msg::Key(key(KeyCode::Enter)));

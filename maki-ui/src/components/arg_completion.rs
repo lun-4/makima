@@ -771,9 +771,7 @@ mod tests {
         ));
         assert!(matches!(
             result,
-            maki_commands::CompletionResult::Cancelled
-                | maki_commands::CompletionResult::Failed
-                | maki_commands::CompletionResult::Stale
+            maki_commands::CompletionResult::Cancelled | maki_commands::CompletionResult::Stale
         ));
         assert!(resolver.reads.lock().unwrap().is_empty());
     }
