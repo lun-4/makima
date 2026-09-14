@@ -866,10 +866,11 @@ fn register_permission_rule(
 ///                          range is `-9007199254740991` to
 ///                          `9007199254740991`.
 ///   Completion is declared on each typed descriptor with `completion = false`,
-///                            `completion = "disabled"`, `completion = "replace"`,
-///                            `completion = "extend"`, or a provider table.
+///                            `completion = "disabled"`, or a provider table.
 ///                            A provider table contains exactly one of `items` and
-///                            `get_items`. Defaults are enum choices in the core
+///                            `get_items`, and may set `mode` to `"replace"` or
+///                            `"extend"` (`"replace"` is the default). Defaults are
+///                            enum choices in the core
 ///                            and file or directory discovery in the TUI. String
 ///                            and integer defaults are empty. Provider callbacks
 ///                            receive the typed argument name, type, parsed
