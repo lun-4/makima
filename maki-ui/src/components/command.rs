@@ -1066,26 +1066,25 @@ impl CommandPalette {
         let parts: Vec<&str> = stripped.split_whitespace().collect();
         let cmd_word = parts.first().copied().unwrap_or(stripped);
         let trailing_space = stripped.ends_with(char::is_whitespace);
-
-        let request = CommandRequest {
-            query: cmd_word.to_owned(),
-            registry_generation: self.snapshot.generation(),
-            argument_count: if trailing_space {
-                parts.len()
-            } else {
-                parts.len().saturating_sub(1)
-            },
+        let whitespace_argument_count = if trailing_space {
+            parts.len()
+        } else {
+            parts.len().saturating_sub(1)
         };
-        if let Some(command) = self
+        let argument_count = self
             .registry
             .resolve_for(&self.target, &format!("/{cmd_word}"))
             .ok()
-            && matches!(command.spec().arguments, CommandArguments::Positional(_))
-            && let Ok(tokens) = lex_tolerant(command_args(input))
-        {
-            self.current_arg_count =
-                tokens.len() + usize::from(command_args(input).ends_with(char::is_whitespace));
-        }
+            .filter(|command| matches!(command.spec().arguments, CommandArguments::Positional(_)))
+            .and_then(|_| lex_tolerant(command_args(input)).ok())
+            .map_or(whitespace_argument_count, |tokens| {
+                tokens.len() + usize::from(command_args(input).ends_with(char::is_whitespace))
+            });
+        let request = CommandRequest {
+            query: cmd_word.to_owned(),
+            registry_generation: self.snapshot.generation(),
+            argument_count,
+        };
         if !registry_changed
             && self.command_publication.can_accept()
             && self.command_query == request.query
@@ -1340,7 +1339,9 @@ impl CommandPalette {
         if !self.command_publication.can_accept() || self.argument_publication.is_pending() {
             return None;
         }
-        let (command, _) = self.argument_command(input)?;
+        let command = self
+            .selected_command()
+            .or_else(|| self.argument_command(input).map(|(command, _)| command))?;
         let args = command_args(input).trim().to_owned();
         Some(ConfirmedCommand { command, args })
     }
@@ -2285,6 +2286,70 @@ mod tests {
 
         assert_eq!(palette.filtered.len(), 1);
         assert_eq!(palette.filtered[0].command.invoked_name(), "/dynamic");
+    }
+
+    #[test]
+    fn confirmation_uses_highlighted_command_over_exact_input() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![
+                registration("/one", "Exact command"),
+                registration("/oner", "Highlighted command"),
+            ])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        palette.sync("/one");
+        settle(&mut palette);
+        assert_eq!(palette.selected_command().unwrap().invoked_name(), "/one");
+
+        palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), "/one");
+
+        assert_eq!(palette.selected_command().unwrap().invoked_name(), "/oner");
+        assert_eq!(
+            palette.confirm("/one").unwrap().command.invoked_name(),
+            "/oner"
+        );
+    }
+
+    #[test_case("/sessions \"two words\"", false; "initial_closed_quote")]
+    #[test_case("/sessions \"two words", false; "initial_unfinished_quote")]
+    #[test_case("/sessions \"two words\"", true; "settled_closed_quote")]
+    #[test_case("/sessions \"two words", true; "settled_unfinished_quote")]
+    fn quoted_scalar_argument_keeps_command_visible(input: &str, settle_command_first: bool) {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/sessions"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        PositionalArgument::optional("query", ArgumentKind::String),
+                    ])),
+                    docs: CommandDocs {
+                        summary: Arc::from("List sessions"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(Noop),
+                argument_completions: vec![None],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        if settle_command_first {
+            palette.sync("/sessions");
+            settle(&mut palette);
+        }
+
+        palette.sync(input);
+        settle(&mut palette);
+
+        assert_eq!(palette.filtered.len(), 1);
+        assert_eq!(palette.filtered[0].command.invoked_name(), "/sessions");
     }
 
     #[test]
