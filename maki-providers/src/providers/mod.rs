@@ -35,6 +35,7 @@ pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
+const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
 
 pub(crate) fn user_agent() -> &'static str {
     concat!(
@@ -119,12 +120,16 @@ pub(crate) struct SseErrorPayload {
     pub error: SseErrorDetail,
 }
 
+/// Every field is optional because rejecting any one shape throws away the whole error, and a
+/// half-filled error frame still tells us an outage happened. `code` in particular arrives as a
+/// string, a number or `null` depending on the provider.
 #[derive(Deserialize)]
 pub(crate) struct SseErrorDetail {
     #[serde(default)]
     pub r#type: String,
     #[serde(default)]
     pub code: Value,
+    #[serde(default)]
     pub message: String,
     #[serde(default)]
     pub metadata: Option<SseErrorMetadata>,
@@ -178,16 +183,12 @@ impl SseErrorPayload {
                     .and_then(|m| sse_error_status(&m.error_type))
             })
             .unwrap_or(UNMAPPED_SSE_ERROR_STATUS);
-        AgentError::Api {
-            status,
-            message: self.error.message,
-        }
-    }
-}
-        AgentError::Api {
-            status,
-            message: self.error.message,
-        }
+        let message = if self.error.message.trim().is_empty() {
+            EMPTY_SSE_ERROR_MESSAGE.to_string()
+        } else {
+            self.error.message
+        };
+        AgentError::Api { status, message }
     }
 }
 
@@ -335,6 +336,8 @@ mod tests {
 
     const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
+    const UNAVAILABLE_STATUS: u16 = 502;
+    const UNAVAILABLE_TAG: &str = "provider_unavailable";
 
     // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain
     // 400 so a user mistake is not retried forever: https://github.com/tontinton/maki/issues/777
@@ -361,6 +364,31 @@ mod tests {
             format!("API error ({status}): {ERROR_MESSAGE}")
         );
         assert_eq!(err.is_retryable(), retryable);
+    }
+
+    // A frame that only says "the upstream is down" must survive parsing, or the turn ends with an
+    // empty assistant message and no retry.
+    #[test_case(Some(ERROR_MESSAGE), ERROR_MESSAGE           ; "message_present")]
+    #[test_case(None,                EMPTY_SSE_ERROR_MESSAGE ; "message_key_absent")]
+    #[test_case(Some(""),            EMPTY_SSE_ERROR_MESSAGE ; "message_empty")]
+    #[test_case(Some("   "),         EMPTY_SSE_ERROR_MESSAGE ; "message_blank")]
+    fn sse_error_payload_without_message_still_classifies(message: Option<&str>, expected: &str) {
+        let mut error = serde_json::json!({
+            "code": UNAVAILABLE_STATUS,
+            "metadata": { "error_type": UNAVAILABLE_TAG },
+        });
+        if let Some(message) = message {
+            error["message"] = message.into();
+        }
+        let payload: SseErrorPayload =
+            serde_json::from_value(serde_json::json!({ "error": error })).expect(PARSE_FAILED);
+        let err = payload.into_agent_error();
+
+        assert_eq!(
+            err.to_string(),
+            format!("API error ({UNAVAILABLE_STATUS}): {expected}")
+        );
+        assert!(err.is_retryable());
     }
     #[test_case("a b", "a%20b" ; "space")]
     #[test_case("a:b", "a%3Ab" ; "colon")]
