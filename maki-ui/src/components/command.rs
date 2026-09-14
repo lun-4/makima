@@ -246,7 +246,7 @@ impl CommandPalette {
                 CommandAction::Passthrough
             };
         }
-        if !self.is_active() {
+        if !self.is_active() && !self.typed_argument_owned {
             return CommandAction::Passthrough;
         }
         if self.is_typed_path_grid()
@@ -276,6 +276,8 @@ impl CommandPalette {
                     };
                     self.notify_keyboard_highlight();
                     CommandAction::Consumed
+                } else if self.typed_argument_owned {
+                    CommandAction::Consumed
                 } else {
                     self.move_up();
                     CommandAction::SelectionChanged
@@ -293,13 +295,18 @@ impl CommandPalette {
                         };
                     self.notify_keyboard_highlight();
                     CommandAction::Consumed
+                } else if self.typed_argument_owned {
+                    CommandAction::Consumed
                 } else {
                     self.move_down();
                     CommandAction::SelectionChanged
                 }
             }
             KeyCode::Esc => {
-                if self.argument_range.is_some() || self.completion_session.is_some() {
+                if self.argument_range.is_some()
+                    || self.completion_session.is_some()
+                    || self.typed_argument_owned
+                {
                     let dismissed_start = self.argument_range.map(|(start, _)| start);
                     self.cancel_arguments();
                     self.dismissed_argument_input =
@@ -1338,12 +1345,17 @@ impl CommandPalette {
     }
 
     pub fn confirm(&self, input: &str) -> Option<ConfirmedCommand> {
-        if !self.command_publication.can_accept() || self.argument_publication.is_pending() {
+        if (!self.typed_argument_owned && !self.command_publication.can_accept())
+            || self.argument_publication.is_pending()
+        {
             return None;
         }
-        let command = self
-            .selected_command()
-            .or_else(|| self.argument_command(input).map(|(command, _)| command))?;
+        let command = if self.typed_argument_owned {
+            self.argument_command(input).map(|(command, _)| command)
+        } else {
+            self.selected_command()
+                .or_else(|| self.argument_command(input).map(|(command, _)| command))
+        }?;
         let args = command_args(input).trim().to_owned();
         Some(ConfirmedCommand { command, args })
     }
@@ -1877,6 +1889,10 @@ mod tests {
     );
 
     fn gated_directory_palette() -> GatedPalette {
+        gated_directory_palette_with_policy(CompletionPolicy::Replace)
+    }
+
+    fn gated_directory_palette_with_policy(policy: CompletionPolicy) -> GatedPalette {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let events = Arc::default();
@@ -1888,23 +1904,29 @@ mod tests {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Plugin);
         producer
-            .replace(vec![Registration {
-                spec: CommandSpec {
-                    name: Arc::from("/cd"),
-                    aliases: Arc::from([]),
-                    arguments: CommandArguments::Positional(Arc::from([
-                        PositionalArgument::optional("path", ArgumentKind::Directory)
-                            .with_completion(CompletionPolicy::Replace),
-                    ])),
-                    docs: CommandDocs {
-                        summary: Arc::from("Change directory"),
-                        argument_hint: None,
+            .replace(vec![
+                Registration {
+                    spec: CommandSpec {
+                        name: Arc::from("/cd"),
+                        aliases: Arc::from([]),
+                        arguments: CommandArguments::Positional(Arc::from([
+                            PositionalArgument::optional("path", ArgumentKind::Directory)
+                                .with_completion(policy),
+                        ])),
+                        docs: CommandDocs {
+                            summary: Arc::from("Change directory"),
+                            argument_hint: None,
+                        },
+                        required_capabilities: TargetCapabilities::default(),
                     },
-                    required_capabilities: TargetCapabilities::default(),
+                    behavior: Arc::new(Noop),
+                    argument_completions: vec![
+                        (policy != CompletionPolicy::Disabled)
+                            .then_some(provider as Arc<dyn CommandCompletion>),
+                    ],
                 },
-                behavior: Arc::new(Noop),
-                argument_completions: vec![Some(provider)],
-            }])
+                registration("/cdebug", "Debug command"),
+            ])
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         (
@@ -1913,6 +1935,50 @@ mod tests {
             release_tx,
             events,
         )
+    }
+
+    #[test]
+    fn empty_typed_completion_keeps_owning_command() {
+        let (mut palette, started, release, _) = gated_directory_palette();
+        let input = "/cd missing";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started.recv().unwrap();
+        publisher.finish_with(Vec::new()).unwrap();
+        release.send(()).unwrap();
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), input),
+            CommandAction::Consumed
+        ));
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), input),
+            CommandAction::Execute(command) if command.command.invoked_name() == "/cd"
+        ));
+    }
+
+    #[test]
+    fn disabled_typed_completion_keeps_owning_command() {
+        let (mut palette, _started, _release, _) =
+            gated_directory_palette_with_policy(CompletionPolicy::Disabled);
+        let input = "/cd missing";
+        palette.sync_arguments(input, input.len(), "insert");
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), input),
+            CommandAction::Consumed
+        ));
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), input),
+            CommandAction::Execute(command) if command.command.invoked_name() == "/cd"
+        ));
     }
 
     #[test_case(None; "empty")]
