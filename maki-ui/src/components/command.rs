@@ -4,10 +4,11 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_commands::{
     ArgumentKind, CommandArguments, CommandId, CommandRegistry, CompletionCandidate,
-    CompletionInput, CompletionItem, CompletionItemNavigation, CompletionProviders,
-    CompletionResult, CompletionSession, CompletionSnapshot, CompletionSnapshotSink,
-    MAX_COMPLETION_CANDIDATES, PositionalArgument, QuoteStyle, RegistrySnapshot, ResolvedCommand,
-    SlashClass, TargetHandle, classify_input, encode_completion_value, lex_strict, lex_tolerant,
+    CompletionInput, CompletionItem, CompletionItemNavigation, CompletionPolicy,
+    CompletionProviders, CompletionResult, CompletionSession, CompletionSnapshot,
+    CompletionSnapshotSink, MAX_COMPLETION_CANDIDATES, PositionalArgument, QuoteStyle,
+    RegistrySnapshot, ResolvedCommand, SlashClass, TargetHandle, classify_input,
+    encode_completion_value, lex_strict, lex_tolerant,
 };
 use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -287,7 +288,7 @@ impl CommandPalette {
                     self.notify_keyboard_highlight();
                     CommandAction::Consumed
                 } else if self.typed_argument_owned {
-                    CommandAction::Consumed
+                    CommandAction::Passthrough
                 } else {
                     self.move_up();
                     CommandAction::SelectionChanged
@@ -306,7 +307,7 @@ impl CommandPalette {
                     self.notify_keyboard_highlight();
                     CommandAction::Consumed
                 } else if self.typed_argument_owned {
-                    CommandAction::Consumed
+                    CommandAction::Passthrough
                 } else {
                     self.move_down();
                     CommandAction::SelectionChanged
@@ -331,7 +332,10 @@ impl CommandPalette {
                 CommandAction::Consumed
             }
             KeyCode::Enter => {
-                if self.command_publication.is_pending() || self.argument_publication.is_pending() {
+                if self.argument_publication.is_pending() {
+                    return CommandAction::Consumed;
+                }
+                if self.command_publication.is_pending() {
                     if self.argument_items.is_empty()
                         && let Some(command) = self.confirm_exact(input)
                     {
@@ -656,16 +660,24 @@ impl CommandPalette {
         };
         self.typed_argument_owned = typed;
         self.active_argument_start = Some(start);
-        self.argument_kind = typed
-            .then(|| {
-                command.spec().arguments.positional().and_then(|schema| {
-                    schema
-                        .get(index)
-                        .or_else(|| schema.last().filter(|argument| argument.variadic))
-                        .map(|argument| argument.kind.clone())
-                })
-            })
-            .flatten();
+        let descriptor = typed
+            .then(|| command.spec().arguments.positional())
+            .flatten()
+            .and_then(|schema| {
+                schema
+                    .get(index)
+                    .or_else(|| schema.last().filter(|argument| argument.variadic))
+            });
+        self.argument_kind = descriptor.map(|argument| argument.kind.clone());
+        if descriptor.is_some_and(|argument| argument.completion == CompletionPolicy::Disabled) {
+            self.notify_lifecycle(PaletteLifecycle::Cancel);
+            self.pending_arguments = None;
+            self.argument_publication.clear();
+            self.argument_items.clear();
+            self.argument_range = None;
+            self.argument_grid.reset();
+            return abandoned;
+        }
         let request_key = ArgumentRequest {
             command_id: command.command_id(),
             invoked_name: Arc::from(command.invoked_name()),
@@ -764,7 +776,6 @@ impl CommandPalette {
                     pending.key.range,
                     latest.candidates,
                     pending.snapshot_applied,
-                    latest.finished,
                     &mut pending.last_highlighted_item,
                 );
                 self.argument_revision = latest.revision;
@@ -802,7 +813,6 @@ impl CommandPalette {
                     pending.key.range,
                     items,
                     pending.snapshot_applied,
-                    true,
                     &mut pending.last_highlighted_item,
                 );
                 dirty
@@ -820,7 +830,6 @@ impl CommandPalette {
         range: (usize, usize),
         items: Vec<CompletionCandidate>,
         preserve_selection: bool,
-        finished: bool,
         last_highlighted_item: &mut Option<CompletionItem>,
     ) -> Dirty {
         let mut matches = Vec::new();
@@ -886,9 +895,6 @@ impl CommandPalette {
             .map(|item| item.item.clone());
         if selected_item.is_none() {
             *last_highlighted_item = None;
-            if finished {
-                self.notify_lifecycle(PaletteLifecycle::Cancel);
-            }
         } else if selected_item.as_ref() != last_highlighted_item.as_ref() {
             *last_highlighted_item = selected_item;
             self.notify_lifecycle(PaletteLifecycle::Highlight);
@@ -1000,7 +1006,6 @@ impl CommandPalette {
             self.argument_items.clear();
             self.argument_range = None;
             self.argument_grid.reset();
-            self.notify_lifecycle(PaletteLifecycle::Cancel);
         }
     }
 
@@ -2106,7 +2111,7 @@ mod tests {
 
         assert!(matches!(
             palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), input),
-            CommandAction::Consumed
+            CommandAction::Passthrough
         ));
         assert!(matches!(
             palette.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), input),
@@ -2127,7 +2132,7 @@ mod tests {
 
         assert!(matches!(
             palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), input),
-            CommandAction::Consumed
+            CommandAction::Passthrough
         ));
         assert!(matches!(
             palette.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), input),
@@ -2216,10 +2221,12 @@ mod tests {
         }
         assert!(palette.argument_items.is_empty());
         assert!(!palette.argument_publication.is_pending());
-        assert!(matches!(
-            palette.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), input),
-            CommandAction::Passthrough
-        ));
+        for key in [KeyCode::Left, KeyCode::Up, KeyCode::Down] {
+            assert!(matches!(
+                palette.handle_key(KeyEvent::new(key, KeyModifiers::NONE), input),
+                CommandAction::Passthrough
+            ));
+        }
     }
 
     #[test_case(None; "empty")]
@@ -2624,11 +2631,7 @@ mod tests {
         );
     }
 
-    #[test_case("/sessions \"two words\"", false; "initial_closed_quote")]
-    #[test_case("/sessions \"two words", false; "initial_unfinished_quote")]
-    #[test_case("/sessions \"two words\"", true; "settled_closed_quote")]
-    #[test_case("/sessions \"two words", true; "settled_unfinished_quote")]
-    fn quoted_scalar_argument_keeps_command_visible(input: &str, settle_command_first: bool) {
+    fn provider_free_typed_palette() -> CommandPalette {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Plugin);
         producer
@@ -2650,7 +2653,15 @@ mod tests {
             }])
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
-        let mut palette = CommandPalette::new(registry, target);
+        CommandPalette::new(registry, target)
+    }
+
+    #[test_case("/sessions \"two words\"", false; "initial_closed_quote")]
+    #[test_case("/sessions \"two words", false; "initial_unfinished_quote")]
+    #[test_case("/sessions \"two words\"", true; "settled_closed_quote")]
+    #[test_case("/sessions \"two words", true; "settled_unfinished_quote")]
+    fn quoted_scalar_argument_keeps_command_visible(input: &str, settle_command_first: bool) {
+        let mut palette = provider_free_typed_palette();
         if settle_command_first {
             palette.sync("/sessions");
             settle(&mut palette);
@@ -2661,6 +2672,26 @@ mod tests {
 
         assert_eq!(palette.filtered.len(), 1);
         assert_eq!(palette.filtered[0].command.invoked_name(), "/sessions");
+    }
+
+    #[test_case(KeyCode::Up; "up")]
+    #[test_case(KeyCode::Down; "down")]
+    fn provider_free_typed_argument_allows_history_navigation(key: KeyCode) {
+        let mut palette = provider_free_typed_palette();
+        let input = "/sessions anything";
+        palette.sync_arguments(input, input.len(), "insert");
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+
+        assert!(palette.typed_argument_owned);
+        assert!(palette.argument_items.is_empty());
+        assert!(!palette.argument_publication.is_pending());
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(key, KeyModifiers::NONE), input),
+            CommandAction::Passthrough
+        ));
     }
 
     #[test]
@@ -2680,6 +2711,21 @@ mod tests {
         palette.sync("//model");
         assert!(!palette.is_active());
         assert!(palette.filtered.is_empty());
+    }
+
+    #[test_case(KeyCode::Enter; "enter")]
+    #[test_case(KeyCode::Tab; "tab")]
+    fn pending_typed_argument_without_published_rows_consumes_submission(key_code: KeyCode) {
+        let (mut palette, started, release, _) = gated_directory_palette();
+        let input = "/cd pro";
+        palette.sync_arguments(input, input.len(), "insert");
+        let _publisher = started.recv().unwrap();
+
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(key_code, KeyModifiers::NONE), input),
+            CommandAction::Consumed
+        ));
+        release.send(()).unwrap();
     }
 
     #[test_case(KeyCode::Enter ; "enter")]

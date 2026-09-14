@@ -1506,6 +1506,42 @@ fn superseded_completion_cannot_return_items() {
 }
 
 #[test]
+fn query_refresh_retains_provider_until_session_cancel() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    let probe = Arc::new(CompletionProbe::default());
+    let session = completion_session(&registry, &producer, probe.clone());
+
+    for argument in ["a", "ab"] {
+        assert!(matches!(
+            futures_lite::future::block_on(session.complete(
+                Arc::from(argument),
+                Arc::from(argument),
+                0,
+                Arc::from("insert"),
+            )),
+            CompletionResult::Items(_)
+        ));
+    }
+    assert!(
+        probe
+            .events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+    );
+
+    session.cancel().unwrap();
+    assert_eq!(
+        *probe
+            .events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        [CompletionLifecycleEvent::Cancel]
+    );
+}
+
+#[test]
 fn invalidating_in_flight_completion_returns_cancelled_then_stale() {
     let registry = CommandRegistry::new();
     let producer = registry.create_producer(ProducerPrecedence::Application);

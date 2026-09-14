@@ -116,14 +116,18 @@ impl CompletionSessionState {
         })
     }
 
-    fn cancel_current(&mut self) -> Option<CompletionCallback> {
+    fn replace_current(&mut self, retained: &[RequestProvider]) -> Option<CompletionCallback> {
         let current = self.current_request.take()?;
         current.cancellation.cancel();
         let providers = current
             .providers
             .into_iter()
             .filter_map(|mut entry| {
-                if entry.terminated {
+                if entry.terminated
+                    || retained
+                        .iter()
+                        .any(|retained| Arc::ptr_eq(&entry.provider, &retained.provider))
+                {
                     None
                 } else {
                     entry.terminated = true;
@@ -679,7 +683,6 @@ impl CompletionSession {
             if state.closed {
                 return Box::pin(async { CompletionResult::Stale });
             }
-            let old_callback = state.cancel_current();
             let request_id = state.next_request;
             state.next_request = state.next_request.wrapping_add(1);
             let (
@@ -718,6 +721,7 @@ impl CompletionSession {
                 generation: request_id,
             };
             let providers = providers_for(&state, &context);
+            let old_callback = state.replace_current(&providers);
             let cancellation = CancellationToken::default();
             state.current_request = Some(CurrentCompletionRequest {
                 id: request_id,

@@ -991,7 +991,7 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
-    if text.starts_with('/') {
+    if text.trim_start().starts_with('/') {
         settle_command_palette(app);
     }
     app.update(Msg::Key(key(KeyCode::Enter)))
@@ -1202,7 +1202,7 @@ fn argument_completion_retains_old_rows_while_request_pending() {
 }
 
 #[test]
-fn unmatched_completion_items_cancel_the_argument_session() {
+fn unmatched_completion_items_keep_session_until_dismissal() {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     let registry = maki_commands::CommandRegistry::new();
@@ -1246,6 +1246,10 @@ fn unmatched_completion_items_cancel_the_argument_session() {
         "completion result was not applied",
     );
 
+    assert!(app.command_palette.completion_session_id().is_some());
+    assert_eq!(probe.try_finish_command_argument_lifecycle(), None);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
     assert!(app.command_palette.completion_session_id().is_none());
     assert_eq!(
         probe.try_finish_command_argument_lifecycle(),
@@ -4636,6 +4640,7 @@ fn copy_typed_completion_destination_policy(
     if expected_candidates.is_empty() {
         copy_type(&mut fixture.app, "\"destination folder/\"");
     }
+    settle_command_palette(&mut fixture.app);
     fixture.app.update(Msg::Key(key(KeyCode::Enter)));
 
     let message = fixture
@@ -7799,6 +7804,7 @@ fn cd_completion_no_match_tab_preserves_input_enter_executes(query: &str, exists
     std::fs::create_dir(tmp.path().join("empty")).unwrap();
     let input = format!("/cd {query}");
     app.update(Msg::Paste(input.clone()));
+    settle_command_palette(&mut app);
     assert!(app.command_palette.is_active());
     assert!(!app.command_palette.has_argument_selectable());
     let mode = app.state.mode.clone();
@@ -7863,6 +7869,7 @@ fn cd_completion_does_not_hijack_plugin_override() {
         },
     );
     app.update(Msg::Paste("/cd al".into()));
+    settle_command_palette(&mut app);
     assert!(!app.file_completion.is_active());
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");

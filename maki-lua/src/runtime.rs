@@ -4608,7 +4608,7 @@ mod tests {
     }
 
     #[test]
-    fn lua_completion_uses_registry_request_generations() {
+    fn lua_completion_retains_session_across_requests_until_terminal_event() {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Plugin);
         let probe = Arc::new(CompletionContextProbe::default());
@@ -4674,11 +4674,13 @@ mod tests {
         let (first, _) = adapter.context(&contexts[0], CancelToken::new().0, false);
         let (second, _) = adapter.context(&contexts[1], CancelToken::new().0, false);
         let (terminal, _) = adapter.context(&contexts[1], CancelToken::new().0, true);
+        let (reopened, _) = adapter.context(&contexts[1], CancelToken::new().0, false);
 
         assert_eq!(first.session, second.session);
         assert!(second.generation > first.generation);
         assert_eq!(terminal.session, second.session);
         assert_eq!(terminal.generation, second.generation);
+        assert_ne!(reopened.session, terminal.session);
     }
 
     #[test]
