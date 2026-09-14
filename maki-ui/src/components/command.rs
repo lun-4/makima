@@ -7,7 +7,7 @@ use maki_commands::{
     CompletionInput, CompletionItem, CompletionItemNavigation, CompletionProviders,
     CompletionResult, CompletionSession, CompletionSnapshot, CompletionSnapshotSink,
     PositionalArgument, QuoteStyle, RegistrySnapshot, ResolvedCommand, SlashClass, TargetHandle,
-    classify_input, encode_completion_value, lex_tolerant,
+    classify_input, encode_completion_value, lex_strict, lex_tolerant,
 };
 use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -1708,6 +1708,11 @@ fn typed_argument_at_cursor(
             (relative_cursor, relative_cursor, index)
         });
     let prefix_end = relative_cursor.clamp(start, end);
+    let end = lex_tolerant(args)
+        .ok()
+        .and_then(|tokens| tokens.into_iter().find(|token| token.range.start == start))
+        .filter(|token| lex_strict(&args[token.range.clone()]).is_ok())
+        .map_or(end, |token| token.range.end);
     let decoded_argument = lex_tolerant(&args[start..prefix_end])
         .ok()
         .and_then(|tokens| tokens.into_iter().next())
@@ -2775,6 +2780,30 @@ mod tests {
         assert_eq!(
             typed_argument_at_cursor(input, cursor, &schema),
             Some((6, 10, "pro".into(), 0))
+        );
+    }
+
+    #[test]
+    fn typed_argument_parser_replaces_closed_multiline_quote() {
+        let schema = [PositionalArgument::required(
+            "path",
+            ArgumentKind::Directory,
+        )];
+        let input = "/test \"pro\nject\"";
+        let cursor = input.find("pro").unwrap() + 3;
+        let (start, end, query, index) = typed_argument_at_cursor(input, cursor, &schema).unwrap();
+        assert_eq!(
+            (start, end, query.as_str(), index),
+            (6, input.len(), "pro", 0)
+        );
+
+        let edit = encode_completion_value("project/", start..end, QuoteStyle::Double);
+        let completed = format!("{}{}{}", &input[..start], edit.text, &input[end..]);
+        assert_eq!(completed, "/test \"project/\"");
+        assert!(
+            CommandArguments::Positional(schema.into())
+                .parse_invocation(command_args(&completed))
+                .is_ok()
         );
     }
 
