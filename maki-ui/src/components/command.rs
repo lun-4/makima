@@ -1180,6 +1180,7 @@ impl CommandPalette {
         Cadence::any([
             self.command_publication.cadence(),
             self.argument_publication.cadence(),
+            Cadence::when(self.pending_arguments.is_some(), Cadence::PENDING),
             Cadence::when(self.command_matching, Cadence::PENDING),
         ])
     }
@@ -1813,6 +1814,8 @@ mod tests {
     };
     use maki_config::DEFAULT_AUTOCOMPLETE_HEIGHT;
     use ratatui::Terminal;
+
+    use crate::repaint::Cadence;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use test_case::test_case;
@@ -2268,6 +2271,7 @@ mod tests {
             .unwrap();
         let _ = palette.poll_arguments();
         assert_eq!(palette.argument_match_items()[0].label.as_ref(), "visible");
+        assert_eq!(palette.cadence(), Cadence::PENDING);
 
         palette
             .completion_session
@@ -2284,6 +2288,7 @@ mod tests {
         assert!(palette.argument_items.is_empty());
         assert!(palette.argument_range.is_none());
         assert_eq!(palette.argument_grid.selected(), 0);
+        assert_eq!(palette.cadence(), Cadence::IDLE);
     }
 
     #[test_case(None; "empty_to_nonempty")]

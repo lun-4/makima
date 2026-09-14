@@ -36,6 +36,10 @@ const FILE_KIND: &str = "file";
 const DIRECTORY_KIND: &str = "directory";
 const DIRECTORY_SUFFIX: char = std::path::MAIN_SEPARATOR;
 
+fn ends_with_path_separator(value: &str) -> bool {
+    value.ends_with(std::path::is_separator)
+}
+
 pub(crate) struct CompletionGridItem<'a> {
     pub(crate) label: &'a str,
     pub(crate) description: Option<&'a str>,
@@ -434,9 +438,9 @@ impl PathDiscovery {
         } else {
             path
         };
-        let lists_path = value.ends_with(DIRECTORY_SUFFIX) || matches!(value, "~" | "." | "..");
+        let lists_path = ends_with_path_separator(value) || matches!(value, "~" | "." | "..");
         if lists_path {
-            let display_prefix = if value.ends_with(DIRECTORY_SUFFIX) {
+            let display_prefix = if ends_with_path_separator(value) {
                 value.to_string()
             } else {
                 format!("{value}{DIRECTORY_SUFFIX}")
@@ -531,11 +535,11 @@ impl PathDiscovery {
             return Ok((cwd.to_path_buf(), String::new(), String::new()));
         }
         let path = maki_commands::resolve_path(cwd, self.home.as_deref(), value)?;
-        let lists_path = value.ends_with(DIRECTORY_SUFFIX)
+        let lists_path = ends_with_path_separator(value)
             || value == "~"
             || matches!(value.rsplit(['/', '\\']).next(), Some("." | ".."));
         if lists_path {
-            let display_prefix = if value.ends_with(DIRECTORY_SUFFIX) {
+            let display_prefix = if ends_with_path_separator(value) {
                 value.to_string()
             } else {
                 format!("{value}{DIRECTORY_SUFFIX}")
@@ -1734,6 +1738,64 @@ mod tests {
             &[PathBuf::from(parent)]
         );
         assert_eq!(candidates, vec![(expected.to_owned(), true)]);
+    }
+
+    #[cfg(windows)]
+    #[test_case("src/", "C:\\work\\src", "src/child"; "relative_forward_slash")]
+    #[test_case("./src/", "C:\\work\\src", "./src/child"; "relative_dot_forward_slash")]
+    #[test_case("C:/work/src/", "C:\\work\\src", "C:/work/src/child"; "absolute_forward_slash")]
+    #[test_case("src\\nested/", "C:\\work\\src\\nested", "src\\nested/child"; "mixed_separators")]
+    fn windows_typed_directory_input_accepts_both_separators(
+        query: &str,
+        parent: &str,
+        expected: &str,
+    ) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "child".into(),
+                is_directory: true,
+            }],
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+
+        let candidates = discovery
+            .typed_candidates(Path::new("C:\\work"), query, true)
+            .unwrap();
+
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(candidates, vec![(expected.to_owned(), true)]);
+    }
+
+    #[cfg(windows)]
+    #[test_case("src/", "C:\\work\\src", "src/child"; "relative_forward_slash")]
+    #[test_case("./src/", "C:\\work\\src", "./src/child"; "relative_dot_forward_slash")]
+    #[test_case("C:/work/src/", "C:\\work\\src", "C:/work/src/child"; "absolute_forward_slash")]
+    #[test_case("src\\nested/", "C:\\work\\src\\nested", "src\\nested/child"; "mixed_separators")]
+    fn windows_reference_directory_input_accepts_both_separators(
+        query: &str,
+        parent: &str,
+        expected: &str,
+    ) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "child".into(),
+                is_directory: true,
+            }],
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+
+        let candidates = discovery.explicit_candidates(Path::new("C:\\work"), query);
+
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(candidates[0].path, expected);
     }
 
     #[test]
