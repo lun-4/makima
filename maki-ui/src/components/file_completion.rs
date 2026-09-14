@@ -490,7 +490,7 @@ impl PathDiscovery {
         directory_only: bool,
     ) -> io::Result<Vec<(String, bool)>> {
         let mut candidates = Vec::new();
-        self.visit_typed_candidates(cwd, value, directory_only, &mut |candidate| {
+        self.visit_typed_candidates(cwd, value, directory_only, &|| false, &mut |candidate| {
             candidates.push(candidate);
             true
         })?;
@@ -502,12 +502,16 @@ impl PathDiscovery {
         cwd: &Path,
         value: &str,
         directory_only: bool,
+        cancelled: &dyn Fn() -> bool,
         visitor: &mut dyn FnMut((String, bool)) -> bool,
     ) -> io::Result<()> {
         let (parent, prefix, display_prefix) = self
             .typed_query(cwd, value)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         self.resolver.visit_dir(&parent, &mut |candidate| {
+            if cancelled() {
+                return false;
+            }
             if (directory_only && !candidate.is_directory)
                 || (!prefix.is_empty() && !candidate.path.starts_with(&prefix))
             {

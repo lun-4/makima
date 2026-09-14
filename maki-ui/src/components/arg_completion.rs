@@ -69,13 +69,19 @@ impl CommandCompletion for PathArgSource {
             smol::unblock(move || {
                 let mut items = Vec::new();
                 discovery
-                    .visit_typed_candidates(&cwd, &query, directory_only, &mut |candidate| {
-                        if cancellation.is_cancelled() || items.len() == MAX_COMPLETION_CANDIDATES {
-                            return false;
-                        }
-                        items.push(path_completion_item(candidate));
-                        true
-                    })
+                    .visit_typed_candidates(
+                        &cwd,
+                        &query,
+                        directory_only,
+                        &|| cancellation.is_cancelled(),
+                        &mut |candidate| {
+                            if items.len() == MAX_COMPLETION_CANDIDATES {
+                                return false;
+                            }
+                            items.push(path_completion_item(candidate));
+                            true
+                        },
+                    )
                     .map_err(|_| CompletionError::Unavailable)?;
                 Ok(items)
             })
@@ -115,19 +121,25 @@ impl CommandCompletion for PathArgSource {
             smol::unblock(move || {
                 let mut items = Vec::new();
                 discovery
-                    .visit_typed_candidates(&cwd, &query, directory_only, &mut |candidate| {
-                        if cancellation.is_cancelled() || items.len() == MAX_COMPLETION_CANDIDATES {
-                            return false;
-                        }
-                        items.push(path_completion_item(candidate));
-                        if items.len().is_multiple_of(PATH_COMPLETION_BATCH_SIZE) {
-                            items.sort_by(|left, right| left.insertion.cmp(&right.insertion));
-                            if publisher.publish(items.clone()).is_err() {
+                    .visit_typed_candidates(
+                        &cwd,
+                        &query,
+                        directory_only,
+                        &|| cancellation.is_cancelled(),
+                        &mut |candidate| {
+                            if items.len() == MAX_COMPLETION_CANDIDATES {
                                 return false;
                             }
-                        }
-                        true
-                    })
+                            items.push(path_completion_item(candidate));
+                            if items.len().is_multiple_of(PATH_COMPLETION_BATCH_SIZE) {
+                                items.sort_by(|left, right| left.insertion.cmp(&right.insertion));
+                                if publisher.publish(items.clone()).is_err() {
+                                    return false;
+                                }
+                            }
+                            true
+                        },
+                    )
                     .map_err(|_| CompletionError::Unavailable)?;
                 if !cancellation.is_cancelled() {
                     items.sort_by(|left, right| left.insertion.cmp(&right.insertion));
@@ -315,6 +327,7 @@ mod tests {
         CompletionResult, CompletionSnapshotSink, HostResponse, ProducerPrecedence, Registration,
         TargetCapabilities,
     };
+    use test_case::test_case;
 
     use crate::components::file_completion::{FileCandidate, FileResolver, PathDiscovery};
     use crate::theme::InMemoryThemesProvider;
@@ -610,6 +623,7 @@ mod tests {
         visited: AtomicUsize,
         reached_batch: mpsc::SyncSender<()>,
         release: Mutex<mpsc::Receiver<()>>,
+        directories: bool,
     }
 
     impl FileResolver for GatedResolver {
@@ -628,7 +642,12 @@ mod tests {
                     self.release.lock().unwrap().recv().unwrap();
                 }
                 self.visited.fetch_add(1, Ordering::Relaxed);
-                if !visitor(directory(&format!("entry-{index}"))) {
+                let candidate = if self.directories {
+                    directory(&format!("entry-{index}"))
+                } else {
+                    file(&format!("entry-{index}"))
+                };
+                if !visitor(candidate) {
                     break;
                 }
             }
@@ -636,14 +655,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn typed_path_publishes_partial_snapshot_and_stops_after_cancellation() {
+    #[test_case("", true, true; "matching_entries")]
+    #[test_case("no-match", true, false; "nonmatching_prefix")]
+    #[test_case("", false, false; "directory_only_rejects_files")]
+    fn typed_path_stops_after_cancellation(query: &str, directories: bool, expects_snapshot: bool) {
         let (reached_tx, reached_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let resolver = Arc::new(GatedResolver {
             visited: AtomicUsize::new(0),
             reached_batch: reached_tx,
             release: Mutex::new(release_rx),
+            directories,
         });
         let source = Arc::new(PathArgSource::with_discovery(PathDiscovery::with_resolver(
             Arc::clone(&resolver) as Arc<dyn FileResolver>,
@@ -651,13 +673,14 @@ mod tests {
         )));
         let session = session_fixture(source, "/workspace/project");
         let (snapshots_tx, snapshots_rx) = mpsc::channel();
+        let query: Arc<str> = Arc::from(query);
         let worker = {
             let session = session.clone();
             thread::spawn(move || {
                 smol::block_on(session.complete_input_with_sink(
                     CompletionInput {
-                        arguments: Arc::from(""),
-                        argument: Arc::from(""),
+                        arguments: Arc::clone(&query),
+                        argument: query,
                         argument_index: 0,
                         argument_range: Some(0..0),
                         mode: Arc::from("default"),
@@ -670,8 +693,12 @@ mod tests {
         };
 
         reached_rx.recv().unwrap();
-        let first = snapshots_rx.recv().unwrap();
-        assert_eq!(first.candidates.len(), PATH_COMPLETION_BATCH_SIZE);
+        if expects_snapshot {
+            let first = snapshots_rx.recv().unwrap();
+            assert_eq!(first.candidates.len(), PATH_COMPLETION_BATCH_SIZE);
+        } else {
+            assert!(snapshots_rx.try_recv().is_err());
+        }
         session.cancel().unwrap();
         release_tx.send(()).unwrap();
 
