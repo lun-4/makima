@@ -79,6 +79,7 @@ pub struct CommandPalette {
     current_arg_count: usize,
     argument_items: Vec<ArgumentMatch>,
     argument_range: Option<(usize, usize)>,
+    active_argument_start: Option<usize>,
     argument_kind: Option<ArgumentKind>,
     typed_argument_owned: bool,
     argument_generation: u64,
@@ -195,6 +196,7 @@ impl CommandPalette {
             current_arg_count: 0,
             argument_items: Vec::new(),
             argument_range: None,
+            active_argument_start: None,
             argument_kind: None,
             typed_argument_owned: false,
             argument_generation: 0,
@@ -307,7 +309,7 @@ impl CommandPalette {
                     || self.completion_session.is_some()
                     || self.typed_argument_owned
                 {
-                    let dismissed_start = self.argument_range.map(|(start, _)| start);
+                    let dismissed_start = self.active_argument_start;
                     self.cancel_arguments();
                     self.dismissed_argument_input =
                         dismissed_start.map(|start| (input.to_owned(), start));
@@ -478,6 +480,7 @@ impl CommandPalette {
         self.typed_argument_owned = true;
         self.argument_kind = Some(kind);
         self.argument_range = Some((0, 1));
+        self.active_argument_start = Some(0);
         self.argument_items = (0..count)
             .map(|index| ArgumentMatch {
                 candidate: None,
@@ -566,6 +569,7 @@ impl CommandPalette {
             (),
         );
         self.argument_range = Some(range);
+        self.active_argument_start = Some(range.0);
         self.typed_argument_owned = true;
         self.argument_items = items
             .into_iter()
@@ -641,6 +645,7 @@ impl CommandPalette {
             return abandoned;
         };
         self.typed_argument_owned = typed;
+        self.active_argument_start = Some(start);
         self.argument_kind = typed
             .then(|| {
                 command.spec().arguments.positional().and_then(|schema| {
@@ -1028,6 +1033,7 @@ impl CommandPalette {
     fn reset_argument_state(&mut self) {
         self.argument_items.clear();
         self.argument_range = None;
+        self.active_argument_start = None;
         self.argument_kind = None;
         self.typed_argument_owned = false;
         self.pending_arguments = None;
@@ -1984,6 +1990,41 @@ mod tests {
             palette.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), input),
             CommandAction::Execute(command) if command.command.invoked_name() == "/cd"
         ));
+    }
+
+    #[test]
+    fn escape_suppresses_settled_empty_typed_completion() {
+        let (mut palette, started, release, _) = gated_directory_palette();
+        let input = "/cd missing";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started.recv().unwrap();
+        publisher.finish_with(Vec::new()).unwrap();
+        release.send(()).unwrap();
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+
+        palette.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), input);
+        assert_eq!(
+            palette.dismissed_argument_input,
+            Some((input.to_owned(), 4))
+        );
+        assert!(!palette.sync_arguments(input, input.len() - 1, "insert"));
+        assert!(palette.pending_arguments.is_none());
+    }
+
+    #[test]
+    fn escape_suppresses_pending_typed_completion() {
+        let (mut palette, started, release, _) = gated_directory_palette();
+        let input = "/cd missing";
+        palette.sync_arguments(input, input.len(), "insert");
+        let _publisher = started.recv().unwrap();
+
+        palette.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), input);
+        assert!(!palette.sync_arguments(input, input.len() - 1, "insert"));
+        assert!(palette.pending_arguments.is_none());
+        release.send(()).unwrap();
     }
 
     #[test_case(None; "empty")]
