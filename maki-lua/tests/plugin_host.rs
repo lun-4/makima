@@ -2893,20 +2893,48 @@ fn register_command_typed_arguments_registers_descriptor_completion_and_context(
     ));
 }
 
-#[test]
-fn register_command_rejects_removed_nargs_field() {
+#[test_case::test_case("nargs = 1", "use typed descriptors in 'arguments'"; "nargs")]
+#[test_case::test_case("completion = function() end", "set 'completion' on each typed descriptor in 'arguments'"; "completion")]
+#[test_case::test_case("argument_completion = function() end", "set 'completion' on each typed descriptor in 'arguments'"; "argument_completion")]
+#[test_case::test_case("completions = {}", "set 'completion' on each typed descriptor in 'arguments'"; "completions")]
+fn register_command_removed_fields_include_migration_hint(field: &str, expected: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
     let error = host
         .load_source(
             "typed_commands",
-            r#"maki.api.register_command({
-                name = "/typed", tui_only = false, nargs = 1,
-                arguments = {{ name = "value", type = "string" }},
-                handler = function() end,
-            })"#,
+            &format!(
+                r#"maki.api.register_command({{
+                    name = "/typed", tui_only = false, {field},
+                    arguments = {{{{ name = "value", type = "string" }}}},
+                    handler = function() end,
+                }})"#
+            ),
         )
         .expect_err("expected removed field rejection");
-    assert!(error.to_string().contains("unsupported field 'nargs'"));
+    let error = error.to_string();
+    assert!(error.contains("unsupported field"), "{error}");
+    assert!(error.contains(expected), "{error}");
+}
+
+#[test_case::test_case("{ name = 'value', type = 'string', typo = true }", "unknown argument field 'typo'"; "unknown_scalar_field")]
+#[test_case::test_case("{ name = 'value', type = 'string', choices = { 'x' } }", "unknown argument field 'choices'"; "choices_on_scalar")]
+#[test_case::test_case("{ name = 'value', type = 'enum', choices = { 'x' }, typo = true }", "unknown argument field 'typo'"; "unknown_enum_field")]
+#[test_case::test_case("{ name = 'value', type = 'string', completion = { items = {}, typo = true } }", "unknown completion field 'typo'"; "unknown_completion_field")]
+fn register_command_rejects_unknown_typed_argument_fields(descriptor: &str, expected: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let error = host
+        .load_source(
+            "typed_commands",
+            &format!(
+                r#"maki.api.register_command({{
+                    name = "/typed", tui_only = false,
+                    arguments = {{ {descriptor} }},
+                    handler = function() end,
+                }})"#
+            ),
+        )
+        .expect_err("expected unknown field rejection");
+    assert!(error.to_string().contains(expected), "{error}");
 }
 
 #[test]

@@ -401,39 +401,17 @@ browsing memory files or toggling settings.
     separators or alternate bases. The inclusive exact
     range is `-9007199254740991` to
     `9007199254740991`.
-
-  Completion is declared on each typed descriptor with `completion = false`,
-
-
-  `completion = "disabled"`, or a provider table.
-
-
-  A provider table contains exactly one of `items` and
-
-
-  `get_items`, and may set `mode` to `"replace"` or
-
-
-  `"extend"` (`"replace"` is the default). Defaults are
-
-
-  enum choices in the core
-
-
-  and file or directory discovery in the TUI. String
-
-
-  and integer defaults are empty. Provider callbacks
-
-
-  receive the typed argument name, type, parsed
-
-
-  preceding values, and the command completion context.
-
-
-  Raw commands do not have argument completion providers.
-
+    Completion is declared on each typed descriptor
+    with `completion = false`, `completion = "disabled"`,
+    or a provider table. A provider table contains exactly
+    one of `items` and `get_items`, and may set `mode` to
+    `"replace"` or `"extend"` (`"replace"` is the default).
+    Defaults are enum choices in the core and file or
+    directory discovery in the TUI. String and integer
+    defaults are empty. Provider callbacks receive the
+    typed argument name, type, parsed preceding values,
+    and the command completion context. Raw commands do
+    not have argument completion providers.
 
 **Example:**
 

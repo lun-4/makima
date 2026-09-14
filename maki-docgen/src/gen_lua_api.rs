@@ -44,6 +44,10 @@ mod tests {
             .expect("register_command section must have a separator");
         let section = &page[start..end];
         let rendered = section.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !section.contains("| Completion is declared"),
+            "completion prose must remain part of the arguments parameter"
+        );
         let required = [
             "A required scalar consumes exactly one value.",
             "An optional scalar consumes zero or one value.",

@@ -61,6 +61,25 @@ const ARGUMENT_ENUM_ERR: &str =
     "register_command: enum argument 'choices' must be a non-empty array of strings";
 const ARGUMENT_OPTIONAL_ERR: &str = "register_command: argument 'optional' must be a boolean";
 const ARGUMENT_VARIADIC_ERR: &str = "register_command: argument 'variadic' must be a boolean";
+const ARGUMENT_KEYS: &[&str] = &["name", "type", "optional", "variadic", "completion"];
+const ENUM_ARGUMENT_KEYS: &[&str] = &[
+    "name",
+    "type",
+    "choices",
+    "optional",
+    "variadic",
+    "completion",
+];
+const COMPLETION_KEYS: &[&str] = &[
+    "items",
+    "get_items",
+    "mode",
+    "policy",
+    "on_highlight",
+    "on_accept",
+    "on_cancel",
+    "navigation",
+];
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -865,17 +884,17 @@ fn register_permission_rule(
 ///                          separators or alternate bases. The inclusive exact
 ///                          range is `-9007199254740991` to
 ///                          `9007199254740991`.
-///   Completion is declared on each typed descriptor with `completion = false`,
-///                            `completion = "disabled"`, or a provider table.
-///                            A provider table contains exactly one of `items` and
-///                            `get_items`, and may set `mode` to `"replace"` or
-///                            `"extend"` (`"replace"` is the default). Defaults are
-///                            enum choices in the core
-///                            and file or directory discovery in the TUI. String
-///                            and integer defaults are empty. Provider callbacks
-///                            receive the typed argument name, type, parsed
-///                            preceding values, and the command completion context.
-///                            Raw commands do not have argument completion providers.
+///                            Completion is declared on each typed descriptor
+///                            with `completion = false`, `completion = "disabled"`,
+///                            or a provider table. A provider table contains exactly
+///                            one of `items` and `get_items`, and may set `mode` to
+///                            `"replace"` or `"extend"` (`"replace"` is the default).
+///                            Defaults are enum choices in the core and file or
+///                            directory discovery in the TUI. String and integer
+///                            defaults are empty. Provider callbacks receive the
+///                            typed argument name, type, parsed preceding values,
+///                            and the command completion context. Raw commands do
+///                            not have argument completion providers.
 /// @return
 /// @example
 /// -- Documentation and test example. It is not bundled and never copies files.
@@ -1565,6 +1584,7 @@ fn parse_arguments(
                 LuaValue::Boolean(value) => value,
                 _ => return Err(mlua::Error::runtime(ARGUMENT_VARIADIC_ERR)),
             };
+            let kind = parse_argument_kind(&argument)?;
             let completion_value = argument.get::<LuaValue>("completion")?;
             let completion = match &completion_value {
                 LuaValue::Table(table) => Some(parse_argument_completion(lua, table)?),
@@ -1590,7 +1610,7 @@ fn parse_arguments(
             };
             parsed.push(PositionalArgument {
                 name: Arc::from(name),
-                kind: parse_argument_kind(&argument)?,
+                kind,
                 optional,
                 variadic,
                 completion: policy,
@@ -1623,10 +1643,37 @@ fn dense_sequence_values<T: mlua::FromLua>(
     Ok(values)
 }
 
+fn reject_unknown_keys(table: &Table, allowed: &[&str], context: &str) -> LuaResult<()> {
+    for pair in table.clone().pairs::<LuaValue, LuaValue>() {
+        let (key, _) = pair?;
+        let LuaValue::String(key) = key else {
+            return Err(mlua::Error::runtime(format!(
+                "register_command: {context} fields must use string keys"
+            )));
+        };
+        let key = key.to_string_lossy();
+        if !allowed.contains(&key.as_ref()) {
+            return Err(mlua::Error::runtime(format!(
+                "register_command: unknown {context} field '{key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn parse_argument_kind(argument: &Table) -> LuaResult<ArgumentKind> {
     let kind: String = argument
         .get("type")
         .map_err(|_| mlua::Error::runtime(ARGUMENT_TYPE_ERR))?;
+    reject_unknown_keys(
+        argument,
+        if kind == "enum" {
+            ENUM_ARGUMENT_KEYS
+        } else {
+            ARGUMENT_KEYS
+        },
+        "argument",
+    )?;
     match kind.as_str() {
         "string" => Ok(ArgumentKind::String),
         "integer" => Ok(ArgumentKind::Integer),
@@ -1650,6 +1697,7 @@ fn parse_argument_kind(argument: &Table) -> LuaResult<ArgumentKind> {
 }
 
 fn parse_argument_completion(lua: &Lua, spec: &Table) -> LuaResult<ArgumentCompletion> {
+    reject_unknown_keys(spec, COMPLETION_KEYS, "completion")?;
     let items = spec.get::<Option<Table>>("items")?;
     let get_items = spec.get::<Option<Function>>("get_items")?;
     if items.is_some() == get_items.is_some() {
@@ -1754,10 +1802,24 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         LuaValue::Boolean(value) => value,
         _ => return Err(mlua::Error::runtime(TUI_ONLY_ERR)),
     };
-    for key in ["nargs", "completion", "argument_completion", "completions"] {
+    for (key, replacement) in [
+        ("nargs", "use typed descriptors in 'arguments'"),
+        (
+            "completion",
+            "set 'completion' on each typed descriptor in 'arguments'",
+        ),
+        (
+            "argument_completion",
+            "set 'completion' on each typed descriptor in 'arguments'",
+        ),
+        (
+            "completions",
+            "set 'completion' on each typed descriptor in 'arguments'",
+        ),
+    ] {
         if spec.contains_key(key)? {
             return Err(mlua::Error::runtime(format!(
-                "register_command: unsupported field '{key}'"
+                "register_command: unsupported field '{key}'; {replacement}"
             )));
         }
     }

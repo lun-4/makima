@@ -988,9 +988,9 @@ fn parse_query(query: &str) -> QueryIntent {
                     has_colon: false,
                 };
             }
-            if let Some(payload_start) = lowered.strip_prefix(&format!("{alias}:")) {
-                let payload_start = payload_start.as_ptr() as usize - lowered.as_ptr() as usize;
-                let payload = &query[payload_start..];
+            let prefix = format!("{alias}:");
+            if lowered.starts_with(&prefix) {
+                let payload = &query[prefix.len()..];
                 return QueryIntent {
                     payload: payload.into(),
                     kind: Some(kind),

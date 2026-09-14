@@ -1963,13 +1963,19 @@ fn command_registrations(
                 .flatten()
                 .enumerate()
                 .map(|(index, _)| {
-                    let completion = entry.argument_completions.get(index)?.as_ref()?;
-                    let callbacks = completion_callbacks(lua, completion, schema.clone()).ok()?;
+                    let Some(completion) = entry
+                        .argument_completions
+                        .get(index)
+                        .and_then(Option::as_ref)
+                    else {
+                        return Ok(None);
+                    };
+                    let callbacks = completion_callbacks(lua, completion, schema.clone())?;
                     let directory_navigation = matches!(
                         completion.navigation,
                         Some(crate::api::util::command::ArgumentCompletionNavigation::Directory)
                     );
-                    Some(Arc::new(LuaCommandCompletion {
+                    Ok(Some(Arc::new(LuaCommandCompletion {
                         plugin: Arc::clone(plugin),
                         command: Arc::clone(name),
                         argument_index: Some(index),
@@ -1980,9 +1986,9 @@ fn command_registrations(
                         command_argument_lifecycle: command_argument_lifecycle.clone(),
                         sessions: Mutex::new(HashMap::new()),
                         next_session_id: AtomicU64::new(1),
-                    }) as Arc<dyn CommandCompletion>)
+                    }) as Arc<dyn CommandCompletion>))
                 })
-                .collect();
+                .collect::<mlua::Result<Vec<_>>>()?;
             Ok(Registration {
                 spec: CommandSpec {
                     name: Arc::clone(name),
@@ -4605,6 +4611,48 @@ mod tests {
             queued.cancel.is_cancelled(),
             "async task should inherit parent cancel"
         );
+    }
+
+    #[test]
+    fn command_registration_propagates_completion_callback_clone_errors() {
+        let lua = test_lua();
+        let foreign_lua = Lua::new();
+        let invalid = foreign_lua
+            .create_registry_value(foreign_lua.create_table().unwrap())
+            .unwrap();
+        let commands = HashMap::from([(
+            Arc::from("/complete"),
+            crate::api::util::command::CommandEntry {
+                generation: 0,
+                handler: enqueue_dummy(&lua),
+                description: Arc::from("complete"),
+                argument_hint: None,
+                arguments: CommandArguments::Positional(Arc::from([
+                    maki_commands::PositionalArgument::required(
+                        "value",
+                        maki_commands::ArgumentKind::String,
+                    ),
+                ])),
+                tui_only: false,
+                argument_completions: vec![Some(crate::api::util::command::ArgumentCompletion {
+                    completion: invalid,
+                    on_highlight: None,
+                    on_accept: None,
+                    on_cancel: None,
+                    navigation: None,
+                })],
+            },
+        )]);
+        let error = command_registrations(
+            &lua,
+            Some(&commands),
+            &Arc::from("test"),
+            &flume::unbounded().0,
+            &CoalescedLatest::new(|_| false),
+            &CoalescedLatest::new(|_| false),
+        )
+        .expect_err("invalid callback key must abort command publication");
+        assert!(!error.to_string().is_empty());
     }
 
     #[test]

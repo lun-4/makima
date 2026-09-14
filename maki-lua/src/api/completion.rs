@@ -772,6 +772,8 @@ pub(crate) fn install(lua: &Lua) {
 
 #[cfg(test)]
 mod tests {
+    use maki_commands::{ArgumentKind, CommandArguments, PositionalArgument};
+
     use super::*;
     use crate::api::util::pair::Pair;
 
@@ -1187,11 +1189,8 @@ mod tests {
                         .unwrap(),
                     description: Arc::from("deploy"),
                     argument_hint: None,
-                    arguments: maki_commands::CommandArguments::Positional(Arc::from([
-                        maki_commands::PositionalArgument::required(
-                            "environment",
-                            maki_commands::ArgumentKind::String,
-                        ),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        PositionalArgument::required("environment", ArgumentKind::String),
                     ])),
                     tui_only: false,
                     argument_completions: vec![Some(

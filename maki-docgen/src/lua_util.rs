@@ -330,13 +330,50 @@ fn parse_arguments(node: Node<'_>, source: &str) -> Result<CommandArguments> {
 }
 
 fn parse_argument(node: Node<'_>, source: &str) -> Result<PositionalArgument> {
+    let fields = table_fields(node)
+        .map(|field| Ok((table_field_name(field, source)?, field)))
+        .collect::<Result<Vec<_>>>()?;
+    let type_name = fields
+        .iter()
+        .find(|(key, _)| key == "type")
+        .map(|(_, field)| {
+            field
+                .child_by_field_name("value")
+                .ok_or_else(|| {
+                    node_error(
+                        *field,
+                        source,
+                        "registration argument field `type` has no value",
+                    )
+                })
+                .and_then(|value| string_field(value, source, "argument type"))
+        })
+        .transpose()?
+        .ok_or_else(|| node_error(node, source, "registration argument is missing `type`"))?;
+    let allowed = if type_name == "enum" {
+        &[
+            "name",
+            "type",
+            "choices",
+            "optional",
+            "variadic",
+            "completion",
+        ][..]
+    } else {
+        &["name", "type", "optional", "variadic", "completion"][..]
+    };
     let mut name = None;
-    let mut type_name = None;
     let mut choices = None;
     let mut optional = false;
     let mut variadic = false;
-    for field in table_fields(node) {
-        let key = table_field_name(field, source)?;
+    for (key, field) in fields {
+        if !allowed.contains(&key.as_str()) {
+            return Err(node_error(
+                key_node(field),
+                source,
+                &format!("unknown registration argument field `{key}`"),
+            ));
+        }
         let value = field.child_by_field_name("value").ok_or_else(|| {
             node_error(
                 field,
@@ -346,17 +383,15 @@ fn parse_argument(node: Node<'_>, source: &str) -> Result<PositionalArgument> {
         })?;
         match key.as_str() {
             "name" => name = Some(string_field(value, source, "argument name")?),
-            "type" => type_name = Some(string_field(value, source, "argument type")?),
+            "type" | "completion" => {}
             "choices" => choices = Some(parse_choices(value, source)?),
             "optional" => optional = boolean_field(value, source, "argument optional")?,
             "variadic" => variadic = boolean_field(value, source, "argument variadic")?,
-            _ => {}
+            _ => unreachable!("allowed argument field"),
         }
     }
     let name =
         name.ok_or_else(|| node_error(node, source, "registration argument is missing `name`"))?;
-    let type_name = type_name
-        .ok_or_else(|| node_error(node, source, "registration argument is missing `type`"))?;
     let kind = match type_name.as_str() {
         "string" if choices.is_none() => ArgumentKind::String,
         "integer" if choices.is_none() => ArgumentKind::Integer,
@@ -848,6 +883,47 @@ mod tests {
             &commands[1].arguments,
             CommandArguments::Raw { required: false }
         ));
+    }
+
+    #[test_case(
+        "{ name = 'value', type = 'string', typo = true }",
+        "unknown registration argument field `typo`"
+        ; "unknown_scalar_field"
+    )]
+    #[test_case(
+        "{ name = 'value', type = 'string', choices = { 'x' } }",
+        "unknown registration argument field `choices`"
+        ; "choices_on_scalar"
+    )]
+    #[test_case(
+        "{ name = 'value', type = 'enum', choices = { 'x' }, typo = true }",
+        "unknown registration argument field `typo`"
+        ; "unknown_enum_field"
+    )]
+    fn rejects_unknown_typed_argument_fields(descriptor: &str, expected: &str) {
+        let source = format!(
+            r#"maki.api.register_command({{
+                name = "/typed",
+                description = "Typed",
+                tui_only = false,
+                arguments = {{ {descriptor} }},
+            }})"#
+        );
+        let error = parse_lua_commands(&source).expect_err("unknown field");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn accepts_completion_field_in_typed_argument_docs() {
+        let source = r#"maki.api.register_command({
+            name = "/typed",
+            description = "Typed",
+            tui_only = false,
+            arguments = {
+                { name = "value", type = "string", completion = { get_items = provider } },
+            },
+        })"#;
+        assert_eq!(parse_lua_commands(source).expect("command").len(), 1);
     }
 
     #[test]

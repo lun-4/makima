@@ -402,6 +402,15 @@ mod tests {
     }
 
     #[test]
+    fn command_argument_completion_is_its_own_paragraph() {
+        let generated = generate().expect("generated commands");
+        assert!(
+            generated
+                .contains("opts.values` keyed by argument name.\n\nCompletion callbacks receive")
+        );
+    }
+
+    #[test]
     fn doc_projection_separates_builtins_and_bundled_plugins() {
         let generated = generate().expect("generated commands");
         let (builtins, plugins) = generated
