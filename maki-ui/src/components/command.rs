@@ -961,8 +961,8 @@ impl CommandPalette {
     fn finish_empty_arguments(&mut self, pending: PendingArguments) {
         if self
             .argument_publication
-            .commit(pending.generation, pending.key, ())
-            == Publication::Commit
+            .clear_request(pending.generation, &pending.key)
+            == Publication::Clear
         {
             self.argument_items.clear();
             self.argument_range = None;
@@ -1980,6 +1980,39 @@ mod tests {
         let _ = palette.poll_arguments();
         assert_eq!(palette.argument_match_items()[0].label.as_ref(), "match");
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn cancelled_incremental_completion_clears_visible_rows() {
+        let (mut palette, started, release, _) = gated_directory_palette();
+        let input = "/cd ";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started.recv().unwrap();
+        publisher
+            .publish(vec![CompletionItem {
+                label: Arc::from("visible"),
+                insertion: Arc::from("visible"),
+                description: None,
+            }])
+            .unwrap();
+        let _ = palette.poll_arguments();
+        assert_eq!(palette.argument_match_items()[0].label.as_ref(), "visible");
+
+        palette
+            .completion_session
+            .as_ref()
+            .unwrap()
+            .cancel()
+            .unwrap();
+        release.send(()).unwrap();
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+
+        assert!(palette.argument_items.is_empty());
+        assert!(palette.argument_range.is_none());
+        assert_eq!(palette.argument_grid.selected(), 0);
     }
 
     #[test_case(None; "empty_to_nonempty")]
