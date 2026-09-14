@@ -345,6 +345,14 @@ pub(crate) fn lifecycle_superseded(
     this: &CommandArgumentLifecycleRequest,
     pending: &CommandArgumentLifecycleRequest,
 ) -> bool {
+    if this.context.command != pending.context.command
+        || this.context.plugin != pending.context.plugin
+        || this.context.index != pending.context.index
+        || this.context.session != pending.context.session
+        || this.context.command_generation != pending.context.command_generation
+    {
+        return false;
+    }
     match pending.event {
         CommandArgumentLifecycle::Highlight => {
             matches!(this.event, CommandArgumentLifecycle::Highlight)
@@ -4288,6 +4296,21 @@ mod tests {
             lifecycle_superseded(&lifecycle_req(this_event), &lifecycle_req(pending_event)),
             expected
         );
+    }
+
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.index += 1; "argument")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.session += 1; "session")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.command = Arc::from("/other"); "command")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.plugin = Arc::from("other"); "plugin")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.command_generation += 1; "command_generation")]
+    fn lifecycle_events_from_distinct_providers_do_not_coalesce(
+        change_identity: fn(&mut CommandArgumentLifecycleRequest),
+    ) {
+        let this = lifecycle_req(CommandArgumentLifecycle::Cancel);
+        let mut pending = lifecycle_req(CommandArgumentLifecycle::Cancel);
+        change_identity(&mut pending);
+
+        assert!(!lifecycle_superseded(&this, &pending));
     }
 
     #[test]
