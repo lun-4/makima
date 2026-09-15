@@ -415,7 +415,20 @@ async fn handle_request(
         "session/set_config_option" => handle_set_config(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
+    respond_request(srv, method, id, result);
+}
+
+fn respond_request(
+    srv: &Server,
+    method: &str,
+    id: RequestId,
+    result: Result<AgentResponse, AcpError>,
+) {
+    let session_started = matches!(method, "session/new" | "session/load") && result.is_ok();
     srv.respond(id, result);
+    if session_started {
+        emit_current_commands(srv);
+    }
 }
 
 async fn new_session(
@@ -888,10 +901,6 @@ async fn install_session_with_lock(
         ),
     );
     let session_id = SessionId::from(handle.session_id.to_string());
-    let commands = command_registry
-        .presented_commands(&command_target)
-        .unwrap_or_default();
-    emit_available_commands(&srv.out_tx, &session_id, &commands);
     let command_projection_task = watch_available_commands(
         srv.out_tx.clone(),
         session_id.clone(),
@@ -927,6 +936,19 @@ async fn install_session_with_lock(
         lock: Some(lock),
     });
     Some(option_snapshot)
+}
+
+fn emit_current_commands(srv: &Server) {
+    let Some(session) = &srv.session else { return };
+    let commands = session
+        .command_registry
+        .presented_commands(&session.command_target)
+        .unwrap_or_default();
+    emit_available_commands(
+        &srv.out_tx,
+        &SessionId::from(session.handle.session_id.to_string()),
+        &commands,
+    );
 }
 
 fn available_commands(commands: &[PresentedCommand]) -> Vec<AvailableCommand> {
@@ -2934,6 +2956,35 @@ mod tests {
                 .unwrap();
             assert_eq!(input_rx.recv_async().await.unwrap().message, "second");
         });
+    }
+
+    #[test]
+    fn new_session_response_precedes_available_commands() {
+        let (srv, _, out_rx, _) = server_awaiting_answer();
+        let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+        let response = methods::new_session_response(&session_id, &srv.modes);
+
+        respond_request(
+            &srv,
+            "session/new",
+            RequestId::Number(43),
+            Ok(AgentResponse::NewSessionResponse(response)),
+        );
+
+        let response = out_rx.recv().unwrap();
+        assert_eq!(response["id"], 43);
+        let update = out_rx.recv().unwrap();
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"],
+            "available_commands_update"
+        );
+        assert!(
+            update["params"]["update"]["availableCommands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command["name"] == "compact")
+        );
     }
 
     #[test]
