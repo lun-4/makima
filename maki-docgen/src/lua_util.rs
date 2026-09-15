@@ -1,17 +1,27 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use color_eyre::eyre::{Context, Result, eyre};
+use maki_commands::{ArgumentKind, CommandArguments, CompletionPolicy, PositionalArgument};
 use tree_sitter::{Node, Parser};
 
 const REQUIRED_FIELDS: [&str; 3] = ["name", "description", "tui_only"];
-const DOCUMENTED_FIELDS: [&str; 4] = ["name", "description", "argument_hint", "tui_only"];
+const DOCUMENTED_FIELDS: [&str; 5] = [
+    "name",
+    "description",
+    "argument_hint",
+    "arguments",
+    "tui_only",
+];
+const REMOVED_FIELDS: [&str; 4] = ["nargs", "completion", "argument_completion", "completions"];
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaPluginCommand {
     pub name: String,
     pub description: String,
     pub argument_hint: Option<String>,
+    pub arguments: CommandArguments,
     pub tui_only: bool,
 }
 
@@ -123,6 +133,7 @@ fn parse_command(node: Node<'_>, source: &str) -> Result<LuaPluginCommand> {
     let mut name = None;
     let mut description = None;
     let mut argument_hint = None;
+    let mut arguments = None;
     let mut tui_only = None;
     let mut seen = [false; DOCUMENTED_FIELDS.len()];
 
@@ -157,6 +168,13 @@ fn parse_command(node: Node<'_>, source: &str) -> Result<LuaPluginCommand> {
             }
         };
         let Some(index) = DOCUMENTED_FIELDS.iter().position(|field| *field == key) else {
+            if REMOVED_FIELDS.contains(&key.as_str()) {
+                return Err(node_error(
+                    key_node(field),
+                    source,
+                    &format!("registration field `{key}` is obsolete; use `arguments`"),
+                ));
+            }
             continue;
         };
         if seen[index] {
@@ -184,6 +202,16 @@ fn parse_command(node: Node<'_>, source: &str) -> Result<LuaPluginCommand> {
                 } else {
                     Some(string_field(value, source, &key)?)
                 };
+            }
+            "arguments" => {
+                if arguments.is_some() {
+                    return Err(node_error(
+                        value,
+                        source,
+                        "duplicate registration field `arguments`",
+                    ));
+                }
+                arguments = Some(parse_arguments(value, source)?);
             }
             "tui_only" => {
                 tui_only = match value.kind() {
@@ -220,8 +248,253 @@ fn parse_command(node: Node<'_>, source: &str) -> Result<LuaPluginCommand> {
         name: name.expect("required field checked"),
         description: description.expect("required field checked"),
         argument_hint,
+        arguments: arguments.unwrap_or_else(|| CommandArguments::Positional(Arc::from([]))),
         tui_only: tui_only.expect("required field checked"),
     })
+}
+
+fn table_fields<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+fn parse_arguments(node: Node<'_>, source: &str) -> Result<CommandArguments> {
+    if node.kind() != "table_constructor" {
+        return Err(node_error(
+            node,
+            source,
+            "registration field `arguments` must be an inline table",
+        ));
+    }
+    let fields: Vec<_> = table_fields(node).collect();
+    if fields.iter().any(|field| {
+        field
+            .child_by_field_name("name")
+            .is_some_and(|key| node_text(key, source) == "raw")
+    }) {
+        let mut raw = None;
+        let mut required = false;
+        for field in fields {
+            let key = table_field_name(field, source)?;
+            let value = field.child_by_field_name("value").ok_or_else(|| {
+                node_error(
+                    field,
+                    source,
+                    &format!("raw argument field `{key}` has no value"),
+                )
+            })?;
+            match key.as_str() {
+                "raw" => {
+                    if raw.replace(value.kind() == "true").is_some() || value.kind() != "true" {
+                        return Err(node_error(
+                            value,
+                            source,
+                            "raw arguments require `raw = true`",
+                        ));
+                    }
+                }
+                "required" => required = boolean_field(value, source, "raw required")?,
+                _ => {
+                    return Err(node_error(
+                        key_node(field),
+                        source,
+                        "raw arguments accept only `raw` and `required`",
+                    ));
+                }
+            }
+        }
+        return Ok(CommandArguments::Raw { required });
+    }
+    let mut arguments = Vec::new();
+    for field in fields {
+        let value = table_entry_value(field).ok_or_else(|| {
+            node_error(
+                field,
+                source,
+                "registration `arguments` entries must be inline tables",
+            )
+        })?;
+        if value.kind() != "table_constructor" {
+            return Err(node_error(
+                value,
+                source,
+                "registration `arguments` entries must be inline tables",
+            ));
+        }
+        arguments.push(parse_argument(value, source)?);
+    }
+    Ok(CommandArguments::Positional(arguments.into()))
+}
+
+fn parse_argument(node: Node<'_>, source: &str) -> Result<PositionalArgument> {
+    let fields = table_fields(node)
+        .map(|field| Ok((table_field_name(field, source)?, field)))
+        .collect::<Result<Vec<_>>>()?;
+    let type_name = fields
+        .iter()
+        .find(|(key, _)| key == "type")
+        .map(|(_, field)| {
+            field
+                .child_by_field_name("value")
+                .ok_or_else(|| {
+                    node_error(
+                        *field,
+                        source,
+                        "registration argument field `type` has no value",
+                    )
+                })
+                .and_then(|value| string_field(value, source, "argument type"))
+        })
+        .transpose()?
+        .ok_or_else(|| node_error(node, source, "registration argument is missing `type`"))?;
+    let allowed = if type_name == "enum" {
+        &[
+            "name",
+            "type",
+            "choices",
+            "optional",
+            "variadic",
+            "completion",
+        ][..]
+    } else {
+        &["name", "type", "optional", "variadic", "completion"][..]
+    };
+    let mut name = None;
+    let mut choices = None;
+    let mut optional = false;
+    let mut variadic = false;
+    for (key, field) in fields {
+        if !allowed.contains(&key.as_str()) {
+            return Err(node_error(
+                key_node(field),
+                source,
+                &format!("unknown registration argument field `{key}`"),
+            ));
+        }
+        let value = field.child_by_field_name("value").ok_or_else(|| {
+            node_error(
+                field,
+                source,
+                &format!("registration argument field `{key}` has no value"),
+            )
+        })?;
+        match key.as_str() {
+            "name" => name = Some(string_field(value, source, "argument name")?),
+            "type" | "completion" => {}
+            "choices" => choices = Some(parse_choices(value, source)?),
+            "optional" => optional = boolean_field(value, source, "argument optional")?,
+            "variadic" => variadic = boolean_field(value, source, "argument variadic")?,
+            _ => unreachable!("allowed argument field"),
+        }
+    }
+    let name =
+        name.ok_or_else(|| node_error(node, source, "registration argument is missing `name`"))?;
+    let kind = match type_name.as_str() {
+        "string" if choices.is_none() => ArgumentKind::String,
+        "integer" if choices.is_none() => ArgumentKind::Integer,
+        "file" if choices.is_none() => ArgumentKind::File,
+        "directory" if choices.is_none() => ArgumentKind::Directory,
+        "enum" => ArgumentKind::Enum(
+            choices
+                .ok_or_else(|| {
+                    node_error(node, source, "enum arguments require literal `choices`")
+                })?
+                .into_iter()
+                .map(Arc::<str>::from)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        _ => {
+            return Err(node_error(
+                node,
+                source,
+                "registration argument `type` must be string, integer, enum, file, or directory",
+            ));
+        }
+    };
+    Ok(PositionalArgument {
+        name: Arc::from(name),
+        kind,
+        optional,
+        variadic,
+        completion: CompletionPolicy::Default,
+    })
+}
+
+fn parse_choices(node: Node<'_>, source: &str) -> Result<Vec<String>> {
+    if node.kind() != "table_constructor" {
+        return Err(node_error(
+            node,
+            source,
+            "enum argument `choices` must be an inline array",
+        ));
+    }
+    let mut choices = Vec::new();
+    for field in table_fields(node) {
+        let value = table_entry_value(field)
+            .ok_or_else(|| node_error(field, source, "enum choices must contain strings"))?;
+        choices.push(string_field(value, source, "enum choice")?);
+    }
+    let mut unique = std::collections::HashSet::new();
+    if choices.is_empty() {
+        return Err(node_error(
+            node,
+            source,
+            "enum argument `choices` must not be empty",
+        ));
+    }
+    if choices.iter().any(|choice| !unique.insert(choice.as_str())) {
+        return Err(node_error(
+            node,
+            source,
+            "enum argument `choices` must contain distinct strings",
+        ));
+    }
+    Ok(choices)
+}
+
+fn table_entry_value(field: Node<'_>) -> Option<Node<'_>> {
+    field
+        .child_by_field_name("value")
+        .or_else(|| field.named_child(0))
+}
+
+fn table_field_name(field: Node<'_>, source: &str) -> Result<String> {
+    let key = field.child_by_field_name("name").ok_or_else(|| {
+        node_error(
+            field,
+            source,
+            "registration argument fields must use literal keys",
+        )
+    })?;
+    match key.kind() {
+        "identifier" if key.start_byte() == field.start_byte() => {
+            Ok(node_text(key, source).to_owned())
+        }
+        "string" => {
+            decode_string(key, source).map_err(|error| node_error(key, source, &error.to_string()))
+        }
+        _ => Err(node_error(
+            key,
+            source,
+            "computed registration argument keys are unsupported",
+        )),
+    }
+}
+
+fn boolean_field(node: Node<'_>, source: &str, field: &str) -> Result<bool> {
+    match node.kind() {
+        "true" => Ok(true),
+        "false" | "nil" => Ok(false),
+        _ => Err(node_error(
+            node,
+            source,
+            &format!("registration field `{field}` must be a literal boolean"),
+        )),
+    }
 }
 
 fn key_node(field: Node<'_>) -> Node<'_> {
@@ -503,6 +776,8 @@ mod tests {
     use tempfile::tempdir;
     use test_case::test_case;
 
+    use maki_commands::CommandArguments;
+
     use super::{decode_string, load_plugin_commands, parse_lua_commands};
 
     #[test_case("'hello'" => "hello"; "single quoted")]
@@ -550,18 +825,118 @@ mod tests {
                 ["name"] = "/one",
                 description = [[first\nsecond]],
                 tui_only = false,
-                argument_hint = nil,
+                arguments = {},
                 handler = function() end,
             }
             maki.api.register_command({
-                name = "/two", description = "Two", tui_only = true,
+                name = "/two", description = "Two", tui_only = true, arguments = { raw = true },
             })
         "#;
         let commands = parse_lua_commands(source).expect("commands");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].name, "/one");
         assert_eq!(commands[0].description, r"first\nsecond");
+        assert!(matches!(
+            &commands[0].arguments,
+            CommandArguments::Positional(arguments) if arguments.is_empty()
+        ));
         assert!(commands[1].tui_only);
+        assert!(matches!(
+            &commands[1].arguments,
+            CommandArguments::Raw { required: false }
+        ));
+    }
+
+    #[test]
+    fn parses_typed_and_raw_arguments() {
+        let source = r#"
+            maki.api.register_command({
+                name = "/typed",
+                description = "Typed",
+                tui_only = false,
+                arguments = {
+                    -- Source path
+                    { name = "source", type = "file" },
+                    {
+                        name = "mode",
+                        -- Supported modes
+                        type = "enum",
+                        choices = {
+                            "fast",
+                            -- Safest mode
+                            "safe",
+                        },
+                        optional = true,
+                    },
+                    { name = "paths", type = "directory", variadic = true },
+                },
+            })
+            maki.api.register_command({
+                name = "/raw",
+                description = "Raw",
+                tui_only = false,
+                arguments = { raw = true },
+            })
+        "#;
+        let commands = parse_lua_commands(source).expect("commands");
+        assert!(matches!(
+            &commands[0].arguments,
+            CommandArguments::Positional(arguments)
+                if arguments.len() == 3
+                    && arguments[0].name.as_ref() == "source"
+                    && arguments[1].optional
+                    && arguments[2].variadic
+        ));
+        assert!(matches!(
+            &commands[1].arguments,
+            CommandArguments::Raw { required: false }
+        ));
+    }
+
+    #[test_case(
+        "{ name = 'value', type = 'string', typo = true }",
+        "unknown registration argument field `typo`"
+        ; "unknown_scalar_field"
+    )]
+    #[test_case(
+        "{ name = 'value', type = 'string', choices = { 'x' } }",
+        "unknown registration argument field `choices`"
+        ; "choices_on_scalar"
+    )]
+    #[test_case(
+        "{ name = 'value', type = 'enum', choices = { 'x' }, typo = true }",
+        "unknown registration argument field `typo`"
+        ; "unknown_enum_field"
+    )]
+    #[test_case(
+        "{ name = 'value', type = 'enum', choices = { 'x', 'x' } }",
+        "enum argument `choices` must contain distinct strings"
+        ; "duplicate_enum_choice"
+    )]
+    fn rejects_unknown_typed_argument_fields(descriptor: &str, expected: &str) {
+        let source = format!(
+            r#"maki.api.register_command({{
+                name = "/typed",
+                description = "Typed",
+                tui_only = false,
+                arguments = {{ {descriptor} }},
+            }})"#
+        );
+        let error = parse_lua_commands(&source).expect_err("unknown field");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn accepts_completion_field_in_typed_argument_docs() {
+        let source = r#"maki.api.register_command({
+            name = "/typed",
+            description = "Typed",
+            tui_only = false,
+            arguments = {
+                { name = "value", type = "string", completion = { get_items = provider } },
+            },
+        })"#;
+        assert_eq!(parse_lua_commands(source).expect("command").len(), 1);
     }
 
     #[test]
@@ -613,12 +988,12 @@ mod tests {
         fs::create_dir(root.path().join("empty")).expect("empty");
         fs::write(
             root.path().join("first/init.lua"),
-            "maki.api.register_command({name=\"/z\",description=\"z\",tui_only=false})",
+            "maki.api.register_command({name=\"/z\",description=\"z\",tui_only=false,arguments={}})",
         )
         .expect("first source");
         fs::write(
             root.path().join("second/init.lua"),
-            "maki.api.register_command({name=\"/a\",description=\"a\",tui_only=true})",
+            "maki.api.register_command({name=\"/a\",description=\"a\",tui_only=true,arguments={raw=true}})",
         )
         .expect("second source");
         let commands = load_plugin_commands(root.path()).expect("commands");

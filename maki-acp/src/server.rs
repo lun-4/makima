@@ -1541,7 +1541,7 @@ mod tests {
                 spec: maki_commands::CommandSpec {
                     name: Arc::from("/review"),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::ArgumentArity::unbounded(0),
+                    arguments: maki_commands::CommandArguments::Raw { required: false },
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from("Review code"),
                         argument_hint: Some(Arc::from("<path>")),
@@ -1549,7 +1549,7 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(CompletedCommand),
-                completion: None,
+                argument_completions: Vec::new(),
             }])
             .unwrap();
         let updated = registry.snapshot_for(&target).unwrap();
@@ -1793,7 +1793,7 @@ mod tests {
                 spec: maki_commands::CommandSpec {
                     name: Arc::from("/lua-complete"),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::ArgumentArity::NONE,
+                    arguments: maki_commands::CommandArguments::Positional(Arc::from([])),
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from("complete without a turn"),
                         argument_hint: None,
@@ -1801,7 +1801,7 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(CompletedCommand),
-                completion: None,
+                argument_completions: Vec::new(),
             }])
             .unwrap();
         install_registry(&mut srv, registry);
@@ -1829,7 +1829,7 @@ mod tests {
         assert_eq!(error.code, AcpError::invalid_params().code);
         assert_eq!(
             error.message,
-            "invalid arguments for /btw: expected 1 or more"
+            "invalid typed arguments for /btw: raw arguments are required"
         );
         assert!(input_rx.is_empty());
     }

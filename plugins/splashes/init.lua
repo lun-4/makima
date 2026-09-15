@@ -288,7 +288,7 @@ local function apply_startup()
 end
 
 local function command(opts)
-  local name = opts.fargs[1]
+  local name = opts.values.splash
   if name then
     local ok, err = select_and_commit(name:lower(), true)
     if not ok then
@@ -357,38 +357,43 @@ maki.api.create_autocmd("SplashSelect", {
 maki.api.register_command({
   name = "/splash",
   description = "Preview and select a splash renderer",
-  argument_hint = "[splash]",
-  nargs = "?",
   tui_only = true,
-  completion = {
-    get_items = function()
-      local out = {}
-      for _, item in ipairs(items()) do
-        out[#out + 1] = {
-          label = item.label,
-          insertion = item.name,
-          description = item.detail,
-        }
-      end
-      return out
-    end,
-    on_highlight = function(_, item)
-      local _, err = stage(item.insertion)
-      if err then
-        maki.ui.flash("splash preview failed: " .. tostring(err))
-      end
-    end,
-    on_accept = function(_, item)
-      local selection = candidate
-      if not selection or selection.name ~= item.insertion then
-        selection = stage(item.insertion)
-      end
-      local ok, err = commit(selection, true)
-      if not ok then
-        maki.ui.flash("splash selection failed: " .. tostring(err))
-      end
-    end,
-    on_cancel = cancel,
+  arguments = {
+    {
+      name = "splash",
+      type = "string",
+      optional = true,
+      completion = {
+        get_items = function()
+          local out = {}
+          for _, item in ipairs(items()) do
+            out[#out + 1] = {
+              label = item.label,
+              insertion = item.name,
+              description = item.detail,
+            }
+          end
+          return out
+        end,
+        on_highlight = function(_, item)
+          local _, err = stage(item.insertion)
+          if err then
+            maki.ui.flash("splash preview failed: " .. tostring(err))
+          end
+        end,
+        on_accept = function(_, item)
+          local selection = candidate
+          if not selection or selection.name ~= item.insertion then
+            selection = stage(item.insertion)
+          end
+          local ok, err = commit(selection, true)
+          if not ok then
+            maki.ui.flash("splash selection failed: " .. tostring(err))
+          end
+        end,
+        on_cancel = cancel,
+      },
+    },
   },
   handler = command,
 })

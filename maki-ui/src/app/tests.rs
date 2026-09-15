@@ -48,6 +48,7 @@ const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
+const CD_ERROR_PREFIX: &str = "cd:";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_IMAGE_DATA: &str = "dGVzdA==";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
@@ -130,8 +131,11 @@ impl maki_commands::CommandCompletion for TestLuaCompletion {
         Result<Vec<maki_commands::CompletionItem>, maki_commands::CompletionError>,
     > {
         let (_, cancel) = maki_agent::CancelToken::new();
+        let command_generation = self
+            .handle
+            .command_generation_for_test(&self.plugin, &context.invoked_name);
         let context = maki_lua::CommandArgumentContext {
-            command: context.invoked_name,
+            command: Arc::clone(&context.invoked_name),
             plugin: Arc::clone(&self.plugin),
             args: context.arguments.to_string(),
             arg: context.argument.to_string(),
@@ -139,6 +143,13 @@ impl maki_commands::CommandCompletion for TestLuaCompletion {
             mode: context.mode.to_string(),
             session: 1,
             generation: 0,
+            command_generation,
+            argument_name: context.argument_name,
+            argument_kind: context
+                .argument_kind
+                .as_ref()
+                .map(|kind| kind.type_name().to_owned()),
+            preceding_arguments: context.preceding_arguments.clone(),
         };
         let Some(rx) = self.handle.collect_command_argument_items(context, cancel) else {
             return Box::pin(async { Ok(Vec::new()) });
@@ -195,6 +206,15 @@ impl maki_commands::CommandCompletion for TestLuaCompletion {
                 mode: context.mode.to_string(),
                 session: 1,
                 generation: 0,
+                command_generation: self
+                    .handle
+                    .command_generation_for_test(&self.plugin, &context.invoked_name),
+                argument_name: context.argument_name.clone(),
+                argument_kind: context
+                    .argument_kind
+                    .as_ref()
+                    .map(|kind| kind.type_name().to_owned()),
+                preceding_arguments: context.preceding_arguments.clone(),
             },
             event,
             item,
@@ -210,6 +230,29 @@ struct TestLuaCommand {
     plugin: Arc<str>,
     max_args: Option<usize>,
     completion: bool,
+}
+
+fn test_command_arguments(
+    max_args: Option<usize>,
+    completion: bool,
+) -> maki_commands::CommandArguments {
+    match (max_args, completion) {
+        (Some(0), _) => maki_commands::CommandArguments::Positional(Arc::from([])),
+        (_, true) => maki_commands::CommandArguments::Positional(Arc::from([
+            maki_commands::PositionalArgument {
+                name: Arc::from("arg"),
+                kind: maki_commands::ArgumentKind::String,
+                optional: true,
+                variadic: max_args.is_none(),
+                completion: maki_commands::CompletionPolicy::Replace,
+            },
+        ])),
+        (Some(1), false) => maki_commands::CommandArguments::Positional(Arc::from([
+            maki_commands::PositionalArgument::optional("arg", maki_commands::ArgumentKind::String),
+        ])),
+        (None, false) => maki_commands::CommandArguments::Raw { required: false },
+        (Some(_), false) => maki_commands::CommandArguments::Positional(Arc::from([])),
+    }
 }
 
 fn register_test_lua_command(
@@ -228,10 +271,7 @@ fn register_test_lua_command(
             spec: maki_commands::CommandSpec {
                 name: Arc::clone(&command.name),
                 aliases: Arc::from([]),
-                arguments: command
-                    .max_args
-                    .map(|max| maki_commands::ArgumentArity::bounded(0, max))
-                    .unwrap_or_else(|| maki_commands::ArgumentArity::unbounded(0)),
+                arguments: test_command_arguments(command.max_args, command.completion),
                 docs: maki_commands::CommandDocs {
                     summary: Arc::from("Lua test command"),
                     argument_hint: None,
@@ -243,7 +283,13 @@ fn register_test_lua_command(
                 plugin: command.plugin,
                 name: command.name,
             }),
-            completion,
+            argument_completions: if command.completion {
+                vec![completion]
+            } else if command.max_args == Some(1) {
+                vec![None]
+            } else {
+                Vec::new()
+            },
         }])
         .unwrap();
     producer
@@ -275,10 +321,7 @@ fn lua_registry_with_commands(
                 spec: maki_commands::CommandSpec {
                     name: Arc::clone(&command.name),
                     aliases: Arc::from([]),
-                    arguments: command
-                        .max_args
-                        .map(|max| maki_commands::ArgumentArity::bounded(0, max))
-                        .unwrap_or_else(|| maki_commands::ArgumentArity::unbounded(0)),
+                    arguments: test_command_arguments(command.max_args, command.completion),
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from("Lua test command"),
                         argument_hint: None,
@@ -290,7 +333,13 @@ fn lua_registry_with_commands(
                     plugin: command.plugin,
                     name: command.name,
                 }),
-                completion,
+                argument_completions: if command.completion {
+                    vec![completion]
+                } else if command.max_args == Some(1) {
+                    vec![None]
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect();
@@ -942,7 +991,7 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
-    if text.starts_with('/') {
+    if text.trim_start().starts_with('/') {
         settle_command_palette(app);
     }
     app.update(Msg::Key(key(KeyCode::Enter)))
@@ -975,6 +1024,18 @@ fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
         assert!(Instant::now() < deadline, "timed out waiting: {what}");
         std::thread::sleep(SETTLE_POLL);
     }
+}
+
+fn wait_for_receiver<T>(receiver: &flume::Receiver<T>, what: &str) -> T {
+    let mut value = None;
+    wait_for(
+        || {
+            value = receiver.try_recv().ok();
+            value.is_some()
+        },
+        what,
+    );
+    value.unwrap()
 }
 
 fn settle_command_palette(app: &mut App) {
@@ -1153,7 +1214,7 @@ fn argument_completion_retains_old_rows_while_request_pending() {
 }
 
 #[test]
-fn unmatched_completion_items_cancel_the_argument_session() {
+fn unmatched_completion_items_keep_session_until_dismissal() {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     let registry = maki_commands::CommandRegistry::new();
@@ -1197,6 +1258,10 @@ fn unmatched_completion_items_cancel_the_argument_session() {
         "completion result was not applied",
     );
 
+    assert!(app.command_palette.completion_session_id().is_some());
+    assert_eq!(probe.try_finish_command_argument_lifecycle(), None);
+
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
     assert!(app.command_palette.completion_session_id().is_none());
     assert_eq!(
         probe.try_finish_command_argument_lifecycle(),
@@ -4268,9 +4333,9 @@ fn typed_slash_command_executes() {
 const LUA_COMMAND_RAN: &str = "lua command with args must reach the plugin";
 const LUA_COMMAND_NOT_SENT: &str = "lua command with args must not reach the model";
 
-/// The palette hides a lua command once the typed words pass its `max_args`,
-/// and a hidden command falls through to `handle_submit`, so a multi word
-/// `nargs` command must still be routed to its plugin.
+/// The palette hides a Lua command once the typed words pass its derived
+/// positional bound, and a hidden command falls through to `handle_submit`,
+/// so a multiword raw command must still be routed to its plugin.
 #[test]
 fn typed_lua_command_with_args_executes() {
     let dir = StateDir::from_path(env::temp_dir());
@@ -4294,6 +4359,305 @@ fn typed_lua_command_with_args_executes() {
 
     assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
     assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
+}
+
+const COPY_TYPED_PLUGIN: &str = r#"
+    local function destination_items(ctx)
+        return {
+            { label = "destination:" .. ctx.values.source, insertion = "destination folder/" },
+        }
+    end
+
+    maki.api.register_command({
+        name = "/copy",
+        tui_only = false,
+        arguments = {
+            { name = "source", type = "file" },
+            { name = "destination", type = "directory", completion = {
+                mode = "replace",
+                get_items = destination_items,
+            } },
+            { name = "policy", type = "enum", choices = { "skip", "overwrite" }, optional = true },
+        },
+        handler = function(opts)
+            local policy = opts.values.policy or ""
+            maki.ui.flash(opts.values.source .. "|" .. opts.values.destination .. "|" .. policy)
+        end,
+    })
+
+    maki.api.register_command({
+        name = "/copy-default",
+        tui_only = false,
+        arguments = {
+            { name = "source", type = "file" },
+            { name = "destination", type = "directory" },
+        },
+        handler = function(opts)
+            maki.ui.flash("default|" .. opts.values.source .. "|" .. opts.values.destination)
+        end,
+    })
+
+    maki.api.register_command({
+        name = "/copy-disabled",
+        tui_only = false,
+        arguments = {
+            { name = "source", type = "file" },
+            { name = "destination", type = "directory", completion = false },
+        },
+        handler = function(opts)
+            maki.ui.flash("disabled|" .. opts.values.source .. "|" .. opts.values.destination)
+        end,
+    })
+
+    maki.api.register_command({
+        name = "/copy-replace",
+        tui_only = false,
+        arguments = {
+            { name = "source", type = "file" },
+            { name = "destination", type = "directory", completion = {
+                mode = "replace",
+                items = { { label = "replacement", insertion = "replacement folder/" } },
+            } },
+        },
+        handler = function(opts)
+            maki.ui.flash("replace|" .. opts.values.source .. "|" .. opts.values.destination)
+        end,
+    })
+
+    maki.api.register_command({
+        name = "/copy-extend",
+        tui_only = false,
+        arguments = {
+            { name = "source", type = "file" },
+            { name = "destination", type = "directory", completion = {
+                mode = "extend",
+                items = { { label = "custom", insertion = "custom/" } },
+            } },
+        },
+        handler = function(opts)
+            maki.ui.flash("extend|" .. opts.values.source .. "|" .. opts.values.destination)
+        end,
+    })
+    "#;
+
+struct CopyTuiFixture {
+    _host: maki_lua::test_support::PluginHostGuard,
+    actions: flume::Receiver<maki_lua::UiAction>,
+    app: App,
+    root: TempDir,
+}
+
+fn copy_tui_fixture() -> CopyTuiFixture {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("destination folder")).unwrap();
+    std::fs::create_dir_all(root.path().join("other directory")).unwrap();
+    std::fs::write(root.path().join("source file.txt"), b"source bytes").unwrap();
+    std::fs::write(
+        root.path().join("destination folder/existing.txt"),
+        b"existing bytes",
+    )
+    .unwrap();
+
+    let (handle, host) = maki_lua::test_support::spawn_host_for_tests(&[]);
+    host.host()
+        .load_source("copy_fixture", COPY_TYPED_PLUGIN)
+        .unwrap();
+    let registry = host.host().command_registry();
+    let dir = StateDir::from_path(env::temp_dir());
+    let mut app = build_app_with_full(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        registry,
+        handle,
+        UiConfig::default(),
+    );
+    Arc::get_mut(&mut app.state.session)
+        .unwrap()
+        .set_cwd(root.path().to_string_lossy().into_owned());
+    app.command_palette
+        .set_cwd(Arc::from(root.path().to_string_lossy().as_ref()));
+    app.queue.set_shared(shared_queue::queue());
+
+    let actions = host.host().ui_action_rx();
+    CopyTuiFixture {
+        _host: host,
+        actions,
+        app,
+        root,
+    }
+}
+
+fn poll_copy_completion(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let _ = app.tick();
+        if app.command_palette.has_argument_selectable() {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    panic!("copy completion popup never offered a selectable item");
+}
+
+fn copy_candidate_labels(app: &App) -> Vec<String> {
+    app.command_palette
+        .argument_match_items()
+        .into_iter()
+        .map(|item| item.label.to_string())
+        .collect()
+}
+
+fn poll_copy_candidates(app: &mut App, expected: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let _ = app.tick();
+        if copy_candidate_labels(app)
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+        {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    panic!(
+        "copy completion candidates did not settle: expected {expected:?}, got {:?}",
+        copy_candidate_labels(app)
+    );
+}
+
+fn copy_type(app: &mut App, text: &str) {
+    for character in text.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+}
+
+fn copy_tree(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    fn visit(root: &Path, path: &Path, entries: &mut Vec<(String, Option<Vec<u8>>)>) {
+        let mut children = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            let relative = child
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if child.is_dir() {
+                entries.push((relative, None));
+                visit(root, &child, entries);
+            } else {
+                entries.push((relative, Some(std::fs::read(child).unwrap())));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+#[test_case(None; "omitted_optional_policy")]
+#[test_case(Some("overwrite"); "selected_optional_policy")]
+fn copy_typed_command_scenario(policy: Option<&str>) {
+    let mut fixture = copy_tui_fixture();
+    let before_tree = copy_tree(fixture.root.path());
+
+    fixture
+        .app
+        .update(Msg::Paste("/copy \"source file.txt\" dest".into()));
+    poll_copy_completion(&mut fixture.app);
+    let rendered = rendered(&mut fixture.app);
+    assert!(
+        rendered.contains("destination:source file.txt"),
+        "{rendered}"
+    );
+    assert_eq!(
+        copy_candidate_labels(&fixture.app),
+        vec!["destination:source file.txt"]
+    );
+
+    fixture.app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        fixture.app.input_box.buffer.value(),
+        "/copy \"source file.txt\" \"destination folder/\""
+    );
+    assert!(!fixture.app.command_palette.is_active());
+
+    match policy {
+        Some("overwrite") => {
+            fixture.app.update(Msg::Key(key(KeyCode::Char(' '))));
+            poll_copy_completion(&mut fixture.app);
+            assert_eq!(
+                copy_candidate_labels(&fixture.app),
+                vec!["skip", "overwrite"]
+            );
+            fixture.app.update(Msg::Key(key(KeyCode::Down)));
+            fixture.app.update(Msg::Key(key(KeyCode::Enter)));
+            assert_eq!(
+                fixture.app.input_box.buffer.value(),
+                "/copy \"source file.txt\" \"destination folder/\" overwrite"
+            );
+            assert!(!fixture.app.command_palette.is_active());
+        }
+        None => assert_eq!(
+            fixture.app.input_box.buffer.value(),
+            "/copy \"source file.txt\" \"destination folder/\""
+        ),
+        other => panic!("unsupported copy policy: {other:?}"),
+    }
+
+    fixture.app.update(Msg::Key(key(KeyCode::Enter)));
+    let message = wait_for_receiver(&fixture.actions, "copy handler did not record invocation");
+    let expected_flash = match policy {
+        Some(policy) => format!("source file.txt|destination folder/|{policy}"),
+        None => "source file.txt|destination folder/|".to_owned(),
+    };
+    assert!(matches!(message, maki_lua::UiAction::Flash(value) if value == expected_flash));
+    assert_eq!(copy_tree(fixture.root.path()), before_tree);
+}
+
+#[test_case("/copy-default", vec!["destination folder/", "other directory/"], "default|source file.txt|destination folder/" ; "default")]
+#[test_case("/copy-disabled", Vec::<&str>::new(), "disabled|source file.txt|destination folder/" ; "disabled")]
+#[test_case("/copy-replace", vec!["replacement"], "replace|source file.txt|replacement folder/" ; "replace")]
+#[test_case("/copy-extend", vec!["destination folder/", "other directory/", "custom"], "extend|source file.txt|destination folder/" ; "extend")]
+fn copy_typed_completion_destination_policy(
+    command: &str,
+    expected_candidates: Vec<&str>,
+    expected_flash: &str,
+) {
+    let mut fixture = copy_tui_fixture();
+    let before_tree = copy_tree(fixture.root.path());
+    fixture
+        .app
+        .update(Msg::Paste(format!("{command} \"source file.txt\" ")));
+    if expected_candidates.is_empty() {
+        assert!(
+            fixture
+                .app
+                .command_palette
+                .argument_match_items()
+                .is_empty()
+        );
+    } else {
+        poll_copy_candidates(&mut fixture.app, &expected_candidates);
+        fixture.app.update(Msg::Key(key(KeyCode::Enter)));
+    }
+
+    if expected_candidates.is_empty() {
+        copy_type(&mut fixture.app, "\"destination folder/\"");
+    }
+    settle_command_palette(&mut fixture.app);
+    fixture.app.update(Msg::Key(key(KeyCode::Enter)));
+
+    let message = wait_for_receiver(
+        &fixture.actions,
+        "copy policy handler did not record invocation",
+    );
+    assert!(matches!(message, maki_lua::UiAction::Flash(value) if value == expected_flash));
+    assert_eq!(copy_tree(fixture.root.path()), before_tree);
 }
 
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
@@ -4898,7 +5262,7 @@ fn btw_empty_is_rejected_by_registry() {
     assert!(actions.is_empty());
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "invalid arguments for /btw: expected 1 or more"
+        "invalid typed arguments for /btw: raw arguments are required"
     );
 }
 
@@ -6923,12 +7287,18 @@ fn seed_skill(backend: &maki_lua::TestCompletionBackend, name: &str) {
 /// Lets the completion popup's walker finish and nucleo converge, waiting until
 /// the popup is actually offering a selectable item.
 fn converge_completion(app: &mut App) {
+    let reference = app.input_box.buffer.value().starts_with('@');
     wait_for(
         || {
             let _ = app.file_completion.tick();
-            app.file_completion.has_selectable()
+            let _ = app.command_palette.poll_arguments();
+            if reference {
+                app.file_completion.has_selectable()
+            } else {
+                app.command_palette.has_argument_selectable()
+            }
         },
-        "@-completion popup never offered a selectable item",
+        "completion popup never offered a selectable item",
     );
 }
 
@@ -6996,7 +7366,13 @@ fn at_completion_insertion_synchronizes_argument_completion() {
             spec: maki_commands::CommandSpec {
                 name: Arc::from("/deploy"),
                 aliases: Arc::from([]),
-                arguments: maki_commands::ArgumentArity::bounded(0, 1),
+                arguments: maki_commands::CommandArguments::Positional(Arc::from([
+                    maki_commands::PositionalArgument::optional(
+                        "arg",
+                        maki_commands::ArgumentKind::String,
+                    )
+                    .with_completion(maki_commands::CompletionPolicy::Replace),
+                ])),
                 docs: maki_commands::CommandDocs {
                     summary: Arc::from("Deploy"),
                     argument_hint: None,
@@ -7008,10 +7384,11 @@ fn at_completion_insertion_synchronizes_argument_completion() {
                 plugin: Arc::from("deploy"),
                 name: Arc::from("/deploy"),
             }),
-            completion: Some(Arc::new(TestLuaCompletion {
+            argument_completions: vec![Some(Arc::new(TestLuaCompletion {
                 handle: maki_lua::EventHandle::disconnected_for_test(),
                 plugin: Arc::from("deploy"),
-            })),
+            })
+                as Arc<dyn maki_commands::CommandCompletion>)],
         }])
         .unwrap();
     app.command_palette = CommandPalette::new(
@@ -7213,6 +7590,532 @@ fn popup_closes_when_token_removed() {
     assert!(app.file_completion.is_active());
     app.update(Msg::Key(key(KeyCode::Backspace)));
     assert_eq!(app.input_box.buffer.value(), "");
+    assert!(!app.file_completion.is_active());
+}
+
+#[test]
+fn cd_completion_filters_directories_and_accepts_before_execution() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    std::fs::write(tmp.path().join("alpha.txt"), b"file").unwrap();
+
+    for character in "/cd al".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    let items = app.command_palette.argument_match_items();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].label,
+        format!("alpha{}", std::path::MAIN_SEPARATOR).into()
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "/cd alpha/");
+    assert!(!app.command_palette.is_active());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("alpha").to_string_lossy()
+    );
+}
+
+#[test_case("release notes", "release" ; "spaces")]
+#[test_case("日本語 @release notes", "\"日本語 @rel" ; "unicode_spaces_and_at")]
+fn cd_completion_keeps_paths_raw(directory: &str, query: &str) {
+    let (tmp, mut app, backend) = completion_app();
+    seed_skill(&backend, "release");
+    let path = tmp.path().join(directory);
+    std::fs::create_dir(&path).unwrap();
+
+    app.update(Msg::Paste(format!("/cd {query}")));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let expected = if directory.chars().any(char::is_whitespace) {
+        format!("/cd \"{directory}/\"")
+    } else {
+        format!("/cd {directory}/")
+    };
+    assert_eq!(app.input_box.buffer.value(), expected);
+    assert!(!app.command_palette.is_active());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.state.session.cwd, path.to_string_lossy());
+}
+
+#[test]
+fn quoted_directory_descent_keeps_cursor_inside_quotes() {
+    let (tmp, mut app, _backend) = completion_app();
+    let parent = tmp.path().join("release notes");
+    let child = parent.join("draft copy");
+    std::fs::create_dir_all(&child).unwrap();
+
+    app.update(Msg::Paste("/cd release".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+
+    let descended = format!("/cd \"release notes{}\"", std::path::MAIN_SEPARATOR);
+    assert_eq!(app.input_box.buffer.value(), descended);
+    assert_eq!(
+        app.input_box.buffer.cursor_byte_offset(),
+        descended.len() - 1
+    );
+
+    app.update(Msg::Paste("draft copy".into()));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!(
+            "/cd \"release notes{}draft copy\"",
+            std::path::MAIN_SEPARATOR
+        )
+    );
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.state.session.cwd, child.to_string_lossy());
+}
+
+#[test_case(KeyCode::Right, 1 ; "right")]
+#[test_case(KeyCode::Down, 2 ; "down")]
+#[test_case(KeyCode::Left, 0 ; "left")]
+#[test_case(KeyCode::Up, 0 ; "up")]
+fn completion_grid_arrows_match_for_typed_paths_and_at(
+    key_code: KeyCode,
+    expected_selection: usize,
+) {
+    let mut selections = Vec::new();
+    for input in ["/cd ", "@"] {
+        let (tmp, mut app, _backend) = completion_app();
+        for index in 0..7 {
+            std::fs::create_dir(tmp.path().join(format!("entry-{index}"))).unwrap();
+        }
+        app.update(Msg::Paste(input.into()));
+        converge_completion(&mut app);
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        loop {
+            let _ = app.file_completion.tick();
+            let _ = app.command_palette.poll_arguments();
+            let count = if input.starts_with("/cd") {
+                app.command_palette.argument_match_items().len()
+            } else {
+                app.file_completion.match_items().len()
+            };
+            if count >= 7 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "completion rows did not settle");
+            std::thread::yield_now();
+        }
+        let before = (
+            app.input_box.buffer.value(),
+            app.input_box.buffer.cursor_byte_offset(),
+        );
+        let _ = rendered(&mut app);
+        app.update(Msg::Key(key(key_code)));
+        selections.push(if input.starts_with("/cd") {
+            app.command_palette.argument_selected_for_test()
+        } else {
+            app.file_completion.selected_for_test()
+        });
+        assert_eq!(
+            (
+                app.input_box.buffer.value(),
+                app.input_box.buffer.cursor_byte_offset()
+            ),
+            before,
+            "{key_code:?} must not move the prompt cursor"
+        );
+    }
+    assert_eq!(selections, vec![expected_selection; 2]);
+}
+
+#[test]
+fn cd_completion_tab_descends_and_renders_instead_of_slash_rows() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir_all(tmp.path().join("alpha/bravo/charlie")).unwrap();
+    std::fs::write(tmp.path().join("alpha.txt"), b"file").unwrap();
+    for character in "/cd al".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    let screen = rendered(&mut app);
+    assert!(screen.contains("alpha/"));
+    assert!(!screen.contains("alpha.txt"));
+    assert_eq!(screen.matches("/cd").count(), 1);
+
+    for (input, child) in [("/cd alpha/", "bravo/"), ("/cd alpha/bravo/", "charlie/")] {
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input_box.buffer.value(), input);
+        assert!(app.command_palette.is_active());
+        assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+        converge_completion(&mut app);
+        let screen = rendered(&mut app);
+        assert!(screen.contains(child));
+        assert_eq!(screen.matches("/cd").count(), 1);
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "/cd alpha/bravo/charlie/");
+    assert!(!app.command_palette.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("alpha/bravo/charlie").to_string_lossy()
+    );
+}
+
+#[test]
+fn cd_completion_escape_preserves_partial_for_execution() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir_all(tmp.path().join("alpha/child")).unwrap();
+    app.update(Msg::Paste("/cd ./alpha".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.command_palette.is_active());
+    assert_eq!(app.input_box.buffer.value(), "/cd ./alpha");
+    let _ = app.tick();
+    assert!(!app.command_palette.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("alpha").to_string_lossy()
+    );
+}
+
+#[test_case(KeyCode::Esc, "/cd ./alpha"; "dismissed")]
+#[test_case(KeyCode::Enter, "/cd ./alpha/"; "accepted")]
+fn cd_completion_closed_popup_preserves_argument_ownership(close: KeyCode, expected: &str) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    app.update(Msg::Paste("/cd ./alpha".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(close)));
+    assert!(!app.command_palette.is_active());
+    assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
+    let mode = app.state.mode.clone();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), expected);
+    if close == KeyCode::Esc {
+        assert_eq!(app.state.mode, mode);
+    }
+    assert!(!app.command_palette.is_active());
+    assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("alpha").to_string_lossy()
+    );
+}
+
+#[test_case("./missing", false ; "no_match")]
+#[test_case("./empty/", true ; "empty_directory")]
+fn cd_completion_no_match_tab_preserves_input_enter_executes(query: &str, exists: bool) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("empty")).unwrap();
+    let input = format!("/cd {query}");
+    app.update(Msg::Paste(input.clone()));
+    settle_command_palette(&mut app);
+    assert!(app.command_palette.is_active());
+    assert!(!app.command_palette.has_argument_selectable());
+    let mode = app.state.mode.clone();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), input);
+    assert_eq!(app.state.mode, mode);
+    assert!(app.command_palette.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.input_box.buffer.value().is_empty());
+    assert!(!app.command_palette.is_active());
+    let expected = if exists {
+        tmp.path().join("empty")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    assert_eq!(app.state.session.cwd, expected.to_string_lossy());
+    if !exists {
+        assert!(
+            app.status_bar
+                .flash_text()
+                .unwrap()
+                .starts_with(CD_ERROR_PREFIX)
+        );
+    }
+}
+
+#[test_case(false ; "command_name_tab")]
+#[test_case(true ; "paste")]
+fn cd_completion_opens_after_command_name_tab_or_paste(paste: bool) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    if paste {
+        app.update(Msg::Paste("/cd ".into()));
+    } else {
+        for character in "/cd".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(character))));
+        }
+        assert!(!app.file_completion.is_active());
+        app.update(Msg::Key(key(KeyCode::Tab)));
+    }
+    assert_eq!(app.input_box.buffer.value(), "/cd ");
+    assert!(app.command_palette.is_active());
+    assert!(app.command_palette.has_argument_selectable() || app.command_palette.is_active());
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), "/cd alpha/");
+}
+
+#[test]
+fn cd_completion_does_not_hijack_plugin_override() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let _producer = register_test_lua_command(
+        &app.command_runtime.registry,
+        TestLuaCommand {
+            handle,
+            name: Arc::from("/cd"),
+            plugin: Arc::from("test"),
+            max_args: None,
+            completion: false,
+        },
+    );
+    app.update(Msg::Paste("/cd al".into()));
+    settle_command_palette(&mut app);
+    assert!(!app.file_completion.is_active());
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
+    assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+}
+
+#[test]
+fn cd_completion_switches_back_to_reference_sources() {
+    let (tmp, mut app, backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    seed_skill(&backend, "review");
+    app.update(Msg::Paste("/cd ./al".into()));
+    converge_completion(&mut app);
+    app.input_box.set_input(String::new());
+    app.update(Msg::Paste("@skill:rev".into()));
+    assert!(app.file_completion.is_active());
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "@skill:review");
+    assert!(!app.file_completion.is_active());
+}
+
+#[test_case(false ; "active")]
+#[test_case(true ; "dismissed")]
+fn cd_completion_cwd_change_refreshes_typed_popup(dismissed: bool) {
+    let (tmp, mut app, _backend) = completion_app();
+    let next = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    std::fs::create_dir(next.path().join("alpine")).unwrap();
+    let input = "/cd ./al";
+    app.update(Msg::Paste(input.into()));
+    converge_completion(&mut app);
+    assert_eq!(
+        app.command_palette.argument_match_items()[0].label,
+        "./alpha/".into()
+    );
+    if dismissed {
+        app.update(Msg::Key(key(KeyCode::Esc)));
+    }
+
+    app.change_directory(next.path().to_path_buf());
+    if !dismissed {
+        converge_completion(&mut app);
+    }
+
+    assert_eq!(
+        app.state.session.cwd,
+        next.path().canonicalize().unwrap().to_string_lossy()
+    );
+    assert_eq!(app.command_palette.is_active(), !dismissed);
+    assert_eq!(app.input_box.buffer.value(), input);
+    if !dismissed {
+        assert_eq!(
+            app.command_palette.argument_match_items()[0].label,
+            "./alpine/".into()
+        );
+    }
+}
+
+#[test_case(false ; "active")]
+#[test_case(true ; "dismissed")]
+fn cd_completion_cwd_change_refreshes_reference_popup(dismissed: bool) {
+    let (tmp, mut app, _backend) = completion_app();
+    let next = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    std::fs::create_dir(next.path().join("alpine")).unwrap();
+    let input = "@./al";
+    app.update(Msg::Paste(input.into()));
+    converge_completion(&mut app);
+    assert_eq!(app.file_completion.match_items()[0].label, "./alpha/");
+    if dismissed {
+        app.update(Msg::Key(key(KeyCode::Esc)));
+    }
+
+    app.change_directory(next.path().to_path_buf());
+
+    assert_eq!(
+        app.state.session.cwd,
+        next.path().canonicalize().unwrap().to_string_lossy()
+    );
+    assert_eq!(app.file_completion.is_active(), !dismissed);
+    assert_eq!(app.input_box.buffer.value(), input);
+    if !dismissed {
+        assert!(!app.file_completion.needs_reopen(&app.state.session.cwd));
+        assert_eq!(app.file_completion.match_items()[0].label, "./alpine/");
+    }
+    let _ = app.tick();
+    assert_eq!(app.file_completion.is_active(), !dismissed);
+}
+
+#[test]
+fn cd_completion_ctrl_a_enter_executes_original_partial() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    app.update(Msg::Paste("/cd ./al".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(app.input_box.buffer.x(), 0);
+    assert!(!app.file_completion.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert!(
+        app.status_bar
+            .flash_text()
+            .unwrap()
+            .starts_with(CD_ERROR_PREFIX)
+    );
+}
+
+#[test]
+fn cd_completion_click_command_name_closes_popup_before_enter() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    app.update(Msg::Paste("/cd ./al".into()));
+    converge_completion(&mut app);
+    let rows = rendered_rows(&mut app, 80, 24);
+    let area = app.zones.find(SelectionZone::Input).unwrap().area;
+    let row = area.y;
+    let column = rows[usize::from(row)]
+        .chars()
+        .collect::<Vec<_>>()
+        .windows("/cd".len())
+        .position(|window| window == ['/', 'c', 'd'])
+        .unwrap() as u16;
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.update(mouse_event(kind, column, row));
+    }
+    assert_eq!(app.input_box.buffer.cursor_byte_offset(), 0);
+    assert_eq!(app.input_box.buffer.value(), "/cd ./al");
+    assert!(!app.file_completion.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert!(
+        app.status_bar
+            .flash_text()
+            .unwrap()
+            .starts_with(CD_ERROR_PREFIX)
+    );
+}
+
+#[test]
+fn cd_completion_ctrl_left_requeries_before_accepting() {
+    let (tmp, mut app, _backend) = completion_app();
+    for directory in ["release apple", "release notes"] {
+        std::fs::create_dir(tmp.path().join(directory)).unwrap();
+    }
+    app.update(Msg::Paste("/cd \"./release no".into()));
+    converge_completion(&mut app);
+    assert_eq!(
+        app.command_palette.argument_match_items()[0].label,
+        "./release notes/".into()
+    );
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(
+        app.input_box.buffer.cursor_byte_offset(),
+        "/cd \"./release ".len()
+    );
+    converge_completion(&mut app);
+    let items = app.command_palette.argument_match_items();
+    assert_eq!(items.len(), 2);
+    let quoted = items
+        .iter()
+        .find(|item| item.label.as_ref() == "./release apple/")
+        .expect("quoted requery must offer release apple");
+    assert_eq!(quoted.label.as_ref(), "./release apple/");
+    app.command_palette.select_for_test(quoted);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "/cd \"./release apple/\"");
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("release apple").to_string_lossy()
+    );
+}
+
+#[test]
+fn cd_completion_cursor_in_whitespace_before_path_does_not_panic() {
+    let (_tmp, mut app, _backend) = completion_app();
+    let input = "/cd  ./alpha";
+    app.input_box.set_input(input.into());
+    app.input_box.buffer.set_cursor_byte_offset(4);
+    app.command_palette.sync(input);
+    app.sync_command_arguments(input, 4);
+
+    assert!(app.typed_path_completion_context().is_some());
+    app.sync_file_completion();
+    assert!(!app.file_completion.is_active());
+}
+
+#[test_case("/cd ", "  " ; "trailing_spaces")]
+#[test_case("/cd \t ", " \t\nkeep @skill:review" ; "whitespace_and_following_line")]
+fn cd_completion_preserves_text_outside_path(prefix: &str, remainder: &str) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("日本語 notes")).unwrap();
+    let partial = format!("{prefix}./日本");
+    let input = format!("{partial}{remainder}");
+    app.input_box.set_input(input.clone());
+    app.input_box.buffer.set_cursor_byte_offset(partial.len());
+    app.command_palette.sync(&input);
+    app.sync_command_arguments(&input, partial.len());
+    app.sync_file_completion();
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("{prefix}\"./日本語 notes/\"{remainder}")
+    );
+    assert!(!app.file_completion.is_active());
+}
+
+#[test_case(KeyCode::Enter, KeyModifiers::SHIFT ; "shift_enter")]
+#[test_case(KeyCode::Char('j'), KeyModifiers::CONTROL ; "ctrl_j")]
+fn cd_completion_newline_closes_popup_at_new_cursor(code: KeyCode, modifiers: KeyModifiers) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    app.update(Msg::Paste("/cd ./al".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(KeyEvent::new(code, modifiers)));
+    assert_eq!(app.input_box.buffer.value(), "/cd ./al\n");
+    assert_eq!(app.input_box.buffer.y(), 1);
     assert!(!app.file_completion.is_active());
 }
 

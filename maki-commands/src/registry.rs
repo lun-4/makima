@@ -4,9 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Poll, Waker};
 
+use crate::arguments::{CommandArguments, CompletionPolicy};
 use crate::completion::{
     CompletionError, CompletionInvalidation, CompletionSession, CompletionSessionCore,
 };
+use crate::completion_providers::CompletionProviders;
 use crate::dispatch::{
     CommandError, CommandHost, ParsedInput, RegistrationError, ResolutionError, ResolvedCommand,
     ResolvedInput,
@@ -108,7 +110,7 @@ impl From<&ResolvedCommand> for PresentedCommand {
         Self {
             name: Arc::from(command.invoked_name()),
             description: Arc::clone(&command.spec().docs.summary),
-            argument_hint: command.spec().docs.argument_hint.clone(),
+            argument_hint: command.spec().argument_hint(),
         }
     }
 }
@@ -255,10 +257,31 @@ impl CommandRegistry {
         command: ResolvedCommand,
         target_id: InvocationTargetId,
     ) -> Result<CompletionSession, CompletionError> {
+        self.open_completion_with_defaults(
+            command,
+            target_id,
+            CompletionProviders::default(),
+            Arc::from(""),
+        )
+    }
+
+    pub fn open_completion_with_defaults(
+        &self,
+        command: ResolvedCommand,
+        target_id: InvocationTargetId,
+        defaults: CompletionProviders,
+        cwd: Arc<str>,
+    ) -> Result<CompletionSession, CompletionError> {
         if command.registry_id != self.0.id || target_id.0 != self.0.id {
             return Err(CompletionError::StaleCommand);
         }
-        let provider = command.completion().ok_or(CompletionError::Unavailable)?;
+        let argument_completions = command.argument_completions();
+        if argument_completions.iter().all(Option::is_none)
+            && command.spec().arguments.positional().is_none()
+            && defaults.is_empty()
+        {
+            return Err(CompletionError::Unavailable);
+        }
         let mut state = self
             .0
             .state
@@ -282,8 +305,10 @@ impl CommandRegistry {
             command.producer_id(),
             Arc::downgrade(&self.0),
             command,
-            provider,
+            argument_completions,
+            defaults,
             target_id,
+            cwd,
         );
         state.completion_sessions.insert(id, session.weak_core());
         Ok(session)
@@ -706,16 +731,39 @@ fn validate_registrations(
 ) -> Result<Vec<Registration>, RegistrationError> {
     let mut spellings = HashSet::new();
     for registration in &registrations {
-        if registration
-            .spec
-            .arguments
-            .max
-            .is_some_and(|max| registration.spec.arguments.min > max)
-        {
-            return Err(RegistrationError::InvalidArgumentArity {
-                min: registration.spec.arguments.min,
-                max: registration.spec.arguments.max.unwrap_or_default(),
-            });
+        if let CommandArguments::Positional(arguments) = &registration.spec.arguments {
+            validate_positional_arguments(arguments)?;
+            if registration.argument_completions.len() != arguments.len() {
+                return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                    "argument completion providers must match the positional schema",
+                )));
+            }
+            for (argument, provider) in arguments.iter().zip(&registration.argument_completions) {
+                if provider.is_some()
+                    && matches!(
+                        argument.completion,
+                        CompletionPolicy::Default | CompletionPolicy::Disabled
+                    )
+                {
+                    return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                        "argument providers require replace or extend completion policy",
+                    )));
+                }
+                if provider.is_none()
+                    && matches!(
+                        argument.completion,
+                        CompletionPolicy::Replace | CompletionPolicy::Extend
+                    )
+                {
+                    return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                        "replace or extend completion policy requires an argument provider",
+                    )));
+                }
+            }
+        } else if !registration.argument_completions.is_empty() {
+            return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                "raw commands cannot have argument completion providers",
+            )));
         }
         for (spelling, alias) in std::iter::once((&registration.spec.name, false))
             .chain(registration.spec.aliases.iter().map(|alias| (alias, true)))
@@ -733,6 +781,50 @@ fn validate_registrations(
         }
     }
     Ok(registrations)
+}
+
+fn validate_positional_arguments(
+    arguments: &[crate::arguments::PositionalArgument],
+) -> Result<(), RegistrationError> {
+    let mut names = HashSet::new();
+    let mut optional = false;
+    for (index, argument) in arguments.iter().enumerate() {
+        if argument.name.is_empty() || !names.insert(normalize(&argument.name)) {
+            return Err(RegistrationError::InvalidArgumentSchema(Arc::clone(
+                &argument.name,
+            )));
+        }
+        if argument.optional {
+            optional = true;
+        } else if optional {
+            return Err(RegistrationError::InvalidArgumentOrder(Arc::clone(
+                &argument.name,
+            )));
+        }
+        if argument.variadic && index + 1 != arguments.len() {
+            return Err(RegistrationError::VariadicArgumentMustBeLast(Arc::clone(
+                &argument.name,
+            )));
+        }
+        if let Some(choices) = argument.kind.enum_choices() {
+            if choices.is_empty() || choices.iter().any(|choice| choice.is_empty()) {
+                return Err(RegistrationError::InvalidEnum(Arc::clone(&argument.name)));
+            }
+            let mut choices_seen = HashSet::new();
+            if choices
+                .iter()
+                .any(|choice| !choices_seen.insert(choice.as_ref()))
+            {
+                return Err(RegistrationError::InvalidEnum(Arc::clone(&argument.name)));
+            }
+            if let Some(default) = argument.kind.default_value()
+                && !choices.iter().any(|choice| choice.as_ref() == default)
+            {
+                return Err(RegistrationError::InvalidEnum(Arc::clone(&argument.name)));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_spelling(spelling: &str) -> Result<(), ()> {

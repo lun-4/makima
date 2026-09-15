@@ -1649,7 +1649,7 @@ mod tests {
             spec: maki_commands::CommandSpec {
                 name: Arc::from(name),
                 aliases: Arc::from([]),
-                arguments: maki_commands::ArgumentArity::ANY,
+                arguments: maki_commands::CommandArguments::Raw { required: false },
                 docs: maki_commands::CommandDocs {
                     summary: Arc::from(format!("{name} description")),
                     argument_hint: Some(Arc::from("<arg>")),
@@ -1657,7 +1657,7 @@ mod tests {
                 required_capabilities: TargetCapabilities::default(),
             },
             behavior: Arc::new(OutcomeBehavior(outcome)),
-            completion: None,
+            argument_completions: Vec::new(),
         }
     }
 
@@ -1760,10 +1760,9 @@ mod tests {
         assert_eq!(turn.content.text.as_ref(), "explain this");
         assert!(matches!(
             commands.dispatch_input("/btw", &[]),
-            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::InvalidArguments {
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::TypedArguments {
                 command,
-                expected: maki_commands::ArgumentArity::ONE_OR_MORE,
-                actual: 0,
+                error: maki_commands::ArgumentParseError::MissingRaw,
             })) if command.as_ref() == "/btw"
         ));
         let projection = commands.projection();

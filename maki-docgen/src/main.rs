@@ -122,8 +122,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use color_eyre::eyre::{Result, eyre};
 
@@ -143,31 +143,35 @@ mod tests {
         panic!("test panic")
     }
 
+    thread_local! {
+        static CHECK_CALLS: Cell<usize> = const { Cell::new(0) };
+        static WRITE_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
     fn count_check(_: &Path, _: &str) -> Result<bool> {
-        CHECK_CALLS.fetch_add(1, Ordering::Relaxed);
+        CHECK_CALLS.with(|calls| calls.set(calls.get() + 1));
         Ok(true)
     }
 
     fn count_write(_: &Path, _: &str) -> Result<()> {
-        WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+        WRITE_CALLS.with(|calls| calls.set(calls.get() + 1));
         Ok(())
     }
 
-    static CHECK_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
-
     #[test]
     fn generation_failure_prevents_output() {
-        CHECK_CALLS.store(0, Ordering::Relaxed);
-        WRITE_CALLS.store(0, Ordering::Relaxed);
+        CHECK_CALLS.with(|calls| calls.set(0));
+        WRITE_CALLS.with(|calls| calls.set(0));
         let pages: [Page; 2] = [("ok", generated_page), ("broken", failed_page)];
 
         for check in [false, true] {
+            CHECK_CALLS.with(|calls| calls.set(0));
+            WRITE_CALLS.with(|calls| calls.set(0));
             let error = run_generation(check, &pages, count_check, count_write)
                 .expect_err("generation failure");
             assert!(error.to_string().contains(GENERATION_ERROR));
-            assert_eq!(CHECK_CALLS.load(Ordering::Relaxed), 0);
-            assert_eq!(WRITE_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(CHECK_CALLS.with(Cell::get), 0);
+            assert_eq!(WRITE_CALLS.with(Cell::get), 0);
         }
     }
 
@@ -182,14 +186,14 @@ mod tests {
 
     #[test]
     fn generation_success_emits_all_pages() {
-        CHECK_CALLS.store(0, Ordering::Relaxed);
-        WRITE_CALLS.store(0, Ordering::Relaxed);
+        CHECK_CALLS.with(|calls| calls.set(0));
+        WRITE_CALLS.with(|calls| calls.set(0));
         let pages: [Page; 2] = [("one", generated_page), ("two", generated_page)];
 
         run_generation(false, &pages, count_check, count_write).expect("generation");
-        assert_eq!(WRITE_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(WRITE_CALLS.with(Cell::get), 2);
 
         run_generation(true, &pages, count_check, count_write).expect("check");
-        assert_eq!(CHECK_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(CHECK_CALLS.with(Cell::get), 2);
     }
 }

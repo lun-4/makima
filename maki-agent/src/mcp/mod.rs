@@ -32,9 +32,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_commands::{
-    AgentTurn, ArgumentArity, CommandBehavior, CommandContent, CommandDocs, CommandError,
-    CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, Producer,
-    ProducerPrecedence, PromptReference, Registration, TargetCapabilities, TargetCapability,
+    AgentTurn, CommandBehavior, CommandContent, CommandDocs, CommandError, CommandFuture,
+    CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, Producer, ProducerPrecedence,
+    PromptReference, Registration, TargetCapabilities, TargetCapability,
 };
 use maki_providers::{ContentBlock, Message};
 use serde_json::{Value, json};
@@ -1183,7 +1183,7 @@ fn prompt_registration(
         spec: CommandSpec {
             name: Arc::from(format!("/{}", info.display_name)),
             aliases: Arc::from([]),
-            arguments: ArgumentArity::unbounded(0),
+            arguments: maki_commands::CommandArguments::Raw { required: false },
             docs: CommandDocs {
                 summary: Arc::from(info.description.as_str()),
                 argument_hint: prompt_argument_hint(&info.arguments),
@@ -1197,7 +1197,7 @@ fn prompt_registration(
             identity: Arc::clone(&prompt.identity),
             published: Arc::clone(&context.published),
         }),
-        completion: None,
+        argument_completions: Vec::new(),
     }
 }
 

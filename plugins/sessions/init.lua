@@ -418,7 +418,7 @@ local function handle_key(key)
   end
 end
 
-local function open()
+local function open(query)
   if board then
     return
   end
@@ -440,6 +440,7 @@ local function open()
     reserved = 2,
     input = TextInput.new(),
     all = {},
+    query = query or "",
     items = {},
     rank = {},
     deleted = {},
@@ -449,6 +450,9 @@ local function open()
     frame = 0,
     loading = true,
   }
+  if query ~= "" then
+    board.input:insert_text(query)
+  end
   -- Two-phase load: live sessions are cheap, so they show up and take keys
   -- right away; the stored scan can be slow, so a background task merges it
   -- in once it lands.
@@ -532,10 +536,13 @@ maki.api.create_autocmd("SessionStatusChanged", {
 maki.api.register_command({
   name = "/sessions",
   description = "Browse and switch sessions",
-  argument_hint = "[query]",
-  nargs = "?",
+  arguments = {
+    { name = "query", type = "string", optional = true },
+  },
   tui_only = true,
-  handler = open,
+  handler = function(opts)
+    open(opts.values.query)
+  end,
 })
 
 -- Autocmd callbacks run synchronously on the Lua thread; open() suspends
@@ -558,8 +565,7 @@ maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
 maki.api.register_command({
   name = "/rename",
   description = "Rename the current session",
-  argument_hint = "<title>",
-  nargs = "+",
+  arguments = { raw = true, required = true },
   tui_only = true,
   handler = function(opts)
     local title = opts.args:match("^%s*(.-)%s*$")

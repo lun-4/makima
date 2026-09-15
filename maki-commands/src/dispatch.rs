@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::arguments::{ArgumentParseError, ParsedArguments};
 use crate::completion::CommandCompletion;
 use crate::registry::{
     CommandRegistry, RegistrationRecord, TargetHandle, normalize, target_record,
 };
 use crate::spec::{
-    ArgumentArity, BuiltinOperation, CommandFuture, CommandId, CommandSpec, HostContextRequest,
+    BuiltinOperation, CommandFuture, CommandId, CommandSpec, HostContextRequest,
     HostContextResponse, InvocationTargetId, MAX_COMMAND_DEPTH, ProducerId, RegistryId,
     TargetCapabilities, TargetCapability,
 };
@@ -151,19 +152,21 @@ impl CommandRegistry {
                     &command.spec().name,
                 )));
             }
-            let count = arguments.split_whitespace().count();
-            if !command.spec().arguments.accepts(count) {
-                return CommandOutcome::Failed(CommandError::InvalidArguments {
-                    command: Arc::clone(&command.spec().name),
-                    expected: command.spec().arguments,
-                    actual: count,
-                });
-            }
+            let parsed_arguments = match command.spec().arguments.parse_invocation(&arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return CommandOutcome::Failed(CommandError::TypedArguments {
+                        command: Arc::clone(&command.spec().name),
+                        error,
+                    });
+                }
+            };
             let invocation = CommandInvocation {
                 command_id: command.command_id(),
                 canonical_name: Arc::clone(&command.spec().name),
                 invoked_name: Arc::clone(&command.invoked_name),
                 arguments,
+                parsed_arguments,
                 content,
                 depth,
                 target,
@@ -250,8 +253,8 @@ impl ResolvedCommand {
         Arc::clone(&self.record.registration.behavior)
     }
 
-    pub fn completion(&self) -> Option<Arc<dyn CommandCompletion>> {
-        self.record.registration.completion.clone()
+    pub fn argument_completions(&self) -> Vec<Option<Arc<dyn CommandCompletion>>> {
+        self.record.registration.argument_completions.clone()
     }
 
     pub fn invoked_name(&self) -> &str {
@@ -340,6 +343,7 @@ pub struct CommandInvocation {
     pub canonical_name: Arc<str>,
     pub invoked_name: Arc<str>,
     pub arguments: Arc<str>,
+    pub parsed_arguments: Option<ParsedArguments>,
     pub content: CommandContent,
     pub depth: usize,
     target: TargetHandle,
@@ -409,8 +413,14 @@ pub enum RegistrationError {
     InvalidName(Arc<str>),
     #[error("command alias is invalid: {0}")]
     InvalidAlias(Arc<str>),
-    #[error("command argument arity is invalid")]
-    InvalidArgumentArity { min: usize, max: usize },
+    #[error("invalid positional argument schema: {0}")]
+    InvalidArgumentSchema(Arc<str>),
+    #[error("optional positional argument precedes required argument: {0}")]
+    InvalidArgumentOrder(Arc<str>),
+    #[error("variadic argument must be last: {0}")]
+    VariadicArgumentMustBeLast(Arc<str>),
+    #[error("invalid enum choices for argument: {0}")]
+    InvalidEnum(Arc<str>),
     #[error("duplicate command spelling: {0}")]
     DuplicateSpelling(Arc<str>),
 }
@@ -427,11 +437,10 @@ pub enum ResolutionError {
 pub enum CommandError {
     #[error("unknown command {0}")]
     UnknownCommand(Arc<str>),
-    #[error("invalid arguments for {command}: expected {expected}")]
-    InvalidArguments {
+    #[error("invalid typed arguments for {command}: {error}")]
+    TypedArguments {
         command: Arc<str>,
-        expected: ArgumentArity,
-        actual: usize,
+        error: ArgumentParseError,
     },
     #[error("command is unavailable: {0}")]
     UnavailableCommand(Arc<str>),
@@ -443,14 +452,4 @@ pub enum CommandError {
     MaximumDepth,
     #[error("command failed: {0}")]
     Producer(Arc<str>),
-}
-
-impl fmt::Display for ArgumentArity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.max {
-            Some(max) if max == self.min => write!(formatter, "{}", self.min),
-            Some(max) => write!(formatter, "{}..={max}", self.min),
-            None => write!(formatter, "{} or more", self.min),
-        }
-    }
 }

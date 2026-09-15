@@ -9,11 +9,12 @@ use std::{
 };
 
 use maki_commands::{
-    AgentTurn, ArgumentArity, BUILTIN_COMMANDS, BuiltinOperation, CommandBehavior,
-    CommandCompletion, CommandContent, CommandError, CommandFuture, CommandInvocation,
-    CommandOutcome, CommandRegistry, CompletionKey, HostContextRequest, HostContextResponse,
-    HostRequest, HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
-    TargetCapabilities, TargetCapability,
+    AgentTurn, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CancellationToken,
+    CommandBehavior, CommandCompletion, CommandContent, CommandError, CommandFuture,
+    CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext, CompletionError,
+    CompletionItem, HostContextRequest, HostContextResponse, HostRequest, HostResponse, Producer,
+    ProducerPrecedence, Registration, RegistrationError, TargetCapabilities, TargetCapability,
+    resolve_path,
 };
 use maki_config::ModelPolicy;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
@@ -368,6 +369,40 @@ async fn host_context(
     }
 }
 
+fn parsed_string_argument(
+    invocation: &CommandInvocation,
+    name: &str,
+) -> Result<Option<Arc<str>>, CommandError> {
+    invocation
+        .parsed_arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get(name))
+        .map(|value| match value {
+            ArgumentValue::String(value) => Ok(Arc::clone(value)),
+            _ => Err(CommandError::Producer(Arc::from(format!(
+                "invalid builtin argument type for {name}"
+            )))),
+        })
+        .transpose()
+}
+
+fn parsed_directory_argument(
+    invocation: &CommandInvocation,
+    name: &str,
+) -> Result<Option<PathBuf>, CommandError> {
+    invocation
+        .parsed_arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get(name))
+        .map(|value| match value {
+            ArgumentValue::Directory(path) => Ok(path.clone()),
+            _ => Err(CommandError::Producer(Arc::from(format!(
+                "invalid builtin argument type for {name}"
+            )))),
+        })
+        .transpose()
+}
+
 fn resolve_model(argument: &str, specs: &[Arc<str>]) -> Result<Arc<str>, CommandError> {
     if argument.contains('/') {
         Model::from_spec(argument)
@@ -406,6 +441,9 @@ impl CommandBehavior for BuiltinBehavior {
             });
         }
         let arguments = invocation.arguments.trim().to_owned();
+        let model = parsed_string_argument(&invocation, "model");
+        let theme = parsed_string_argument(&invocation, "theme");
+        let directory = parsed_directory_argument(&invocation, "path");
         let id = self.id;
         Box::pin(async move {
             let operation = match id {
@@ -414,7 +452,7 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::New => BuiltinOperation::ResetSession,
                 maki_commands::BuiltinId::Help => BuiltinOperation::ToggleHelp,
                 maki_commands::BuiltinId::Queue => BuiltinOperation::FocusQueue,
-                maki_commands::BuiltinId::Model if arguments.is_empty() => {
+                maki_commands::BuiltinId::Model if model.as_ref().is_ok_and(Option::is_none) => {
                     if !invocation.target_supports(TargetCapability::InteractiveUi) {
                         return Err(CommandError::Producer(Arc::from(
                             NONINTERACTIVE_MODEL_USAGE,
@@ -423,7 +461,10 @@ impl CommandBehavior for BuiltinBehavior {
                     BuiltinOperation::OpenModelPicker
                 }
                 maki_commands::BuiltinId::Model => {
-                    let specs = if arguments.contains('/') {
+                    let model = model?.ok_or_else(|| {
+                        CommandError::Producer(Arc::from("model argument is unavailable"))
+                    })?;
+                    let specs = if model.contains('/') {
                         Arc::from([])
                     } else {
                         let HostContextResponse::Values(specs) =
@@ -436,13 +477,16 @@ impl CommandBehavior for BuiltinBehavior {
                         specs
                     };
                     BuiltinOperation::SetModel {
-                        spec: resolve_model(&arguments, &specs)?,
+                        spec: resolve_model(&model, &specs)?,
                     }
                 }
-                maki_commands::BuiltinId::Theme if arguments.is_empty() => {
+                maki_commands::BuiltinId::Theme if theme.as_ref().is_ok_and(Option::is_none) => {
                     BuiltinOperation::OpenThemePicker
                 }
                 maki_commands::BuiltinId::Theme => {
+                    let theme = theme?.ok_or_else(|| {
+                        CommandError::Producer(Arc::from("theme argument is unavailable"))
+                    })?;
                     let HostContextResponse::Values(names) =
                         host_context(&invocation, HostContextRequest::ThemeNames).await?
                     else {
@@ -450,9 +494,9 @@ impl CommandBehavior for BuiltinBehavior {
                             "theme resolution is unavailable",
                         )));
                     };
-                    let Resolution::Unique(index) = fuzzy_resolve(&arguments, &names) else {
+                    let Resolution::Unique(index) = fuzzy_resolve(&theme, &names) else {
                         return Err(CommandError::Producer(Arc::from(format!(
-                            "theme is unknown or ambiguous: {arguments}"
+                            "theme is unknown or ambiguous: {theme}"
                         ))));
                     };
                     BuiltinOperation::SetTheme {
@@ -469,23 +513,21 @@ impl CommandBehavior for BuiltinBehavior {
                             "working-directory resolution is unavailable",
                         )));
                     };
-                    let path = if arguments.is_empty() {
-                        maki_storage::paths::home().unwrap_or_default()
-                    } else if let Some(rest) = arguments.strip_prefix('~') {
-                        let home = maki_storage::paths::home().unwrap_or_default();
-                        if rest.is_empty() {
-                            home
-                        } else {
-                            home.join(rest.trim_start_matches('/'))
-                        }
-                    } else {
-                        let path = PathBuf::from(&arguments);
-                        if path.is_relative() {
-                            cwd.join(path)
-                        } else {
-                            path
-                        }
-                    };
+                    let path = directory?
+                        .map(|path| {
+                            resolve_path(
+                                &cwd,
+                                maki_storage::paths::home().as_deref(),
+                                &path.to_string_lossy(),
+                            )
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            CommandError::Producer(Arc::from(format!(
+                                "argument path (directory): {error}"
+                            )))
+                        })?
+                        .unwrap_or_else(|| maki_storage::paths::home().unwrap_or_default());
                     BuiltinOperation::ChangeDirectory { path }
                 }
                 maki_commands::BuiltinId::Btw => BuiltinOperation::QuickQuestion {
@@ -516,6 +558,18 @@ impl CommandBehavior for BuiltinBehavior {
                 ))),
             }
         })
+    }
+}
+
+struct EmptyCompletion;
+
+impl CommandCompletion for EmptyCompletion {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -555,14 +609,35 @@ impl StandardCommands {
             .replace(
                 BUILTIN_COMMANDS
                     .iter()
-                    .map(|command| Registration {
-                        spec: command.spec(),
-                        behavior: Arc::new(BuiltinBehavior { id: command.id }),
-                        completion: match command.completion {
-                            Some(CompletionKey::Model) => completions.model.clone(),
-                            Some(CompletionKey::Theme) => completions.theme.clone(),
-                            None => None,
-                        },
+                    .map(|command| {
+                        let spec = command.spec();
+                        let argument_completions = command
+                            .argument_completions
+                            .iter()
+                            .map(|completion| {
+                                completion
+                                    .as_ref()
+                                    .and_then(|completion| match completion.key {
+                                        maki_commands::CompletionKey::Model => {
+                                            completions.model.clone().or_else(|| {
+                                                Some(Arc::new(EmptyCompletion)
+                                                    as Arc<dyn CommandCompletion>)
+                                            })
+                                        }
+                                        maki_commands::CompletionKey::Theme => {
+                                            completions.theme.clone().or_else(|| {
+                                                Some(Arc::new(EmptyCompletion)
+                                                    as Arc<dyn CommandCompletion>)
+                                            })
+                                        }
+                                    })
+                            })
+                            .collect();
+                        Registration {
+                            spec,
+                            behavior: Arc::new(BuiltinBehavior { id: command.id }),
+                            argument_completions,
+                        }
                     })
                     .collect(),
             )
@@ -614,9 +689,9 @@ pub fn register_commands(
                     name: Arc::from(command.display_name()),
                     aliases: Arc::from([]),
                     arguments: if command.has_args() {
-                        ArgumentArity::ANY
+                        maki_commands::CommandArguments::Raw { required: false }
                     } else {
-                        ArgumentArity::NONE
+                        maki_commands::CommandArguments::Positional(Arc::from([]))
                     },
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from(command.description.clone()),
@@ -625,7 +700,7 @@ pub fn register_commands(
                     required_capabilities: Default::default(),
                 },
                 behavior: Arc::new(CustomCommandBehavior { command }),
-                completion: None,
+                argument_completions: Vec::new(),
             })
             .collect(),
     )
@@ -903,6 +978,43 @@ mod tests {
     }
 
     #[test]
+    fn cd_parses_bare_quoted_and_rejects_extra_arguments() {
+        let registry = maki_commands::CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let host = Arc::new(RecordingCommandHost::default());
+        let target = registry.bind_target(TargetCapabilities::ALL, host.clone());
+
+        for input in ["/cd", r#"/cd "release notes""#] {
+            assert!(matches!(
+                smol::block_on(registry.dispatch_input(&target, input.into())),
+                maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+            ));
+        }
+        assert!(matches!(
+            smol::block_on(registry.dispatch_input(&target, "/cd one two".into())),
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
+                CommandError::TypedArguments { .. }
+            ))
+        ));
+
+        let operations = host.0.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(operations.len(), 2);
+        assert_eq!(
+            operations[0],
+            BuiltinOperation::ChangeDirectory {
+                path: maki_storage::paths::home().unwrap_or_default(),
+            }
+        );
+        assert_eq!(
+            operations[1],
+            BuiltinOperation::ChangeDirectory {
+                path: PathBuf::from("/project/release notes"),
+            }
+        );
+    }
+
+    #[test]
     fn builtin_arguments_are_centrally_interpreted() {
         let registry = maki_commands::CommandRegistry::new();
         let _commands =
@@ -913,8 +1025,10 @@ mod tests {
         for input in [
             "/model",
             "/model openai/gpt-5",
+            r#"/model "openai/"'gpt-5'"#,
             "/theme",
             "/theme dark",
+            r#"/theme "da"'rk'"#,
             "/btw explain this",
             "/fast",
         ] {
@@ -932,7 +1046,13 @@ mod tests {
                 maki_commands::BuiltinOperation::SetModel {
                     spec: Arc::from("openai/gpt-5"),
                 },
+                maki_commands::BuiltinOperation::SetModel {
+                    spec: Arc::from("openai/gpt-5"),
+                },
                 maki_commands::BuiltinOperation::OpenThemePicker,
+                maki_commands::BuiltinOperation::SetTheme {
+                    name: Arc::from("dark"),
+                },
                 maki_commands::BuiltinOperation::SetTheme {
                     name: Arc::from("dark"),
                 },

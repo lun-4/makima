@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::arguments::{
+    CommandArguments, CompletionPolicy, StaticArgumentKind, StaticCommandArguments,
+    StaticPositionalArgument,
+};
 use crate::completion::CommandCompletion;
 use crate::dispatch::{CommandAttachment, CommandBehavior};
 
@@ -134,15 +138,21 @@ pub enum HostContextResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticArgumentCompletion {
+    pub key: CompletionKey,
+    pub policy: CompletionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinDefinition {
     pub id: BuiltinId,
     pub name: &'static str,
     pub aliases: &'static [&'static str],
     pub description: &'static str,
-    pub arguments: ArgumentArity,
+    pub arguments: StaticCommandArguments,
+    pub argument_completions: &'static [Option<StaticArgumentCompletion>],
     pub argument_hint: Option<&'static str>,
     pub required_capabilities: TargetCapabilities,
-    pub completion: Option<CompletionKey>,
 }
 
 const INTERACTIVE: TargetCapabilities =
@@ -163,19 +173,62 @@ const LIFECYCLE: TargetCapabilities =
 const RELOAD: TargetCapabilities = TargetCapabilities::from_capability(TargetCapability::Reload);
 
 macro_rules! builtin {
-    ($id:ident, $name:expr, $aliases:expr, $description:expr, $arguments:expr, $hint:expr, $caps:expr, $completion:expr $(,)?) => {
+    ($id:ident, $name:expr, $aliases:expr, $description:expr, typed $arguments:expr, $completions:expr, $hint:expr, $caps:expr $(,)?) => {
         BuiltinDefinition {
             id: BuiltinId::$id,
             name: $name,
             aliases: $aliases,
             description: $description,
-            arguments: $arguments,
+            arguments: StaticCommandArguments::Positional($arguments),
+            argument_completions: $completions,
             argument_hint: $hint,
             required_capabilities: $caps,
-            completion: $completion,
+        }
+    };
+    ($id:ident, $name:expr, $aliases:expr, $description:expr, raw $required:expr, $hint:expr, $caps:expr $(,)?) => {
+        BuiltinDefinition {
+            id: BuiltinId::$id,
+            name: $name,
+            aliases: $aliases,
+            description: $description,
+            arguments: StaticCommandArguments::Raw {
+                required: $required,
+            },
+            argument_completions: &[],
+            argument_hint: $hint,
+            required_capabilities: $caps,
         }
     };
 }
+
+const CD_ARGUMENTS: &[StaticPositionalArgument] = &[StaticPositionalArgument {
+    name: "path",
+    kind: StaticArgumentKind::Directory,
+    optional: true,
+    variadic: false,
+}];
+const MODEL_ARGUMENTS: &[StaticPositionalArgument] = &[StaticPositionalArgument {
+    name: "model",
+    kind: StaticArgumentKind::String,
+    optional: true,
+    variadic: false,
+}];
+const THEME_ARGUMENTS: &[StaticPositionalArgument] = &[StaticPositionalArgument {
+    name: "theme",
+    kind: StaticArgumentKind::String,
+    optional: true,
+    variadic: false,
+}];
+const MODEL_COMPLETIONS: &[Option<StaticArgumentCompletion>] = &[Some(StaticArgumentCompletion {
+    key: CompletionKey::Model,
+    policy: CompletionPolicy::Replace,
+})];
+const THEME_COMPLETIONS: &[Option<StaticArgumentCompletion>] = &[Some(StaticArgumentCompletion {
+    key: CompletionKey::Theme,
+    policy: CompletionPolicy::Replace,
+})];
+const NO_ARGUMENT_COMPLETIONS: &[Option<StaticArgumentCompletion>] = &[];
+const CD_COMPLETIONS: &[Option<StaticArgumentCompletion>] = &[None];
 
 pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
     builtin!(
@@ -183,160 +236,159 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         "/tasks",
         &[],
         "Browse and search tasks",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         INTERACTIVE,
-        None,
     ),
     builtin!(
         Compact,
         COMPACT_COMMAND_NAME,
         &[],
         "Summarize and compact conversation history",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         SESSION,
-        None,
     ),
     builtin!(
         New,
         "/new",
         &["/clear"],
         "Start a new session",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         SESSION,
-        None,
     ),
     builtin!(
         Help,
         "/help",
         &[],
         "Show keybindings",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         INTERACTIVE,
-        None,
     ),
     builtin!(
         Queue,
         "/queue",
         &[],
         "Remove items from queue",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         INTERACTIVE,
-        None,
     ),
     builtin!(
         Model,
         "/model",
         &[],
         "Switch model",
-        ArgumentArity::OPTIONAL,
+        typed MODEL_ARGUMENTS,
+        MODEL_COMPLETIONS,
         Some("<model>"),
         MODEL,
-        Some(CompletionKey::Model),
     ),
     builtin!(
         Theme,
         "/theme",
         &[],
         "Switch color theme",
-        ArgumentArity::OPTIONAL,
+        typed THEME_ARGUMENTS,
+        THEME_COMPLETIONS,
         Some("<theme>"),
         INTERACTIVE,
-        Some(CompletionKey::Theme),
     ),
     builtin!(
         Mcp,
         "/mcp",
         &[],
         "Configure MCP servers",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         INTERACTIVE,
-        None,
     ),
     builtin!(
         Login,
         "/login",
         &[],
         "Authenticate with an LLM provider",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         INTERACTIVE,
-        None,
     ),
     builtin!(
         Cd,
         "/cd",
         &[],
-        "Change working directory",
-        ArgumentArity::OPTIONAL,
-        Some("<path>"),
-        CWD,
+        "Change working directory. Quote paths containing spaces.",
+        typed CD_ARGUMENTS,
+        CD_COMPLETIONS,
         None,
+        CWD,
     ),
     builtin!(
         Btw,
         "/btw",
         &[],
         "Ask a quick question (no tools, no history pollution)",
-        ArgumentArity::ONE_OR_MORE,
+        raw true,
         Some("<question>"),
         AGENT,
-        None,
     ),
     builtin!(
         Yolo,
         "/yolo",
         &[],
         "Toggle YOLO mode (skip all permission prompts)",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         PERMISSIONS,
-        None,
     ),
     builtin!(
         Fast,
         "/fast",
         &[],
         "Toggle Anthropic fast mode (Opus only)",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         CONFIG,
-        None,
     ),
     builtin!(
         Workflow,
         "/workflow",
         &[],
         "Toggle workflow mode (task callable inside code_execution)",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         CONFIG,
-        None,
     ),
     builtin!(
         Exit,
         "/exit",
         &[],
         "Exit the application",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         LIFECYCLE,
-        None,
     ),
     builtin!(
         Reload,
         "/reload",
         &[],
         "Reload plugins and config",
-        ArgumentArity::NONE,
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
         None,
         RELOAD,
-        None,
     ),
 ];
 
@@ -344,62 +396,45 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
 pub struct CommandSpec {
     pub name: Arc<str>,
     pub aliases: Arc<[Arc<str>]>,
-    pub arguments: ArgumentArity,
+    pub arguments: CommandArguments,
     pub docs: CommandDocs,
     pub required_capabilities: TargetCapabilities,
 }
 
+impl CommandSpec {
+    pub fn argument_hint(&self) -> Option<Arc<str>> {
+        self.docs
+            .argument_hint
+            .clone()
+            .or_else(|| self.arguments.usage_hint())
+    }
+}
+
 impl BuiltinDefinition {
     pub fn spec(&self) -> CommandSpec {
+        let arguments = match self.arguments {
+            StaticCommandArguments::Raw { required } => CommandArguments::Raw { required },
+            StaticCommandArguments::Positional(arguments) => {
+                let mut arguments: Vec<crate::arguments::PositionalArgument> =
+                    arguments.iter().copied().map(Into::into).collect();
+                for (argument, completion) in arguments.iter_mut().zip(self.argument_completions) {
+                    if let Some(completion) = completion {
+                        argument.completion = completion.policy;
+                    }
+                }
+                CommandArguments::Positional(arguments.into())
+            }
+        };
         CommandSpec {
             name: Arc::from(self.name),
             aliases: self.aliases.iter().copied().map(Arc::from).collect(),
-            arguments: self.arguments,
+            arguments,
             docs: CommandDocs {
                 summary: Arc::from(self.description),
                 argument_hint: self.argument_hint.map(Arc::from),
             },
             required_capabilities: self.required_capabilities,
         }
-    }
-}
-
-/// Argument count bounds. Arguments are counted by splitting the raw
-/// remainder on whitespace, with no shell-like quoting: `/cd "my dir"` counts
-/// as two arguments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ArgumentArity {
-    pub min: usize,
-    pub max: Option<usize>,
-}
-
-impl ArgumentArity {
-    pub const NONE: Self = Self::exactly(0);
-    pub const OPTIONAL: Self = Self::bounded(0, 1);
-    pub const ONE: Self = Self::exactly(1);
-    pub const ANY: Self = Self::unbounded(0);
-    pub const ONE_OR_MORE: Self = Self::unbounded(1);
-
-    pub const fn exactly(count: usize) -> Self {
-        Self {
-            min: count,
-            max: Some(count),
-        }
-    }
-
-    pub const fn bounded(min: usize, max: usize) -> Self {
-        Self {
-            min,
-            max: Some(max),
-        }
-    }
-
-    pub const fn unbounded(min: usize) -> Self {
-        Self { min, max: None }
-    }
-
-    pub fn accepts(self, count: usize) -> bool {
-        count >= self.min && self.max.is_none_or(|max| count <= max)
     }
 }
 
@@ -412,7 +447,27 @@ pub struct CommandDocs {
 pub struct Registration {
     pub spec: CommandSpec,
     pub behavior: Arc<dyn CommandBehavior>,
-    pub completion: Option<Arc<dyn CommandCompletion>>,
+    pub argument_completions: Vec<Option<Arc<dyn CommandCompletion>>>,
+}
+
+impl Registration {
+    pub fn with_argument_completion(
+        mut self,
+        name: impl Into<Arc<str>>,
+        provider: Arc<dyn CommandCompletion>,
+    ) -> Self {
+        let name = name.into();
+        if let Some(arguments) = self.spec.arguments.positional()
+            && let Some(index) = arguments.iter().position(|argument| argument.name == name)
+        {
+            if self.argument_completions.len() != arguments.len() {
+                self.argument_completions
+                    .resize_with(arguments.len(), || None);
+            }
+            self.argument_completions[index] = Some(provider);
+        }
+        self
+    }
 }
 
 impl fmt::Debug for Registration {
@@ -422,8 +477,12 @@ impl fmt::Debug for Registration {
             .field("spec", &self.spec)
             .field("behavior", &"dyn CommandBehavior")
             .field(
-                "completion",
-                &self.completion.as_ref().map(|_| "dyn CommandCompletion"),
+                "argument_completions",
+                &self
+                    .argument_completions
+                    .iter()
+                    .map(|provider| provider.as_ref().map(|_| "dyn CommandCompletion"))
+                    .collect::<Vec<_>>(),
             )
             .finish()
     }

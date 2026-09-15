@@ -211,16 +211,23 @@ fn frame_text(frame: &maki_lua::SplashFrame) -> String {
     frame.rows.iter().map(|r| r.glyphs.as_str()).collect()
 }
 
-fn lifecycle_ctx() -> CommandArgumentContext {
+fn lifecycle_ctx(host: &maki_lua::test_support::PluginHostGuard) -> CommandArgumentContext {
     CommandArgumentContext {
         command: Arc::from("/splash"),
         plugin: Arc::from("splashes"),
         args: SELECTION_VORTEX.into(),
         arg: SELECTION_VORTEX.into(),
-        index: 1,
+        index: 0,
         mode: "build".into(),
         session: 1,
         generation: 1,
+        command_generation: host
+            .host()
+            .event_handle()
+            .command_generation_for_test("splashes", "/splash"),
+        argument_name: None,
+        argument_kind: None,
+        preceding_arguments: Arc::from([]),
     }
 }
 
@@ -371,13 +378,13 @@ fn splash_picker_accept_survives_late_highlight() {
     // Accept is still in flight. The late Highlight must not coalesce the
     // Accept away, or the selection save is silently lost.
     handle.command_argument_lifecycle(
-        lifecycle_ctx(),
+        lifecycle_ctx(&guard),
         CommandArgumentLifecycle::Accept,
         Some(lifecycle_item()),
         CancelToken::none(),
     );
     handle.command_argument_lifecycle(
-        lifecycle_ctx(),
+        lifecycle_ctx(&guard),
         CommandArgumentLifecycle::Highlight,
         Some(lifecycle_item()),
         CancelToken::none(),

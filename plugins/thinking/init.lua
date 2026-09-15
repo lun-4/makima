@@ -93,25 +93,30 @@ end
 maki.api.register_command({
   name = "/thinking",
   description = "Set thinking effort (bare opens a selector)",
-  argument_hint = "[effort]",
-  nargs = "?",
   tui_only = true,
-  completion = {
-    get_items = function()
-      local info, err = maki.session.thinking()
-      if err or not info.supports_thinking or not info.options then
-        return {}
-      end
-      local items = {}
-      for _, option in ipairs(info.options) do
-        items[#items + 1] = { label = option, insertion = option }
-      end
-      return items
-    end,
+  arguments = {
+    {
+      name = "effort",
+      type = "string",
+      optional = true,
+      completion = {
+        get_items = function()
+          local info, err = maki.session.thinking()
+          if err or not info.supports_thinking or not info.options then
+            return {}
+          end
+          local items = {}
+          for _, option in ipairs(info.options) do
+            items[#items + 1] = { label = option, insertion = option }
+          end
+          return items
+        end,
+      },
+    },
   },
   handler = function(opts)
-    local args = tostring(opts.args or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    if args ~= "" then
+    local args = opts.values.effort
+    if args then
       set_thinking(args)
       return
     end

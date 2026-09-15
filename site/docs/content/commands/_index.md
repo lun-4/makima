@@ -9,29 +9,29 @@ group = "Reference"
 
 Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text is rejected with an error instead of becoming a prompt. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Text sent programmatically (`maki.session.prompt`, subagent chat) is not parsed as a command. A known available command with invalid arguments returns an error instead of becoming a prompt.
 
-The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. The Lua `tui_only` field maps to the interactive-TUI capability. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands.
+The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands.
 
 ## Built-in commands
 
-| Command | Description | Arguments | TUI-only |
-|---------|-------------|-----------|----------|
-| `/tasks` | Browse and search tasks |  | yes |
-| `/compact` | Summarize and compact conversation history |  | no |
-| `/new` | Start a new session |  | no |
-| `/clear` | Alias for `/new` |  | no |
-| `/help` | Show keybindings |  | yes |
-| `/queue` | Remove items from queue |  | yes |
-| `/model` | Switch model | <model> | no |
-| `/theme` | Switch color theme | <theme> | yes |
-| `/mcp` | Configure MCP servers |  | yes |
-| `/login` | Authenticate with an LLM provider |  | yes |
-| `/cd` | Change working directory | <path> | no |
-| `/btw` | Ask a quick question (no tools, no history pollution) | <question> | no |
-| `/yolo` | Toggle YOLO mode (skip all permission prompts) |  | no |
-| `/fast` | Toggle Anthropic fast mode (Opus only) |  | no |
-| `/workflow` | Toggle workflow mode (task callable inside code_execution) |  | no |
-| `/exit` | Exit the application |  | no |
-| `/reload` | Reload plugins and config |  | no |
+| Command | Description | Mode | Arguments | TUI-only |
+|---------|-------------|------|-----------|----------|
+| `/tasks` | Browse and search tasks | none |  | yes |
+| `/compact` | Summarize and compact conversation history | none |  | no |
+| `/new` | Start a new session | none |  | no |
+| `/clear` | Alias for `/new` | none |  | no |
+| `/help` | Show keybindings | none |  | yes |
+| `/queue` | Remove items from queue | none |  | yes |
+| `/model` | Switch model | typed | <model> | no |
+| `/theme` | Switch color theme | typed | <theme> | yes |
+| `/mcp` | Configure MCP servers | none |  | yes |
+| `/login` | Authenticate with an LLM provider | none |  | yes |
+| `/cd` | Change working directory. Quote paths containing spaces. | typed | [path] | no |
+| `/btw` | Ask a quick question (no tools, no history pollution) | raw (required) | <question> | no |
+| `/yolo` | Toggle YOLO mode (skip all permission prompts) | none |  | no |
+| `/fast` | Toggle Anthropic fast mode (Opus only) | none |  | no |
+| `/workflow` | Toggle workflow mode (task callable inside code_execution) | none |  | no |
+| `/exit` | Exit the application | none |  | yes |
+| `/reload` | Reload plugins and config | none |  | yes |
 
 The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`).
 
@@ -39,20 +39,26 @@ The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `
 
 Bundled Lua plugins register these commands at startup. Plugin commands have higher collision priority than built-ins, so a bundled plugin can replace a built-in implementation for the targets it supports.
 
-| Command | Description | Arguments | TUI-only |
-|---------|-------------|-----------|----------|
-| `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | no |
-| `/build` | Switch to build mode (full tool access) |  | no |
-| `/memory` | View, edit, and delete memory files |  | yes |
-| `/plan` | Switch to plan mode (analyse and write only the plan file) |  | no |
-| `/rename` | Rename the current session | <title> | yes |
-| `/sessions` | Browse and switch sessions | [query] | yes |
-| `/splash` | Preview and select a splash renderer | [splash] | yes |
-| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | yes |
-| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |
-| `/usage` | Show provider quota and focused-session token usage |  | yes |
+| Command | Description | Mode | Arguments | TUI-only |
+|---------|-------------|------|-----------|----------|
+| `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | no |
+| `/build` | Switch to build mode (full tool access) | none |  | no |
+| `/memory` | View, edit, and delete memory files | none |  | yes |
+| `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | no |
+| `/rename` | Rename the current session | raw (required) |  | yes |
+| `/sessions` | Browse and switch sessions | typed | [query] | yes |
+| `/splash` | Preview and select a splash renderer | typed | [splash] | yes |
+| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | yes |
+| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | yes |
+| `/usage` | Show provider quota and focused-session token usage | none |  | yes |
 
 ## Command arguments
+
+Lua commands declare their arguments with `arguments`. Use `arguments = { raw = true }` for an optional unparsed argument string, or add `required = true` to reject empty input. Provide a dense array of typed positional descriptors for decoded values. Each typed argument has a name and one of `string`, `integer`, `enum`, `file`, or `directory` types. Set `optional = true` only after required arguments, and set `variadic = true` only on the final argument.
+
+Typed command input uses shell-like single or double quotes to keep spaces in one value. Quotes are removed before validation; double-quoted values only escape `\"` and `\\`. Integers are signed decimal values from `-9007199254740991` through `9007199254740991`. Handlers receive the original text in `opts.args`, decoded tokens in `opts.fargs`, and typed values in `opts.values` keyed by argument name.
+
+Completion callbacks receive the typed argument name as `ctx.argument`, its type as `ctx.type`, and successfully parsed preceding values as `ctx.values`. Raw commands receive the original argument text.
 
 `/model` and `/theme` also accept an argument. While you type it, the palette lists the possible values (model specs, theme names), and submitting resolves the argument without opening the picker:
 
