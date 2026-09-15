@@ -228,6 +228,10 @@ pub enum Action {
     },
     ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
+    ImplementPlan {
+        clear_context: bool,
+        model: Option<String>,
+    },
     RefreshProvider {
         slug: String,
     },

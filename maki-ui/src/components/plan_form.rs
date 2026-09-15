@@ -16,10 +16,16 @@ const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
 } else {
     "Ctrl+T/Esc"
 };
+const MODEL_PICKER_HINT: &str = if cfg!(target_os = "macos") {
+    "⌃M"
+} else {
+    key::MODEL_PICKER.label
+};
 const HINT_PAIRS: &[(&str, &str)] = &[
     ("↑↓", "select"),
     ("Space", "toggle parallel"),
     ("Enter", "confirm"),
+    (MODEL_PICKER_HINT, "choose implementation model"),
     (key::OPEN_EDITOR.label, "edit plan"),
     (DISMISS_KEYS, "dismiss"),
 ];
@@ -46,6 +52,11 @@ const MENU: &[MenuItem] = &[
         desc: "  Keep current context, implement the plan",
         action: || PlanFormAction::Implement,
     },
+    MenuItem {
+        label: "Implementation model",
+        desc: "",
+        action: || PlanFormAction::OpenModelPicker,
+    },
 ];
 
 // 2 borders + 1 empty line + 1 hint bar
@@ -59,6 +70,7 @@ pub enum PlanFormAction {
     ClearAndImplement,
     Implement,
     OpenEditor,
+    OpenModelPicker,
     Hide,
 }
 
@@ -73,6 +85,7 @@ pub struct PlanForm {
     visibility: Visibility,
     selected: usize,
     parallel: bool,
+    implementation_model: Option<String>,
 }
 
 impl PlanForm {
@@ -81,6 +94,7 @@ impl PlanForm {
             visibility: Visibility::Hidden,
             selected: 0,
             parallel: false,
+            implementation_model: None,
         }
     }
 
@@ -121,6 +135,15 @@ impl PlanForm {
     pub fn reset(&mut self) {
         self.visibility = Visibility::Hidden;
         self.selected = 0;
+        self.implementation_model = None;
+    }
+
+    pub fn set_implementation_model(&mut self, spec: String) {
+        self.implementation_model = Some(spec);
+    }
+
+    pub fn implementation_model(&self) -> Option<&str> {
+        self.implementation_model.as_deref()
     }
 
     pub fn hint_line(&self) -> Option<Line<'static>> {
@@ -140,6 +163,9 @@ impl PlanForm {
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PlanFormAction {
+        if key::MODEL_PICKER.matches(key_event) {
+            return PlanFormAction::OpenModelPicker;
+        }
         if key::QUIT.matches(key_event)
             || key_event.code == KeyCode::Esc
             || key::PLAN_TOGGLE.matches(key_event)
@@ -168,7 +194,7 @@ impl PlanForm {
         }
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, current_model: &str) {
         if !self.is_visible() {
             return;
         }
@@ -178,13 +204,26 @@ impl PlanForm {
 
         for (i, item) in MENU.iter().enumerate() {
             let (prefix, style) = selected_prefix(&t, i == self.selected);
-            let mut spans = vec![
-                Span::styled(prefix, t.tool_dim),
-                Span::styled(item.label, style),
-                Span::styled(item.desc, t.tool_dim),
-            ];
-            if self.parallel {
-                spans.push(Span::styled(" (parallel)", t.tool_dim.bold()));
+            let mut spans = vec![Span::styled(prefix, t.tool_dim)];
+            if i == MENU.len() - 1 {
+                let current = current_model;
+                let selected = self.implementation_model.as_deref();
+                let spec = selected.unwrap_or(current);
+                spans.push(Span::styled(format!("Implementation model: {spec}"), style));
+                spans.push(Span::styled(
+                    if selected.is_some() {
+                        "  selected"
+                    } else {
+                        "  current"
+                    },
+                    t.tool_dim,
+                ));
+            } else {
+                spans.push(Span::styled(item.label, style));
+                spans.push(Span::styled(item.desc, t.tool_dim));
+                if self.parallel {
+                    spans.push(Span::styled(" (parallel)", t.tool_dim.bold()));
+                }
             }
             lines.push(Line::from(spans));
         }
@@ -250,9 +289,11 @@ mod tests {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         form.selected = 1;
+        form.implementation_model = Some("provider/model".into());
         form.reset();
         assert!(!form.is_visible());
         assert_eq!(form.selected, 0);
+        assert_eq!(form.implementation_model, None);
     }
 
     #[test]
@@ -290,6 +331,7 @@ mod tests {
     #[test_case(0, PlanFormAction::Hide              ; "enter_at_0_refine")]
     #[test_case(1, PlanFormAction::ClearAndImplement ; "enter_at_1")]
     #[test_case(2, PlanFormAction::Implement          ; "enter_at_2")]
+    #[test_case(3, PlanFormAction::OpenModelPicker ; "enter_at_3_model_picker")]
     fn enter_dispatches(selected: usize, expected: PlanFormAction) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
@@ -322,6 +364,16 @@ mod tests {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         assert_eq!(form.handle_key(k), PlanFormAction::Hide);
+    }
+
+    #[test]
+    fn ctrl_m_opens_model_picker() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        assert_eq!(
+            form.handle_key(key::MODEL_PICKER.to_key_event()),
+            PlanFormAction::OpenModelPicker
+        );
     }
 
     #[test]

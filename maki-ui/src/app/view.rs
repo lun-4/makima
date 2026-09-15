@@ -307,7 +307,8 @@ impl App {
                 );
             }
         } else if self.plan_form_active() {
-            self.plan_form.view(frame, layout.bottom_area);
+            self.plan_form
+                .view(frame, layout.bottom_area, &self.state.model.spec());
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
             queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
@@ -611,7 +612,9 @@ impl App {
     #[cfg(test)]
     pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
-        if self.plan_form_active() {
+        if self.model_picker.is_open() {
+            contexts.push(KeybindContext::ModelPicker);
+        } else if self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);
@@ -621,8 +624,6 @@ impl App {
             contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {
             contexts.push(KeybindContext::ThemePicker);
-        } else if self.model_picker.is_open() {
-            contexts.push(KeybindContext::ModelPicker);
         } else if self.command_palette.is_active() {
             contexts.push(KeybindContext::CommandPalette);
         } else if self.search_modal.is_open() {
