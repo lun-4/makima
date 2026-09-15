@@ -195,6 +195,12 @@ pub async fn run(
             None => None,
         };
 
+        if matches!(emit, Emit::Notify) {
+            let _ = ctx
+                .event_tx
+                .send(AgentEvent::ToolExecutionStart { id: id.clone() });
+        }
+
         let result = match locked {
             Some((exec_ctx, guard)) => {
                 let result = invocation.execute(&exec_ctx).await;
@@ -244,7 +250,7 @@ pub async fn run(
             format!("mcp: {mcp_lookup}"),
             input,
         );
-        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input).await
+        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input, emit).await
     } else {
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
         warn!(tool = %mcp_lookup, "unknown tool");
@@ -386,6 +392,7 @@ async fn execute_mcp_tool(
     tool_id: Arc<str>,
     tool_name: &str,
     input: &Value,
+    emit: Emit,
 ) -> ToolDoneEvent {
     let done = |output: String, is_error: bool| ToolDoneEvent {
         id: id.to_owned(),
@@ -432,6 +439,11 @@ async fn execute_mcp_tool(
     // A permitted call to a deferred tool counts as loading it, so its full
     // definition joins the next request; a denied call must not load anything.
     mcp.mark_loaded(tool_name);
+    if matches!(emit, Emit::Notify) {
+        let _ = ctx
+            .event_tx
+            .send(AgentEvent::ToolExecutionStart { id: id.to_owned() });
+    }
     match mcp.call_tool(tool_name, input).await {
         Ok(text) => done(text, false),
         Err(e) => done(e.to_string(), true),
@@ -542,7 +554,7 @@ async fn dispatch_mcp(
         .as_ref()
         .map(|m| m.interned_name(tool_name))
         .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
-    execute_mcp_tool(ctx, id, tool_id, tool_name, input).await
+    execute_mcp_tool(ctx, id, tool_id, tool_name, input, Emit::Silent).await
 }
 
 #[cfg(test)]
@@ -557,7 +569,7 @@ mod tests {
 
     use super::*;
     use crate::AgentMode;
-    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
+    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager};
     use crate::tools::registry::ToolSource;
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
     use crate::tools::{ToolAudience, ToolInvocation};
@@ -768,6 +780,71 @@ mod tests {
                 crate::mcp::tool_names(&tools),
                 vec!["srv__fetch_issue"],
                 "called tool must join the next request"
+            );
+        });
+    }
+
+    #[test]
+    fn mcp_execution_start_follows_permission_and_precedes_dispatch() {
+        smol::block_on(async {
+            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                TempDir::new().unwrap().path().to_path_buf(),
+                Arc::default(),
+            ));
+            let (event_tx, event_rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            let (answer_tx, answer_rx) = flume::unbounded();
+            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+            ctx.event_tx = event_tx;
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
+            ctx.mcp = Some(mcp.clone());
+            let input = serde_json::json!({});
+
+            let call = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                "t1".into(),
+                "srv__fetch_issue",
+                &input,
+                &ctx,
+                Emit::Notify,
+            );
+            let approve = async {
+                assert!(matches!(
+                    event_rx.recv_async().await.unwrap().event,
+                    AgentEvent::ToolStart(_)
+                ));
+                assert!(matches!(
+                    event_rx.recv_async().await.unwrap().event,
+                    AgentEvent::PermissionRequest { .. }
+                ));
+                assert!(
+                    event_rx.is_empty(),
+                    "execution must not start before approval"
+                );
+                answer_tx
+                    .send_async(PermissionAnswer::AllowOnce.encode())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    event_rx.recv_async().await.unwrap().event,
+                    AgentEvent::ToolExecutionStart { ref id } if id == "t1"
+                ));
+            };
+            let (done, ()) = futures_lite::future::zip(call, approve).await;
+            assert!(
+                done.is_error,
+                "the stub dispatch must complete with its error"
+            );
+            assert!(
+                done.output.as_text().contains("unknown MCP tool"),
+                "dispatch must occur after execution start: {}",
+                done.output.as_text()
             );
         });
     }
@@ -1063,6 +1140,75 @@ mod tests {
                 executed: Arc::clone(&self.executed),
             }))
         }
+    }
+
+    #[test]
+    fn execution_start_follows_permission_approval_and_precedes_execute() {
+        smol::block_on(async {
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                TempDir::new().unwrap().path().to_path_buf(),
+                Arc::default(),
+            ));
+            let (event_tx, event_rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            let (answer_tx, answer_rx) = flume::unbounded();
+            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+            ctx.event_tx = event_tx;
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
+
+            let probe = StartProbe::default();
+            let executed = Arc::clone(&probe.executed);
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(probe),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                    },
+                )
+                .unwrap();
+
+            let input = serde_json::json!({});
+            let call = run(
+                &registry,
+                None,
+                "t1".into(),
+                START_PROBE_NAME,
+                &input,
+                &ctx,
+                Emit::Notify,
+            );
+            let approve = async {
+                let start = event_rx.recv_async().await.unwrap();
+                assert!(matches!(start.event, AgentEvent::ToolStart(_)));
+                let permission = event_rx.recv_async().await.unwrap();
+                assert!(matches!(
+                    permission.event,
+                    AgentEvent::PermissionRequest { .. }
+                ));
+                assert!(
+                    event_rx.is_empty(),
+                    "execution must not start before approval"
+                );
+                assert!(!executed.load(Ordering::SeqCst));
+                answer_tx
+                    .send_async(PermissionAnswer::AllowOnce.encode())
+                    .await
+                    .unwrap();
+                let execution = event_rx.recv_async().await.unwrap();
+                assert!(matches!(
+                    execution.event,
+                    AgentEvent::ToolExecutionStart { ref id } if id == "t1"
+                ));
+            };
+            let (done, ()) = futures_lite::future::zip(call, approve).await;
+            assert!(!done.is_error);
+            assert!(executed.load(Ordering::SeqCst));
+        });
     }
 
     /// A denied tool should still get its preview, but never its `execute`.

@@ -11,10 +11,10 @@ use agent_client_protocol_schema::{
     CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
     InitializeRequest, JsonRpcMessage, LoadSessionRequest, McpServer, NewSessionRequest,
     Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
-    RequestPermissionResponse, Response, SessionId, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallId,
-    ToolCallUpdate, ToolCallUpdateFields, UnstructuredCommandInput,
+    RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionModeId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
 use flume::{Receiver, Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
@@ -63,6 +63,7 @@ struct PendingOperation {
     id: u64,
     request_id: RequestId,
     kind: OperationKind,
+    cancelling: bool,
     cancel: Option<maki_agent::cancel::CancelTrigger>,
     _lease: Option<maki_agent::session_coordinator::SessionLease>,
 }
@@ -72,6 +73,7 @@ struct PendingOperation {
 #[derive(Default)]
 struct Pending {
     operation: Option<PendingOperation>,
+    admission_waiters: Vec<Sender<()>>,
     permission: Option<i64>,
     elicitation: Option<i64>,
 }
@@ -119,6 +121,7 @@ struct OptionProjection {
     read: maki_agent::session_coordinator::SessionReadHandle,
     command_state: Arc<maki_agent::command::SessionCommandState>,
     permissions: Arc<maki_agent::permissions::PermissionManager>,
+    supports_boolean: bool,
     emitted_version: Mutex<u64>,
 }
 
@@ -138,7 +141,12 @@ impl OptionProjection {
         }
         self.apply_committed_options(snapshot);
         if emit {
-            emit_config_options(&self.out_tx, &self.session_id, snapshot);
+            emit_config_options(
+                &self.out_tx,
+                &self.session_id,
+                snapshot,
+                self.supports_boolean,
+            );
         }
         *emitted_version = snapshot.version;
     }
@@ -228,6 +236,7 @@ struct Server {
     session: Option<SessionState>,
     /// Whether the client advertised form elicitation support at `initialize`.
     elicitation: bool,
+    supports_boolean: bool,
 }
 
 impl Server {
@@ -256,6 +265,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         modes: Arc::clone(&params.modes),
         session: None,
         elicitation: false,
+        supports_boolean: false,
     };
 
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
@@ -382,6 +392,7 @@ async fn handle_request(
 ) {
     let result = match method {
         "initialize" => {
+            srv.supports_boolean = supports_boolean_config(raw);
             srv.elicitation = parse_params::<InitializeRequest>(raw).is_ok_and(|req| {
                 req.client_capabilities
                     .elicitation
@@ -447,8 +458,9 @@ async fn new_session(
         },
     )
     .ok_or_else(|| AcpError::internal_error().data(json_str(&"session registration failed")))?;
-    let resp = methods::new_session_response(&session_id, &srv.modes)
-        .config_options(methods::session_config_options(&snapshot));
+    let resp = methods::new_session_response(&session_id, &srv.modes).config_options(
+        methods::session_config_options(&snapshot, srv.supports_boolean),
+    );
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -524,8 +536,9 @@ async fn load_session(
         },
     )
     .ok_or_else(|| AcpError::internal_error().data(json_str(&"session registration failed")))?;
-    let resp = methods::load_session_response(&srv.modes)
-        .config_options(methods::session_config_options(&snapshot));
+    let resp = methods::load_session_response(&srv.modes).config_options(
+        methods::session_config_options(&snapshot, srv.supports_boolean),
+    );
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
@@ -640,16 +653,17 @@ async fn close_session(srv: &mut Server) {
     };
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
-    let operation = state.pending.lock().unwrap().operation.take();
-    if let Some(operation) = operation {
-        let resp = PromptResponse::new(StopReason::Cancelled);
-        send(
-            &srv.out_tx,
-            Response::new(
-                operation.request_id,
-                Ok(AgentResponse::PromptResponse(resp)),
-            ),
-        );
+    let operation = state
+        .pending
+        .lock()
+        .unwrap()
+        .operation
+        .as_ref()
+        .map(|operation| (operation.id, operation.kind));
+    if let Some((operation_id, kind)) = operation {
+        finish_operation(&state.pending, operation_id, kind, |request_id| {
+            respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
+        });
     }
     state.command_projection_task.cancel().await;
     state.option_projection_task.cancel().await;
@@ -823,6 +837,7 @@ fn install_session(
         read: coordinator.read(),
         command_state: Arc::clone(&command_state),
         permissions: Arc::clone(&handle.permissions),
+        supports_boolean: srv.supports_boolean,
         emitted_version: Mutex::new(option_snapshot.version),
     });
     let option_projection_task = watch_config_options(
@@ -922,12 +937,13 @@ fn emit_config_options(
     out_tx: &Sender<Value>,
     session_id: &SessionId,
     snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
+    supports_boolean: bool,
 ) {
     session_update(
         out_tx,
         session_id,
         SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
-            methods::session_config_options(snapshot),
+            methods::session_config_options(snapshot, supports_boolean),
         )),
     );
 }
@@ -1033,6 +1049,7 @@ fn validate_session<'a>(srv: &'a Server, requested: &str) -> Result<&'a SessionS
 async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
     let session = validate_session(srv, req.session_id.0.as_ref())?;
+    await_prompt_admission(&session.pending).await?;
     let content = extract_prompt_content(&req.prompt)?;
     let dispatch = session
         .command_registry
@@ -1116,6 +1133,7 @@ async fn send_manual_compaction(
             id: operation_id,
             request_id: id.clone(),
             kind: OperationKind::ManualCompaction,
+            cancelling: false,
             cancel: Some(trigger),
             _lease: Some(lease),
         });
@@ -1137,7 +1155,7 @@ async fn send_manual_compaction(
         })
         .is_err()
     {
-        take_operation(
+        release_operation(
             &session.pending,
             operation_id,
             OperationKind::ManualCompaction,
@@ -1155,50 +1173,77 @@ async fn send_manual_compaction(
                     session_update(&out_tx, &sid, translate::local_operation_started(&tool_id));
                 }
                 ManualCompactionEvent::Completed => {
-                    if let Some(operation) =
-                        take_operation(&pending, operation_id, OperationKind::ManualCompaction)
-                    {
-                        session_update(
-                            &out_tx,
-                            &sid,
-                            translate::local_operation_terminal(&tool_id, None),
-                        );
-                        respond_prompt(&out_tx, operation.request_id, StopReason::EndTurn);
-                    }
+                    finish_operation(
+                        &pending,
+                        operation_id,
+                        OperationKind::ManualCompaction,
+                        |request_id| {
+                            session_update(
+                                &out_tx,
+                                &sid,
+                                translate::local_operation_terminal(&tool_id, None),
+                            );
+                            respond_prompt(&out_tx, request_id, StopReason::EndTurn);
+                        },
+                    );
                     break;
                 }
                 ManualCompactionEvent::Cancelled => {
-                    if let Some(operation) =
-                        take_operation(&pending, operation_id, OperationKind::ManualCompaction)
-                    {
-                        session_update(
-                            &out_tx,
-                            &sid,
-                            translate::local_operation_terminal(&tool_id, Some("cancelled")),
-                        );
-                        respond_prompt(&out_tx, operation.request_id, StopReason::Cancelled);
-                    }
+                    finish_operation(
+                        &pending,
+                        operation_id,
+                        OperationKind::ManualCompaction,
+                        |request_id| {
+                            session_update(
+                                &out_tx,
+                                &sid,
+                                translate::local_operation_terminal(&tool_id, Some("cancelled")),
+                            );
+                            respond_prompt(&out_tx, request_id, StopReason::Cancelled);
+                        },
+                    );
                     break;
                 }
                 ManualCompactionEvent::Failed(error) => {
-                    if let Some(operation) =
-                        take_operation(&pending, operation_id, OperationKind::ManualCompaction)
-                    {
-                        session_update(
-                            &out_tx,
-                            &sid,
-                            translate::local_operation_terminal(&tool_id, Some(&error)),
-                        );
-                        let error = AcpError::internal_error().data(Value::String(error));
-                        send(
-                            &out_tx,
-                            Response::new(operation.request_id, Err::<AgentResponse, _>(error)),
-                        );
-                    }
+                    finish_operation(
+                        &pending,
+                        operation_id,
+                        OperationKind::ManualCompaction,
+                        |request_id| {
+                            session_update(
+                                &out_tx,
+                                &sid,
+                                translate::local_operation_terminal(&tool_id, Some(&error)),
+                            );
+                            let error = AcpError::internal_error().data(Value::String(error));
+                            send(
+                                &out_tx,
+                                Response::new(request_id, Err::<AgentResponse, _>(error)),
+                            );
+                        },
+                    );
                     break;
                 }
             }
         }
+        finish_operation(
+            &pending,
+            operation_id,
+            OperationKind::ManualCompaction,
+            |request_id| {
+                session_update(
+                    &out_tx,
+                    &sid,
+                    translate::local_operation_terminal(&tool_id, Some("event stream ended")),
+                );
+                let error = AcpError::internal_error()
+                    .data(Value::String("manual compaction event stream ended".into()));
+                send(
+                    &out_tx,
+                    Response::new(request_id, Err::<AgentResponse, _>(error)),
+                );
+            },
+        );
     })
     .detach();
     Ok(())
@@ -1246,6 +1291,7 @@ async fn send_isolated_turn(
             id: operation_id,
             request_id: id.clone(),
             kind: OperationKind::IsolatedTurn,
+            cancelling: false,
             cancel: Some(trigger),
             _lease: Some(lease),
         });
@@ -1262,7 +1308,7 @@ async fn send_isolated_turn(
         })
         .is_err()
     {
-        take_operation(&session.pending, operation_id, OperationKind::IsolatedTurn);
+        release_operation(&session.pending, operation_id, OperationKind::IsolatedTurn);
         return Err(AcpError::new(-32603, "session ended"));
     }
     let pending = Arc::clone(&session.pending);
@@ -1280,35 +1326,53 @@ async fn send_isolated_turn(
                     session_update(&out_tx, &sid, translate::thinking_delta(&text));
                 }
                 IsolatedTurnEvent::Done => {
-                    if let Some(operation) =
-                        take_operation(&pending, operation_id, OperationKind::IsolatedTurn)
-                    {
-                        respond_prompt(&out_tx, operation.request_id, StopReason::EndTurn);
-                    }
+                    finish_operation(
+                        &pending,
+                        operation_id,
+                        OperationKind::IsolatedTurn,
+                        |request_id| respond_prompt(&out_tx, request_id, StopReason::EndTurn),
+                    );
                     break;
                 }
                 IsolatedTurnEvent::Cancelled => {
-                    if let Some(operation) =
-                        take_operation(&pending, operation_id, OperationKind::IsolatedTurn)
-                    {
-                        respond_prompt(&out_tx, operation.request_id, StopReason::Cancelled);
-                    }
+                    finish_operation(
+                        &pending,
+                        operation_id,
+                        OperationKind::IsolatedTurn,
+                        |request_id| respond_prompt(&out_tx, request_id, StopReason::Cancelled),
+                    );
                     break;
                 }
                 IsolatedTurnEvent::Error(message) => {
-                    if let Some(operation) =
-                        take_operation(&pending, operation_id, OperationKind::IsolatedTurn)
-                    {
-                        let error = AcpError::internal_error().data(Value::String(message));
-                        send(
-                            &out_tx,
-                            Response::new(operation.request_id, Err::<AgentResponse, _>(error)),
-                        );
-                    }
+                    finish_operation(
+                        &pending,
+                        operation_id,
+                        OperationKind::IsolatedTurn,
+                        |request_id| {
+                            let error = AcpError::internal_error().data(Value::String(message));
+                            send(
+                                &out_tx,
+                                Response::new(request_id, Err::<AgentResponse, _>(error)),
+                            );
+                        },
+                    );
                     break;
                 }
             }
         }
+        finish_operation(
+            &pending,
+            operation_id,
+            OperationKind::IsolatedTurn,
+            |request_id| {
+                let error = AcpError::internal_error()
+                    .data(Value::String("isolated turn event stream ended".into()));
+                send(
+                    &out_tx,
+                    Response::new(request_id, Err::<AgentResponse, _>(error)),
+                );
+            },
+        );
     })
     .detach();
     Ok(())
@@ -1383,12 +1447,13 @@ async fn send_command_turn(
             id: operation_id,
             request_id: id.clone(),
             kind: OperationKind::PrimaryTurn,
+            cancelling: false,
             cancel: None,
             _lease: Some(lease),
         });
     }
     if session.handle.input_tx.send(input).is_err() {
-        take_operation(&session.pending, operation_id, OperationKind::PrimaryTurn);
+        release_operation(&session.pending, operation_id, OperationKind::PrimaryTurn);
         return Err(AcpError::new(-32603, "session ended"));
     }
     Ok(())
@@ -1438,32 +1503,96 @@ fn coordinator_error(error: maki_agent::session_coordinator::SessionCoordinatorE
     }
 }
 
-fn take_operation(
-    pending: &PendingState,
-    operation_id: u64,
-    kind: OperationKind,
-) -> Option<PendingOperation> {
-    let mut pending = pending.lock().unwrap();
-    if pending
-        .operation
-        .as_ref()
-        .is_some_and(|operation| operation.id == operation_id && operation.kind == kind)
-    {
-        pending.operation.take()
-    } else {
-        None
+async fn await_prompt_admission(pending: &PendingState) -> Result<(), AcpError> {
+    loop {
+        let receiver = {
+            let mut pending = pending.lock().unwrap();
+            match pending.operation.as_ref() {
+                None => return Ok(()),
+                Some(operation) if !operation.cancelling => {
+                    return Err(AcpError::new(
+                        -32600,
+                        "session already has an active operation",
+                    ));
+                }
+                Some(_) => {
+                    pending
+                        .admission_waiters
+                        .retain(|waiter| !waiter.is_disconnected());
+                    let (sender, receiver) = flume::bounded(1);
+                    pending.admission_waiters.push(sender);
+                    receiver
+                }
+            }
+        };
+        let _ = receiver.recv_async().await;
     }
 }
 
-fn take_active_operation(pending: &PendingState, kind: OperationKind) -> Option<PendingOperation> {
+fn finish_operation(
+    pending: &PendingState,
+    operation_id: u64,
+    kind: OperationKind,
+    respond: impl FnOnce(RequestId),
+) -> bool {
+    let (operation, waiters) = {
+        let mut pending = pending.lock().unwrap();
+        if !pending
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.id == operation_id && operation.kind == kind)
+        {
+            return false;
+        }
+        (
+            pending.operation.take().unwrap(),
+            std::mem::take(&mut pending.admission_waiters),
+        )
+    };
+    let request_id = operation.request_id.clone();
+    drop(operation);
+    respond(request_id);
+    for waiter in waiters {
+        let _ = waiter.send(());
+    }
+    true
+}
+
+fn finish_active_operation(
+    pending: &PendingState,
+    kind: OperationKind,
+    respond: impl FnOnce(RequestId),
+) -> bool {
     let operation_id = pending
         .lock()
         .unwrap()
         .operation
         .as_ref()
         .filter(|operation| operation.kind == kind)
-        .map(|operation| operation.id)?;
-    take_operation(pending, operation_id, kind)
+        .map(|operation| operation.id);
+    operation_id.is_some_and(|id| finish_operation(pending, id, kind, respond))
+}
+
+fn release_operation(pending: &PendingState, operation_id: u64, kind: OperationKind) {
+    finish_operation(pending, operation_id, kind, |_| {});
+}
+
+#[cfg(test)]
+fn take_operation(
+    pending: &PendingState,
+    operation_id: u64,
+    kind: OperationKind,
+) -> Option<RequestId> {
+    let mut request_id = None;
+    finish_operation(pending, operation_id, kind, |id| request_id = Some(id));
+    request_id
+}
+
+#[cfg(test)]
+fn take_active_operation(pending: &PendingState, kind: OperationKind) -> Option<RequestId> {
+    let mut request_id = None;
+    finish_active_operation(pending, kind, |id| request_id = Some(id));
+    request_id
 }
 
 fn respond_prompt(out_tx: &Sender<Value>, id: RequestId, reason: StopReason) {
@@ -1501,7 +1630,15 @@ async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentRespons
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
     validate_session(srv, req.session_id.0.as_ref())?;
     let config_id = req.config_id.0.to_string();
-    let value = req.value.0.to_string();
+    let value = match req.value {
+        SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
+        SessionConfigOptionValue::Boolean { value } => String::from(if value {
+            maki_agent::session_options::ENABLED_VALUE
+        } else {
+            maki_agent::session_options::DISABLED_VALUE
+        }),
+        _ => return Err(AcpError::invalid_params()),
+    };
     let session = srv.session.as_mut().ok_or_else(no_session)?;
     let coordinator = session.coordinator.as_ref().ok_or_else(no_session)?;
     let snapshot = coordinator
@@ -1511,7 +1648,10 @@ async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentRespons
     let projection = session.option_projection.as_ref().ok_or_else(no_session)?;
     projection.apply(&snapshot);
     Ok(AgentResponse::SetSessionConfigOptionResponse(
-        SetSessionConfigOptionResponse::new(methods::session_config_options(&snapshot)),
+        SetSessionConfigOptionResponse::new(methods::session_config_options(
+            &snapshot,
+            srv.supports_boolean,
+        )),
     ))
 }
 
@@ -1526,18 +1666,22 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                 return;
             };
             if let Ok(session) = validate_session(srv, requested) {
-                // Any answer still in flight belongs to the cancelled turn, so
-                // forget its id and let it be dropped on arrival.
-                let isolated_cancel = {
+                let cancellation = {
                     let mut pending = session.pending.lock().unwrap();
-                    pending.permission = None;
-                    pending.elicitation = None;
-                    pending
+                    let Some(operation) = pending
                         .operation
                         .as_mut()
-                        .and_then(|operation| operation.cancel.take())
+                        .filter(|operation| !operation.cancelling)
+                    else {
+                        return;
+                    };
+                    operation.cancelling = true;
+                    let cancellation = operation.cancel.take();
+                    pending.permission = None;
+                    pending.elicitation = None;
+                    cancellation
                 };
-                if let Some(trigger) = isolated_cancel {
+                if let Some(trigger) = cancellation {
                     trigger.cancel();
                 } else {
                     let _ = session.handle.cancel_tx.try_send(());
@@ -1696,30 +1840,47 @@ fn start_event_pump(
                 AgentEvent::ToolStart(event) => {
                     translate::tool_start(&event, &session.cwd(), home.as_deref())
                 }
+                AgentEvent::ToolExecutionStart { id } => translate::tool_execution_start(&id),
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => {
                     translate::tool_done(&event, &session.cwd(), home.as_deref())
                 }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest { id, tool, scopes } => {
-                    let fields =
-                        ToolCallUpdateFields::new().title(format!("{tool}: {}", scopes.join(", ")));
                     let request =
                         AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
                             sid.clone(),
-                            ToolCallUpdate::new(ToolCallId::from(id), fields),
+                            translate::permission_request(
+                                &id,
+                                format!("{tool}: {}", scopes.join(", ")),
+                            ),
                             permissions::permission_options(),
                         ));
                     let request_id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-                    pending.lock().unwrap().permission = Some(request_id);
-                    send(
-                        &out_tx,
-                        Request {
-                            id: RequestId::Number(request_id),
-                            method: Arc::from(request.method()),
-                            params: Some(request),
-                        },
-                    );
+                    let should_send = {
+                        let mut pending = pending.lock().unwrap();
+                        if pending
+                            .operation
+                            .as_ref()
+                            .is_some_and(|operation| operation.cancelling)
+                        {
+                            false
+                        } else {
+                            pending.permission = Some(request_id);
+                            true
+                        }
+                    };
+                    if should_send {
+                        send_with_pending_tool_status(
+                            &out_tx,
+                            Request {
+                                id: RequestId::Number(request_id),
+                                method: Arc::from(request.method()),
+                                params: Some(request),
+                            },
+                            "/params/toolCall",
+                        );
+                    }
                     continue;
                 }
                 AgentEvent::Question { id, questions } => {
@@ -1748,73 +1909,61 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::TurnOutcome(outcome) => {
-                    if let Some(operation) =
-                        take_active_operation(&pending, OperationKind::PrimaryTurn)
-                    {
+                    finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
                         match outcome {
                             maki_agent::TurnOutcome::Completed { reason, .. } => {
                                 let resp = PromptResponse::new(translate::map_done_reason(reason));
                                 send(
                                     &out_tx,
                                     Response::new(
-                                        operation.request_id,
+                                        request_id,
                                         Ok(AgentResponse::PromptResponse(resp)),
                                     ),
                                 );
                             }
                             maki_agent::TurnOutcome::Cancelled { .. } => {
-                                respond_prompt(
-                                    &out_tx,
-                                    operation.request_id,
-                                    StopReason::Cancelled,
-                                );
+                                respond_prompt(&out_tx, request_id, StopReason::Cancelled);
                             }
                             maki_agent::TurnOutcome::Failed { failure, .. } => {
                                 let error = AcpError::internal_error()
                                     .data(Value::String(failure.user_message));
                                 send(
                                     &out_tx,
-                                    Response::<AgentResponse>::new(
-                                        operation.request_id,
-                                        Err(error),
-                                    ),
+                                    Response::<AgentResponse>::new(request_id, Err(error)),
                                 );
                             }
                         }
-                    }
+                    });
                     continue;
                 }
                 AgentEvent::ControlComplete { .. } => {
-                    if let Some(operation) =
-                        take_active_operation(&pending, OperationKind::PrimaryTurn)
-                    {
-                        let resp = PromptResponse::new(StopReason::EndTurn);
-                        send(
-                            &out_tx,
-                            Response::new(
-                                operation.request_id,
-                                Ok(AgentResponse::PromptResponse(resp)),
-                            ),
-                        );
-                    }
+                    finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
+                        respond_prompt(&out_tx, request_id, StopReason::EndTurn)
+                    });
                     continue;
                 }
                 AgentEvent::ControlError { message } => {
-                    if let Some(operation) =
-                        take_active_operation(&pending, OperationKind::PrimaryTurn)
-                    {
+                    finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
                         let error = AcpError::internal_error().data(Value::String(message));
                         send(
                             &out_tx,
-                            Response::<AgentResponse>::new(operation.request_id, Err(error)),
+                            Response::<AgentResponse>::new(request_id, Err(error)),
                         );
-                    }
+                    });
                     continue;
                 }
                 _ => continue,
             };
             session_update(&out_tx, &sid, update);
         }
+        finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
+            let error =
+                AcpError::internal_error().data(Value::String("session event stream ended".into()));
+            send(
+                &out_tx,
+                Response::<AgentResponse>::new(request_id, Err(error)),
+            );
+        });
     })
     .detach();
 }
@@ -1825,20 +1974,43 @@ fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
     }
 }
 
+fn send_with_pending_tool_status(out_tx: &Sender<Value>, msg: impl Serialize, pointer: &str) {
+    if let Ok(mut json) = serde_json::to_value(JsonRpcMessage::wrap(msg)) {
+        if let Some(tool_call) = json.pointer_mut(pointer).and_then(Value::as_object_mut) {
+            tool_call.insert("status".into(), Value::String("pending".into()));
+        }
+        let _ = out_tx.send(json);
+    }
+}
+
 fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate) {
+    let pending = matches!(
+        &update,
+        SessionUpdate::ToolCall(tool_call) if tool_call.status == ToolCallStatus::Pending
+    ) || matches!(
+        &update,
+        SessionUpdate::ToolCallUpdate(tool_call) if tool_call.fields.status == Some(ToolCallStatus::Pending)
+    );
     let notification =
         AgentNotification::SessionNotification(SessionNotification::new(sid.clone(), update));
-    send(
-        out_tx,
-        Notification {
-            method: Arc::from("session/update"),
-            params: Some(notification),
-        },
-    );
+    let notification = Notification {
+        method: Arc::from("session/update"),
+        params: Some(notification),
+    };
+    if pending {
+        send_with_pending_tool_status(out_tx, notification, "/params/update");
+    } else {
+        send(out_tx, notification);
+    }
 }
 
 fn no_session() -> AcpError {
     AcpError::new(-32600, "no active session")
+}
+
+fn supports_boolean_config(raw: &Value) -> bool {
+    raw.pointer("/params/clientCapabilities/session/configOptions/boolean")
+        .is_some_and(Value::is_object)
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(raw: &Value) -> Result<T, AcpError> {
@@ -1867,6 +2039,49 @@ mod tests {
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
     const FAST_SPEC: &str = "anthropic/claude-opus-4-8";
     const OFFLINE_SPEC: &str = "openai/gpt-5";
+    const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const SPAWN_TEST_SPEC: &str = "ollama/acp-end-turn-test";
+
+    struct EndTurnProvider;
+
+    impl maki_providers::provider::Provider for EndTurnProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_agent::AgentError>,
+        > {
+            Box::pin(async {
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![maki_providers::ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
 
     fn test_registry(
         custom_commands: &[maki_agent::command::CustomCommand],
@@ -1973,6 +2188,13 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
+    #[test_case(serde_json::json!({}) => false ; "missing")]
+    #[test_case(serde_json::json!({ "params": { "clientCapabilities": { "session": { "configOptions": { "boolean": {} } } } } }) => true ; "object")]
+    #[test_case(serde_json::json!({ "params": { "clientCapabilities": { "session": { "configOptions": { "boolean": true } } } } }) => false ; "non_object")]
+    fn boolean_config_capability_requires_object(raw: Value) -> bool {
+        supports_boolean_config(&raw)
+    }
+
     fn server_awaiting_answer() -> (
         Server,
         Receiver<String>,
@@ -2040,6 +2262,7 @@ mod tests {
                     read: coordinator.read(),
                     command_state: Arc::clone(&command_state),
                     permissions: Arc::clone(&handle.permissions),
+                    supports_boolean: false,
                     emitted_version: Mutex::new(coordinator.read().options().version),
                 })),
                 handle,
@@ -2058,6 +2281,7 @@ mod tests {
                 lock: None,
             }),
             elicitation: false,
+            supports_boolean: false,
         };
         (server, answer_rx, out_rx, input_rx)
     }
@@ -2069,6 +2293,7 @@ mod tests {
                 id: 7,
                 request_id: RequestId::Number(41),
                 kind: OperationKind::TestLocal,
+                cancelling: false,
                 cancel: None,
                 _lease: None,
             }),
@@ -2078,8 +2303,37 @@ mod tests {
         assert!(take_operation(&pending, 6, OperationKind::TestLocal).is_none());
         assert!(take_operation(&pending, 7, OperationKind::PrimaryTurn).is_none());
         let operation = take_operation(&pending, 7, OperationKind::TestLocal).unwrap();
-        assert_eq!(operation.request_id, RequestId::Number(41));
+        assert_eq!(operation, RequestId::Number(41));
         assert!(take_operation(&pending, 7, OperationKind::TestLocal).is_none());
+    }
+
+    #[test]
+    fn operation_is_removed_before_response_and_waiters_wake_after() {
+        let (waiter_tx, waiter_rx) = flume::bounded(1);
+        let pending = Arc::new(Mutex::new(Pending {
+            operation: Some(PendingOperation {
+                id: 8,
+                request_id: RequestId::Number(42),
+                kind: OperationKind::TestLocal,
+                cancelling: true,
+                cancel: None,
+                _lease: None,
+            }),
+            admission_waiters: vec![waiter_tx],
+            ..Pending::default()
+        }));
+
+        assert!(finish_operation(
+            &pending,
+            8,
+            OperationKind::TestLocal,
+            |request_id| {
+                assert_eq!(request_id, RequestId::Number(42));
+                assert!(pending.try_lock().unwrap().operation.is_none());
+                assert!(waiter_rx.is_empty(), "waiters wake only after the response");
+            },
+        ));
+        assert!(waiter_rx.try_recv().is_ok());
     }
 
     #[test]
@@ -2089,6 +2343,7 @@ mod tests {
                 id: 9,
                 request_id: RequestId::Number(43),
                 kind: OperationKind::TestLocal,
+                cancelling: false,
                 cancel: None,
                 _lease: None,
             }),
@@ -2138,7 +2393,7 @@ mod tests {
 
             let pending = &srv.session.as_ref().unwrap().pending;
             let operation = take_active_operation(pending, OperationKind::PrimaryTurn).unwrap();
-            assert_eq!(operation.request_id, request_id);
+            assert_eq!(operation, request_id);
             drop(operation);
             done_rx.recv_async().await.unwrap().unwrap();
             assert_eq!(coordinator.read().history().len(), 1);
@@ -2165,6 +2420,7 @@ mod tests {
                 read: coordinator.read(),
                 command_state: Arc::clone(&session.command_state),
                 permissions: Arc::clone(&session.handle.permissions),
+                supports_boolean: srv.supports_boolean,
                 emitted_version: Mutex::new(coordinator.read().options().version),
             }));
             let request_id = RequestId::Number(42);
@@ -2193,6 +2449,60 @@ mod tests {
             assert_eq!(response["id"], 42);
             coordinator.close().await.unwrap();
         });
+    }
+
+    #[test_case(false, serde_json::json!(maki_agent::session_options::ENABLED_VALUE) ; "legacy_value_id")]
+    #[test_case(true, serde_json::json!({ "type": "boolean", "value": true }) ; "boolean_value")]
+    fn set_config_accepts_legacy_and_boolean_values(supports_boolean: bool, value: Value) {
+        let (mut srv, _, out_rx, _) = server_awaiting_answer();
+        srv.supports_boolean = supports_boolean;
+        Arc::get_mut(
+            srv.session
+                .as_mut()
+                .unwrap()
+                .option_projection
+                .as_mut()
+                .unwrap(),
+        )
+        .unwrap()
+        .supports_boolean = supports_boolean;
+        let coordinator = srv
+            .session
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .clone();
+        let active_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+        let mut request = serde_json::json!({
+            "params": {
+                "sessionId": active_id,
+                "configId": maki_agent::session_options::YOLO_OPTION_ID,
+            }
+        });
+        if supports_boolean {
+            request["params"]["type"] = value["type"].clone();
+            request["params"]["value"] = value["value"].clone();
+        } else {
+            request["params"]["value"] = value;
+        }
+        let response = smol::block_on(handle_set_config(&mut srv, &request)).unwrap();
+        let AgentResponse::SetSessionConfigOptionResponse(response) = response else {
+            panic!("expected config option response");
+        };
+        let wire = serde_json::to_value(&response.config_options[1]).unwrap();
+        assert_eq!(
+            wire["type"],
+            if supports_boolean {
+                "boolean"
+            } else {
+                "select"
+            }
+        );
+        assert!(srv.session.as_ref().unwrap().handle.permissions.is_yolo());
+        assert!(out_rx.is_empty());
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]
@@ -2378,6 +2688,15 @@ mod tests {
     #[test]
     fn cancel_drops_the_outstanding_permission_request() {
         let (srv, answer_rx, ..) = server_awaiting_answer();
+        let pending = &srv.session.as_ref().unwrap().pending;
+        pending.lock().unwrap().operation = Some(PendingOperation {
+            id: 1,
+            request_id: RequestId::Number(41),
+            kind: OperationKind::TestLocal,
+            cancelling: false,
+            cancel: None,
+            _lease: None,
+        });
         handle_notification(
             &srv,
             "session/cancel",
@@ -2390,6 +2709,151 @@ mod tests {
 
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
         assert!(answer_rx.is_empty(), "the cancelled turn owns that answer");
+    }
+
+    #[test]
+    fn cancel_during_permission_allows_the_next_prompt() {
+        smol::block_on(async {
+            let (mut srv, answer_rx, out_rx, input_rx) = server_awaiting_answer();
+            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+            let session = srv.session.as_ref().unwrap();
+            session.pending.lock().unwrap().permission = None;
+            start_event_pump(
+                event_rx,
+                session.handle.session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&session.pending),
+                false,
+                session.handle.answer_tx.clone(),
+                session.coordinator.as_ref().unwrap().read(),
+                maki_storage::paths::home(),
+                None,
+            );
+            let session_id = session.handle.session_id.to_string();
+
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "first", false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap();
+            assert_eq!(input_rx.recv_async().await.unwrap().message, "first");
+            event_tx
+                .send_async(Envelope {
+                    event: AgentEvent::PermissionRequest {
+                        id: "tool-1".to_string(),
+                        tool: maki_config::ToolKey::Native(Arc::from("bash")),
+                        scopes: vec!["echo first".to_string()],
+                    },
+                    subagent: None,
+                    run_id: 0,
+                })
+                .await
+                .unwrap();
+            let permission = out_rx.recv_async().await.unwrap();
+            assert_eq!(permission["method"], "session/request_permission");
+            let permission_id = permission["id"].as_i64().unwrap();
+
+            handle_notification(
+                &srv,
+                "session/cancel",
+                &serde_json::json!({ "params": { "sessionId": session_id } }),
+            );
+            handle_incoming_response(&srv, &allow_once(permission_id));
+            assert!(
+                answer_rx.is_empty(),
+                "the cancelled permission answer must be dropped"
+            );
+
+            event_tx
+                .send_async(Envelope {
+                    event: AgentEvent::PermissionRequest {
+                        id: "tool-stale".to_string(),
+                        tool: maki_config::ToolKey::Native(Arc::from("bash")),
+                        scopes: vec!["echo stale".to_string()],
+                    },
+                    subagent: None,
+                    run_id: 0,
+                })
+                .await
+                .unwrap();
+            smol::future::yield_now().await;
+            assert!(
+                out_rx.is_empty(),
+                "cancelled turn permission must be suppressed"
+            );
+
+            let second = prompt_request(&session_id, "second", false);
+            let follow_up = smol::spawn(async move {
+                let result = handle_prompt(&mut srv, &second, &RequestId::Number(42)).await;
+                (srv, result)
+            });
+            smol::future::yield_now().await;
+            assert!(input_rx.is_empty(), "successor must wait for terminal");
+
+            event_tx
+                .send_async(Envelope {
+                    event: AgentEvent::ControlComplete {
+                        usage: TokenUsage::default(),
+                    },
+                    subagent: None,
+                    run_id: 0,
+                })
+                .await
+                .unwrap();
+            let (_srv, follow_up) = follow_up.await;
+            assert!(
+                follow_up.is_ok(),
+                "a cancelled permission must not block the next prompt: {follow_up:?}"
+            );
+            assert_eq!(input_rx.recv_async().await.unwrap().message, "second");
+        });
+    }
+
+    #[test]
+    fn idle_and_duplicate_cancel_do_not_poison_the_next_prompt() {
+        smol::block_on(async {
+            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let (cancel_tx, cancel_rx) = flume::unbounded();
+            srv.session.as_mut().unwrap().handle.cancel_tx = cancel_tx;
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            let cancel = serde_json::json!({ "params": { "sessionId": session_id } });
+
+            handle_notification(&srv, "session/cancel", &cancel);
+            assert!(cancel_rx.is_empty(), "idle cancel must not be queued");
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "first", false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap();
+            assert_eq!(input_rx.recv_async().await.unwrap().message, "first");
+
+            handle_notification(&srv, "session/cancel", &cancel);
+            handle_notification(&srv, "session/cancel", &cancel);
+            assert!(
+                cancel_rx.try_recv().is_ok(),
+                "active operation must be cancelled"
+            );
+            assert!(cancel_rx.is_empty(), "duplicate cancel must not be queued");
+            let pending = &srv.session.as_ref().unwrap().pending;
+            take_active_operation(pending, OperationKind::PrimaryTurn).unwrap();
+
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "second", false),
+                &RequestId::Number(42),
+            )
+            .await
+            .unwrap();
+            assert_eq!(input_rx.recv_async().await.unwrap().message, "second");
+            assert!(
+                cancel_rx.is_empty(),
+                "next prompt must not inherit cancellation"
+            );
+        });
     }
 
     #[test]
@@ -2497,6 +2961,84 @@ mod tests {
                 );
                 smol::Timer::after(std::time::Duration::from_millis(5)).await;
             }
+        });
+        smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test]
+    fn event_pump_projects_tool_permission_lifecycle_in_wire_order() {
+        let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+        let (out_tx, out_rx) = flume::unbounded::<Value>();
+        let (answer_tx, _answer_rx) = flume::unbounded::<String>();
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let session_id = SessionRef::from(MakiId::generate());
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+        let tool_id = "tool-1";
+
+        start_event_pump(
+            event_rx,
+            session_id,
+            out_tx,
+            pending,
+            true,
+            answer_tx,
+            coordinator.read(),
+            maki_storage::paths::home(),
+            None,
+        );
+
+        for event in [
+            AgentEvent::ToolPending {
+                id: tool_id.to_string(),
+                name: "bash".to_string(),
+            },
+            AgentEvent::ToolStart(Box::new(maki_agent::ToolStartEvent {
+                id: tool_id.to_string(),
+                tool: Arc::from("bash"),
+                summary: "Run command".to_string(),
+                render_header: None,
+                annotation: None,
+                input: None,
+                raw_input: Some(serde_json::json!({ "command": "true" })),
+                output: None,
+            })),
+            AgentEvent::PermissionRequest {
+                id: tool_id.to_string(),
+                tool: maki_config::ToolKey::native("bash"),
+                scopes: vec!["true".to_string()],
+            },
+            AgentEvent::ToolExecutionStart {
+                id: tool_id.to_string(),
+            },
+        ] {
+            event_tx
+                .send(Envelope {
+                    event,
+                    subagent: None,
+                    run_id: 0,
+                })
+                .unwrap();
+        }
+
+        smol::block_on(async {
+            let pending = out_rx.recv_async().await.unwrap();
+            let details = out_rx.recv_async().await.unwrap();
+            let permission = out_rx.recv_async().await.unwrap();
+            let executing = out_rx.recv_async().await.unwrap();
+
+            assert_eq!(
+                pending["params"]["update"]["status"], "pending",
+                "{pending}"
+            );
+            assert_eq!(details["params"]["update"]["toolCallId"], tool_id);
+            assert_eq!(details["params"]["update"]["title"], "Run command");
+            assert_eq!(details["params"]["update"]["status"], "pending");
+            assert_eq!(permission["method"], "session/request_permission");
+            assert_eq!(permission["params"]["toolCall"]["toolCallId"], tool_id);
+            assert_eq!(permission["params"]["toolCall"]["status"], "pending");
+            assert_eq!(executing["params"]["update"]["toolCallId"], tool_id);
+            assert_eq!(executing["params"]["update"]["status"], "in_progress");
+            assert!(out_rx.is_empty());
         });
         smol::block_on(coordinator.close()).unwrap();
     }
@@ -2871,6 +3413,143 @@ mod tests {
             assert_eq!(terminal["id"], 31);
             assert_eq!(terminal["result"]["stopReason"], "end_turn");
             assert!(out_rx.is_empty(), "operation terminates exactly once");
+        });
+    }
+
+    #[test]
+    fn spawned_primary_turn_end_turn_releases_pending_operation() {
+        smol::block_on(async {
+            let previous_host = std::env::var_os("OLLAMA_HOST");
+            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.clone();
+            let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
+            let handle = spawn_session(
+                &AcpParams {
+                    model: model.clone(),
+                    config: Default::default(),
+                    permissions_config: Default::default(),
+                    timeouts: Default::default(),
+                    initial_wd: PathBuf::from("/project"),
+                    prompt_slots: Arc::default(),
+                    modes: Arc::default(),
+                    yolo: false,
+                    system_prompt_override: Some(String::new()),
+                    append_system_prompt: None,
+                    model_policy: Arc::default(),
+                    plugin_rules: Arc::default(),
+                    session_options: Default::default(),
+                    command_registry: test_registry(&[]),
+                },
+                SpawnSession {
+                    model,
+                    cwd: PathBuf::from("/project"),
+                    session_id: Some(session_id),
+                    history: Vec::new(),
+                    mcp_handle: None,
+                    elicitation: false,
+                    yolo: false,
+                    workflow: false,
+                },
+            );
+            let provider_ready = smol::future::or(
+                async {
+                    while maki_agent::ModelSource::current(&handle.model).is_none() {
+                        smol::future::yield_now().await;
+                    }
+                    true
+                },
+                async {
+                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                    false
+                },
+            )
+            .await;
+            assert!(
+                provider_ready,
+                "spawned session provider did not initialize"
+            );
+            handle.model.install(
+                Arc::new(EndTurnProvider),
+                Model::from_spec(OFFLINE_SPEC).unwrap(),
+            );
+            let session = srv.session.as_mut().unwrap();
+            let previous_handle = std::mem::replace(&mut session.handle, handle);
+            previous_handle.task.cancel().await;
+            start_event_pump(
+                session.handle.event_rx.clone(),
+                session.handle.session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&session.pending),
+                false,
+                session.handle.answer_tx.clone(),
+                session.coordinator.as_ref().unwrap().read(),
+                None,
+                None,
+            );
+            let session_id = session.handle.session_id.to_string();
+            let request_id = RequestId::Number(71);
+
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "first", false),
+                &request_id,
+            )
+            .await
+            .unwrap();
+
+            let visible_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed_complete = Arc::clone(&visible_complete);
+            let response = smol::future::or(
+                async {
+                    loop {
+                        let message = out_rx.recv_async().await.unwrap();
+                        if matches!(
+                            message["params"]["update"]["sessionUpdate"].as_str(),
+                            Some("agent_message_chunk" | "usage_update")
+                        ) {
+                            observed_complete.store(true, Ordering::SeqCst);
+                        }
+                        if message["id"] == 71 {
+                            break Some(message);
+                        }
+                    }
+                },
+                async {
+                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                    None
+                },
+            )
+            .await;
+            let pending = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .operation
+                .is_some();
+            let visible_complete = visible_complete.load(Ordering::SeqCst);
+            let terminal = response.unwrap_or_else(|| {
+                panic!(
+                    "PromptResponse timed out; visible_complete={visible_complete}, pending={pending}"
+                )
+            });
+            assert_eq!(terminal["result"]["stopReason"], "end_turn");
+            assert!(
+                visible_complete,
+                "usage update must precede terminal response"
+            );
+            assert!(
+                !pending,
+                "terminal response must release the pending primary operation"
+            );
+            close_session(&mut srv).await;
+            match previous_host {
+                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
+                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+            }
         });
     }
 

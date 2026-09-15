@@ -109,6 +109,19 @@ pub fn local_operation_started(id: &str) -> SessionUpdate {
     ))
 }
 
+pub fn tool_execution_start(id: &str) -> SessionUpdate {
+    local_operation_started(id)
+}
+
+pub fn permission_request(id: &str, title: String) -> ToolCallUpdate {
+    ToolCallUpdate::new(
+        ToolCallId::from(id.to_string()),
+        ToolCallUpdateFields::new()
+            .title(title)
+            .status(ToolCallStatus::Pending),
+    )
+}
+
 pub fn local_operation_terminal(id: &str, error: Option<&str>) -> SessionUpdate {
     let mut fields = ToolCallUpdateFields::new().status(if error.is_some() {
         ToolCallStatus::Failed
@@ -128,7 +141,7 @@ pub fn local_operation_terminal(id: &str, error: Option<&str>) -> SessionUpdate 
 
 pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
     let mut fields = ToolCallUpdateFields::new()
-        .status(ToolCallStatus::InProgress)
+        .status(ToolCallStatus::Pending)
         .title(event.summary.clone());
 
     if let Some(raw) = &event.raw_input {

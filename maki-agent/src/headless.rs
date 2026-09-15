@@ -400,6 +400,19 @@ enum InteractiveWake {
     Control(InteractiveControl),
 }
 
+async fn collect_turn_events(
+    turn_event_rx: Receiver<Envelope>,
+    raw_tx: flume::Sender<Envelope>,
+) -> Option<Envelope> {
+    while let Ok(envelope) = turn_event_rx.recv_async().await {
+        if envelope.subagent.is_none() && matches!(envelope.event, AgentEvent::TurnOutcome(_)) {
+            return Some(envelope);
+        }
+        let _ = raw_tx.send(envelope);
+    }
+    None
+}
+
 async fn receive_wake_and_refresh(
     input_rx: &Receiver<AgentInput>,
     control_rx: &Receiver<InteractiveControl>,
@@ -732,20 +745,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 }
 
                 let (turn_event_tx, turn_event_rx) = flume::unbounded::<Envelope>();
-                let terminal_task = smol::spawn({
-                    let raw_tx = raw_tx.clone();
-                    async move {
-                        let mut terminal = None;
-                        while let Ok(envelope) = turn_event_rx.recv_async().await {
-                            if matches!(envelope.event, AgentEvent::TurnOutcome(_)) {
-                                terminal = Some(envelope);
-                            } else {
-                                let _ = raw_tx.send(envelope);
-                            }
-                        }
-                        terminal
-                    }
-                });
+                let terminal_task = smol::spawn(collect_turn_events(turn_event_rx, raw_tx.clone()));
                 let event_tx = EventSender::new(turn_event_tx.clone(), run_id);
                 let error_tx = EventSender::new(raw_tx.clone(), run_id);
 
@@ -1160,6 +1160,68 @@ mod tests {
         > {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    #[test]
+    fn turn_event_collection_finishes_with_retained_sender() {
+        smol::block_on(async {
+            let (turn_tx, turn_rx) = flume::unbounded();
+            let retained_tx = turn_tx.clone();
+            let (raw_tx, raw_rx) = flume::unbounded();
+            let run_id = 17;
+            let outcome = TurnOutcome::Completed {
+                agent_id: AgentId::generate(),
+                turn_id: TurnId::generate(),
+                usage: TokenUsage::default(),
+                num_turns: 1,
+                reason: crate::DoneReason::EndTurn,
+            };
+            let collector = smol::spawn(collect_turn_events(turn_rx, raw_tx));
+
+            turn_tx
+                .send(Envelope {
+                    event: AgentEvent::TextDelta {
+                        text: "before terminal".into(),
+                    },
+                    subagent: None,
+                    run_id,
+                })
+                .unwrap();
+            turn_tx
+                .send(Envelope {
+                    event: AgentEvent::TurnOutcome(outcome.clone()),
+                    subagent: None,
+                    run_id,
+                })
+                .unwrap();
+            drop(turn_tx);
+
+            let terminal = collector
+                .await
+                .expect("root outcome must finish collection");
+            assert_eq!(terminal.run_id, run_id);
+            assert!(terminal.subagent.is_none());
+            assert!(matches!(terminal.event, AgentEvent::TurnOutcome(got) if got == outcome));
+            assert!(matches!(
+                raw_rx.recv_async().await.unwrap(),
+                Envelope {
+                    event: AgentEvent::TextDelta { text },
+                    subagent: None,
+                    run_id: got_run_id,
+                } if text == "before terminal" && got_run_id == run_id
+            ));
+            assert!(
+                retained_tx
+                    .send(Envelope {
+                        event: AgentEvent::TextDelta {
+                            text: "retained".into(),
+                        },
+                        subagent: None,
+                        run_id,
+                    })
+                    .is_err()
+            );
+        });
     }
 
     #[test]

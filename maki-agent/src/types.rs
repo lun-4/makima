@@ -761,6 +761,9 @@ pub enum AgentEvent {
         name: String,
     },
     ToolStart(Box<ToolStartEvent>),
+    ToolExecutionStart {
+        id: String,
+    },
     /// `content` is the **full accumulated output** so far, not a delta.
     /// Producers must accumulate into a growing buffer and send the whole thing each flush.
     ToolOutput {

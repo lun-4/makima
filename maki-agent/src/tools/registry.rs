@@ -210,7 +210,8 @@ pub trait ToolInvocation: Send + Sync {
         Box::pin(std::future::ready(None))
     }
     /// Runs after `ToolStart` but before permission enforcement, so a tool
-    /// can paint a preview while the prompt is still up. Some call paths skip
+    /// can paint a preview while the prompt is still up. `ToolExecutionStart`
+    /// is emitted after permission succeeds. Some call paths skip
     /// it, so `execute` must never rely on it having run.
     fn start<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))

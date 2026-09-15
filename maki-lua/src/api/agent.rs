@@ -469,7 +469,9 @@ async fn relay_session_events(
                     let _ = sink.send(ToolLive::Usage(turn.usage.format_sum_cost(cost)));
                 }
             }
-            AgentEvent::ToolOutput { .. } | AgentEvent::ToolPending { .. } => continue,
+            AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolPending { .. }
+            | AgentEvent::ToolExecutionStart { .. } => continue,
             AgentEvent::SubagentHistory { .. } if envelope.subagent.is_none() => continue,
             _ => {}
         }
@@ -1997,7 +1999,22 @@ mod tests {
         LuaSession,
         flume::Receiver<Envelope>,
     ) {
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
+        session_with_provider_and_parent(provider, semaphore, relay_gate, None)
+    }
+
+    fn session_with_provider_and_parent(
+        provider: Arc<dyn Provider>,
+        semaphore: Option<Arc<async_lock::Semaphore>>,
+        relay_gate: Option<flume::Receiver<()>>,
+        parent_raw_tx: Option<flume::Sender<Envelope>>,
+    ) -> (
+        Arc<AgentActorHandle>,
+        Arc<LuaActorState>,
+        LuaSession,
+        flume::Receiver<Envelope>,
+    ) {
+        let (fallback_tx, parent_rx) = flume::unbounded();
+        let parent_raw_tx = parent_raw_tx.unwrap_or(fallback_tx);
         let (chip_raw_tx, relay) = match relay_gate {
             Some(gate) => {
                 let (sub_tx, sub_rx) = flume::unbounded();
@@ -2370,6 +2387,77 @@ mod tests {
         );
         map.retire(&"task-1".to_owned(), sibling_slot);
         map.remove(&"task-1".to_owned());
+    }
+
+    #[test]
+    fn reusable_actor_retains_parent_turn_event_sender_after_end_turn() {
+        let provider: Arc<dyn Provider> =
+            Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(
+                "child done",
+            )]));
+        let (turn_tx, turn_rx) = flume::unbounded();
+        let (actor, state, session, _relayed) =
+            session_with_provider_and_parent(provider, None, None, Some(turn_tx.clone()));
+        let ticket = admit(&state, &actor, "run me");
+        let outcome = smol::block_on(ticket.wait());
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+        assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Open));
+
+        let root_outcome = TurnOutcome::Completed {
+            agent_id: AgentId::generate(),
+            turn_id: TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        };
+        turn_tx
+            .send(Envelope {
+                event: AgentEvent::TextDelta {
+                    text: "visible completion".into(),
+                },
+                subagent: None,
+                run_id: RUN_ID,
+            })
+            .unwrap();
+        turn_tx
+            .send(Envelope {
+                event: AgentEvent::TurnOutcome(root_outcome),
+                subagent: None,
+                run_id: RUN_ID,
+            })
+            .unwrap();
+        drop(turn_tx);
+
+        let (visible_tx, visible_rx) = flume::unbounded();
+        let mut terminal_task = smol::spawn(async move {
+            let mut terminal = None;
+            while let Ok(envelope) = turn_rx.recv_async().await {
+                if matches!(envelope.event, AgentEvent::TurnOutcome(_)) {
+                    terminal = Some(envelope);
+                } else {
+                    visible_tx.send(envelope).unwrap();
+                }
+            }
+            terminal
+        });
+        smol::block_on(async {
+            while !matches!(
+                visible_rx.recv_async().await.unwrap(),
+                Envelope {
+                    event: AgentEvent::TextDelta { ref text },
+                    subagent: None,
+                    run_id: RUN_ID,
+                } if text == "visible completion"
+            ) {}
+            assert!(
+                futures_lite::future::poll_once(&mut terminal_task)
+                    .await
+                    .is_none(),
+                "sender retention must reproduce the old disconnect wait"
+            );
+        });
+        drop(terminal_task);
+        drop(session);
     }
 
     #[test]

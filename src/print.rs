@@ -383,6 +383,7 @@ pub fn run(
                 AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
                 AgentEvent::ToolPending { .. }
                 | AgentEvent::ToolStart(_)
+                | AgentEvent::ToolExecutionStart { .. }
                 | AgentEvent::ToolOutput { .. }
                 | AgentEvent::ToolDone(_)
                 | AgentEvent::QueueItemConsumed { .. }

@@ -1592,6 +1592,7 @@ impl EventPump {
                 self.tool_inputs.insert(ts.id.clone(), (name, input));
             }
             AgentEvent::ToolPending { .. }
+            | AgentEvent::ToolExecutionStart { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
