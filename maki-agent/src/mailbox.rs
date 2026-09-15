@@ -23,6 +23,8 @@ pub struct SessionMailbox {
     state: Arc<Mutex<State>>,
 }
 
+pub struct PreparedSessionMailbox(SessionMailbox);
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -33,6 +35,10 @@ impl SessionMailbox {
             session_id,
             state: Arc::default(),
         }
+    }
+
+    pub fn prepare(session_id: MakiId) -> PreparedSessionMailbox {
+        PreparedSessionMailbox(Self::new(session_id))
     }
 
     pub fn notify(session_id: MakiId, text: String, wake: bool) -> Result<(), MailboxError> {
@@ -72,12 +78,35 @@ impl SessionMailbox {
     }
 }
 
+impl PreparedSessionMailbox {
+    pub fn mailbox(&self) -> SessionMailbox {
+        self.0.clone()
+    }
+
+    pub fn activate(self) -> SessionMailbox {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn text(message: &Message) -> &str {
         message.user_text().unwrap()
+    }
+
+    #[test]
+    fn prepared_mailbox_preserves_state_on_activation() {
+        let prepared = SessionMailbox::prepare(MakiId::generate());
+        let mailbox = prepared.mailbox();
+        mailbox.push("ready".into(), true);
+
+        let activated = prepared.activate();
+        assert_eq!(
+            activated.claim_wake().iter().map(text).collect::<Vec<_>>(),
+            ["ready"]
+        );
     }
 
     #[test]

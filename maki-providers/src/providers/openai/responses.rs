@@ -238,7 +238,8 @@ pub(crate) async fn parse_sse(
     let mut lines = reader.lines();
 
     let mut text = String::new();
-    let mut reasoning_text = String::new();
+    let mut thinking_parts: Vec<String> = Vec::new();
+    let mut current_thinking = String::new();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
@@ -449,7 +450,7 @@ pub(crate) async fn parse_sse(
                 if let Some(delta) = parsed["delta"].as_str()
                     && !delta.is_empty()
                 {
-                    reasoning_text.push_str(delta);
+                    current_thinking.push_str(delta);
                     event_tx
                         .send_async(ProviderEvent::ThinkingDelta {
                             text: delta.to_string(),
@@ -458,8 +459,9 @@ pub(crate) async fn parse_sse(
                 }
             }
 
-            "response.reasoning_summary_part.added" if !reasoning_text.is_empty() => {
-                reasoning_text.push_str("\n\n");
+            "response.reasoning_summary_part.added" if !current_thinking.is_empty() => {
+                thinking_parts.push(std::mem::take(&mut current_thinking));
+                event_tx.send_async(ProviderEvent::ThinkingBlockEnd).await?;
             }
 
             "response.completed" => {
@@ -525,9 +527,13 @@ pub(crate) async fn parse_sse(
 
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
-    if !reasoning_text.is_empty() {
+    if !current_thinking.is_empty() {
+        thinking_parts.push(std::mem::take(&mut current_thinking));
+    }
+
+    for part in thinking_parts {
         content_blocks.push(ContentBlock::Thinking {
-            thinking: reasoning_text,
+            thinking: part,
             signature: None,
         });
     }
@@ -1090,7 +1096,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
     }
 
     #[test]
-    fn parse_sse_reasoning_summary_part_added() {
+    fn parse_sse_summary_parts_become_separate_thinking_blocks() {
         smol::block_on(async {
             let sse = "\
 event: response.reasoning_summary_part.added\n\
@@ -1112,11 +1118,55 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
+            let (resp, events) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            assert_eq!(resp.message.content.len(), 3);
+            assert!(
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "First part")
+            );
+            assert!(
+                matches!(&resp.message.content[1], ContentBlock::Thinking { thinking, .. } if thinking == "Second part")
+            );
+            assert!(
+                matches!(&resp.message.content[2], ContentBlock::Text { text } if text == "Answer")
+            );
+
+            assert_eq!(events.len(), 4);
+            assert!(
+                matches!(&events[0], ProviderEvent::ThinkingDelta { text } if text == "First part")
+            );
+            assert!(matches!(&events[1], ProviderEvent::ThinkingBlockEnd));
+            assert!(
+                matches!(&events[2], ProviderEvent::ThinkingDelta { text } if text == "Second part")
+            );
+            assert!(matches!(&events[3], ProviderEvent::TextDelta { text } if text == "Answer"));
+        })
+    }
+
+    #[test]
+    fn parse_sse_summary_single_part_has_no_boundary() {
+        smol::block_on(async {
+            let sse = "\
+event: response.reasoning_summary_part.added\n\
+data: {\"id\":\"sp_1\"}\n\
+\n\
+event: response.reasoning_summary_text.delta\n\
+data: {\"delta\":\"Only part\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\"}}\n\
+\n";
+
+            let (resp, events) = run_sse(sse).await;
             let resp = resp.unwrap();
 
             assert!(
-                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "First part\n\nSecond part")
+                matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Only part")
+            );
+            assert_eq!(events.len(), 1);
+            assert!(
+                matches!(&events[0], ProviderEvent::ThinkingDelta { text } if text == "Only part")
             );
         })
     }

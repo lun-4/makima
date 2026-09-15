@@ -342,7 +342,7 @@ maki.api.register_command({spec})
 Register a slash-command that appears in the user input bar.
 
 Slash commands let the user trigger plugin actions by typing `/name` in the
-input. Use them for interactive workflows that do not need the model, like
+input. Use them for interactive workflows that do not need the model, such as
 browsing memory files or toggling settings.
 
 **Parameters:**
@@ -353,57 +353,94 @@ browsing memory files or toggling settings.
   - `description` (`string`) Optional. Short description shown in the command palette.
   - `tui_only` (`boolean`) Required. If true, the command is available only in the interactive TUI.
   - `argument_hint` (`string`) Optional. Short hint describing the command arguments.
-  - `nargs` (`integer|string`) Optional. How many arguments the command
-    takes, spelled like nvim's nargs: 0 (default),
-    1, "?" (zero or one), "*" (any number), or "+"
-    (one or more). An argument is a whitespace
-    separated word. Type more than allowed and the
-    command quietly stops matching: the input goes
-    to the model as a normal message. Only the upper
-    bound is checked, so with "+" you still need to
-    handle an empty `opts.args` yourself.
-  - `handler` (`function`) Required. Called when the user runs the command,
-    with one opts table: `opts.args` is the raw
-    argument string (whitespace kept, may be empty)
-    and `opts.fargs` is the same split into words.
-  - `completion` (`table`) Optional. Argument completion specification. Use
-    `items = {...}` for a static list or `get_items =
-    function(ctx) -> {...}` for dynamic candidates.
-    Each candidate has `label` (match/display text),
-    `insertion` (replacement text), and optional
-    `description`. The callback context has `command`
-    (registered slash name), `args` (raw argument string,
-    never the full slash input), `arg` (argument under
-    the cursor), `index` (zero-based argument index),
-    `mode` (active mode id), `session` (stable for one
-    popup session), and `generation` (increases for
-    each request in that session). Optional lifecycle
-    callbacks `on_highlight(ctx, item)`,
-    `on_accept(ctx, item)`, and `on_cancel(ctx)` run in
-    request order. The first result highlights its
-    selected candidate. A later highlight cancels a
-    running highlight callback. Accept runs after its
-    highlight and ends the session without on_cancel.
-    Dismissal, an empty result, or a new completion
-    session calls on_cancel once. `Tab` accepts and
-    keeps editing. `Enter` accepts; press `Enter` again
-    to execute the command.
+  - `arguments` (`array`) Optional. A dense typed positional schema. Each
+    descriptor has a unique non-empty `name` and a
+    `type` of `string`, `integer`, `enum`, `file`, or
+    `directory`. Enum descriptors also require a
+    non-empty `choices` array of distinct strings.
+    `optional` and `variadic` are false by default.
+    A required scalar consumes exactly one value. An
+    optional scalar consumes zero or one value. A
+    required variadic consumes one or more values.
+    An optional variadic consumes zero or more values.
+    Optional descriptors follow required descriptors.
+    A variadic descriptor is last and consumes the
+    remaining values. Typed input uses one quote-aware
+    grammar. Unicode
+    whitespace separates tokens outside quotes. Single
+    and double quotes group text, adjacent quoted and
+    unquoted fragments concatenate, and empty quotes
+    produce an empty value. Backslashes are literal
+    outside quotes and inside single quotes. Inside
+    double quotes, only `\\"` and `\\\\` decode to a
+    quote or backslash. Other backslashes stay literal.
+    Shell expansion and operators are not supported.
+    The command parser outer-trims the argument
+    remainder before this grammar runs. Inner spaces,
+    quotes, newlines inside quotes, and decoded values
+    remain significant. Newlines separate tokens only
+    outside quotes.
+  - `arguments` (`table`) Use `{ raw = true }` for an unparsed argument
+    remainder. Add `required = true` to reject empty
+    input. Raw handlers receive `opts.args` only.
+  - `handler` (`function`) Required. Called with one opts table after the
+    command arguments pass validation. `opts.args` is
+    the outer-trimmed original argument remainder. It
+    keeps inner whitespace and source quotes. For typed
+    commands, `opts.fargs` is the decoded token array
+    and `opts.values` is a name-keyed table. String,
+    enum, file, and directory values are strings.
+    Integer values are Lua integers. A missing optional
+    scalar is `nil`. A missing optional variadic is an
+    empty array. A variadic value is always an array.
+    File and directory values retain their decoded,
+    non-empty, NUL-free spelling and are not expanded
+    or checked for existence by type validation. Raw
+    commands do not set `opts.fargs` or `opts.values`.
+    Typed integers are signed decimal values with no
+    separators or alternate bases. The inclusive exact
+    range is `-9007199254740991` to
+    `9007199254740991`.
+    Completion is declared on each typed descriptor
+    with `completion = false`, `completion = "disabled"`,
+    or a provider table. A provider table contains exactly
+    one of `items` and `get_items`, and may set `mode` to
+    `"replace"` or `"extend"` (`"replace"` is the default).
+    Defaults are enum choices in the core and file or
+    directory discovery in the TUI. String and integer
+    defaults are empty. Provider callbacks receive the
+    typed argument name, type, parsed preceding values,
+    and the command completion context. Raw commands do
+    not have argument completion providers.
 
 **Example:**
 
 ```lua
+-- Documentation and test example. It is not bundled and never copies files.
+local recorded
+maki.api.register_command({
+  name = "/copy",
+  description = "Record typed path arguments",
+  tui_only = false,
+  arguments = {
+    { name = "source", type = "file" },
+    { name = "destination", type = "directory" },
+    { name = "policy", type = "enum", choices = { "skip", "overwrite" }, optional = true },
+  },
+  handler = function(opts)
+    recorded = opts.values
+  end,
+})
+-- `/copy "input file.txt" "build output" overwrite` records decoded values.
+
+-- Raw commands preserve the complete argument remainder:
 maki.api.register_command({
   name = "/hello",
   description = "Say hello",
   tui_only = false,
-  nargs = 1,
-  completion = {
-    get_items = function(ctx)
-      return { { label = "world", insertion = "world", description = ctx.mode } }
-    end,
-  },
+  arguments = { raw = true, required = true },
   handler = function(opts)
-    maki.ui.flash("Hello " .. opts.args)
+    recorded = opts.args
   end,
 })
 ```
@@ -1261,8 +1298,13 @@ and tool set.
     usage into the parent session's UI or event stream. The session still
     completes and `:prompt()` still returns its result (including a commit
     set via a `local_tools` handler). Use for hidden one-shot classification.
+  - `auto_deliver` (`boolean?`) queue completed output for the root agent only
+    for asynchronous direct-root children. Blocking `prompt()` returns its
+    result to the caller. Nested asynchronous completion is not automatically
+    delivered to the parent. Default: `true`.
   - `semaphore` (`maki.async.Semaphore?`) concurrency limit acquired by the
-    driver immediately before each turn and released when that turn ends.
+    driver immediately before each unmanaged turn and released when that turn
+    ends. Managed sessions ignore it and use the parent manager's limit.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
@@ -1319,6 +1361,12 @@ loop runs to completion, calling tools as needed. Conversation history is
 kept across calls, so you can have a multi-turn conversation. This is a
 blocking compatibility wrapper over `send` + the completion notifier; the
 async `send`/`status` pair is preferred for background work.
+
+In a managed invocation, `prompt` validates the current turn and temporarily
+yields its manager permit while the child runs. Without a current managed
+invocation, the same managed session uses an ordinary exact-turn wait. The
+child still uses manager capacity, but no parent permit is yielded. A timeout
+closes the child's managed subtree.
 
 The returned table has fields: `text` (string), `duration_ms` (integer),
 `input_tokens` (integer), `output_tokens` (integer). `text` is an empty
@@ -1428,6 +1476,10 @@ maki.async.run({fn}, {on_finish?})
 Fire off a function as a new async task. It runs in the background and
 you do not wait for it. If you need the result, pass an {on_finish}
 callback.
+
+A task started from a managed agent invocation inherits that exact turn's
+authority. It may use the authority only while the originating turn remains
+active; retained work fails closed after the turn ends.
 
 **Parameters:**
 
@@ -3952,8 +4004,9 @@ Recurring callbacks on the runtime's timer pump.
 Use `set` for anything that must happen every N seconds: demo loops,
 periodic refreshes, watchdogs. Each fire runs as a fresh task, so
 callbacks may sleep or do I/O, and fires land exactly on schedule
-instead of being polled each frame. Timers registered by a plugin are
-dropped when the plugin is unloaded.
+instead of being polled each frame. Timer fires do not inherit managed
+agent authority from their registration task. Timers registered by a
+plugin are dropped when the plugin is unloaded.
 
 ```lua
 local id = maki.timer.set(5, function()
@@ -3972,8 +4025,9 @@ maki.timer.set({seconds}, {callback})
 Schedule {callback} to run every {seconds} on the runtime's timer pump.
 
 Each fire runs as a fresh task, so the callback may be async (`sleep`,
-fs, ...) and fires exactly when due: no per-frame polling. The callback
-receives the timer's id as its first argument - use it with
+fs, ...) and fires exactly when due: no per-frame polling. Timer fires do
+not inherit managed agent authority from the task that registered them.
+The callback receives the timer's id as its first argument - use it with
 `maki.timer.del` to stop the timer. Do not capture the returned id in the
 callback instead: `local id = maki.timer.set(5, function()
 maki.timer.del(id) end)` captures nil (a Luau value-capture quirk), which

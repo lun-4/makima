@@ -471,6 +471,10 @@ impl InputBox {
         &self.history
     }
 
+    pub(crate) fn replace_history_from(&mut self, other: &mut Self) {
+        self.history = mem::take(&mut other.history);
+    }
+
     pub fn scroll(&mut self, delta: i32) {
         self.scroll_y = apply_scroll_delta(self.scroll_y, delta).min(self.max_scroll());
         self.follow_cursor = false;

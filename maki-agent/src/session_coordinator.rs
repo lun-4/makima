@@ -98,6 +98,17 @@ pub struct SessionCoordinatorHandle {
     read: SessionReadHandle,
 }
 
+pub struct PreparedSessionCoordinator {
+    handle: SessionCoordinatorHandle,
+    catalog: SessionOptionCatalog,
+    model_policy: Arc<ModelPolicy>,
+    model_adopter: Arc<dyn ModelAdopter>,
+    directory_adopter: Arc<dyn DirectoryAdopter>,
+    checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
+    mailbox: SessionMailbox,
+    rx: flume::Receiver<Operation>,
+}
+
 #[derive(Clone)]
 pub struct SessionReadHandle {
     session_id: MakiId,
@@ -360,81 +371,14 @@ impl SessionOptionCatalog {
 }
 
 impl SessionCoordinatorHandle {
+    pub fn prepare(
+        params: SessionCoordinatorParams,
+    ) -> Result<PreparedSessionCoordinator, SessionCoordinatorError> {
+        PreparedSessionCoordinator::new(params)
+    }
+
     pub fn register(params: SessionCoordinatorParams) -> Result<Self, SessionCoordinatorError> {
-        let SessionCoordinatorParams {
-            session_id,
-            catalog,
-            mut definitions,
-            persisted_options,
-            history,
-            model,
-            cwd,
-            model_policy,
-            model_adopter,
-            directory_adopter,
-            checkpoint,
-            mailbox,
-        } = params;
-        let mut directory = lock(&DIRECTORY);
-        if directory.entries.contains_key(&session_id) {
-            return Err(SessionCoordinatorError::DuplicateSession(session_id));
-        }
-        let mut catalog_state = lock(&catalog.state);
-        definitions.extend(
-            catalog_state
-                .definitions
-                .values()
-                .flat_map(|definitions| definitions.iter().cloned()),
-        );
-        let options = SessionOptions::new(definitions, &persisted_options)?;
-        let read = SessionReadHandle {
-            session_id,
-            options,
-            state: Arc::new(Mutex::new(CoordinatorState {
-                history: Arc::new(history),
-                model,
-                cwd,
-                checkpoint_revision: 0,
-            })),
-        };
-        let (tx, rx) = flume::unbounded();
-        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
-        directory.entries.insert(
-            session_id,
-            DirectoryEntry {
-                generation,
-                tx: tx.clone(),
-                read: read.clone(),
-                mailbox,
-            },
-        );
-        catalog_state.sessions.insert(
-            session_id,
-            CatalogSession {
-                generation,
-                tx: tx.clone(),
-            },
-        );
-        drop(catalog_state);
-        drop(directory);
-        smol::spawn(run(
-            session_id,
-            generation,
-            catalog,
-            read.clone(),
-            model_policy,
-            model_adopter,
-            directory_adopter,
-            checkpoint,
-            rx,
-        ))
-        .detach();
-        Ok(Self {
-            session_id,
-            generation,
-            tx,
-            read,
-        })
+        Self::prepare(params)?.activate()
     }
 
     pub fn resolve(session_id: MakiId) -> Result<Self, SessionCoordinatorError> {
@@ -581,6 +525,12 @@ impl SessionCoordinatorHandle {
             .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))
     }
 
+    pub fn retire(&self) {
+        unregister(self.session_id, self.generation);
+        let (reply, _) = flume::bounded(1);
+        let _ = self.tx.send(Operation::Close { reply });
+    }
+
     fn ensure_live(&self) -> Result<(), SessionCoordinatorError> {
         let directory = lock(&DIRECTORY);
         if directory
@@ -592,6 +542,139 @@ impl SessionCoordinatorHandle {
         } else {
             Err(SessionCoordinatorError::StaleSession(self.session_id))
         }
+    }
+}
+
+impl PreparedSessionCoordinator {
+    fn new(params: SessionCoordinatorParams) -> Result<Self, SessionCoordinatorError> {
+        let SessionCoordinatorParams {
+            session_id,
+            catalog,
+            mut definitions,
+            persisted_options,
+            history,
+            model,
+            cwd,
+            model_policy,
+            model_adopter,
+            directory_adopter,
+            checkpoint,
+            mailbox,
+        } = params;
+        definitions.extend(
+            lock(&catalog.state)
+                .definitions
+                .values()
+                .flat_map(|definitions| definitions.iter().cloned()),
+        );
+        let options = SessionOptions::new(definitions, &persisted_options)?;
+        let read = SessionReadHandle {
+            session_id,
+            options,
+            state: Arc::new(Mutex::new(CoordinatorState {
+                history: Arc::new(history),
+                model,
+                cwd,
+                checkpoint_revision: 0,
+            })),
+        };
+        let (tx, rx) = flume::unbounded();
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            handle: SessionCoordinatorHandle {
+                session_id,
+                generation,
+                tx,
+                read,
+            },
+            catalog,
+            model_policy,
+            model_adopter,
+            directory_adopter,
+            checkpoint,
+            mailbox,
+            rx,
+        })
+    }
+
+    pub fn activate(self) -> Result<SessionCoordinatorHandle, SessionCoordinatorError> {
+        self.activate_inner(None)
+    }
+
+    pub fn activate_replacing(
+        self,
+        current: &SessionCoordinatorHandle,
+    ) -> Result<SessionCoordinatorHandle, SessionCoordinatorError> {
+        if self.handle.session_id != current.session_id {
+            return Err(SessionCoordinatorError::StaleSession(current.session_id));
+        }
+        self.activate_inner(Some(current.generation))
+    }
+
+    fn activate_inner(
+        self,
+        replaced_generation: Option<u64>,
+    ) -> Result<SessionCoordinatorHandle, SessionCoordinatorError> {
+        let Self {
+            handle,
+            catalog,
+            model_policy,
+            model_adopter,
+            directory_adopter,
+            checkpoint,
+            mailbox,
+            rx,
+        } = self;
+        let mut directory = lock(&DIRECTORY);
+        let retired = match (
+            directory.entries.get(&handle.session_id),
+            replaced_generation,
+        ) {
+            (None, None) => None,
+            (Some(entry), Some(generation)) if entry.generation == generation => {
+                Some(entry.tx.clone())
+            }
+            (Some(_), None) => {
+                return Err(SessionCoordinatorError::DuplicateSession(handle.session_id));
+            }
+            _ => return Err(SessionCoordinatorError::StaleSession(handle.session_id)),
+        };
+        let mut catalog_state = lock(&catalog.state);
+        directory.entries.insert(
+            handle.session_id,
+            DirectoryEntry {
+                generation: handle.generation,
+                tx: handle.tx.clone(),
+                read: handle.read.clone(),
+                mailbox,
+            },
+        );
+        catalog_state.sessions.insert(
+            handle.session_id,
+            CatalogSession {
+                generation: handle.generation,
+                tx: handle.tx.clone(),
+            },
+        );
+        drop(catalog_state);
+        drop(directory);
+        smol::spawn(run(
+            handle.session_id,
+            handle.generation,
+            catalog,
+            handle.read.clone(),
+            model_policy,
+            model_adopter,
+            directory_adopter,
+            checkpoint,
+            rx,
+        ))
+        .detach();
+        if let Some(retired) = retired {
+            let (reply, _) = flume::bounded(1);
+            let _ = retired.send(Operation::Close { reply });
+        }
+        Ok(handle)
     }
 }
 

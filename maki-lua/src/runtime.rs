@@ -21,20 +21,21 @@ use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
-use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_agent::{
+    BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+};
 use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value as LuaValue, ffi};
 
 use crate::coalesced_latest::{CoalescedLatest, CoalescedWork};
 use crate::splash::SplashFrame;
 use serde_json::Value;
 
-#[cfg(test)]
-use maki_commands::ArgumentArity;
 use maki_commands::{
-    CommandBehavior, CommandCompletion, CommandDocs, CommandError, CommandFuture,
-    CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionContext,
-    CompletionError, CompletionItem, CompletionLifecycleEvent, CompletionSessionId, Producer,
-    ProducerPrecedence, Registration, RegistrationError, TargetCapabilities, TargetCapability,
+    ArgumentValue, CommandArguments, CommandBehavior, CommandCompletion, CommandDocs, CommandError,
+    CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec,
+    CompletionContext, CompletionError, CompletionItem, CompletionLifecycleEvent,
+    CompletionSessionId, ParsedArgument, ParsedArguments, Producer, ProducerPrecedence,
+    Registration, RegistrationError, TargetCapabilities, TargetCapability,
 };
 use maki_config::RawConfig;
 
@@ -58,7 +59,10 @@ use crate::api::tool::{
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::ui::{HintStore, StatusContentStore};
-use crate::api::util::command::{CommandHandlerMap, HintWriter, StatusContentWriter, UiAction};
+use crate::api::util::command::{
+    ArgumentCompletion, CommandCompletionCallbacks, CommandGenerationMap, CommandHandlerMap,
+    HintWriter, StatusContentWriter, UiAction,
+};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::picker::{PickerCallbacks, PickerEvent};
@@ -72,6 +76,7 @@ const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
 const LUA_COMMAND_ATTACHMENTS: &str = "Lua commands cannot include non-text content";
 const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
+static NEXT_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
@@ -101,6 +106,10 @@ const SPLASH_RENDER_KILL_GRACE: Duration = Duration::from_millis(100);
 const SPLASH_CODEGEN_BUDGET: Duration = Duration::from_millis(2);
 const SPLASH_CODEGEN_MAX_STEPS: usize = 8;
 const COMMAND_COMPLETION_DEADLINE: Duration = Duration::from_secs(2);
+
+pub(crate) fn next_command_generation() -> u64 {
+    NEXT_COMMAND_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 /// How long a doomed task may run without yielding before the watchdog
 /// shoots it. Cleanup after a cancel or a timeout (batch marking its
 /// children cancelled, rerendering its buf) is plain Lua running with the
@@ -213,14 +222,25 @@ pub enum Request {
     RunCommand {
         plugin: Arc<str>,
         command: Arc<str>,
+        generation: u64,
         args: String,
         depth: u8,
-        completion: Option<flume::Sender<()>>,
+        completion: Option<flume::Sender<Result<(), String>>>,
     },
     ExecuteCommand {
         plugin: Arc<str>,
         command: Arc<str>,
+        generation: u64,
         invocation: CommandInvocation,
+    },
+    #[cfg(feature = "test-support")]
+    TestPause {
+        ready: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    },
+    #[cfg(feature = "test-support")]
+    TestBarrier {
+        reply: flume::Sender<()>,
     },
     CollectPromptSlots {
         reply: flume::Sender<ResolvedSlots>,
@@ -299,10 +319,15 @@ pub struct CommandArgumentContext {
     pub mode: String,
     pub session: u64,
     pub generation: u64,
+    pub command_generation: u64,
+    pub argument_name: Option<Arc<str>>,
+    pub argument_kind: Option<String>,
+    pub preceding_arguments: Arc<[ParsedArgument]>,
 }
 
 pub(crate) struct CommandArgumentRequest {
     pub(crate) context: CommandArgumentContext,
+    pub(crate) callbacks: Option<Arc<crate::api::util::command::CommandCompletionCallbacks>>,
     pub(crate) cancel: CancelToken,
     pub(crate) reply: flume::Sender<Vec<crate::api::util::command::CommandArgumentItem>>,
 }
@@ -326,6 +351,14 @@ pub(crate) fn lifecycle_superseded(
     this: &CommandArgumentLifecycleRequest,
     pending: &CommandArgumentLifecycleRequest,
 ) -> bool {
+    if this.context.command != pending.context.command
+        || this.context.plugin != pending.context.plugin
+        || this.context.index != pending.context.index
+        || this.context.session != pending.context.session
+        || this.context.command_generation != pending.context.command_generation
+    {
+        return false;
+    }
     match pending.event {
         CommandArgumentLifecycle::Highlight => {
             matches!(this.event, CommandArgumentLifecycle::Highlight)
@@ -342,6 +375,7 @@ pub(crate) fn lifecycle_superseded(
 
 pub(crate) struct CommandArgumentLifecycleRequest {
     pub(crate) context: CommandArgumentContext,
+    pub(crate) callbacks: Option<Arc<crate::api::util::command::CommandCompletionCallbacks>>,
     pub(crate) event: CommandArgumentLifecycle,
     pub(crate) item: Option<crate::api::util::command::CommandArgumentItem>,
     pub(crate) cancel: CancelToken,
@@ -452,6 +486,7 @@ enum KillReason {
 pub(crate) struct TaskCell {
     pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
+    pub(crate) managed_turn: Option<CurrentManagedTurn>,
     /// End of the current kill grace, armed by the first watchdog poke that
     /// sees a doomed task and cleared at every yield.
     kill_at: Cell<Option<Instant>>,
@@ -499,6 +534,7 @@ impl TaskCell {
         Self {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
+            managed_turn: None,
             kill_at: Cell::new(None),
             kill_grace: KILL_GRACE,
             deadline: Cell::new(deadline),
@@ -1014,6 +1050,71 @@ pub(crate) async fn run_command_scoped<F: Future>(
     run_scoped(lua, scope, fut).await
 }
 
+fn set_lua_command_options(
+    lua: &Lua,
+    opts: &mlua::Table,
+    invocation: &CommandInvocation,
+) -> mlua::Result<()> {
+    set_lua_command_options_from_parsed(
+        lua,
+        opts,
+        invocation.arguments.as_ref(),
+        invocation.parsed_arguments.as_ref(),
+        invocation.parsed_arguments.is_some(),
+    )
+}
+
+fn set_lua_command_options_from_parsed(
+    lua: &Lua,
+    opts: &mlua::Table,
+    arguments: &str,
+    parsed: Option<&ParsedArguments>,
+    typed: bool,
+) -> mlua::Result<()> {
+    opts.set("args", arguments)?;
+    if !typed {
+        return Ok(());
+    }
+    let parsed = parsed.expect("typed command invocation must have parsed arguments");
+    let fargs = parsed
+        .tokens()
+        .iter()
+        .map(|token| token.value.as_ref())
+        .collect::<Vec<_>>();
+    opts.set("fargs", lua.create_sequence_from(fargs)?)?;
+    let values = lua.create_table()?;
+    for argument in parsed.arguments() {
+        let to_lua = |value: &ArgumentValue| -> mlua::Result<mlua::Value> {
+            Ok(match value {
+                ArgumentValue::String(value) | ArgumentValue::Enum(value) => {
+                    mlua::Value::String(lua.create_string(value.as_ref())?)
+                }
+                ArgumentValue::Integer(value) => mlua::Value::Integer(*value),
+                ArgumentValue::File(value) | ArgumentValue::Directory(value) => {
+                    mlua::Value::String(lua.create_string(value.to_string_lossy().as_ref())?)
+                }
+            })
+        };
+        let value = if argument.variadic {
+            let items = lua.create_table()?;
+            for (index, value) in argument.values.iter().enumerate() {
+                items.set(index + 1, to_lua(value)?)?;
+            }
+            mlua::Value::Table(items)
+        } else {
+            argument
+                .values
+                .first()
+                .map(to_lua)
+                .transpose()?
+                .unwrap_or(mlua::Value::Nil)
+        };
+        values.set(argument.name.as_ref(), value)?;
+    }
+    opts.set("values", values)?;
+    Ok(())
+}
+
 async fn run_command_completion_scoped<F: Future>(
     lua: &Lua,
     cancel: CancelToken,
@@ -1139,6 +1240,10 @@ impl<F: Future> Future for ScopedFuture<F> {
     }
 }
 
+pub(crate) fn current_managed_turn(lua: &Lua) -> Option<CurrentManagedTurn> {
+    lock_cell(&active_task(lua)).managed_turn.clone()
+}
+
 pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
     lua.app_data_ref::<TaskHandle>()
         .map(|r| Arc::clone(&*r))
@@ -1206,17 +1311,18 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, command_depth, command_invocation) = match &handle {
+    let (cancel, live_ctx, managed_turn, command_depth, command_invocation) = match &handle {
         Some(h) => {
             let cell = lock_cell(h);
             (
                 cell.cancel.clone(),
                 cell.live.clone(),
+                cell.managed_turn.clone(),
                 cell.command_depth,
                 cell.command_invocation.clone(),
             )
         }
-        None => (CancelToken::none(), None, 0, None),
+        None => (CancelToken::none(), None, None, 0, None),
     };
 
     let mut task = PendingAsyncTask {
@@ -1225,6 +1331,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
         live_ctx,
         owner: None,
+        managed_turn,
         command_depth,
         command_invocation,
         timer_id: None,
@@ -1382,6 +1489,7 @@ pub(crate) struct PendingAsyncTask {
     pub deadline: Option<Instant>,
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
+    pub managed_turn: Option<CurrentManagedTurn>,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
     /// Timer fires pass their id as the first callback argument.
@@ -1498,6 +1606,7 @@ fn spawn_async_task(
         let _gate_guard = g.acquire().await;
 
         let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
+        cell.managed_turn = task.managed_turn;
         cell.command_depth = task.command_depth;
         cell.command_invocation = task.command_invocation;
         let scope = TaskScope::new(&lua, cell);
@@ -1572,6 +1681,7 @@ type PluginMap = Rc<RefCell<HashMap<Arc<str>, HashMap<Arc<str>, ToolKeys>>>>;
 struct LuaCommandBehavior {
     plugin: Arc<str>,
     command: Arc<str>,
+    generation: u64,
     tx: flume::Sender<Request>,
 }
 
@@ -1588,6 +1698,7 @@ impl CommandBehavior for LuaCommandBehavior {
         let result = self.tx.send(Request::ExecuteCommand {
             plugin: Arc::clone(&self.plugin),
             command: Arc::clone(&self.command),
+            generation: self.generation,
             invocation,
         });
         Box::pin(async move {
@@ -1599,6 +1710,11 @@ impl CommandBehavior for LuaCommandBehavior {
 
 struct LuaCommandCompletion {
     plugin: Arc<str>,
+    command: Arc<str>,
+    argument_index: Option<usize>,
+    directory_navigation: bool,
+    callbacks: Option<Arc<CommandCompletionCallbacks>>,
+    command_generation: u64,
     command_arguments: CoalescedLatest<CommandArgumentRequest>,
     command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
     sessions: Mutex<HashMap<CompletionSessionId, LuaCompletionSession>>,
@@ -1639,7 +1755,7 @@ impl LuaCommandCompletion {
             None
         };
         let context = CommandArgumentContext {
-            command: Arc::clone(&context.invoked_name),
+            command: Arc::clone(&self.command),
             plugin: Arc::clone(&self.plugin),
             args: context.arguments.to_string(),
             arg: context.argument.to_string(),
@@ -1647,6 +1763,13 @@ impl LuaCommandCompletion {
             mode: context.mode.to_string(),
             session: id,
             generation: context.generation,
+            command_generation: self.command_generation,
+            argument_name: context.argument_name.clone(),
+            argument_kind: context
+                .argument_kind
+                .as_ref()
+                .map(|kind| kind.type_name().to_owned()),
+            preceding_arguments: context.preceding_arguments.clone(),
         };
         (context, request_trigger)
     }
@@ -1659,10 +1782,17 @@ impl CommandCompletion for LuaCommandCompletion {
         cancellation: maki_commands::CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
         let (trigger, cancel) = CancelToken::new();
+        if self
+            .argument_index
+            .is_some_and(|index| index != context.argument_index)
+        {
+            return Box::pin(async { Ok(Vec::new()) });
+        }
         let (context, _) = self.context(&context, trigger, false);
         let (reply, rx) = flume::bounded(1);
         if !self.command_arguments.submit(CommandArgumentRequest {
             context,
+            callbacks: self.callbacks.clone(),
             cancel: cancel.clone(),
             reply,
         }) {
@@ -1683,6 +1813,18 @@ impl CommandCompletion for LuaCommandCompletion {
                 })
                 .collect())
         })
+    }
+
+    fn navigation(
+        &self,
+        _context: &CompletionContext,
+        _item: &CompletionItem,
+    ) -> maki_commands::CompletionItemNavigation {
+        if self.directory_navigation {
+            maki_commands::CompletionItemNavigation::Directory
+        } else {
+            maki_commands::CompletionItemNavigation::Terminal
+        }
     }
 
     fn lifecycle(
@@ -1711,6 +1853,7 @@ impl CommandCompletion for LuaCommandCompletion {
         self.command_argument_lifecycle
             .submit(CommandArgumentLifecycleRequest {
                 context,
+                callbacks: self.callbacks.clone(),
                 event,
                 item,
                 cancel,
@@ -1734,60 +1877,147 @@ pub(crate) fn publish_registered_commands(lua: &Lua, plugin: &Arc<str>) -> mlua:
         .app_data_ref::<CommandHandlerMap>()
         .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
     let registrations = command_registrations(
+        lua,
         commands.get(plugin),
         plugin,
         &publisher.tx,
         &publisher.command_arguments,
         &publisher.command_argument_lifecycle,
-    );
+    )?;
     replace_command_producer(
         &publisher.registry,
         &publisher.producers,
         plugin,
         registrations,
     )
-    .map_err(|error| mlua::Error::runtime(format!("invalid command registration: {error}")))
+    .map_err(|error| mlua::Error::runtime(format!("invalid command registration: {error}")))?;
+    if let Some(plugin_commands) = commands.get(plugin) {
+        let mut generations = publisher
+            .command_generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        generations.retain(|(owner, _), _| owner != plugin);
+        generations.extend(
+            plugin_commands
+                .iter()
+                .map(|(name, entry)| ((Arc::clone(plugin), Arc::clone(name)), entry.generation)),
+        );
+    }
+    Ok(())
+}
+
+fn resolve_command_handler(
+    lua: &Lua,
+    plugin: &Arc<str>,
+    command: &Arc<str>,
+    generation: u64,
+) -> Option<Function> {
+    lua.app_data_ref::<CommandHandlerMap>().and_then(|map| {
+        let entry = map.get(plugin)?.get(command)?;
+        (entry.generation == generation)
+            .then(|| lua.registry_value::<Function>(&entry.handler).ok())
+            .flatten()
+    })
+}
+
+fn clone_registry_key(lua: &Lua, key: &RegistryKey) -> mlua::Result<RegistryKey> {
+    lua.create_registry_value(lua.registry_value::<LuaValue>(key)?)
+}
+
+fn completion_callbacks(
+    lua: &Lua,
+    completion: &ArgumentCompletion,
+    argument_schema: Option<Arc<[maki_commands::PositionalArgument]>>,
+) -> mlua::Result<Arc<CommandCompletionCallbacks>> {
+    Ok(Arc::new(CommandCompletionCallbacks {
+        completion: clone_registry_key(lua, &completion.completion)?,
+        argument_schema,
+        on_highlight: completion
+            .on_highlight
+            .as_ref()
+            .map(|key| clone_registry_key(lua, key))
+            .transpose()?,
+        on_accept: completion
+            .on_accept
+            .as_ref()
+            .map(|key| clone_registry_key(lua, key))
+            .transpose()?,
+        on_cancel: completion
+            .on_cancel
+            .as_ref()
+            .map(|key| clone_registry_key(lua, key))
+            .transpose()?,
+    }))
 }
 
 fn command_registrations(
+    lua: &Lua,
     commands: Option<&HashMap<Arc<str>, crate::api::util::command::CommandEntry>>,
     plugin: &Arc<str>,
     tx: &flume::Sender<Request>,
     command_arguments: &CoalescedLatest<CommandArgumentRequest>,
     command_argument_lifecycle: &CoalescedLatest<CommandArgumentLifecycleRequest>,
-) -> Vec<Registration> {
+) -> mlua::Result<Vec<Registration>> {
     commands
         .into_iter()
         .flatten()
-        .map(|(name, entry)| Registration {
-            spec: CommandSpec {
-                name: Arc::clone(name),
-                aliases: Arc::from([]),
-                arguments: entry.arguments,
-                docs: CommandDocs {
-                    summary: Arc::clone(&entry.description),
-                    argument_hint: entry.argument_hint.clone(),
+        .map(|(name, entry)| {
+            let schema = entry.arguments.positional().map(Arc::from);
+            let argument_completions = schema
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, _)| {
+                    let Some(completion) = entry
+                        .argument_completions
+                        .get(index)
+                        .and_then(Option::as_ref)
+                    else {
+                        return Ok(None);
+                    };
+                    let callbacks = completion_callbacks(lua, completion, schema.clone())?;
+                    let directory_navigation = matches!(
+                        completion.navigation,
+                        Some(crate::api::util::command::ArgumentCompletionNavigation::Directory)
+                    );
+                    Ok(Some(Arc::new(LuaCommandCompletion {
+                        plugin: Arc::clone(plugin),
+                        command: Arc::clone(name),
+                        argument_index: Some(index),
+                        directory_navigation,
+                        callbacks: Some(callbacks),
+                        command_generation: entry.generation,
+                        command_arguments: command_arguments.clone(),
+                        command_argument_lifecycle: command_argument_lifecycle.clone(),
+                        sessions: Mutex::new(HashMap::new()),
+                        next_session_id: AtomicU64::new(1),
+                    }) as Arc<dyn CommandCompletion>))
+                })
+                .collect::<mlua::Result<Vec<_>>>()?;
+            Ok(Registration {
+                spec: CommandSpec {
+                    name: Arc::clone(name),
+                    aliases: Arc::from([]),
+                    arguments: entry.arguments.clone(),
+                    docs: CommandDocs {
+                        summary: Arc::clone(&entry.description),
+                        argument_hint: entry.argument_hint.clone(),
+                    },
+                    required_capabilities: if entry.tui_only {
+                        TargetCapabilities::from_capability(TargetCapability::InteractiveUi)
+                    } else {
+                        TargetCapabilities::NONE
+                    },
                 },
-                required_capabilities: if entry.tui_only {
-                    TargetCapabilities::from_capability(TargetCapability::InteractiveUi)
-                } else {
-                    TargetCapabilities::NONE
-                },
-            },
-            behavior: Arc::new(LuaCommandBehavior {
-                plugin: Arc::clone(plugin),
-                command: Arc::clone(name),
-                tx: tx.clone(),
-            }),
-            completion: entry.argument_completion.as_ref().map(|_| {
-                Arc::new(LuaCommandCompletion {
+                behavior: Arc::new(LuaCommandBehavior {
                     plugin: Arc::clone(plugin),
-                    command_arguments: command_arguments.clone(),
-                    command_argument_lifecycle: command_argument_lifecycle.clone(),
-                    sessions: Mutex::new(HashMap::new()),
-                    next_session_id: AtomicU64::new(1),
-                }) as Arc<dyn CommandCompletion>
-            }),
+                    command: Arc::clone(name),
+                    generation: entry.generation,
+                    tx: tx.clone(),
+                }),
+                argument_completions,
+            })
         })
         .collect()
 }
@@ -1816,6 +2046,7 @@ fn command_argument_item(item: &CompletionItem) -> crate::CommandArgumentItem {
 struct CommandPublisher {
     registry: CommandRegistry,
     producers: Arc<Mutex<HashMap<Arc<str>, Producer>>>,
+    command_generations: Arc<Mutex<CommandGenerationMap>>,
     tx: flume::Sender<Request>,
     command_arguments: CoalescedLatest<CommandArgumentRequest>,
     command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
@@ -1864,6 +2095,7 @@ impl LuaRuntime {
         bundled_dirs: &'static [&'static Dir<'static>],
         ui_action_tx: Option<flume::Sender<UiAction>>,
         command_registry: CommandRegistry,
+        command_generations: Arc<Mutex<CommandGenerationMap>>,
         command_arguments: CoalescedLatest<CommandArgumentRequest>,
         command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
         keymap_writer: KeymapWriter,
@@ -1902,6 +2134,7 @@ impl LuaRuntime {
 
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(crate::api::util::command::RetiredCommandHandlerMap::new());
+        lua.set_app_data(Arc::clone(&command_generations));
         lua.set_app_data(JobStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(PromptHintCallbacks::default());
@@ -1934,6 +2167,7 @@ impl LuaRuntime {
         lua.set_app_data(CommandPublisher {
             registry: command_registry.clone(),
             producers: Arc::clone(&command_producers),
+            command_generations: Arc::clone(&command_generations),
             tx: tx.clone(),
             command_arguments: command_arguments.clone(),
             command_argument_lifecycle: command_argument_lifecycle.clone(),
@@ -2052,6 +2286,12 @@ impl LuaRuntime {
                 .app_data_mut::<crate::api::util::command::RetiredCommandHandlerMap>()
             {
                 retired.push((Arc::from(name), entries));
+            }
+            if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
+                let mut generations = generations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                generations.retain(|(plugin, _), _| plugin.as_ref() != name);
             }
             let _ = self.tx.send(Request::DropCommandKeys {
                 plugin: Arc::from(name),
@@ -2263,12 +2503,17 @@ impl LuaRuntime {
     ) -> Result<(), PluginError> {
         let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
         let registrations = command_registrations(
+            &self.lua,
             Some(&pending),
             plugin,
             &self.tx,
             &self.command_arguments,
             &self.command_argument_lifecycle,
-        );
+        )
+        .map_err(|source| PluginError::Lua {
+            plugin: plugin.to_string(),
+            source,
+        })?;
         maki_commands::validate_registrations(registrations)
             .map(|_| ())
             .map_err(|error| PluginError::Lua {
@@ -2287,12 +2532,17 @@ impl LuaRuntime {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let registrations = command_registrations(
+            &self.lua,
             Some(&pending_commands),
             plugin,
             &self.tx,
             &self.command_arguments,
             &self.command_argument_lifecycle,
-        );
+        )
+        .map_err(|source| PluginError::Lua {
+            plugin: plugin.to_string(),
+            source,
+        })?;
         replace_command_producer(
             &self.command_registry,
             &self.command_producers,
@@ -2310,6 +2560,21 @@ impl LuaRuntime {
                 .app_data_mut::<CommandHandlerMap>()
                 .and_then(|mut live| live.insert(Arc::clone(plugin), candidate))
         };
+        if let Some(commands) = self.lua.app_data_ref::<CommandHandlerMap>() {
+            let generations = self
+                .lua
+                .app_data_ref::<Arc<Mutex<CommandGenerationMap>>>()
+                .expect("command generation map initialized");
+            let mut generations = generations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            generations.retain(|(owner, _), _| owner != plugin);
+            if let Some(commands) = commands.get(plugin) {
+                generations.extend(commands.iter().map(|(name, entry)| {
+                    ((Arc::clone(plugin), Arc::clone(name)), entry.generation)
+                }));
+            }
+        }
         if let Some(entries) = old {
             if let Some(mut retired) = self
                 .lua
@@ -2924,6 +3189,12 @@ impl LuaRuntime {
             store.remove(plugin);
         }
         self.registry.clear_plugin(plugin);
+        if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
+            generations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|(owner, _), _| owner.as_ref() != plugin);
+        }
         self.plugin_rules.remove(plugin);
         self.drop_plugin_keys(plugin);
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
@@ -3516,7 +3787,8 @@ async fn run_tool_call(
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
-    let live_sink = ctx.agent().and_then(|a| a.live_sink.clone());
+    let live_sink = ctx.agent().and_then(|agent| agent.live_sink.clone());
+    let managed_turn = ctx.agent().and_then(|agent| agent.managed_turn.clone());
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -3529,6 +3801,7 @@ async fn run_tool_call(
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
+    cell.managed_turn = managed_turn;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
@@ -3617,6 +3890,7 @@ async fn run_tool_call(
 pub(crate) struct LuaThread {
     pub tx: flume::Sender<Request>,
     pub prio_tx: flume::Sender<Request>,
+    pub command_generations: Arc<Mutex<CommandGenerationMap>>,
     pub command_arguments: crate::coalesced_latest::CoalescedLatest<CommandArgumentRequest>,
     pub command_argument_lifecycle:
         crate::coalesced_latest::CoalescedLatest<CommandArgumentLifecycleRequest>,
@@ -3738,10 +4012,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
     let (status_content_writer, status_content_reader) = StatusContentWriter::new();
+    let command_generations = Arc::new(Mutex::new(CommandGenerationMap::new()));
     let runtime_command_arguments = command_arguments.clone();
     let runtime_command_argument_lifecycle = command_argument_lifecycle.clone();
     let runtime_session_options = session_options.clone();
 
+    let runtime_command_generations = Arc::clone(&command_generations);
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
         .spawn(move || {
@@ -3753,6 +4029,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                 bundled_dirs,
                 Some(ui_action_tx),
                 command_registry,
+                runtime_command_generations,
                 runtime_command_arguments,
                 runtime_command_argument_lifecycle,
                 keymap_writer,
@@ -3949,14 +4226,20 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 if let Err(error) = rt.lua.remove_registry_value(entry.handler) {
                                     tracing::warn!(%plugin, %error, "failed to drop command handler key");
                                 }
-                                for key in [
-                                    entry.argument_completion,
-                                    entry.completion_on_highlight,
-                                    entry.completion_on_accept,
-                                    entry.completion_on_cancel,
-                                ]
-                                .into_iter()
-                                .flatten()
+                                for key in entry
+                                    .argument_completions
+                                    .into_iter()
+                                    .flatten()
+                                    .flat_map(|completion| {
+                                        [
+                                            Some(completion.completion),
+                                            completion.on_highlight,
+                                            completion.on_accept,
+                                            completion.on_cancel,
+                                        ]
+                                        .into_iter()
+                                        .flatten()
+                                    })
                                 {
                                     if let Err(error) = rt.lua.remove_registry_value(key) {
                                         tracing::warn!(%plugin, %error, "failed to drop command completion key");
@@ -3967,58 +4250,86 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::RunCommand {
                             plugin,
                             command,
+                            generation,
                             args,
                             depth,
                             completion,
                         } => {
-                            let handler_fn =
-                                rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
-                                    let entry = m.get(&plugin)?.get(&command)?;
-                                    rt.lua.registry_value::<Function>(&entry.handler).ok()
-                                });
-                            if let Some(func) = handler_fn {
+                            let command_data = rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
+                                let entry = m.get(&plugin)?.get(&command)?;
+                                if entry.generation != generation {
+                                    return None;
+                                }
+                                let function = rt.lua.registry_value::<Function>(&entry.handler).ok()?;
+                                let typed = matches!(entry.arguments, CommandArguments::Positional(_));
+                                let parsed = entry.arguments.parse_invocation(args.trim());
+                                Some((function, typed, parsed))
+                            });
+                            if let Some((func, typed, parsed)) = command_data {
+                                let args = args.trim().to_owned();
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let run = async {
+                                        let parsed = match parsed {
+                                            Ok(parsed) => parsed,
+                                            Err(error) => {
+                                                return Err(mlua::Error::runtime(error.to_string()));
+                                            }
+                                        };
                                         let opts = lua.create_table()?;
-                                        opts.set(
-                                            "fargs",
-                                            lua.create_sequence_from(args.split_whitespace())?,
+                                        set_lua_command_options_from_parsed(
+                                            &lua,
+                                            &opts,
+                                            &args,
+                                            parsed.as_ref(),
+                                            typed,
                                         )?;
-                                        opts.set("args", args)?;
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>(opts)?.await
                                     };
-                                    if let Err(e) = run_command_legacy_scoped(&lua, depth, run).await {
-                                        tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
+                                    let result = run_command_legacy_scoped(&lua, depth, run)
+                                        .await
+                                        .map_err(|error| error.to_string());
+                                    if let Err(error) = &result {
+                                        tracing::warn!(plugin = %plugin, command = %command, error, "command handler failed");
                                     }
                                     if let Some(completion) = completion {
-                                        let _ = completion.send(());
+                                        let _ = completion.send(result);
                                     }
                                 })
                                 .detach();
+                            } else if let Some(completion) = completion {
+                                let _ = completion.send(Err("command handler is unavailable".to_owned()));
                             }
+                        }
+                        #[cfg(feature = "test-support")]
+                        Request::TestPause { ready, release } => {
+                            let _ = ready.send(());
+                            let _ = release.recv_async().await;
+                        }
+                        #[cfg(feature = "test-support")]
+                        Request::TestBarrier { reply } => {
+                            let _ = reply.send(());
                         }
                         Request::ExecuteCommand {
                             plugin,
                             command,
+                            generation,
                             invocation,
                         } => {
-                            let handler_fn = rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
-                                let entry = m.get(&plugin)?.get(&command)?;
-                                rt.lua.registry_value::<Function>(&entry.handler).ok()
-                            });
+                            let handler_fn = resolve_command_handler(
+                                &rt.lua,
+                                &plugin,
+                                &command,
+                                generation,
+                            );
                             if let Some(func) = handler_fn {
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
-                                    let arguments = invocation.arguments.to_string();
+                                    let options_invocation = invocation.clone();
                                     let run = async {
                                         let opts = lua.create_table()?;
-                                        opts.set(
-                                            "fargs",
-                                            lua.create_sequence_from(arguments.split_whitespace())?,
-                                        )?;
-                                        opts.set("args", arguments)?;
+                                        set_lua_command_options(&lua, &opts, &options_invocation)?;
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>(opts)?.await
                                     };
@@ -4290,6 +4601,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 crate::api::completion::collect_command_argument_items(
                                     &rt.lua,
                                     &request.context,
+                                    request.callbacks.as_deref(),
                                 ),
                             )
                             .await
@@ -4350,6 +4662,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
     Ok(LuaThread {
         tx,
         prio_tx,
+        command_generations,
         command_arguments,
         command_argument_lifecycle,
         splash_frames,
@@ -4430,7 +4743,12 @@ mod tests {
                 mode: "build".into(),
                 session: 1,
                 generation: 1,
+                command_generation: 0,
+                argument_name: None,
+                argument_kind: None,
+                preceding_arguments: Arc::from([]),
             },
+            callbacks: None,
             event,
             item: None,
             cancel: CancelToken::none(),
@@ -4456,6 +4774,21 @@ mod tests {
             lifecycle_superseded(&lifecycle_req(this_event), &lifecycle_req(pending_event)),
             expected
         );
+    }
+
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.index += 1; "argument")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.session += 1; "session")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.command = Arc::from("/other"); "command")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.plugin = Arc::from("other"); "plugin")]
+    #[test_case(|request: &mut CommandArgumentLifecycleRequest| request.context.command_generation += 1; "command_generation")]
+    fn lifecycle_events_from_distinct_providers_do_not_coalesce(
+        change_identity: fn(&mut CommandArgumentLifecycleRequest),
+    ) {
+        let this = lifecycle_req(CommandArgumentLifecycle::Cancel);
+        let mut pending = lifecycle_req(CommandArgumentLifecycle::Cancel);
+        change_identity(&mut pending);
+
+        assert!(!lifecycle_superseded(&this, &pending));
     }
 
     #[test]
@@ -4753,16 +5086,65 @@ mod tests {
     }
 
     #[test]
-    fn lua_completion_uses_registry_request_generations() {
+    fn command_registration_propagates_completion_callback_clone_errors() {
+        let lua = test_lua();
+        let foreign_lua = Lua::new();
+        let invalid = foreign_lua
+            .create_registry_value(foreign_lua.create_table().unwrap())
+            .unwrap();
+        let commands = HashMap::from([(
+            Arc::from("/complete"),
+            crate::api::util::command::CommandEntry {
+                generation: 0,
+                handler: enqueue_dummy(&lua),
+                description: Arc::from("complete"),
+                argument_hint: None,
+                arguments: CommandArguments::Positional(Arc::from([
+                    maki_commands::PositionalArgument::required(
+                        "value",
+                        maki_commands::ArgumentKind::String,
+                    ),
+                ])),
+                tui_only: false,
+                argument_completions: vec![Some(crate::api::util::command::ArgumentCompletion {
+                    completion: invalid,
+                    on_highlight: None,
+                    on_accept: None,
+                    on_cancel: None,
+                    navigation: None,
+                })],
+            },
+        )]);
+        let error = command_registrations(
+            &lua,
+            Some(&commands),
+            &Arc::from("test"),
+            &flume::unbounded().0,
+            &CoalescedLatest::new(|_| false),
+            &CoalescedLatest::new(|_| false),
+        )
+        .expect_err("invalid callback key must abort command publication");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn lua_completion_retains_session_across_requests_until_terminal_event() {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Plugin);
         let probe = Arc::new(CompletionContextProbe::default());
+        let completion: Arc<dyn CommandCompletion> = probe.clone();
         producer
             .replace(vec![Registration {
                 spec: CommandSpec {
                     name: Arc::from("/complete"),
                     aliases: Arc::from([]),
-                    arguments: ArgumentArity::ANY,
+                    arguments: CommandArguments::Positional(Arc::from([
+                        maki_commands::PositionalArgument::optional(
+                            "value",
+                            maki_commands::ArgumentKind::String,
+                        )
+                        .with_completion(maki_commands::CompletionPolicy::Replace),
+                    ])),
                     docs: CommandDocs {
                         summary: Arc::from("Complete"),
                         argument_hint: None,
@@ -4772,9 +5154,10 @@ mod tests {
                 behavior: Arc::new(LuaCommandBehavior {
                     plugin: Arc::from("test-plugin"),
                     command: Arc::from("/complete"),
+                    generation: 0,
                     tx: flume::unbounded().0,
                 }),
-                completion: Some(probe.clone()),
+                argument_completions: vec![Some(Arc::clone(&completion))],
             }])
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
@@ -4798,6 +5181,11 @@ mod tests {
             .clone();
         let adapter = LuaCommandCompletion {
             plugin: Arc::from("test-plugin"),
+            command: Arc::from("/complete"),
+            argument_index: None,
+            directory_navigation: false,
+            callbacks: None,
+            command_generation: 0,
             command_arguments: CoalescedLatest::new(|_| false),
             command_argument_lifecycle: CoalescedLatest::new(|_| false),
             sessions: Mutex::new(HashMap::new()),
@@ -4806,11 +5194,43 @@ mod tests {
         let (first, _) = adapter.context(&contexts[0], CancelToken::new().0, false);
         let (second, _) = adapter.context(&contexts[1], CancelToken::new().0, false);
         let (terminal, _) = adapter.context(&contexts[1], CancelToken::new().0, true);
+        let (reopened, _) = adapter.context(&contexts[1], CancelToken::new().0, false);
 
         assert_eq!(first.session, second.session);
         assert!(second.generation > first.generation);
         assert_eq!(terminal.session, second.session);
         assert_eq!(terminal.generation, second.generation);
+        assert_ne!(reopened.session, terminal.session);
+    }
+
+    #[test]
+    fn lua_command_handler_generation_rejects_stale_requests() {
+        let lua = test_lua();
+        let plugin: Arc<str> = Arc::from("plugin");
+        let command: Arc<str> = Arc::from("/cmd");
+        let old = lua
+            .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
+            .unwrap();
+        let new = lua
+            .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
+            .unwrap();
+        let mut commands = HashMap::new();
+        commands.insert(
+            command.clone(),
+            crate::api::util::command::CommandEntry {
+                generation: 2,
+                handler: new,
+                description: Arc::from("new"),
+                argument_hint: None,
+                arguments: CommandArguments::Raw { required: false },
+                tui_only: false,
+                argument_completions: Vec::new(),
+            },
+        );
+        lua.set_app_data(CommandHandlerMap::from([(plugin.clone(), commands)]));
+        assert!(resolve_command_handler(&lua, &plugin, &command, 1).is_none());
+        assert!(resolve_command_handler(&lua, &plugin, &command, 2).is_some());
+        let _ = old;
     }
 
     #[test]
@@ -4823,7 +5243,7 @@ mod tests {
                 spec: CommandSpec {
                     name: Arc::from("/lua-command"),
                     aliases: Arc::from([]),
-                    arguments: ArgumentArity::NONE,
+                    arguments: CommandArguments::Raw { required: false },
                     docs: CommandDocs {
                         summary: Arc::from("Lua command"),
                         argument_hint: None,
@@ -4833,9 +5253,10 @@ mod tests {
                 behavior: Arc::new(LuaCommandBehavior {
                     plugin: Arc::from("test-plugin"),
                     command: Arc::from("/lua-command"),
+                    generation: 0,
                     tx,
                 }),
-                completion: None,
+                argument_completions: Vec::new(),
             }])
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
@@ -4882,7 +5303,7 @@ mod tests {
                 spec: CommandSpec {
                     name: Arc::from("/capture"),
                     aliases: Arc::from([]),
-                    arguments: ArgumentArity::NONE,
+                    arguments: CommandArguments::Raw { required: false },
                     docs: CommandDocs {
                         summary: Arc::from("capture"),
                         argument_hint: None,
@@ -4890,7 +5311,7 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(CaptureBehavior(tx)),
-                completion: None,
+                argument_completions: Vec::new(),
             }])
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(FakeCommandHost));
@@ -4977,6 +5398,7 @@ mod tests {
             deadline,
             live_ctx: None,
             owner: None,
+            managed_turn: None,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,
@@ -5510,6 +5932,7 @@ mod tests {
             deadline: None,
             live_ctx: None,
             owner: None,
+            managed_turn: None,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,

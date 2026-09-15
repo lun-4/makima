@@ -87,6 +87,30 @@ impl<K: PartialEq, T> Published<K, T> {
         }
     }
 
+    pub(super) fn clear_request(&mut self, generation: u64, key: &K) -> Publication {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.generation != generation || pending.key != *key)
+        {
+            return Publication::Wait;
+        }
+        let matches_pending = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation && pending.key == *key);
+        let matches_committed = self
+            .committed
+            .as_ref()
+            .is_some_and(|committed| committed.key == *key);
+        if !matches_pending && !matches_committed {
+            return Publication::Wait;
+        }
+        self.pending = None;
+        self.committed = None;
+        Publication::Clear
+    }
+
     pub(super) fn cancel(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = None;
@@ -247,6 +271,21 @@ mod tests {
         state.begin("new");
         assert_eq!(state.stream("old", 2), Publication::Wait);
         assert_eq!(state.value(), Some(&1));
+    }
+
+    #[test]
+    fn clear_request_handles_committed_stream_but_preserves_newer_pending() {
+        let mut state = Published::default();
+        let old = state.begin("old");
+        assert_eq!(state.commit(old, "old", 1), Publication::Commit);
+        assert_eq!(state.clear_request(old, &"old"), Publication::Clear);
+        assert_eq!(state.value(), None);
+
+        state.commit_sync("old", 2);
+        let newer = state.begin("new");
+        assert_eq!(state.clear_request(old, &"old"), Publication::Wait);
+        assert_eq!(state.commit(newer, "new", 3), Publication::Commit);
+        assert_eq!(state.value(), Some(&3));
     }
 
     #[test]

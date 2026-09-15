@@ -148,9 +148,6 @@ mod tests {
         panic!("test panic")
     }
 
-    /// One set of counters per test: these used to be statics, and the binary
-    /// runs its tests in parallel, so a success case's writes were visible to
-    /// the failure case asserting that nothing had been written.
     #[derive(Default)]
     struct Sinks {
         checks: AtomicUsize,

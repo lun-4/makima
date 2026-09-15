@@ -64,9 +64,9 @@ pub async fn run_isolated_turn(
                 let event = match event {
                     ProviderEvent::TextDelta { text } => IsolatedTurnEvent::TextDelta(text),
                     ProviderEvent::ThinkingDelta { text } => IsolatedTurnEvent::ThinkingDelta(text),
-                    ProviderEvent::ToolUseStart { .. } | ProviderEvent::PromptProgress { .. } => {
-                        continue;
-                    }
+                    ProviderEvent::ThinkingBlockEnd
+                    | ProviderEvent::ToolUseStart { .. }
+                    | ProviderEvent::PromptProgress { .. } => continue,
                 };
                 if output.send_async(event).await.is_err() {
                     break;

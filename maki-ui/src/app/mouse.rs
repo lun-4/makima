@@ -166,6 +166,14 @@ impl App {
                         let focused = !self.any_overlay_open();
                         self.input_box
                             .handle_click(zone.area, event.row, event.column, focused);
+                        if focused && self.is_main_chat() {
+                            let input = self.input_box.buffer.value();
+                            self.sync_command_arguments(
+                                &input,
+                                self.input_box.buffer.cursor_byte_offset(),
+                            );
+                            self.sync_file_completion();
+                        }
                     }
                     let scroll = self.scroll_offset(zone.zone);
                     self.selection_state = Some(SelectionState::Dragging {

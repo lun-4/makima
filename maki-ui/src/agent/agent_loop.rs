@@ -369,6 +369,7 @@ impl TuiActorBackend {
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
                 file_write_locks: Arc::clone(&self.file_write_locks),
+                managed_turn: context.managed_turn.clone(),
             },
             AgentRunParams {
                 history,
@@ -712,6 +713,7 @@ mod tests {
             cancel_reason: ReasonedCancelToken::none(),
             correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
             interrupt: None,
+            managed_turn: None,
         };
         let mut history = History::new(Vec::new());
         let outcome = smol::block_on(backend.execute_agent(

@@ -4,9 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Poll, Waker};
 
+use crate::arguments::{CommandArguments, CompletionPolicy};
 use crate::completion::{
     CompletionError, CompletionInvalidation, CompletionSession, CompletionSessionCore,
 };
+use crate::completion_providers::CompletionProviders;
 use crate::dispatch::{
     CommandError, CommandHost, ParsedInput, RegistrationError, ResolutionError, ResolvedCommand,
     ResolvedInput,
@@ -67,6 +69,12 @@ struct TargetCore {
 #[derive(Clone)]
 pub struct TargetHandle(Arc<TargetCore>);
 
+pub struct PreparedTarget {
+    registry: Arc<RegistryInner>,
+    handle: TargetHandle,
+    record: TargetRecord,
+}
+
 struct SubscriptionCore {
     generation: AtomicU64,
     waker: Mutex<Option<Waker>>,
@@ -103,7 +111,7 @@ impl From<&ResolvedCommand> for PresentedCommand {
         Self {
             name: Arc::from(command.invoked_name()),
             description: Arc::clone(&command.spec().docs.summary),
-            argument_hint: command.spec().docs.argument_hint.clone(),
+            argument_hint: command.spec().argument_hint(),
         }
     }
 }
@@ -175,7 +183,7 @@ impl CommandRegistry {
         capabilities: TargetCapabilities,
         host: Arc<dyn CommandHost>,
     ) -> TargetHandle {
-        self.bind_target_with_presentation(capabilities, capabilities, host)
+        self.prepare_target(capabilities, host).activate()
     }
 
     pub fn bind_target_with_presentation(
@@ -184,24 +192,53 @@ impl CommandRegistry {
         presentation_capabilities: TargetCapabilities,
         host: Arc<dyn CommandHost>,
     ) -> TargetHandle {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let id = InvocationTargetId::new(self.0.id, state.take_id());
-        state.targets.insert(
-            id,
-            TargetRecord {
+        self.prepare_target_with_presentation(capabilities, presentation_capabilities, host)
+            .activate()
+    }
+
+    pub fn prepare_target(
+        &self,
+        capabilities: TargetCapabilities,
+        host: Arc<dyn CommandHost>,
+    ) -> PreparedTarget {
+        self.prepare_target_with_presentation(capabilities, capabilities, host)
+    }
+
+    pub fn prepare_target_with_presentation(
+        &self,
+        capabilities: TargetCapabilities,
+        presentation_capabilities: TargetCapabilities,
+        host: Arc<dyn CommandHost>,
+    ) -> PreparedTarget {
+        let id = InvocationTargetId::new(
+            self.0.id,
+            self.0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take_id(),
+        );
+        PreparedTarget {
+            registry: Arc::clone(&self.0),
+            handle: TargetHandle(Arc::new(TargetCore {
+                id,
+                registry: Arc::downgrade(&self.0),
+            })),
+            record: TargetRecord {
                 capabilities,
                 presentation_capabilities,
                 host,
             },
-        );
-        TargetHandle(Arc::new(TargetCore {
-            id,
-            registry: Arc::downgrade(&self.0),
-        }))
+        }
+    }
+
+    pub fn target_count(&self) -> usize {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .targets
+            .len()
     }
 
     pub fn claim_standard_commands(&self) -> bool {
@@ -244,10 +281,31 @@ impl CommandRegistry {
         command: ResolvedCommand,
         target_id: InvocationTargetId,
     ) -> Result<CompletionSession, CompletionError> {
+        self.open_completion_with_defaults(
+            command,
+            target_id,
+            CompletionProviders::default(),
+            Arc::from(""),
+        )
+    }
+
+    pub fn open_completion_with_defaults(
+        &self,
+        command: ResolvedCommand,
+        target_id: InvocationTargetId,
+        defaults: CompletionProviders,
+        cwd: Arc<str>,
+    ) -> Result<CompletionSession, CompletionError> {
         if command.registry_id != self.0.id || target_id.0 != self.0.id {
             return Err(CompletionError::StaleCommand);
         }
-        let provider = command.completion().ok_or(CompletionError::Unavailable)?;
+        let argument_completions = command.argument_completions();
+        if argument_completions.iter().all(Option::is_none)
+            && command.spec().arguments.positional().is_none()
+            && defaults.is_empty()
+        {
+            return Err(CompletionError::Unavailable);
+        }
         let mut state = self
             .0
             .state
@@ -271,8 +329,10 @@ impl CommandRegistry {
             command.producer_id(),
             Arc::downgrade(&self.0),
             command,
-            provider,
+            argument_completions,
+            defaults,
             target_id,
+            cwd,
         );
         state.completion_sessions.insert(id, session.weak_core());
         Ok(session)
@@ -312,23 +372,11 @@ impl CommandRegistry {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let record = target_record(&state, self.0.id, target).ok_or(CommandError::StaleTarget)?;
-        let commands = state
-            .projection
-            .iter()
-            .filter(|command| {
-                record
-                    .capabilities
-                    .contains_all(command.spec().required_capabilities)
-                    && record
-                        .presentation_capabilities
-                        .contains_all(command.spec().required_capabilities)
-            })
-            .cloned()
-            .collect();
-        Ok(RegistrySnapshot {
-            generation: state.generation,
-            commands,
-        })
+        Ok(snapshot_for_capabilities(
+            &state,
+            record.capabilities,
+            record.presentation_capabilities,
+        ))
     }
 
     pub fn presented_commands(
@@ -364,6 +412,37 @@ impl CommandRegistry {
 impl Default for CommandRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl PreparedTarget {
+    pub fn handle(&self) -> &TargetHandle {
+        &self.handle
+    }
+
+    pub fn snapshot(&self) -> RegistrySnapshot {
+        let state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        snapshot_for_capabilities(
+            &state,
+            self.record.capabilities,
+            self.record.presentation_capabilities,
+        )
+    }
+
+    pub fn activate(self) -> TargetHandle {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = state.targets.insert(self.handle.id(), self.record);
+        debug_assert!(previous.is_none());
+        drop(state);
+        self.handle
     }
 }
 
@@ -430,6 +509,26 @@ fn target_capabilities(
     target: &TargetHandle,
 ) -> Option<TargetCapabilities> {
     target_record(state, registry_id, target).map(|record| record.capabilities)
+}
+
+fn snapshot_for_capabilities(
+    state: &RegistryState,
+    capabilities: TargetCapabilities,
+    presentation_capabilities: TargetCapabilities,
+) -> RegistrySnapshot {
+    let commands = state
+        .projection
+        .iter()
+        .filter(|command| {
+            capabilities.contains_all(command.spec().required_capabilities)
+                && presentation_capabilities.contains_all(command.spec().required_capabilities)
+        })
+        .cloned()
+        .collect();
+    RegistrySnapshot {
+        generation: state.generation,
+        commands,
+    }
 }
 
 impl Producer {
@@ -667,16 +766,39 @@ pub fn validate_registrations(
 ) -> Result<Vec<Registration>, RegistrationError> {
     let mut spellings = HashSet::new();
     for registration in &registrations {
-        if registration
-            .spec
-            .arguments
-            .max
-            .is_some_and(|max| registration.spec.arguments.min > max)
-        {
-            return Err(RegistrationError::InvalidArgumentArity {
-                min: registration.spec.arguments.min,
-                max: registration.spec.arguments.max.unwrap_or_default(),
-            });
+        if let CommandArguments::Positional(arguments) = &registration.spec.arguments {
+            validate_positional_arguments(arguments)?;
+            if registration.argument_completions.len() != arguments.len() {
+                return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                    "argument completion providers must match the positional schema",
+                )));
+            }
+            for (argument, provider) in arguments.iter().zip(&registration.argument_completions) {
+                if provider.is_some()
+                    && matches!(
+                        argument.completion,
+                        CompletionPolicy::Default | CompletionPolicy::Disabled
+                    )
+                {
+                    return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                        "argument providers require replace or extend completion policy",
+                    )));
+                }
+                if provider.is_none()
+                    && matches!(
+                        argument.completion,
+                        CompletionPolicy::Replace | CompletionPolicy::Extend
+                    )
+                {
+                    return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                        "replace or extend completion policy requires an argument provider",
+                    )));
+                }
+            }
+        } else if !registration.argument_completions.is_empty() {
+            return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                "raw commands cannot have argument completion providers",
+            )));
         }
         for (spelling, alias) in std::iter::once((&registration.spec.name, false))
             .chain(registration.spec.aliases.iter().map(|alias| (alias, true)))
@@ -694,6 +816,50 @@ pub fn validate_registrations(
         }
     }
     Ok(registrations)
+}
+
+fn validate_positional_arguments(
+    arguments: &[crate::arguments::PositionalArgument],
+) -> Result<(), RegistrationError> {
+    let mut names = HashSet::new();
+    let mut optional = false;
+    for (index, argument) in arguments.iter().enumerate() {
+        if argument.name.is_empty() || !names.insert(normalize(&argument.name)) {
+            return Err(RegistrationError::InvalidArgumentSchema(Arc::clone(
+                &argument.name,
+            )));
+        }
+        if argument.optional {
+            optional = true;
+        } else if optional {
+            return Err(RegistrationError::InvalidArgumentOrder(Arc::clone(
+                &argument.name,
+            )));
+        }
+        if argument.variadic && index + 1 != arguments.len() {
+            return Err(RegistrationError::VariadicArgumentMustBeLast(Arc::clone(
+                &argument.name,
+            )));
+        }
+        if let Some(choices) = argument.kind.enum_choices() {
+            if choices.is_empty() || choices.iter().any(|choice| choice.is_empty()) {
+                return Err(RegistrationError::InvalidEnum(Arc::clone(&argument.name)));
+            }
+            let mut choices_seen = HashSet::new();
+            if choices
+                .iter()
+                .any(|choice| !choices_seen.insert(choice.as_ref()))
+            {
+                return Err(RegistrationError::InvalidEnum(Arc::clone(&argument.name)));
+            }
+            if let Some(default) = argument.kind.default_value()
+                && !choices.iter().any(|choice| choice.as_ref() == default)
+            {
+                return Err(RegistrationError::InvalidEnum(Arc::clone(&argument.name)));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_spelling(spelling: &str) -> Result<(), ()> {

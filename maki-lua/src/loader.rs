@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
@@ -16,7 +16,7 @@ use crate::api::completion::{CompletionCtx, ItemSpec};
 use crate::api::fs::{FsBackend, RealFs};
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::util::command::{HintReader, StatusContentReader, UiAction};
+use crate::api::util::command::{CommandGenerationMap, HintReader, StatusContentReader, UiAction};
 use crate::api::util::picker::PickerEvent;
 use crate::coalesced_latest::CoalescedLatest;
 use crate::error::PluginError;
@@ -439,6 +439,52 @@ impl PluginHost {
         reply_rx.recv().map_err(|_| PluginError::HostDead)?
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn pause_worker_for_test(&self) -> flume::Sender<()> {
+        let (ready_tx, ready_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        self.inner
+            .prio_tx
+            .send(Request::TestPause {
+                ready: ready_tx,
+                release: release_rx,
+            })
+            .expect("Lua worker is alive");
+        ready_rx.recv().expect("Lua worker reached test pause");
+        release_tx
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn queue_load_source_for_test(
+        &self,
+        name: &str,
+        source: &str,
+    ) -> Result<flume::Receiver<Result<(), PluginError>>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .prio_tx
+            .send(Request::LoadSource {
+                name: Arc::from(name),
+                source: source.to_owned(),
+                plugin_dir: None,
+                permissions: PluginPermissions::trusted(),
+                opts: PluginOpts::default(),
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        Ok(reply_rx)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn wait_for_worker_barrier_for_test(&self) {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TestBarrier { reply: reply_tx })
+            .expect("Lua worker is alive");
+        reply_rx.recv().expect("Lua worker reached test barrier");
+    }
+
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
     /// keyed by plugin name. Used by docgen.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
@@ -544,6 +590,7 @@ impl PluginHost {
             modes: Arc::clone(&self.inner.modes),
             session_options: self.inner.session_options.clone(),
             completion: None,
+            command_generations: Some(Arc::clone(&self.inner.command_generations)),
             command_arguments: self.inner.command_arguments.clone(),
             command_argument_lifecycle: self.inner.command_argument_lifecycle.clone(),
             splash_frames: self.inner.splash_frames.clone(),
@@ -593,6 +640,7 @@ pub struct EventHandle {
     /// tests that build an `App` without a running plugin host. `None` in
     /// production, where the two RPC methods below talk to the Lua thread.
     completion: Option<Arc<TestCompletionBackend>>,
+    command_generations: Option<Arc<Mutex<CommandGenerationMap>>>,
     command_arguments: CoalescedLatest<CommandArgumentRequest>,
     command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
     splash_frames: CoalescedLatest<SplashFrameRequest>,
@@ -675,6 +723,7 @@ impl EventHandle {
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             session_options: SessionOptionCatalog::default(),
             completion: None,
+            command_generations: None,
             command_arguments: CoalescedLatest::new({
                 let tx = tx.clone();
                 move |work| tx.send(Request::CollectCommandArgumentItems(work)).is_ok()
@@ -700,6 +749,24 @@ impl EventHandle {
         self.session_options.clone()
     }
 
+    fn command_generation(&self, plugin: &Arc<str>, command: &Arc<str>) -> u64 {
+        self.command_generations
+            .as_ref()
+            .and_then(|generations| {
+                generations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&(Arc::clone(plugin), Arc::clone(command)))
+                    .copied()
+            })
+            .unwrap_or_default()
+    }
+
+    #[doc(hidden)]
+    pub fn command_generation_for_test(&self, plugin: &str, command: &str) -> u64 {
+        self.command_generation(&Arc::from(plugin), &Arc::from(command))
+    }
+
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
         Self::from_tx(flume::unbounded().0)
@@ -716,6 +783,7 @@ impl EventHandle {
             modes,
             session_options: SessionOptionCatalog::default(),
             completion: None,
+            command_generations: None,
             command_arguments: CoalescedLatest::new(|_| false),
             command_argument_lifecycle: CoalescedLatest::new(|_| false),
             splash_frames: CoalescedLatest::new(|_| false),
@@ -733,6 +801,7 @@ impl EventHandle {
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             session_options: SessionOptionCatalog::default(),
             completion: Some(backend),
+            command_generations: None,
             command_arguments: CoalescedLatest::new(|_| false),
             command_argument_lifecycle: CoalescedLatest::new(|_| false),
             splash_frames: CoalescedLatest::new(|_| false),
@@ -761,6 +830,7 @@ impl EventHandle {
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             session_options: SessionOptionCatalog::default(),
             completion: None,
+            command_generations: None,
             command_arguments: CoalescedLatest::new({
                 let shared = shared.clone();
                 move |work| {
@@ -783,9 +853,11 @@ impl EventHandle {
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
+        let generation = self.command_generation(&plugin, &command);
         let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
             command,
+            generation,
             args,
             depth,
             completion: None,
@@ -799,11 +871,13 @@ impl EventHandle {
         command: Arc<str>,
         args: String,
         depth: u8,
-    ) -> flume::Receiver<()> {
+    ) -> flume::Receiver<Result<(), String>> {
         let (completion, rx) = flume::bounded(1);
+        let generation = self.command_generation(&plugin, &command);
         let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
             command,
+            generation,
             args,
             depth,
             completion: Some(completion),
@@ -832,6 +906,7 @@ impl EventHandle {
         self.command_arguments
             .submit(CommandArgumentRequest {
                 context,
+                callbacks: None,
                 cancel,
                 reply,
             })
@@ -848,6 +923,7 @@ impl EventHandle {
         self.command_argument_lifecycle
             .submit(CommandArgumentLifecycleRequest {
                 context,
+                callbacks: None,
                 event,
                 item,
                 cancel,
@@ -1394,6 +1470,7 @@ mod tests {
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             session_options: SessionOptionCatalog::default(),
             completion: None,
+            command_generations: None,
             command_arguments: CoalescedLatest::new(|_| false),
             command_argument_lifecycle: CoalescedLatest::new(|_| false),
             splash_frames: CoalescedLatest::new(move |work| {
@@ -1411,11 +1488,13 @@ mod tests {
             Request::RunCommand {
                 plugin,
                 command,
+                generation,
                 args,
                 depth,
                 completion,
             } => {
                 assert_eq!(plugin.as_ref(), "myplugin");
+                assert_eq!(generation, 0);
                 assert_eq!(command.as_ref(), "/greet");
                 assert_eq!(args, "world");
                 assert_eq!(depth, 2);
@@ -1440,6 +1519,10 @@ mod tests {
                     mode: "build".to_string(),
                     session: 1,
                     generation: 1,
+                    command_generation: 0,
+                    argument_name: None,
+                    argument_kind: None,
+                    preceding_arguments: Arc::from([]),
                 },
                 maki_agent::CancelToken::none(),
             )

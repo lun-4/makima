@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
-use maki_commands::ArgumentArity;
+use maki_commands::{CommandArguments, PositionalArgument};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
@@ -130,34 +130,56 @@ impl HintWriter {
     }
 }
 
+pub(crate) struct ArgumentCompletion {
+    pub completion: RegistryKey,
+    pub on_highlight: Option<RegistryKey>,
+    pub on_accept: Option<RegistryKey>,
+    pub on_cancel: Option<RegistryKey>,
+    pub navigation: Option<ArgumentCompletionNavigation>,
+}
+
+pub(crate) struct CommandCompletionCallbacks {
+    pub completion: RegistryKey,
+    pub argument_schema: Option<Arc<[PositionalArgument]>>,
+    pub on_highlight: Option<RegistryKey>,
+    pub on_accept: Option<RegistryKey>,
+    pub on_cancel: Option<RegistryKey>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ArgumentCompletionNavigation {
+    Directory,
+}
+
 pub(crate) struct CommandEntry {
+    pub generation: u64,
     pub handler: RegistryKey,
     pub description: Arc<str>,
     pub argument_hint: Option<Arc<str>>,
-    pub arguments: ArgumentArity,
+    pub arguments: CommandArguments,
     pub tui_only: bool,
-    pub argument_completion: Option<RegistryKey>,
-    pub completion_on_highlight: Option<RegistryKey>,
-    pub completion_on_accept: Option<RegistryKey>,
-    pub completion_on_cancel: Option<RegistryKey>,
+    pub argument_completions: Vec<Option<ArgumentCompletion>>,
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
 pub(crate) type PendingCommandMap = Arc<Mutex<HashMap<Arc<str>, CommandEntry>>>;
 pub(crate) type RetiredCommandHandlerMap = Vec<(Arc<str>, HashMap<Arc<str>, CommandEntry>)>;
+pub(crate) type CommandGenerationMap = HashMap<(Arc<str>, Arc<str>), u64>;
 
 pub(crate) fn remove_command_entry(lua: &Lua, entry: CommandEntry) {
     let _ = lua.remove_registry_value(entry.handler);
-    for key in [
-        entry.argument_completion,
-        entry.completion_on_highlight,
-        entry.completion_on_accept,
-        entry.completion_on_cancel,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let _ = lua.remove_registry_value(key);
+    for completion in entry.argument_completions.into_iter().flatten() {
+        for key in [
+            Some(completion.completion),
+            completion.on_highlight,
+            completion.on_accept,
+            completion.on_cancel,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = lua.remove_registry_value(key);
+        }
     }
 }
 

@@ -53,9 +53,9 @@ pub struct Chat {
     pub cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
-    /// For subagent chats, the `parent_tool_use_id` that owns this tab, so
-    /// submits in this tab can be routed to that subagent's driver.
+    /// Compatibility identity retained for display and persistence.
     pub subagent_id: Option<String>,
+    pub agent_id: Option<maki_agent::AgentId>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     finished: bool,
@@ -75,6 +75,7 @@ impl Chat {
             context_size: 0,
             model_id: None,
             subagent_id: None,
+            agent_id: None,
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle, theme_provider),
             finished: false,
@@ -104,6 +105,7 @@ impl Chat {
                 self.messages_panel.clear_prompt_progress();
                 self.messages_panel.thinking_delta(&text);
             }
+            AgentEvent::ThinkingBlockEnd => self.messages_panel.end_thinking_block(),
             AgentEvent::TextDelta { text } => {
                 self.messages_panel.clear_prompt_progress();
                 self.messages_panel.text_delta(&text);
@@ -199,7 +201,7 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::SubagentHistory { .. } => {}
+            AgentEvent::SubagentHistory { .. } | AgentEvent::SubagentClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
@@ -276,6 +278,7 @@ impl Chat {
         self.messages_panel.splash_frame()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_splash_frame(&mut self, frame: Option<maki_lua::SplashFrame>) {
         self.messages_panel.set_splash_frame(frame);
     }
@@ -1054,6 +1057,35 @@ mod tests {
         assert_eq!(display[1].role, DisplayRole::Assistant);
     }
 
+    #[test]
+    fn history_to_display_splits_consecutive_thinking_blocks() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "first".into(),
+                    signature: None,
+                },
+                ContentBlock::Thinking {
+                    thinking: "second".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            ..Default::default()
+        }];
+        let display = history_to_display(&msgs, &HashMap::new(), &ToolOutputLines::default()).0;
+        assert_eq!(display.len(), 3);
+        assert_eq!(display[0].role, DisplayRole::Thinking);
+        assert_eq!(display[0].text, "first");
+        assert_eq!(display[1].role, DisplayRole::Thinking);
+        assert_eq!(display[1].text, "second");
+        assert_eq!(display[2].role, DisplayRole::Assistant);
+        assert_eq!(display[2].text, "answer");
+    }
+
     const RESTORE_OUTPUT: &str = "rendered output";
 
     fn tool_msg_with_input(tool: &str) -> DisplayMessage {
@@ -1158,5 +1190,33 @@ mod tests {
         chat.flush();
         assert_eq!(chat.message_count(), 4);
         assert_eq!(chat.last_message_text(), "new");
+    }
+
+    #[test]
+    fn chat_thinking_block_end_flushes_panel() {
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+            Arc::new(InMemoryThemesProvider::bundled()),
+        );
+
+        chat.handle_event(
+            AgentEvent::ThinkingDelta {
+                text: "first".into(),
+            },
+            None,
+        );
+        chat.handle_event(AgentEvent::ThinkingBlockEnd, None);
+        chat.handle_event(
+            AgentEvent::ThinkingDelta {
+                text: "second".into(),
+            },
+            None,
+        );
+        chat.flush();
+
+        assert_eq!(chat.message_count(), 2);
+        assert_eq!(chat.last_message_text(), "second");
     }
 }

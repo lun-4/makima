@@ -438,6 +438,14 @@ impl StreamSynth {
         self.current_block.take().map(|_| self.block_stop())
     }
 
+    fn thinking_block_end(&mut self) -> Vec<Value> {
+        if self.current_block == Some(BlockKind::Thinking) {
+            self.close_block().into_iter().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn block_stop(&self) -> Value {
         serde_json::json!({
             "type": "content_block_stop",
@@ -1561,6 +1569,12 @@ impl EventPump {
                     self.emit_stream(events)?;
                 }
             }
+            AgentEvent::ThinkingBlockEnd => {
+                if self.include_partial_messages {
+                    let events = self.synth.thinking_block_end();
+                    self.emit_stream(events)?;
+                }
+            }
             AgentEvent::ToolStart(ts) => {
                 let name = ts.tool.to_string();
                 let input = ts.raw_input.clone().unwrap_or(Value::Null);
@@ -1587,6 +1601,7 @@ impl EventPump {
             | AgentEvent::CompactionDone
             | AgentEvent::AuthRequired
             | AgentEvent::SubagentHistory { .. }
+            | AgentEvent::SubagentClosed
             | AgentEvent::Question { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
@@ -1810,7 +1825,7 @@ mod tests {
             spec: maki_commands::CommandSpec {
                 name: Arc::from(name),
                 aliases: Arc::from([]),
-                arguments: maki_commands::ArgumentArity::ANY,
+                arguments: maki_commands::CommandArguments::Raw { required: false },
                 docs: maki_commands::CommandDocs {
                     summary: Arc::from(format!("{name} description")),
                     argument_hint: Some(Arc::from("<arg>")),
@@ -1818,7 +1833,7 @@ mod tests {
                 required_capabilities: TargetCapabilities::default(),
             },
             behavior: Arc::new(OutcomeBehavior(outcome)),
-            completion: None,
+            argument_completions: Vec::new(),
         }
     }
 
@@ -1921,10 +1936,9 @@ mod tests {
         assert_eq!(turn.content.text.as_ref(), "explain this");
         assert!(matches!(
             commands.dispatch_input("/btw", &[]),
-            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::InvalidArguments {
+            InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::TypedArguments {
                 command,
-                expected: maki_commands::ArgumentArity::ONE_OR_MORE,
-                actual: 0,
+                error: maki_commands::ArgumentParseError::MissingRaw,
             })) if command.as_ref() == "/btw"
         ));
         let projection = commands.projection();
@@ -2215,6 +2229,24 @@ mod tests {
         assert_eq!(events[0]["index"], 0);
         assert_eq!(events[1]["index"], 1);
         assert_eq!(events[1]["content_block"]["type"], "thinking");
+    }
+
+    #[test]
+    fn thinking_block_end_closes_thinking_block() {
+        let mut synth = StreamSynth::new();
+        synth.thinking_delta(MODEL, "a");
+
+        let events = synth.thinking_block_end();
+        assert_eq!(types(&events), ["content_block_stop"]);
+        assert_eq!(events[0]["index"], 0);
+
+        let events = synth.thinking_delta(MODEL, "b");
+        assert_eq!(
+            types(&events),
+            ["content_block_start", "content_block_delta"]
+        );
+        assert_eq!(events[0]["index"], 1);
+        assert_eq!(events[0]["content_block"]["type"], "thinking");
     }
 
     #[test]

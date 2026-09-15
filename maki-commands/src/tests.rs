@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::*;
-use crate::completion::CompletionInvalidation;
+use crate::completion::{CompletionInvalidation, CompletionPublisher, CompletionSource};
 use test_case::test_case;
 
 const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -35,6 +35,35 @@ impl CommandBehavior for CountingBehavior {
 
 struct Host;
 
+#[test]
+fn prepared_target_is_stale_until_activation() {
+    let registry = CommandRegistry::new();
+    let prepared = registry.prepare_target(TargetCapabilities::NONE, Arc::new(Host));
+    let id = prepared.handle().id();
+
+    assert!(matches!(
+        registry.snapshot_for(prepared.handle()),
+        Err(CommandError::StaleTarget)
+    ));
+
+    let target = prepared.activate();
+    assert_eq!(target.id(), id);
+    assert!(registry.snapshot_for(&target).is_ok());
+}
+
+#[test]
+fn dropped_prepared_target_is_never_published() {
+    let registry = CommandRegistry::new();
+    let prepared = registry.prepare_target(TargetCapabilities::NONE, Arc::new(Host));
+    let handle = prepared.handle().clone();
+    drop(prepared);
+
+    assert!(matches!(
+        registry.snapshot_for(&handle),
+        Err(CommandError::StaleTarget)
+    ));
+}
+
 #[derive(Default)]
 struct CompletionProbe {
     completions: AtomicU64,
@@ -46,6 +75,71 @@ struct BlockingCompletion {
     entered: mpsc::SyncSender<()>,
     release: Mutex<mpsc::Receiver<()>>,
     events: Mutex<Vec<CompletionLifecycleEvent>>,
+}
+
+struct SnapshotProvider {
+    started: mpsc::SyncSender<CompletionPublisher>,
+    release: Arc<Mutex<mpsc::Receiver<()>>>,
+    events: Arc<Mutex<Vec<CompletionLifecycleEvent>>>,
+    navigation: Arc<Mutex<CompletionItemNavigation>>,
+    preview: Mutex<Option<CompletionItem>>,
+}
+
+struct ReleaseSender(Option<mpsc::SyncSender<()>>);
+
+impl ReleaseSender {
+    fn send(&mut self) {
+        self.0.take().unwrap().send(()).unwrap();
+    }
+}
+
+struct ContextProbe {
+    context: Mutex<Option<CompletionContext>>,
+}
+
+struct UnavailableCompletion;
+
+impl CommandCompletion for UnavailableCompletion {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        Box::pin(async { Err(CompletionError::Unavailable) })
+    }
+}
+
+struct StaticCompletion(&'static str);
+
+impl CommandCompletion for StaticCompletion {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        let item = completion_item(self.0);
+        Box::pin(async move { Ok(vec![item]) })
+    }
+}
+
+type VariadicCompletionCall = (Arc<str>, Arc<[ParsedArgument]>);
+
+struct VariadicCompletionProbe {
+    calls: Arc<Mutex<Vec<VariadicCompletionCall>>>,
+}
+
+impl CommandCompletion for VariadicCompletionProbe {
+    fn complete(
+        &self,
+        context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((Arc::clone(&context.argument), context.preceding_arguments));
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 struct FirstRequestBlockingCompletion {
@@ -112,6 +206,74 @@ impl CommandCompletion for CompletionProbe {
             .unwrap_or_else(|error| error.into_inner())
             .push(event.clone());
         Ok(())
+    }
+}
+
+impl CommandCompletion for SnapshotProvider {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn complete_incremental(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+        publisher: CompletionPublisher,
+    ) -> CommandFuture<Result<(), CompletionError>> {
+        let started = self.started.clone();
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            started.send(publisher).unwrap();
+            release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv()
+                .unwrap();
+            Ok(())
+        })
+    }
+
+    fn navigation(
+        &self,
+        _context: &CompletionContext,
+        _item: &CompletionItem,
+    ) -> CompletionItemNavigation {
+        *self
+            .navigation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn lifecycle(
+        &self,
+        _context: &CompletionContext,
+        event: &CompletionLifecycleEvent,
+        _cancellation: &CancellationToken,
+    ) -> Result<(), CompletionError> {
+        *self.preview.lock().unwrap() = match event {
+            CompletionLifecycleEvent::Highlight(item) => Some(item.clone()),
+            _ => None,
+        };
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(event.clone());
+        Ok(())
+    }
+}
+
+impl CommandCompletion for ContextProbe {
+    fn complete(
+        &self,
+        context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        *self.context.lock().unwrap() = Some(context);
+        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -199,7 +361,7 @@ fn registration_with(
         spec: CommandSpec {
             name: Arc::from(name),
             aliases: aliases.iter().copied().map(Arc::from).collect(),
-            arguments: ArgumentArity::ANY,
+            arguments: CommandArguments::Raw { required: false },
             docs: CommandDocs {
                 summary: Arc::from("test command"),
                 argument_hint: None,
@@ -207,14 +369,47 @@ fn registration_with(
             required_capabilities: capabilities,
         },
         behavior,
-        completion: None,
+        argument_completions: Vec::new(),
     }
 }
 
 fn completion_registration(completion: Arc<dyn CommandCompletion>) -> Registration {
+    positional_registration_with_completion(
+        "/complete",
+        Arc::from([PositionalArgument::required("value", ArgumentKind::String)
+            .with_completion(CompletionPolicy::Replace)]),
+        Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+        Some(completion),
+    )
+}
+
+fn positional_registration(
+    name: &str,
+    arguments: Arc<[PositionalArgument]>,
+    behavior: Arc<dyn CommandBehavior>,
+) -> Registration {
+    positional_registration_with_completion(name, arguments, behavior, None)
+}
+
+fn positional_registration_with_completion(
+    name: &str,
+    arguments: Arc<[PositionalArgument]>,
+    behavior: Arc<dyn CommandBehavior>,
+    completion: Option<Arc<dyn CommandCompletion>>,
+) -> Registration {
     Registration {
-        completion: Some(completion),
-        ..registration("/complete", TargetCapabilities::NONE)
+        spec: CommandSpec {
+            name: Arc::from(name),
+            aliases: Arc::from([]),
+            arguments: CommandArguments::Positional(Arc::clone(&arguments)),
+            docs: CommandDocs {
+                summary: Arc::from("test command"),
+                argument_hint: None,
+            },
+            required_capabilities: TargetCapabilities::NONE,
+        },
+        behavior,
+        argument_completions: vec![completion; arguments.len()],
     }
 }
 
@@ -243,6 +438,261 @@ fn complete_once(session: &CompletionSession) -> CompletionCandidate {
     items.pop().unwrap()
 }
 
+fn completion_item(value: &str) -> CompletionItem {
+    CompletionItem {
+        label: Arc::from(value),
+        insertion: Arc::from(value),
+        description: None,
+    }
+}
+
+type SnapshotFixture = (
+    Arc<SnapshotProvider>,
+    mpsc::Receiver<CompletionPublisher>,
+    ReleaseSender,
+    Arc<Mutex<Vec<CompletionLifecycleEvent>>>,
+);
+
+fn gated_snapshot_provider(navigation: CompletionItemNavigation) -> SnapshotFixture {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(Mutex::new(release_rx));
+    (
+        Arc::new(SnapshotProvider {
+            started: started_tx,
+            release,
+            events: Arc::clone(&events),
+            navigation: Arc::new(Mutex::new(navigation)),
+            preview: Mutex::new(None),
+        }),
+        started_rx,
+        ReleaseSender(Some(release_tx)),
+        events,
+    )
+}
+
+fn snapshot_session(
+    provider: Arc<dyn CommandCompletion>,
+    policy: CompletionPolicy,
+    defaults: CompletionProviders,
+) -> (CommandRegistry, CompletionSession) {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    let mut argument = PositionalArgument::required("value", ArgumentKind::String);
+    argument.completion = policy;
+    producer
+        .replace(vec![
+            positional_registration(
+                "/snapshot",
+                Arc::from([argument]),
+                Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+            )
+            .with_argument_completion("value", provider),
+        ])
+        .unwrap();
+    let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+    let command = registry.resolve_for(&target, "/snapshot").unwrap();
+    let session = registry
+        .open_completion_with_defaults(command, target.id(), defaults, Arc::from(""))
+        .unwrap();
+    (registry, session)
+}
+
+fn start_snapshot(session: &CompletionSession) -> thread::JoinHandle<CompletionResult> {
+    let session = session.clone();
+    thread::spawn(move || {
+        futures_lite::future::block_on(session.complete_input_with_sink(
+            CompletionInput {
+                arguments: Arc::from(""),
+                argument: Arc::from(""),
+                argument_index: 0,
+                argument_range: Some(0..0),
+                mode: Arc::from("insert"),
+            },
+            None,
+        ))
+    })
+}
+
+#[test]
+fn completion_snapshot_preserves_composed_candidates_for_consumer_filtering() {
+    let (provider, started, mut release, _events) =
+        gated_snapshot_provider(CompletionItemNavigation::Terminal);
+    let (_registry, session) = snapshot_session(
+        provider,
+        CompletionPolicy::Replace,
+        CompletionProviders::default(),
+    );
+    let worker = start_snapshot(&session);
+    let publisher = started.recv().unwrap();
+    let item_count = MAX_COMPLETION_CANDIDATES + 100;
+    let items = (0..item_count)
+        .map(|index| completion_item(&format!("item-{index}")))
+        .collect();
+
+    let snapshot = publisher.publish(items).unwrap();
+
+    assert_eq!(snapshot.candidates.len(), item_count);
+    publisher.finish().unwrap();
+    release.send();
+    assert!(
+        matches!(worker.join().unwrap(), CompletionResult::Items(items) if items.len() == item_count)
+    );
+}
+
+#[test]
+fn completion_snapshot_replacement_rejects_removed_value_before_validate_highlight_and_accept() {
+    let (provider, started, mut release, events) =
+        gated_snapshot_provider(CompletionItemNavigation::Terminal);
+    let (_registry, session) = snapshot_session(
+        provider,
+        CompletionPolicy::Replace,
+        CompletionProviders::default(),
+    );
+    let worker = start_snapshot(&session);
+    let publisher = started.recv().unwrap();
+    let first = publisher.publish(vec![completion_item("old")]).unwrap();
+    let old = first.candidates[0].clone();
+    let second = publisher.publish(Vec::new()).unwrap();
+    assert!(second.candidates.is_empty());
+    assert_eq!(session.validate(&old), Err(CompletionError::StaleRequest));
+    assert_eq!(session.highlight(&old), Err(CompletionError::StaleRequest));
+    assert_eq!(session.accept(old), Err(CompletionError::StaleRequest));
+    publisher.finish().unwrap();
+    release.send();
+    assert!(matches!(worker.join().unwrap(), CompletionResult::Items(items) if items.is_empty()));
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn completion_snapshot_replacement_rejects_changed_navigation_before_highlight_and_accept() {
+    let (provider, started, mut release, events) =
+        gated_snapshot_provider(CompletionItemNavigation::Terminal);
+    let navigation = Arc::clone(&provider.navigation);
+    let (_registry, session) = snapshot_session(
+        provider,
+        CompletionPolicy::Replace,
+        CompletionProviders::default(),
+    );
+    let worker = start_snapshot(&session);
+    let publisher = started.recv().unwrap();
+    let first = publisher.publish(vec![completion_item("path")]).unwrap();
+    let old = first.candidates[0].clone();
+    *navigation.lock().unwrap() = CompletionItemNavigation::Directory;
+    let second = publisher.publish(vec![completion_item("path")]).unwrap();
+    let fresh = second.candidates[0].clone();
+    assert_eq!(fresh.navigation(), CompletionItemNavigation::Directory);
+    assert_eq!(session.validate(&old), Err(CompletionError::StaleRequest));
+    assert_eq!(session.highlight(&old), Err(CompletionError::StaleRequest));
+    assert_eq!(session.accept(old), Err(CompletionError::StaleRequest));
+    session.validate(&fresh).unwrap();
+    session.highlight(&fresh).unwrap();
+    publisher.finish().unwrap();
+    release.send();
+    assert!(
+        matches!(worker.join().unwrap(), CompletionResult::Items(items) if items[0].navigation() == CompletionItemNavigation::Directory)
+    );
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [CompletionLifecycleEvent::Highlight(completion_item("path"))]
+    );
+}
+
+#[test]
+fn completion_snapshot_replacement_rejects_old_custom_duplicate_provenance() {
+    let (custom, custom_started, mut custom_release, custom_events) =
+        gated_snapshot_provider(CompletionItemNavigation::Terminal);
+    let (default, default_started, mut default_release, _default_events) =
+        gated_snapshot_provider(CompletionItemNavigation::Directory);
+    let defaults = CompletionProviders::default().with(CompletionKind::String, default);
+    let (_registry, session) = snapshot_session(custom, CompletionPolicy::Extend, defaults);
+    let worker = start_snapshot(&session);
+    let default_publisher = default_started.recv().unwrap();
+    let default_snapshot = default_publisher
+        .publish(vec![completion_item("same")])
+        .unwrap();
+    let old = default_snapshot.candidates[0].clone();
+    assert_eq!(old.source(), &CompletionSource::KindDefault);
+    default_publisher.finish().unwrap();
+    default_release.send();
+    let custom_publisher = custom_started.recv().unwrap();
+    let second = custom_publisher
+        .publish(vec![completion_item("same")])
+        .unwrap();
+    let fresh = second.candidates[0].clone();
+    assert!(matches!(fresh.source(), CompletionSource::Argument(_)));
+    assert_eq!(session.validate(&old), Err(CompletionError::StaleRequest));
+    assert_eq!(session.highlight(&old), Err(CompletionError::StaleRequest));
+    assert_eq!(session.accept(old), Err(CompletionError::StaleRequest));
+    session.validate(&fresh).unwrap();
+    session.highlight(&fresh).unwrap();
+    custom_publisher.finish().unwrap();
+    custom_release.send();
+    assert!(
+        matches!(worker.join().unwrap(), CompletionResult::Items(items) if items[0].source() == fresh.source())
+    );
+    assert_eq!(
+        custom_events.lock().unwrap().as_slice(),
+        [CompletionLifecycleEvent::Highlight(completion_item("same"))]
+    );
+}
+
+#[test]
+fn finished_custom_provider_is_cancelled_when_default_candidate_wins() {
+    let (custom, custom_started, mut custom_release, custom_events) =
+        gated_snapshot_provider(CompletionItemNavigation::Terminal);
+    let custom_preview = Arc::clone(&custom);
+    let (default, default_started, mut default_release, default_events) =
+        gated_snapshot_provider(CompletionItemNavigation::Terminal);
+    let defaults = CompletionProviders::default().with(CompletionKind::String, default);
+    let (_registry, session) = snapshot_session(custom, CompletionPolicy::Extend, defaults);
+    let worker = start_snapshot(&session);
+    let default_publisher = default_started.recv().unwrap();
+    default_publisher
+        .publish(vec![completion_item("default")])
+        .unwrap();
+    default_publisher.finish().unwrap();
+    default_release.send();
+    let custom_publisher = custom_started.recv().unwrap();
+    custom_publisher
+        .publish(vec![completion_item("custom")])
+        .unwrap();
+    custom_publisher.finish().unwrap();
+    custom_release.send();
+    let CompletionResult::Items(candidates) = worker.join().unwrap() else {
+        panic!("finished providers must retain their candidates");
+    };
+    let custom_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.item().insertion.as_ref() == "custom")
+        .unwrap();
+    let default_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.item().insertion.as_ref() == "default")
+        .unwrap();
+    assert_eq!(default_candidate.source(), &CompletionSource::KindDefault);
+    session.highlight(custom_candidate).unwrap();
+    assert_eq!(
+        *custom_preview.preview.lock().unwrap(),
+        Some(completion_item("custom"))
+    );
+    session.accept(default_candidate.clone()).unwrap();
+    session.cancel().unwrap();
+    assert!(custom_preview.preview.lock().unwrap().is_none());
+    assert_eq!(
+        custom_events.lock().unwrap().as_slice(),
+        [
+            CompletionLifecycleEvent::Highlight(completion_item("custom")),
+            CompletionLifecycleEvent::Cancel,
+        ]
+    );
+    assert_eq!(
+        default_events.lock().unwrap().as_slice(),
+        [CompletionLifecycleEvent::Accept(completion_item("default"))]
+    );
+}
+
 #[test]
 fn resolve_input_uses_shared_parser_and_preserves_arguments() {
     let registry = CommandRegistry::new();
@@ -262,6 +712,336 @@ fn resolve_input_uses_shared_parser_and_preserves_arguments() {
         registry.resolve_input_for(&target, "literal input"),
         Err(ResolutionError::UnknownCommand(name)) if name.as_ref() == "literal input"
     ));
+}
+
+#[test]
+fn typed_dispatch_parses_quoted_arguments_before_behavior() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    let executions = Arc::new(AtomicU64::new(0));
+    producer
+        .replace(vec![positional_registration(
+            "/typed",
+            Arc::from([
+                PositionalArgument::required("message", ArgumentKind::String),
+                PositionalArgument::required("count", ArgumentKind::Integer),
+            ]),
+            Arc::new(CountingBehavior(Arc::clone(&executions))),
+        )])
+        .unwrap();
+    let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+
+    assert!(matches!(
+        futures_lite::future::block_on(
+            registry.dispatch_input(&target, "/typed \"hello world\" 3".into(),)
+        ),
+        InputDispatch::Dispatched(CommandOutcome::Completed)
+    ));
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+}
+
+#[test_case(CompletionPolicy::Replace, CompletionProviders::default(), &[]; "replace_unavailable_is_empty")]
+#[test_case(
+    CompletionPolicy::Extend,
+    CompletionProviders::default().with(CompletionKind::String, Arc::new(StaticCompletion("default"))),
+    &["default"]
+    ; "extend_unavailable_retains_defaults"
+)]
+fn unavailable_provider_follows_completion_policy(
+    policy: CompletionPolicy,
+    defaults: CompletionProviders,
+    expected: &[&str],
+) {
+    let (_registry, session) = snapshot_session(Arc::new(UnavailableCompletion), policy, defaults);
+    let CompletionResult::Items(items) = futures_lite::future::block_on(session.complete(
+        Arc::from(""),
+        Arc::from(""),
+        0,
+        Arc::from("insert"),
+    )) else {
+        panic!("unavailable provider should complete with policy-composed items");
+    };
+    assert_eq!(
+        items
+            .iter()
+            .map(|candidate| candidate.item().insertion.as_ref())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn completion_policy_composes_default_and_provider_items() {
+    assert_eq!(
+        CompletionPolicy::Disabled.compose(vec![1, 2], vec![3]),
+        Vec::<i32>::new()
+    );
+    assert_eq!(
+        CompletionPolicy::Replace.compose(vec![1, 2], vec![3]),
+        vec![3]
+    );
+    assert_eq!(
+        CompletionPolicy::Extend.compose(vec![1, 2], vec![3]),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        CompletionPolicy::Default.compose(vec![1], Vec::<i32>::new()),
+        vec![1]
+    );
+}
+
+#[test]
+fn variadic_replace_provider_registers_and_repeats_for_each_slot() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(VariadicCompletionProbe {
+        calls: Arc::clone(&calls),
+    });
+    let mut paths = PositionalArgument::required("paths", ArgumentKind::Directory);
+    paths.variadic = true;
+    paths.completion = CompletionPolicy::Replace;
+    producer
+        .replace(vec![
+            positional_registration(
+                "/paths",
+                Arc::from([paths]),
+                Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+            )
+            .with_argument_completion("paths", provider),
+        ])
+        .unwrap();
+    let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+    let command = registry.resolve_for(&target, "/paths").unwrap();
+    let session = registry.open_completion(command, target.id()).unwrap();
+
+    for (argument, range) in [("one", 0..3), ("two", 4..7), ("one", 0..3)] {
+        let _ = futures_lite::future::block_on(session.complete_input(CompletionInput {
+            arguments: Arc::from("one two three "),
+            argument: Arc::from(argument),
+            argument_index: 0,
+            argument_range: Some(range),
+            mode: Arc::from("insert"),
+        }));
+    }
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(argument, _)| argument.as_ref())
+            .collect::<Vec<_>>(),
+        ["one", "two", "one"]
+    );
+    assert!(calls[0].1.is_empty());
+    assert_eq!(
+        calls[1]
+            .1
+            .iter()
+            .flat_map(|argument| argument.values.iter())
+            .map(|value| match value {
+                ArgumentValue::Directory(path) => path.to_string_lossy(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        ["one"]
+    );
+    assert!(calls[2].1.is_empty());
+}
+
+#[test]
+fn completion_context_exposes_argument_semantics_and_legacy_input_stays_usable() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    let probe = Arc::new(ContextProbe {
+        context: Mutex::new(None),
+    });
+    producer
+        .replace(vec![
+            positional_registration(
+                "/typed",
+                Arc::from([
+                    PositionalArgument::required(
+                        "mode",
+                        ArgumentKind::enum_with_default(
+                            Arc::from([Arc::from("fast"), Arc::from("safe")]),
+                            "safe",
+                        ),
+                    ),
+                    PositionalArgument::optional("path", ArgumentKind::Directory)
+                        .with_completion(CompletionPolicy::Replace),
+                ]),
+                Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+            )
+            .with_argument_completion("path", probe.clone()),
+        ])
+        .unwrap();
+    let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+    let command = registry.resolve_for(&target, "/typed").unwrap();
+    let session = registry.open_completion(command, target.id()).unwrap();
+
+    let _ = futures_lite::future::block_on(session.complete_input(CompletionInput {
+        arguments: Arc::from("fast"),
+        argument: Arc::from(""),
+        argument_index: 1,
+        argument_range: Some(0..0),
+        mode: Arc::from("insert"),
+    }));
+    let context = probe.context.lock().unwrap().clone();
+    assert_eq!(
+        context
+            .as_ref()
+            .and_then(|value| value.argument_name.as_deref()),
+        Some("path")
+    );
+    assert_eq!(
+        context.as_ref().map(|value| value.completion_policy),
+        Some(CompletionPolicy::Replace)
+    );
+    assert_eq!(
+        context.as_ref().and_then(|value| value.next_argument_index),
+        None
+    );
+    assert_eq!(
+        context.as_ref().map(|value| value.navigation),
+        Some(CompletionNavigation::Close)
+    );
+}
+
+#[test]
+fn invalid_typed_input_prevents_behavior_execution() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    let executions = Arc::new(AtomicU64::new(0));
+    producer
+        .replace(vec![positional_registration(
+            "/typed",
+            Arc::from([PositionalArgument::required(
+                "mode",
+                ArgumentKind::Enum(Arc::from([Arc::from("fast"), Arc::from("safe")])),
+            )]),
+            Arc::new(CountingBehavior(Arc::clone(&executions))),
+        )])
+        .unwrap();
+    let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+
+    let outcome =
+        futures_lite::future::block_on(registry.dispatch_input(&target, "/typed slow".into()));
+
+    assert!(matches!(
+        outcome,
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::TypedArguments { .. }))
+    ));
+    assert_eq!(executions.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn builtin_argument_descriptors_carry_completion_metadata() {
+    let model = BUILTIN_COMMANDS
+        .iter()
+        .find(|command| command.id == BuiltinId::Model)
+        .unwrap()
+        .spec();
+    let theme = BUILTIN_COMMANDS
+        .iter()
+        .find(|command| command.id == BuiltinId::Theme)
+        .unwrap()
+        .spec();
+    assert!(matches!(model.arguments, CommandArguments::Positional(_)));
+    assert_eq!(
+        model
+            .arguments
+            .positional()
+            .unwrap()
+            .first()
+            .unwrap()
+            .completion,
+        CompletionPolicy::Replace
+    );
+    assert_eq!(
+        theme
+            .arguments
+            .positional()
+            .unwrap()
+            .first()
+            .unwrap()
+            .completion,
+        CompletionPolicy::Replace
+    );
+
+    let btw = BUILTIN_COMMANDS
+        .iter()
+        .find(|command| command.id == BuiltinId::Btw)
+        .unwrap()
+        .spec();
+    assert_eq!(btw.arguments, CommandArguments::Raw { required: true });
+}
+
+#[test]
+fn typed_usage_hint_fallback_preserves_explicit_hints() {
+    let typed = CommandSpec {
+        name: Arc::from("/typed"),
+        aliases: Arc::from([]),
+        arguments: CommandArguments::Positional(Arc::from([
+            PositionalArgument::required("source", ArgumentKind::File),
+            PositionalArgument::optional("paths", ArgumentKind::Directory),
+        ])),
+        docs: CommandDocs {
+            summary: Arc::from("typed"),
+            argument_hint: None,
+        },
+        required_capabilities: TargetCapabilities::NONE,
+    };
+    assert_eq!(typed.argument_hint().as_deref(), Some("<source> [paths]"));
+
+    let explicit = CommandSpec {
+        docs: CommandDocs {
+            argument_hint: Some(Arc::from("<custom>")),
+            ..typed.docs.clone()
+        },
+        ..typed
+    };
+    assert_eq!(explicit.argument_hint().as_deref(), Some("<custom>"));
+    assert_eq!(
+        BUILTIN_COMMANDS
+            .iter()
+            .find(|command| command.id == BuiltinId::Cd)
+            .unwrap()
+            .spec()
+            .argument_hint()
+            .as_deref(),
+        Some("[path]")
+    );
+}
+
+#[test]
+fn positional_schema_validation_is_atomic() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    producer
+        .replace(vec![registration("/old", TargetCapabilities::NONE)])
+        .unwrap();
+    let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
+    let generation = registry.snapshot_for(&target).unwrap().generation();
+    let invalid = positional_registration(
+        "/new",
+        Arc::from([
+            PositionalArgument::required("value", ArgumentKind::String),
+            PositionalArgument::required("value", ArgumentKind::Integer),
+        ]),
+        Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+    );
+
+    assert!(matches!(
+        producer.replace(vec![invalid]),
+        Err(RegistrationError::InvalidArgumentSchema(name)) if name.as_ref() == "value"
+    ));
+
+    let snapshot = registry.snapshot_for(&target).unwrap();
+    assert_eq!(snapshot.generation(), generation);
+    assert_eq!(snapshot.commands().len(), 1);
+    assert_eq!(snapshot.commands()[0].spec().name.as_ref(), "/old");
+    assert!(registry.resolve_for(&target, "/new").is_err());
 }
 
 #[test]
@@ -394,15 +1174,18 @@ fn producer_replacement_is_atomic_on_validation_failure() {
         .unwrap();
     let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
     let generation = registry.snapshot_for(&target).unwrap().generation();
-    let mut invalid = registration("/invalid", TargetCapabilities::NONE);
-    invalid.spec.arguments = ArgumentArity::bounded(2, 1);
+    let invalid = positional_registration(
+        "/invalid",
+        Arc::from([
+            PositionalArgument::optional("first", ArgumentKind::String),
+            PositionalArgument::required("second", ArgumentKind::String),
+        ]),
+        Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+    );
 
     assert!(matches!(
-        producer.replace(vec![
-            registration("/new", TargetCapabilities::NONE),
-            invalid
-        ]),
-        Err(RegistrationError::InvalidArgumentArity { min: 2, max: 1 })
+        producer.replace(vec![registration("/new", TargetCapabilities::NONE), invalid]),
+        Err(RegistrationError::InvalidArgumentOrder(name)) if name.as_ref() == "second"
     ));
 
     let snapshot = registry.snapshot_for(&target).unwrap();
@@ -810,6 +1593,42 @@ fn superseded_completion_cannot_return_items() {
 
     assert!(matches!(second, CompletionResult::Items(_)));
     assert_eq!(first.join().unwrap(), CompletionResult::Cancelled);
+}
+
+#[test]
+fn query_refresh_retains_provider_until_session_cancel() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    let probe = Arc::new(CompletionProbe::default());
+    let session = completion_session(&registry, &producer, probe.clone());
+
+    for argument in ["a", "ab"] {
+        assert!(matches!(
+            futures_lite::future::block_on(session.complete(
+                Arc::from(argument),
+                Arc::from(argument),
+                0,
+                Arc::from("insert"),
+            )),
+            CompletionResult::Items(_)
+        ));
+    }
+    assert!(
+        probe
+            .events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+    );
+
+    session.cancel().unwrap();
+    assert_eq!(
+        *probe
+            .events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        [CompletionLifecycleEvent::Cancel]
+    );
 }
 
 #[test]

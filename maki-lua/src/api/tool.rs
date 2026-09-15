@@ -23,7 +23,10 @@ use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
     TextOutput, ToolOutput,
 };
-use maki_commands::{ArgumentArity, CommandContent, CommandError, CommandOutcome, InputDispatch};
+use maki_commands::{
+    ArgumentKind, CommandArguments, CommandContent, CommandError, CommandOutcome, CompletionPolicy,
+    InputDispatch, PositionalArgument,
+};
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
@@ -38,8 +41,8 @@ use crate::api::options::{PluginOpts, register_options__doc, register_options__r
 use crate::api::session_option::add_session_option_fn;
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
-    CommandEntry, CommandHandlerMap, PendingCommandMap, UiAction, remove_command_entry,
-    ui_roundtrip,
+    ArgumentCompletion, ArgumentCompletionNavigation, CommandEntry, CommandHandlerMap,
+    PendingCommandMap, UiAction, ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
@@ -52,9 +55,35 @@ const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
-const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
 const TUI_ONLY_ERR: &str = "register_command: 'tui_only' must be a boolean";
 const ARGUMENT_HINT_ERR: &str = "register_command: 'argument_hint' must be a string";
+const ARGUMENTS_ERR: &str = "register_command: 'arguments' must be an array of argument tables";
+const ARGUMENT_NAME_ERR: &str = "register_command: argument 'name' must be a non-empty string";
+const ARGUMENT_TYPE_ERR: &str =
+    "register_command: argument 'type' must be string, integer, enum, file, or directory";
+const ARGUMENT_ENUM_ERR: &str =
+    "register_command: enum argument 'choices' must be a non-empty array of strings";
+const ARGUMENT_OPTIONAL_ERR: &str = "register_command: argument 'optional' must be a boolean";
+const ARGUMENT_VARIADIC_ERR: &str = "register_command: argument 'variadic' must be a boolean";
+const ARGUMENT_KEYS: &[&str] = &["name", "type", "optional", "variadic", "completion"];
+const ENUM_ARGUMENT_KEYS: &[&str] = &[
+    "name",
+    "type",
+    "choices",
+    "optional",
+    "variadic",
+    "completion",
+];
+const COMPLETION_KEYS: &[&str] = &[
+    "items",
+    "get_items",
+    "mode",
+    "policy",
+    "on_highlight",
+    "on_accept",
+    "on_cancel",
+    "navigation",
+];
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -802,7 +831,7 @@ fn register_permission_rule(
 /// Register a slash-command that appears in the user input bar.
 ///
 /// Slash commands let the user trigger plugin actions by typing `/name` in the
-/// input. Use them for interactive workflows that do not need the model, like
+/// input. Use them for interactive workflows that do not need the model, such as
 /// browsing memory files or toggling settings.
 ///
 /// @param spec table Command specification:
@@ -811,55 +840,92 @@ fn register_permission_rule(
 ///   description (string)   Optional. Short description shown in the command palette.
 ///   tui_only    (boolean)   Required. If true, the command is available only in the interactive TUI.
 ///   argument_hint (string)  Optional. Short hint describing the command arguments.
-///   nargs       (integer|string) Optional. How many arguments the command
-///                          takes, spelled like nvim's nargs: 0 (default),
-///                          1, "?" (zero or one), "*" (any number), or "+"
-///                          (one or more). An argument is a whitespace
-///                          separated word. Type more than allowed and the
-///                          command quietly stops matching: the input goes
-///                          to the model as a normal message. Only the upper
-///                          bound is checked, so with "+" you still need to
-///                          handle an empty `opts.args` yourself.
-///   handler     (function) Required. Called when the user runs the command,
-///                          with one opts table: `opts.args` is the raw
-///                          argument string (whitespace kept, may be empty)
-///                          and `opts.fargs` is the same split into words.
-///   completion  (table)    Optional. Argument completion specification. Use
-///                          `items = {...}` for a static list or `get_items =
-///                          function(ctx) -> {...}` for dynamic candidates.
-///                          Each candidate has `label` (match/display text),
-///                          `insertion` (replacement text), and optional
-///                          `description`. The callback context has `command`
-///                          (registered slash name), `args` (raw argument string,
-///                          never the full slash input), `arg` (argument under
-///                          the cursor), `index` (zero-based argument index),
-///                          `mode` (active mode id), `session` (stable for one
-///                          popup session), and `generation` (increases for
-///                          each request in that session). Optional lifecycle
-///                          callbacks `on_highlight(ctx, item)`,
-///                          `on_accept(ctx, item)`, and `on_cancel(ctx)` run in
-///                          request order. The first result highlights its
-///                          selected candidate. A later highlight cancels a
-///                          running highlight callback. Accept runs after its
-///                          highlight and ends the session without on_cancel.
-///                          Dismissal, an empty result, or a new completion
-///                          session calls on_cancel once. `Tab` accepts and
-///                          keeps editing. `Enter` accepts; press `Enter` again
-///                          to execute the command.
+///   arguments   (array)    Optional. A dense typed positional schema. Each
+///                            descriptor has a unique non-empty `name` and a
+///                            `type` of `string`, `integer`, `enum`, `file`, or
+///                            `directory`. Enum descriptors also require a
+///                            non-empty `choices` array of distinct strings.
+///                            `optional` and `variadic` are false by default.
+///                            A required scalar consumes exactly one value. An
+///                            optional scalar consumes zero or one value. A
+///                            required variadic consumes one or more values.
+///                            An optional variadic consumes zero or more values.
+///                            Optional descriptors follow required descriptors.
+///                            A variadic descriptor is last and consumes the
+///                            remaining values. Typed input uses one quote-aware
+///                            grammar. Unicode
+///                            whitespace separates tokens outside quotes. Single
+///                            and double quotes group text, adjacent quoted and
+///                            unquoted fragments concatenate, and empty quotes
+///                            produce an empty value. Backslashes are literal
+///                            outside quotes and inside single quotes. Inside
+///                            double quotes, only `\\"` and `\\\\` decode to a
+///                            quote or backslash. Other backslashes stay literal.
+///                            Shell expansion and operators are not supported.
+///                            The command parser outer-trims the argument
+///                            remainder before this grammar runs. Inner spaces,
+///                            quotes, newlines inside quotes, and decoded values
+///                            remain significant. Newlines separate tokens only
+///                            outside quotes.
+///   arguments   (table)    Use `{ raw = true }` for an unparsed argument
+///                          remainder. Add `required = true` to reject empty
+///                          input. Raw handlers receive `opts.args` only.
+///   handler     (function) Required. Called with one opts table after the
+///                          command arguments pass validation. `opts.args` is
+///                          the outer-trimmed original argument remainder. It
+///                          keeps inner whitespace and source quotes. For typed
+///                          commands, `opts.fargs` is the decoded token array
+///                          and `opts.values` is a name-keyed table. String,
+///                          enum, file, and directory values are strings.
+///                          Integer values are Lua integers. A missing optional
+///                          scalar is `nil`. A missing optional variadic is an
+///                          empty array. A variadic value is always an array.
+///                          File and directory values retain their decoded,
+///                          non-empty, NUL-free spelling and are not expanded
+///                          or checked for existence by type validation. Raw
+///                          commands do not set `opts.fargs` or `opts.values`.
+///                          Typed integers are signed decimal values with no
+///                          separators or alternate bases. The inclusive exact
+///                          range is `-9007199254740991` to
+///                          `9007199254740991`.
+///                            Completion is declared on each typed descriptor
+///                            with `completion = false`, `completion = "disabled"`,
+///                            or a provider table. A provider table contains exactly
+///                            one of `items` and `get_items`, and may set `mode` to
+///                            `"replace"` or `"extend"` (`"replace"` is the default).
+///                            Defaults are enum choices in the core and file or
+///                            directory discovery in the TUI. String and integer
+///                            defaults are empty. Provider callbacks receive the
+///                            typed argument name, type, parsed preceding values,
+///                            and the command completion context. Raw commands do
+///                            not have argument completion providers.
 /// @return
 /// @example
+/// -- Documentation and test example. It is not bundled and never copies files.
+/// local recorded
+/// maki.api.register_command({
+///   name = "/copy",
+///   description = "Record typed path arguments",
+///   tui_only = false,
+///   arguments = {
+///     { name = "source", type = "file" },
+///     { name = "destination", type = "directory" },
+///     { name = "policy", type = "enum", choices = { "skip", "overwrite" }, optional = true },
+///   },
+///   handler = function(opts)
+///     recorded = opts.values
+///   end,
+/// })
+/// -- `/copy "input file.txt" "build output" overwrite` records decoded values.
+///
+/// -- Raw commands preserve the complete argument remainder:
 /// maki.api.register_command({
 ///   name = "/hello",
 ///   description = "Say hello",
 ///   tui_only = false,
-///   nargs = 1,
-///   completion = {
-///     get_items = function(ctx)
-///       return { { label = "world", insertion = "world", description = ctx.mode } }
-///     end,
-///   },
+///   arguments = { raw = true, required = true },
 ///   handler = function(opts)
-///     maki.ui.flash("Hello " .. opts.args)
+///     recorded = opts.args
 ///   end,
 /// })
 #[lua_fn]
@@ -1527,17 +1593,270 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     Ok(())
 }
 
-fn parse_nargs(spec: &Table) -> LuaResult<ArgumentArity> {
-    match spec.get::<LuaValue>("nargs")? {
-        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(ArgumentArity::NONE),
-        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(ArgumentArity::ONE),
-        LuaValue::String(s) => match s.to_string_lossy().as_ref() {
-            "?" => Ok(ArgumentArity::OPTIONAL),
-            "*" => Ok(ArgumentArity::ANY),
-            "+" => Ok(ArgumentArity::ONE_OR_MORE),
-            _ => Err(mlua::Error::runtime(NARGS_ERR)),
+fn parse_arguments(
+    lua: &Lua,
+    spec: &Table,
+) -> LuaResult<(CommandArguments, Vec<Option<ArgumentCompletion>>)> {
+    let value = spec.get::<LuaValue>("arguments")?;
+    let Some(value) = (!matches!(value, LuaValue::Nil)).then_some(value) else {
+        return Ok((CommandArguments::Positional(Arc::from([])), Vec::new()));
+    };
+    let LuaValue::Table(arguments) = value else {
+        return Err(mlua::Error::runtime(ARGUMENTS_ERR));
+    };
+    if arguments.get::<Option<bool>>("raw")? == Some(true) {
+        let required_value = arguments.get::<Option<LuaValue>>("required")?;
+        let required = match required_value {
+            None => false,
+            Some(LuaValue::Boolean(value)) => value,
+            Some(_) => return Err(mlua::Error::runtime(ARGUMENTS_ERR)),
+        };
+        if arguments.raw_len() != 0
+            || arguments.pairs::<LuaValue, LuaValue>().count()
+                != 1 + usize::from(required_value.is_some())
+        {
+            return Err(mlua::Error::runtime(ARGUMENTS_ERR));
+        }
+        return Ok((CommandArguments::Raw { required }, Vec::new()));
+    }
+    let mut parsed = Vec::new();
+    let mut completions = Vec::new();
+    let result = (|| {
+        for argument in dense_sequence_values::<LuaValue>(&arguments, ARGUMENTS_ERR)? {
+            let argument = match argument {
+                LuaValue::Table(argument) => argument,
+                _ => return Err(mlua::Error::runtime(ARGUMENTS_ERR)),
+            };
+            let name: String = argument
+                .get("name")
+                .map_err(|_| mlua::Error::runtime(ARGUMENT_NAME_ERR))?;
+            if name.is_empty()
+                || parsed
+                    .iter()
+                    .any(|item: &PositionalArgument| item.name.as_ref() == name)
+            {
+                return Err(mlua::Error::runtime(ARGUMENT_NAME_ERR));
+            }
+            let optional = match argument.get::<LuaValue>("optional")? {
+                LuaValue::Nil => false,
+                LuaValue::Boolean(value) => value,
+                _ => return Err(mlua::Error::runtime(ARGUMENT_OPTIONAL_ERR)),
+            };
+            let variadic = match argument.get::<LuaValue>("variadic")? {
+                LuaValue::Nil => false,
+                LuaValue::Boolean(value) => value,
+                _ => return Err(mlua::Error::runtime(ARGUMENT_VARIADIC_ERR)),
+            };
+            let kind = parse_argument_kind(&argument)?;
+            let completion_value = argument.get::<LuaValue>("completion")?;
+            let (completion, policy) = match &completion_value {
+                LuaValue::Table(table) => {
+                    let mode = table.get::<Option<LuaValue>>("mode")?;
+                    let policy = table.get::<Option<LuaValue>>("policy")?;
+                    if mode.is_some() && policy.is_some() {
+                        return Err(mlua::Error::runtime(
+                            "register_command: argument completion accepts only one of 'mode' or 'policy'",
+                        ));
+                    }
+                    let policy = mode
+                        .or(policy)
+                        .map_or(Ok(CompletionPolicy::Replace), parse_completion_policy)?;
+                    (Some(parse_argument_completion(lua, table)?), policy)
+                }
+                LuaValue::Nil | LuaValue::Boolean(false) | LuaValue::String(_) => {
+                    (None, parse_completion_policy(completion_value)?)
+                }
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "register_command: argument 'completion' must be false, a policy string, or a table",
+                    ));
+                }
+            };
+            parsed.push(PositionalArgument {
+                name: Arc::from(name),
+                kind,
+                optional,
+                variadic,
+                completion: policy,
+            });
+            completions.push(completion);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for completion in completions.into_iter().flatten() {
+            remove_argument_completion(lua, completion);
+        }
+        return Err(error);
+    }
+    Ok((CommandArguments::Positional(parsed.into()), completions))
+}
+
+fn dense_sequence_values<T: mlua::FromLua>(
+    table: &Table,
+    error: &'static str,
+) -> LuaResult<Vec<T>> {
+    let length = table.raw_len();
+    let values = (1..=length)
+        .map(|index| table.raw_get(index))
+        .collect::<LuaResult<Vec<T>>>()?;
+    let key_count = table.pairs::<LuaValue, LuaValue>().count();
+    if key_count != length {
+        return Err(mlua::Error::runtime(error));
+    }
+    Ok(values)
+}
+
+fn reject_unknown_keys(table: &Table, allowed: &[&str], context: &str) -> LuaResult<()> {
+    for pair in table.clone().pairs::<LuaValue, LuaValue>() {
+        let (key, _) = pair?;
+        let LuaValue::String(key) = key else {
+            return Err(mlua::Error::runtime(format!(
+                "register_command: {context} fields must use string keys"
+            )));
+        };
+        let key = key.to_string_lossy();
+        if !allowed.contains(&key.as_ref()) {
+            return Err(mlua::Error::runtime(format!(
+                "register_command: unknown {context} field '{key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_argument_kind(argument: &Table) -> LuaResult<ArgumentKind> {
+    let kind: String = argument
+        .get("type")
+        .map_err(|_| mlua::Error::runtime(ARGUMENT_TYPE_ERR))?;
+    reject_unknown_keys(
+        argument,
+        if kind == "enum" {
+            ENUM_ARGUMENT_KEYS
+        } else {
+            ARGUMENT_KEYS
         },
-        _ => Err(mlua::Error::runtime(NARGS_ERR)),
+        "argument",
+    )?;
+    match kind.as_str() {
+        "string" => Ok(ArgumentKind::String),
+        "integer" => Ok(ArgumentKind::Integer),
+        "file" => Ok(ArgumentKind::File),
+        "directory" => Ok(ArgumentKind::Directory),
+        "enum" => {
+            let choices: Table = argument
+                .get("choices")
+                .map_err(|_| mlua::Error::runtime(ARGUMENT_ENUM_ERR))?;
+            let choices = dense_sequence_values::<String>(&choices, ARGUMENT_ENUM_ERR)?
+                .into_iter()
+                .map(Arc::<str>::from)
+                .collect::<Vec<_>>();
+            let mut unique = std::collections::HashSet::new();
+            if choices.is_empty() || choices.iter().any(|choice| !unique.insert(choice.as_ref())) {
+                return Err(mlua::Error::runtime(ARGUMENT_ENUM_ERR));
+            }
+            Ok(ArgumentKind::Enum(choices.into()))
+        }
+        _ => Err(mlua::Error::runtime(ARGUMENT_TYPE_ERR)),
+    }
+}
+
+fn parse_argument_completion(lua: &Lua, spec: &Table) -> LuaResult<ArgumentCompletion> {
+    reject_unknown_keys(spec, COMPLETION_KEYS, "completion")?;
+    let items = spec.get::<Option<Table>>("items")?;
+    let get_items = spec.get::<Option<Function>>("get_items")?;
+    if items.is_some() == get_items.is_some() {
+        return Err(mlua::Error::runtime(
+            "register_command: completion requires exactly one of 'items' or 'get_items'",
+        ));
+    }
+    let on_highlight = spec.get::<Option<Function>>("on_highlight")?;
+    let on_accept = spec.get::<Option<Function>>("on_accept")?;
+    let on_cancel = spec.get::<Option<Function>>("on_cancel")?;
+    let navigation = match spec.get::<Option<String>>("navigation")? {
+        None => None,
+        Some(value) if value == "directory" => Some(ArgumentCompletionNavigation::Directory),
+        Some(_) => {
+            return Err(mlua::Error::runtime(
+                "register_command: completion navigation must be \"directory\"",
+            ));
+        }
+    };
+    let completion = if let Some(items) = items {
+        lua.create_registry_value(items)?
+    } else {
+        lua.create_registry_value(get_items.expect("validated get_items"))?
+    };
+    let mut staged = ArgumentCompletion {
+        completion,
+        on_highlight: None,
+        on_accept: None,
+        on_cancel: None,
+        navigation,
+    };
+    let result = (|| {
+        staged.on_highlight = on_highlight
+            .map(|function| lua.create_registry_value(function))
+            .transpose()?;
+        staged.on_accept = on_accept
+            .map(|function| lua.create_registry_value(function))
+            .transpose()?;
+        staged.on_cancel = on_cancel
+            .map(|function| lua.create_registry_value(function))
+            .transpose()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        remove_argument_completion(lua, staged);
+        return Err(error);
+    }
+    Ok(staged)
+}
+
+fn parse_completion_policy(value: LuaValue) -> LuaResult<CompletionPolicy> {
+    match value {
+        LuaValue::Nil => Ok(CompletionPolicy::Default),
+        LuaValue::Boolean(false) => Ok(CompletionPolicy::Disabled),
+        LuaValue::Boolean(true) => Err(mlua::Error::runtime(
+            "register_command: argument completion policy must be false, disabled, replace, or extend",
+        )),
+        LuaValue::String(value) => match value.to_string_lossy().as_ref() {
+            "disabled" => Ok(CompletionPolicy::Disabled),
+            "replace" => Ok(CompletionPolicy::Replace),
+            "extend" => Ok(CompletionPolicy::Extend),
+            _ => Err(mlua::Error::runtime(
+                "register_command: argument completion policy must be disabled, replace, or extend",
+            )),
+        },
+        _ => Err(mlua::Error::runtime(
+            "register_command: argument completion policy must be false or a string",
+        )),
+    }
+}
+
+fn remove_argument_completion(lua: &Lua, completion: ArgumentCompletion) {
+    for key in [
+        Some(completion.completion),
+        completion.on_highlight,
+        completion.on_accept,
+        completion.on_cancel,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = lua.remove_registry_value(key);
+    }
+}
+
+fn remove_command_registry_values(lua: &Lua, entry: CommandEntry) {
+    let CommandEntry {
+        handler,
+        argument_completions,
+        ..
+    } = entry;
+    let _ = lua.remove_registry_value(handler);
+    for completion in argument_completions.into_iter().flatten() {
+        remove_argument_completion(lua, completion);
     }
 }
 
@@ -1568,93 +1887,97 @@ fn register_command_from_lua(
         LuaValue::Boolean(value) => value,
         _ => return Err(mlua::Error::runtime(TUI_ONLY_ERR)),
     };
-    let arguments = parse_nargs(spec)?;
+    for (key, replacement) in [
+        ("nargs", "use typed descriptors in 'arguments'"),
+        (
+            "completion",
+            "set 'completion' on each typed descriptor in 'arguments'",
+        ),
+        (
+            "argument_completion",
+            "set 'completion' on each typed descriptor in 'arguments'",
+        ),
+        (
+            "completions",
+            "set 'completion' on each typed descriptor in 'arguments'",
+        ),
+    ] {
+        if spec.contains_key(key)? {
+            return Err(mlua::Error::runtime(format!(
+                "register_command: unsupported field '{key}'; {replacement}"
+            )));
+        }
+    }
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
-
-    let (completion_key, completion_on_highlight, completion_on_accept, completion_on_cancel) =
-        match spec.get::<Table>("completion") {
-            Ok(completion) => {
-                let items = if let Ok(items) = completion.get::<mlua::Table>("items") {
-                    lua.create_registry_value(items)?
-                } else {
-                    let get_items: Function = completion.get("get_items")?;
-                    lua.create_registry_value(get_items)?
-                };
-                let hook = |name| -> LuaResult<Option<RegistryKey>> {
-                    completion
-                        .get::<Option<Function>>(name)?
-                        .map(|function| lua.create_registry_value(function))
-                        .transpose()
-                };
-                (
-                    Some(items),
-                    hook("on_highlight")?,
-                    hook("on_accept")?,
-                    hook("on_cancel")?,
-                )
+    if lua.app_data_ref::<CommandHandlerMap>().is_none() {
+        return Err(mlua::Error::runtime("register_command: not initialized"));
+    }
+    let (arguments, argument_completions) = parse_arguments(lua, spec)?;
+    let handler_key = match lua.create_registry_value(handler) {
+        Ok(key) => key,
+        Err(error) => {
+            for completion in argument_completions.into_iter().flatten() {
+                remove_argument_completion(lua, completion);
             }
-            Err(_) => (None, None, None, None),
-        };
-    let handler_key = lua.create_registry_value(handler)?;
+            return Err(error);
+        }
+    };
     let name: Arc<str> = Arc::from(name.as_str());
     let description: Arc<str> = Arc::from(description.as_str());
 
     let entry = CommandEntry {
+        generation: crate::runtime::next_command_generation(),
         handler: handler_key,
         description,
         argument_hint,
         arguments,
         tui_only,
-        argument_completion: completion_key,
-        completion_on_highlight,
-        completion_on_accept,
-        completion_on_cancel,
+        argument_completions,
     };
 
     if crate::runtime::loading_plugin(lua).is_some() {
         let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(previous) = pending.insert(Arc::clone(&name), entry) {
-            remove_command_entry(lua, previous);
+            remove_command_registry_values(lua, previous);
         }
         return Ok(());
     }
 
-    let mut map = lua
-        .app_data_mut::<CommandHandlerMap>()
-        .ok_or_else(|| mlua::Error::runtime("register_command: not initialized"))?;
-    let commands = map.entry(Arc::clone(&plugin)).or_default();
-    if let Some(previous) = commands.insert(Arc::clone(&name), entry) {
-        remove_command_entry(lua, previous);
-    }
-    drop(map);
+    let mut previous = {
+        let mut map = lua
+            .app_data_mut::<CommandHandlerMap>()
+            .expect("command handler map checked before staging registry keys");
+        let commands = map.entry(Arc::clone(&plugin)).or_default();
+        commands.insert(Arc::clone(&name), entry)
+    };
 
     if let Err(error) = crate::runtime::publish_registered_commands(lua, &plugin) {
-        // The registry rejected the batch (invalid name, duplicate spelling);
-        // roll the entry back so later registrations from this plugin are not
-        // poisoned by it.
-        if let Some(mut map) = lua.app_data_mut::<CommandHandlerMap>() {
-            let commands = map.entry(Arc::clone(&plugin)).or_default();
-            if let Some(entry) = commands.remove(&name) {
-                let _ = lua.remove_registry_value(entry.handler);
-                for key in [
-                    entry.argument_completion,
-                    entry.completion_on_highlight,
-                    entry.completion_on_accept,
-                    entry.completion_on_cancel,
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    let _ = lua.remove_registry_value(key);
+        let failed = if let Some(mut map) = lua.app_data_mut::<CommandHandlerMap>() {
+            let (failed, empty) = if let Some(commands) = map.get_mut(&plugin) {
+                let failed = commands.remove(&name);
+                if let Some(previous) = previous.take() {
+                    commands.insert(name.clone(), previous);
                 }
-            }
-            if commands.is_empty() {
+                (failed, commands.is_empty())
+            } else {
+                (None, false)
+            };
+            if empty {
                 map.remove(&plugin);
             }
+            failed
+        } else {
+            None
+        };
+        if let Some(failed) = failed {
+            remove_command_registry_values(lua, failed);
         }
         return Err(error);
+    }
+    if let Some(previous) = previous {
+        remove_command_registry_values(lua, previous);
     }
     Ok(())
 }
@@ -1915,6 +2238,120 @@ impl LuaToolInvocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collect_twice(lua: &Lua) {
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+    }
+
+    #[test]
+    fn failed_completion_hook_validation_releases_callback_capture() {
+        let lua = Lua::new();
+        lua.set_app_data(CommandHandlerMap::new());
+        let captured = Arc::new(());
+        {
+            let held = Arc::clone(&captured);
+            let get_items = lua
+                .create_function(move |lua, ()| {
+                    let _ = &held;
+                    lua.create_table()
+                })
+                .unwrap();
+            let completion = lua.create_table().unwrap();
+            completion.set("get_items", get_items).unwrap();
+            completion.set("on_accept", true).unwrap();
+            let descriptor = lua.create_table().unwrap();
+            descriptor.set("name", "value").unwrap();
+            descriptor.set("type", "string").unwrap();
+            descriptor.set("completion", completion).unwrap();
+            let arguments = lua.create_table().unwrap();
+            arguments.raw_set(1, descriptor).unwrap();
+            let spec = lua.create_table().unwrap();
+            spec.set("name", "/test").unwrap();
+            spec.set("tui_only", false).unwrap();
+            spec.set("arguments", arguments).unwrap();
+            spec.set("handler", lua.create_function(|_, ()| Ok(())).unwrap())
+                .unwrap();
+            register_command_from_lua(&lua, &spec, Arc::from("test"), Arc::default())
+                .expect_err("invalid completion hook");
+        }
+        collect_twice(&lua);
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    #[test_case::test_case(true, "replace"; "conflicting_mode_and_policy")]
+    #[test_case::test_case(false, "invalid"; "invalid_policy")]
+    fn failed_completion_policy_validation_releases_callback_capture(
+        include_mode: bool,
+        policy: &str,
+    ) {
+        let lua = Lua::new();
+        lua.set_app_data(CommandHandlerMap::new());
+        let captured = Arc::new(());
+        {
+            let held = Arc::clone(&captured);
+            let get_items = lua
+                .create_function(move |lua, ()| {
+                    let _ = &held;
+                    lua.create_table()
+                })
+                .unwrap();
+            let completion = lua.create_table().unwrap();
+            completion.set("get_items", get_items).unwrap();
+            completion.set("policy", policy).unwrap();
+            if include_mode {
+                completion.set("mode", "replace").unwrap();
+            }
+            let descriptor = lua.create_table().unwrap();
+            descriptor.set("name", "value").unwrap();
+            descriptor.set("type", "string").unwrap();
+            descriptor.set("completion", completion).unwrap();
+            let arguments = lua.create_table().unwrap();
+            arguments.raw_set(1, descriptor).unwrap();
+            let spec = lua.create_table().unwrap();
+            spec.set("name", "/test").unwrap();
+            spec.set("tui_only", false).unwrap();
+            spec.set("arguments", arguments).unwrap();
+            spec.set("handler", lua.create_function(|_, ()| Ok(())).unwrap())
+                .unwrap();
+            register_command_from_lua(&lua, &spec, Arc::from("test"), Arc::default())
+                .expect_err("invalid completion policy");
+        }
+        collect_twice(&lua);
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    #[test]
+    fn missing_handler_releases_parsed_completion_capture() {
+        let lua = Lua::new();
+        lua.set_app_data(CommandHandlerMap::new());
+        let captured = Arc::new(());
+        {
+            let held = Arc::clone(&captured);
+            let get_items = lua
+                .create_function(move |lua, ()| {
+                    let _ = &held;
+                    lua.create_table()
+                })
+                .unwrap();
+            let completion = lua.create_table().unwrap();
+            completion.set("get_items", get_items).unwrap();
+            let descriptor = lua.create_table().unwrap();
+            descriptor.set("name", "value").unwrap();
+            descriptor.set("type", "string").unwrap();
+            descriptor.set("completion", completion).unwrap();
+            let arguments = lua.create_table().unwrap();
+            arguments.raw_set(1, descriptor).unwrap();
+            let spec = lua.create_table().unwrap();
+            spec.set("name", "/test").unwrap();
+            spec.set("tui_only", false).unwrap();
+            spec.set("arguments", arguments).unwrap();
+            register_command_from_lua(&lua, &spec, Arc::from("test"), Arc::default())
+                .expect_err("missing handler");
+        }
+        collect_twice(&lua);
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
 
     #[test]
     fn local_callbacks_release_captured_runtime_before_thread_teardown() {

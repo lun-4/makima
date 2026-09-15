@@ -259,6 +259,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     question_mode: crate::tools::QuestionMode::Headless,
                     model_policy: Arc::clone(&params.model_policy),
                     file_write_locks: Arc::clone(&file_write_locks),
+                    managed_turn: None,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -855,6 +856,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         question_mode: params.question_mode,
                         model_policy: Arc::clone(&params.model_policy),
                         file_write_locks: Arc::clone(&file_write_locks),
+                        managed_turn: None,
                     },
                     AgentRunParams {
                         history: &mut history,

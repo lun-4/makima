@@ -2497,7 +2497,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_from_removes_the_lock_file() {
+    fn delete_from_releases_the_session_lock() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s: TestSession = Session::new("m", "/project");
@@ -2506,7 +2506,9 @@ mod tests {
         assert!(session_lock::lock_path(dir, &s.id).exists());
 
         TestSession::delete_from(s.id, dir).unwrap();
-        assert!(!session_lock::lock_path(dir, &s.id).exists());
+        assert!(!session_lock::open_elsewhere(dir, &s.id));
+        let lease = session_lock::claim(dir, &s.id).unwrap().unwrap();
+        lease.release().unwrap();
     }
 
     /// Rewrites the scan-cache title of `id` without touching the session

@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use maki_commands::BUILTIN_COMMANDS;
+use maki_commands::{BUILTIN_COMMANDS, CommandArguments, TargetCapabilities};
 
 use crate::lua_util;
 
@@ -38,13 +38,23 @@ fn markdown_cell(value: &str) -> String {
         .replace(['\r', '\n'], "<br>")
 }
 
-/// Where a built-in is advertised. "TUI-only" used to mean the interactive-UI
-/// capability alone, which read as a contradiction for `/new`: it is not an
-/// interactive command, but it needs session replacement, which no portable
-/// frontend offers. The column asks the question the reader has instead --
-/// can I type this here? -- so anything the portable capability set cannot
-/// satisfy is TUI-only regardless of which capability it was missing.
-fn frontends(required: maki_commands::TargetCapabilities) -> &'static str {
+fn argument_mode(arguments: &CommandArguments) -> &'static str {
+    match arguments {
+        CommandArguments::Positional(arguments) if arguments.is_empty() => "none",
+        CommandArguments::Positional(_) => "typed",
+        CommandArguments::Raw { required: true } => "raw (required)",
+        CommandArguments::Raw { required: false } => "raw (optional)",
+    }
+}
+
+fn argument_hint(arguments: &CommandArguments, explicit_hint: Option<&str>) -> String {
+    explicit_hint
+        .map(str::to_owned)
+        .or_else(|| arguments.usage_hint().map(|hint| hint.to_string()))
+        .unwrap_or_default()
+}
+
+fn frontends(required: TargetCapabilities) -> &'static str {
     if maki_agent::command::portable_capabilities().contains_all(required) {
         "all"
     } else {
@@ -56,18 +66,35 @@ fn write_row(
     out: &mut String,
     name: &str,
     description: &str,
-    argument_hint: Option<&str>,
-    required: maki_commands::TargetCapabilities,
+    arguments: &CommandArguments,
+    explicit_hint: Option<&str>,
+    required: TargetCapabilities,
 ) {
     writeln!(
         out,
-        "| `{}` | {} | {} | {} |",
+        "| `{}` | {} | {} | {} | {} |",
         markdown_cell(name),
         markdown_cell(description),
-        markdown_cell(argument_hint.unwrap_or("")),
-        frontends(required)
+        argument_mode(arguments),
+        markdown_cell(&argument_hint(arguments, explicit_hint)),
+        frontends(required),
     )
     .unwrap();
+}
+
+fn write_plugin_row(out: &mut String, command: &lua_util::LuaPluginCommand) {
+    write_row(
+        out,
+        &command.name,
+        &command.description,
+        &command.arguments,
+        command.argument_hint.as_deref(),
+        if command.tui_only {
+            TargetCapabilities::from_capability(maki_commands::TargetCapability::InteractiveUi)
+        } else {
+            TargetCapabilities::NONE
+        },
+    );
 }
 
 pub fn generate() -> color_eyre::Result<String> {
@@ -89,21 +116,30 @@ pub fn generate() -> color_eyre::Result<String> {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. The Lua `tui_only` field maps to the interactive-TUI capability. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands."
+        "The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands."
     )
     .unwrap();
     writeln!(out).unwrap();
 
     writeln!(out, "## Built-in commands").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description | Arguments | Frontends |").unwrap();
-    writeln!(out, "|---------|-------------|-----------|------------|").unwrap();
+    writeln!(
+        out,
+        "| Command | Description | Mode | Arguments | Frontends |"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "|---------|-------------|------|-----------|-----------|"
+    )
+    .unwrap();
     for cmd in BUILTIN_COMMANDS {
         let spec = cmd.spec();
         write_row(
             &mut out,
             cmd.name,
             cmd.description,
+            &spec.arguments,
             spec.docs.argument_hint.as_deref(),
             cmd.required_capabilities,
         );
@@ -112,6 +148,7 @@ pub fn generate() -> color_eyre::Result<String> {
                 &mut out,
                 alias,
                 &format!("Alias for `{}`", cmd.name),
+                &spec.arguments,
                 spec.docs.argument_hint.as_deref(),
                 cmd.required_capabilities,
             );
@@ -134,26 +171,40 @@ pub fn generate() -> color_eyre::Result<String> {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description | Arguments | Frontends |").unwrap();
-    writeln!(out, "|---------|-------------|-----------|------------|").unwrap();
-    for cmd in lua_util::load_builtin_plugin_commands()? {
-        write_row(
-            &mut out,
-            &cmd.name,
-            &cmd.description,
-            cmd.argument_hint.as_deref(),
-            if cmd.tui_only {
-                maki_commands::TargetCapabilities::from_capability(
-                    maki_commands::TargetCapability::InteractiveUi,
-                )
-            } else {
-                maki_commands::TargetCapabilities::NONE
-            },
-        );
+    writeln!(
+        out,
+        "| Command | Description | Mode | Arguments | Frontends |"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "|---------|-------------|------|-----------|-----------|"
+    )
+    .unwrap();
+    for command in lua_util::load_builtin_plugin_commands()? {
+        write_plugin_row(&mut out, &command);
     }
 
     writeln!(out).unwrap();
     writeln!(out, "## Command arguments").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Lua commands declare their arguments with `arguments`. Use `arguments = {{ raw = true }}` for an optional unparsed argument string, or add `required = true` to reject empty input. Provide a dense array of typed positional descriptors for decoded values. Each typed argument has a name and one of `string`, `integer`, `enum`, `file`, or `directory` types. Set `optional = true` only after required arguments, and set `variadic = true` only on the final argument."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Typed command input uses shell-like single or double quotes to keep spaces in one value. Quotes are removed before validation; double-quoted values only escape `\\\"` and `\\\\`. Integers are signed decimal values from `-9007199254740991` through `9007199254740991`. Handlers receive the original text in `opts.args`, decoded tokens in `opts.fargs`, and typed values in `opts.values` keyed by argument name."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Completion callbacks receive the typed argument name as `ctx.argument`, its type as `ctx.type`, and successfully parsed preceding values as `ctx.values`. Raw commands receive the original argument text."
+    )
+    .unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
@@ -316,9 +367,26 @@ pub fn generate() -> color_eyre::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use maki_commands::BUILTIN_COMMANDS;
+    use maki_commands::{BUILTIN_COMMANDS, CommandArguments, TargetCapabilities};
 
     use super::generate;
+
+    #[test]
+    fn plugin_row_preserves_explicit_argument_hint() {
+        let command = crate::lua_util::LuaPluginCommand {
+            name: "/custom".into(),
+            description: "Custom".into(),
+            argument_hint: Some("<title>".into()),
+            arguments: CommandArguments::Raw { required: false },
+            tui_only: false,
+        };
+        let mut generated = String::new();
+        super::write_plugin_row(&mut generated, &command);
+        assert_eq!(
+            generated,
+            "| `/custom` | Custom | raw (optional) | <title> | all |\n"
+        );
+    }
 
     #[test]
     fn markdown_cells_escape_table_delimiters_and_newlines() {
@@ -327,12 +395,22 @@ mod tests {
             &mut generated,
             "name|value",
             "line 1\nline 2",
-            Some("<a|b>"),
-            maki_commands::TargetCapabilities::NONE,
+            &CommandArguments::Raw { required: true },
+            None,
+            TargetCapabilities::NONE,
         );
         assert_eq!(
             generated,
-            "| `name\\|value` | line 1<br>line 2 | <a\\|b> | all |\n"
+            "| `name\\|value` | line 1<br>line 2 | raw (required) |  | all |\n"
+        );
+    }
+
+    #[test]
+    fn command_argument_completion_is_its_own_paragraph() {
+        let generated = generate().expect("generated commands");
+        assert!(
+            generated
+                .contains("opts.values` keyed by argument name.\n\nCompletion callbacks receive")
         );
     }
 
@@ -352,16 +430,16 @@ mod tests {
             }
         }
         for row in [
-            "| `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | all |",
-            "| `/build` | Switch to build mode (full tool access) |  | all |",
-            "| `/memory` | View, edit, and delete memory files |  | TUI only |",
-            "| `/plan` | Switch to plan mode (analyse and write only the plan file) |  | all |",
-            "| `/rename` | Rename the current session | <title> | TUI only |",
-            "| `/sessions` | Browse and switch sessions | [query] | TUI only |",
-            "| `/splash` | Preview and select a splash renderer | [splash] | TUI only |",
-            "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | TUI only |",
-            "| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | TUI only |",
-            "| `/usage` | Show provider quota and focused-session token usage |  | TUI only |",
+            "| `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | all |",
+            "| `/build` | Switch to build mode (full tool access) | none |  | all |",
+            "| `/memory` | View, edit, and delete memory files | none |  | TUI only |",
+            "| `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | all |",
+            "| `/rename` | Rename the current session | raw (required) |  | TUI only |",
+            "| `/sessions` | Browse and switch sessions | typed | [query] | TUI only |",
+            "| `/splash` | Preview and select a splash renderer | typed | [splash] | TUI only |",
+            "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | TUI only |",
+            "| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | TUI only |",
+            "| `/usage` | Show provider quota and focused-session token usage | none |  | TUI only |",
         ] {
             assert!(plugins.contains(row), "{row}");
         }

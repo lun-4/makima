@@ -380,7 +380,7 @@ pub fn run(
                         result_text.push_str(text);
                     }
                 }
-                AgentEvent::ThinkingDelta { .. } => {}
+                AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
                 AgentEvent::ToolPending { .. }
                 | AgentEvent::ToolStart(_)
                 | AgentEvent::ToolOutput { .. }
@@ -394,6 +394,7 @@ pub fn run(
                 | AgentEvent::PermissionRequest { .. }
                 | AgentEvent::Question { .. }
                 | AgentEvent::SubagentHistory { .. }
+                | AgentEvent::SubagentClosed
                 | AgentEvent::ToolSnapshot { .. }
                 | AgentEvent::ToolHeaderSnapshot { .. }
                 | AgentEvent::LiveToolBuf { .. }
@@ -634,7 +635,7 @@ mod tests {
                 spec: maki_commands::CommandSpec {
                     name: Arc::from("/inspect"),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::ArgumentArity::NONE,
+                    arguments: maki_commands::CommandArguments::Positional(Arc::from([])),
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from("inspect"),
                         argument_hint: None,
@@ -644,7 +645,7 @@ mod tests {
                     ),
                 },
                 behavior: Arc::new(ReplaceAttachment),
-                completion: None,
+                argument_completions: Vec::new(),
             }])
             .unwrap();
         let target = target(&registry);
@@ -720,7 +721,7 @@ mod tests {
                 spec: maki_commands::CommandSpec {
                     name: Arc::from("/done"),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::ArgumentArity::NONE,
+                    arguments: maki_commands::CommandArguments::Positional(Arc::from([])),
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from("done"),
                         argument_hint: None,
@@ -728,7 +729,7 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(Completed),
-                completion: None,
+                argument_completions: Vec::new(),
             }])
             .unwrap();
         let target = target(&registry);

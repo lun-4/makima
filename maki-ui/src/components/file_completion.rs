@@ -36,6 +36,128 @@ const FILE_KIND: &str = "file";
 const DIRECTORY_KIND: &str = "directory";
 const DIRECTORY_SUFFIX: char = std::path::MAIN_SEPARATOR;
 
+fn ends_with_path_separator(value: &str) -> bool {
+    value.ends_with(std::path::is_separator)
+}
+
+pub(crate) struct CompletionGridItem<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) indices: &'a [u32],
+    pub(crate) kind: &'a str,
+}
+
+#[derive(Default)]
+pub(crate) struct CompletionGridState {
+    selected: usize,
+    cols: usize,
+    scroll_offset: usize,
+    viewport_height: usize,
+}
+
+impl CompletionGridState {
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    pub(crate) fn set_selected(&mut self, selected: usize) {
+        self.selected = selected;
+    }
+
+    #[cfg(test)]
+    fn set_scroll_offset(&mut self, scroll_offset: usize) {
+        self.scroll_offset = scroll_offset;
+    }
+
+    pub(crate) fn handle_key(&mut self, key: &KeyEvent, item_count: usize, pending: bool) -> bool {
+        let horizontal = matches!(key.code, KeyCode::Left | KeyCode::Right);
+        if !matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+        ) || (horizontal && super::menu_navigation_blocked(key))
+        {
+            return false;
+        }
+        if pending || item_count == 0 {
+            return true;
+        }
+        match key.code {
+            KeyCode::Up => self.move_selection(item_count, -1),
+            KeyCode::Down => self.move_selection(item_count, 1),
+            KeyCode::Left => self.move_column(item_count, -1),
+            KeyCode::Right => self.move_column(item_count, 1),
+            _ => unreachable!(),
+        }
+        true
+    }
+
+    pub(crate) fn set_layout(&mut self, item_count: usize, cols: usize, viewport_height: usize) {
+        self.cols = cols.max(1);
+        self.viewport_height = viewport_height;
+        self.selected = self.selected.min(item_count.saturating_sub(1));
+        self.ensure_visible(item_count);
+    }
+
+    fn move_selection(&mut self, item_count: usize, rows: isize) {
+        let cols = self.cols.max(1);
+        let last = item_count - 1;
+        let col = (self.selected % cols).min(last);
+        let last_row = last / cols;
+        let row = ((self.selected / cols) as isize + rows).clamp(0, last_row as isize) as usize;
+        self.selected = (row * cols + col).min(last);
+        self.ensure_visible(item_count);
+    }
+
+    fn move_column(&mut self, item_count: usize, delta: isize) {
+        if self.cols < 2 {
+            return;
+        }
+        let last = item_count - 1;
+        let row = self.selected / self.cols;
+        let col = self.selected % self.cols;
+        let last_col = (last - row * self.cols).min(self.cols - 1);
+        let new_col = (col as isize + delta).clamp(0, last_col as isize) as usize;
+        self.selected = row * self.cols + new_col;
+        self.ensure_visible(item_count);
+    }
+
+    pub(crate) fn clamp_selection(&mut self, item_count: usize) {
+        self.selected = self.selected.min(item_count.saturating_sub(1));
+        self.ensure_visible(item_count);
+    }
+
+    fn ensure_visible(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+        let cols = self.cols.max(1);
+        let total_rows = item_count.div_ceil(cols);
+        let viewport_height = self.viewport_height.max(1);
+        if total_rows > viewport_height {
+            self.scroll_offset = self.scroll_offset.min(total_rows - viewport_height);
+        } else {
+            self.scroll_offset = 0;
+        }
+        let row = self.selected / cols;
+        if row < self.scroll_offset {
+            self.scroll_offset = row;
+        } else if row >= self.scroll_offset + viewport_height {
+            self.scroll_offset = row + 1 - viewport_height;
+        }
+    }
+}
+
 /// Byte range of the `@`-token under the cursor (including its leading `@`),
 /// or `None` when the most recent `@` does not begin a token.
 pub fn at_token_range(line: &str, cursor_chars: usize) -> Option<(usize, usize)> {
@@ -92,13 +214,6 @@ impl CompletionItem {
             .to_string()
     }
 
-    fn display(&self) -> String {
-        match &self.description {
-            Some(d) if !d.is_empty() => format!("{}  {}", self.label, d),
-            _ => self.label.clone(),
-        }
-    }
-
     fn file(path: String) -> Self {
         Self::path(path, false)
     }
@@ -108,7 +223,7 @@ impl CompletionItem {
     }
 
     fn path(mut path: String, directory: bool) -> Self {
-        if directory && !path.ends_with(['/', '\\']) {
+        if directory && !path.ends_with(DIRECTORY_SUFFIX) {
             path.push(DIRECTORY_SUFFIX);
         }
         let kind = if directory { DIRECTORY_KIND } else { FILE_KIND };
@@ -168,9 +283,9 @@ fn normalize_completion_insertion(insertion: &str, file: bool) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct FileCandidate {
-    path: String,
-    is_directory: bool,
+pub(crate) struct FileCandidate {
+    pub(crate) path: String,
+    pub(crate) is_directory: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +328,7 @@ enum Discovery {
 struct Session {
     discovery: Discovery,
     query: String,
+    query_refresh_pending: bool,
     publication: CoherentCompletion,
     intent: QueryIntent,
     /// Non-file candidates from Lua sources, as `(matchable label, item)`.
@@ -227,11 +343,7 @@ struct Session {
     final_match_count: u32,
     truncated: bool,
 
-    selected: usize,
-    /// Grid layout: columns used, and scroll/viewport in whole rows.
-    cols: usize,
-    scroll_offset: usize,
-    viewport_height: usize,
+    grid: CompletionGridState,
 
     started_at: Instant,
 
@@ -251,8 +363,21 @@ impl Drop for Session {
     }
 }
 
-trait FileResolver: Send + Sync {
+pub(crate) trait FileResolver: Send + Sync {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>>;
+
+    fn visit_dir(
+        &self,
+        path: &Path,
+        visitor: &mut dyn FnMut(FileCandidate) -> bool,
+    ) -> io::Result<()> {
+        for candidate in self.read_dir(path)? {
+            if !visitor(candidate) {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -262,56 +387,194 @@ impl FileResolver for RealFileResolver {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
         discover_one_level(path)
     }
-}
 
-fn resolve_file_path(cwd: &Path, home: Option<&Path>, value: &str) -> PathBuf {
-    let path = if value == "~" {
-        home.map_or_else(|| PathBuf::from(value), Path::to_path_buf)
-    } else if let Some(rest) = value.strip_prefix("~/") {
-        home.map(|home| home.join(rest))
-            .unwrap_or_else(|| PathBuf::from(value))
-    } else {
-        PathBuf::from(value)
-    };
-    if path.is_relative() {
-        cwd.join(path)
-    } else {
-        path
+    fn visit_dir(
+        &self,
+        path: &Path,
+        visitor: &mut dyn FnMut(FileCandidate) -> bool,
+    ) -> io::Result<()> {
+        visit_one_level(path, visitor)
     }
 }
 
-fn discovery_path(cwd: &Path, home: Option<&Path>, value: &str) -> (PathBuf, String, String) {
-    let path = resolve_file_path(cwd, home, value);
-    let lists_path = value.ends_with(['/', '\\']) || matches!(value, "~" | "." | "..");
-    if lists_path {
-        let display_prefix = if value.ends_with(['/', '\\']) {
-            value.to_string()
+#[derive(Clone)]
+pub(crate) struct PathDiscovery {
+    resolver: Arc<dyn FileResolver>,
+    home: Option<PathBuf>,
+}
+
+impl PathDiscovery {
+    pub(crate) fn new(home: Option<PathBuf>) -> Self {
+        Self {
+            resolver: Arc::new(RealFileResolver),
+            home,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_resolver(resolver: Arc<dyn FileResolver>, home: Option<PathBuf>) -> Self {
+        Self { resolver, home }
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+        self.resolver.read_dir(path)
+    }
+
+    fn reference_query(&self, cwd: &Path, value: &str) -> (PathBuf, String, String) {
+        let path = if value == "~" {
+            self.home
+                .as_deref()
+                .map_or_else(|| PathBuf::from(value), Path::to_path_buf)
+        } else if let Some(rest) = value.strip_prefix("~/") {
+            self.home
+                .as_deref()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| PathBuf::from(value))
         } else {
-            format!("{value}{DIRECTORY_SUFFIX}")
+            PathBuf::from(value)
         };
-        return (path, String::new(), display_prefix);
+        let path = if path.is_relative() {
+            cwd.join(path)
+        } else {
+            path
+        };
+        let lists_path = ends_with_path_separator(value) || matches!(value, "~" | "." | "..");
+        if lists_path {
+            let display_prefix = if ends_with_path_separator(value) {
+                value.to_string()
+            } else {
+                format!("{value}{DIRECTORY_SUFFIX}")
+            };
+            return (path, String::new(), display_prefix);
+        }
+        let leaf = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let display_prefix = value.strip_suffix(&leaf).unwrap_or(value).to_string();
+        (
+            path.parent().unwrap_or(cwd).to_path_buf(),
+            leaf,
+            display_prefix,
+        )
     }
-    let leaf = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let display_prefix = value.strip_suffix(&leaf).unwrap_or(value).to_string();
-    (
-        path.parent().unwrap_or(cwd).to_path_buf(),
-        leaf,
-        display_prefix,
-    )
+
+    fn explicit_candidates(&self, cwd: &Path, value: &str) -> Vec<FileCandidate> {
+        if value.starts_with('~') && self.home.is_none() {
+            return Vec::new();
+        }
+        let (parent, leaf, display_prefix) = self.reference_query(cwd, value);
+        self.read_dir(&parent)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|candidate| {
+                leaf.is_empty()
+                    || completion_match(
+                        &leaf,
+                        &candidate.path,
+                        CompletionMatchOptions {
+                            case_matching: CaseMatching::Smart,
+                            normalization: Normalization::Smart,
+                        },
+                    )
+                    .is_some()
+            })
+            .map(|candidate| FileCandidate {
+                path: format!("{display_prefix}{}", candidate.path),
+                is_directory: candidate.is_directory,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn typed_candidates(
+        &self,
+        cwd: &Path,
+        value: &str,
+        directory_only: bool,
+    ) -> io::Result<Vec<(String, bool)>> {
+        let mut candidates = Vec::new();
+        self.visit_typed_candidates(cwd, value, directory_only, &|| false, &mut |candidate| {
+            candidates.push(candidate);
+            true
+        })?;
+        Ok(candidates)
+    }
+
+    pub(crate) fn visit_typed_candidates(
+        &self,
+        cwd: &Path,
+        value: &str,
+        directory_only: bool,
+        cancelled: &dyn Fn() -> bool,
+        visitor: &mut dyn FnMut((String, bool)) -> bool,
+    ) -> io::Result<()> {
+        let (parent, prefix, display_prefix) = self
+            .typed_query(cwd, value)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        self.resolver.visit_dir(&parent, &mut |candidate| {
+            if cancelled() {
+                return false;
+            }
+            if (directory_only && !candidate.is_directory)
+                || (!prefix.is_empty() && !candidate.path.starts_with(&prefix))
+            {
+                return true;
+            }
+            let is_directory = candidate.is_directory;
+            visitor((format!("{display_prefix}{}", candidate.path), is_directory))
+        })
+    }
+
+    fn typed_query(
+        &self,
+        cwd: &Path,
+        value: &str,
+    ) -> Result<(PathBuf, String, String), maki_commands::PathResolutionError> {
+        if value.is_empty() {
+            return Ok((cwd.to_path_buf(), String::new(), String::new()));
+        }
+        let path = maki_commands::resolve_path(cwd, self.home.as_deref(), value)?;
+        let lists_path = ends_with_path_separator(value)
+            || value == "~"
+            || matches!(value.rsplit(['/', '\\']).next(), Some("." | ".."));
+        if lists_path {
+            let display_prefix = if ends_with_path_separator(value) {
+                value.to_string()
+            } else {
+                format!("{value}{DIRECTORY_SUFFIX}")
+            };
+            return Ok((path, String::new(), display_prefix));
+        }
+        let prefix = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let display_prefix = value.strip_suffix(&prefix).unwrap_or(value).to_owned();
+        Ok((
+            path.parent().unwrap_or(cwd).to_path_buf(),
+            prefix,
+            display_prefix,
+        ))
+    }
 }
 
 fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
     let mut entries = Vec::new();
+    visit_one_level(path, &mut |candidate| {
+        entries.push(candidate);
+        true
+    })?;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+fn visit_one_level(path: &Path, visitor: &mut dyn FnMut(FileCandidate) -> bool) -> io::Result<()> {
     for entry in std::fs::read_dir(path)? {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        // `DirEntry::metadata` is an lstat, so symlinks would never satisfy the
-        // file/dir filter below; `metadata(entry.path())` follows the link.
         let metadata = match std::fs::metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(_) => continue,
@@ -319,46 +582,14 @@ fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
         if !metadata.is_file() && !metadata.is_dir() {
             continue;
         }
-        entries.push(FileCandidate {
+        if !visitor(FileCandidate {
             path: entry.file_name().to_string_lossy().into_owned(),
             is_directory: metadata.is_dir(),
-        });
+        }) {
+            break;
+        }
     }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(entries)
-}
-
-fn explicit_candidates(
-    resolver: &dyn FileResolver,
-    cwd: &Path,
-    home: Option<&Path>,
-    value: &str,
-) -> Vec<FileCandidate> {
-    if value.starts_with('~') && home.is_none() {
-        return Vec::new();
-    }
-    let (parent, leaf, display_prefix) = discovery_path(cwd, home, value);
-    resolver
-        .read_dir(&parent)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|candidate| {
-            leaf.is_empty()
-                || completion_match(
-                    &leaf,
-                    &candidate.path,
-                    CompletionMatchOptions {
-                        case_matching: CaseMatching::Smart,
-                        normalization: Normalization::Smart,
-                    },
-                )
-                .is_some()
-        })
-        .map(|candidate| FileCandidate {
-            path: format!("{display_prefix}{}", candidate.path),
-            is_directory: candidate.is_directory,
-        })
-        .collect()
+    Ok(())
 }
 
 type Walker = (Nucleo<()>, flume::Receiver<()>, Arc<AtomicBool>);
@@ -366,39 +597,31 @@ type WalkerSpawner = Arc<dyn Fn(&str) -> Option<Walker> + Send + Sync>;
 
 pub struct FileCompletionMenu {
     session: Option<Session>,
-    resolver: Arc<dyn FileResolver>,
+    discovery: PathDiscovery,
     walker_spawner: WalkerSpawner,
-    home: Option<PathBuf>,
 }
 
 impl FileCompletionMenu {
     pub fn new() -> Self {
         Self::with_dependencies(
-            Arc::new(RealFileResolver),
+            PathDiscovery::new(maki_storage::paths::home()),
             Arc::new(super::file_picker::spawn_file_walker),
-            maki_storage::paths::home(),
         )
     }
 
     #[cfg(test)]
     fn with_resolver(resolver: Arc<dyn FileResolver>, home: Option<PathBuf>) -> Self {
         Self::with_dependencies(
-            resolver,
+            PathDiscovery::with_resolver(resolver, home),
             Arc::new(super::file_picker::spawn_file_walker),
-            home,
         )
     }
 
-    fn with_dependencies(
-        resolver: Arc<dyn FileResolver>,
-        walker_spawner: WalkerSpawner,
-        home: Option<PathBuf>,
-    ) -> Self {
+    fn with_dependencies(discovery: PathDiscovery, walker_spawner: WalkerSpawner) -> Self {
         Self {
             session: None,
-            resolver,
+            discovery,
             walker_spawner,
-            home,
         }
     }
 
@@ -413,15 +636,11 @@ impl FileCompletionMenu {
     ) {
         self.close();
         let root = PathBuf::from(cwd);
-        let (discovery, walking) = if query.starts_with(['~', '/', '.']) {
+        let explicit = query.starts_with(['~', '/', '.']);
+        let (discovery, walking) = if explicit {
             (
                 Discovery::Explicit {
-                    candidates: explicit_candidates(
-                        self.resolver.as_ref(),
-                        &root,
-                        self.home.as_deref(),
-                        query,
-                    ),
+                    candidates: self.discovery.explicit_candidates(&root, query),
                 },
                 false,
             )
@@ -455,6 +674,7 @@ impl FileCompletionMenu {
         let session = Session {
             discovery,
             query: String::new(),
+            query_refresh_pending: false,
             publication: CoherentCompletion::default(),
             intent: QueryIntent {
                 payload: String::new(),
@@ -470,10 +690,7 @@ impl FileCompletionMenu {
             materialized_count: 0,
             final_match_count: 0,
             truncated: false,
-            selected: 0,
-            cols: 1,
-            scroll_offset: 0,
-            viewport_height: 0,
+            grid: CompletionGridState::default(),
             started_at: Instant::now(),
             walking,
             root,
@@ -508,6 +725,17 @@ impl FileCompletionMenu {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_for_test(&self) -> usize {
+        self.session.as_ref().map_or(0, |s| s.grid.selected())
+    }
+
+    pub fn needs_reopen(&self, cwd: &str) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|session| session.root.as_os_str() != cwd)
+    }
+
     pub fn token_byte_range(&self) -> (usize, usize) {
         self.session.as_ref().map_or((0, 0), |s| s.token_byte_range)
     }
@@ -523,18 +751,14 @@ impl FileCompletionMenu {
             return;
         };
         let explicit = query.starts_with(['~', '/', '.']);
+        session.intent = parse_query(query);
         let was_explicit = matches!(session.discovery, Discovery::Explicit { .. });
         if explicit {
             if let Discovery::Project { cancel, .. } = &session.discovery {
                 cancel.store(true, Ordering::Relaxed);
             }
             session.discovery = Discovery::Explicit {
-                candidates: explicit_candidates(
-                    self.resolver.as_ref(),
-                    &session.root,
-                    self.home.as_deref(),
-                    query,
-                ),
+                candidates: self.discovery.explicit_candidates(&session.root, query),
             };
             session.walking = false;
             session.matching = false;
@@ -560,7 +784,7 @@ impl FileCompletionMenu {
                 session.file_matches.clear();
             }
             let new_ref_matches = fuzzy_match(
-                &parse_query(query),
+                &session.intent,
                 session
                     .ref_items
                     .iter()
@@ -569,6 +793,9 @@ impl FileCompletionMenu {
                     .map(|(order, (label, item))| (label, item, order)),
             );
             let query_changed = session.query != query || was_explicit;
+            if query_changed {
+                session.query_refresh_pending = matches!(&session.discovery, Discovery::Project { nucleo, .. } if nucleo.injector().injected_items() > 0);
+            }
             if let Discovery::Project { nucleo, .. } = &mut session.discovery {
                 nucleo.pattern.reparse(
                     0,
@@ -591,11 +818,9 @@ impl FileCompletionMenu {
                 session.pending_ref_matches = None;
             }
         }
-        session.intent = parse_query(query);
         session.query = query.to_string();
         if explicit || session.publication.ready() {
-            session.selected = 0;
-            session.scroll_offset = 0;
+            session.grid.reset();
             session.coarse_match_count = 0;
             session.materialized_count = 0;
             session.final_match_count = 0;
@@ -621,7 +846,7 @@ impl FileCompletionMenu {
                 if !s.visible || !s.publication.ready() {
                     return CompletionAction::Passthrough;
                 }
-                return match s.matches.get(s.selected) {
+                return match s.matches.get(s.grid.selected()) {
                     Some(candidate) if candidate.descendable => {
                         CompletionAction::Advance(candidate.item.clone())
                     }
@@ -629,10 +854,9 @@ impl FileCompletionMenu {
                     None => CompletionAction::Passthrough,
                 };
             }
-            KeyCode::Up => move_selection(s, -1),
-            KeyCode::Down => move_selection(s, 1),
-            KeyCode::Left if !super::menu_navigation_blocked(&key) => move_column(s, -1),
-            KeyCode::Right if !super::menu_navigation_blocked(&key) => move_column(s, 1),
+            _ if s
+                .grid
+                .handle_key(&key, s.matches.len(), !s.publication.ready()) => {}
             _ => return CompletionAction::Passthrough,
         }
         CompletionAction::Consumed
@@ -701,20 +925,27 @@ impl FileCompletionMenu {
             }
         }
 
-        if publication != Publication::Wait
-            && let Some(s) = self.session.as_mut()
-        {
-            refresh_file_matches(s);
+        if let Some(s) = self.session.as_mut() {
+            let refresh_finished = s.query_refresh_pending && !s.matching;
+            if publication != Publication::Wait || refresh_finished {
+                refresh_file_matches(s);
+            }
             if publication == Publication::Commit {
                 if let Some(ref_matches) = s.pending_ref_matches.take() {
                     s.ref_matches = ref_matches;
                 }
-                s.selected = 0;
-                s.scroll_offset = 0;
+                s.grid.reset();
             }
-            rebuild_combined(s);
-            clamp_selection(s);
-            dirty = Dirty::YES;
+            if publication != Publication::Wait || refresh_finished {
+                rebuild_combined(s);
+                clamp_selection(s);
+            }
+            if refresh_finished {
+                s.query_refresh_pending = false;
+            }
+            if publication != Publication::Wait {
+                dirty = Dirty::YES;
+            }
         }
 
         (dirty, None)
@@ -726,62 +957,17 @@ impl FileCompletionMenu {
             _ => return None,
         };
 
-        let len = s.matches.len();
-        // Cap taken from the screen height: the popup is a compact overlay, not
-        // a full-height list.
-        let max_height = ((frame.area().height as u32 * 30 / 100) as u16).max(2);
-        let avail = max_height.saturating_sub(1) as usize;
-        if avail == 0 || input_area.y == 0 {
-            return None;
-        }
-
-        let cols = if len <= avail {
-            1
-        } else if len <= avail.saturating_mul(2) {
-            2
-        } else {
-            len.min(3)
-        };
-        s.cols = cols;
-        let total_rows = len.div_ceil(cols);
-        let view_rows = avail.min(total_rows);
-        s.viewport_height = view_rows;
-        ensure_visible(s);
-
-        let budget = (input_area.width as usize).saturating_sub(COL_GAP * (cols - 1)) / cols;
-        let col_widths: Vec<usize> = (0..cols)
-            .map(|j| {
-                s.matches
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| i % cols == j)
-                    .map(|(_, c)| c.item.display().chars().count())
-                    .max()
-                    .unwrap_or(0)
-                    .min(budget)
+        let items: Vec<_> = s
+            .matches
+            .iter()
+            .map(|candidate| CompletionGridItem {
+                label: &candidate.item.label,
+                description: candidate.item.description.as_deref(),
+                indices: &candidate.matching.indices,
+                kind: &candidate.item.kind,
             })
             .collect();
-        let total_width = col_widths.iter().sum::<usize>() + COL_GAP * (cols - 1);
-        let popup_height = (view_rows as u16 + 1).min(max_height);
-        let popup = Rect {
-            x: input_area.x,
-            y: input_area.y.saturating_sub(popup_height),
-            width: total_width.clamp(1, input_area.width.max(1) as usize) as u16,
-            height: popup_height,
-        };
-
-        let t = theme::current();
-        let lines = build_grid(s, view_rows, cols, &col_widths, &t);
-
-        frame.render_widget(Clear, popup);
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .style(Style::new().bg(t.background));
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        frame.render_widget(Paragraph::new(lines), inner);
-
-        Some(popup)
+        render_completion_grid(frame, input_area, &items, &mut s.grid)
     }
 }
 
@@ -802,9 +988,9 @@ fn parse_query(query: &str) -> QueryIntent {
                     has_colon: false,
                 };
             }
-            if let Some(payload_start) = lowered.strip_prefix(&format!("{alias}:")) {
-                let payload_start = payload_start.as_ptr() as usize - lowered.as_ptr() as usize;
-                let payload = &query[payload_start..];
+            let prefix = format!("{alias}:");
+            if lowered.starts_with(&prefix) {
+                let payload = &query[prefix.len()..];
                 return QueryIntent {
                     payload: payload.into(),
                     kind: Some(kind),
@@ -899,20 +1085,29 @@ fn refresh_file_matches(s: &mut Session) {
         return;
     };
     let snapshot = nucleo.snapshot();
+    let mut paths = Vec::new();
+    let scan_count = snapshot.matched_item_count().min(MAX_MATERIALIZED);
+    for item in snapshot.matched_items(0..scan_count) {
+        let path = item.matcher_columns[0].slice(..);
+        if paths.len() < MAX_MATERIALIZED as usize {
+            paths.push(path.to_string());
+        }
+    }
     let coarse_match_count = snapshot.matched_item_count();
-    let materialized_count = coarse_match_count.min(MAX_MATERIALIZED);
-    let mut paths: Vec<String> = snapshot
-        .matched_items(0..materialized_count)
-        .map(|item| item.matcher_columns[0].to_string())
-        .collect();
+    let materialized_count = paths.len() as u32;
     paths.sort();
     s.coarse_match_count = coarse_match_count;
     s.materialized_count = materialized_count;
     s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
-        let item = CompletionItem::file(path);
-        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, false) {
+        let directory = path.ends_with(DIRECTORY_SUFFIX);
+        let item = if directory {
+            CompletionItem::directory(path)
+        } else {
+            CompletionItem::file(path)
+        };
+        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, directory) {
             s.file_matches.push(candidate);
         }
     }
@@ -966,85 +1161,111 @@ fn highlight_indices(label: &str, query: &str) -> Option<Vec<u32>> {
     completion_match_default(query, label).map(|matching| matching.indices)
 }
 
-fn move_selection(s: &mut Session, rows: isize) {
-    if s.matches.is_empty() {
-        return;
-    }
-    let cols = s.cols.max(1);
-    let last = s.matches.len() - 1;
-    let col = (s.selected % cols).min(last);
-    let last_row = last / cols;
-    let row = ((s.selected / cols) as isize + rows).clamp(0, last_row as isize) as usize;
-    s.selected = (row * cols + col).min(last);
-    ensure_visible(s);
-}
-
-/// Moves one column left or right within the same grid row, clamped at the
-/// row's boundaries. The final row may hold fewer than `cols` items.
-fn move_column(s: &mut Session, delta: isize) {
-    if s.matches.is_empty() || s.cols < 2 {
-        return;
-    }
-    let cols = s.cols;
-    let last = s.matches.len() - 1;
-    let row = s.selected / cols;
-    let col = s.selected % cols;
-    let last_col = (last - row * cols).min(cols - 1);
-    let new_col = (col as isize + delta).clamp(0, last_col as isize) as usize;
-    s.selected = row * cols + new_col;
-    ensure_visible(s);
-}
-
 fn clamp_selection(s: &mut Session) {
-    if s.matches.is_empty() {
-        s.selected = 0;
-        s.scroll_offset = 0;
-    } else {
-        s.selected = s.selected.min(s.matches.len() - 1);
-        ensure_visible(s);
-    }
+    s.grid.clamp_selection(s.matches.len());
 }
 
-fn ensure_visible(s: &mut Session) {
-    let cols = s.cols.max(1);
-    let total_rows = s.matches.len().div_ceil(cols);
-    let vh = s.viewport_height.max(1);
+pub(crate) fn render_completion_grid(
+    frame: &mut Frame,
+    input_area: Rect,
+    items: &[CompletionGridItem<'_>],
+    grid: &mut CompletionGridState,
+) -> Option<Rect> {
+    if items.is_empty() || input_area.y == 0 {
+        return None;
+    }
 
-    if total_rows > vh {
-        s.scroll_offset = s.scroll_offset.min(total_rows - vh);
+    let max_height = ((frame.area().height as u32 * 30 / 100) as u16).max(2);
+    let avail = max_height.saturating_sub(1) as usize;
+    if avail == 0 {
+        return None;
+    }
+
+    let len = items.len();
+    let cols = if len <= avail {
+        1
+    } else if len <= avail.saturating_mul(2) {
+        2
     } else {
-        s.scroll_offset = 0;
-    }
+        len.min(3)
+    };
+    let total_rows = len.div_ceil(cols);
+    let view_rows = avail.min(total_rows);
+    grid.set_layout(len, cols, view_rows);
+    let selected = grid.selected();
 
-    let row = s.selected / cols;
-    if row < s.scroll_offset {
-        s.scroll_offset = row;
-    } else if row >= s.scroll_offset + vh {
-        s.scroll_offset = row + 1 - vh;
-    }
+    let budget = (input_area.width as usize).saturating_sub(COL_GAP * (cols - 1)) / cols;
+    let col_widths: Vec<usize> = (0..cols)
+        .map(|column| {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| index % cols == column)
+                .map(|(_, item)| completion_item_width(item))
+                .max()
+                .unwrap_or(0)
+                .min(budget)
+        })
+        .collect();
+    let popup_height = (view_rows as u16 + 1).min(max_height);
+    let popup = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(popup_height),
+        width: input_area.width.max(1),
+        height: popup_height,
+    };
+
+    let t = theme::current();
+    let lines = build_grid(
+        items,
+        view_rows,
+        cols,
+        &col_widths,
+        grid.scroll_offset(),
+        selected,
+        &t,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .style(Style::new().bg(t.background));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    Some(popup)
+}
+
+fn completion_item_width(item: &CompletionGridItem<'_>) -> usize {
+    item.label.chars().count()
+        + item
+            .description
+            .filter(|description| !description.is_empty())
+            .map_or(0, |description| description.chars().count() + 2)
 }
 
 fn build_grid<'a>(
-    s: &Session,
+    items: &[CompletionGridItem<'_>],
     view_rows: usize,
     cols: usize,
     col_widths: &[usize],
+    scroll_offset: usize,
+    selected: usize,
     t: &'a theme::Theme,
 ) -> Vec<Line<'a>> {
-    let len = s.matches.len();
     let mut lines = Vec::with_capacity(view_rows);
 
-    for r in 0..view_rows {
-        let row = s.scroll_offset + r;
+    for row_offset in 0..view_rows {
+        let row = scroll_offset + row_offset;
         let mut spans = Vec::new();
-        for (j, width) in col_widths.iter().enumerate() {
-            let idx = row * cols + j;
-            if idx < len {
-                spans.extend(cell_line(&s.matches[idx], *width, idx == s.selected, t).spans);
+        for (column, width) in col_widths.iter().enumerate() {
+            let index = row * cols + column;
+            if let Some(item) = items.get(index) {
+                spans.extend(cell_line(item, *width, index == selected, t).spans);
             } else {
                 spans.push(Span::raw(" ".repeat(*width)));
             }
-            if j + 1 < cols {
+            if column + 1 < cols {
                 spans.push(Span::raw(" ".repeat(COL_GAP)));
             }
         }
@@ -1053,13 +1274,14 @@ fn build_grid<'a>(
     lines
 }
 
-fn cell_line<'a>(c: &Candidate, width: usize, selected: bool, t: &'a theme::Theme) -> Line<'a> {
+fn cell_line<'a>(
+    item: &CompletionGridItem<'_>,
+    width: usize,
+    selected: bool,
+    t: &'a theme::Theme,
+) -> Line<'a> {
     let base = if selected { t.item_selected } else { t.item };
-    let kind_style = t
-        .completion_kinds
-        .get(&c.item.kind)
-        .copied()
-        .unwrap_or(base);
+    let kind_style = t.completion_kinds.get(item.kind).copied().unwrap_or(base);
     // Matched characters keep the kind foreground but also carry the
     // selection background, so the highlight is not cut out of the selected
     // row.
@@ -1071,19 +1293,24 @@ fn cell_line<'a>(c: &Candidate, width: usize, selected: bool, t: &'a theme::Them
     } else {
         kind_style
     };
-    let text = c.item.display();
+    let text = match item.description {
+        Some(description) if !description.is_empty() => {
+            format!("{}  {}", item.label, description)
+        }
+        _ => item.label.to_owned(),
+    };
     let mut spans: Vec<Span<'a>> = Vec::new();
     let mut used = 0usize;
     let mut in_match = false;
     let mut run = String::new();
 
-    for (i, ch) in text.chars().enumerate() {
+    for (index, ch) in text.chars().enumerate() {
         let cw = ch.width().unwrap_or(0);
         if used + cw > width {
             break;
         }
         used += cw;
-        let is_match = c.matching.indices.binary_search(&(i as u32)).is_ok();
+        let is_match = item.indices.binary_search(&(index as u32)).is_ok();
         if is_match != in_match && !run.is_empty() {
             spans.push(Span::styled(
                 mem::take(&mut run),
@@ -1182,6 +1409,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
             query: String::new(),
+            query_refresh_pending: false,
             publication: CoherentCompletion::default(),
             intent: QueryIntent {
                 payload: String::new(),
@@ -1197,10 +1425,7 @@ mod tests {
             materialized_count: 0,
             final_match_count: 0,
             truncated: false,
-            selected: 0,
-            cols: 1,
-            scroll_offset: 0,
-            viewport_height: 0,
+            grid: CompletionGridState::default(),
             started_at: Instant::now(),
             walking: true,
             root: PathBuf::new(),
@@ -1248,7 +1473,10 @@ mod tests {
             reads: std::sync::Mutex::new(Vec::new()),
             entries: Vec::new(),
         });
-        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
 
         menu.open("/project", Vec::new(), "../", (0, 3));
         assert!(spawns.lock().unwrap().is_empty());
@@ -1269,7 +1497,10 @@ mod tests {
                 is_directory: false,
             }],
         });
-        let mut menu = FileCompletionMenu::with_dependencies(resolver, Arc::new(|_| None), None);
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            Arc::new(|_| None),
+        );
         menu.open("/project", Vec::new(), "../out", (0, 7));
         assert!(menu.has_selectable());
 
@@ -1300,7 +1531,10 @@ mod tests {
                 is_directory: false,
             }],
         });
-        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
         menu.open("/project", Vec::new(), "src", (0, 4));
         menu.sync_query("../out");
         drop(done_tx);
@@ -1348,12 +1582,14 @@ mod tests {
             Some((nucleo, done_rx, Arc::new(AtomicBool::new(false))))
         });
         let mut menu = FileCompletionMenu::with_dependencies(
-            Arc::new(CountingResolver {
-                reads: std::sync::Mutex::new(Vec::new()),
-                entries: Vec::new(),
-            }),
+            PathDiscovery::with_resolver(
+                Arc::new(CountingResolver {
+                    reads: std::sync::Mutex::new(Vec::new()),
+                    entries: Vec::new(),
+                }),
+                None,
+            ),
             spawner,
-            None,
         );
         menu.open("/project", Vec::new(), "src", (0, 4));
 
@@ -1374,7 +1610,10 @@ mod tests {
                 is_directory: false,
             }],
         });
-        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
         menu.open(
             "/project",
             vec![item("skill:review", "skill", "@skill:review")],
@@ -1434,7 +1673,7 @@ mod tests {
     #[test]
     fn explicit_discovery_reads_parent_once_and_marks_directories() {
         let cwd = PathBuf::from("/workspace/project");
-        let resolver = CountingResolver {
+        let resolver = Arc::new(CountingResolver {
             reads: std::sync::Mutex::new(Vec::new()),
             entries: vec![
                 FileCandidate {
@@ -1446,26 +1685,132 @@ mod tests {
                     is_directory: true,
                 },
             ],
-        };
-        let candidates = explicit_candidates(&resolver, &cwd, None, "../ar");
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+        let candidates = discovery.explicit_candidates(&cwd, "../ar");
         assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[cwd.join("..")]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, "../archive");
         assert!(candidates[0].is_directory);
     }
 
+    #[test_case(".", "/workspace/project/.", "./archive"; "current_directory")]
+    #[test_case("./ar", "/workspace/project", "./archive"; "current_prefix")]
+    #[test_case("..", "/workspace/project/..", "../archive"; "parent_directory")]
+    #[test_case("../ar", "/workspace/project/..", "../archive"; "parent_prefix")]
+    #[test_case("/outside/", "/outside", "/outside/archive"; "absolute_directory")]
+    #[test_case("/outside/ar", "/outside", "/outside/archive"; "absolute_prefix")]
+    #[test_case("~", "/home/tester", "~/archive"; "home_directory")]
+    #[test_case("~/ar", "/home/tester", "~/archive"; "home_prefix")]
+    #[test_case("nested/", "/workspace/project/nested", "nested/archive"; "relative_directory")]
+    #[test_case("nested/ar", "/workspace/project/nested", "nested/archive"; "relative_prefix")]
+    #[test_case("nested/.", "/workspace/project/nested/.", "nested/./archive"; "nested_current_directory")]
+    #[test_case("nested/./", "/workspace/project/nested/.", "nested/./archive"; "nested_current_directory_separator")]
+    #[test_case("nested/..", "/workspace/project/nested/..", "nested/../archive"; "nested_parent_directory")]
+    #[test_case("nested/../", "/workspace/project/nested/..", "nested/../archive"; "nested_parent_directory_separator")]
+    #[test_case("/outside/.", "/outside/.", "/outside/./archive"; "absolute_current_directory")]
+    #[test_case("/outside/./", "/outside/.", "/outside/./archive"; "absolute_current_directory_separator")]
+    #[test_case("/outside/..", "/outside/..", "/outside/../archive"; "absolute_parent_directory")]
+    #[test_case("/outside/../", "/outside/..", "/outside/../archive"; "absolute_parent_directory_separator")]
+    fn typed_paths_use_resolver(query: &str, parent: &str, expected: &str) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![
+                FileCandidate {
+                    path: "archive.txt".into(),
+                    is_directory: false,
+                },
+                FileCandidate {
+                    path: "archive".into(),
+                    is_directory: true,
+                },
+            ],
+        });
+        let discovery =
+            PathDiscovery::with_resolver(resolver.clone(), Some(PathBuf::from("/home/tester")));
+
+        let candidates = discovery
+            .typed_candidates(Path::new("/workspace/project"), query, true)
+            .unwrap();
+
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(candidates, vec![(expected.to_owned(), true)]);
+    }
+
+    #[cfg(windows)]
+    #[test_case("src/", "C:\\work\\src", "src/child"; "relative_forward_slash")]
+    #[test_case("./src/", "C:\\work\\src", "./src/child"; "relative_dot_forward_slash")]
+    #[test_case("C:/work/src/", "C:\\work\\src", "C:/work/src/child"; "absolute_forward_slash")]
+    #[test_case("src\\nested/", "C:\\work\\src\\nested", "src\\nested/child"; "mixed_separators")]
+    fn windows_typed_directory_input_accepts_both_separators(
+        query: &str,
+        parent: &str,
+        expected: &str,
+    ) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "child".into(),
+                is_directory: true,
+            }],
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+
+        let candidates = discovery
+            .typed_candidates(Path::new("C:\\work"), query, true)
+            .unwrap();
+
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(candidates, vec![(expected.to_owned(), true)]);
+    }
+
+    #[cfg(windows)]
+    #[test_case("src/", "C:\\work\\src", "src/child"; "relative_forward_slash")]
+    #[test_case("./src/", "C:\\work\\src", "./src/child"; "relative_dot_forward_slash")]
+    #[test_case("C:/work/src/", "C:\\work\\src", "C:/work/src/child"; "absolute_forward_slash")]
+    #[test_case("src\\nested/", "C:\\work\\src\\nested", "src\\nested/child"; "mixed_separators")]
+    fn windows_reference_directory_input_accepts_both_separators(
+        query: &str,
+        parent: &str,
+        expected: &str,
+    ) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![FileCandidate {
+                path: "child".into(),
+                is_directory: true,
+            }],
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+
+        let candidates = discovery.explicit_candidates(Path::new("C:\\work"), query);
+
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(candidates[0].path, expected);
+    }
+
     #[test]
     fn home_discovery_preserves_tilde_namespace() {
         let cwd = PathBuf::from("/workspace/project");
         let home = PathBuf::from("/home/tester");
-        let resolver = CountingResolver {
+        let resolver = Arc::new(CountingResolver {
             reads: std::sync::Mutex::new(Vec::new()),
             entries: vec![FileCandidate {
                 path: "notes.txt".into(),
                 is_directory: false,
             }],
-        };
-        let candidates = explicit_candidates(&resolver, &cwd, Some(&home), "~/not");
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), Some(home.clone()));
+        let candidates = discovery.explicit_candidates(&cwd, "~/not");
         assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[home]);
         assert_eq!(candidates[0].path, "~/notes.txt");
     }
@@ -1894,33 +2239,50 @@ mod tests {
         menu
     }
 
-    #[test_case(0, -5, 0    ; "clamps_at_start")]
-    #[test_case(4, 5, 4     ; "clamps_at_end")]
-    #[test_case(2, 1, 3     ; "moves_down")]
-    #[test_case(2, -1, 1    ; "moves_up")]
-    fn move_selection_behavior(start: usize, delta: isize, expected: usize) {
-        let mut menu = menu_with_matches(5);
-        let s = menu.session.as_mut().unwrap();
-        s.viewport_height = 10;
-        s.selected = start;
-        move_selection(s, delta);
-        assert_eq!(s.selected, expected);
+    #[test_case(0, KeyCode::Up, 0     ; "up_clamps_at_start")]
+    #[test_case(4, KeyCode::Down, 4   ; "down_clamps_at_end")]
+    #[test_case(2, KeyCode::Down, 3   ; "moves_down")]
+    #[test_case(2, KeyCode::Up, 1     ; "moves_up")]
+    fn grid_vertical_behavior(start: usize, key_code: KeyCode, expected: usize) {
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(5, 1, 10);
+        grid.set_selected(start);
+        assert!(grid.handle_key(&key(key_code), 5, false));
+        assert_eq!(grid.selected(), expected);
     }
 
-    #[test_case(1, -1, 0   ; "left_steps_to_prev_column")]
-    #[test_case(0, -1, 0   ; "left_clamps_at_first_column")]
-    #[test_case(0, 1, 1    ; "right_steps_to_next_column")]
-    #[test_case(1, 1, 1    ; "right_clamps_at_row_end")]
-    #[test_case(4, 1, 4    ; "partial_last_row_clamps")]
-    fn move_column_behavior(start: usize, delta: isize, expected: usize) {
+    #[test_case(1, KeyCode::Left, 0   ; "left_steps_to_prev_column")]
+    #[test_case(0, KeyCode::Left, 0   ; "left_clamps_at_first_column")]
+    #[test_case(0, KeyCode::Right, 1  ; "right_steps_to_next_column")]
+    #[test_case(1, KeyCode::Right, 1  ; "right_clamps_at_row_end")]
+    #[test_case(4, KeyCode::Right, 4  ; "partial_last_row_clamps")]
+    fn grid_horizontal_behavior(start: usize, key_code: KeyCode, expected: usize) {
         // 5 items in 2 columns: row 0 = 0,1; row 1 = 2,3; row 2 = 4.
-        let mut menu = menu_with_matches(5);
-        let s = menu.session.as_mut().unwrap();
-        s.cols = 2;
-        s.viewport_height = 10;
-        s.selected = start;
-        move_column(s, delta);
-        assert_eq!(s.selected, expected);
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(5, 2, 10);
+        grid.set_selected(start);
+        assert!(grid.handle_key(&key(key_code), 5, false));
+        assert_eq!(grid.selected(), expected);
+    }
+
+    #[test_case(0, KeyCode::Down, 2, 0, 0 ; "down_one_row")]
+    #[test_case(2, KeyCode::Down, 4, 1, 0 ; "down_scrolls")]
+    #[test_case(6, KeyCode::Down, 6, 2, 0 ; "down_clamps_last_row")]
+    #[test_case(4, KeyCode::Up, 2, 1, 1 ; "up_keeps_viewport")]
+    fn grid_navigation_updates_selection_and_scroll(
+        start: usize,
+        key_code: KeyCode,
+        expected_selection: usize,
+        expected_scroll: usize,
+        initial_scroll: usize,
+    ) {
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(7, 2, 2);
+        grid.set_selected(start);
+        grid.set_scroll_offset(initial_scroll);
+        assert!(grid.handle_key(&key(key_code), 7, false));
+        assert_eq!(grid.selected(), expected_selection);
+        assert_eq!(grid.scroll_offset(), expected_scroll);
     }
 
     #[test]
@@ -1928,23 +2290,23 @@ mod tests {
         let mut menu = menu_with_matches(5);
         let s = menu.session.as_mut().unwrap();
         s.visible = true;
-        s.cols = 2;
+        s.grid.set_layout(s.matches.len(), 2, 10);
         assert!(matches!(
             menu.handle_key(key(KeyCode::Right)),
             CompletionAction::Consumed
         ));
-        assert_eq!(menu.session.as_ref().unwrap().selected, 1);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 1);
         // Row 0 is full (0,1); a further Right clamps in place.
         assert!(matches!(
             menu.handle_key(key(KeyCode::Right)),
             CompletionAction::Consumed
         ));
-        assert_eq!(menu.session.as_ref().unwrap().selected, 1);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 1);
         assert!(matches!(
             menu.handle_key(key(KeyCode::Left)),
             CompletionAction::Consumed
         ));
-        assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
     }
 
     #[test]
@@ -1958,7 +2320,7 @@ mod tests {
             let mut menu = menu_with_matches(5);
             let s = menu.session.as_mut().unwrap();
             s.visible = true;
-            s.cols = 2;
+            s.grid.set_layout(s.matches.len(), 2, 10);
             for code in [KeyCode::Left, KeyCode::Right] {
                 assert!(
                     matches!(
@@ -1967,7 +2329,7 @@ mod tests {
                     ),
                     "{mods:?}+{code:?} should reach the prompt buffer"
                 );
-                assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+                assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
             }
         }
     }
@@ -2000,12 +2362,12 @@ mod tests {
             menu.handle_key(key(KeyCode::Char('a'))),
             CompletionAction::Passthrough
         ));
-        let sel = menu.session.as_ref().unwrap().selected;
+        let sel = menu.session.as_ref().unwrap().grid.selected();
         assert!(matches!(
             menu.handle_key(key(KeyCode::Down)),
             CompletionAction::Consumed
         ));
-        assert_eq!(menu.session.as_ref().unwrap().selected, sel + 1);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), sel + 1);
     }
 
     #[test]
@@ -2045,7 +2407,13 @@ mod tests {
         let t = theme::InMemoryThemesProvider::bundled()
             .load("makima")
             .unwrap();
-        let line = cell_line(&c, 40, true, &t);
+        let item = CompletionGridItem {
+            label: &c.item.label,
+            description: c.item.description.as_deref(),
+            indices: &c.matching.indices,
+            kind: &c.item.kind,
+        };
+        let line = cell_line(&item, 40, true, &t);
         let kind = t.completion_kinds.get("skill").copied().unwrap_or(t.item);
         let expected_match = Style {
             bg: t.item_selected.bg,
@@ -2359,6 +2727,29 @@ mod tests {
     }
 
     #[test]
+    fn project_root_preserves_files_and_directories() {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.walking = false;
+        let root = DIRECTORY_SUFFIX.to_string();
+        for path in [root.as_str(), "src/", "文档/", "file.rs"] {
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| columns[0] = Utf32String::from(path));
+        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().materialized_count > 0,
+            "root matcher did not settle",
+        );
+        let expected = vec![root.as_str(), "file.rs", "src/", "文档/"];
+        assert_eq!(labels(&menu), expected);
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.coarse_match_count, expected.len() as u32);
+        assert!(!session.truncated);
+    }
+
+    #[test]
     fn file_refresh_tracks_materialization_boundary() {
         let mut menu = session_with_items(Vec::new());
         {
@@ -2397,7 +2788,7 @@ mod tests {
                 columns[0] = Utf32String::from("needle-file");
             });
         session.walking = false;
-        session.selected = 99;
+        session.grid.set_selected(99);
         project_nucleo_mut(session).tick(0);
         menu.sync_query("needle");
         wait_for_matcher(
@@ -2405,7 +2796,7 @@ mod tests {
             |menu| menu.session.as_ref().unwrap().publication.ready(),
             "file matcher did not settle",
         );
-        assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
     }
 
     #[test]
@@ -2476,15 +2867,15 @@ mod tests {
         let before_rect = rendered_rect.get();
         {
             let session = menu.session.as_mut().unwrap();
-            session.selected = 2;
-            session.scroll_offset = 1;
+            session.grid.set_selected(2);
+            session.grid.set_scroll_offset(1);
         }
 
         menu.sync_query("gamma");
         let session = menu.session.as_ref().unwrap();
         assert!(session.publication.pending());
-        assert_eq!(session.selected, 2);
-        assert_eq!(session.scroll_offset, 1);
+        assert_eq!(session.grid.selected(), 2);
+        assert_eq!(session.grid.scroll_offset(), 1);
         assert_eq!(labels(&menu), before);
         terminal
             .draw(|frame| rendered_rect.set(menu.view(frame, input_area).unwrap()))
@@ -2507,8 +2898,8 @@ mod tests {
         );
         assert_eq!(labels(&menu), vec!["gamma-file", "gamma-file-plugin"]);
         let session = menu.session.as_ref().unwrap();
-        assert_eq!(session.selected, 0);
-        assert_eq!(session.scroll_offset, 0);
+        assert_eq!(session.grid.selected(), 0);
+        assert_eq!(session.grid.scroll_offset(), 0);
     }
 
     #[test]
@@ -2569,7 +2960,7 @@ mod tests {
     }
 
     #[test]
-    fn view_popup_above_input_area() {
+    fn view_grid_uses_full_input_width() {
         let mut menu = menu_with_matches(3);
         let s = menu.session.as_mut().unwrap();
         s.visible = true;
@@ -2587,6 +2978,7 @@ mod tests {
             .draw(|frame| {
                 let rect = menu.view(frame, input_area).unwrap();
                 assert_eq!(rect.y, 10 - rect.height);
+                assert_eq!(rect.width, input_area.width);
             })
             .unwrap();
     }
