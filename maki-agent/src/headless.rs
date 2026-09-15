@@ -395,6 +395,32 @@ async fn persist_history(session_id: MakiId, history: &[Message]) -> Result<(), 
         .map_err(|error| error.to_string())
 }
 
+async fn checkpoint_and_forward_terminal(
+    committer: Option<crate::session_coordinator::SessionLeaseCommitter>,
+    session_id: MakiId,
+    history: &[Message],
+    timeout: std::time::Duration,
+    terminal: Option<Envelope>,
+    raw_tx: &flume::Sender<Envelope>,
+) -> Result<(), String> {
+    let commit = match committer {
+        Some(committer) => Some(
+            committer
+                .begin_history_commit(history.to_vec(), Some(timeout))
+                .await,
+        ),
+        None => None,
+    };
+    if let Some(terminal) = terminal {
+        let _ = raw_tx.send(terminal);
+    }
+    match commit {
+        Some(Ok(commit)) => commit.wait().await.map_err(|error| error.to_string()),
+        Some(Err(error)) => Err(error.to_string()),
+        None => persist_history(session_id, history).await,
+    }
+}
+
 enum InteractiveWake {
     Input(AgentInput),
     Control(InteractiveControl),
@@ -880,23 +906,17 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 if let TurnOutcome::Failed { failure, .. } = &outcome {
                     error!(error = %failure.user_message, "agent error");
                 }
-                let checkpoint = match lease_committer {
-                    Some(committer) => committer
-                        .commit_history(history.as_slice().to_vec())
-                        .await
-                        .map_err(|error| error.to_string()),
-                    None => persist_history(session_id, history.as_slice()).await,
-                };
-                match checkpoint {
-                    Ok(()) => {
-                        if let Some(terminal) = terminal {
-                            let _ = raw_tx.send(terminal);
-                        }
-                    }
-                    Err(error) => {
-                        error!(%error, %session_id, "failed to checkpoint completed turn");
-                        let _ = error_tx.send(AgentEvent::ControlError { message: error });
-                    }
+                if let Err(error) = checkpoint_and_forward_terminal(
+                    lease_committer,
+                    session_id,
+                    history.as_slice(),
+                    params.timeouts.low_speed,
+                    terminal,
+                    &raw_tx,
+                )
+                .await
+                {
+                    error!(%error, %session_id, "failed to checkpoint completed turn");
                 }
                 run_id += 1;
             }
@@ -1221,6 +1241,86 @@ mod tests {
                     })
                     .is_err()
             );
+        });
+    }
+
+    #[test]
+    fn terminal_precedes_never_resolving_checkpoint_and_next_lease_recovers() {
+        smol::block_on(async {
+            let session_id = MakiId::generate();
+            let checkpoint: Arc<
+                dyn maki_storage::checkpoint::CheckpointWriter<
+                        crate::session_coordinator::SessionCheckpoint,
+                    >,
+            > = Arc::new(|_| {
+                Box::pin(std::future::pending()) as maki_storage::checkpoint::CheckpointFuture
+            });
+            let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+                session_id,
+                catalog: Default::default(),
+                definitions: builtin_option_definitions(
+                    "test/model",
+                    [Arc::from("test/model")],
+                    false,
+                    false,
+                    false,
+                    Default::default(),
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from("test/model"),
+                cwd: PathBuf::from("/project"),
+                model_policy: Arc::default(),
+                model_adopter: Arc::new(|_| {
+                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path| {
+                    Box::pin(async move { Ok(path) })
+                        as crate::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint,
+                mailbox: SessionMailbox::new(session_id),
+            })
+            .unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let committer = lease.committer().unwrap();
+            let outcome = TurnOutcome::Completed {
+                agent_id: AgentId::generate(),
+                turn_id: TurnId::generate(),
+                usage: TokenUsage::default(),
+                num_turns: 1,
+                reason: crate::DoneReason::EndTurn,
+            };
+            let terminal = Envelope {
+                event: AgentEvent::TurnOutcome(outcome.clone()),
+                subagent: None,
+                run_id: 0,
+            };
+            let (raw_tx, raw_rx) = flume::unbounded();
+            let history = [Message::user("first".into())];
+            let mut checkpoint = Box::pin(checkpoint_and_forward_terminal(
+                Some(committer),
+                session_id,
+                &history,
+                std::time::Duration::ZERO,
+                Some(terminal),
+                &raw_tx,
+            ));
+            assert!(
+                futures_lite::future::poll_once(&mut checkpoint)
+                    .await
+                    .is_none()
+            );
+
+            let forwarded = raw_rx.recv_async().await.unwrap();
+            assert!(matches!(forwarded.event, AgentEvent::TurnOutcome(got) if got == outcome));
+            assert!(checkpoint.await.is_err());
+            drop(lease);
+
+            let next = coordinator.acquire_lease().await.unwrap();
+            assert!(coordinator.read().history().is_empty());
+            drop(next);
+            coordinator.close().await.unwrap();
         });
     }
 

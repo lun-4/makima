@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use maki_config::ModelPolicy;
 use maki_providers::{Message, Model, ThinkingConfig};
@@ -47,12 +48,14 @@ pub struct SessionOptionCatalog {
 static DIRECTORY: LazyLock<Mutex<LiveSessions>> =
     LazyLock::new(|| Mutex::new(LiveSessions::default()));
 static GENERATION: AtomicU64 = AtomicU64::new(1);
+const CHECKPOINT_TIMEOUT_MESSAGE: &str = "checkpoint deadline exceeded";
 
 #[derive(Clone)]
 struct DirectoryEntry {
     generation: u64,
     tx: flume::Sender<Operation>,
     read: SessionReadHandle,
+    catalog: SessionOptionCatalog,
     mailbox: SessionMailbox,
 }
 
@@ -96,6 +99,7 @@ pub struct SessionCoordinatorHandle {
     generation: u64,
     tx: flume::Sender<Operation>,
     read: SessionReadHandle,
+    catalog: SessionOptionCatalog,
 }
 
 pub struct PreparedSessionCoordinator {
@@ -128,9 +132,15 @@ pub struct SessionLeaseCommitter {
     released: flume::Sender<LeaseRelease>,
 }
 
+pub struct SessionHistoryCommit {
+    session_id: MakiId,
+    response: flume::Receiver<Result<(), SessionCoordinatorError>>,
+}
+
 enum LeaseRelease {
     CommitHistory {
         history: Arc<Vec<Message>>,
+        timeout: Option<Duration>,
         reply: flume::Sender<Result<(), SessionCoordinatorError>>,
     },
     Release,
@@ -392,6 +402,7 @@ impl SessionCoordinatorHandle {
             generation: entry.generation,
             tx: entry.tx.clone(),
             read: entry.read.clone(),
+            catalog: entry.catalog.clone(),
         })
     }
 
@@ -527,6 +538,7 @@ impl SessionCoordinatorHandle {
 
     pub fn retire(&self) {
         unregister(self.session_id, self.generation);
+        self.catalog.unregister(self.session_id, self.generation);
         let (reply, _) = flume::bounded(1);
         let _ = self.tx.send(Operation::Close { reply });
     }
@@ -586,6 +598,7 @@ impl PreparedSessionCoordinator {
                 generation,
                 tx,
                 read,
+                catalog: catalog.clone(),
             },
             catalog,
             model_policy,
@@ -646,6 +659,7 @@ impl PreparedSessionCoordinator {
                 generation: handle.generation,
                 tx: handle.tx.clone(),
                 read: handle.read.clone(),
+                catalog: catalog.clone(),
                 mailbox,
             },
         );
@@ -716,15 +730,33 @@ impl SessionLeaseCommitter {
         &self,
         history: Vec<Message>,
     ) -> Result<(), SessionCoordinatorError> {
+        self.begin_history_commit(history, None).await?.wait().await
+    }
+
+    pub async fn begin_history_commit(
+        &self,
+        history: Vec<Message>,
+        timeout: Option<Duration>,
+    ) -> Result<SessionHistoryCommit, SessionCoordinatorError> {
         let (reply, response) = flume::bounded(1);
         self.released
             .send_async(LeaseRelease::CommitHistory {
                 history: Arc::new(history),
+                timeout,
                 reply,
             })
             .await
             .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
-        response
+        Ok(SessionHistoryCommit {
+            session_id: self.session_id,
+            response,
+        })
+    }
+}
+
+impl SessionHistoryCommit {
+    pub async fn wait(self) -> Result<(), SessionCoordinatorError> {
+        self.response
             .recv_async()
             .await
             .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?
@@ -988,8 +1020,12 @@ async fn hold_lease(
         })
         .await
         {
-            Either::Left(Ok(LeaseRelease::CommitHistory { history, reply })) => {
-                let result = replace_history(&ctx.read, &*ctx.checkpoint, history).await;
+            Either::Left(Ok(LeaseRelease::CommitHistory {
+                history,
+                timeout,
+                reply,
+            })) => {
+                let result = commit_history(ctx, history, timeout).await;
                 let _ = reply.send(result);
                 let _ = wait.recv_async().await;
                 return;
@@ -1013,6 +1049,28 @@ async fn hold_lease(
 enum Either<L, R> {
     Left(L),
     Right(R),
+}
+
+async fn commit_history(
+    ctx: &CoordinatorCtx,
+    history: Arc<Vec<Message>>,
+    timeout: Option<Duration>,
+) -> Result<(), SessionCoordinatorError> {
+    let Some(timeout) = timeout else {
+        return replace_history(&ctx.read, &*ctx.checkpoint, history).await;
+    };
+    futures_lite::future::or(
+        replace_history(&ctx.read, &*ctx.checkpoint, history),
+        async {
+            smol::Timer::after(timeout).await;
+            Err(CheckpointError::Save {
+                session_id: ctx.session_id,
+                message: Arc::from(CHECKPOINT_TIMEOUT_MESSAGE),
+            }
+            .into())
+        },
+    )
+    .await
 }
 
 async fn abort_plugin_options(
@@ -2251,6 +2309,27 @@ mod tests {
                 ]
             );
             coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn retire_immediately_allows_same_id_while_committer_is_retained() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let coordinator = register(id);
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let committer = lease.committer().unwrap();
+            std::mem::forget(lease);
+
+            coordinator.retire();
+            assert!(matches!(
+                SessionCoordinatorHandle::resolve(id),
+                Err(SessionCoordinatorError::StaleSession(_))
+            ));
+            let replacement = register(id);
+
+            drop(committer);
+            replacement.close().await.unwrap();
         });
     }
 

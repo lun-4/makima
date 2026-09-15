@@ -43,6 +43,9 @@ use tracing::{debug, warn};
 use crate::{AcpParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+const CANCELLATION_IN_PROGRESS_CODE: i32 = -32001;
+const CANCELLATION_IN_PROGRESS_MESSAGE: &str =
+    "session cancellation is still in progress; retry the prompt";
 const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’s new-session action. This conversation has not been changed.";
 
 /// Ids come from here and are never reused, so a late answer for a closed
@@ -73,7 +76,6 @@ struct PendingOperation {
 #[derive(Default)]
 struct Pending {
     operation: Option<PendingOperation>,
-    admission_waiters: Vec<Sender<()>>,
     permission: Option<i64>,
     elicitation: Option<i64>,
 }
@@ -457,6 +459,7 @@ async fn new_session(
             persisted_options: &persisted_options,
         },
     )
+    .await
     .ok_or_else(|| AcpError::internal_error().data(json_str(&"session registration failed")))?;
     let resp = methods::new_session_response(&session_id, &srv.modes).config_options(
         methods::session_config_options(&snapshot, srv.supports_boolean),
@@ -535,6 +538,7 @@ async fn load_session(
             persisted_options: &restored.meta.session_options,
         },
     )
+    .await
     .ok_or_else(|| AcpError::internal_error().data(json_str(&"session registration failed")))?;
     let resp = methods::load_session_response(&srv.modes).config_options(
         methods::session_config_options(&snapshot, srv.supports_boolean),
@@ -665,14 +669,12 @@ async fn close_session(srv: &mut Server) {
             respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
         });
     }
-    state.command_projection_task.cancel().await;
-    state.option_projection_task.cancel().await;
-    if let Some(coordinator) = &state.coordinator
-        && let Err(error) = coordinator.close().await
-    {
-        warn!(%error, "failed to close session coordinator");
+    if let Some(coordinator) = state.coordinator.take() {
+        coordinator.retire();
     }
     state.handle.task.cancel().await;
+    state.command_projection_task.cancel().await;
+    state.option_projection_task.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
     }
@@ -681,10 +683,66 @@ async fn close_session(srv: &mut Server) {
     }
 }
 
-fn install_session(
+fn start_session_lock(id: MakiId) -> Result<SessionLock, String> {
+    let dir = maki_storage::StateDir::resolve()
+        .and_then(|state| state.ensure_subdir(SESSIONS_DIR))
+        .map_err(|error| error.to_string())?;
+    start_session_lock_in(dir, id)
+}
+
+fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String> {
+    match session_lock::heartbeat(&dir, &id).map_err(|error| error.to_string())? {
+        session_lock::LockBeat::Lost => return Err(session_lock::OPEN_ELSEWHERE_MSG.to_owned()),
+        session_lock::LockBeat::Held | session_lock::LockBeat::Claimed => {}
+    }
+    let (stop_tx, stop_rx) = flume::bounded(1);
+    let beat_dir = dir.clone();
+    let thread = std::thread::spawn(move || {
+        loop {
+            if stop_rx
+                .recv_timeout(session_lock::HEARTBEAT_INTERVAL)
+                .is_ok()
+            {
+                return;
+            }
+            let _ = session_lock::heartbeat(&beat_dir, &id);
+        }
+    });
+    Ok(SessionLock {
+        dir,
+        id,
+        stop_tx,
+        thread: Some(thread),
+    })
+}
+
+async fn rollback_install(
+    handle: InteractiveHandle,
+    mcp: Option<McpHandle>,
+    coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
+) {
+    if let Some(coordinator) = coordinator {
+        coordinator.retire();
+    }
+    handle.task.cancel().await;
+    if let Some(mcp) = mcp {
+        mcp.shutdown().await;
+    }
+}
+
+async fn install_session(
     srv: &mut Server,
     params: &AcpParams,
     session: InstallSession<'_>,
+) -> Option<maki_agent::session_options::SessionOptionsSnapshot> {
+    install_session_with_lock(srv, params, session, start_session_lock).await
+}
+
+async fn install_session_with_lock(
+    srv: &mut Server,
+    params: &AcpParams,
+    session: InstallSession<'_>,
+    lock_session: impl FnOnce(MakiId) -> Result<SessionLock, String>,
 ) -> Option<maki_agent::session_options::SessionOptionsSnapshot> {
     let InstallSession {
         handle,
@@ -714,6 +772,7 @@ fn install_session(
         Ok(checkpoint) => Arc::new(checkpoint),
         Err(error) => {
             warn!(%error, "failed to open session checkpoint");
+            rollback_install(handle, mcp, None).await;
             return None;
         }
     };
@@ -777,6 +836,15 @@ fn install_session(
         Ok(coordinator) => coordinator,
         Err(error) => {
             warn!(%error, "failed to register session coordinator");
+            rollback_install(handle, mcp, None).await;
+            return None;
+        }
+    };
+    let lock = match lock_session(handle.session_id.id()) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!(%error, "session lock claim failed");
+            rollback_install(handle, mcp, Some(coordinator)).await;
             return None;
         }
     };
@@ -844,46 +912,6 @@ fn install_session(
         Arc::clone(&option_projection),
         coordinator.read().subscribe(),
     );
-    // Claim-if-free heartbeat: beats every interval while the session is
-    // open, so the lock goes stale only when this process stops beating. A
-    // dedicated std thread keeps the periodic file I/O off the smol executor
-    // and, being joinable, lets the drop in `SessionLock` prove no beat is in
-    // flight when the lock releases.
-    let lock = match maki_storage::StateDir::resolve().and_then(|s| s.ensure_subdir(SESSIONS_DIR)) {
-        Ok(dir) => {
-            let id = handle.session_id.id();
-            if matches!(
-                session_lock::heartbeat(&dir, &id),
-                Ok(session_lock::LockBeat::Lost)
-            ) {
-                warn!(session_id = %id, "session lock claim failed: open elsewhere");
-                return None;
-            }
-            let (stop_tx, stop_rx) = flume::bounded(1);
-            let beat_dir = dir.clone();
-            let thread = std::thread::spawn(move || {
-                loop {
-                    if stop_rx
-                        .recv_timeout(session_lock::HEARTBEAT_INTERVAL)
-                        .is_ok()
-                    {
-                        return;
-                    }
-                    let _ = session_lock::heartbeat(&beat_dir, &id);
-                }
-            });
-            Some(SessionLock {
-                dir,
-                id,
-                stop_tx,
-                thread: Some(thread),
-            })
-        }
-        Err(e) => {
-            warn!(error = %e, "session lock unavailable, continuing unlocked");
-            None
-        }
-    };
     srv.session = Some(SessionState {
         handle,
         coordinator: Some(coordinator),
@@ -896,7 +924,7 @@ fn install_session(
         command_projection_task,
         option_projection: Some(option_projection),
         option_projection_task,
-        lock,
+        lock: Some(lock),
     });
     Some(option_snapshot)
 }
@@ -1049,7 +1077,7 @@ fn validate_session<'a>(srv: &'a Server, requested: &str) -> Result<&'a SessionS
 async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
     let session = validate_session(srv, req.session_id.0.as_ref())?;
-    await_prompt_admission(&session.pending).await?;
+    admit_prompt(&session.pending)?;
     let content = extract_prompt_content(&req.prompt)?;
     let dispatch = session
         .command_registry
@@ -1503,29 +1531,18 @@ fn coordinator_error(error: maki_agent::session_coordinator::SessionCoordinatorE
     }
 }
 
-async fn await_prompt_admission(pending: &PendingState) -> Result<(), AcpError> {
-    loop {
-        let receiver = {
-            let mut pending = pending.lock().unwrap();
-            match pending.operation.as_ref() {
-                None => return Ok(()),
-                Some(operation) if !operation.cancelling => {
-                    return Err(AcpError::new(
-                        -32600,
-                        "session already has an active operation",
-                    ));
-                }
-                Some(_) => {
-                    pending
-                        .admission_waiters
-                        .retain(|waiter| !waiter.is_disconnected());
-                    let (sender, receiver) = flume::bounded(1);
-                    pending.admission_waiters.push(sender);
-                    receiver
-                }
-            }
-        };
-        let _ = receiver.recv_async().await;
+fn admit_prompt(pending: &PendingState) -> Result<(), AcpError> {
+    match pending.lock().unwrap().operation.as_ref() {
+        None => Ok(()),
+        Some(operation) if operation.cancelling => Err(AcpError::new(
+            CANCELLATION_IN_PROGRESS_CODE,
+            CANCELLATION_IN_PROGRESS_MESSAGE,
+        )
+        .data(serde_json::json!({ "retryable": true }))),
+        Some(_) => Err(AcpError::new(
+            -32600,
+            "session already has an active operation",
+        )),
     }
 }
 
@@ -1535,7 +1552,7 @@ fn finish_operation(
     kind: OperationKind,
     respond: impl FnOnce(RequestId),
 ) -> bool {
-    let (operation, waiters) = {
+    let operation = {
         let mut pending = pending.lock().unwrap();
         if !pending
             .operation
@@ -1544,17 +1561,11 @@ fn finish_operation(
         {
             return false;
         }
-        (
-            pending.operation.take().unwrap(),
-            std::mem::take(&mut pending.admission_waiters),
-        )
+        pending.operation.take().unwrap()
     };
     let request_id = operation.request_id.clone();
     drop(operation);
     respond(request_id);
-    for waiter in waiters {
-        let _ = waiter.send(());
-    }
     true
 }
 
@@ -2040,6 +2051,7 @@ mod tests {
     const FAST_SPEC: &str = "anthropic/claude-opus-4-8";
     const OFFLINE_SPEC: &str = "openai/gpt-5";
     const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const LIFECYCLE_STRESS_ITERATIONS: usize = 64;
     const SPAWN_TEST_SPEC: &str = "ollama/acp-end-turn-test";
 
     struct EndTurnProvider;
@@ -2080,6 +2092,25 @@ mod tests {
             Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
         > {
             Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn test_params(model: Model, cwd: PathBuf) -> AcpParams {
+        AcpParams {
+            model,
+            config: Default::default(),
+            permissions_config: Default::default(),
+            timeouts: Default::default(),
+            initial_wd: cwd,
+            prompt_slots: Arc::default(),
+            modes: Arc::default(),
+            yolo: false,
+            system_prompt_override: Some(String::new()),
+            append_system_prompt: None,
+            model_policy: Arc::default(),
+            plugin_rules: Arc::default(),
+            session_options: Default::default(),
+            command_registry: test_registry(&[]),
         }
     }
 
@@ -2287,6 +2318,96 @@ mod tests {
     }
 
     #[test]
+    fn post_registration_lock_failure_rolls_back_and_same_id_retries() {
+        smol::block_on(async {
+            let cwd = TempDir::new().unwrap();
+            let params = test_params(
+                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                cwd.path().to_path_buf(),
+            );
+            let (out_tx, _) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                model_specs: vec![OFFLINE_SPEC.to_owned()],
+                modes: Arc::clone(&params.modes),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+            };
+            let session_id = SessionRef::from(MakiId::generate());
+            let persisted_options = BTreeMap::new();
+
+            let first = spawn_session(
+                &params,
+                SpawnSession {
+                    model: params.model.clone(),
+                    cwd: cwd.path().to_path_buf(),
+                    session_id: Some(session_id.clone()),
+                    history: Vec::new(),
+                    mcp_handle: None,
+                    elicitation: false,
+                    yolo: false,
+                    workflow: false,
+                },
+            );
+            assert!(
+                install_session_with_lock(
+                    &mut srv,
+                    &params,
+                    InstallSession {
+                        handle: first,
+                        mcp: None,
+                        current_model: OFFLINE_SPEC.to_owned(),
+                        history: Vec::new(),
+                        initial_cost: None,
+                        cwd: cwd.path().to_path_buf(),
+                        fast: false,
+                        workflow: false,
+                        thinking: maki_agent::ThinkingConfig::Off,
+                        persisted_options: &persisted_options,
+                    },
+                    |_| Err("injected lock failure".to_owned()),
+                )
+                .await
+                .is_none()
+            );
+            assert!(srv.session.is_none());
+            assert!(
+                maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(session_id.id())
+                    .is_err()
+            );
+
+            let retry = test_coordinator(session_id.id(), OFFLINE_SPEC, cwd.path().to_path_buf());
+            retry.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn close_retires_routing_with_retained_committer() {
+        smol::block_on(async {
+            let (mut srv, ..) = server_awaiting_answer();
+            let id = srv.session.as_ref().unwrap().handle.session_id.id();
+            let coordinator = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .clone();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let committer = lease.committer().unwrap();
+            std::mem::forget(lease);
+
+            close_session(&mut srv).await;
+            let replacement = test_coordinator(id, OFFLINE_SPEC, PathBuf::from("/project"));
+
+            drop(committer);
+            replacement.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn operation_terminal_is_compare_and_set() {
         let pending = Arc::new(Mutex::new(Pending {
             operation: Some(PendingOperation {
@@ -2308,8 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_is_removed_before_response_and_waiters_wake_after() {
-        let (waiter_tx, waiter_rx) = flume::bounded(1);
+    fn operation_is_removed_before_response() {
         let pending = Arc::new(Mutex::new(Pending {
             operation: Some(PendingOperation {
                 id: 8,
@@ -2319,7 +2439,6 @@ mod tests {
                 cancel: None,
                 _lease: None,
             }),
-            admission_waiters: vec![waiter_tx],
             ..Pending::default()
         }));
 
@@ -2330,10 +2449,8 @@ mod tests {
             |request_id| {
                 assert_eq!(request_id, RequestId::Number(42));
                 assert!(pending.try_lock().unwrap().operation.is_none());
-                assert!(waiter_rx.is_empty(), "waiters wake only after the response");
             },
         ));
-        assert!(waiter_rx.try_recv().is_ok());
     }
 
     #[test]
@@ -2785,12 +2902,19 @@ mod tests {
             );
 
             let second = prompt_request(&session_id, "second", false);
-            let follow_up = smol::spawn(async move {
-                let result = handle_prompt(&mut srv, &second, &RequestId::Number(42)).await;
-                (srv, result)
-            });
-            smol::future::yield_now().await;
-            assert!(input_rx.is_empty(), "successor must wait for terminal");
+            let error = handle_prompt(&mut srv, &second, &RequestId::Number(42))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                AcpError::new(CANCELLATION_IN_PROGRESS_CODE, "").code
+            );
+            assert_eq!(error.message, CANCELLATION_IN_PROGRESS_MESSAGE);
+            assert_eq!(error.data, Some(serde_json::json!({ "retryable": true })));
+            assert!(
+                input_rx.is_empty(),
+                "successor must not enter the active turn"
+            );
 
             event_tx
                 .send_async(Envelope {
@@ -2802,12 +2926,215 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let (_srv, follow_up) = follow_up.await;
-            assert!(
-                follow_up.is_ok(),
-                "a cancelled permission must not block the next prompt: {follow_up:?}"
-            );
+            let cancelled = out_rx.recv_async().await.unwrap();
+            assert_eq!(cancelled["id"], 41);
+            assert_eq!(cancelled["result"]["stopReason"], "end_turn");
+            handle_prompt(&mut srv, &second, &RequestId::Number(43))
+                .await
+                .unwrap();
             assert_eq!(input_rx.recv_async().await.unwrap().message, "second");
+        });
+    }
+
+    #[test]
+    fn cancelled_prompt_rejects_follow_up_and_processes_new_session() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let old_session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            let params = test_params(
+                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                PathBuf::from("/project"),
+            );
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&old_session_id, "first", false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap();
+            input_rx.recv_async().await.unwrap();
+
+            handle_line(
+                &mut srv,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": { "sessionId": old_session_id }
+                })
+                .to_string(),
+                &params,
+            )
+            .await;
+            handle_line(
+                &mut srv,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": old_session_id,
+                        "prompt": [{ "type": "text", "text": "second" }]
+                    }
+                })
+                .to_string(),
+                &params,
+            )
+            .await;
+            let rejected = out_rx.recv_async().await.unwrap();
+            assert_eq!(rejected["id"], 42);
+            assert_eq!(rejected["error"]["code"], CANCELLATION_IN_PROGRESS_CODE);
+            assert_eq!(
+                rejected["error"]["message"],
+                CANCELLATION_IN_PROGRESS_MESSAGE
+            );
+            assert_eq!(rejected["error"]["data"]["retryable"], true);
+
+            let cwd = TempDir::new().unwrap();
+            let params = test_params(
+                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                cwd.path().to_owned(),
+            );
+            handle_line(
+                &mut srv,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 43,
+                    "method": "session/new",
+                    "params": { "cwd": cwd.path(), "mcpServers": [] }
+                })
+                .to_string(),
+                &params,
+            )
+            .await;
+
+            let mut new_session_response = None;
+            while let Ok(message) = out_rx.try_recv() {
+                if message["id"] == 43 {
+                    new_session_response = Some(message);
+                    break;
+                }
+            }
+            let response = new_session_response.expect("new session must receive a response");
+            assert_eq!(response["id"], 43);
+            assert!(
+                srv.session
+                    .as_ref()
+                    .is_none_or(|session| session.handle.session_id.to_string() != old_session_id),
+                "the cancelled session must be closed even if replacement setup fails: {response}"
+            );
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn primary_completion_with_reusable_subagent_activity_survives_cancellation_stress() {
+        smol::block_on(async {
+            for iteration in 0..LIFECYCLE_STRESS_ITERATIONS {
+                let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+                let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+                let session = srv.session.as_ref().unwrap();
+                session.pending.lock().unwrap().permission = None;
+                start_event_pump(
+                    event_rx,
+                    session.handle.session_id.clone(),
+                    srv.out_tx.clone(),
+                    Arc::clone(&session.pending),
+                    false,
+                    session.handle.answer_tx.clone(),
+                    session.coordinator.as_ref().unwrap().read(),
+                    None,
+                    None,
+                );
+                let session_id = session.handle.session_id.to_string();
+                let request_id = RequestId::Number(iteration as i64 + 1);
+
+                handle_prompt(
+                    &mut srv,
+                    &prompt_request(&session_id, "primary", false),
+                    &request_id,
+                )
+                .await
+                .unwrap();
+                input_rx.recv_async().await.unwrap();
+                for _ in 0..2 {
+                    event_tx
+                        .send_async(subagent_activity(AgentEvent::ControlComplete {
+                            usage: TokenUsage::default(),
+                        }))
+                        .await
+                        .unwrap();
+                }
+                smol::future::yield_now().await;
+                assert!(
+                    out_rx.is_empty(),
+                    "subagent completion terminated primary; iteration={iteration}; {}",
+                    lifecycle_state(&srv)
+                );
+
+                if iteration % 2 == 0 {
+                    handle_notification(
+                        &srv,
+                        "session/cancel",
+                        &serde_json::json!({ "params": { "sessionId": session_id } }),
+                    );
+                }
+                let event = if iteration % 2 == 0 {
+                    AgentEvent::TurnOutcome(maki_agent::TurnOutcome::Cancelled {
+                        agent_id: maki_agent::AgentId::generate(),
+                        turn_id: maki_agent::TurnId::generate(),
+                        usage: TokenUsage::default(),
+                        num_turns: 1,
+                        reason: maki_agent::TurnCancellationReason::User,
+                    })
+                } else {
+                    AgentEvent::ControlComplete {
+                        usage: TokenUsage::default(),
+                    }
+                };
+                event_tx
+                    .send_async(Envelope {
+                        event,
+                        subagent: None,
+                        run_id: 0,
+                    })
+                    .await
+                    .unwrap();
+                let terminal = out_rx.recv_async().await.unwrap();
+                let expected = if iteration % 2 == 0 {
+                    "cancelled"
+                } else {
+                    "end_turn"
+                };
+                assert_eq!(
+                    terminal["result"]["stopReason"],
+                    expected,
+                    "iteration={iteration}; {}",
+                    lifecycle_state(&srv)
+                );
+                handle_notification(
+                    &srv,
+                    "session/cancel",
+                    &serde_json::json!({ "params": { "sessionId": session_id } }),
+                );
+                assert!(
+                    srv.session
+                        .as_ref()
+                        .unwrap()
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .operation
+                        .is_none(),
+                    "completed operation remained pending; iteration={iteration}; {}",
+                    lifecycle_state(&srv)
+                );
+                assert!(
+                    out_rx.is_empty(),
+                    "completion or late cancellation responded twice; iteration={iteration}; {}",
+                    lifecycle_state(&srv)
+                );
+                close_session(&mut srv).await;
+            }
         });
     }
 
@@ -3203,6 +3530,57 @@ mod tests {
         assert!(out_rx.is_empty());
     }
 
+    fn lifecycle_state(srv: &Server) -> String {
+        let Some(session) = &srv.session else {
+            return "session=none".to_owned();
+        };
+        let pending = session.pending.lock().unwrap();
+        let operation = pending.operation.as_ref().map(|operation| {
+            format!(
+                "id={},request={:?},kind={:?},cancelling={}",
+                operation.id, operation.request_id, operation.kind, operation.cancelling
+            )
+        });
+        let permission = pending.permission;
+        let elicitation = pending.elicitation;
+        drop(pending);
+        let coordinator = session.coordinator.as_ref().map(|coordinator| {
+            let read = coordinator.read();
+            let options = read.options();
+            format!(
+                "history={},model={},cwd={},options_version={}",
+                read.history().len(),
+                read.model(),
+                read.cwd().display(),
+                options.version
+            )
+        });
+        format!(
+            "session={},operation={operation:?},permission={permission:?},elicitation={elicitation:?},coordinator={coordinator:?}",
+            session.handle.session_id
+        )
+    }
+
+    fn subagent_activity(event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: Some(maki_agent::SubagentInfo {
+                agent_id: maki_agent::AgentId::generate(),
+                parent_agent_id: Some(maki_agent::AgentId::generate()),
+                parent_is_root: true,
+                auto_deliver: true,
+                parent_tool_use_id: "task-reusable".to_owned(),
+                name: "task".to_owned(),
+                prompt: Some("reuse actor".to_owned()),
+                model: Some(OFFLINE_SPEC.to_owned()),
+                answer_tx: None,
+                input_tx: None,
+                cancel: None,
+            }),
+            run_id: 0,
+        }
+    }
+
     fn prompt_request(session_id: &str, text: &str, image: bool) -> Value {
         let mut prompt = vec![serde_json::json!({ "type": "text", "text": text })];
         if image {
@@ -3544,6 +3922,169 @@ mod tests {
             assert!(
                 !pending,
                 "terminal response must release the pending primary operation"
+            );
+            close_session(&mut srv).await;
+            match previous_host {
+                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
+                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+            }
+        });
+    }
+
+    #[test]
+    fn completed_then_cancelled_session_can_be_replaced_and_prompted() {
+        smol::block_on(async {
+            let previous_host = std::env::var_os("OLLAMA_HOST");
+            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let temp = TempDir::new().unwrap();
+            let cwd = temp.path().to_path_buf();
+            maki_storage::paths::init_at(cwd.clone());
+            let _state_root = temp.keep();
+            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+            let old = srv.session.as_ref().unwrap();
+            old.pending.lock().unwrap().permission = None;
+            start_event_pump(
+                event_rx,
+                old.handle.session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&old.pending),
+                false,
+                old.handle.answer_tx.clone(),
+                old.coordinator.as_ref().unwrap().read(),
+                None,
+                None,
+            );
+            let old_id = old.handle.session_id.to_string();
+
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&old_id, "old primary", false),
+                &RequestId::Number(81),
+            )
+            .await
+            .unwrap();
+            input_rx.recv_async().await.unwrap();
+            event_tx
+                .send_async(subagent_activity(AgentEvent::ControlComplete {
+                    usage: TokenUsage::default(),
+                }))
+                .await
+                .unwrap();
+            event_tx
+                .send_async(Envelope {
+                    event: AgentEvent::ControlComplete {
+                        usage: TokenUsage::default(),
+                    },
+                    subagent: None,
+                    run_id: 0,
+                })
+                .await
+                .unwrap();
+            let old_terminal = out_rx.recv_async().await.unwrap();
+            assert_eq!(old_terminal["id"], 81);
+            assert_eq!(old_terminal["result"]["stopReason"], "end_turn");
+            handle_notification(
+                &srv,
+                "session/cancel",
+                &serde_json::json!({ "params": { "sessionId": old_id } }),
+            );
+
+            let params = test_params(Model::from_spec(SPAWN_TEST_SPEC).unwrap(), cwd.clone());
+            new_session(
+                &mut srv,
+                &serde_json::json!({
+                    "params": { "cwd": cwd, "mcpServers": [] }
+                }),
+                &params,
+            )
+            .await
+            .unwrap();
+            let new_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            assert_ne!(old_id, new_id);
+            assert!(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .operation
+                    .is_none(),
+                "new session inherited pending state; {}",
+                lifecycle_state(&srv)
+            );
+            while out_rx.try_recv().is_ok() {}
+            let provider_ready = smol::future::or(
+                async {
+                    while maki_agent::ModelSource::current(
+                        &srv.session.as_ref().unwrap().handle.model,
+                    )
+                    .is_none()
+                    {
+                        smol::future::yield_now().await;
+                    }
+                    true
+                },
+                async {
+                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                    false
+                },
+            )
+            .await;
+            assert!(
+                provider_ready,
+                "new session provider did not initialize; {}",
+                lifecycle_state(&srv)
+            );
+            srv.session.as_ref().unwrap().handle.model.install(
+                Arc::new(EndTurnProvider),
+                Model::from_spec(OFFLINE_SPEC).unwrap(),
+            );
+
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&new_id, "new primary", false),
+                &RequestId::Number(82),
+            )
+            .await
+            .unwrap();
+            let started = std::time::Instant::now();
+            let terminal = smol::future::or(
+                async {
+                    loop {
+                        let message = out_rx.recv_async().await.unwrap();
+                        if message["id"] == 82 {
+                            break Some(message);
+                        }
+                    }
+                },
+                async {
+                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                    None
+                },
+            )
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "new PromptResponse timed out after {:?}; {}",
+                    started.elapsed(),
+                    lifecycle_state(&srv)
+                )
+            });
+            assert_eq!(terminal["result"]["stopReason"], "end_turn");
+            assert!(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .operation
+                    .is_none(),
+                "new prompt completed but remained pending; elapsed={:?}; {}",
+                started.elapsed(),
+                lifecycle_state(&srv)
             );
             close_session(&mut srv).await;
             match previous_host {
