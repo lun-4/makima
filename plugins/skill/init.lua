@@ -46,6 +46,9 @@ local function scan_skill_dir(dir, skills)
 end
 
 local function find_project_ancestors(cwd)
+  -- Callers without a tool ctx (the completion source, the expander) have no
+  -- session cwd to pass, so they fall back to the process cwd.
+  cwd = cwd or maki.uv.cwd()
   if not cwd then
     return {}
   end
