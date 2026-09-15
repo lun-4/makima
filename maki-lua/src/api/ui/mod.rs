@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use humantime::format_duration;
@@ -70,6 +70,8 @@ impl StatusContentStore {
 pub(crate) struct HintStore {
     hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
 }
+
+pub(crate) type PendingHintStore = Arc<Mutex<Option<Vec<(String, String)>>>>;
 
 impl HintStore {
     pub fn new() -> Self {
@@ -653,6 +655,7 @@ pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     plugin: Arc<str>,
+    pending_hint: Option<crate::api::ui::PendingHintStore>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
@@ -666,6 +669,7 @@ pub(crate) fn create_ui_table(
     }
 
     let p = Arc::clone(&plugin);
+    let pending = pending_hint;
     t.set(
         "set_status_content",
         lua.create_function(move |lua, value: mlua::Value| {
@@ -718,6 +722,31 @@ pub(crate) fn create_ui_table(
     t.set(
         "set_status_hint",
         lua.create_function(move |lua, value: mlua::Value| {
+            if crate::runtime::loading_plugin(lua).is_some()
+                && let Some(pending) = &pending
+            {
+                let spans = match value {
+                    mlua::Value::Nil => None,
+                    mlua::Value::Table(tbl) => Some(
+                        tbl.sequence_values::<Table>()
+                            .map(|entry| {
+                                let entry = entry?;
+                                Ok((
+                                    entry.get::<String>(1)?,
+                                    entry.get::<String>(2).unwrap_or_default(),
+                                ))
+                            })
+                            .collect::<LuaResult<_>>()?,
+                    ),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_hint expects a table or nil",
+                        ));
+                    }
+                };
+                *pending.lock().unwrap_or_else(|e| e.into_inner()) = spans;
+                return Ok(());
+            }
             match value {
                 mlua::Value::Nil => {
                     if let Some(mut store) = lua.app_data_mut::<HintStore>() {
@@ -1543,7 +1572,7 @@ mod tests {
     fn format_time_uses_explicit_clock_formats() {
         let lua = Lua::new();
         lua.set_app_data(ClockFormat::Hour12);
-        let ui = create_ui_table(&lua, None, Arc::from("test")).unwrap();
+        let ui = create_ui_table(&lua, None, Arc::from("test"), None).unwrap();
         let f: mlua::Function = ui.get("format_time").unwrap();
         let twelve: String = f.call((0_u64, "time")).unwrap();
         lua.set_app_data(ClockFormat::Hour24);
@@ -1558,8 +1587,8 @@ mod tests {
         lua.set_app_data(StatusContentStore::new());
         let (writer, reader) = StatusContentWriter::new();
         lua.set_app_data(writer);
-        let ui = create_ui_table(&lua, None, Arc::from("plug")).unwrap();
-        let other_ui = create_ui_table(&lua, None, Arc::from("other")).unwrap();
+        let ui = create_ui_table(&lua, None, Arc::from("plug"), None).unwrap();
+        let other_ui = create_ui_table(&lua, None, Arc::from("other"), None).unwrap();
         lua.globals().set("ui", ui).unwrap();
         lua.globals().set("other_ui", other_ui).unwrap();
 

@@ -1069,6 +1069,41 @@ fn projection_and_dispatch_share_capability_filter() {
 }
 
 #[test]
+fn dispatch_capabilities_can_differ_from_presentation() {
+    let registry = CommandRegistry::new();
+    let producer = registry.create_producer(ProducerPrecedence::Builtin);
+    let command_capability =
+        TargetCapabilities::from_capability(TargetCapability::SessionReplacement);
+    producer
+        .replace(vec![registration("/new", command_capability)])
+        .unwrap();
+    let target = registry.bind_target_with_presentation(
+        command_capability,
+        TargetCapabilities::NONE,
+        Arc::new(Host),
+    );
+
+    assert!(registry.presented_commands(&target).unwrap().is_empty());
+    assert!(registry.resolve_for(&target, "/new").is_ok());
+    assert!(matches!(
+        futures_lite::future::block_on(registry.dispatch_input(&target, "/new".into())),
+        InputDispatch::Dispatched(CommandOutcome::Completed)
+    ));
+
+    let unexecutable = registry.bind_target_with_presentation(
+        TargetCapabilities::NONE,
+        command_capability,
+        Arc::new(Host),
+    );
+    assert!(
+        registry
+            .presented_commands(&unexecutable)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn portable_override_wins_over_restricted_builtin() {
     let registry = CommandRegistry::new();
     let builtin = registry.create_producer(ProducerPrecedence::Builtin);

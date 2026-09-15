@@ -6,71 +6,30 @@ use flume::Receiver;
 use futures_lite::future;
 use maki_config::ModelPolicy;
 use maki_providers::Message;
-use maki_providers::Timeouts;
-use maki_providers::TokenUsage;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
-use maki_storage::StateDir;
+use maki_providers::{Timeouts, TokenUsage};
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::Session;
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
+use crate::session_coordinator::SessionOptionCatalog;
+use crate::session_coordinator::{
+    SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
+};
 use crate::template;
 use crate::tools::{
     DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
 };
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, Envelope,
-    EventSender, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
+    Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
+    Envelope, EventSender, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
     ToolOutputLines, TurnFailure, TurnId, TurnOutcome,
 };
-
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
-
-struct SessionStore {
-    dir: StateDir,
-    session: StoredSession,
-}
-
-impl SessionStore {
-    fn open(session_id: MakiId, cwd: &str, model_spec: &str) -> Option<Self> {
-        let dir = StateDir::resolve()
-            .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
-            .ok()?;
-        Some(Self::open_in(dir, session_id, cwd, model_spec))
-    }
-
-    fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
-        match StoredSession::load(session_id, &dir) {
-            Ok(session) => Self { dir, session },
-            Err(_) => {
-                let mut session = StoredSession::new(model_spec, cwd);
-                session.id = session_id;
-                let mut store = Self { dir, session };
-                store.save();
-                store
-            }
-        }
-    }
-
-    fn save(&mut self) {
-        if let Err(e) = self.session.save(&self.dir) {
-            warn!(error = %e, session_id = %self.session.id, "failed to persist session");
-        }
-    }
-
-    fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.replace_messages(messages.to_vec());
-        self.session.set_model(model_spec);
-        self.session.update_title_if_default();
-        self.save();
-    }
-}
 
 pub struct HeadlessParams {
     pub model: Model,
@@ -87,6 +46,10 @@ pub struct HeadlessParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub modes: Arc<crate::ModeRegistry>,
+    /// Plugin-registered session options. A print-mode run still needs a
+    /// coordinator: tools read their options through one, and
+    /// `SessionMailbox::notify` resolves through one.
+    pub session_options: SessionOptionCatalog,
 }
 
 pub struct HeadlessHandle {
@@ -178,7 +141,6 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             &mode,
             &instructions.text,
             &params.prompt_slots,
-            &params.model,
         )
     });
     if let Some(append) = &params.append_system_prompt {
@@ -194,7 +156,60 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_id = MakiId::generate();
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
-    let mailbox = SessionMailbox::register(session_id);
+    let mailbox = SessionMailbox::new(session_id);
+    // A print-mode session is one turn and is never restored, so the
+    // checkpoint is a no-op and no options are persisted -- but the
+    // coordinator must exist, or every option read and every mailbox
+    // notification in this run fails with `session not live`.
+    let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id,
+        catalog: params.session_options.clone(),
+        definitions: builtin_option_definitions(
+            Arc::from(params.model.spec().as_str()),
+            [Arc::from(params.model.spec().as_str())],
+            params.permissions_config.yolo,
+            false,
+            workflow,
+            params.input.thinking,
+        ),
+        persisted_options: Default::default(),
+        history: Vec::new(),
+        model: Arc::from(params.model.spec().as_str()),
+        cwd: params.initial_wd.clone(),
+        model_policy: Arc::clone(&params.model_policy),
+        // A print run resolves its provider once, up front: there is no
+        // mechanism to swap either mid-run, so both adoptions are refused
+        // rather than silently accepted and ignored.
+        model_adopter: Arc::new(|_: Model| {
+            Box::pin(async { Err(Arc::from("model cannot be changed in print mode")) })
+                as crate::session_coordinator::ModelAdoptionFuture
+        }),
+        directory_adopter: Arc::new(|_: PathBuf| {
+            Box::pin(async { Err(Arc::from("directory cannot be changed in print mode")) })
+                as crate::session_coordinator::DirectoryAdoptionFuture
+        }),
+        checkpoint: Arc::new(
+            |request: maki_storage::checkpoint::CheckpointRequest<
+                crate::session_coordinator::SessionCheckpoint,
+            >| {
+                Box::pin(async move {
+                    Ok(maki_storage::checkpoint::CheckpointAck {
+                        session_id: request.session_id,
+                        version: request.version,
+                    })
+                }) as maki_storage::checkpoint::CheckpointFuture
+            },
+        ),
+        mailbox: mailbox.clone(),
+    })
+    .map_err(|error| error.to_string());
+    let coordinator = match coordinator {
+        Ok(coordinator) => Some(coordinator),
+        Err(error) => {
+            error!(%error, "session coordinator registration failed");
+            None
+        }
+    };
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
     let task = smol::spawn({
         let file_write_locks = Arc::clone(&file_write_locks);
@@ -211,12 +226,17 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         let _ = event_tx.send(AgentEvent::ControlError {
                             message: e.user_message(),
                         });
+                        if let Some(coordinator) = coordinator {
+                            let _ = coordinator.close().await;
+                        }
                         return;
                     }
                 };
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
+                    settings_source: None,
+                    tool_builder: None,
                     agent_id: AgentId::generate(),
                     provider,
                     model,
@@ -257,6 +277,9 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             if let Some(handle) = mcp_shutdown {
                 handle.shutdown().await;
             }
+            if let Some(coordinator) = coordinator {
+                let _ = coordinator.close().await;
+            }
         }
     });
 
@@ -293,25 +316,154 @@ pub struct InteractiveParams {
     pub local_tools: LocalTools,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualCompactionEvent {
+    Started,
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
 pub enum InteractiveControl {
     Compact(flume::Sender<Result<(), String>>),
+    ManualCompaction {
+        output: flume::Sender<ManualCompactionEvent>,
+        cancel: CancelToken,
+        lease_committer: Option<crate::session_coordinator::SessionLeaseCommitter>,
+    },
     Reset(flume::Sender<Result<(), String>>),
     ChangeDirectory {
         path: PathBuf,
-        reply: flume::Sender<Result<(), String>>,
+        reply: flume::Sender<Result<PathBuf, String>>,
+    },
+    IsolatedTurn {
+        question: String,
+        images: Vec<maki_providers::ImageSource>,
+        output: flume::Sender<agent::isolated_turn::IsolatedTurnEvent>,
+        cancel: CancelToken,
     },
 }
 
 struct InteractiveControlContext<'a> {
+    session_id: MakiId,
     history: &'a mut History,
-    store: &'a mut Option<SessionStore>,
     model: &'a Model,
     provider: &'a dyn Provider,
     raw_tx: &'a flume::Sender<Envelope>,
     run_id: u64,
     config: &'a AgentConfig,
-    working_dir: &'a mut PathBuf,
-    permissions: &'a PermissionManager,
+}
+
+/// Finish a manual compaction: persist the compacted history, and only then
+/// report success. A compaction that reported `Completed` before the write
+/// landed would promise durability it does not have, so persistence failure --
+/// like compaction failure -- rolls the in-memory history back to `previous`
+/// and reports the error instead. A failed compaction is never persisted.
+async fn settle_manual_compaction<P, F>(
+    compacted: Result<(), String>,
+    history: &mut History,
+    previous: Vec<Message>,
+    cancel: &CancelToken,
+    persist: P,
+) -> ManualCompactionEvent
+where
+    P: FnOnce(Vec<Message>) -> F,
+    F: Future<Output = Result<(), String>>,
+{
+    let result = match compacted {
+        Ok(()) => persist(history.as_slice().to_vec()).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => ManualCompactionEvent::Completed,
+        Err(_) if cancel.is_cancelled() => {
+            history.replace(previous);
+            ManualCompactionEvent::Cancelled
+        }
+        Err(error) => {
+            history.replace(previous);
+            ManualCompactionEvent::Failed(error)
+        }
+    }
+}
+
+async fn persist_history(session_id: MakiId, history: &[Message]) -> Result<(), String> {
+    crate::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
+        .map_err(|error| error.to_string())?
+        .replace_history(history.to_vec())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn checkpoint_and_forward_terminal(
+    committer: Option<crate::session_coordinator::SessionLeaseCommitter>,
+    session_id: MakiId,
+    history: &[Message],
+    timeout: std::time::Duration,
+    terminal: Option<Envelope>,
+    raw_tx: &flume::Sender<Envelope>,
+) -> Result<(), String> {
+    let commit = match committer {
+        Some(committer) => Some(
+            committer
+                .begin_history_commit(history.to_vec(), Some(timeout))
+                .await,
+        ),
+        None => None,
+    };
+    if let Some(terminal) = terminal {
+        let _ = raw_tx.send(terminal);
+    }
+    match commit {
+        Some(Ok(commit)) => commit.wait().await.map_err(|error| error.to_string()),
+        Some(Err(error)) => Err(error.to_string()),
+        None => persist_history(session_id, history).await,
+    }
+}
+
+enum InteractiveWake {
+    Input(AgentInput),
+    Control(InteractiveControl),
+}
+
+async fn collect_turn_events(
+    turn_event_rx: Receiver<Envelope>,
+    raw_tx: flume::Sender<Envelope>,
+) -> Option<Envelope> {
+    while let Ok(envelope) = turn_event_rx.recv_async().await {
+        if envelope.subagent.is_none() && matches!(envelope.event, AgentEvent::TurnOutcome(_)) {
+            return Some(envelope);
+        }
+        let _ = raw_tx.send(envelope);
+    }
+    None
+}
+
+async fn receive_wake_and_refresh(
+    input_rx: &Receiver<AgentInput>,
+    control_rx: &Receiver<InteractiveControl>,
+    shared_model: &crate::SharedModel,
+    provider: &mut Arc<dyn Provider>,
+    model: &mut Model,
+) -> Option<InteractiveWake> {
+    let wake = if let Ok(control) = control_rx.try_recv() {
+        Some(InteractiveWake::Control(control))
+    } else {
+        future::or(
+            async { input_rx.recv_async().await.map(InteractiveWake::Input) },
+            async { control_rx.recv_async().await.map(InteractiveWake::Control) },
+        )
+        .await
+        .ok()
+    };
+    use crate::ModelSource;
+    if let Some((current_provider, current_model)) = shared_model.current()
+        && current_model.spec() != model.spec()
+    {
+        *provider = current_provider;
+        *model = current_model;
+    }
+    wake
 }
 
 async fn apply_interactive_control(
@@ -319,59 +471,61 @@ async fn apply_interactive_control(
     context: InteractiveControlContext<'_>,
 ) {
     let InteractiveControlContext {
+        session_id,
         history,
-        store,
         model,
         provider,
         raw_tx,
         run_id,
         config,
-        working_dir,
-        permissions,
     } = context;
     let result = match &control {
-        InteractiveControl::Compact(_) => agent::compact(
-            provider,
-            model,
-            history,
-            &EventSender::new(raw_tx.clone(), run_id),
-            config,
-        )
-        .await
-        .map_err(|error| error.to_string()),
-        InteractiveControl::Reset(_) => {
-            history.replace(Vec::new());
-            if let Some(store) = store {
-                store.record_turn(&[], model.spec());
+        InteractiveControl::Compact(_) => {
+            let previous = history.as_slice().to_vec();
+            match agent::compact(
+                provider,
+                model,
+                history,
+                &EventSender::new(raw_tx.clone(), run_id),
+                &CancelToken::none(),
+                config,
+            )
+            .await
+            {
+                Ok(()) => persist_history(session_id, history.as_slice())
+                    .await
+                    .inspect_err(|_| history.replace(previous)),
+                Err(error) => Err(error.to_string()),
             }
-            Ok(())
         }
-        InteractiveControl::ChangeDirectory { path, .. } => path
-            .canonicalize()
-            .and_then(|path| {
-                if !path.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotADirectory,
-                        "path is not a directory",
-                    ));
-                }
-                *working_dir = path;
-                permissions.set_cwd(working_dir.clone());
-                if let Some(store) = store {
-                    store
-                        .session
-                        .set_cwd(working_dir.to_string_lossy().into_owned());
-                    store.save();
-                }
-                Ok(())
-            })
-            .map_err(|error| error.to_string()),
+        InteractiveControl::ManualCompaction { .. } => {
+            Err("manual compaction was not intercepted by the session loop".into())
+        }
+        InteractiveControl::Reset(_) => {
+            let previous = history.as_slice().to_vec();
+            history.replace(Vec::new());
+            persist_history(session_id, history.as_slice())
+                .await
+                .inspect_err(|_| history.replace(previous))
+        }
+        InteractiveControl::ChangeDirectory { .. } => {
+            Err("directory adoption was not intercepted by the session loop".into())
+        }
+        InteractiveControl::IsolatedTurn { .. } => {
+            Err("isolated turn was not intercepted by the session loop".into())
+        }
     };
-    let reply = match control {
-        InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply) => reply,
-        InteractiveControl::ChangeDirectory { reply, .. } => reply,
-    };
-    let _ = reply.send(result);
+    match control {
+        InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply) => {
+            let _ = reply.send(result);
+        }
+        InteractiveControl::ChangeDirectory { reply, .. } => {
+            let _ = reply.send(Err(
+                "directory adoption was not intercepted by the session loop".into(),
+            ));
+        }
+        InteractiveControl::ManualCompaction { .. } | InteractiveControl::IsolatedTurn { .. } => {}
+    }
 }
 
 pub struct InteractiveHandle {
@@ -382,7 +536,12 @@ pub struct InteractiveHandle {
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
     pub control_tx: flume::Sender<InteractiveControl>,
+    /// Install a model here to change it. Adoption is a store, so it lands on
+    /// the run's next request rather than waiting for the turn to end, and it
+    /// never blocks a caller behind a running turn.
+    pub model: crate::SharedModel,
     pub session_id: SessionRef,
+    pub mailbox: SessionMailbox,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
@@ -417,7 +576,12 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             (id, SessionRef::from(id))
         }
     };
-    let mailbox = SessionMailbox::register(session_id);
+    let mailbox = SessionMailbox::new(session_id);
+    let handle_mailbox = mailbox.clone();
+    // Seeded by the task once its provider exists; until then it reports no
+    // change, which is what an unstarted session should say.
+    let shared_model = crate::SharedModel::default();
+    let handle_model = shared_model.clone();
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -451,45 +615,135 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         return;
                     }
                 };
+            shared_model.install(Arc::clone(&provider), model.clone());
 
-            let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
             let mut history = History::restored(params.initial_history);
             let mut working_dir = PathBuf::from(working_dir);
             let permissions = permissions;
             let agent_id = AgentId::generate();
             let mut run_id: u64 = 0;
 
-            enum Wake {
-                Input(AgentInput),
-                Control(InteractiveControl),
-            }
-
             loop {
-                let wake = if let Ok(control) = control_rx.try_recv() {
-                    Some(Wake::Control(control))
-                } else {
-                    future::or(
-                        async { input_rx.recv_async().await.map(Wake::Input) },
-                        async { control_rx.recv_async().await.map(Wake::Control) },
-                    )
-                    .await
-                    .ok()
-                };
+                let wake = receive_wake_and_refresh(
+                    &input_rx,
+                    &control_rx,
+                    &shared_model,
+                    &mut provider,
+                    &mut model,
+                )
+                .await;
                 let input = match wake {
-                    Some(Wake::Input(input)) => input,
-                    Some(Wake::Control(control)) => {
+                    Some(InteractiveWake::Input(input)) => input,
+                    Some(InteractiveWake::Control(InteractiveControl::ChangeDirectory {
+                        path,
+                        reply,
+                    })) => {
+                        let result = path
+                            .canonicalize()
+                            .and_then(|canonical| {
+                                if canonical.is_dir() {
+                                    Ok(canonical)
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotADirectory,
+                                        "path is not a directory",
+                                    ))
+                                }
+                            })
+                            .inspect(|canonical| {
+                                working_dir = canonical.clone();
+                                permissions.set_cwd(canonical.clone());
+                            })
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                    Some(InteractiveWake::Control(InteractiveControl::ManualCompaction {
+                        output,
+                        cancel,
+                        lease_committer,
+                    })) => {
+                        let _ = output.send(ManualCompactionEvent::Started);
+                        let previous = history.as_slice().to_vec();
+                        let (private_tx, _private_rx) = flume::unbounded();
+                        let result = agent::compact(
+                            &*provider,
+                            &model,
+                            &mut history,
+                            &EventSender::new(private_tx, run_id),
+                            &cancel,
+                            &params.config,
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                        let terminal = settle_manual_compaction(
+                            result,
+                            &mut history,
+                            previous,
+                            &cancel,
+                            |compacted| async move {
+                                match lease_committer {
+                                    Some(committer) => committer
+                                        .commit_history(compacted)
+                                        .await
+                                        .map_err(|error| error.to_string()),
+                                    None => persist_history(session_id, &compacted).await,
+                                }
+                            },
+                        )
+                        .await;
+                        let _ = output.send(terminal);
+                        continue;
+                    }
+                    Some(InteractiveWake::Control(InteractiveControl::IsolatedTurn {
+                        question,
+                        images,
+                        output,
+                        cancel,
+                    })) => {
+                        let vars = template::env_vars_for(&working_dir);
+                        let instructions = agent::load_instructions(&working_dir.to_string_lossy());
+                        let mut system =
+                            params.system_prompt_override.clone().unwrap_or_else(|| {
+                                agent::build_system_prompt(
+                                    &vars,
+                                    &modes,
+                                    &AgentMode::Build,
+                                    &instructions.text,
+                                    &params.prompt_slots,
+                                )
+                            });
+                        if let Some(append) = &params.append_system_prompt {
+                            system.push('\n');
+                            system.push_str(append);
+                        }
+                        agent::isolated_turn::run_isolated_turn(
+                            agent::isolated_turn::IsolatedTurnRequest {
+                                provider: Arc::clone(&provider),
+                                model: model.clone(),
+                                history: history.as_slice().to_vec(),
+                                system,
+                                question,
+                                images,
+                                session_id: Some(SessionRef::from(session_id)),
+                                cancel,
+                            },
+                            output,
+                        )
+                        .await;
+                        continue;
+                    }
+                    Some(InteractiveWake::Control(control)) => {
                         apply_interactive_control(
                             control,
                             InteractiveControlContext {
+                                session_id,
                                 history: &mut history,
-                                store: &mut store,
                                 model: &model,
                                 provider: &*provider,
                                 raw_tx: &raw_tx,
                                 run_id,
                                 config: &params.config,
-                                working_dir: &mut working_dir,
-                                permissions: &permissions,
                             },
                         )
                         .await;
@@ -498,6 +752,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     None => break,
                 };
                 let turn_id = TurnId::generate();
+                let lease_committer = input.lease_committer.clone();
                 let (trigger, cancel) = CancelToken::new();
                 let cancel_task = smol::spawn({
                     let cancel_rx = cancel_rx.clone();
@@ -515,8 +770,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     let _ = cancel.race(mcp.ready()).await;
                 }
 
-                let event_tx = EventSender::new(raw_tx.clone(), run_id);
-                let error_tx = event_tx.clone();
+                let (turn_event_tx, turn_event_rx) = flume::unbounded::<Envelope>();
+                let terminal_task = smol::spawn(collect_turn_events(turn_event_rx, raw_tx.clone()));
+                let event_tx = EventSender::new(turn_event_tx.clone(), run_id);
+                let error_tx = EventSender::new(raw_tx.clone(), run_id);
 
                 if let Some(mut new_model) = model_rx
                     .try_iter()
@@ -528,6 +785,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         Ok(p) => {
                             provider = Arc::from(p);
                             model = new_model;
+                            // The run reads the shared source, so an adoption
+                            // that stops here is discarded.
+                            shared_model.install(Arc::clone(&provider), model.clone());
                         }
                         Err(e) => {
                             error!(error = %e, agent_id = %agent_id, %turn_id, "provider error");
@@ -571,7 +831,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         &input.mode,
                         &turn_instructions.text,
                         &params.prompt_slots,
-                        &model,
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {
@@ -583,6 +842,28 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
                 let mut agent = Agent::new(
                     AgentParams {
+                        // Session options travel through the coordinator, so
+                        // fast and workflow reach a run in flight the same way
+                        // the model does.
+                        settings_source: Some(Arc::new(crate::SessionRunSettings {
+                            model: Arc::new(shared_model.clone()),
+                            session_id,
+                        })),
+                        // Without this a workflow toggle would flip the flag
+                        // while the interpreter kept the schema built for the
+                        // old one, and a model switch would carry the previous
+                        // model's tool descriptions.
+                        tool_builder: Some({
+                            let vars = turn_vars.clone();
+                            let config = params.config.clone();
+                            let excluded = params.excluded_tools.clone();
+                            let registry = Arc::clone(ToolRegistry::global_arc());
+                            Arc::new(move |model: &Model, workflow: bool| {
+                                tool_definitions(
+                                    &vars, model, &config, &excluded, workflow, &registry,
+                                )
+                            })
+                        }),
                         agent_id,
                         provider: Arc::clone(&provider),
                         model: model.clone(),
@@ -616,12 +897,26 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_local_tools(Arc::clone(&params.local_tools))
                 .with_mcp(mcp.clone());
 
-                agent.run(turn_id, input).await;
+                let outcome = agent.run(turn_id, input).await;
                 drop(agent);
+                drop(turn_event_tx);
                 cancel_task.cancel().await;
+                let terminal = terminal_task.await;
 
-                if let Some(store) = &mut store {
-                    store.record_turn(history.as_slice(), model.spec());
+                if let TurnOutcome::Failed { failure, .. } = &outcome {
+                    error!(error = %failure.user_message, "agent error");
+                }
+                if let Err(error) = checkpoint_and_forward_terminal(
+                    lease_committer,
+                    session_id,
+                    history.as_slice(),
+                    params.timeouts.low_speed,
+                    terminal,
+                    &raw_tx,
+                )
+                .await
+                {
+                    error!(%error, %session_id, "failed to checkpoint completed turn");
                 }
                 run_id += 1;
             }
@@ -640,7 +935,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         cancel_tx,
         model_tx,
         control_tx,
+        model: handle_model,
         session_id: session_ref,
+        mailbox: handle_mailbox,
         permissions,
         task,
     }
@@ -659,91 +956,407 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use maki_storage::sessions::generate_title;
-    use tempfile::TempDir;
-
     use super::*;
 
-    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
-    const CWD: &str = "/project";
-    const MODEL_SPEC: &str = "anthropic/claude-test";
+    /// A print-mode run needs a coordinator like any other session: tools read
+    /// their options through one, and `SessionMailbox::notify` resolves through
+    /// one. Without it every option read fails with `session not live` and
+    /// `bash` cannot run at all.
+    #[test]
+    fn spawn_registers_a_resolvable_coordinator() {
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let handle = spawn(HeadlessParams {
+            model: model.clone(),
+            config: AgentConfig::default(),
+            permissions_config: PermissionsConfig::default(),
+            timeouts: Timeouts::default(),
+            input: AgentInput {
+                message: "hello".into(),
+                mode: AgentMode::Build,
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: Default::default(),
+                fast: false,
+                workflow: false,
+                prompt: None,
+                lease_committer: None,
+            },
+            prompt_slots: ResolvedSlots::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: PathBuf::from("/tmp"),
+            system_prompt_override: None,
+            append_system_prompt: None,
+            model_policy: Arc::default(),
+            plugin_rules: Arc::default(),
+            modes: Arc::default(),
+            session_options: Default::default(),
+        });
 
-    fn session_id() -> MakiId {
-        SESSION_ID.parse().unwrap()
+        let session_id = handle.session_id.id();
+        let coordinator = SessionCoordinatorHandle::resolve(session_id)
+            .expect("print mode must register a coordinator for its session");
+        assert_eq!(coordinator.read().session_id(), session_id);
+        // The mailbox the coordinator hands out must be the one the run polls,
+        // or notifications land nowhere.
+        SessionMailbox::notify(session_id, "ping".into(), true)
+            .expect("notify resolves through the registered coordinator");
+
+        drop(handle.task);
+        let _ = futures_lite::future::block_on(coordinator.close());
     }
 
-    fn store_in(tmp: &TempDir) -> SessionStore {
-        SessionStore::open_in(
-            StateDir::from_path(tmp.path().to_path_buf()),
-            session_id(),
-            CWD,
-            MODEL_SPEC,
-        )
+    /// `/compact` reports success only when the compacted history is durable.
+    /// These pin the order: nothing reports `Completed` unless the persist step
+    /// ran first and returned `Ok`, and every other path rolls the in-memory
+    /// history back to what it was before the compaction.
+    fn as_json(messages: &[Message]) -> Value {
+        serde_json::to_value(messages).unwrap()
     }
 
-    fn load(tmp: &TempDir) -> StoredSession {
-        StoredSession::load(session_id(), &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
+    type PersistLog = Arc<std::sync::Mutex<Vec<Vec<Message>>>>;
+
+    struct CompactionFixture {
+        history: History,
+        previous: Vec<Message>,
+        persisted: PersistLog,
+    }
+
+    fn compaction_fixture() -> CompactionFixture {
+        CompactionFixture {
+            history: History::new(vec![Message::user("compacted".into())]),
+            previous: vec![Message::user("original".into())],
+            persisted: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 
     #[test]
-    fn new_session_is_loadable_before_first_turn() {
-        let tmp = TempDir::new().unwrap();
-        store_in(&tmp);
-        let loaded = load(&tmp);
-        assert_eq!(loaded.id, session_id());
-        assert_eq!(loaded.cwd, CWD);
-        assert_eq!(loaded.model, MODEL_SPEC);
-        assert!(loaded.messages().is_empty());
+    fn manual_compaction_persists_before_reporting_success() {
+        smol::block_on(async {
+            let CompactionFixture {
+                mut history,
+                previous,
+                persisted,
+            } = compaction_fixture();
+            let terminal = settle_manual_compaction(
+                Ok(()),
+                &mut history,
+                previous,
+                &CancelToken::none(),
+                |compacted| {
+                    let persisted = Arc::clone(&persisted);
+                    async move {
+                        persisted.lock().unwrap().push(compacted);
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+
+            assert_eq!(terminal, ManualCompactionEvent::Completed);
+            let persisted = persisted.lock().unwrap();
+            assert_eq!(persisted.len(), 1, "persistence must run exactly once");
+            assert_eq!(
+                as_json(&persisted[0]),
+                as_json(&[Message::user("compacted".into())]),
+                "the compacted history is what must reach persistence"
+            );
+            assert_eq!(
+                as_json(history.as_slice()),
+                as_json(&[Message::user("compacted".into())])
+            );
+        });
     }
 
     #[test]
-    fn record_turn_persists_messages_and_title() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        let messages = vec![Message::user("fix the login bug".into())];
-        store.record_turn(&messages, MODEL_SPEC.into());
+    fn failed_persistence_reports_failure_and_rolls_history_back() {
+        smol::block_on(async {
+            let CompactionFixture {
+                mut history,
+                previous,
+                ..
+            } = compaction_fixture();
+            let terminal = settle_manual_compaction(
+                Ok(()),
+                &mut history,
+                previous.clone(),
+                &CancelToken::none(),
+                |_| async { Err("save failed".to_owned()) },
+            )
+            .await;
 
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 1);
-        assert_eq!(loaded.title, generate_title(&messages));
+            assert_eq!(
+                terminal,
+                ManualCompactionEvent::Failed("save failed".to_owned()),
+                "a compaction nobody saved must not report success"
+            );
+            assert_eq!(as_json(history.as_slice()), as_json(&previous));
+        });
     }
 
     #[test]
-    fn record_turn_persists_observations() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        store.record_turn(
-            &[
-                Message::user("fix the login bug".into()),
-                Message::observation("build failed".into()),
-            ],
-            MODEL_SPEC.into(),
-        );
+    fn a_failed_compaction_is_never_persisted() {
+        smol::block_on(async {
+            let CompactionFixture {
+                mut history,
+                previous,
+                persisted,
+            } = compaction_fixture();
+            let terminal = settle_manual_compaction(
+                Err("provider failed".to_owned()),
+                &mut history,
+                previous.clone(),
+                &CancelToken::none(),
+                |compacted| {
+                    let persisted = Arc::clone(&persisted);
+                    async move {
+                        persisted.lock().unwrap().push(compacted);
+                        Ok(())
+                    }
+                },
+            )
+            .await;
 
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 2);
-        assert!(loaded.messages()[1].is_observation());
+            assert_eq!(
+                terminal,
+                ManualCompactionEvent::Failed("provider failed".to_owned())
+            );
+            assert!(
+                persisted.lock().unwrap().is_empty(),
+                "a compaction that failed must not overwrite the saved history"
+            );
+            assert_eq!(as_json(history.as_slice()), as_json(&previous));
+        });
     }
 
     #[test]
-    fn reopening_resumes_existing_session() {
-        let tmp = TempDir::new().unwrap();
-        let mut store = store_in(&tmp);
-        store.record_turn(&[Message::user("first prompt".into())], MODEL_SPEC.into());
-        drop(store);
+    fn cancelled_persistence_reports_cancellation_not_failure() {
+        smol::block_on(async {
+            let CompactionFixture {
+                mut history,
+                previous,
+                ..
+            } = compaction_fixture();
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+            let terminal = settle_manual_compaction(
+                Ok(()),
+                &mut history,
+                previous.clone(),
+                &cancel,
+                |_| async { Err("interrupted".to_owned()) },
+            )
+            .await;
 
-        let mut store = store_in(&tmp);
-        assert_eq!(store.session.messages().len(), 1);
+            assert_eq!(terminal, ManualCompactionEvent::Cancelled);
+            assert_eq!(as_json(history.as_slice()), as_json(&previous));
+        });
+    }
 
-        let messages = vec![
-            Message::user("first prompt".into()),
-            Message::user("second prompt".into()),
-        ];
-        store.record_turn(&messages, "other/model".into());
+    struct TestProvider;
 
-        let loaded = load(&tmp);
-        assert_eq!(loaded.messages().len(), 2);
-        assert_eq!(loaded.model, "other/model");
+    impl maki_providers::provider::Provider for TestProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, crate::AgentError>,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn turn_event_collection_finishes_with_retained_sender() {
+        smol::block_on(async {
+            let (turn_tx, turn_rx) = flume::unbounded();
+            let retained_tx = turn_tx.clone();
+            let (raw_tx, raw_rx) = flume::unbounded();
+            let run_id = 17;
+            let outcome = TurnOutcome::Completed {
+                agent_id: AgentId::generate(),
+                turn_id: TurnId::generate(),
+                usage: TokenUsage::default(),
+                num_turns: 1,
+                reason: crate::DoneReason::EndTurn,
+            };
+            let collector = smol::spawn(collect_turn_events(turn_rx, raw_tx));
+
+            turn_tx
+                .send(Envelope {
+                    event: AgentEvent::TextDelta {
+                        text: "before terminal".into(),
+                    },
+                    subagent: None,
+                    run_id,
+                })
+                .unwrap();
+            turn_tx
+                .send(Envelope {
+                    event: AgentEvent::TurnOutcome(outcome.clone()),
+                    subagent: None,
+                    run_id,
+                })
+                .unwrap();
+            drop(turn_tx);
+
+            let terminal = collector
+                .await
+                .expect("root outcome must finish collection");
+            assert_eq!(terminal.run_id, run_id);
+            assert!(terminal.subagent.is_none());
+            assert!(matches!(terminal.event, AgentEvent::TurnOutcome(got) if got == outcome));
+            assert!(matches!(
+                raw_rx.recv_async().await.unwrap(),
+                Envelope {
+                    event: AgentEvent::TextDelta { text },
+                    subagent: None,
+                    run_id: got_run_id,
+                } if text == "before terminal" && got_run_id == run_id
+            ));
+            assert!(
+                retained_tx
+                    .send(Envelope {
+                        event: AgentEvent::TextDelta {
+                            text: "retained".into(),
+                        },
+                        subagent: None,
+                        run_id,
+                    })
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_precedes_never_resolving_checkpoint_and_next_lease_recovers() {
+        smol::block_on(async {
+            let session_id = MakiId::generate();
+            let checkpoint: Arc<
+                dyn maki_storage::checkpoint::CheckpointWriter<
+                        crate::session_coordinator::SessionCheckpoint,
+                    >,
+            > = Arc::new(|_| {
+                Box::pin(std::future::pending()) as maki_storage::checkpoint::CheckpointFuture
+            });
+            let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+                session_id,
+                catalog: Default::default(),
+                definitions: builtin_option_definitions(
+                    "test/model",
+                    [Arc::from("test/model")],
+                    false,
+                    false,
+                    false,
+                    Default::default(),
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from("test/model"),
+                cwd: PathBuf::from("/project"),
+                model_policy: Arc::default(),
+                model_adopter: Arc::new(|_| {
+                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path| {
+                    Box::pin(async move { Ok(path) })
+                        as crate::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint,
+                mailbox: SessionMailbox::new(session_id),
+            })
+            .unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let committer = lease.committer().unwrap();
+            let outcome = TurnOutcome::Completed {
+                agent_id: AgentId::generate(),
+                turn_id: TurnId::generate(),
+                usage: TokenUsage::default(),
+                num_turns: 1,
+                reason: crate::DoneReason::EndTurn,
+            };
+            let terminal = Envelope {
+                event: AgentEvent::TurnOutcome(outcome.clone()),
+                subagent: None,
+                run_id: 0,
+            };
+            let (raw_tx, raw_rx) = flume::unbounded();
+            let history = [Message::user("first".into())];
+            let mut checkpoint = Box::pin(checkpoint_and_forward_terminal(
+                Some(committer),
+                session_id,
+                &history,
+                std::time::Duration::ZERO,
+                Some(terminal),
+                &raw_tx,
+            ));
+            assert!(
+                futures_lite::future::poll_once(&mut checkpoint)
+                    .await
+                    .is_none()
+            );
+
+            let forwarded = raw_rx.recv_async().await.unwrap();
+            assert!(matches!(forwarded.event, AgentEvent::TurnOutcome(got) if got == outcome));
+            assert!(checkpoint.await.is_err());
+            drop(lease);
+
+            let next = coordinator.acquire_lease().await.unwrap();
+            assert!(coordinator.read().history().is_empty());
+            drop(next);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn wake_refreshes_model_after_idle_wait() {
+        smol::block_on(async {
+            let (_input_tx, input_rx) = flume::unbounded();
+            let (control_tx, control_rx) = flume::unbounded();
+            let initial_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+            let adopted_model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+            let adopted_provider: Arc<dyn Provider> = Arc::new(TestProvider);
+            let mut provider: Arc<dyn Provider> = Arc::new(TestProvider);
+            let mut model = initial_model;
+            let shared_model = crate::SharedModel::default();
+            let mut wake = Box::pin(receive_wake_and_refresh(
+                &input_rx,
+                &control_rx,
+                &shared_model,
+                &mut provider,
+                &mut model,
+            ));
+            assert!(futures_lite::future::poll_once(&mut wake).await.is_none());
+            shared_model.install(Arc::clone(&adopted_provider), adopted_model.clone());
+            control_tx
+                .send(InteractiveControl::Reset(flume::bounded(1).0))
+                .unwrap();
+            let got_control = matches!(
+                wake.as_mut().await,
+                Some(InteractiveWake::Control(InteractiveControl::Reset(_)))
+            );
+            drop(wake);
+
+            assert!(got_control);
+            assert_eq!(model.spec(), adopted_model.spec());
+            assert!(Arc::ptr_eq(&provider, &adopted_provider));
+        });
     }
 
     #[test]

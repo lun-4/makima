@@ -659,11 +659,11 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    fn warm_empty_catalog() {
+    fn warm_empty_catalog() -> std::sync::MutexGuard<'static, ()> {
         let tmp = tempfile::tempdir().unwrap();
         crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
             tmp.path().to_path_buf(),
-        ));
+        ))
     }
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
@@ -740,7 +740,7 @@ mod tests {
     #[test_case("foobar/", ModelError::InvalidFormat ; "missing_model")]
     #[test_case("foobar/gpt-4", ModelError::UnsupportedProvider("foobar".into()) ; "unsupported_provider")]
     fn from_spec_errors(spec: &str, expected: ModelError) {
-        warm_empty_catalog();
+        let _catalog = warm_empty_catalog();
         let err = Model::from_spec(spec).unwrap_err();
         assert_eq!(
             std::mem::discriminant(&err),
@@ -794,7 +794,7 @@ mod tests {
         // A cold-cache model resolution now warms the catalog from the on-disk
         // cache (or fetches once), so seed an empty catalog to stay hermetic:
         // the generic fallback still fires because the slug is not in it.
-        warm_empty_catalog();
+        let _catalog = warm_empty_catalog();
         let err = Model::from_spec("definitely-not-a-catalog-slug/any-model").unwrap_err();
         assert!(matches!(err, ModelError::UnsupportedProvider(_)));
     }

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
 use maki_agent::permissions::PluginRuleStore;
+use maki_agent::session_coordinator::SessionOptionCatalog;
 use maki_agent::tools::ToolRegistry;
 use maki_commands::CommandRegistry;
 use maki_config::{PluginsConfig, RawConfig};
@@ -117,6 +118,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "mode_plan_override",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/mode_plan_override"),
+    },
+    BundledPlugin {
+        name: "options",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/options"),
     },
     BundledPlugin {
         name: "perf",
@@ -238,6 +243,7 @@ impl PluginHost {
     ) -> Result<Self, PluginError> {
         let modes = Arc::new(maki_agent::ModeRegistry::builtin());
         let plugin_rules = Arc::new(PluginRuleStore::default());
+        let session_options = SessionOptionCatalog::default();
         let lua = runtime::spawn(
             Arc::clone(&registry),
             runtime::SpawnConfig {
@@ -246,6 +252,7 @@ impl PluginHost {
                 bundled_dirs: *BUNDLED_DIRS,
                 jit,
                 plugin_rules: Arc::clone(&plugin_rules),
+                session_options: session_options.clone(),
                 state_dir,
                 fs,
             },
@@ -578,8 +585,10 @@ impl PluginHost {
     pub fn event_handle(&self) -> EventHandle {
         EventHandle {
             tx: self.inner.tx.clone(),
+            shutdown: Arc::clone(&self.inner.shutdown),
             prio_tx: self.inner.prio_tx.clone(),
             modes: Arc::clone(&self.inner.modes),
+            session_options: self.inner.session_options.clone(),
             completion: None,
             command_generations: Some(Arc::clone(&self.inner.command_generations)),
             command_arguments: self.inner.command_arguments.clone(),
@@ -617,11 +626,16 @@ impl PluginHost {
 #[derive(Clone)]
 pub struct EventHandle {
     tx: flume::Sender<Request>,
+    /// Set once the host starts shutting down. A handle outlives
+    /// `begin_shutdown` -- it holds its own sender clone -- so without this it
+    /// would race the dispatch loop for whether a request still gets served.
+    shutdown: Arc<AtomicBool>,
     /// User-initiated requests bypass queued bulk work (session restores).
     prio_tx: flume::Sender<Request>,
     /// Shared mode registry; `None`-less so plugins and the Rust agent see
     /// the same definitions. Test handles use an empty builtin set.
     modes: Arc<maki_agent::ModeRegistry>,
+    session_options: SessionOptionCatalog,
     /// In-memory stand-in for the Lua completion/expander stores, used only by
     /// tests that build an `App` without a running plugin host. `None` in
     /// production, where the two RPC methods below talk to the Lua thread.
@@ -704,8 +718,10 @@ impl EventHandle {
     pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
         Self {
             tx: tx.clone(),
+            shutdown: Arc::default(),
             prio_tx: flume::unbounded().0,
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            session_options: SessionOptionCatalog::default(),
             completion: None,
             command_generations: None,
             command_arguments: CoalescedLatest::new({
@@ -727,6 +743,10 @@ impl EventHandle {
 
     pub fn mode_registry(&self) -> Arc<maki_agent::ModeRegistry> {
         Arc::clone(&self.modes)
+    }
+
+    pub fn session_option_catalog(&self) -> SessionOptionCatalog {
+        self.session_options.clone()
     }
 
     fn command_generation(&self, plugin: &Arc<str>, command: &Arc<str>) -> u64 {
@@ -758,8 +778,10 @@ impl EventHandle {
     pub fn disconnected_for_test_with_modes(modes: Arc<maki_agent::ModeRegistry>) -> Self {
         Self {
             tx: flume::unbounded().0,
+            shutdown: Arc::default(),
             prio_tx: flume::unbounded().0,
             modes,
+            session_options: SessionOptionCatalog::default(),
             completion: None,
             command_generations: None,
             command_arguments: CoalescedLatest::new(|_| false),
@@ -773,9 +795,11 @@ impl EventHandle {
     #[doc(hidden)]
     pub fn with_completion_for_test(backend: Arc<TestCompletionBackend>) -> Self {
         Self {
+            shutdown: Arc::default(),
             tx: flume::unbounded().0,
             prio_tx: flume::unbounded().0,
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            session_options: SessionOptionCatalog::default(),
             completion: Some(backend),
             command_generations: None,
             command_arguments: CoalescedLatest::new(|_| false),
@@ -800,9 +824,11 @@ impl EventHandle {
     #[cfg(feature = "test-support")]
     pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
         Self {
+            shutdown: Arc::default(),
             tx: shared.clone(),
             prio_tx: shared.clone(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            session_options: SessionOptionCatalog::default(),
             completion: None,
             command_generations: None,
             command_arguments: CoalescedLatest::new({
@@ -860,6 +886,9 @@ impl EventHandle {
     }
 
     pub fn collect_prompt_slots(&self) -> ResolvedSlots {
+        if self.shutdown.load(Ordering::Acquire) {
+            return ResolvedSlots::default();
+        }
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv().unwrap_or_default()
@@ -942,6 +971,9 @@ impl EventHandle {
     }
 
     pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+        if self.shutdown.load(Ordering::Acquire) {
+            return ResolvedSlots::default();
+        }
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv_async().await.unwrap_or_default()
@@ -1097,8 +1129,19 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::SessionMailbox;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
+    use maki_agent::session_coordinator::{
+        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
+        SessionCoordinatorParams, builtin_option_definitions,
+    };
     use maki_agent::tools::ToolRegistry;
+    use maki_providers::Model;
+    use maki_storage::checkpoint::{
+        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+    };
+    use maki_storage::id::MakiId;
+    use std::collections::BTreeMap;
     use std::thread;
     use std::time::Instant;
     use test_case::test_case;
@@ -1125,6 +1168,50 @@ mod tests {
         registry.snapshot_for(&target).unwrap()
     }
 
+    fn test_coordinator(catalog: SessionOptionCatalog) -> SessionCoordinatorHandle {
+        test_coordinator_with_options(catalog, Default::default())
+    }
+
+    fn test_coordinator_with_options(
+        catalog: SessionOptionCatalog,
+        persisted_options: BTreeMap<String, String>,
+    ) -> SessionCoordinatorHandle {
+        let id = MakiId::generate();
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+            Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
+                Box::pin(async move {
+                    Ok(CheckpointAck {
+                        session_id: request.session_id,
+                        version: request.version,
+                    })
+                }) as CheckpointFuture
+            });
+        SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id: id,
+            catalog,
+            definitions: builtin_option_definitions(
+                "test/model",
+                [Arc::from("test/model")],
+                false,
+                false,
+                false,
+                maki_agent::ThinkingConfig::Off,
+            ),
+            persisted_options,
+            history: Vec::new(),
+            model: Arc::from("test/model"),
+            cwd: PathBuf::from("/project"),
+            model_policy: Arc::default(),
+            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
+            directory_adopter: Arc::new(|path: PathBuf| {
+                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
+            }),
+            checkpoint,
+            mailbox: SessionMailbox::new(id),
+        })
+        .unwrap()
+    }
+
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
     /// interpreter path needs its own coverage.
@@ -1139,6 +1226,148 @@ mod tests {
 
     /// The second call sends `Shutdown` on a sender that is already
     /// disconnected; it must swallow that error and keep rejecting work.
+    #[test]
+    fn session_option_load_reload_failure_and_unload_are_transactional() {
+        const SOURCE: &str = r#"
+            maki.api.register_session_option({
+                id = "choice.value",
+                name = "Choice",
+                description = "Test choice",
+                category = "mode",
+                values = {
+                    { value = "a", name = "A" },
+                    { value = "b", name = "B" },
+                },
+                initial_value = "a",
+                persistent = true,
+            })
+        "#;
+        smol::block_on(async {
+            let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            host.load_source("choice", SOURCE).unwrap();
+            let coordinator = test_coordinator(host.event_handle().session_option_catalog());
+            coordinator.set_option("choice.value", "b").await.unwrap();
+
+            host.load_source("choice", SOURCE).unwrap();
+            let current = || {
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == "choice.value")
+                    .unwrap()
+                    .current_value
+                    .to_string()
+            };
+            assert_eq!(current(), "b");
+
+            assert!(
+                host.load_source("choice", "maki.api.register_session_option({ id = 'bad' })")
+                    .is_err()
+            );
+            assert_eq!(current(), "b");
+
+            host.unload("choice").unwrap();
+            assert!(
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .all(|option| option.definition.id.as_ref() != "choice.value")
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn independent_plugin_hosts_do_not_share_session_option_catalogs() {
+        const FIRST: &str = r#"
+            maki.api.register_session_option({
+                id = "choice.value",
+                name = "Choice",
+                description = "First choice",
+                category = "mode",
+                values = {{ value = "a", name = "A" }},
+                initial_value = "a",
+            })
+        "#;
+        const SECOND: &str = r#"
+            maki.api.register_session_option({
+                id = "choice.value",
+                name = "Choice",
+                description = "Second choice",
+                category = "mode",
+                values = {{ value = "b", name = "B" }},
+                initial_value = "b",
+            })
+        "#;
+        smol::block_on(async {
+            let first_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            let second_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            first_host.load_source("choice", FIRST).unwrap();
+            second_host.load_source("choice", SECOND).unwrap();
+
+            let first = test_coordinator(first_host.event_handle().session_option_catalog());
+            let second = test_coordinator(second_host.event_handle().session_option_catalog());
+            let option = |coordinator: &SessionCoordinatorHandle| {
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == "choice.value")
+                    .cloned()
+                    .unwrap()
+            };
+            assert_eq!(option(&first).current_value.as_ref(), "a");
+            assert_eq!(
+                option(&first).definition.description.as_ref(),
+                "First choice"
+            );
+            assert_eq!(option(&second).current_value.as_ref(), "b");
+            assert_eq!(
+                option(&second).definition.description.as_ref(),
+                "Second choice"
+            );
+
+            first.close().await.unwrap();
+            second.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn bash_auto_mode_persisted_value_wins_over_plugin_default() {
+        smol::block_on(async {
+            let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            let source = BUNDLED_PLUGINS
+                .iter()
+                .find(|plugin| plugin.name == "bash")
+                .and_then(|plugin| plugin.dir.get_file("init.lua"))
+                .and_then(|file| file.contents_utf8())
+                .unwrap();
+            let mut opts = serde_json::Map::new();
+            opts.insert("auto_mode".to_string(), serde_json::json!(true));
+            host.load_source_with_opts("bash", source, opts).unwrap();
+
+            let coordinator = test_coordinator_with_options(
+                host.event_handle().session_option_catalog(),
+                BTreeMap::from([("bash.auto_mode".to_string(), "disabled".to_string())]),
+            );
+            let option = coordinator
+                .read()
+                .options()
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == "bash.auto_mode")
+                .cloned()
+                .unwrap();
+            assert_eq!(option.current_value.as_ref(), "disabled");
+            coordinator.close().await.unwrap();
+        });
+    }
+
     #[test]
     fn begin_shutdown_rejects_later_loads_and_is_idempotent() {
         let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
@@ -1236,8 +1465,10 @@ mod tests {
         let (tx, _rx) = flume::bounded(8);
         let handle = EventHandle {
             tx,
+            shutdown: Arc::default(),
             prio_tx: prio_tx.clone(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
+            session_options: SessionOptionCatalog::default(),
             completion: None,
             command_generations: None,
             command_arguments: CoalescedLatest::new(|_| false),
@@ -1560,6 +1791,479 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn slots_prompts_and_status_hints_replace_transactionally() {
+        const OLD: &str = r#"
+            maki.api.declare_slot("transaction.slot", function() return "old slot" end)
+            maki.api.set_prompt({ slot = "identity", content = function() return "old prompt" end })
+            maki.ui.set_status_hint({ { "o", "old hint" } })
+        "#;
+        const FAILED: &str = r#"
+            maki.api.declare_slot("transaction.slot", function() return "candidate slot" end)
+            maki.api.set_prompt({ slot = "identity", content = function() return "candidate prompt" end })
+            maki.ui.set_status_hint({ { "c", "candidate hint" } })
+            error("reject candidate")
+        "#;
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("transaction", OLD).unwrap();
+        assert!(host.load_source("transaction", FAILED).is_err());
+
+        let slots = host.event_handle().collect_prompt_slots();
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["old prompt"]
+        );
+        let hints = host.hint_reader().load_full();
+        assert_eq!(hints.entries.len(), 1);
+        assert_eq!(hints.entries[0].1, vec![("o".into(), "old hint".into())]);
+
+        host.load_source("transaction", "return true").unwrap();
+        let slots = host.event_handle().collect_prompt_slots();
+        assert!(contents(&slots, PromptId::System, Slot::Identity).is_empty());
+        assert!(host.hint_reader().load_full().entries.is_empty());
+    }
+
+    #[test]
+    fn command_and_keymap_replacement_is_transactional() {
+        const OLD: &str = r#"
+            maki.api.register_command({
+                name = "/choice",
+                description = "old command",
+                tui_only = false,
+                handler = function() end,
+            })
+            maki.keymap.set("n", "<C-g>", function()
+                maki.api.register_command({
+                    name = "/old_callback",
+                    description = "old callback",
+                    tui_only = false,
+                    handler = function() end,
+                })
+            end, { desc = "old keymap" })
+        "#;
+        const FAILED: &str = r#"
+            maki.api.register_command({
+                name = "/choice",
+                description = "candidate command",
+                tui_only = false,
+                handler = function() end,
+            })
+            maki.keymap.set("n", "<C-g>", function() error("candidate callback") end,
+                { desc = "candidate keymap" })
+            error("reject candidate")
+        "#;
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("transaction", OLD).unwrap();
+        assert!(host.load_source("transaction", FAILED).is_err());
+
+        let commands = command_snapshot(&host);
+        assert!(
+            commands
+                .commands()
+                .iter()
+                .any(|command| command.spec().name.as_ref() == "/choice")
+        );
+        let keymaps = host.keymap_reader().load();
+        assert_eq!(keymaps.entries.len(), 1);
+        assert_eq!(keymaps.entries[0].desc, "old keymap");
+        host.event_handle()
+            .run_keybind_callback(keymaps.entries[0].id);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !command_snapshot(&host)
+            .commands()
+            .iter()
+            .any(|command| command.spec().name.as_ref() == "/old_callback")
+        {
+            assert!(Instant::now() < deadline, "old keymap callback was lost");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        host.load_source("transaction", "return true").unwrap();
+        assert!(
+            command_snapshot(&host)
+                .commands()
+                .iter()
+                .all(|command| command.spec().name.as_ref() != "/choice")
+        );
+        assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
+    #[test]
+    fn autocmd_failed_replacement_keeps_old_listener() {
+        const OLD: &str = r#"
+            maki.api.create_autocmd("Replacement", { callback = function()
+                maki.api.register_command({
+                    name = "/old-fired",
+                    description = "old",
+                    tui_only = false,
+                    handler = function() end,
+                })
+            end })
+        "#;
+        const FAILED: &str = r#"
+            maki.api.create_autocmd("Replacement", { callback = function()
+                maki.api.register_command({
+                    name = "/new-fired",
+                    description = "new",
+                    tui_only = false,
+                    handler = function() end,
+                })
+            end })
+            error("reject replacement")
+        "#;
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("replacement", OLD).unwrap();
+        assert!(host.load_source("replacement", FAILED).is_err());
+        host.event_handle()
+            .fire_autocmd("Replacement", serde_json::json!({}));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !command_snapshot(&host)
+            .commands()
+            .iter()
+            .any(|command| command.spec().name.as_ref() == "/old-fired")
+        {
+            assert!(Instant::now() < deadline, "old autocmd listener was lost");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            command_snapshot(&host)
+                .commands()
+                .iter()
+                .all(|command| command.spec().name.as_ref() != "/new-fired")
+        );
+    }
+
+    #[test]
+    fn autocmd_successful_replacement_omits_old_listener_and_keeps_others() {
+        const LISTENER: &str = r#"
+            maki.api.create_autocmd("Replacement", { callback = function()
+                maki.api.register_command({
+                    name = "/retained-fired",
+                    description = "retained",
+                    tui_only = false,
+                    handler = function() end,
+                })
+            end })
+        "#;
+        const OLD: &str = r#"
+            maki.api.create_autocmd("Replacement", { callback = function()
+                maki.api.register_command({
+                    name = "/omitted-fired",
+                    description = "omitted",
+                    tui_only = false,
+                    handler = function() end,
+                })
+            end })
+        "#;
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("retained", LISTENER).unwrap();
+        host.load_source("replacement", OLD).unwrap();
+        host.load_source("replacement", "return true").unwrap();
+        host.event_handle()
+            .fire_autocmd("Replacement", serde_json::json!({}));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !command_snapshot(&host)
+            .commands()
+            .iter()
+            .any(|command| command.spec().name.as_ref() == "/retained-fired")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "retained autocmd listener was lost"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            command_snapshot(&host)
+                .commands()
+                .iter()
+                .all(|command| command.spec().name.as_ref() != "/omitted-fired")
+        );
+    }
+
+    #[test]
+    fn timer_failed_load_never_fires_candidate_callback() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        assert!(
+            host.load_source(
+                "timer_replacement",
+                r#"
+                    maki.timer.set(0.001, function()
+                        maki.api.register_command({
+                            name = "/candidate-timer-fired",
+                            description = "candidate",
+                            tui_only = false,
+                            handler = function() end,
+                        })
+                    end)
+                    error("reject timer")
+                "#,
+            )
+            .is_err()
+        );
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            command_snapshot(&host)
+                .commands()
+                .iter()
+                .all(|command| command.spec().name.as_ref() != "/candidate-timer-fired")
+        );
+    }
+
+    #[test]
+    fn committed_timer_keeps_id_and_successful_omission_stops_it() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "timer_replacement",
+            r#"
+                local count = 0
+                maki.timer.set(0.001, function(id)
+                    count = count + 1
+                    maki.api.register_command({
+                        name = "/committed-timer-" .. tostring(count),
+                        description = "committed timer",
+                        tui_only = false,
+                        handler = function() end,
+                    })
+                    maki.timer.del(id)
+                end)
+            "#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while command_snapshot(&host)
+            .commands()
+            .iter()
+            .all(|command| command.spec().name.as_ref() != "/committed-timer-1")
+        {
+            assert!(Instant::now() < deadline, "committed timer did not fire");
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            command_snapshot(&host)
+                .commands()
+                .iter()
+                .all(|command| command.spec().name.as_ref() != "/committed-timer-2"),
+            "callback timer id did not stop the committed timer"
+        );
+
+        host.load_source("timer_replacement", "return true")
+            .unwrap();
+        assert!(
+            command_snapshot(&host)
+                .commands()
+                .iter()
+                .all(|command| !command.spec().name.starts_with("/committed-timer-"))
+        );
+    }
+
+    #[test]
+    fn complete_plugin_replacement_is_transactional() {
+        const OLD: &str = r#"
+            maki.api.register_command({ name = "/old", description = "old", tui_only = false, handler = function() end })
+            maki.keymap.set("n", "<C-o>", function() maki.api.register_command({ name = "/old-key", description = "old", tui_only = false, handler = function() end }) end, { desc = "old key" })
+            maki.store.register("transaction", "old", { value = "old" })
+            maki.api.register_options({ old = { type = "string", desc = "old" } })
+            maki.api.register_completion_source("old", { get_items = function() return {{ label = "old", kind = "old", insertion = "@old:x" }} end })
+            maki.api.register_expander("old", function(ref) return "<old:" .. ref.value .. ">", nil end)
+            maki.api.declare_slot("transaction.slot", function() return "old slot" end)
+            maki.api.set_prompt({ slot = "identity", content = function() return "old prompt" end })
+            maki.ui.set_status_hint({ { "o", "old hint" } })
+            maki.api.create_autocmd("TransactionProbe", { callback = function()
+                local entries = maki.store.collect("transaction")
+                if entries.old then maki.api.register_command({ name = "/old-store", description = "old", tui_only = false, handler = function() end }) end
+                if entries.candidate then maki.api.register_command({ name = "/candidate-store", description = "candidate", tui_only = false, handler = function() end }) end
+            end })
+            maki.timer.set(0.001, function(id)
+                maki.api.register_command({ name = "/old-timer", description = "old", tui_only = false, handler = function() end })
+                maki.timer.del(id)
+            end)
+            maki.api.register_session_option({ id = "transaction.old", name = "Old", description = "old", category = "mode", values = {{ value = "yes", name = "Yes" }}, initial_value = "yes", persistent = true })
+        "#;
+        const FAILED: &str = r#"
+            maki.api.register_command({ name = "/candidate", description = "candidate", tui_only = false, handler = function() end })
+            maki.keymap.set("n", "<C-o>", function() maki.api.register_command({ name = "/candidate-key", description = "candidate", tui_only = false, handler = function() end }) end, { desc = "candidate key" })
+            maki.store.register("transaction", "candidate", { value = "candidate" })
+            maki.api.register_options({ candidate = { type = "string", desc = "candidate" } })
+            maki.api.register_completion_source("candidate", { get_items = function() return {{ label = "candidate", kind = "candidate", insertion = "@candidate:x" }} end })
+            maki.api.register_expander("candidate", function(ref) return "<candidate:" .. ref.value .. ">", nil end)
+            maki.api.declare_slot("transaction.slot", function() return "candidate slot" end)
+            maki.api.set_prompt({ slot = "identity", content = function() return "candidate prompt" end })
+            maki.ui.set_status_hint({ { "c", "candidate hint" } })
+            maki.api.create_autocmd("TransactionProbe", { callback = function() maki.api.register_command({ name = "/candidate-autocmd", description = "candidate", tui_only = false, handler = function() end }) end })
+            maki.timer.set(0.001, function() maki.api.register_command({ name = "/candidate-timer", description = "candidate", tui_only = false, handler = function() end }) end)
+            maki.api.register_session_option({ id = "transaction.candidate", name = "Candidate", description = "candidate", category = "mode", values = {{ value = "no", name = "No" }}, initial_value = "no", persistent = true })
+            error("reject candidate")
+        "#;
+
+        smol::block_on(async {
+            let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            host.load_source("transaction", OLD).unwrap();
+            assert!(host.load_source("transaction", FAILED).is_err());
+
+            let commands = command_snapshot(&host);
+            assert!(
+                commands
+                    .commands()
+                    .iter()
+                    .any(|c| c.spec().name.as_ref() == "/old")
+            );
+            assert!(
+                commands
+                    .commands()
+                    .iter()
+                    .all(|c| c.spec().name.as_ref() != "/candidate")
+            );
+            let keymaps = host.keymap_reader().load();
+            assert_eq!(keymaps.entries[0].desc, "old key");
+            let slots = host.event_handle().collect_prompt_slots();
+            assert_eq!(
+                contents(&slots, PromptId::System, Slot::Identity),
+                ["old prompt"]
+            );
+            assert_eq!(
+                host.hint_reader().load_full().entries[0].1,
+                vec![("o".into(), "old hint".into())]
+            );
+            let handle = host.event_handle();
+            assert_eq!(
+                handle.collect_completion_items(&CompletionCtx::default())[0].label,
+                "old"
+            );
+            assert_eq!(handle.expand_references("@old:x").unwrap(), "<old:x>");
+            handle.fire_autocmd("TransactionProbe", serde_json::json!({}));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !command_snapshot(&host).commands().iter().any(|c| {
+                c.spec().name.as_ref() == "/old-store" || c.spec().name.as_ref() == "/old-timer"
+            }) {
+                assert!(Instant::now() < deadline, "old callbacks did not fire");
+                thread::sleep(Duration::from_millis(10));
+            }
+            let commands = command_snapshot(&host);
+            assert!(
+                commands
+                    .commands()
+                    .iter()
+                    .all(|c| !c.spec().name.starts_with("/candidate-"))
+            );
+            assert!(
+                commands
+                    .commands()
+                    .iter()
+                    .all(|c| c.spec().name.as_ref() != "/candidate-store")
+            );
+            let options = host.plugin_options().unwrap();
+            assert!(
+                options[&Arc::from("transaction")]
+                    .iter()
+                    .any(|s| s.name == "old")
+            );
+            let coordinator = test_coordinator(host.event_handle().session_option_catalog());
+            assert!(
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .any(|o| o.definition.id.as_ref() == "transaction.old")
+            );
+            coordinator.close().await.unwrap();
+
+            host.load_source("transaction", "return true").unwrap();
+            assert!(
+                command_snapshot(&host)
+                    .commands()
+                    .iter()
+                    .all(|c| c.spec().name.as_ref() != "/old")
+            );
+            assert!(host.keymap_reader().load().entries.is_empty());
+            assert!(
+                contents(
+                    &host.event_handle().collect_prompt_slots(),
+                    PromptId::System,
+                    Slot::Identity
+                )
+                .is_empty()
+            );
+            assert!(host.hint_reader().load_full().entries.is_empty());
+            assert!(
+                host.event_handle()
+                    .collect_completion_items(&CompletionCtx::default())
+                    .iter()
+                    .all(|i| i.label != "old")
+            );
+            assert_eq!(
+                host.event_handle().expand_references("@old:x").unwrap(),
+                "@old:x"
+            );
+            assert!(
+                !host
+                    .plugin_options()
+                    .unwrap()
+                    .contains_key(&Arc::from("transaction"))
+            );
+        });
+    }
+
+    #[test]
+    fn options_and_completion_replacement_is_transactional() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "transaction",
+            r#"
+            maki.api.register_options({ old = { type = "string", desc = "old" } })
+            maki.api.register_completion_source("old", { get_items = function() return {} end })
+            maki.api.register_expander("old", function() return "old", nil end)
+        "#,
+        )
+        .unwrap();
+        assert!(
+            host.load_source(
+                "transaction",
+                r#"
+            maki.api.register_options({ bad = { type = "string", desc = "bad" } })
+            maki.api.register_completion_source("bad", { get_items = function() return {} end })
+            error("reject")
+        "#
+            )
+            .is_err()
+        );
+        assert!(
+            host.plugin_options().unwrap()[&Arc::from("transaction")]
+                .iter()
+                .any(|s| s.name == "old")
+        );
+        assert!(host.event_handle().expand_references("@old:x").is_ok());
+        host.load_source(
+            "transaction",
+            r#"
+            maki.api.register_options({ new = { type = "string", desc = "new" } })
+            maki.api.register_completion_source("new", { get_items = function() return {} end })
+        "#,
+        )
+        .unwrap();
+        let options = host.plugin_options().unwrap();
+        assert!(
+            options[&Arc::from("transaction")]
+                .iter()
+                .all(|s| s.name == "new")
+        );
+        assert!(
+            host.event_handle()
+                .expand_references("@old:x")
+                .unwrap()
+                .contains("@old:x")
+        );
     }
 
     /// `load_init_files_or_skip` is the single seam every entry point

@@ -606,6 +606,7 @@ fn input() -> AgentInput {
         fast: false,
         workflow: false,
         prompt: None,
+        lease_committer: None,
     }
 }
 

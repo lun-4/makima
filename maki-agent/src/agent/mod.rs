@@ -1,6 +1,7 @@
 mod compaction;
 mod history;
 mod instructions;
+pub mod isolated_turn;
 mod run;
 mod streaming;
 pub mod tool_dispatch;
@@ -14,5 +15,7 @@ pub use instructions::{
     is_instruction_file, load_instruction_text, load_instructions,
 };
 pub use run::{
-    Agent, AgentParams, AgentRunParams, estimate_message_tokens, resolve_compaction_model,
+    Agent, AgentParams, AgentRunParams, ModelSource, RunSettings, RunSettingsSource,
+    SessionRunSettings, SharedModel, ToolBuilder, estimate_message_tokens,
+    resolve_compaction_model,
 };

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use maki_agent::prompt::{PromptId, Slot};
 use maki_agent::tools::ToolRegistry;
+use maki_lua::test_support::{InMemoryFs, spawn_host_with_fs_for_tests};
 use maki_lua::{CompletionCtx, EventHandle, ItemSpec, PluginHost};
 
 const SKILL_SRC: &str = include_str!("../../plugins/skill/init.lua");
@@ -14,6 +15,10 @@ const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
 const MODEL_SRC: &str = include_str!("../../plugins/model/init.lua");
 
 const BUILTIN_SKILL: &str = "maki-plugin-dev";
+const PROJECT_SKILL: &str = "proj-skill";
+const PROJECT_SKILL_SOURCE: &str =
+    "---\nname: proj-skill\ndescription: project scoped\n---\n\nDo the project thing.\n";
+const PROJECT_SKILL_REL: &str = ".agents/skills/proj-skill/SKILL.md";
 const MODEL_SPEC: &str = "zai/glm-5";
 const PLAN_MODE: &str = "plan";
 const BUILD_MODE: &str = "build";
@@ -121,6 +126,33 @@ fn skill_source_offers_builtin_skill() {
         skills.contains(&expected.as_str()),
         "builtin skill must be offered: {skills:?}"
     );
+}
+
+/// The completion source and the expander have no tool ctx, so they read the
+/// project root from the process cwd: a skill in the cwd's `.agents/skills`
+/// must reach both the `@` popup and submit-time expansion.
+#[test]
+fn project_skill_from_cwd_is_offered_and_expands() {
+    let fs = Arc::new(InMemoryFs::new());
+    let cwd = std::env::current_dir().expect("cwd");
+    fs.seed(
+        &cwd.join(PROJECT_SKILL_REL),
+        PROJECT_SKILL_SOURCE.as_bytes().to_vec(),
+    );
+    let (handle, _guard) = spawn_host_with_fs_for_tests(&["skill"], Arc::clone(&fs), None);
+
+    let items = handle.collect_completion_items(&CompletionCtx::default());
+    let expected = format!("skill:{PROJECT_SKILL}");
+    let skills = labels(&items, "skill");
+    assert!(
+        skills.contains(&expected.as_str()),
+        "project skill must be offered: {skills:?}"
+    );
+
+    let expanded = handle
+        .expand_references(&format!("use @skill:{PROJECT_SKILL}"))
+        .unwrap_or_else(|e| panic!("project skill must expand: {e}"));
+    assert_eq!(expanded, format!("use <skill:{PROJECT_SKILL}>"));
 }
 
 #[test]

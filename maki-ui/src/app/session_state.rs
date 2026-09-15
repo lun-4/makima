@@ -90,13 +90,7 @@ impl SessionState {
         Self {
             // Saved model may differ from the live one (updated, removed, etc).
             // Reconcile so the UI badge and agent always see the truth.
-            thinking: session
-                .meta
-                .thinking
-                .or_else(|| read_prefs(storage).default_thinking)
-                .map(Into::into)
-                .filter(|_| model.supports_thinking())
-                .unwrap_or_default(),
+            thinking: resolve_thinking(&session, &model, storage),
             fast,
             workflow: session.meta.workflow,
             session: Arc::new(session),
@@ -124,6 +118,20 @@ impl SessionState {
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
     }
+}
+
+/// The thinking a session starts on: its own saved value, else the global
+/// default, and off outright when the model cannot think. The coordinator owns
+/// thinking once a session is registered, so this is read both to seed the
+/// option and to seed the state the option is mirrored into.
+pub fn resolve_thinking(session: &AppSession, model: &Model, storage: &StateDir) -> ThinkingConfig {
+    session
+        .meta
+        .thinking
+        .or_else(|| read_prefs(storage).default_thinking)
+        .map(Into::into)
+        .filter(|_| model.supports_thinking())
+        .unwrap_or_default()
 }
 
 impl From<Mode> for StoredMode {

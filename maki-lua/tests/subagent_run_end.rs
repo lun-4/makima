@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maki_agent::AgentEvent;
 use maki_agent::tools::ToolRegistry;
@@ -429,12 +429,33 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
     )
     .expect("failed turn did not resolve");
     assert_eq!(failed["error"], json!(PROVIDER_FAILURE));
-    let status = exec_tool(&reg, &ctx, "probe_status", json!({})).unwrap();
+    // `prompt` resolves its ticket inside `finalize_turn`, which runs before
+    // the actor flips to idle, so a status read straight afterwards can still
+    // see the turn running and carry no error. `status` is a polling API, so
+    // wait for it to settle instead of racing it.
+    let deadline = Instant::now() + TURN_TIMEOUT;
+    let status = loop {
+        let status = exec_tool(&reg, &ctx, "probe_status", json!({})).unwrap();
+        if status["status"] == json!("done") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failed turn's status never settled: {status}"
+        );
+        std::thread::yield_now();
+    };
     assert_eq!(status["error"], json!(PROVIDER_FAILURE));
-    let history = parent_rx
-        .recv_timeout(TURN_TIMEOUT)
-        .expect("failure history event");
-    assert!(matches!(history.event, AgentEvent::SubagentHistory { .. }));
+    // The parent channel also carries subagent activity, so scan for the
+    // history envelope rather than assuming it arrives first.
+    loop {
+        let envelope = parent_rx
+            .recv_timeout(TURN_TIMEOUT)
+            .expect("failure history event");
+        if matches!(envelope.event, AgentEvent::SubagentHistory { .. }) {
+            break;
+        }
+    }
 
     let recovered = exec_tool(
         &reg,

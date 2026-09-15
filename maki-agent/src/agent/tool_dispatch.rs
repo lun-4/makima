@@ -12,7 +12,7 @@ use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
 use crate::tools::{LocalToolFn, ToolContext, truncate_line};
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
-use maki_config::ToolKey;
+use maki_config::{FILE_WRITE_TOOLS, ToolKey};
 
 #[derive(Clone, Copy)]
 pub enum Emit {
@@ -122,7 +122,7 @@ pub async fn run(
             }
         };
 
-        if let Some(target) = invocation.mutable_path() {
+        if let Some(target) = invocation.mutable_path(ctx) {
             let restrict = ctx.restrict_write_to();
             let is_plan_target = restrict.as_deref().is_some_and(|pp| target == pp);
             if !is_plan_target {
@@ -134,7 +134,7 @@ pub async fn run(
                     );
                     return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
                 }
-                if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
+                if let Some(reason) = ctx.permissions.boundary_block_reason(&target) {
                     return done_error(reason);
                 }
             }
@@ -168,10 +168,11 @@ pub async fn run(
         // prompts. The execution context carries this dispatch's owner
         // appended to the inherited chain, so recursive same-path calls
         // from inside a locked handler are rejected instead of deadlocking.
-        let locked = match invocation.mutable_path() {
+        let locked = match invocation.mutable_path(ctx) {
             Some(target) => {
                 let key = match crate::tools::file_locks::FileWriteLocks::lock_key(
                     &target.to_string_lossy(),
+                    &ctx.cwd,
                 ) {
                     Ok(key) => key,
                     Err(e) => return done_error(e),
@@ -193,6 +194,12 @@ pub async fn run(
             }
             None => None,
         };
+
+        if matches!(emit, Emit::Notify) {
+            let _ = ctx
+                .event_tx
+                .send(AgentEvent::ToolExecutionStart { id: id.clone() });
+        }
 
         let result = match locked {
             Some((exec_ctx, guard)) => {
@@ -243,7 +250,7 @@ pub async fn run(
             format!("mcp: {mcp_lookup}"),
             input,
         );
-        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input).await
+        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input, emit).await
     } else {
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
         warn!(tool = %mcp_lookup, "unknown tool");
@@ -350,6 +357,18 @@ async fn enforce_permission(
         ));
     }
     if let Some(scopes) = inv.permission_scopes().await {
+        let scopes = if FILE_WRITE_TOOLS.contains(&name) {
+            crate::tools::PermissionScopes {
+                scopes: scopes
+                    .scopes
+                    .into_iter()
+                    .map(|scope| ctx.resolve_path(&scope).unwrap_or(scope))
+                    .collect(),
+                force_prompt: scopes.force_prompt,
+            }
+        } else {
+            scopes
+        };
         let tool_key = ToolKey::native(name);
         ctx.permissions
             .enforce(
@@ -373,6 +392,7 @@ async fn execute_mcp_tool(
     tool_id: Arc<str>,
     tool_name: &str,
     input: &Value,
+    emit: Emit,
 ) -> ToolDoneEvent {
     let done = |output: String, is_error: bool| ToolDoneEvent {
         id: id.to_owned(),
@@ -419,6 +439,11 @@ async fn execute_mcp_tool(
     // A permitted call to a deferred tool counts as loading it, so its full
     // definition joins the next request; a denied call must not load anything.
     mcp.mark_loaded(tool_name);
+    if matches!(emit, Emit::Notify) {
+        let _ = ctx
+            .event_tx
+            .send(AgentEvent::ToolExecutionStart { id: id.to_owned() });
+    }
     match mcp.call_tool(tool_name, input).await {
         Ok(text) => done(text, false),
         Err(e) => done(e.to_string(), true),
@@ -529,7 +554,7 @@ async fn dispatch_mcp(
         .as_ref()
         .map(|m| m.interned_name(tool_name))
         .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
-    execute_mcp_tool(ctx, id, tool_id, tool_name, input).await
+    execute_mcp_tool(ctx, id, tool_id, tool_name, input, Emit::Silent).await
 }
 
 #[cfg(test)]
@@ -544,7 +569,7 @@ mod tests {
 
     use super::*;
     use crate::AgentMode;
-    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
+    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager};
     use crate::tools::registry::ToolSource;
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
     use crate::tools::{ToolAudience, ToolInvocation};
@@ -755,6 +780,71 @@ mod tests {
                 crate::mcp::tool_names(&tools),
                 vec!["srv__fetch_issue"],
                 "called tool must join the next request"
+            );
+        });
+    }
+
+    #[test]
+    fn mcp_execution_start_follows_permission_and_precedes_dispatch() {
+        smol::block_on(async {
+            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                TempDir::new().unwrap().path().to_path_buf(),
+                Arc::default(),
+            ));
+            let (event_tx, event_rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            let (answer_tx, answer_rx) = flume::unbounded();
+            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+            ctx.event_tx = event_tx;
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
+            ctx.mcp = Some(mcp.clone());
+            let input = serde_json::json!({});
+
+            let call = run(
+                ToolRegistry::global(),
+                Some(&mcp),
+                "t1".into(),
+                "srv__fetch_issue",
+                &input,
+                &ctx,
+                Emit::Notify,
+            );
+            let approve = async {
+                assert!(matches!(
+                    event_rx.recv_async().await.unwrap().event,
+                    AgentEvent::ToolStart(_)
+                ));
+                assert!(matches!(
+                    event_rx.recv_async().await.unwrap().event,
+                    AgentEvent::PermissionRequest { .. }
+                ));
+                assert!(
+                    event_rx.is_empty(),
+                    "execution must not start before approval"
+                );
+                answer_tx
+                    .send_async(PermissionAnswer::AllowOnce.encode())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    event_rx.recv_async().await.unwrap().event,
+                    AgentEvent::ToolExecutionStart { ref id } if id == "t1"
+                ));
+            };
+            let (done, ()) = futures_lite::future::zip(call, approve).await;
+            assert!(
+                done.is_error,
+                "the stub dispatch must complete with its error"
+            );
+            assert!(
+                done.output.as_text().contains("unknown MCP tool"),
+                "dispatch must occur after execution start: {}",
+                done.output.as_text()
             );
         });
     }
@@ -1052,6 +1142,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn execution_start_follows_permission_approval_and_precedes_execute() {
+        smol::block_on(async {
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                TempDir::new().unwrap().path().to_path_buf(),
+                Arc::default(),
+            ));
+            let (event_tx, event_rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            let (answer_tx, answer_rx) = flume::unbounded();
+            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+            ctx.event_tx = event_tx;
+            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
+
+            let probe = StartProbe::default();
+            let executed = Arc::clone(&probe.executed);
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(probe),
+                    ToolSource::Lua {
+                        plugin: "test".into(),
+                    },
+                )
+                .unwrap();
+
+            let input = serde_json::json!({});
+            let call = run(
+                &registry,
+                None,
+                "t1".into(),
+                START_PROBE_NAME,
+                &input,
+                &ctx,
+                Emit::Notify,
+            );
+            let approve = async {
+                let start = event_rx.recv_async().await.unwrap();
+                assert!(matches!(start.event, AgentEvent::ToolStart(_)));
+                let permission = event_rx.recv_async().await.unwrap();
+                assert!(matches!(
+                    permission.event,
+                    AgentEvent::PermissionRequest { .. }
+                ));
+                assert!(
+                    event_rx.is_empty(),
+                    "execution must not start before approval"
+                );
+                assert!(!executed.load(Ordering::SeqCst));
+                answer_tx
+                    .send_async(PermissionAnswer::AllowOnce.encode())
+                    .await
+                    .unwrap();
+                let execution = event_rx.recv_async().await.unwrap();
+                assert!(matches!(
+                    execution.event,
+                    AgentEvent::ToolExecutionStart { ref id } if id == "t1"
+                ));
+            };
+            let (done, ()) = futures_lite::future::zip(call, approve).await;
+            assert!(!done.is_error);
+            assert!(executed.load(Ordering::SeqCst));
+        });
+    }
+
     /// A denied tool should still get its preview, but never its `execute`.
     #[test]
     fn start_runs_before_permission_denial_blocks_execute() {
@@ -1112,7 +1271,6 @@ mod tests {
 
     // ---- write-lock dispatch tests ----------------------------------------
 
-    use std::path::Path;
     use std::time::Duration;
 
     use crate::cancel::CancelToken;
@@ -1179,8 +1337,8 @@ mod tests {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("gated".into()))
         }
-        fn mutable_path(&self) -> Option<&Path> {
-            Some(Path::new(&self.path))
+        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
+            Some(PathBuf::from(&self.path))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
@@ -1695,8 +1853,8 @@ mod tests {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("recursive".into()))
         }
-        fn mutable_path(&self) -> Option<&Path> {
-            self.input["path"].as_str().map(Path::new)
+        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
+            self.input["path"].as_str().map(PathBuf::from)
         }
         fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
@@ -1753,8 +1911,8 @@ mod tests {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("inner".into()))
         }
-        fn mutable_path(&self) -> Option<&Path> {
-            Some(Path::new(&self.path))
+        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
+            Some(PathBuf::from(&self.path))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async {

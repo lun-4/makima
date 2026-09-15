@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
@@ -203,14 +203,15 @@ pub trait ToolInvocation: Send + Sync {
     /// normalized path for invocations that expose one: an advisory
     /// in-process lock, never protection for shell commands, other
     /// processes, or paths the tool mutates without declaring them.
-    fn mutable_path(&self) -> Option<&Path> {
+    fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
         None
     }
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         Box::pin(std::future::ready(None))
     }
     /// Runs after `ToolStart` but before permission enforcement, so a tool
-    /// can paint a preview while the prompt is still up. Some call paths skip
+    /// can paint a preview while the prompt is still up. `ToolExecutionStart`
+    /// is emitted after permission succeeds. Some call paths skip
     /// it, so `execute` must never rely on it having run.
     fn start<'a>(&'a self, _ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))
@@ -361,6 +362,19 @@ impl ToolRegistry {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+    }
+
+    pub fn plugin_entries(&self, plugin: &str) -> Vec<(Arc<dyn Tool>, ToolSource)> {
+        self.tools
+            .load()
+            .iter()
+            .filter_map(|entry| match &entry.source {
+                ToolSource::Lua { plugin: owner } if owner.as_ref() == plugin => {
+                    Some((Arc::clone(&entry.tool), entry.source.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn replace_plugin(

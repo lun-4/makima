@@ -279,6 +279,7 @@ fn input(message: &str) -> AgentInput {
         fast: false,
         workflow: false,
         prompt: None,
+        lease_committer: None,
     }
 }
 

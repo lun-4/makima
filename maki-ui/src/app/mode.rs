@@ -201,6 +201,7 @@ impl App {
             fast: self.state.fast,
             workflow: self.state.workflow,
             prompt: None,
+            lease_committer: None,
         }
     }
 

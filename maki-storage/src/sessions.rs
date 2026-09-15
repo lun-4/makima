@@ -8,7 +8,7 @@
 //! Legacy `.json` files are loaded transparently and converted to `.jsonl` on next save.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -159,6 +159,10 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub yolo: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_options: BTreeMap<String, String>,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
@@ -3004,7 +3008,11 @@ mod tests {
         write_legacy_jsonl(&path, &s);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         // The crash happened between the record's closing brace and the
-        // newline the writer emits after it.
+        // newline the writer emits after it. Written literally, because the
+        // scan matches MSG_PREFIX against the head of the line: a `json!`
+        // round-trip orders keys by whether serde_json has `preserve_order`,
+        // which is a workspace-wide feature this crate does not ask for, so
+        // building the record that way passes or fails with the build graph.
         file.write_all(br#"{"t":"msg","d":{"role":"user"}}"#)
             .unwrap();
         drop(file);

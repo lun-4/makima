@@ -57,6 +57,7 @@ pub(super) struct RegistryState {
 
 pub(super) struct TargetRecord {
     pub(super) capabilities: TargetCapabilities,
+    pub(super) presentation_capabilities: TargetCapabilities,
     pub(super) host: Arc<dyn CommandHost>,
 }
 
@@ -185,9 +186,28 @@ impl CommandRegistry {
         self.prepare_target(capabilities, host).activate()
     }
 
+    pub fn bind_target_with_presentation(
+        &self,
+        capabilities: TargetCapabilities,
+        presentation_capabilities: TargetCapabilities,
+        host: Arc<dyn CommandHost>,
+    ) -> TargetHandle {
+        self.prepare_target_with_presentation(capabilities, presentation_capabilities, host)
+            .activate()
+    }
+
     pub fn prepare_target(
         &self,
         capabilities: TargetCapabilities,
+        host: Arc<dyn CommandHost>,
+    ) -> PreparedTarget {
+        self.prepare_target_with_presentation(capabilities, capabilities, host)
+    }
+
+    pub fn prepare_target_with_presentation(
+        &self,
+        capabilities: TargetCapabilities,
+        presentation_capabilities: TargetCapabilities,
         host: Arc<dyn CommandHost>,
     ) -> PreparedTarget {
         let id = InvocationTargetId::new(
@@ -204,7 +224,11 @@ impl CommandRegistry {
                 id,
                 registry: Arc::downgrade(&self.0),
             })),
-            record: TargetRecord { capabilities, host },
+            record: TargetRecord {
+                capabilities,
+                presentation_capabilities,
+                host,
+            },
         }
     }
 
@@ -347,9 +371,12 @@ impl CommandRegistry {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let capabilities =
-            target_capabilities(&state, self.0.id, target).ok_or(CommandError::StaleTarget)?;
-        Ok(snapshot_for_capabilities(&state, capabilities))
+        let record = target_record(&state, self.0.id, target).ok_or(CommandError::StaleTarget)?;
+        Ok(snapshot_for_capabilities(
+            &state,
+            record.capabilities,
+            record.presentation_capabilities,
+        ))
     }
 
     pub fn presented_commands(
@@ -399,7 +426,11 @@ impl PreparedTarget {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        snapshot_for_capabilities(&state, self.record.capabilities)
+        snapshot_for_capabilities(
+            &state,
+            self.record.capabilities,
+            self.record.presentation_capabilities,
+        )
     }
 
     pub fn activate(self) -> TargetHandle {
@@ -483,11 +514,15 @@ fn target_capabilities(
 fn snapshot_for_capabilities(
     state: &RegistryState,
     capabilities: TargetCapabilities,
+    presentation_capabilities: TargetCapabilities,
 ) -> RegistrySnapshot {
     let commands = state
         .projection
         .iter()
-        .filter(|command| capabilities.contains_all(command.spec().required_capabilities))
+        .filter(|command| {
+            capabilities.contains_all(command.spec().required_capabilities)
+                && presentation_capabilities.contains_all(command.spec().required_capabilities)
+        })
         .cloned()
         .collect();
     RegistrySnapshot {
@@ -726,7 +761,7 @@ impl Winner {
     }
 }
 
-fn validate_registrations(
+pub fn validate_registrations(
     registrations: Vec<Registration>,
 ) -> Result<Vec<Registration>, RegistrationError> {
     let mut spellings = HashSet::new();

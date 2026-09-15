@@ -86,7 +86,7 @@ impl App {
             let id = self.state.session.id;
             if self.status == Status::Idle && self.last_sent.take_if(|last| last.id == id).is_some()
             {
-                self.storage_writer.delete(id, |_| {});
+                self.storage_writer.delete_empty(id);
             }
             return;
         }
@@ -138,6 +138,8 @@ impl App {
             thinking: Some(state.thinking.into()),
             fast: state.fast,
             workflow: state.workflow,
+            yolo: self.permissions.is_yolo(),
+            session_options: Default::default(),
         }
     }
 
@@ -337,6 +339,7 @@ impl App {
     pub(crate) fn apply_loaded_session(&mut self, session: AppSession, fallback_model: &Model) {
         self.checkpoint_now();
         self.rotate_command_target();
+        self.permissions.set_yolo(session.meta.yolo);
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.state =

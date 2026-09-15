@@ -4279,6 +4279,19 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
 }
 
 #[test]
+fn loaded_session_restores_yolo() {
+    let mut app = test_app();
+    app.permissions.set_yolo(false);
+    let mut session = AppSession::new("test-model", "/tmp/test");
+    session.meta.yolo = true;
+
+    let model = app.state.model.clone();
+    app.apply_loaded_session(session, &model);
+
+    assert!(app.permissions.is_yolo());
+}
+
+#[test]
 fn yolo_toggle() {
     let mut app = test_app();
     assert!(!app.permissions.is_yolo());
@@ -6129,7 +6142,7 @@ fn thinking_restored_from_session_meta() {
         &storage,
         &maki_config::ModelPolicy::default(),
     );
-    assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
+    assert_eq!(state.thinking, maki_domain::ThinkingConfig::Budget(4096));
 }
 
 fn set_opus_model(app: &mut App) {

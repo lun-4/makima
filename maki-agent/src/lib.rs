@@ -24,7 +24,8 @@ pub use actor::{
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
+    ModelSource, RunSettings, RunSettingsSource, SessionRunSettings, SharedMessages, SharedModel,
+    ToolBuilder, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
     is_instruction_file,
 };
 pub use cancel::{
@@ -41,6 +42,9 @@ pub mod command;
 pub mod diff;
 pub mod permissions;
 pub mod prompt;
+pub mod session_checkpoint;
+pub mod session_coordinator;
+pub mod session_options;
 pub mod template;
 pub mod tools;
 pub use tools::ToolFilter;
@@ -110,4 +114,5 @@ pub struct AgentInput {
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
+    pub lease_committer: Option<session_coordinator::SessionLeaseCommitter>,
 }

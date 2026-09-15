@@ -21,7 +21,8 @@ pub const COMPACT_COMMAND_NAME: &str = "/compact";
 pub enum TargetCapability {
     AgentTurns,
     ModelSelection,
-    SessionControl,
+    HistoryCompaction,
+    SessionReplacement,
     WorkingDirectory,
     PermissionToggles,
     ConfigToggles,
@@ -35,7 +36,7 @@ pub struct TargetCapabilities(u16);
 
 impl TargetCapabilities {
     pub const NONE: Self = Self(0);
-    pub const ALL: Self = Self((1 << 9) - 1);
+    pub const ALL: Self = Self((1 << 10) - 1);
 
     pub const fn from_capability(capability: TargetCapability) -> Self {
         Self(1 << capability as u8)
@@ -157,8 +158,10 @@ pub struct BuiltinDefinition {
 
 const INTERACTIVE: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::InteractiveUi);
-const SESSION: TargetCapabilities =
-    TargetCapabilities::from_capability(TargetCapability::SessionControl);
+const COMPACTION: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::HistoryCompaction);
+const SESSION_REPLACEMENT: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::SessionReplacement);
 const MODEL: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::ModelSelection);
 const CWD: TargetCapabilities =
@@ -249,7 +252,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        SESSION,
+        COMPACTION,
     ),
     builtin!(
         New,
@@ -259,7 +262,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        SESSION,
+        SESSION_REPLACEMENT,
     ),
     builtin!(
         Help,

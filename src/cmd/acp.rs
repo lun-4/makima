@@ -89,6 +89,7 @@ pub fn run(
         append_system_prompt,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
+        session_options: plugin_host.event_handle().session_option_catalog(),
         command_registry,
     });
     drop(standard_commands);

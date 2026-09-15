@@ -251,9 +251,8 @@ fn cache_path() -> Option<PathBuf> {
     Some(StateDir::resolve().ok()?.path().join(SCRIPT_CACHE_FILE))
 }
 
-fn read_cache() -> ScriptCache {
-    cache_path()
-        .and_then(|p| std::fs::read(p).ok())
+fn read_cache(path: Option<&Path>) -> ScriptCache {
+    path.and_then(|p| std::fs::read(p).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
@@ -377,26 +376,30 @@ fn build_meta(
     })
 }
 
-fn write_cache(cache: &ScriptCache) {
-    let Some(path) = cache_path() else {
+fn write_cache(path: Option<&Path>, cache: &ScriptCache) {
+    let Some(path) = path else {
         return;
     };
     let Ok(bytes) = serde_json::to_vec(cache) else {
         return;
     };
-    if let Err(e) = maki_storage::atomic_write(&path, &bytes) {
+    if let Err(e) = maki_storage::atomic_write(path, &bytes) {
         debug!(error = %e, "failed to write provider script cache");
     }
 }
 
-fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
+/// The cache path is a parameter rather than resolved in here, so a test
+/// describes scripts against its own cache file. Resolving it internally put
+/// every test's descriptions in the caller's real state directory, where they
+/// outlived the run and collided with each other.
+fn discover_in(dir: &Path, cache_file: Option<&Path>) -> Vec<DynamicProviderMeta> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
 
     let builtins = builtin_slugs();
-    let cache = read_cache();
+    let cache = read_cache(cache_file);
     let mut next = ScriptCache::new();
     let mut result = Vec::new();
 
@@ -461,7 +464,7 @@ fn discover_in(dir: &Path) -> Vec<DynamicProviderMeta> {
     }
 
     if next != cache {
-        write_cache(&next);
+        write_cache(cache_file, &next);
     }
     result
 }
@@ -473,7 +476,10 @@ fn discover() -> &'static [DynamicProviderMeta] {
         // Load config first: it hard-exits on malformed providers.toml, so fail
         // before spawning every provider script.
         let custom = ProvidersConfig::load();
-        let mut metas = providers_dir().map(|d| discover_in(&d)).unwrap_or_default();
+        let cache_file = cache_path();
+        let mut metas = providers_dir()
+            .map(|d| discover_in(&d, cache_file.as_deref()))
+            .unwrap_or_default();
         // A script and a providers.toml entry must not share a slug. The script
         // loses, the same way it already loses to a builtin, and we say so
         // instead of silently picking a winner.
@@ -923,6 +929,16 @@ mod tests {
         assert!(meta.models[0].thinking_fields.is_none());
     }
 
+    /// A cache file of this test's own. `discover_in` skips directories, so a
+    /// nested one keeps the cache out of the scanned set, and out of the
+    /// developer's real state directory where every test used to share it.
+    #[cfg(unix)]
+    fn cache_in(dir: &Path) -> PathBuf {
+        let cache = dir.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        cache.join("provider-scripts.json")
+    }
+
     #[cfg(unix)]
     fn write_script(dir: &Path, name: &str, info_json: &str) -> PathBuf {
         let path = dir.join(name);
@@ -946,7 +962,7 @@ mod tests {
             "test-provider",
             r#"{"display_name": "Test", "base": "anthropic", "has_auth": true}"#,
         );
-        let providers = discover_in(tmp.path());
+        let providers = discover_in(tmp.path(), Some(&cache_in(tmp.path())));
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].slug, "test-provider");
         assert_eq!(providers[0].display_name, "Test");
@@ -962,7 +978,7 @@ mod tests {
     fn discover_skips_invalid(name: &str, info_json: &str) {
         let tmp = TempDir::new().unwrap();
         write_script(tmp.path(), name, info_json);
-        assert!(discover_in(tmp.path()).is_empty());
+        assert!(discover_in(tmp.path(), Some(&cache_in(tmp.path()))).is_empty());
     }
 
     #[cfg(unix)]
@@ -983,7 +999,7 @@ esac
         file.sync_all().unwrap();
         drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let providers = discover_in(tmp.path());
+        let providers = discover_in(tmp.path(), Some(&cache_in(tmp.path())));
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].models.len(), 1);
         assert_eq!(providers[0].models[0].id, "custom-v1");
@@ -1089,7 +1105,7 @@ esac
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
         write_script(tmp.path(), "custom-test", &info);
-        let providers = discover_in(tmp.path());
+        let providers = discover_in(tmp.path(), Some(&cache_in(tmp.path())));
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].base, expected);
     }

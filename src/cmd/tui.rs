@@ -305,6 +305,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             plugin_rules: stack.plugin_host.plugin_rules(),
             commands: stack.commands,
             command_registry: stack.plugin_host.command_registry(),
+            session_options: stack.plugin_host.event_handle().session_option_catalog(),
         })
         .context("run sdk mode")?;
         return Ok(());
