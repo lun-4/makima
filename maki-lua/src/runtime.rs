@@ -49,7 +49,7 @@ use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::session_option::{
     PendingSessionOptions, SessionOptionStore, SessionOptionValidation, SessionOptionValidators,
-    commit_pending, unload as unload_session_options,
+    commit_pending, unload as unload_session_options, validate_option_value,
 };
 use crate::api::slot::SlotStore;
 use crate::api::store::{self, Store};
@@ -218,6 +218,7 @@ pub enum Request {
     RunInitLua {
         source: String,
         source_name: String,
+        owner: Arc<str>,
         plugin_dir: Option<PathBuf>,
         reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
     },
@@ -308,6 +309,17 @@ pub enum Request {
     ExpandReferences {
         text: String,
         reply: flume::Sender<Result<String, String>>,
+    },
+    SetSessionOption {
+        coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
+        id: Arc<str>,
+        value: Arc<str>,
+        reply: flume::Sender<
+            Result<
+                maki_agent::session_options::SessionOptionsSnapshot,
+                crate::SessionOptionMutationError,
+            >,
+        >,
     },
 }
 
@@ -2838,15 +2850,16 @@ impl LuaRuntime {
 
     async fn load_source(
         &mut self,
-        name: Arc<str>,
+        identity: (Arc<str>, &str),
         source: &str,
         plugin_dir: Option<PathBuf>,
         permissions: &PluginPermissions,
         opts: PluginOpts,
         config_store: Option<&ConfigStore>,
     ) -> LoadResult {
+        let (name, source_name) = identity;
         let map_err = |e: mlua::Error| PluginError::Lua {
-            plugin: name.to_string(),
+            plugin: source_name.to_owned(),
             source: e,
         };
 
@@ -2934,7 +2947,7 @@ impl LuaRuntime {
         let main_fn = self
             .lua
             .load(source)
-            .set_name(name.as_ref())
+            .set_name(source_name)
             .set_environment(env)
             .into_function();
         let exec_result = match main_fn {
@@ -3331,12 +3344,13 @@ impl LuaRuntime {
         &mut self,
         source: &str,
         source_name: &str,
+        owner: Arc<str>,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
         let config_store: ConfigStore = Arc::new(Mutex::new(None));
         let perms = load_plugin_permissions(plugin_dir.as_deref());
         self.load_source(
-            Arc::from(source_name),
+            (owner, source_name),
             source,
             plugin_dir,
             &perms,
@@ -4180,7 +4194,16 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, &permissions, opts, None).await;
+                            let res = rt
+                                .load_source(
+                                    (Arc::clone(&name), &name),
+                                    &source,
+                                    plugin_dir,
+                                    &permissions,
+                                    opts,
+                                    None,
+                                )
+                                .await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
@@ -4389,11 +4412,14 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::RunInitLua {
                             source,
                             source_name,
+                            owner,
                             plugin_dir,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.run_init_lua(&source, &source_name, plugin_dir).await;
+                            let res = rt
+                                .run_init_lua(&source, &source_name, owner, plugin_dir)
+                                .await;
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { reply } => {
@@ -4645,6 +4671,34 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 run_detached(&rt.lua, completion::expand_references(&rt.lua, &text))
                                     .await;
                             let _ = reply.send(res);
+                        }
+                        Request::SetSessionOption {
+                            coordinator,
+                            id,
+                            value,
+                            reply,
+                        } => {
+                            let snapshot = coordinator.read().options();
+                            let validation = snapshot
+                                .options
+                                .iter()
+                                .find(|option| option.definition.id == id)
+                                .map_or(Ok(()), |option| {
+                                    validate_option_value(&rt.lua, option, &value)
+                                });
+                            let result = match validation {
+                                Ok(()) => coordinator
+                                    .set_option_if_version(id, value, Some(snapshot.version))
+                                    .await
+                                    .map_err(Into::into),
+                                Err(error) => Err(
+                                    maki_agent::session_coordinator::SessionCoordinatorError::from(
+                                        error,
+                                    )
+                                    .into(),
+                                ),
+                            };
+                            let _ = reply.send(result);
                         }
                     }
                 }

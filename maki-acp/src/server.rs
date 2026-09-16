@@ -239,6 +239,7 @@ struct Server {
     /// Whether the client advertised form elicitation support at `initialize`.
     elicitation: bool,
     supports_boolean: bool,
+    lua_event_handle: maki_lua::EventHandle,
 }
 
 impl Server {
@@ -268,6 +269,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         session: None,
         elicitation: false,
         supports_boolean: false,
+        lua_event_handle: params.lua_event_handle.clone(),
     };
 
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
@@ -792,7 +794,7 @@ async fn install_session_with_lock(
     let coordinator = match maki_agent::session_coordinator::SessionCoordinatorHandle::register(
         maki_agent::session_coordinator::SessionCoordinatorParams {
             session_id: handle.session_id.id(),
-            catalog: params.session_options.clone(),
+            catalog: params.lua_event_handle.session_option_catalog(),
             definitions,
             persisted_options: persisted_options.clone(),
             history,
@@ -1547,7 +1549,8 @@ fn coordinator_error(error: maki_agent::session_coordinator::SessionCoordinatorE
             SessionOptionError::UnknownId(_)
             | SessionOptionError::InvalidValue { .. }
             | SessionOptionError::FastUnsupported
-            | SessionOptionError::PolicyRejected(_),
+            | SessionOptionError::PolicyRejected(_)
+            | SessionOptionError::CallbackFailed(_),
         ) => AcpError::invalid_params().data(json_str(&error.to_string())),
         _ => AcpError::internal_error().data(json_str(&error.to_string())),
     }
@@ -1674,10 +1677,16 @@ async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentRespons
     };
     let session = srv.session.as_mut().ok_or_else(no_session)?;
     let coordinator = session.coordinator.as_ref().ok_or_else(no_session)?;
-    let snapshot = coordinator
-        .set_option(config_id.as_str(), value.as_str())
+    let snapshot = srv
+        .lua_event_handle
+        .set_session_option(coordinator.clone(), config_id.as_str(), value.as_str())
         .await
-        .map_err(coordinator_error)?;
+        .map_err(|error| match error {
+            maki_lua::SessionOptionMutationError::Coordinator(error) => coordinator_error(error),
+            maki_lua::SessionOptionMutationError::HostDead => {
+                AcpError::internal_error().data(json_str(&error.to_string()))
+            }
+        })?;
     let projection = session.option_projection.as_ref().ok_or_else(no_session)?;
     projection.apply(&snapshot);
     Ok(AgentResponse::SetSessionConfigOptionResponse(
@@ -2131,7 +2140,7 @@ mod tests {
             append_system_prompt: None,
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
-            session_options: Default::default(),
+            lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
             command_registry: test_registry(&[]),
         }
     }
@@ -2187,6 +2196,20 @@ mod tests {
                 })
             }) as maki_storage::checkpoint::CheckpointFuture
         });
+        test_coordinator_with(session_id, model, cwd, Default::default(), checkpoint)
+    }
+
+    fn test_coordinator_with(
+        session_id: MakiId,
+        model: &str,
+        cwd: PathBuf,
+        catalog: maki_agent::session_coordinator::SessionOptionCatalog,
+        checkpoint: Arc<
+            dyn maki_storage::checkpoint::CheckpointWriter<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >,
+        >,
+    ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
         let mut model_specs = vec![
             Arc::from(model),
             Arc::from(FAST_SPEC),
@@ -2197,7 +2220,7 @@ mod tests {
         maki_agent::session_coordinator::SessionCoordinatorHandle::register(
             maki_agent::session_coordinator::SessionCoordinatorParams {
                 session_id,
-                catalog: Default::default(),
+                catalog,
                 definitions: maki_agent::session_coordinator::builtin_option_definitions(
                     model,
                     model_specs,
@@ -2335,6 +2358,7 @@ mod tests {
             }),
             elicitation: false,
             supports_boolean: false,
+            lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
         };
         (server, answer_rx, out_rx, input_rx)
     }
@@ -2355,6 +2379,7 @@ mod tests {
                 session: None,
                 elicitation: false,
                 supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
             };
             let session_id = SessionRef::from(MakiId::generate());
             let persisted_options = BTreeMap::new();
@@ -2640,6 +2665,102 @@ mod tests {
             }
         );
         assert!(srv.session.as_ref().unwrap().handle.permissions.is_yolo());
+        assert!(out_rx.is_empty());
+        smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test]
+    fn acp_rejected_plugin_option_does_not_mutate_or_checkpoint() {
+        const OPTION_ID: &str = "choice.value";
+        const REJECTED_VALUE: &str = "rejected";
+        const SOURCE: &str = r#"
+            maki.api.register_session_option({
+                id = "choice.value",
+                name = "Choice",
+                description = "Test choice",
+                category = "mode",
+                values = {
+                    { value = "accepted", name = "Accepted" },
+                    { value = "rejected", name = "Rejected" },
+                },
+                initial_value = "accepted",
+                validate = function(value)
+                    if value == "rejected" then return false, "rejected by test" end
+                    return true
+                end,
+            })
+        "#;
+
+        let (mut srv, _, out_rx, _) = server_awaiting_answer();
+        let old = srv.session.as_ref().unwrap().coordinator.as_ref().unwrap();
+        let session_id = old.read().session_id();
+        smol::block_on(old.close()).unwrap();
+
+        let host =
+            maki_lua::PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new())).unwrap();
+        host.load_source("choice", SOURCE).unwrap();
+        let lua = host.event_handle();
+        let checkpoints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checkpoint: Arc<
+            dyn maki_storage::checkpoint::CheckpointWriter<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >,
+        > = {
+            let checkpoints = Arc::clone(&checkpoints);
+            Arc::new(
+                move |request: maki_storage::checkpoint::CheckpointRequest<_>| {
+                    checkpoints.fetch_add(1, Ordering::Relaxed);
+                    Box::pin(async move {
+                        Ok(maki_storage::checkpoint::CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as maki_storage::checkpoint::CheckpointFuture
+                },
+            )
+        };
+        let coordinator = test_coordinator_with(
+            session_id,
+            OFFLINE_SPEC,
+            PathBuf::from("/project"),
+            lua.session_option_catalog(),
+            checkpoint,
+        );
+        let before = coordinator.read().options();
+        let session = srv.session.as_mut().unwrap();
+        session.coordinator = Some(coordinator.clone());
+        session.option_projection = Some(Arc::new(OptionProjection {
+            out_tx: srv.out_tx.clone(),
+            session_id: SessionId::from(session_id.to_string()),
+            read: coordinator.read(),
+            command_state: Arc::clone(&session.command_state),
+            permissions: Arc::clone(&session.handle.permissions),
+            supports_boolean: false,
+            emitted_version: Mutex::new(before.version),
+        }));
+        srv.lua_event_handle = lua;
+
+        let error = smol::block_on(handle_set_config(
+            &mut srv,
+            &serde_json::json!({
+                "params": {
+                    "sessionId": session_id.to_string(),
+                    "configId": OPTION_ID,
+                    "value": REJECTED_VALUE,
+                }
+            }),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.code, AcpError::invalid_params().code);
+        assert_eq!(
+            error.data,
+            Some(Value::String(
+                "session option callback failed: rejected by test".to_owned()
+            ))
+        );
+        assert_eq!(coordinator.read().options(), before);
+        assert_eq!(checkpoints.load(Ordering::Relaxed), 0);
         assert!(out_rx.is_empty());
         smol::block_on(coordinator.close()).unwrap();
     }
@@ -3867,7 +3988,7 @@ mod tests {
                     append_system_prompt: None,
                     model_policy: Arc::default(),
                     plugin_rules: Arc::default(),
-                    session_options: Default::default(),
+                    lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
                     command_registry: test_registry(&[]),
                 },
                 SpawnSession {

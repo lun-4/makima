@@ -989,6 +989,12 @@ fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
                     let canonical = path
                         .canonicalize()
                         .map_err(|error| Arc::from(error.to_string()))?;
+                    if !canonical.is_dir() {
+                        return Err(Arc::from(format!(
+                            "{} is not a directory",
+                            canonical.display()
+                        )));
+                    }
                     cwd.store(Arc::new(canonical.clone()));
                     permissions.set_cwd(canonical.clone());
                     Ok(canonical)
@@ -3859,6 +3865,24 @@ mod tests {
         let manager = handles.manager_and_root().0;
         drop(handles);
         shutdown_manager(&manager);
+    }
+
+    #[test]
+    fn coordinator_directory_adopter_rejects_files() {
+        const FILE_NAME: &str = "not-a-directory";
+
+        let harness = RuntimeHarness::new();
+        let path = harness._temp_dir.path().join(FILE_NAME);
+        std::fs::write(&path, []).unwrap();
+        let runtime = harness.runtime(harness.session());
+        let expected_cwd = runtime.coordinator.read().cwd();
+
+        let error = smol::block_on(runtime.coordinator.change_directory(path)).unwrap_err();
+
+        assert!(error.to_string().contains("not a directory"));
+        assert_eq!(runtime.coordinator.read().cwd(), expected_cwd);
+        assert_eq!(*runtime.handles.cwd_slot().load_full(), expected_cwd);
+        release_runtime(runtime);
     }
 
     #[test]

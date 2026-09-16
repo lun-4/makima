@@ -28,7 +28,7 @@ pub struct AcpParams {
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
-    pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
+    pub lua_event_handle: maki_lua::EventHandle,
     pub command_registry: CommandRegistry,
 }
 

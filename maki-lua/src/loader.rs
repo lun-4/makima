@@ -30,6 +30,8 @@ use crate::splash::{SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const GLOBAL_INIT_OWNER: &str = "maki_init.global";
+const PROJECT_INIT_OWNER: &str = "maki_init.project";
 
 struct BundledPlugin {
     name: &'static str,
@@ -305,7 +307,12 @@ impl PluginHost {
         let mut merged: Option<RawConfig> = None;
 
         for global_dir in maki_config::global_config_dirs() {
-            self.run_init_file(&global_dir.join("init.lua"), "global/init.lua", &mut merged)?;
+            self.run_init_file(
+                &global_dir.join("init.lua"),
+                "global/init.lua",
+                GLOBAL_INIT_OWNER,
+                &mut merged,
+            )?;
             if merged.is_some() {
                 break;
             }
@@ -313,6 +320,7 @@ impl PluginHost {
         self.run_init_file(
             &cwd.join(".makima/init.lua"),
             "project/init.lua",
+            PROJECT_INIT_OWNER,
             &mut merged,
         )?;
 
@@ -336,7 +344,8 @@ impl PluginHost {
     fn run_init_file(
         &self,
         path: &Path,
-        label: &str,
+        source_name: &str,
+        owner: &str,
         merged: &mut Option<RawConfig>,
     ) -> Result<(), PluginError> {
         if !path.is_file() {
@@ -347,7 +356,9 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
-        if let Some(raw) = self.send_run_init_lua(source, label.to_owned(), plugin_dir)? {
+        if let Some(raw) =
+            self.send_run_init_lua_as(source, source_name.to_owned(), Arc::from(owner), plugin_dir)?
+        {
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
@@ -502,12 +513,24 @@ impl PluginHost {
         source_name: String,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        let owner = Arc::from(source_name.as_str());
+        self.send_run_init_lua_as(source, source_name, owner, plugin_dir)
+    }
+
+    fn send_run_init_lua_as(
+        &self,
+        source: String,
+        source_name: String,
+        owner: Arc<str>,
+        plugin_dir: Option<PathBuf>,
+    ) -> Result<Option<RawConfig>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
             .send(Request::RunInitLua {
                 source,
                 source_name,
+                owner,
                 plugin_dir,
                 reply: reply_tx,
             })
@@ -746,6 +769,48 @@ impl EventHandle {
 
     pub fn session_option_catalog(&self) -> SessionOptionCatalog {
         self.session_options.clone()
+    }
+
+    pub async fn set_session_option(
+        &self,
+        coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
+        id: impl Into<Arc<str>>,
+        value: impl Into<Arc<str>>,
+    ) -> Result<
+        maki_agent::session_options::SessionOptionsSnapshot,
+        crate::SessionOptionMutationError,
+    > {
+        let id = id.into();
+        let value = value.into();
+        let snapshot = coordinator.read().options();
+        if self.is_disconnected()
+            && snapshot.options.iter().any(|option| {
+                option.definition.id == id
+                    && matches!(
+                        option.definition.owner,
+                        maki_agent::session_options::SessionOptionOwner::Builtin
+                    )
+            })
+        {
+            return coordinator
+                .set_option_if_version(id, value, Some(snapshot.version))
+                .await
+                .map_err(Into::into);
+        }
+        let (reply, response) = flume::bounded(1);
+        self.tx
+            .send_async(Request::SetSessionOption {
+                coordinator,
+                id,
+                value,
+                reply,
+            })
+            .await
+            .map_err(|_| crate::SessionOptionMutationError::HostDead)?;
+        response
+            .recv_async()
+            .await
+            .map_err(|_| crate::SessionOptionMutationError::HostDead)?
     }
 
     fn command_generation(&self, plugin: &Arc<str>, command: &Arc<str>) -> u64 {
@@ -1231,6 +1296,80 @@ mod tests {
         assert!(reg.has("glob"));
     }
 
+    #[test]
+    fn global_and_project_init_session_options_coexist_with_stable_owners() {
+        const GLOBAL_SOURCE: &str = r#"
+            maki.api.register_session_option({
+                id = "maki_init.global.choice",
+                name = "Global choice",
+                description = "Global init choice",
+                category = "mode",
+                values = { { value = "on", name = "On" } },
+                initial_value = "on",
+            })
+        "#;
+        const PROJECT_SOURCE: &str = r#"
+            maki.api.register_session_option({
+                id = "maki_init.project.choice",
+                name = "Project choice",
+                description = "Project init choice",
+                category = "mode",
+                values = { { value = "on", name = "On" } },
+                initial_value = "on",
+            })
+        "#;
+
+        smol::block_on(async {
+            let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            host.send_run_init_lua_as(
+                GLOBAL_SOURCE.to_owned(),
+                "global/init.lua".to_owned(),
+                Arc::from(GLOBAL_INIT_OWNER),
+                None,
+            )
+            .unwrap();
+            host.send_run_init_lua_as(
+                PROJECT_SOURCE.to_owned(),
+                "project/init.lua".to_owned(),
+                Arc::from(PROJECT_INIT_OWNER),
+                None,
+            )
+            .unwrap();
+            let error = host
+                .send_run_init_lua_as(
+                    "error('broken')".to_owned(),
+                    "global/init.lua".to_owned(),
+                    Arc::from(GLOBAL_INIT_OWNER),
+                    None,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                PluginError::Lua { plugin, .. } if plugin == "global/init.lua"
+            ));
+            let coordinator = test_coordinator(host.event_handle().session_option_catalog());
+            let snapshot = coordinator.read().options();
+
+            for (id, expected_owner) in [
+                ("maki_init.global.choice", GLOBAL_INIT_OWNER),
+                ("maki_init.project.choice", PROJECT_INIT_OWNER),
+            ] {
+                let option = snapshot
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == id)
+                    .unwrap();
+                assert!(matches!(
+                    &option.definition.owner,
+                    maki_agent::session_options::SessionOptionOwner::Plugin { plugin, .. }
+                        if plugin.as_ref() == expected_owner
+                ));
+            }
+
+            coordinator.close().await.unwrap();
+        });
+    }
+
     /// The second call sends `Shutdown` on a sender that is already
     /// disconnected; it must swallow that error and keep rejecting work.
     #[test]
@@ -1303,6 +1442,48 @@ mod tests {
             host.load_source("choice", SOURCE).unwrap();
             assert!(generation() > before_unload);
             host.unload("choice").unwrap();
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn event_handle_validates_and_commits_session_option() {
+        const SOURCE: &str = r#"
+            maki.api.register_session_option({
+                id = "choice.value",
+                name = "Choice",
+                description = "Test choice",
+                category = "mode",
+                values = {
+                    { value = "a", name = "A" },
+                    { value = "b", name = "B" },
+                },
+                initial_value = "a",
+                validate = function(value) return value == "b", "expected b" end,
+            })
+        "#;
+
+        smol::block_on(async {
+            let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            host.load_source("choice", SOURCE).unwrap();
+            let handle = host.event_handle();
+            let coordinator = test_coordinator(handle.session_option_catalog());
+
+            let snapshot = handle
+                .set_session_option(coordinator.clone(), "choice.value", "b")
+                .await
+                .unwrap();
+
+            assert_eq!(
+                snapshot
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == "choice.value")
+                    .unwrap()
+                    .current_value
+                    .as_ref(),
+                "b"
+            );
             coordinator.close().await.unwrap();
         });
     }

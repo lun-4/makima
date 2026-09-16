@@ -1245,16 +1245,38 @@ mod tests {
     }
 
     #[test]
-    fn terminal_precedes_never_resolving_checkpoint_and_next_lease_recovers() {
+    fn terminal_forwards_while_checkpoint_is_blocked_then_commits_history() {
         smol::block_on(async {
             let session_id = MakiId::generate();
+            let (checkpoint_seen_tx, checkpoint_seen_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
             let checkpoint: Arc<
                 dyn maki_storage::checkpoint::CheckpointWriter<
                         crate::session_coordinator::SessionCheckpoint,
                     >,
-            > = Arc::new(|_| {
-                Box::pin(std::future::pending()) as maki_storage::checkpoint::CheckpointFuture
-            });
+            > = Arc::new(
+                move |request: maki_storage::checkpoint::CheckpointRequest<
+                    crate::session_coordinator::SessionCheckpoint,
+                >| {
+                    let checkpoint_seen_tx = checkpoint_seen_tx.clone();
+                    let release_rx = release_rx.clone();
+                    Box::pin(async move {
+                        let history = request
+                            .snapshot
+                            .history
+                            .as_ref()
+                            .expect("history commits include history")
+                            .as_ref()
+                            .clone();
+                        checkpoint_seen_tx.send_async(history).await.unwrap();
+                        release_rx.recv_async().await.unwrap();
+                        Ok(maki_storage::checkpoint::CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as maki_storage::checkpoint::CheckpointFuture
+                },
+            );
             let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
                 session_id,
                 catalog: Default::default(),
@@ -1297,26 +1319,41 @@ mod tests {
                 run_id: 0,
             };
             let (raw_tx, raw_rx) = flume::unbounded();
-            let history = [Message::user("first".into())];
-            let checkpoint = checkpoint_and_forward_terminal(
-                Some(committer),
-                session_id,
-                &history,
-                std::time::Duration::ZERO,
-                Some(terminal),
-                &raw_tx,
-            );
-            let (checkpoint_result, forwarded) =
-                futures_lite::future::zip(checkpoint, raw_rx.recv_async()).await;
+            let history = vec![Message::user("first".into())];
+            let checkpoint_task = smol::spawn({
+                let history = history.clone();
+                async move {
+                    checkpoint_and_forward_terminal(
+                        Some(committer),
+                        session_id,
+                        &history,
+                        std::time::Duration::from_secs(1),
+                        Some(terminal),
+                        &raw_tx,
+                    )
+                    .await
+                }
+            });
 
+            let checkpoint_history = checkpoint_seen_rx.recv_async().await.unwrap();
+            assert_eq!(as_json(&checkpoint_history), as_json(&history));
+            let forwarded = raw_rx.recv_async().await.unwrap();
             assert!(
-                matches!(forwarded.unwrap().event, AgentEvent::TurnOutcome(got) if got == outcome)
+                matches!(forwarded.event, AgentEvent::TurnOutcome(got) if got == outcome)
+                    && forwarded.subagent.is_none()
+                    && forwarded.run_id == 0
             );
-            assert!(checkpoint_result.is_err());
+
+            release_tx.send_async(()).await.unwrap();
+            assert!(checkpoint_task.await.is_ok());
+            assert_eq!(
+                as_json(coordinator.read().history().as_ref()),
+                as_json(&history)
+            );
             drop(lease);
 
             let next = coordinator.acquire_lease().await.unwrap();
-            assert!(coordinator.read().history().is_empty());
+            assert_eq!(as_json(next.read().history().as_ref()), as_json(&history));
             drop(next);
             coordinator.close().await.unwrap();
         });

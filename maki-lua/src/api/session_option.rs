@@ -365,7 +365,9 @@ impl UserData for SessionOptionHandle {
 
 /// Registers one selectable session option owned by the loading plugin.
 ///
-/// The `id` must use the plugin namespace, such as `bash.auto_mode`. Core owns
+/// The `id` must use the plugin namespace, such as `bash.auto_mode`. Global
+/// `init.lua` uses `maki_init.global.*`, and project `init.lua` uses
+/// `maki_init.project.*`. Core owns
 /// unqualified ids. The definition supplies `name`, `description`, `category`,
 /// an ordered non-empty `values` list, and `initial_value`. Set `persistent` to
 /// retain each session's value across reloads.
