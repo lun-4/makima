@@ -1083,12 +1083,11 @@ impl SpawnCtx {
 
     fn prepare_runtime_with_provider(
         &self,
-        session: AppSession,
+        mut session: AppSession,
         provider: Option<PreparedProvider>,
     ) -> PreparedSessionRuntime {
-        let permissions = self.permissions.fork();
-        permissions.set_yolo(session.meta.yolo);
-        self.prepare_runtime_with_provider_and_permissions(session, provider, &permissions)
+        session.meta.yolo |= self.permissions.is_yolo();
+        self.prepare_runtime_with_provider_and_permissions(session, provider, &self.permissions)
     }
 
     fn prepare_runtime_with_provider_and_permissions(
@@ -3793,6 +3792,10 @@ mod tests {
             self.ctx().prepare_runtime(self.session())
         }
 
+        fn set_startup_yolo(&self) {
+            self.ctx().permissions.set_yolo(true);
+        }
+
         fn runtime(&self, session: AppSession) -> SessionRuntime {
             self.ctx().spawn_runtime(session).unwrap()
         }
@@ -4100,6 +4103,33 @@ mod tests {
         );
         drop(prepared);
         release_runtime(current);
+    }
+
+    #[test]
+    fn startup_yolo_seeds_new_session_and_coordinator() {
+        let harness = RuntimeHarness::new();
+        harness.set_startup_yolo();
+
+        let runtime = harness
+            .prepare()
+            .activate(&harness.ctx().model_slot, None)
+            .unwrap();
+
+        assert!(runtime.app.permissions.is_yolo());
+        assert!(runtime.app.state.session.meta.yolo);
+        let options = runtime.coordinator.read().options();
+        let yolo = options
+            .options
+            .iter()
+            .find(|option| {
+                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+            })
+            .unwrap();
+        assert_eq!(
+            yolo.current_value.as_ref(),
+            maki_agent::session_options::ENABLED_VALUE
+        );
+        release_runtime(runtime);
     }
 
     #[test_case(false, true, false ; "rewind_preserves_enabled")]

@@ -75,6 +75,7 @@ pub fn run(
 
     let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
     let modes = plugin_host.event_handle().mode_registry();
+    let yolo = config.permissions.yolo;
 
     let result = maki_acp::run(maki_acp::AcpParams {
         model,

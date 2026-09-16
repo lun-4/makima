@@ -692,7 +692,11 @@ pub fn run(params: SdkParams) -> Result<()> {
     if let Some(max) = cli.max_turns {
         config.max_turns = Some(max);
     }
-    let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
+    let permission_mode = PermissionMode::resolve(
+        cli.permission_mode.as_deref(),
+        cli.yolo || permissions_config.yolo,
+    );
+    let startup_yolo = permission_mode == PermissionMode::BypassPermissions;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
@@ -705,11 +709,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         .and_then(|spec| Model::from_spec(spec).ok())
         .filter(|candidate| model_policy.allows(&candidate.spec()))
         .unwrap_or(model);
-    let yolo = if restored_state {
-        restored.meta.yolo
-    } else {
-        permission_mode == PermissionMode::BypassPermissions
-    };
+    let yolo = startup_yolo;
     let fast = if restored_state {
         restored.meta.fast && model.supports_fast()
     } else {
@@ -939,6 +939,11 @@ pub fn run(params: SdkParams) -> Result<()> {
         coordinator: coordinator.clone(),
         shared: Arc::clone(&shared),
     });
+    let permission_watcher = watch_permission_option(
+        coordinator.read(),
+        Arc::clone(&handle.permissions),
+        Arc::clone(&shared),
+    );
 
     let input_result = (|| -> Result<()> {
         for line in io::stdin().lock().lines() {
@@ -1081,7 +1086,11 @@ pub fn run(params: SdkParams) -> Result<()> {
     })();
 
     drop(sdk_commands);
-    smol::block_on(stop_sdk_tasks(projection_watcher, command_driver));
+    smol::block_on(stop_sdk_tasks(
+        projection_watcher,
+        command_driver,
+        permission_watcher,
+    ));
     let InteractiveHandle { input_tx, task, .. } = handle;
     drop(input_tx);
     smol::block_on(async {
@@ -1145,9 +1154,47 @@ fn watch_command_projection(
     })
 }
 
-async fn stop_sdk_tasks(projection_watcher: smol::Task<()>, command_driver: smol::Task<()>) {
+async fn stop_sdk_tasks(
+    projection_watcher: smol::Task<()>,
+    command_driver: smol::Task<()>,
+    permission_watcher: smol::Task<()>,
+) {
     projection_watcher.cancel().await;
     command_driver.cancel().await;
+    permission_watcher.cancel().await;
+}
+
+fn watch_permission_option(
+    read: maki_agent::session_coordinator::SessionReadHandle,
+    permissions: Arc<maki_agent::permissions::PermissionManager>,
+    shared: Arc<Mutex<Shared>>,
+) -> smol::Task<()> {
+    smol::spawn(async move {
+        let mut subscription = read.subscribe();
+        loop {
+            apply_permission_option(&subscription.changed().await, &permissions, &shared);
+        }
+    })
+}
+
+fn apply_permission_option(
+    snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
+    permissions: &maki_agent::permissions::PermissionManager,
+    shared: &Mutex<Shared>,
+) {
+    let Some(option) = snapshot.options.iter().find(|option| {
+        option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+    }) else {
+        return;
+    };
+    let enabled =
+        option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE;
+    permissions.set_yolo(enabled);
+    shared.lock().unwrap().permission_mode = if enabled {
+        PermissionMode::BypassPermissions
+    } else {
+        PermissionMode::Default
+    };
 }
 
 fn spawn_command_driver(params: CommandDriverParams) -> smol::Task<()> {
@@ -1381,6 +1428,9 @@ fn handle_control_request(
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
                     shared.lock().unwrap().permission_mode = mode;
+                    handle
+                        .permissions
+                        .set_yolo(mode == PermissionMode::BypassPermissions);
                     writer.emit_control_response(&cr.request_id, ok, None)
                 }
                 None => writer.emit_control_response(
@@ -2052,6 +2102,78 @@ mod tests {
         assert_eq!(checkpointed.lock().unwrap()[0].model.as_ref(), TARGET_MODEL);
 
         smol::block_on(driver.cancel());
+        smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test]
+    fn sdk_yolo_option_updates_live_permission_state() {
+        let id = MakiId::generate();
+        let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+            maki_agent::session_coordinator::SessionCoordinatorParams {
+                session_id: id,
+                catalog: Default::default(),
+                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                    STARTUP_MODEL,
+                    [Arc::from(STARTUP_MODEL)],
+                    false,
+                    false,
+                    false,
+                    maki_agent::ThinkingConfig::Off,
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(STARTUP_MODEL),
+                cwd: PathBuf::from("/project"),
+                model_policy: Arc::new(ModelPolicy::default()),
+                model_adopter: Arc::new(|_: Model| {
+                    Box::pin(async { Ok(()) })
+                        as maki_agent::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path: PathBuf| {
+                    Box::pin(async move { Ok(path) })
+                        as maki_agent::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint: Arc::new(
+                    |request: maki_storage::checkpoint::CheckpointRequest<
+                        maki_agent::session_coordinator::SessionCheckpoint,
+                    >| {
+                        Box::pin(async move {
+                            Ok(maki_storage::checkpoint::CheckpointAck {
+                                session_id: request.session_id,
+                                version: request.version,
+                            })
+                        }) as maki_storage::checkpoint::CheckpointFuture
+                    },
+                ),
+                mailbox: maki_agent::SessionMailbox::new(id),
+            },
+        )
+        .unwrap();
+        let permissions = Arc::new(maki_agent::permissions::PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/project"),
+            Arc::default(),
+        ));
+        let shared = Arc::new(Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Default,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+        }));
+        let snapshot = smol::block_on(
+            coordinator.set_option(
+                maki_agent::session_options::YOLO_OPTION_ID,
+                maki_agent::session_options::ENABLED_VALUE,
+            ),
+        )
+        .unwrap();
+        apply_permission_option(&snapshot, &permissions, &shared);
+
+        assert!(permissions.is_yolo());
+        assert_eq!(
+            shared.lock().unwrap().permission_mode,
+            PermissionMode::BypassPermissions
+        );
         smol::block_on(coordinator.close()).unwrap();
     }
 

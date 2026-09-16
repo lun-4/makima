@@ -590,9 +590,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         params.initial_wd,
         Arc::clone(&params.plugin_rules),
     ));
-    if params.yolo {
-        permissions.toggle_yolo();
-    }
+    permissions.set_yolo(params.yolo);
     let modes = Arc::clone(&params.modes);
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
