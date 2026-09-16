@@ -450,7 +450,7 @@ local function open(query)
     frame = 0,
     loading = true,
   }
-  if query ~= "" then
+  if query and query ~= "" then
     board.input:insert_text(query)
   end
   -- Two-phase load: live sessions are cheap, so they show up and take keys

@@ -4,18 +4,22 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crossterm::event::{KeyCode, KeyModifiers};
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
     ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
     timeout_annotation,
 };
-use maki_agent::{AgentMode, ToolOutput};
+use maki_agent::{AgentMode, SharedBuf, ToolOutput};
+use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
-use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
+use maki_lua::{
+    PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP, WinCommand, WinEvent,
+};
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
@@ -24,6 +28,16 @@ use serde_json::{Value, json};
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
+const PICKER_TITLE: &str = " Sessions ";
+const PICKER_COMMAND: &str = "/sessions";
+const PICKER_MATCH_TITLE: &str = "Orchid";
+const PICKER_OTHER_TITLE: &str = "Birch";
+const PICKER_QUERY: &str = "orch";
+const PICKER_FILTER_PREFIX: &str = "❯";
+const PICKER_LOADING_HINT: &str = "Loading sessions…";
+const PICKER_ACTION_TIMEOUT: &str = "sessions picker did not send the expected UI action";
+const PICKER_RENDER_TIMEOUT: &str = "sessions picker did not render the expected content";
+const PICKER_CLOSE_TIMEOUT: &str = "sessions picker did not close";
 
 struct FakeCommandHost;
 
@@ -5911,59 +5925,216 @@ fn session_picker_requested_autocmd_does_not_wedge_host() {
 /// `RunCommand`, and a direct `open()` call would never route through it.
 #[test]
 fn session_picker_requested_routes_through_sessions_command() {
-    const PICKER_TITLE: &str = " Sessions ";
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
-    let ui_rx = guard.host().ui_action_rx();
-    let (saw_run_command_tx, saw_run_command_rx) = flume::bounded(1);
-    let (saw_open_win_tx, saw_open_win_rx) = flume::bounded(1);
-    std::thread::spawn(move || {
-        while let Ok(action) = ui_rx.recv() {
-            match action {
-                maki_lua::UiAction::Session { reply_tx, .. } => {
-                    let _ = reply_tx.send(Ok(json!([])));
-                }
-                maki_lua::UiAction::OpenWin { config, .. } => {
-                    let _ = saw_open_win_tx.send(config.title);
-                }
-                maki_lua::UiAction::RunCommand {
-                    cmdline,
-                    depth,
-                    reply_tx,
-                } => {
-                    let _ = saw_run_command_tx.send(cmdline.clone());
-                    // Play the UI's role in command dispatch so `open()` runs
-                    // end to end as a deadline-free command coroutine.
-                    let _ = handle.run_command_for_test(
-                        Arc::from("sessions"),
-                        Arc::from("/sessions"),
-                        String::new(),
-                        depth,
-                    );
-                    let _ = reply_tx.send(Ok(()));
-                }
+    let actions = guard.host().ui_action_rx();
+    handle.fire_autocmd("SessionPickerRequested", json!({}));
+    let UiAction::RunCommand {
+        cmdline,
+        depth,
+        reply_tx,
+    } = next_picker_action(&actions)
+    else {
+        panic!("SessionPickerRequested did not route through RunCommand");
+    };
+    assert_eq!(cmdline, PICKER_COMMAND);
+    let registry = guard.host().command_registry();
+    let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
+    let resolved = registry.resolve_input_for(&target, &cmdline).unwrap();
+    let outcome = smol::block_on(registry.dispatch_command_with_depth(
+        &target,
+        resolved.command,
+        resolved.arguments,
+        cmdline.as_str().into(),
+        usize::from(depth),
+    ));
+    reply_tx.send(Ok(())).unwrap();
+    assert!(matches!(outcome, CommandOutcome::Completed));
+    let picker = SessionsPicker::load(&actions);
+    picker.wait_for_unfiltered_rows();
+    picker.close("esc");
+}
+
+fn dispatch_sessions_command(host: &PluginHost, input: &str) {
+    let registry = host.command_registry();
+    let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
+    let outcome = smol::block_on(registry.dispatch_input(&target, input.into()));
+    assert!(matches!(
+        outcome,
+        InputDispatch::Dispatched(CommandOutcome::Completed)
+    ));
+}
+
+fn next_picker_action(actions: &flume::Receiver<UiAction>) -> UiAction {
+    actions
+        .recv_timeout(HOST_REPLY_TIMEOUT)
+        .expect(PICKER_ACTION_TIMEOUT)
+}
+
+fn reply_picker_sessions(actions: &flume::Receiver<UiAction>, expected: SessionRequest) {
+    let UiAction::Session { req, reply_tx } = next_picker_action(actions) else {
+        panic!("expected a sessions picker storage request");
+    };
+    let rows = match (expected, req) {
+        (SessionRequest::Live, SessionRequest::Live) => json!([{
+            "id": "00000000-0000-4000-8000-000000000001",
+            "title": PICKER_OTHER_TITLE,
+            "status": "idle",
+            "focused": true,
+            "open_elsewhere": false,
+            "updated_at": 1_700_000_000,
+            "message_count": 2,
+        }]),
+        (SessionRequest::List, SessionRequest::List) => json!([{
+            "id": "00000000-0000-4000-8000-000000000002",
+            "title": PICKER_MATCH_TITLE,
+            "status": "idle",
+            "focused": false,
+            "open_elsewhere": false,
+            "updated_at": 1_700_000_001,
+            "message_count": 4,
+        }]),
+        _ => panic!("unexpected sessions picker storage request"),
+    };
+    reply_tx.send(Ok(rows)).unwrap();
+}
+
+struct SessionsPicker {
+    buf: Arc<SharedBuf>,
+    event_tx: flume::Sender<WinEvent>,
+    cmd_rx: flume::Receiver<WinCommand>,
+}
+
+impl SessionsPicker {
+    fn load(actions: &flume::Receiver<UiAction>) -> Self {
+        let UiAction::OpenWin {
+            buf,
+            config,
+            focus,
+            event_tx,
+            cmd_rx,
+        } = next_picker_action(actions)
+        else {
+            panic!("sessions command did not open a window");
+        };
+        assert_eq!(config.title, PICKER_TITLE);
+        assert!(focus);
+        let picker = Self {
+            buf,
+            event_tx,
+            cmd_rx,
+        };
+        reply_picker_sessions(actions, SessionRequest::Live);
+        picker.wait_for_render(|text| text.contains(PICKER_LOADING_HINT));
+        reply_picker_sessions(actions, SessionRequest::List);
+        reply_picker_sessions(actions, SessionRequest::Live);
+        picker
+    }
+
+    fn wait_for_render(&self, predicate: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + HOST_REPLY_TIMEOUT;
+        loop {
+            let command = self
+                .cmd_rx
+                .recv_deadline(deadline)
+                .expect(PICKER_RENDER_TIMEOUT);
+            match command {
+                WinCommand::SetCursor(_) if predicate(&self.buf.take().text()) => return,
+                WinCommand::Close => panic!("sessions picker closed before rendering"),
                 _ => {}
             }
         }
+    }
+
+    fn wait_for_unfiltered_rows(&self) {
+        self.wait_for_render(|text| {
+            text.lines()
+                .next()
+                .is_some_and(|line| line.trim() == PICKER_FILTER_PREFIX)
+                && text.contains(PICKER_MATCH_TITLE)
+                && text.contains(PICKER_OTHER_TITLE)
+                && !text.contains(PICKER_LOADING_HINT)
+        });
+    }
+
+    fn key(&self, key: &str) {
+        self.event_tx
+            .send(WinEvent::Key { key: key.into() })
+            .unwrap();
+    }
+
+    fn close(&self, key: &str) {
+        self.key(key);
+        let deadline = Instant::now() + HOST_REPLY_TIMEOUT;
+        loop {
+            if matches!(
+                self.cmd_rx
+                    .recv_deadline(deadline)
+                    .expect(PICKER_CLOSE_TIMEOUT),
+                WinCommand::Close
+            ) {
+                return;
+            }
+        }
+    }
+}
+
+#[test_case::test_case("/sessions", "esc"; "omitted_query_escape")]
+#[test_case::test_case("/sessions", "ctrl+c"; "omitted_query_control_c")]
+#[test_case::test_case("/sessions \"\"", "esc"; "empty_query_escape")]
+#[test_case::test_case("/sessions \"\"", "ctrl+c"; "empty_query_control_c")]
+fn sessions_command_initializes_closes_and_reopens(input: &str, close_key: &str) {
+    let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
+    let actions = guard.host().ui_action_rx();
+    dispatch_sessions_command(guard.host(), input);
+    let first = SessionsPicker::load(&actions);
+    first.wait_for_unfiltered_rows();
+    first.close(close_key);
+    dispatch_sessions_command(guard.host(), input);
+    let second = SessionsPicker::load(&actions);
+    assert!(!Arc::ptr_eq(&first.buf, &second.buf));
+    second.wait_for_unfiltered_rows();
+    second.close(close_key);
+}
+
+#[test_case::test_case(PICKER_QUERY)]
+fn sessions_command_query_filters_and_escape_clears(query: &str) {
+    let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
+    let actions = guard.host().ui_action_rx();
+    dispatch_sessions_command(guard.host(), &format!("{PICKER_COMMAND} \"{query}\""));
+    let picker = SessionsPicker::load(&actions);
+    let filter = format!("{PICKER_FILTER_PREFIX} {query}");
+    picker.wait_for_render(|text| {
+        text.lines()
+            .next()
+            .is_some_and(|line| line.trim() == filter)
+            && text.contains(PICKER_MATCH_TITLE)
+            && !text.contains(PICKER_OTHER_TITLE)
+            && !text.contains(PICKER_LOADING_HINT)
     });
+    picker.key("esc");
+    picker.wait_for_unfiltered_rows();
+    picker.close("esc");
+}
 
-    let guard = host_roundtrip_bounded(guard, |host| {
-        host.load_source("fire", "maki.api.exec_autocmds('SessionPickerRequested')")
-    });
-
-    let cmdline = saw_run_command_rx
-        .recv_timeout(HOST_REPLY_TIMEOUT)
-        .expect("SessionPickerRequested never ran the /sessions command");
-    assert_eq!(cmdline, "/sessions");
-
-    let title = saw_open_win_rx
-        .recv_timeout(HOST_REPLY_TIMEOUT)
-        .expect("the /sessions command never opened the picker");
-    assert_eq!(title, PICKER_TITLE);
-
-    // The host stays responsive while the picker is parked open.
-    let _guard = host_roundtrip_bounded(guard, |host| {
-        host.load_source("probe", "local still_alive = true")
-    });
+#[test_case::test_case("esc")]
+#[test_case::test_case("ctrl+c")]
+fn sessions_keybind_initializes_and_closes(close_key: &str) {
+    let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
+    let actions = guard.host().ui_action_rx();
+    let keymaps = guard.host().keymap_reader().load();
+    let entry = keymaps
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.key == KeyCode::Char('p')
+                && entry.modifiers == KeyModifiers::CONTROL
+                && entry.plugin.as_ref() == "sessions"
+        })
+        .expect("bundled sessions Ctrl+P keybind is missing");
+    assert!(handle.run_keybind_callback(entry.id));
+    let picker = SessionsPicker::load(&actions);
+    picker.wait_for_unfiltered_rows();
+    picker.close(close_key);
 }
 
 const SESSION_OPTION_PLUGIN_ID: &str = "session_option_e2e.choice";
