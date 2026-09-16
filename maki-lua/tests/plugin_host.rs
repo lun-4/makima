@@ -5965,3 +5965,101 @@ fn session_picker_requested_routes_through_sessions_command() {
         host.load_source("probe", "local still_alive = true")
     });
 }
+
+const SESSION_OPTION_PLUGIN_ID: &str = "session_option_e2e.choice";
+const SESSION_OPTION_VALIDATOR_REJECTION: &str = "c is not allowed";
+const SESSION_OPTION_PLUGIN: &str = r#"
+maki.api.register_session_option({
+    id = "session_option_e2e.choice",
+    name = "Choice",
+    description = "e2e choice",
+    category = "mode",
+    values = {
+        { value = "a", name = "A" },
+        { value = "b", name = "B" },
+        { value = "c", name = "C" },
+    },
+    initial_value = "a",
+    validate = function(value)
+        if value == "c" then return false, "c is not allowed" end
+        return true
+    end,
+})
+
+maki.api.register_tool({
+    name = "set_choice",
+    description = "sets the plugin-owned session option",
+    schema = {
+        type = "object",
+        properties = {
+            session = { type = "string" },
+            value = { type = "string" },
+        },
+        required = { "session", "value" },
+    },
+    handler = function(input, ctx)
+        local ok, err = maki.session.set_option(
+            "session_option_e2e.choice",
+            input.value,
+            { session = input.session })
+        if not ok then
+            return "error: " .. tostring(err)
+        end
+        return "ok"
+    end,
+})
+"#;
+
+const SESSION_OPTION_SET_OK: &str = "ok";
+
+fn plugin_option_state(
+    session: &maki_agent::session_coordinator::SessionCoordinatorHandle,
+) -> (String, u64) {
+    let snapshot = session.read().options();
+    let state = snapshot
+        .options
+        .iter()
+        .find(|option| option.definition.id.as_ref() == SESSION_OPTION_PLUGIN_ID)
+        .expect("plugin-owned option missing from session snapshot");
+    (state.current_value.to_string(), snapshot.version)
+}
+
+/// Covers the Lua-facing set path end to end: a plugin loaded through the
+/// real host registers a plugin-owned option (including its validator), and a
+/// tool handler mutates a live session through `maki.session.set_option`.
+#[test]
+fn session_set_option_applies_plugin_owned_option_on_live_session() {
+    let (reg, host) = builtins_host();
+    let session = test_session(&host);
+    host.load_source("session_option_e2e", SESSION_OPTION_PLUGIN)
+        .unwrap();
+    let session_id = session.read().session_id().to_string();
+
+    let (value, _) = plugin_option_state(&session);
+    assert_eq!(value, "a");
+
+    let out = exec_tool(
+        &reg,
+        "set_choice",
+        json!({ "session": session_id, "value": "b" }),
+    )
+    .unwrap();
+    assert_eq!(out, SESSION_OPTION_SET_OK);
+    let (value, version) = plugin_option_state(&session);
+    assert_eq!(value, "b");
+    let set_version = version;
+
+    let out = exec_tool(
+        &reg,
+        "set_choice",
+        json!({ "session": session_id, "value": "c" }),
+    )
+    .unwrap();
+    assert!(
+        out.contains(SESSION_OPTION_VALIDATOR_REJECTION),
+        "expected validator rejection, got: {out}"
+    );
+    let (value, version) = plugin_option_state(&session);
+    assert_eq!(value, "b");
+    assert_eq!(version, set_version);
+}
