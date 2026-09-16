@@ -489,6 +489,7 @@ async fn apply_interactive_control(
                 &EventSender::new(raw_tx.clone(), run_id),
                 &CancelToken::none(),
                 config,
+                Some(&SessionRef::from(session_id)),
             )
             .await
             {
@@ -673,6 +674,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                             &EventSender::new(private_tx, run_id),
                             &cancel,
                             &params.config,
+                            Some(&session_ref_clone),
                         )
                         .await
                         .map_err(|error| error.to_string());

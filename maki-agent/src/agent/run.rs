@@ -798,6 +798,7 @@ impl<'h> Agent<'h> {
             &self.event_tx,
             &self.cancel,
             &self.config,
+            self.session_id.as_ref(),
         )
         .await?;
         self.rollback_len = self.history.len();

@@ -558,6 +558,7 @@ impl ActorBackend for TuiActorBackend {
                 &event_tx,
                 &maki_agent::cancel::CancelToken::none(),
                 &self.config,
+                self.session_id.as_ref(),
             )
             .await;
             if result.is_ok()
