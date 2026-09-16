@@ -2721,6 +2721,7 @@ dependencies = [
  "maki-agent",
  "maki-commands",
  "maki-config",
+ "maki-lua",
  "maki-providers",
  "maki-storage",
  "serde",
