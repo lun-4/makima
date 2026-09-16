@@ -696,7 +696,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         cli.permission_mode.as_deref(),
         cli.yolo || permissions_config.yolo,
     );
-    let startup_yolo = permission_mode == PermissionMode::BypassPermissions;
+    let startup_permission_mode = permission_mode;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
@@ -709,7 +709,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         .and_then(|spec| Model::from_spec(spec).ok())
         .filter(|candidate| model_policy.allows(&candidate.spec()))
         .unwrap_or(model);
-    let yolo = startup_yolo;
+    let permission_mode =
+        restored_permission_mode(restored_state, restored.meta.yolo, startup_permission_mode);
+    let yolo = permission_mode == PermissionMode::BypassPermissions;
     let fast = if restored_state {
         restored.meta.fast && model.supports_fast()
     } else {
@@ -1043,12 +1045,15 @@ pub fn run(params: SdkParams) -> Result<()> {
                     };
                     handle_control_request(
                         &cr,
-                        &writer,
-                        &handle,
-                        &shared,
-                        &startup_model,
-                        &model_policy,
-                        &sdk_commands,
+                        ControlRequestContext {
+                            writer: &writer,
+                            handle: &handle,
+                            coordinator: &coordinator,
+                            shared: &shared,
+                            startup_model: &startup_model,
+                            model_policy: &model_policy,
+                            commands: &sdk_commands,
+                        },
                     )?;
                 }
                 InboundMessageType::ControlResponse => {
@@ -1189,11 +1194,46 @@ fn apply_permission_option(
     };
     let enabled = option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE;
     permissions.set_yolo(enabled);
-    shared.lock().unwrap().permission_mode = if enabled {
+    let mut shared = shared.lock().unwrap();
+    if enabled {
+        shared.permission_mode = PermissionMode::BypassPermissions;
+    } else if shared.permission_mode == PermissionMode::BypassPermissions {
+        shared.permission_mode = PermissionMode::Default;
+    }
+}
+
+fn restored_permission_mode(
+    restored: bool,
+    persisted_yolo: bool,
+    startup: PermissionMode,
+) -> PermissionMode {
+    if !restored {
+        startup
+    } else if persisted_yolo {
         PermissionMode::BypassPermissions
-    } else {
+    } else if startup == PermissionMode::BypassPermissions {
         PermissionMode::Default
+    } else {
+        startup
+    }
+}
+
+fn set_permission_mode(
+    mode: PermissionMode,
+    coordinator: &maki_agent::session_coordinator::SessionCoordinatorHandle,
+    permissions: &maki_agent::permissions::PermissionManager,
+    shared: &Mutex<Shared>,
+) -> Result<(), maki_agent::session_coordinator::SessionCoordinatorError> {
+    let value = if mode == PermissionMode::BypassPermissions {
+        maki_agent::session_options::ENABLED_VALUE
+    } else {
+        maki_agent::session_options::DISABLED_VALUE
     };
+    let snapshot =
+        smol::block_on(coordinator.set_option(maki_agent::session_options::YOLO_OPTION_ID, value))?;
+    apply_permission_option(&snapshot, permissions, shared);
+    shared.lock().unwrap().permission_mode = mode;
+    Ok(())
 }
 
 fn spawn_command_driver(params: CommandDriverParams) -> smol::Task<()> {
@@ -1395,15 +1435,29 @@ fn content_images(content: &Value) -> Vec<ImageSource> {
         .collect()
 }
 
+struct ControlRequestContext<'a> {
+    writer: &'a SdkWriter,
+    handle: &'a InteractiveHandle,
+    coordinator: &'a maki_agent::session_coordinator::SessionCoordinatorHandle,
+    shared: &'a Mutex<Shared>,
+    startup_model: &'a Model,
+    model_policy: &'a ModelPolicy,
+    commands: &'a SdkCommands,
+}
+
 fn handle_control_request(
     cr: &InboundControlRequest,
-    writer: &SdkWriter,
-    handle: &InteractiveHandle,
-    shared: &Mutex<Shared>,
-    startup_model: &Model,
-    model_policy: &ModelPolicy,
-    commands: &SdkCommands,
+    ctx: ControlRequestContext<'_>,
 ) -> Result<()> {
+    let ControlRequestContext {
+        writer,
+        handle,
+        coordinator,
+        shared,
+        startup_model,
+        model_policy,
+        commands,
+    } = ctx;
     let ok = Some(Value::Object(Default::default()));
     match &cr.request.subtype {
         InboundControlRequestType::Initialize => {
@@ -1426,11 +1480,14 @@ fn handle_control_request(
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
-                    shared.lock().unwrap().permission_mode = mode;
-                    handle
-                        .permissions
-                        .set_yolo(mode == PermissionMode::BypassPermissions);
-                    writer.emit_control_response(&cr.request_id, ok, None)
+                    match set_permission_mode(mode, coordinator, &handle.permissions, shared) {
+                        Ok(()) => writer.emit_control_response(&cr.request_id, ok, None),
+                        Err(error) => writer.emit_control_response(
+                            &cr.request_id,
+                            None,
+                            Some(error.to_string()),
+                        ),
+                    }
                 }
                 None => writer.emit_control_response(
                     &cr.request_id,
@@ -2104,8 +2161,14 @@ mod tests {
         smol::block_on(coordinator.close()).unwrap();
     }
 
-    #[test]
-    fn sdk_yolo_option_updates_live_permission_state() {
+    #[test_case(PermissionMode::Default ; "default")]
+    #[test_case(PermissionMode::AcceptEdits ; "accept_edits")]
+    #[test_case(PermissionMode::Plan ; "plan")]
+    fn sdk_permission_mode_disables_persisted_yolo(mode: PermissionMode) {
+        use std::sync::Mutex as StdMutex;
+
+        let checkpointed = Arc::new(StdMutex::new(Vec::new()));
+        let checkpointed_clone = Arc::clone(&checkpointed);
         let id = MakiId::generate();
         let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
             maki_agent::session_coordinator::SessionCoordinatorParams {
@@ -2114,7 +2177,7 @@ mod tests {
                 definitions: maki_agent::session_coordinator::builtin_option_definitions(
                     STARTUP_MODEL,
                     [Arc::from(STARTUP_MODEL)],
-                    false,
+                    true,
                     false,
                     false,
                     maki_agent::ThinkingConfig::Off,
@@ -2133,10 +2196,12 @@ mod tests {
                         as maki_agent::session_coordinator::DirectoryAdoptionFuture
                 }),
                 checkpoint: Arc::new(
-                    |request: maki_storage::checkpoint::CheckpointRequest<
+                    move |request: maki_storage::checkpoint::CheckpointRequest<
                         maki_agent::session_coordinator::SessionCheckpoint,
                     >| {
+                        let checkpointed = Arc::clone(&checkpointed_clone);
                         Box::pin(async move {
+                            checkpointed.lock().unwrap().push(request.snapshot);
                             Ok(maki_storage::checkpoint::CheckpointAck {
                                 session_id: request.session_id,
                                 version: request.version,
@@ -2148,30 +2213,98 @@ mod tests {
             },
         )
         .unwrap();
-        let permissions = Arc::new(maki_agent::permissions::PermissionManager::new(
+        let permissions = maki_agent::permissions::PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/project"),
             Arc::default(),
-        ));
-        let shared = Arc::new(Mutex::new(Shared {
+        );
+        permissions.set_yolo(true);
+        let shared = Mutex::new(Shared {
             model: Model::from_spec(STARTUP_MODEL).unwrap(),
-            permission_mode: PermissionMode::Default,
+            permission_mode: PermissionMode::BypassPermissions,
             turn_start: Instant::now(),
             pending: HashSet::new(),
-        }));
-        let snapshot = smol::block_on(coordinator.set_option(
-            maki_agent::session_options::YOLO_OPTION_ID,
-            maki_agent::session_options::ENABLED_VALUE,
-        ))
-        .unwrap();
-        apply_permission_option(&snapshot, &permissions, &shared);
+        });
 
-        assert!(permissions.is_yolo());
+        set_permission_mode(mode, &coordinator, &permissions, &shared).unwrap();
+
+        assert!(!permissions.is_yolo());
+        assert_eq!(shared.lock().unwrap().permission_mode, mode);
+        let snapshot = coordinator.read().options();
+        let yolo = snapshot
+            .options
+            .iter()
+            .find(|option| {
+                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+            })
+            .unwrap();
         assert_eq!(
-            shared.lock().unwrap().permission_mode,
-            PermissionMode::BypassPermissions
+            yolo.current_value.as_ref(),
+            maki_agent::session_options::DISABLED_VALUE
+        );
+        let checkpointed = checkpointed.lock().unwrap();
+        assert_eq!(checkpointed.len(), 1);
+        let checkpointed_yolo = checkpointed[0]
+            .options
+            .options
+            .iter()
+            .find(|option| {
+                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+            })
+            .unwrap();
+        assert_eq!(
+            checkpointed_yolo.current_value.as_ref(),
+            maki_agent::session_options::DISABLED_VALUE
         );
         smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test]
+    fn disabled_yolo_preserves_non_bypass_permission_mode() {
+        let permissions = maki_agent::permissions::PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/project"),
+            Arc::default(),
+        );
+        let shared = Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Plan,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+        });
+        let snapshot = maki_agent::session_options::SessionOptions::new(
+            maki_agent::session_coordinator::builtin_option_definitions(
+                STARTUP_MODEL,
+                [Arc::from(STARTUP_MODEL)],
+                false,
+                false,
+                false,
+                maki_agent::ThinkingConfig::Off,
+            ),
+            &Default::default(),
+        )
+        .unwrap()
+        .snapshot();
+
+        apply_permission_option(&snapshot, &permissions, &shared);
+
+        assert_eq!(shared.lock().unwrap().permission_mode, PermissionMode::Plan);
+    }
+
+    #[test_case(true, true, PermissionMode::Default, PermissionMode::BypassPermissions ; "restored_enabled_wins")]
+    #[test_case(true, false, PermissionMode::BypassPermissions, PermissionMode::Default ; "restored_disabled_wins")]
+    #[test_case(false, false, PermissionMode::BypassPermissions, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
+    #[test_case(true, false, PermissionMode::Plan, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
+    fn sdk_yolo_restore_precedence(
+        restored: bool,
+        persisted: bool,
+        startup: PermissionMode,
+        expected: PermissionMode,
+    ) {
+        assert_eq!(
+            restored_permission_mode(restored, persisted, startup),
+            expected
+        );
     }
 
     #[test]
