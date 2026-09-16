@@ -1059,7 +1059,7 @@ impl SpawnCtx {
             .unwrap_or_default()
     }
 
-    fn prepare_runtime(&self, session: AppSession) -> PreparedSessionRuntime {
+    fn prepare_runtime(&self, session: AppSession) -> Result<PreparedSessionRuntime> {
         self.prepare_runtime_with_provider(session, None)
     }
 
@@ -1072,12 +1072,13 @@ impl SpawnCtx {
         session.meta.yolo = permissions.is_yolo();
         let provider = self.prepare_replacement_provider(&session)?;
         let seed_snapshot = session.id != current_id;
-        Ok(self.prepare_runtime_with_provider_and_permissions(
+        self.prepare_runtime_with_provider_and_permissions(
             session,
             provider,
             permissions,
             seed_snapshot,
-        ))
+        )
+        .map_err(|error| error.to_string())
     }
 
     fn prepare_replacement_provider(
@@ -1102,7 +1103,7 @@ impl SpawnCtx {
         &self,
         mut session: AppSession,
         provider: Option<PreparedProvider>,
-    ) -> PreparedSessionRuntime {
+    ) -> Result<PreparedSessionRuntime> {
         if !session_has_content(&session) {
             session.meta.yolo = self.permissions.is_yolo();
         }
@@ -1120,7 +1121,7 @@ impl SpawnCtx {
         provider: Option<PreparedProvider>,
         permissions: &PermissionManager,
         seed_snapshot: bool,
-    ) -> PreparedSessionRuntime {
+    ) -> Result<PreparedSessionRuntime> {
         let resumed = session_has_content(&session);
         let session_id = session.id;
         let history = session.messages().to_vec();
@@ -1168,8 +1169,7 @@ impl SpawnCtx {
             &permissions,
             crate::app::session_state::resolve_thinking(&session, &model, &self.storage),
             seed_snapshot,
-        )
-        .expect("session coordinator registration");
+        )?;
         let app = App::prepare(
             &model,
             session,
@@ -1190,7 +1190,7 @@ impl SpawnCtx {
             Arc::clone(&self.command_runtime),
         );
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
-        PreparedSessionRuntime {
+        Ok(PreparedSessionRuntime {
             app,
             handles,
             model_slot,
@@ -1199,12 +1199,12 @@ impl SpawnCtx {
             shell_tx,
             shell_rx,
             resumed,
-        }
+        })
     }
 
     fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
         let id = session.id;
-        let prepared = self.prepare_runtime(session);
+        let prepared = self.prepare_runtime(session)?;
         let session_lock = match claim_lock(&self.sessions_dir, &id) {
             Ok(session_lock) => session_lock,
             Err(error) => {
@@ -3820,7 +3820,7 @@ mod tests {
         }
 
         fn prepare(&self) -> PreparedSessionRuntime {
-            self.ctx().prepare_runtime(self.session())
+            self.ctx().prepare_runtime(self.session()).unwrap()
         }
 
         fn set_startup_yolo(&self) {
@@ -3934,7 +3934,7 @@ mod tests {
         let mut session = harness.session();
         session.push_message(Message::user("history".into()));
         session.meta.queued_messages = vec!["restored".into()];
-        let prepared = harness.ctx().prepare_runtime(session);
+        let prepared = harness.ctx().prepare_runtime(session).unwrap();
         let mut runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
 
         assert!(runtime.handles.queue.is_empty());
@@ -3997,7 +3997,7 @@ mod tests {
             panic!("expected replacement request");
         };
         let mut runtime = harness.runtime(session);
-        let prepared = harness.ctx().prepare_runtime(request.session);
+        let prepared = harness.ctx().prepare_runtime(request.session).unwrap();
         let old = replace_session_runtime(
             &mut runtime,
             prepared,
@@ -4034,7 +4034,7 @@ mod tests {
         let harness = RuntimeHarness::new();
         let mut session = harness.session();
         session.meta.input_draft = Some(DRAFT.into());
-        let prepared = harness.ctx().prepare_runtime(session);
+        let prepared = harness.ctx().prepare_runtime(session).unwrap();
         let mut runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
 
         assert!(runtime.restore_pending);
@@ -4064,7 +4064,8 @@ mod tests {
         };
         let prepared = harness
             .ctx()
-            .prepare_runtime_with_provider(session, Some(provider));
+            .prepare_runtime_with_provider(session, Some(provider))
+            .unwrap();
         let runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
         let installed = harness.ctx().model_slot.load();
 
@@ -4147,7 +4148,7 @@ mod tests {
         replacement.meta.session_rules = current.app.state.session.meta.session_rules.clone();
         assert!(replacement.messages().is_empty());
 
-        let prepared = harness.ctx().prepare_runtime(replacement);
+        let prepared = harness.ctx().prepare_runtime(replacement).unwrap();
 
         assert!(
             prepared
@@ -4308,7 +4309,7 @@ mod tests {
         runtime.app.input_box.set_input(PROMPT.into());
         assert_eq!(runtime.app.input_box.submit().unwrap().text, PROMPT);
         let replacement = if reset { harness.session() } else { session };
-        let prepared = harness.ctx().prepare_runtime(replacement);
+        let prepared = harness.ctx().prepare_runtime(replacement).unwrap();
 
         let old = replace_session_runtime(
             &mut runtime,
@@ -4603,12 +4604,15 @@ mod tests {
         ));
         ensure_replacement_lock_available(&runtime, id).unwrap();
 
-        let prepared = harness.ctx().prepare_runtime_with_provider_and_permissions(
-            session,
-            None,
-            runtime.app.permissions.as_ref(),
-            false,
-        );
+        let prepared = harness
+            .ctx()
+            .prepare_runtime_with_provider_and_permissions(
+                session,
+                None,
+                runtime.app.permissions.as_ref(),
+                false,
+            )
+            .unwrap();
         let old = replace_session_runtime(
             &mut runtime,
             prepared,
@@ -4639,7 +4643,7 @@ mod tests {
         });
         entered_rx.recv().unwrap();
 
-        let prepared = harness.ctx().prepare_runtime(session);
+        let prepared = harness.ctx().prepare_runtime(session).unwrap();
         let error = match replace_session_runtime(
             &mut runtime,
             prepared,
@@ -4900,7 +4904,7 @@ mod tests {
         let mut runtime = harness.runtime(session.clone());
         let path = session_lock::lock_path(&harness.ctx().sessions_dir, &id);
         let owner_before = std::fs::read(&path).unwrap();
-        let prepared = harness.ctx().prepare_runtime(session);
+        let prepared = harness.ctx().prepare_runtime(session).unwrap();
 
         let old = replace_session_runtime(
             &mut runtime,
@@ -4926,7 +4930,7 @@ mod tests {
         let target = harness.session();
         let target_id = target.id;
         let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target_id);
-        let prepared = harness.ctx().prepare_runtime(target);
+        let prepared = harness.ctx().prepare_runtime(target).unwrap();
 
         let mut old = replace_session_runtime(
             &mut runtime,
@@ -4971,7 +4975,7 @@ mod tests {
         let target_id = target.id;
         let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target_id);
         std::fs::write(&target_path, "4294967294").unwrap();
-        let prepared = harness.ctx().prepare_runtime(target);
+        let prepared = harness.ctx().prepare_runtime(target).unwrap();
         let (_, _, candidate_manager, _) = prepared.snapshot();
 
         let error = match replace_session_runtime(

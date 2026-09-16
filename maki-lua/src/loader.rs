@@ -2353,6 +2353,40 @@ mod tests {
         );
     }
 
+    #[test_case("register_prompt_hint", r#"{ slot = "tool_usage", content = "late" }"#)]
+    #[test_case("set_prompt", r#"{ slot = "identity", content = "late" }"#)]
+    #[test_case(
+        "register_options",
+        r#"{ enabled = { default = true, desc = "Enabled" } }"#
+    )]
+    #[test_case(
+        "register_session_option",
+        r#"{ id = "late.value", name = "Late", description = "Late", category = "mode", values = {{ value = "a", name = "A" }}, initial_value = "a" }"#
+    )]
+    fn load_only_registration_apis_reject_runtime_calls(api: &str, spec: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "late",
+            &format!(
+                r#"maki.api.register_command({{
+                    name = "/late",
+                    description = "late registration",
+                    tui_only = false,
+                    handler = function() maki.api.{api}({spec}) end,
+                }})"#
+            ),
+        )
+        .unwrap();
+
+        let result = host
+            .event_handle()
+            .run_command_for_test(Arc::from("late"), Arc::from("/late"), String::new(), 0)
+            .recv()
+            .unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("may only be called at the top level during plugin load"));
+    }
+
     #[test]
     fn complete_plugin_replacement_is_transactional() {
         const OLD: &str = r#"

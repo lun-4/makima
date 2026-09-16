@@ -84,6 +84,7 @@ pub fn run(
         permissions_config: config.permissions,
         timeouts,
         initial_wd: cwd,
+        storage,
         prompt_slots: Arc::new(prompt_slots),
         modes,
         yolo,

@@ -250,6 +250,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl SessionOptionCatalog {
+    pub fn plugin_definitions(&self, plugin: &str) -> Vec<SessionOptionDefinition> {
+        lock(&self.state)
+            .definitions
+            .get(plugin)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn unregister(&self, session_id: MakiId, generation: u64) {
         let mut state = lock(&self.state);
         if state
@@ -292,19 +300,27 @@ impl SessionOptionCatalog {
         for (session_id, tx) in sessions {
             let (prepared_tx, prepared_rx) = flume::bounded(1);
             let (decision_tx, decision_rx) = flume::bounded(1);
-            tx.send_async(Operation::PreparePluginOptions {
-                plugin: Arc::clone(&plugin),
-                definitions: definitions.clone(),
-                prepared: prepared_tx,
-                decision: decision_rx,
-            })
-            .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(session_id))?;
-            match prepared_rx
-                .recv_async()
+            if tx
+                .send_async(Operation::PreparePluginOptions {
+                    plugin: Arc::clone(&plugin),
+                    definitions: definitions.clone(),
+                    prepared: prepared_tx,
+                    decision: decision_rx,
+                })
                 .await
-                .map_err(|_| SessionCoordinatorError::StaleSession(session_id))?
+                .is_err()
             {
+                abort_plugin_options(prepared).await?;
+                return Err(SessionCoordinatorError::StaleSession(session_id));
+            }
+            let result = match prepared_rx.recv_async().await {
+                Ok(result) => result,
+                Err(_) => {
+                    abort_plugin_options(prepared).await?;
+                    return Err(SessionCoordinatorError::StaleSession(session_id));
+                }
+            };
+            match result {
                 Ok(candidate) => prepared.push((candidate, decision_tx)),
                 Err(error) => {
                     abort_plugin_options(prepared).await?;
@@ -349,7 +365,7 @@ impl SessionOptionCatalog {
             .iter()
             .map(|(prepared, _)| (Arc::clone(&prepared.options), prepared.candidate.clone()))
             .collect();
-        let snapshots = {
+        let (snapshots, previous_definitions) = {
             let mut state = lock(&self.state);
             let snapshots = match SessionOptions::commit_batch(candidates) {
                 Ok(snapshots) => snapshots,
@@ -359,24 +375,52 @@ impl SessionOptionCatalog {
                     return Err(error.into());
                 }
             };
-            if definitions.is_empty() {
-                state.definitions.remove(plugin.as_ref());
+            let previous_definitions = if definitions.is_empty() {
+                state.definitions.remove(plugin.as_ref())
             } else {
-                state.definitions.insert(Arc::clone(&plugin), definitions);
-            }
-            snapshots
+                state.definitions.insert(Arc::clone(&plugin), definitions)
+            };
+            (snapshots, previous_definitions)
         };
+        let restore = prepared
+            .iter()
+            .zip(&snapshots)
+            .map(|((prepared, _), snapshot)| {
+                (
+                    Arc::clone(&prepared.options),
+                    snapshot.version,
+                    prepared.previous.clone(),
+                )
+            })
+            .collect();
         let mut committed = Vec::with_capacity(prepared.len());
+        let mut commit_error = None;
         for ((prepared, decision), snapshot) in prepared.into_iter().zip(snapshots) {
             let (reply, response) = flume::bounded(1);
-            decision
-                .send(PluginOptionDecision::Commit(reply))
-                .map_err(|_| SessionCoordinatorError::StaleSession(prepared.session_id))?;
-            response
-                .recv_async()
-                .await
-                .map_err(|_| SessionCoordinatorError::StaleSession(prepared.session_id))??;
+            let result = if decision.send(PluginOptionDecision::Commit(reply)).is_err() {
+                Err(SessionCoordinatorError::StaleSession(prepared.session_id))
+            } else {
+                response.recv_async().await.unwrap_or_else(|_| {
+                    Err(SessionCoordinatorError::StaleSession(prepared.session_id))
+                })
+            };
+            if let Err(error) = result {
+                commit_error.get_or_insert(error);
+            }
             committed.push((prepared.session_id, snapshot));
+        }
+        if let Some(error) = commit_error {
+            if SessionOptions::restore_batch_if_versions(restore) {
+                let mut state = lock(&self.state);
+                if let Some(definitions) = previous_definitions {
+                    state.definitions.insert(Arc::clone(&plugin), definitions);
+                } else {
+                    state.definitions.remove(plugin.as_ref());
+                }
+            } else {
+                tracing::warn!(%plugin, "session options advanced before plugin rollback");
+            }
+            return Err(error);
         }
         Ok(committed)
     }
@@ -1055,9 +1099,49 @@ async fn hold_lease(
                 timeout,
                 reply,
             })) => {
-                let result = commit_history(ctx, history, timeout).await;
+                let (completed_tx, completed_rx) = flume::bounded(1);
+                let read = ctx.read.clone();
+                let checkpoint = Arc::clone(&ctx.checkpoint);
+                smol::spawn(async move {
+                    let result = replace_history(&read, &*checkpoint, history).await;
+                    let _ = completed_tx.send(result);
+                })
+                .detach();
+
+                let result = match timeout {
+                    Some(timeout) => {
+                        futures_lite::future::or(
+                            async {
+                                smol::Timer::after(timeout).await;
+                                Err(CheckpointError::Save {
+                                    session_id: ctx.session_id,
+                                    message: Arc::from(CHECKPOINT_TIMEOUT_MESSAGE),
+                                }
+                                .into())
+                            },
+                            async {
+                                completed_rx.recv_async().await.unwrap_or_else(|_| {
+                                    Err(SessionCoordinatorError::StaleSession(ctx.session_id))
+                                })
+                            },
+                        )
+                        .await
+                    }
+                    None => completed_rx.recv_async().await.unwrap_or_else(|_| {
+                        Err(SessionCoordinatorError::StaleSession(ctx.session_id))
+                    }),
+                };
+                let timed_out = matches!(
+                    &result,
+                    Err(SessionCoordinatorError::Checkpoint(CheckpointError::Save {
+                        message,
+                        ..
+                    })) if message.as_ref() == CHECKPOINT_TIMEOUT_MESSAGE
+                );
                 let _ = reply.send(result);
-                let _ = wait.recv_async().await;
+                if !timed_out {
+                    let _ = wait.recv_async().await;
+                }
                 return;
             }
             // Released without a commit, or the holder dropped.
@@ -1083,28 +1167,6 @@ async fn hold_lease(
 enum Either<L, R> {
     Left(L),
     Right(R),
-}
-
-async fn commit_history(
-    ctx: &CoordinatorCtx,
-    history: Arc<Vec<Message>>,
-    timeout: Option<Duration>,
-) -> Result<(), SessionCoordinatorError> {
-    let Some(timeout) = timeout else {
-        return replace_history(&ctx.read, &*ctx.checkpoint, history).await;
-    };
-    futures_lite::future::or(
-        replace_history(&ctx.read, &*ctx.checkpoint, history),
-        async {
-            smol::Timer::after(timeout).await;
-            Err(CheckpointError::Save {
-                session_id: ctx.session_id,
-                message: Arc::from(CHECKPOINT_TIMEOUT_MESSAGE),
-            }
-            .into())
-        },
-    )
-    .await
 }
 
 async fn abort_plugin_options(
@@ -1965,6 +2027,61 @@ mod tests {
                 1,
                 "the queued replacement lands after the commit, not before it"
             );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn timed_out_history_commit_finishes_checkpoint_and_publishes_history() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let (checkpoint_started_tx, checkpoint_started_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+                Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let checkpoint_started_tx = checkpoint_started_tx.clone();
+                    let release_rx = release_rx.clone();
+                    Box::pin(async move {
+                        checkpoint_started_tx.send_async(()).await.unwrap();
+                        release_rx.recv_async().await.unwrap();
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                });
+            let coordinator = SessionCoordinatorHandle::register(params(id, checkpoint)).unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let committer = lease.committer().unwrap();
+            let history = vec![Message::user("committed".into())];
+            let commit = committer
+                .begin_history_commit(history.clone(), Some(Duration::ZERO))
+                .await
+                .unwrap();
+
+            checkpoint_started_rx.recv_async().await.unwrap();
+            assert!(matches!(
+                commit.wait().await,
+                Err(SessionCoordinatorError::Checkpoint(CheckpointError::Save {
+                    message,
+                    ..
+                })) if message.as_ref() == CHECKPOINT_TIMEOUT_MESSAGE
+            ));
+            assert!(coordinator.read().history().is_empty());
+
+            let next = coordinator.acquire_lease().await.unwrap();
+            drop(next);
+
+            release_tx.send_async(()).await.unwrap();
+            while coordinator.read().history().is_empty() {
+                smol::future::yield_now().await;
+            }
+            assert_eq!(
+                serde_json::to_value(coordinator.read().history().as_ref()).unwrap(),
+                serde_json::to_value(&history).unwrap()
+            );
+
+            drop(lease);
             coordinator.close().await.unwrap();
         });
     }

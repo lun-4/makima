@@ -18,7 +18,7 @@ use std::time::UNIX_EPOCH;
 
 use tracing::{info, warn};
 
-use crate::id::{MakiId, MakiIdParseError};
+use crate::id::MakiId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -73,12 +73,8 @@ pub enum SessionError {
     VersionMismatch { found: u32, expected: u32 },
     #[error("session ID mismatch: log owns {log_id}, got {given_id}")]
     IdMismatch { log_id: MakiId, given_id: MakiId },
-    #[error("session log {path} has header id {raw_id:?} that is not a valid id: {source}")]
-    CorruptHeaderId {
-        path: String,
-        raw_id: String,
-        source: MakiIdParseError,
-    },
+    #[error("session log {path} has no valid header")]
+    MissingHeader { path: String },
     #[error("session log diverged ({reason}); rewrite required")]
     LogDiverged { reason: &'static str },
     #[error("session is open in another terminal; close it there first")]
@@ -823,15 +819,6 @@ fn append_record<R: Serialize>(buf: &mut Vec<u8>, record: &R) -> Result<(), Sess
 
 /// Tag-only probe used to classify a line that failed the strict `LogRecord`
 /// parse: distinguishes a header with a bad id from a genuinely unknown record.
-#[derive(Deserialize)]
-#[serde(tag = "t", rename_all = "lowercase")]
-enum RawTag {
-    Header {
-        id: String,
-    },
-    #[serde(other)]
-    Other,
-}
 
 fn load_jsonl<M, U, T>(data: &[u8], display_path: &str) -> Result<Session<M, U, T>, SessionError>
 where
@@ -854,8 +841,6 @@ where
     let mut subagents = Vec::new();
     let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
-    let mut got_header = false;
-
     for line in data.split(|&b| b == b'\n') {
         line_count += 1;
         if line.is_empty() {
@@ -864,16 +849,6 @@ where
         let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
             Err(e) => {
-                if !got_header
-                    && let Ok(RawTag::Header { id: raw_id }) = serde_json::from_slice(line)
-                    && let Err(source) = raw_id.parse::<MakiId>()
-                {
-                    return Err(SessionError::CorruptHeaderId {
-                        path: display_path.to_string(),
-                        raw_id,
-                        source,
-                    });
-                }
                 warn!(
                     path = display_path,
                     error = %e,
@@ -901,7 +876,6 @@ where
                 model = h_model;
                 cwd = h_cwd;
                 created_at = h_created;
-                got_header = true;
             }
             LogRecord::Msg { d } => messages.push(d),
             LogRecord::Out { id: out_id, d } => {
@@ -928,7 +902,9 @@ where
         }
     }
 
-    let id = id.ok_or(StorageError::NotFound(display_path.to_string()))?;
+    let id = id.ok_or_else(|| SessionError::MissingHeader {
+        path: display_path.to_string(),
+    })?;
 
     Ok(Session {
         version: SESSION_VERSION,
@@ -2851,7 +2827,7 @@ mod tests {
     }
 
     #[test]
-    fn load_surfaces_corrupt_header_id() {
+    fn load_with_corrupt_header_id_reports_missing_header() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let id = MakiId::generate();
@@ -2868,7 +2844,7 @@ mod tests {
         fs::write(&path, corrupted).unwrap();
 
         let err = TestSession::load_from(id, dir).unwrap_err();
-        assert!(matches!(err, SessionError::CorruptHeaderId { .. }));
+        assert!(matches!(err, SessionError::MissingHeader { .. }));
     }
 
     #[test]

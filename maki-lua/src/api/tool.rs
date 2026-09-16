@@ -1063,7 +1063,8 @@ fn register_prompt_hint(
     #[ctx] plugin: Arc<str>,
     spec: Table,
 ) -> LuaResult<()> {
-    let slot: Slot = parse_slot(&spec)?;
+    crate::runtime::require_plugin_load(lua, &plugin, "register_prompt_hint")?;
+    let slot = parse_slot(&spec)?;
     if slot.kind() == SlotKind::Singleton {
         return Err(mlua::Error::runtime(format!(
             "register_prompt_hint is for aggregate slots ({}); \
@@ -1074,6 +1075,7 @@ fn register_prompt_hint(
     }
     let prompts = parse_prompt_field(&spec)?;
     validate_slot_prompt_compatibility(slot, &prompts)?;
+
     let content = parse_hint_content(lua, &spec)?;
     let reg = PromptHintRegistration {
         prompts,
@@ -1115,6 +1117,7 @@ fn set_prompt(
     #[ctx] plugin: Arc<str>,
     spec: Table,
 ) -> LuaResult<()> {
+    crate::runtime::require_plugin_load(lua, &plugin, "set_prompt")?;
     let slot: Slot = parse_slot(&spec)?;
     if slot.kind() == SlotKind::Aggregate {
         return Err(mlua::Error::runtime(format!(

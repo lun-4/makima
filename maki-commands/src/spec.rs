@@ -36,7 +36,18 @@ pub struct TargetCapabilities(u16);
 
 impl TargetCapabilities {
     pub const NONE: Self = Self(0);
-    pub const ALL: Self = Self((1 << 10) - 1);
+    pub const ALL: Self = Self::from_slice(&[
+        TargetCapability::AgentTurns,
+        TargetCapability::ModelSelection,
+        TargetCapability::HistoryCompaction,
+        TargetCapability::SessionReplacement,
+        TargetCapability::WorkingDirectory,
+        TargetCapability::PermissionToggles,
+        TargetCapability::ConfigToggles,
+        TargetCapability::InteractiveUi,
+        TargetCapability::ApplicationLifecycle,
+        TargetCapability::Reload,
+    ]);
 
     pub const fn from_capability(capability: TargetCapability) -> Self {
         Self(1 << capability as u8)

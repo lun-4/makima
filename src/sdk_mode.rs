@@ -787,12 +787,15 @@ pub fn run(params: SdkParams) -> Result<()> {
         workflow,
         thinking,
     );
-    let checkpoint = Arc::new(maki_agent::session_checkpoint::SessionLogCheckpoint::open(
-        storage.clone(),
-        handle.session_id.id(),
-        &startup_model.spec(),
-        &working_dir,
-    ));
+    let checkpoint = Arc::new(
+        maki_agent::session_checkpoint::SessionLogCheckpoint::open(
+            storage.clone(),
+            handle.session_id.id(),
+            &startup_model.spec(),
+            &working_dir,
+        )
+        .map_err(|error| eyre!(error))?,
+    );
     let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
         maki_agent::session_coordinator::SessionCoordinatorParams {
             session_id: handle.session_id.id(),
@@ -945,6 +948,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         result_text: String::new(),
         cost: None,
         request_counter: 0,
+        terminal_run_id: None,
     }
     .spawn(handle.event_rx.clone());
     let command_driver = spawn_command_driver(CommandDriverParams {
@@ -1413,10 +1417,16 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
         // belong to this directory and be free of other holders; a fresh ID
         // simply starts new.
         Some(Ok(id)) => {
-            if let Ok(session) = StoredSession::load(id.id(), storage)
-                && let Some(block) = resume_block_for(&sessions_dir, &session, cwd)
-            {
-                return Err(eyre!("session {}: {block}", session.id));
+            match StoredSession::load(id.id(), storage) {
+                Ok(session) => {
+                    if let Some(block) = resume_block_for(&sessions_dir, &session, cwd) {
+                        return Err(eyre!("session {}: {block}", session.id));
+                    }
+                }
+                Err(maki_storage::sessions::SessionError::Storage(
+                    maki_storage::StorageError::NotFound(_),
+                )) => {}
+                Err(error) => return Err(eyre!("load session {id}: {error}")),
             }
             Some(id)
         }
@@ -1643,6 +1653,7 @@ struct EventPump {
     /// the rate it paid.
     cost: Option<f64>,
     request_counter: u64,
+    terminal_run_id: Option<u64>,
 }
 
 impl EventPump {
@@ -1841,6 +1852,7 @@ impl EventPump {
                     }))?;
             }
             AgentEvent::TurnOutcome(outcome) => {
+                self.terminal_run_id = Some(envelope.run_id);
                 let result = mem::take(&mut self.result_text);
                 match outcome {
                     TurnOutcome::Completed {
@@ -1868,7 +1880,12 @@ impl EventPump {
             }
             AgentEvent::ControlComplete { .. } => {}
             AgentEvent::ControlError { message } => {
-                self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                if self.terminal_run_id == Some(envelope.run_id) {
+                    self.writer
+                        .emit_system("warning", serde_json::json!({ "message": message }))?;
+                } else {
+                    self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                }
             }
         }
         Ok(())
@@ -2735,6 +2752,70 @@ mod tests {
         assert!(content_images(&serde_json::json!("hi")).is_empty());
         let bad = serde_json::json!([{"type": "image", "source": {"data": "x"}}]);
         assert!(content_images(&bad).is_empty());
+    }
+
+    #[test]
+    fn persistence_error_after_outcome_emits_one_result_and_warning() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let mut pump = EventPump {
+            writer: SdkWriter {
+                session_id: SessionRef::generate(),
+                out_tx,
+            },
+            shared: Arc::new(Mutex::new(Shared {
+                model: Model::from_spec(STARTUP_MODEL).unwrap(),
+                permission_mode: PermissionMode::Default,
+                turn_start: Instant::now(),
+                pending: HashSet::new(),
+            })),
+            answer_tx: flume::unbounded().0,
+            include_partial_messages: false,
+            synth: StreamSynth::new(),
+            tool_inputs: HashMap::new(),
+            result_text: String::new(),
+            cost: None,
+            request_counter: 0,
+            terminal_run_id: None,
+        };
+        let outcome = TurnOutcome::Completed {
+            agent_id: maki_agent::AgentId::generate(),
+            turn_id: maki_agent::TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: maki_agent::DoneReason::EndTurn,
+        };
+
+        pump.handle(Envelope {
+            event: AgentEvent::TurnOutcome(outcome),
+            subagent: None,
+            run_id: 9,
+        })
+        .unwrap();
+        pump.handle(Envelope {
+            event: AgentEvent::ControlError {
+                message: "checkpoint failed".into(),
+            },
+            subagent: None,
+            run_id: 9,
+        })
+        .unwrap();
+
+        let records: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["type"] == "result")
+                .count(),
+            1
+        );
+        assert!(records.iter().any(|record| {
+            record["type"] == "system"
+                && record["subtype"] == "warning"
+                && record["message"] == "checkpoint failed"
+        }));
     }
 
     #[test]

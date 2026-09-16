@@ -391,6 +391,7 @@ fn register_session_option(
     #[ctx] ui_action_tx: Option<flume::Sender<UiAction>>,
     spec: Table,
 ) -> LuaResult<mlua::AnyUserData> {
+    crate::runtime::require_plugin_load(lua, &pending.plugin, "register_session_option")?;
     let (definition, validator) = parse_definition(&pending, &spec)?;
     let mut definitions = lock(&pending.definitions);
     if definitions
@@ -423,7 +424,7 @@ lua_table! {
     ), DOCS [register_session_option(pending, ui_action_tx)]
 }
 
-pub(crate) async fn commit_pending(
+pub(crate) async fn commit_catalog(
     lua: &Lua,
     catalog: &SessionOptionCatalog,
     pending: &PendingSessionOptions,
@@ -454,18 +455,43 @@ pub(crate) async fn commit_pending(
         )
         .await
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn activate_pending(lua: &Lua, pending: &PendingSessionOptions) {
     if let Some(mut active) = lua.app_data_mut::<SessionOptionValidators>() {
         active
             .0
             .retain(|(plugin, _, _), _| plugin != &pending.plugin);
-        for (id, validator) in validators {
+        for (id, validator) in pending.validators() {
             active.0.insert(
                 (Arc::clone(&pending.plugin), pending.generation, id),
                 validator,
             );
         }
     }
+}
+
+pub(crate) async fn commit_pending(
+    lua: &Lua,
+    catalog: &SessionOptionCatalog,
+    pending: &PendingSessionOptions,
+) -> Result<(), String> {
+    commit_catalog(lua, catalog, pending).await?;
+    activate_pending(lua, pending);
     Ok(())
+}
+
+pub(crate) async fn restore(
+    catalog: &SessionOptionCatalog,
+    plugin: &str,
+    definitions: Vec<SessionOptionDefinition>,
+) -> Result<(), String> {
+    catalog
+        .replace_plugin_options(plugin, definitions)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn unload(
@@ -500,6 +526,7 @@ mod tests {
         CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
     };
     use maki_storage::id::MakiId;
+    use test_case::test_case;
 
     use super::*;
 
@@ -582,6 +609,7 @@ mod tests {
             let first = coordinator(first_id, &catalog);
             let second = coordinator(second_id, &catalog);
             let lua = Lua::new();
+            lua.set_app_data(crate::runtime::LoadingPlugin(Arc::from("test"), 1));
             lua.set_app_data(SessionOptionStore::default());
             lua.set_app_data(SessionOptionValidators::default());
             lua.set_app_data(SessionOptionValidation::default());
@@ -646,6 +674,7 @@ mod tests {
             let first = coordinator(first_id, &catalog);
             let second = coordinator(second_id, &catalog);
             let lua = Lua::new();
+            lua.set_app_data(crate::runtime::LoadingPlugin(Arc::from("test"), 1));
             lua.set_app_data(SessionOptionStore::default());
             lua.set_app_data(SessionOptionValidators::default());
             lua.set_app_data(SessionOptionValidation::default());
@@ -783,9 +812,52 @@ mod tests {
         });
     }
 
+    #[test_case("return {}", "validator rejected value"; "table")]
+    #[test_case("return 1", "validator rejected value"; "number")]
+    #[test_case("return 'invalid result', 'ignored'", "invalid result"; "string_message")]
+    fn validator_rejects_invalid_return_values(body: &str, expected: &str) {
+        let lua = Lua::new();
+        let function = lua
+            .load(&format!("function() {body} end"))
+            .eval::<Function>()
+            .unwrap();
+
+        let error = validate_function(&lua, function, "a").unwrap_err();
+        assert!(error.to_string().contains(expected));
+    }
+
+    #[test]
+    fn validator_reentrancy_is_rejected_and_guard_recovers() {
+        let lua = Lua::new();
+        let nested = lua
+            .load("function() return true end")
+            .eval::<Function>()
+            .unwrap();
+        let call_nested = lua
+            .create_function(move |lua, ()| {
+                validate_function(lua, nested.clone(), "a")
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            })
+            .unwrap();
+        lua.globals().set("call_nested", call_nested).unwrap();
+        let outer = lua
+            .load("function() call_nested(); return true end")
+            .eval::<Function>()
+            .unwrap();
+
+        let error = validate_function(&lua, outer, "a").unwrap_err();
+        assert!(error.to_string().contains(VALIDATION_REENTRANT_ERR));
+        let valid = lua
+            .load("function() return true end")
+            .eval::<Function>()
+            .unwrap();
+        assert!(validate_function(&lua, valid, "a").is_ok());
+    }
+
     #[test]
     fn invalid_registration_is_a_programmer_error() {
         let lua = Lua::new();
+        lua.set_app_data(crate::runtime::LoadingPlugin(Arc::from("test"), 1));
         let pending = PendingSessionOptions::new(Arc::from("test"), 1);
         let api = lua.create_table().unwrap();
         add_session_option_fn(&api, &lua, pending, None).unwrap();

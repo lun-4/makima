@@ -81,7 +81,7 @@ fn main() {
     // First, before anything can ask for a path: until this runs the state,
     // config, cache and log directories resolve to nothing, which is what
     // keeps a test binary out of the directories a real run reads and writes.
-    maki_storage::paths::init();
+    maki_storage::paths::init().expect("storage paths must be initialized exactly once");
     color_eyre::install().ok();
     if let Err(e) = cmd::dispatch(Cli::parse()) {
         print_error(&e);

@@ -9,6 +9,7 @@ const APP_NAME: &str = "makima";
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 
+#[derive(Debug, PartialEq, Eq)]
 struct Paths {
     config: PathBuf,
     data: PathBuf,
@@ -190,21 +191,36 @@ fn state_logs(s: &impl BaseStrategy, fallback: &Path) -> (PathBuf, PathBuf) {
 /// Call it first thing in `main`, before anything can ask for a path: code
 /// that resolves earlier gets the uninitialized answer and degrades to an
 /// error instead of working.
-pub fn init() {
-    let _ = STRATEGY.set(discover());
+pub fn init() -> Result<(), PathsInitError> {
+    initialize(&STRATEGY, discover())
 }
 
 /// Put every directory under `root`, for a test that needs somewhere real to
 /// write and for any future flag that relocates the state directory.
-pub fn init_at(root: PathBuf) {
-    let _ = STRATEGY.set(Some(Paths {
-        config: root.clone(),
-        data: root.clone(),
-        state: root.clone(),
-        logs: root.clone(),
-        cache: root.clone(),
-        xdg_config: root,
-    }));
+pub fn init_at(root: PathBuf) -> Result<(), PathsInitError> {
+    initialize(
+        &STRATEGY,
+        Some(Paths {
+            config: root.clone(),
+            data: root.clone(),
+            state: root.clone(),
+            logs: root.clone(),
+            cache: root.clone(),
+            xdg_config: root,
+        }),
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("storage paths were already initialized with a different strategy")]
+pub struct PathsInitError;
+
+fn initialize(lock: &OnceLock<Option<Paths>>, paths: Option<Paths>) -> Result<(), PathsInitError> {
+    match lock.set(paths) {
+        Ok(()) => Ok(()),
+        Err(paths) if lock.get().is_some_and(|initialized| *initialized == paths) => Ok(()),
+        Err(_) => Err(PathsInitError),
+    }
 }
 
 fn discover() -> Option<Paths> {
@@ -329,6 +345,29 @@ pub fn user_config_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_paths(root: &Path) -> Option<Paths> {
+        Some(Paths {
+            config: root.to_path_buf(),
+            data: root.to_path_buf(),
+            state: root.to_path_buf(),
+            logs: root.to_path_buf(),
+            cache: root.to_path_buf(),
+            xdg_config: root.to_path_buf(),
+        })
+    }
+
+    #[test]
+    fn path_initialization_is_idempotent_but_rejects_conflicts() {
+        let lock = OnceLock::new();
+        let first = Path::new("/first");
+        let second = Path::new("/second");
+
+        assert!(initialize(&lock, test_paths(first)).is_ok());
+        assert!(initialize(&lock, test_paths(first)).is_ok());
+        assert!(initialize(&lock, test_paths(second)).is_err());
+        assert_eq!(lock.get(), Some(&test_paths(first)));
+    }
 
     #[test]
     fn normalize_path_resolves_parent() {

@@ -47,6 +47,7 @@ const CANCELLATION_IN_PROGRESS_CODE: i32 = -32001;
 const CANCELLATION_IN_PROGRESS_MESSAGE: &str =
     "session cancellation is still in progress; retry the prompt";
 const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’s new-session action. This conversation has not been changed.";
+const ACTIVE_OPERATION_MESSAGE: &str = "session already has an active operation";
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -71,12 +72,12 @@ struct PendingOperation {
     _lease: Option<maki_agent::session_coordinator::SessionLease>,
 }
 
-/// What the client still owes us. Only one permission or elicitation can be
-/// outstanding: the agent holds the answer channel while it waits for one.
+/// What the client still owes us. Subagents have independent answer channels,
+/// so more than one permission request can be outstanding.
 #[derive(Default)]
 struct Pending {
     operation: Option<PendingOperation>,
-    permission: Option<i64>,
+    permissions: HashMap<i64, Sender<String>>,
     elicitation: Option<i64>,
 }
 
@@ -475,7 +476,7 @@ async fn new_session(
         },
     )
     .await
-    .ok_or_else(|| AcpError::internal_error().data(json_str(&"session registration failed")))?;
+    .map_err(session_registration_error)?;
     let resp = methods::new_session_response(&session_id, &srv.modes).config_options(
         methods::session_config_options(&snapshot, srv.supports_boolean),
     );
@@ -493,7 +494,7 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    let mut restored = load_history(session_ref.id())?;
+    let mut restored = load_history_from(&params.storage, session_ref.id())?;
     close_session(srv).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers, params).await;
     let sid = SessionId::from(session_ref.to_string());
@@ -554,7 +555,7 @@ async fn load_session(
         },
     )
     .await
-    .ok_or_else(|| AcpError::internal_error().data(json_str(&"session registration failed")))?;
+    .map_err(session_registration_error)?;
     let resp = methods::load_session_response(&srv.modes).config_options(
         methods::session_config_options(&snapshot, srv.supports_boolean),
     );
@@ -698,13 +699,6 @@ async fn close_session(srv: &mut Server) {
     }
 }
 
-fn start_session_lock(id: MakiId) -> Result<SessionLock, String> {
-    let dir = maki_storage::StateDir::resolve()
-        .and_then(|state| state.ensure_subdir(SESSIONS_DIR))
-        .map_err(|error| error.to_string())?;
-    start_session_lock_in(dir, id)
-}
-
 fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String> {
     match session_lock::heartbeat(&dir, &id).map_err(|error| error.to_string())? {
         session_lock::LockBeat::Lost => return Err(session_lock::OPEN_ELSEWHERE_MSG.to_owned()),
@@ -749,8 +743,15 @@ async fn install_session(
     srv: &mut Server,
     params: &AcpParams,
     session: InstallSession<'_>,
-) -> Option<maki_agent::session_options::SessionOptionsSnapshot> {
-    install_session_with_lock(srv, params, session, start_session_lock).await
+) -> Result<maki_agent::session_options::SessionOptionsSnapshot, String> {
+    let sessions_dir = params
+        .storage
+        .ensure_subdir(SESSIONS_DIR)
+        .map_err(|error| error.to_string())?;
+    install_session_with_lock(srv, params, session, |id| {
+        start_session_lock_in(sessions_dir, id)
+    })
+    .await
 }
 
 async fn install_session_with_lock(
@@ -758,7 +759,7 @@ async fn install_session_with_lock(
     params: &AcpParams,
     session: InstallSession<'_>,
     lock_session: impl FnOnce(MakiId) -> Result<SessionLock, String>,
-) -> Option<maki_agent::session_options::SessionOptionsSnapshot> {
+) -> Result<maki_agent::session_options::SessionOptionsSnapshot, String> {
     let InstallSession {
         handle,
         mcp,
@@ -779,7 +780,8 @@ async fn install_session_with_lock(
         workflow,
         thinking,
     );
-    let checkpoint = match maki_agent::session_checkpoint::SessionLogCheckpoint::resolve(
+    let checkpoint = match maki_agent::session_checkpoint::SessionLogCheckpoint::open(
+        params.storage.clone(),
         handle.session_id.id(),
         &current_model,
         &cwd.to_string_lossy(),
@@ -788,7 +790,7 @@ async fn install_session_with_lock(
         Err(error) => {
             warn!(%error, "failed to open session checkpoint");
             rollback_install(handle, mcp, None).await;
-            return None;
+            return Err(error.to_string());
         }
     };
     let coordinator = match maki_agent::session_coordinator::SessionCoordinatorHandle::register(
@@ -852,7 +854,7 @@ async fn install_session_with_lock(
         Err(error) => {
             warn!(%error, "failed to register session coordinator");
             rollback_install(handle, mcp, None).await;
-            return None;
+            return Err(error.to_string());
         }
     };
     let lock = match lock_session(handle.session_id.id()) {
@@ -860,7 +862,7 @@ async fn install_session_with_lock(
         Err(error) => {
             warn!(%error, "session lock claim failed");
             rollback_install(handle, mcp, Some(coordinator)).await;
-            return None;
+            return Err(error);
         }
     };
     let pending = PendingState::default();
@@ -937,7 +939,7 @@ async fn install_session_with_lock(
         option_projection_task,
         lock: Some(lock),
     });
-    Some(option_snapshot)
+    Ok(option_snapshot)
 }
 
 fn emit_current_commands(srv: &Server) {
@@ -1039,12 +1041,6 @@ struct Restored {
     by_model: HashMap<String, StoredTokenUsage>,
     model: String,
     meta: maki_storage::sessions::SessionMeta,
-}
-
-fn load_history(session_id: MakiId) -> Result<Restored, AcpError> {
-    let storage = maki_storage::StateDir::resolve()
-        .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
-    load_history_from(&storage, session_id)
 }
 
 fn load_history_from(
@@ -1157,10 +1153,7 @@ async fn send_manual_compaction(
     id: &RequestId,
 ) -> Result<(), AcpError> {
     if session.pending.lock().unwrap().operation.is_some() {
-        return Err(AcpError::new(
-            -32600,
-            "session already has an active operation",
-        ));
+        return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
     let lease = session
         .coordinator
@@ -1176,10 +1169,7 @@ async fn send_manual_compaction(
     {
         let mut pending = session.pending.lock().unwrap();
         if pending.operation.is_some() {
-            return Err(AcpError::new(
-                -32600,
-                "session already has an active operation",
-            ));
+            return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
         }
         pending.operation = Some(PendingOperation {
             id: operation_id,
@@ -1308,10 +1298,7 @@ async fn send_isolated_turn(
     turn: maki_commands::IsolatedTurn,
 ) -> Result<(), AcpError> {
     if session.pending.lock().unwrap().operation.is_some() {
-        return Err(AcpError::new(
-            -32600,
-            "session already has an active operation",
-        ));
+        return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
     let images = turn
         .content
@@ -1334,10 +1321,7 @@ async fn send_isolated_turn(
     {
         let mut pending = session.pending.lock().unwrap();
         if pending.operation.is_some() {
-            return Err(AcpError::new(
-                -32600,
-                "session already has an active operation",
-            ));
+            return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
         }
         pending.operation = Some(PendingOperation {
             id: operation_id,
@@ -1473,10 +1457,7 @@ async fn send_command_turn(
         prompt,
     );
     if session.pending.lock().unwrap().operation.is_some() {
-        return Err(AcpError::new(
-            -32600,
-            "session already has an active operation",
-        ));
+        return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
     }
     let lease = session
         .coordinator
@@ -1490,10 +1471,7 @@ async fn send_command_turn(
     {
         let mut pending = session.pending.lock().unwrap();
         if pending.operation.is_some() {
-            return Err(AcpError::new(
-                -32600,
-                "session already has an active operation",
-            ));
+            return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
         }
         pending.operation = Some(PendingOperation {
             id: operation_id,
@@ -1564,10 +1542,7 @@ fn admit_prompt(pending: &PendingState) -> Result<(), AcpError> {
             CANCELLATION_IN_PROGRESS_MESSAGE,
         )
         .data(serde_json::json!({ "retryable": true }))),
-        Some(_) => Err(AcpError::new(
-            -32600,
-            "session already has an active operation",
-        )),
+        Some(_) => Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE)),
     }
 }
 
@@ -1708,7 +1683,7 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                 return;
             };
             if let Ok(session) = validate_session(srv, requested) {
-                let cancellation = {
+                let (cancellation, permission_answers) = {
                     let mut pending = session.pending.lock().unwrap();
                     let Some(operation) = pending
                         .operation
@@ -1719,10 +1694,14 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     };
                     operation.cancelling = true;
                     let cancellation = operation.cancel.take();
-                    pending.permission = None;
+                    let permission_answers = std::mem::take(&mut pending.permissions);
                     pending.elicitation = None;
-                    cancellation
+                    (cancellation, permission_answers)
                 };
+                let denial = PermissionAnswer::Deny.encode();
+                for answer_tx in permission_answers.into_values() {
+                    let _ = answer_tx.send(denial.clone());
+                }
                 if let Some(trigger) = cancellation {
                     trigger.cancel();
                 } else {
@@ -1746,20 +1725,16 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
             .take_if(|pending| *pending == id)
             .is_some()
         {
-            Some(elicitation_answer(raw))
-        } else if pending
-            .permission
-            .take_if(|pending| *pending == id)
-            .is_some()
-        {
-            Some(permission_answer(raw).encode())
+            Some((session.handle.answer_tx.clone(), elicitation_answer(raw)))
+        } else if let Some(answer_tx) = pending.permissions.remove(&id) {
+            Some((answer_tx, permission_answer(raw).encode()))
         } else {
             warn!(id, "response for an unknown request id");
             None
         }
     };
-    if let Some(answer) = answer {
-        let _ = session.handle.answer_tx.send(answer);
+    if let Some((answer_tx, answer)) = answer {
+        let _ = answer_tx.send(answer);
     }
 }
 
@@ -1867,11 +1842,20 @@ fn start_event_pump(
             event, subagent, ..
         }) = event_rx.recv_async().await
         {
+            let permission_answer_tx = if let Some(subagent) = subagent {
+                if !matches!(&event, AgentEvent::PermissionRequest { .. }) {
+                    continue;
+                }
+                let Some(answer_tx) = subagent.answer_tx else {
+                    warn!(agent_id = %subagent.agent_id, "subagent permission request has no answer channel");
+                    continue;
+                };
+                Some(answer_tx)
+            } else {
+                None
+            };
             if let AgentEvent::TurnComplete(tc) = &event {
                 add_cost(&mut cost_total, tc.cost);
-            }
-            if subagent.is_some() {
-                continue;
             }
 
             let update = match event {
@@ -1908,7 +1892,12 @@ fn start_event_pump(
                         {
                             false
                         } else {
-                            pending.permission = Some(request_id);
+                            pending.permissions.insert(
+                                request_id,
+                                permission_answer_tx
+                                    .clone()
+                                    .unwrap_or_else(|| answer_tx.clone()),
+                            );
                             true
                         }
                     };
@@ -1922,6 +1911,9 @@ fn start_event_pump(
                             },
                             "/params/toolCall",
                         );
+                    } else {
+                        let answer_tx = permission_answer_tx.unwrap_or_else(|| answer_tx.clone());
+                        let _ = answer_tx.send(PermissionAnswer::Deny.encode());
                     }
                     continue;
                 }
@@ -2050,6 +2042,10 @@ fn no_session() -> AcpError {
     AcpError::new(-32600, "no active session")
 }
 
+fn session_registration_error(error: String) -> AcpError {
+    AcpError::internal_error().data(json_str(&error))
+}
+
 fn supports_boolean_config(raw: &Value) -> bool {
     raw.pointer("/params/clientCapabilities/session/configOptions/boolean")
         .is_some_and(Value::is_object)
@@ -2132,7 +2128,8 @@ mod tests {
             config: Default::default(),
             permissions_config: Default::default(),
             timeouts: Default::default(),
-            initial_wd: cwd,
+            initial_wd: cwd.clone(),
+            storage: StateDir::from_path(cwd),
             prompt_slots: Arc::default(),
             modes: Arc::default(),
             yolo: false,
@@ -2286,7 +2283,7 @@ mod tests {
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
             input_tx,
-            answer_tx,
+            answer_tx: answer_tx.clone(),
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
             control_tx: flume::unbounded().0,
@@ -2347,7 +2344,7 @@ mod tests {
                 current_mode: AgentMode::Build,
                 command_state,
                 pending: Arc::new(Mutex::new(Pending {
-                    permission: Some(ANSWERED_ID),
+                    permissions: HashMap::from([(ANSWERED_ID, answer_tx)]),
                     ..Default::default()
                 })),
                 command_registry,
@@ -2361,6 +2358,17 @@ mod tests {
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
         };
         (server, answer_rx, out_rx, input_rx)
+    }
+
+    #[test]
+    fn registration_error_preserves_open_elsewhere_message() {
+        let error = session_registration_error(session_lock::OPEN_ELSEWHERE_MSG.to_owned());
+
+        assert_eq!(error.code, AcpError::internal_error().code);
+        assert_eq!(
+            error.data,
+            Some(json_str(&session_lock::OPEN_ELSEWHERE_MSG))
+        );
     }
 
     #[test]
@@ -2397,27 +2405,26 @@ mod tests {
                     workflow: false,
                 },
             );
-            assert!(
-                install_session_with_lock(
-                    &mut srv,
-                    &params,
-                    InstallSession {
-                        handle: first,
-                        mcp: None,
-                        current_model: OFFLINE_SPEC.to_owned(),
-                        history: Vec::new(),
-                        initial_cost: None,
-                        cwd: cwd.path().to_path_buf(),
-                        fast: false,
-                        workflow: false,
-                        thinking: maki_agent::ThinkingConfig::Off,
-                        persisted_options: &persisted_options,
-                    },
-                    |_| Err("injected lock failure".to_owned()),
-                )
-                .await
-                .is_none()
-            );
+            let error = install_session_with_lock(
+                &mut srv,
+                &params,
+                InstallSession {
+                    handle: first,
+                    mcp: None,
+                    current_model: OFFLINE_SPEC.to_owned(),
+                    history: Vec::new(),
+                    initial_cost: None,
+                    cwd: cwd.path().to_path_buf(),
+                    fast: false,
+                    workflow: false,
+                    thinking: maki_agent::ThinkingConfig::Off,
+                    persisted_options: &persisted_options,
+                },
+                |_| Err(session_lock::OPEN_ELSEWHERE_MSG.to_owned()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, session_lock::OPEN_ELSEWHERE_MSG);
             assert!(srv.session.is_none());
             assert!(
                 maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(session_id.id())
@@ -2946,10 +2953,13 @@ mod tests {
     }
 
     #[test]
-    fn cancel_drops_the_outstanding_permission_request() {
+    fn cancel_denies_all_outstanding_permission_requests() {
         let (srv, answer_rx, ..) = server_awaiting_answer();
         let pending = &srv.session.as_ref().unwrap().pending;
-        pending.lock().unwrap().operation = Some(PendingOperation {
+        let (subagent_answer_tx, subagent_answer_rx) = flume::unbounded();
+        let mut pending = pending.lock().unwrap();
+        pending.permissions.insert(ANSWERED_ID + 1, subagent_answer_tx);
+        pending.operation = Some(PendingOperation {
             id: 1,
             request_id: RequestId::Number(41),
             kind: OperationKind::TestLocal,
@@ -2957,6 +2967,7 @@ mod tests {
             cancel: None,
             _lease: None,
         });
+        drop(pending);
         handle_notification(
             &srv,
             "session/cancel",
@@ -2967,8 +2978,13 @@ mod tests {
             }),
         );
 
+        assert_eq!(answer_rx.try_recv().ok(), Some(PermissionAnswer::Deny.encode()));
+        assert_eq!(
+            subagent_answer_rx.try_recv().ok(),
+            Some(PermissionAnswer::Deny.encode())
+        );
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
-        assert!(answer_rx.is_empty(), "the cancelled turn owns that answer");
+        assert!(answer_rx.is_empty(), "the late answer must be ignored");
     }
 
     #[test]
@@ -2977,7 +2993,7 @@ mod tests {
             let (mut srv, answer_rx, out_rx, input_rx) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let session = srv.session.as_ref().unwrap();
-            session.pending.lock().unwrap().permission = None;
+            session.pending.lock().unwrap().permissions.clear();
             start_event_pump(
                 event_rx,
                 session.handle.session_id.clone(),
@@ -3020,11 +3036,12 @@ mod tests {
                 "session/cancel",
                 &serde_json::json!({ "params": { "sessionId": session_id } }),
             );
-            handle_incoming_response(&srv, &allow_once(permission_id));
-            assert!(
-                answer_rx.is_empty(),
-                "the cancelled permission answer must be dropped"
+            assert_eq!(
+                answer_rx.recv_async().await.unwrap(),
+                PermissionAnswer::Deny.encode()
             );
+            handle_incoming_response(&srv, &allow_once(permission_id));
+            assert!(answer_rx.is_empty(), "the late permission answer must be dropped");
 
             event_tx
                 .send_async(Envelope {
@@ -3038,7 +3055,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            smol::future::yield_now().await;
+            assert_eq!(
+                answer_rx.recv_async().await.unwrap(),
+                PermissionAnswer::Deny.encode()
+            );
             assert!(
                 out_rx.is_empty(),
                 "cancelled turn permission must be suppressed"
@@ -3205,7 +3225,7 @@ mod tests {
                 let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
                 let (event_tx, event_rx) = flume::unbounded::<Envelope>();
                 let session = srv.session.as_ref().unwrap();
-                session.pending.lock().unwrap().permission = None;
+                session.pending.lock().unwrap().permissions.clear();
                 start_event_pump(
                     event_rx,
                     session.handle.session_id.clone(),
@@ -3360,7 +3380,7 @@ mod tests {
         let (srv, answer_rx, ..) = server_awaiting_answer();
         {
             let mut pending = srv.session.as_ref().unwrap().pending.lock().unwrap();
-            pending.permission = None;
+            pending.permissions.clear();
             pending.elicitation = Some(ANSWERED_ID);
         }
 
@@ -3543,6 +3563,66 @@ mod tests {
     }
 
     #[test]
+    fn event_pump_routes_subagent_permission_answer_to_subagent() {
+        smol::block_on(async {
+            let (srv, root_answer_rx, out_rx, _) = server_awaiting_answer();
+            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+            let (subagent_answer_tx, subagent_answer_rx) = flume::unbounded();
+            let session = srv.session.as_ref().unwrap();
+            session.pending.lock().unwrap().permissions.clear();
+            start_event_pump(
+                event_rx,
+                session.handle.session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&session.pending),
+                false,
+                session.handle.answer_tx.clone(),
+                session.coordinator.as_ref().unwrap().read(),
+                maki_storage::paths::home(),
+                None,
+            );
+
+            event_tx
+                .send_async(subagent_activity(AgentEvent::TextDelta {
+                    text: "hidden".to_owned(),
+                }))
+                .await
+                .unwrap();
+            event_tx
+                .send_async(subagent_activity_with_answer(
+                    AgentEvent::PermissionRequest {
+                        id: "subagent-tool".to_owned(),
+                        tool: maki_config::ToolKey::native("bash"),
+                        scopes: vec!["true".to_owned()],
+                    },
+                    subagent_answer_tx,
+                ))
+                .await
+                .unwrap();
+
+            let request = out_rx.recv_async().await.unwrap();
+            assert_eq!(request["method"], "session/request_permission");
+            assert_eq!(request["params"]["toolCall"]["toolCallId"], "subagent-tool");
+            let request_id = request["id"].as_i64().unwrap();
+            handle_incoming_response(&srv, &allow_once(request_id));
+            assert_eq!(
+                subagent_answer_rx.recv_async().await.unwrap(),
+                PermissionAnswer::AllowOnce.encode()
+            );
+            assert!(root_answer_rx.is_empty());
+
+            event_tx
+                .send_async(subagent_activity(AgentEvent::ControlComplete {
+                    usage: TokenUsage::default(),
+                }))
+                .await
+                .unwrap();
+            smol::future::yield_now().await;
+            assert!(out_rx.is_empty());
+        });
+    }
+
+    #[test]
     fn event_pump_emits_thinking_separator() {
         let (event_tx, event_rx) = flume::unbounded::<Envelope>();
         let (out_tx, out_rx) = flume::unbounded::<Value>();
@@ -3713,7 +3793,7 @@ mod tests {
                 operation.id, operation.request_id, operation.kind, operation.cancelling
             )
         });
-        let permission = pending.permission;
+        let permissions = pending.permissions.keys().copied().collect::<Vec<_>>();
         let elicitation = pending.elicitation;
         drop(pending);
         let coordinator = session.coordinator.as_ref().map(|coordinator| {
@@ -3728,12 +3808,23 @@ mod tests {
             )
         });
         format!(
-            "session={},operation={operation:?},permission={permission:?},elicitation={elicitation:?},coordinator={coordinator:?}",
+            "session={},operation={operation:?},permissions={permissions:?},elicitation={elicitation:?},coordinator={coordinator:?}",
             session.handle.session_id
         )
     }
 
     fn subagent_activity(event: AgentEvent) -> Envelope {
+        subagent_activity_with_optional_answer(event, None)
+    }
+
+    fn subagent_activity_with_answer(event: AgentEvent, answer_tx: Sender<String>) -> Envelope {
+        subagent_activity_with_optional_answer(event, Some(answer_tx))
+    }
+
+    fn subagent_activity_with_optional_answer(
+        event: AgentEvent,
+        answer_tx: Option<Sender<String>>,
+    ) -> Envelope {
         Envelope {
             event,
             subagent: Some(maki_agent::SubagentInfo {
@@ -3745,7 +3836,7 @@ mod tests {
                 name: "task".to_owned(),
                 prompt: Some("reuse actor".to_owned()),
                 model: Some(OFFLINE_SPEC.to_owned()),
-                answer_tx: None,
+                answer_tx,
                 input_tx: None,
                 cancel: None,
             }),
@@ -3981,6 +4072,7 @@ mod tests {
                     permissions_config: Default::default(),
                     timeouts: Default::default(),
                     initial_wd: PathBuf::from("/project"),
+                    storage: StateDir::from_path(PathBuf::from("/tmp/maki-acp-test")),
                     prompt_slots: Arc::default(),
                     modes: Arc::default(),
                     yolo: false,
@@ -4110,12 +4202,10 @@ mod tests {
             unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
-            maki_storage::paths::init_at(cwd.clone());
-            let _state_root = temp.keep();
             let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let old = srv.session.as_ref().unwrap();
-            old.pending.lock().unwrap().permission = None;
+            old.pending.lock().unwrap().permissions.clear();
             start_event_pump(
                 event_rx,
                 old.handle.session_id.clone(),

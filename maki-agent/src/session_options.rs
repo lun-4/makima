@@ -356,6 +356,51 @@ impl SessionOptions {
         Ok(snapshots)
     }
 
+    pub(crate) fn restore_batch_if_versions(
+        snapshots: Vec<(Arc<SessionOptions>, u64, SessionOptionsSnapshot)>,
+    ) -> bool {
+        let mut guards = snapshots
+            .iter()
+            .map(|(options, _, _)| lock(&options.state))
+            .collect::<Vec<_>>();
+        if guards
+            .iter()
+            .zip(&snapshots)
+            .any(|(guard, (_, expected_version, _))| guard.version != *expected_version)
+        {
+            return false;
+        }
+        let changed = snapshots
+            .iter()
+            .map(|(options, _, _)| Arc::clone(options))
+            .collect::<Vec<_>>();
+        for (guard, (_, _, snapshot)) in guards.iter_mut().zip(snapshots) {
+            **guard = State {
+                version: snapshot.version,
+                definitions: snapshot
+                    .options
+                    .iter()
+                    .map(|option| option.definition.clone())
+                    .collect(),
+                values: snapshot
+                    .options
+                    .iter()
+                    .map(|option| {
+                        (
+                            Arc::clone(&option.definition.id),
+                            Arc::clone(&option.current_value),
+                        )
+                    })
+                    .collect(),
+            };
+        }
+        drop(guards);
+        for options in changed {
+            options.changed.notify(usize::MAX);
+        }
+        true
+    }
+
     pub(crate) fn prepare_replace_definition(
         &self,
         definition: SessionOptionDefinition,
@@ -626,6 +671,29 @@ mod tests {
             Err(SessionOptionError::InvalidValue { .. })
         ));
         assert_eq!(options.snapshot(), before);
+    }
+
+    #[test]
+    fn rollback_does_not_overwrite_a_newer_option_update() {
+        let options = SessionOptions::new(
+            vec![definition(YOLO_OPTION_ID, DISABLED_VALUE)],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let previous = options.snapshot();
+        let candidate = options
+            .prepare_set(YOLO_OPTION_ID, ENABLED_VALUE)
+            .unwrap()
+            .unwrap();
+        let committed = options.commit(candidate).unwrap();
+        let concurrent = options.set(YOLO_OPTION_ID, DISABLED_VALUE).unwrap();
+
+        assert!(!SessionOptions::restore_batch_if_versions(vec![(
+            Arc::clone(&options),
+            committed.version,
+            previous,
+        )]));
+        assert_eq!(options.snapshot(), concurrent);
     }
 
     #[test]

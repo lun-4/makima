@@ -443,7 +443,7 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
             Instant::now() < deadline,
             "the failed turn's status never settled: {status}"
         );
-        std::thread::yield_now();
+        std::thread::park_timeout(Duration::from_millis(1));
     };
     assert_eq!(status["error"], json!(PROVIDER_FAILURE));
     // The parent channel also carries subagent activity, so scan for the

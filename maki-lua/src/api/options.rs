@@ -259,6 +259,7 @@ fn register_options(
     #[ctx] opts: PluginOpts,
     spec: Table,
 ) -> LuaResult<Table> {
+    crate::runtime::require_plugin_load(lua, &plugin, "register_options")?;
     let mut entries: Vec<(String, Table)> = spec
         .pairs::<String, Table>()
         .collect::<LuaResult<_>>()

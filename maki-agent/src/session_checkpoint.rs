@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_providers::{Message, ThinkingConfig, TokenUsage};
-use maki_storage::StateDir;
 use maki_storage::checkpoint::{
     CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
 };
-use maki_storage::sessions::{Session, SessionMeta};
+use maki_storage::sessions::{Session, SessionError, SessionMeta};
+use maki_storage::{StateDir, StorageError};
 
 use crate::ToolOutput;
 use crate::session_coordinator::SessionCheckpoint;
@@ -36,12 +36,21 @@ impl SessionLogCheckpoint {
         session_id: maki_storage::id::MakiId,
         model: &str,
         cwd: &str,
-    ) -> Self {
-        let session = StoredSession::load(session_id, &dir).unwrap_or_else(|_| {
-            let mut session = StoredSession::new(model, cwd);
-            session.id = session_id;
-            session
-        });
+    ) -> Result<Self, CheckpointError> {
+        let session = match StoredSession::load(session_id, &dir) {
+            Ok(session) => session,
+            Err(SessionError::Storage(StorageError::NotFound(_))) => {
+                let mut session = StoredSession::new(model, cwd);
+                session.id = session_id;
+                session
+            }
+            Err(error) => {
+                return Err(CheckpointError::Save {
+                    session_id,
+                    message: Arc::from(error.to_string()),
+                });
+            }
+        };
         let session = Arc::new(Mutex::new(session));
         let (save_tx, save_rx) = flume::unbounded::<SaveJob>();
         let worker_session = Arc::clone(&session);
@@ -54,11 +63,11 @@ impl SessionLogCheckpoint {
             }
         })
         .detach();
-        Self {
+        Ok(Self {
             save_tx,
             #[cfg(test)]
             session,
-        }
+        })
     }
 
     pub fn resolve(
@@ -70,7 +79,7 @@ impl SessionLogCheckpoint {
             session_id,
             message: Arc::from(error.to_string()),
         })?;
-        Ok(Self::open(dir, session_id, model, cwd))
+        Self::open(dir, session_id, model, cwd)
     }
 
     fn save(
@@ -195,12 +204,8 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-            let writer = Arc::new(SessionLogCheckpoint::open(
-                dir,
-                id,
-                "test/model",
-                "/project",
-            ));
+            let writer =
+                Arc::new(SessionLogCheckpoint::open(dir, id, "test/model", "/project").unwrap());
             let session_guard = lock(&writer.session);
             let (checkpoint_tx, checkpoint_rx) = flume::bounded(1);
             let checkpoint_writer = Arc::clone(&writer);
@@ -238,7 +243,8 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-            let writer = SessionLogCheckpoint::open(dir.clone(), id, "test/model", "/project");
+            let writer =
+                SessionLogCheckpoint::open(dir.clone(), id, "test/model", "/project").unwrap();
             let first = writer.checkpoint(request(id, 1, "test/first", &options));
             let second = writer.checkpoint(request(id, 2, "test/second", &options));
 
@@ -259,27 +265,40 @@ mod tests {
             std::fs::write(&state_path, "file").unwrap();
             let dir = StateDir::from_path(state_path);
             let id = MakiId::generate();
-            let options = SessionOptions::new(
-                builtin_option_definitions(
-                    "test/model",
-                    [Arc::from("test/model")],
-                    false,
-                    false,
-                    false,
-                    ThinkingConfig::Off,
-                ),
-                &BTreeMap::new(),
-            )
-            .unwrap();
-            let writer = SessionLogCheckpoint::open(dir, id, "test/model", "/project");
-
             assert!(matches!(
-                writer
-                    .checkpoint(request(id, 1, "test/model", &options))
-                    .await,
+                SessionLogCheckpoint::open(dir, id, "test/model", "/project"),
                 Err(CheckpointError::Save { session_id, .. }) if session_id == id
             ));
         });
+    }
+
+    #[test]
+    fn corrupt_session_is_rejected_without_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        let id = MakiId::generate();
+        let mut session = StoredSession::new("test/model", "/project");
+        session.id = id;
+        session.save(&dir).unwrap();
+        let sessions = dir
+            .ensure_subdir(maki_storage::sessions::SESSIONS_DIR)
+            .unwrap();
+        let path = std::fs::read_dir(sessions)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .unwrap();
+        const CORRUPT: &[u8] = b"not json\n";
+        std::fs::write(&path, CORRUPT).unwrap();
+
+        assert!(matches!(
+            SessionLogCheckpoint::open(dir, id, "test/model", "/project"),
+            Err(CheckpointError::Save { session_id, .. }) if session_id == id
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), CORRUPT);
     }
 
     #[test]
@@ -300,7 +319,8 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-            let writer = SessionLogCheckpoint::open(dir.clone(), id, "test/model", "/project");
+            let writer =
+                SessionLogCheckpoint::open(dir.clone(), id, "test/model", "/project").unwrap();
 
             writer
                 .checkpoint(CheckpointRequest {

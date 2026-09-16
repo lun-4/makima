@@ -21,6 +21,7 @@ pub struct AcpParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,
+    pub storage: maki_storage::StateDir,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub modes: Arc<ModeRegistry>,
     pub yolo: bool,

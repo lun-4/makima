@@ -49,7 +49,8 @@ use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::session_option::{
     PendingSessionOptions, SessionOptionStore, SessionOptionValidation, SessionOptionValidators,
-    commit_pending, unload as unload_session_options, validate_option_value,
+    activate_pending as activate_session_options, commit_catalog as commit_session_option_catalog,
+    restore as restore_session_options, unload as unload_session_options, validate_option_value,
 };
 use crate::api::slot::SlotStore;
 use crate::api::store::{self, Store};
@@ -2077,6 +2078,16 @@ pub(crate) fn loading_plugin_generation(lua: &Lua) -> Option<u64> {
     lua.app_data_ref::<LoadingPlugin>().map(|loading| loading.1)
 }
 
+pub(crate) fn require_plugin_load(lua: &Lua, plugin: &str, api: &str) -> mlua::Result<()> {
+    if loading_plugin(lua).as_deref() == Some(plugin) {
+        Ok(())
+    } else {
+        Err(mlua::Error::runtime(format!(
+            "{api} may only be called at the top level during plugin load"
+        )))
+    }
+}
+
 struct LuaRuntime {
     /// Held for its Drop (joins the poker thread). Field order doesn't
     /// matter: the thread keeps its own `Lua` clone alive.
@@ -2510,11 +2521,11 @@ impl LuaRuntime {
         }
     }
 
-    fn validate_pending_commands(
+    fn prepare_pending_commands(
         &self,
         plugin: &Arc<str>,
         pending: &crate::api::util::command::PendingCommandMap,
-    ) -> Result<(), PluginError> {
+    ) -> Result<Vec<Registration>, PluginError> {
         let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
         let registrations = command_registrations(
             &self.lua,
@@ -2528,26 +2539,20 @@ impl LuaRuntime {
             plugin: plugin.to_string(),
             source,
         })?;
-        maki_commands::validate_registrations(registrations)
-            .map(|_| ())
-            .map_err(|error| PluginError::Lua {
-                plugin: plugin.to_string(),
-                source: mlua::Error::runtime(format!("invalid command registration: {error}")),
-            })
+        maki_commands::validate_registrations(registrations).map_err(|error| PluginError::Lua {
+            plugin: plugin.to_string(),
+            source: mlua::Error::runtime(format!("invalid command registration: {error}")),
+        })
     }
 
-    fn commit_pending_registrations(
-        &mut self,
+    fn active_command_registrations(
+        &self,
         plugin: &Arc<str>,
-        pending_commands: crate::api::util::command::PendingCommandMap,
-        pending_keymaps: crate::api::keymap::PendingKeymapStore,
-    ) -> Result<(), PluginError> {
-        let mut pending_commands = pending_commands
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let registrations = command_registrations(
+    ) -> Result<Vec<Registration>, PluginError> {
+        let commands = self.lua.app_data_ref::<CommandHandlerMap>();
+        command_registrations(
             &self.lua,
-            Some(&pending_commands),
+            commands.as_ref().and_then(|commands| commands.get(plugin)),
             plugin,
             &self.tx,
             &self.command_arguments,
@@ -2556,17 +2561,18 @@ impl LuaRuntime {
         .map_err(|source| PluginError::Lua {
             plugin: plugin.to_string(),
             source,
-        })?;
-        replace_command_producer(
-            &self.command_registry,
-            &self.command_producers,
-            plugin,
-            registrations,
-        )
-        .map_err(|error| PluginError::Lua {
-            plugin: plugin.to_string(),
-            source: mlua::Error::runtime(format!("invalid command registration: {error}")),
-        })?;
+        })
+    }
+
+    fn commit_pending_registrations(
+        &mut self,
+        plugin: &Arc<str>,
+        pending_commands: crate::api::util::command::PendingCommandMap,
+        pending_keymaps: crate::api::keymap::PendingKeymapStore,
+    ) {
+        let mut pending_commands = pending_commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let candidate = std::mem::take(&mut *pending_commands);
         drop(pending_commands);
         let old = {
@@ -2621,7 +2627,6 @@ impl LuaRuntime {
         for key in old_callbacks {
             let _ = self.lua.remove_registry_value(key);
         }
-        Ok(())
     }
 
     fn commit_pending_completion(
@@ -3012,67 +3017,59 @@ impl LuaRuntime {
             })
             .collect();
 
-        if let Err(error) = self.validate_pending_commands(&name, &pending_commands) {
-            self.abort_candidate_jobs(&name, generation);
-            self.discard_pending(pending);
-            self.discard_pending_commands(pending_commands);
-            self.discard_pending_keymaps(pending_keymaps);
-            self.discard_pending_completion(
-                Arc::clone(&pending_sources),
-                Arc::clone(&pending_expanders),
-            );
-            self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
-            self.discard_pending_timers(Arc::clone(&pending_timers));
-            self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
-            self.lua
-                .remove_app_data::<crate::api::slot::PendingSlotStore>();
-            self.lua
-                .remove_app_data::<crate::api::ui::PendingHintStore>();
-            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
-            return Err(error);
-        }
-
-        let previous_registry_entries = self.registry.plugin_entries(&name);
-        if let Err(e) = self.registry.replace_plugin(&name, registry_entries) {
-            self.abort_candidate_jobs(&name, generation);
-            self.discard_pending(pending);
-            self.discard_pending_commands(pending_commands);
-            self.discard_pending_keymaps(pending_keymaps);
-            self.discard_pending_completion(
-                Arc::clone(&pending_sources),
-                Arc::clone(&pending_expanders),
-            );
-            self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
-            self.discard_pending_timers(Arc::clone(&pending_timers));
-            self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
-            self.lua
-                .remove_app_data::<crate::api::slot::PendingSlotStore>();
-            self.lua
-                .remove_app_data::<crate::api::ui::PendingHintStore>();
-            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
-            return Err(match e {
-                RegistryError::NameConflict { name: n, .. } => PluginError::NameConflict {
-                    plugin: name.to_string(),
-                    tool: n,
-                },
-            });
-        }
-
+        let command_registrations = match self.prepare_pending_commands(&name, &pending_commands) {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                self.abort_candidate_jobs(&name, generation);
+                self.discard_pending(pending);
+                self.discard_pending_commands(pending_commands);
+                self.discard_pending_keymaps(pending_keymaps);
+                self.discard_pending_completion(
+                    Arc::clone(&pending_sources),
+                    Arc::clone(&pending_expanders),
+                );
+                self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
+                self.discard_pending_timers(Arc::clone(&pending_timers));
+                self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
+                self.lua
+                    .remove_app_data::<crate::api::slot::PendingSlotStore>();
+                self.lua
+                    .remove_app_data::<crate::api::ui::PendingHintStore>();
+                self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+                return Err(error);
+            }
+        };
+        let previous_command_registrations = match self.active_command_registrations(&name) {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                self.abort_candidate_jobs(&name, generation);
+                self.discard_pending(pending);
+                self.discard_pending_commands(pending_commands);
+                self.discard_pending_keymaps(pending_keymaps);
+                self.discard_pending_completion(pending_sources, pending_expanders);
+                self.discard_pending_autocmds(pending_autocmds);
+                self.discard_pending_timers(pending_timers);
+                self.discard_pending_plugin_slice(pending_prompts);
+                self.lua.remove_app_data::<crate::api::slot::PendingSlotStore>();
+                self.lua.remove_app_data::<crate::api::ui::PendingHintStore>();
+                self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+                return Err(error);
+            }
+        };
         let session_options = self
             .lua
             .app_data_ref::<maki_agent::session_coordinator::SessionOptionCatalog>()
             .expect("session option catalog installed")
             .clone();
-        if let Err(error) =
-            commit_pending(&self.lua, &session_options, &pending_session_options).await
+        let previous_option_definitions = session_options.plugin_definitions(&name);
+        if let Err(error) = commit_session_option_catalog(
+            &self.lua,
+            &session_options,
+            &pending_session_options,
+        )
+        .await
         {
             self.abort_candidate_jobs(&name, generation);
-            if let Err(restore_error) = self
-                .registry
-                .replace_plugin(&name, previous_registry_entries)
-            {
-                tracing::error!(plugin = %name, error = %restore_error, "failed to restore plugin tools after session option validation");
-            }
             self.discard_pending(pending);
             self.discard_pending_commands(pending_commands);
             self.discard_pending_keymaps(pending_keymaps);
@@ -3093,15 +3090,70 @@ impl LuaRuntime {
                 source: mlua::Error::runtime(error),
             });
         }
+        if let Err(error) = replace_command_producer(
+            &self.command_registry,
+            &self.command_producers,
+            &name,
+            command_registrations,
+        ) {
+            self.abort_candidate_jobs(&name, generation);
+            if let Err(restore_error) =
+                restore_session_options(&session_options, &name, previous_option_definitions).await
+            {
+                tracing::error!(plugin = %name, error = %restore_error, "failed to restore session options after command publication");
+            }
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(pending_sources, pending_expanders);
+            self.discard_pending_autocmds(pending_autocmds);
+            self.discard_pending_timers(pending_timers);
+            self.discard_pending_plugin_slice(pending_prompts);
+            self.lua.remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua.remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(PluginError::Lua {
+                plugin: name.to_string(),
+                source: mlua::Error::runtime(format!("invalid command registration: {error}")),
+            });
+        }
+        if let Err(error) = self.registry.replace_plugin(&name, registry_entries) {
+            self.abort_candidate_jobs(&name, generation);
+            if let Err(restore_error) = replace_command_producer(
+                &self.command_registry,
+                &self.command_producers,
+                &name,
+                previous_command_registrations,
+            ) {
+                tracing::error!(plugin = %name, %restore_error, "failed to restore plugin commands after tool publication");
+            }
+            if let Err(restore_error) =
+                restore_session_options(&session_options, &name, previous_option_definitions).await
+            {
+                tracing::error!(plugin = %name, error = %restore_error, "failed to restore session options after tool publication");
+            }
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(pending_sources, pending_expanders);
+            self.discard_pending_autocmds(pending_autocmds);
+            self.discard_pending_timers(pending_timers);
+            self.discard_pending_plugin_slice(pending_prompts);
+            self.lua.remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua.remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(match error {
+                RegistryError::NameConflict { name: tool, .. } => PluginError::NameConflict {
+                    plugin: name.to_string(),
+                    tool,
+                },
+            });
+        }
+        activate_session_options(&self.lua, &pending_session_options);
         if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
             store.commit(Arc::clone(&name), generation);
         }
-        if let Err(error) =
-            self.commit_pending_registrations(&name, pending_commands, pending_keymaps)
-        {
-            self.abort_candidate_jobs(&name, generation);
-            return Err(error);
-        }
+        self.commit_pending_registrations(&name, pending_commands, pending_keymaps);
         self.commit_pending_autocmds(pending_autocmds);
         self.commit_pending_timers(pending_timers);
         if let Some(candidate) = self
@@ -3272,9 +3324,18 @@ impl LuaRuntime {
             // No callback to ask: fail closed to a prompt.
             None => return Some(PermissionScopes::force_prompt(input.to_string())),
         };
-        let context = self.lua.create_table().ok()?;
-        if let Some(session_id) = session_id {
-            context.set("session_id", session_id.to_string()).ok()?;
+        let context = match self.lua.create_table() {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(plugin, tool, %error, "failed to build permission_scopes context");
+                return Some(PermissionScopes::force_prompt(input.to_string()));
+            }
+        };
+        if let Some(session_id) = session_id
+            && let Err(error) = context.set("session_id", session_id.to_string())
+        {
+            tracing::warn!(plugin, tool, %error, "failed to build permission_scopes context");
+            return Some(PermissionScopes::force_prompt(input.to_string()));
         }
         let result: LuaValue =
             match run_detached(&self.lua, func.call_async((lua_input, context))).await {

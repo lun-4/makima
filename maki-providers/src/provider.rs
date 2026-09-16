@@ -600,14 +600,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Reaches a real directory: listing specs resolves the state directory to
-    /// look for credentials. Paths resolve to nothing until something asks for
-    /// them explicitly, so this says where, and gets a temporary directory
-    /// rather than the directory of whoever is running the tests.
     #[test]
     fn available_specs_apply_model_policy() {
-        let tmp = tempfile::tempdir().unwrap();
-        maki_storage::paths::init_at(tmp.path().to_path_buf());
         unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-model-policy") };
         let policy = policy(&["openai/*"], &["*/gpt-5.6-terra"]);
 

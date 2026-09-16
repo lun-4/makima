@@ -656,6 +656,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_sse_returns_on_incomplete_before_stream_eof() {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let stream = NeverEndingSse(Cursor::new(
+                b"event: response.output_text.delta\ndata: {\"delta\":\"partial\"}\n\nevent: response.incomplete\ndata: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n".to_vec(),
+            ));
+            let response = parse_sse(BufReader::new(stream), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+            assert_eq!(response.usage.input, 10);
+            assert_eq!(response.usage.output, 5);
+            assert!(
+                matches!(&response.message.content[..], [ContentBlock::Text { text }] if text == "partial")
+            );
+        });
+    }
+
+    #[test]
     fn parse_sse_text_and_usage() {
         smol::block_on(async {
             let sse = "\

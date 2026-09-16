@@ -402,6 +402,7 @@ async fn checkpoint_and_forward_terminal(
     timeout: std::time::Duration,
     terminal: Option<Envelope>,
     raw_tx: &flume::Sender<Envelope>,
+    run_id: u64,
 ) -> Result<(), String> {
     let commit = match committer {
         Some(committer) => Some(
@@ -414,11 +415,17 @@ async fn checkpoint_and_forward_terminal(
     if let Some(terminal) = terminal {
         let _ = raw_tx.send(terminal);
     }
-    match commit {
+    let result = match commit {
         Some(Ok(commit)) => commit.wait().await.map_err(|error| error.to_string()),
         Some(Err(error)) => Err(error.to_string()),
         None => persist_history(session_id, history).await,
+    };
+    if let Err(error) = &result {
+        let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::ControlError {
+            message: format!("failed to checkpoint completed turn: {error}"),
+        });
     }
+    result
 }
 
 enum InteractiveWake {
@@ -913,6 +920,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     params.timeouts.low_speed,
                     terminal,
                     &raw_tx,
+                    run_id,
                 )
                 .await
                 {
@@ -1330,6 +1338,7 @@ mod tests {
                         std::time::Duration::from_secs(1),
                         Some(terminal),
                         &raw_tx,
+                        0,
                     )
                     .await
                 }
@@ -1355,6 +1364,97 @@ mod tests {
             let next = coordinator.acquire_lease().await.unwrap();
             assert_eq!(as_json(next.read().history().as_ref()), as_json(&history));
             drop(next);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn checkpoint_failure_after_terminal_is_forwarded_to_frontend() {
+        smol::block_on(async {
+            const SAVE_ERROR: &str = "save failed";
+
+            let session_id = MakiId::generate();
+            let checkpoint: Arc<
+                dyn maki_storage::checkpoint::CheckpointWriter<
+                        crate::session_coordinator::SessionCheckpoint,
+                    >,
+            > = Arc::new(
+                |request: maki_storage::checkpoint::CheckpointRequest<
+                    crate::session_coordinator::SessionCheckpoint,
+                >| {
+                    Box::pin(async move {
+                        Err(maki_storage::checkpoint::CheckpointError::Save {
+                            session_id: request.session_id,
+                            message: Arc::from(SAVE_ERROR),
+                        })
+                    }) as maki_storage::checkpoint::CheckpointFuture
+                },
+            );
+            let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+                session_id,
+                catalog: Default::default(),
+                definitions: builtin_option_definitions(
+                    "test/model",
+                    [Arc::from("test/model")],
+                    false,
+                    false,
+                    false,
+                    Default::default(),
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from("test/model"),
+                cwd: PathBuf::from("/project"),
+                model_policy: Arc::default(),
+                model_adopter: Arc::new(|_| {
+                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path| {
+                    Box::pin(async move { Ok(path) })
+                        as crate::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint,
+                mailbox: SessionMailbox::new(session_id),
+            })
+            .unwrap();
+            let outcome = TurnOutcome::Completed {
+                agent_id: AgentId::generate(),
+                turn_id: TurnId::generate(),
+                usage: TokenUsage::default(),
+                num_turns: 1,
+                reason: crate::DoneReason::EndTurn,
+            };
+            let terminal = Envelope {
+                event: AgentEvent::TurnOutcome(outcome.clone()),
+                subagent: None,
+                run_id: 7,
+            };
+            let (raw_tx, raw_rx) = flume::unbounded();
+
+            let result = checkpoint_and_forward_terminal(
+                None,
+                session_id,
+                &[Message::user("first".into())],
+                std::time::Duration::from_secs(1),
+                Some(terminal),
+                &raw_tx,
+                7,
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert!(matches!(
+                raw_rx.recv_async().await.unwrap().event,
+                AgentEvent::TurnOutcome(got) if got == outcome
+            ));
+            assert!(matches!(
+                raw_rx.recv_async().await.unwrap(),
+                Envelope {
+                    event: AgentEvent::ControlError { message },
+                    run_id: 7,
+                    ..
+                } if message.contains(SAVE_ERROR)
+            ));
             coordinator.close().await.unwrap();
         });
     }

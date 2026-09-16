@@ -10,7 +10,7 @@ use std::io;
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maki_storage::checkpoint::{
     CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointVersion,
@@ -30,12 +30,32 @@ use crate::AppSession;
 
 const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
+#[cfg(not(test))]
+const CHECKPOINT_RETRY_BACKOFFS: &[Duration] = &[
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+];
+#[cfg(test)]
+const CHECKPOINT_RETRY_BACKOFFS: &[Duration] =
+    &[Duration::from_millis(10), Duration::from_millis(20)];
+#[cfg(not(test))]
+const BACKGROUND_RETRY_BACKOFFS: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+#[cfg(test)]
+const BACKGROUND_RETRY_BACKOFFS: &[Duration] =
+    &[Duration::from_millis(20), Duration::from_millis(50)];
 
 type Pending = Arc<Mutex<PendingState>>;
 
 #[derive(Default)]
 struct PendingState {
     entries: HashMap<MakiId, Entry>,
+    /// Latest state requested by the app. It may be newer than durable storage
+    /// while an entry is pending or being retried.
     latest: HashMap<MakiId, Arc<AppSession>>,
     coordinator_history_bases: HashMap<MakiId, Arc<Vec<maki_providers::Message>>>,
 }
@@ -54,6 +74,8 @@ enum Entry {
 struct PendingSave {
     session: Arc<AppSession>,
     waiters: Vec<CheckpointWaiter>,
+    retry_attempt: usize,
+    retry_at: Option<Instant>,
 }
 
 struct CheckpointWaiter {
@@ -114,6 +136,8 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
             PendingSave {
                 session: merged,
                 waiters: vec![CheckpointWaiter { version, reply }],
+                retry_attempt: 0,
+                retry_at: None,
             },
         );
         drop(state);
@@ -145,10 +169,24 @@ impl StorageWriter {
                     logs: HashMap::new(),
                     failing: HashSet::new(),
                 };
-                while wake_rx.recv().is_ok() {
-                    writer.flush(&writer_pending);
+                let mut retry_at: Option<Instant> = None;
+                loop {
+                    let wake = if let Some(deadline) = retry_at {
+                        wake_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    } else {
+                        wake_rx.recv().map_err(|_| flume::RecvTimeoutError::Disconnected)
+                    };
+                    if matches!(wake, Err(flume::RecvTimeoutError::Disconnected)) {
+                        break;
+                    }
+                    retry_at = writer.flush(&writer_pending);
                     if writer_stop.load(Ordering::Acquire) {
                         break;
+                    }
+                }
+                for entry in lock(&writer_pending).entries.values_mut() {
+                    if let Entry::Save(save) = entry {
+                        save.retry_at = None;
                     }
                 }
                 writer.flush(&writer_pending);
@@ -185,6 +223,8 @@ impl StorageWriter {
             PendingSave {
                 session,
                 waiters: Vec::new(),
+                retry_attempt: 0,
+                retry_at: None,
             },
         );
         drop(state);
@@ -216,6 +256,8 @@ impl StorageWriter {
             PendingSave {
                 session: request.snapshot,
                 waiters: vec![CheckpointWaiter { version, reply }],
+                retry_attempt: 0,
+                retry_at: None,
             },
         );
         drop(state);
@@ -428,28 +470,80 @@ impl Writer {
         self.failing.remove(&id);
     }
 
-    fn flush(&mut self, pending: &Pending) {
+    fn flush(&mut self, pending: &Pending) -> Option<Instant> {
         // Bound first: a `for` head temporary lives for the whole loop, so
         // iterating the guard directly would deadlock the re-insert below.
         let batch = mem::take(&mut lock(pending).entries);
         for (id, entry) in batch {
             match entry {
-                Entry::Save(save) => {
-                    let result = self.write(&save.session);
-                    match result {
-                        Ok(()) => acknowledge_waiters(id, save.waiters),
-                        Err(error) => {
-                            let message: Arc<str> = Arc::from(error.to_string());
-                            if save.waiters.is_empty() {
-                                lock(pending).entries.entry(id).or_insert(Entry::Save(save));
-                            } else {
-                                fail_waiters(id, save.waiters, &message);
+                Entry::Save(mut save) => {
+                    if save.retry_at.is_some_and(|retry_at| retry_at > Instant::now()) {
+                        lock(pending).entries.entry(id).or_insert(Entry::Save(save));
+                        continue;
+                    }
+                    save.retry_at = None;
+                    let mut result = self.write(&save.session);
+                    if result.is_err() && !save.waiters.is_empty() {
+                        self.report(
+                            id,
+                            result
+                                .as_ref()
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                        );
+                        for backoff in CHECKPOINT_RETRY_BACKOFFS {
+                            std::thread::sleep(*backoff);
+                            result = self.write(&save.session);
+                            if result.is_ok() {
+                                break;
                             }
-                            self.report(id, Err(message));
-                            continue;
                         }
                     }
-                    self.report(id, Ok::<(), &str>(()));
+                    match result {
+                        Ok(()) => {
+                            acknowledge_waiters(id, save.waiters);
+                            self.report(id, Ok::<(), &str>(()));
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            let waiters = mem::take(&mut save.waiters);
+                            let backoff = BACKGROUND_RETRY_BACKOFFS[save
+                                .retry_attempt
+                                .min(BACKGROUND_RETRY_BACKOFFS.len() - 1)];
+                            save.retry_attempt = save.retry_attempt.saturating_add(1);
+                            save.retry_at = Some(Instant::now() + backoff);
+                            let replaced_by_delete = {
+                                let mut state = lock(pending);
+                                match state.entries.remove(&id) {
+                                    Some(Entry::Save(mut newer)) => {
+                                        newer.waiters.extend(save.waiters);
+                                        state.entries.insert(id, Entry::Save(newer));
+                                        false
+                                    }
+                                    Some(Entry::Delete(done)) => {
+                                        state.entries.insert(id, Entry::Delete(done));
+                                        true
+                                    }
+                                    None => {
+                                        state.entries.insert(id, Entry::Save(save));
+                                        false
+                                    }
+                                }
+                            };
+                            if !waiters.is_empty() {
+                                fail_waiters(
+                                    id,
+                                    waiters,
+                                    if replaced_by_delete {
+                                        "checkpoint superseded by session deletion"
+                                    } else {
+                                        &message
+                                    },
+                                );
+                            }
+                            self.report(id, Err(message));
+                        }
+                    }
                 }
                 Entry::Delete(done) => {
                     self.forget(id);
@@ -460,6 +554,14 @@ impl Writer {
                 }
             }
         }
+        lock(pending)
+            .entries
+            .values()
+            .filter_map(|entry| match entry {
+                Entry::Save(save) => save.retry_at,
+                Entry::Delete(_) => None,
+            })
+            .min()
     }
 
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
@@ -799,14 +901,42 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_checkpoint_returns_save_failure() {
+    fn failed_checkpoint_retries_without_another_wake() {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
             block_sessions_dir(&dir);
-            let (writer, _warn_rx) = writer(&dir);
+            let (writer, warn_rx) = writer(&dir);
             let session = AppSession::new(MODEL, CWD);
             let id = session.id;
+            let version = CheckpointVersion {
+                revision: session.revision(),
+                epoch: 1,
+            };
+            let ack = writer.checkpoint(CheckpointRequest {
+                session_id: id,
+                version,
+                snapshot: Arc::new(session),
+            });
 
+            let warning = warn_rx.recv_async().await.unwrap();
+            assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
+            std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+
+            assert_eq!(ack.await.unwrap().version, version);
+            assert_eq!(warn_rx.recv_async().await.unwrap(), SAVE_RECOVERED);
+            writer.shutdown(DRAIN_TIMEOUT);
+            assert!(AppSession::load(id, &dir).is_ok());
+        });
+    }
+
+    #[test]
+    fn failed_checkpoint_exhausts_retries_without_false_ack() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            block_sessions_dir(&dir);
+            let (writer, warn_rx) = writer(&dir);
+            let session = AppSession::new(MODEL, CWD);
+            let id = session.id;
             let result = writer
                 .checkpoint(CheckpointRequest {
                     session_id: id,
@@ -822,6 +952,8 @@ mod tests {
                 result,
                 Err(CheckpointError::Save { session_id, .. }) if session_id == id
             ));
+            let warning = warn_rx.recv_async().await.unwrap();
+            assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
             writer.shutdown(DRAIN_TIMEOUT);
         });
     }
@@ -942,11 +1074,8 @@ mod tests {
         assert!(warn_rx.is_empty());
     }
 
-    /// A failed write stays queued: `checkpoint` never resends an unchanged
-    /// revision, so the writer owns the retry, and the shutdown flush is the
-    /// last one.
     #[test]
-    fn failed_write_is_retried_by_a_later_flush() {
+    fn failed_write_is_retried_without_an_external_wake() {
         let (_tmp, dir) = state_dir();
         block_sessions_dir(&dir);
         let (writer, warn_rx) = writer(&dir);
@@ -958,10 +1087,9 @@ mod tests {
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
         std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
-        writer.shutdown(DRAIN_TIMEOUT);
-
-        assert!(AppSession::load(id, &dir).is_ok());
         assert_eq!(warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap(), SAVE_RECOVERED);
+        assert!(AppSession::load(id, &dir).is_ok());
+        writer.shutdown(DRAIN_TIMEOUT);
     }
 
     /// After a delete the cursor still holds an open handle to the unlinked

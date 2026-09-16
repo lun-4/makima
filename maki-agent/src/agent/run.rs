@@ -466,9 +466,11 @@ impl<'h> Agent<'h> {
         let Some(settings) = source.current() else {
             return;
         };
+        let provider_changed = !Arc::ptr_eq(&self.provider, &settings.provider);
         let model_changed = settings.model.spec() != self.model.spec();
         let workflow_changed = settings.workflow != self.workflow;
-        if !model_changed
+        if !provider_changed
+            && !model_changed
             && !workflow_changed
             && settings.fast == self.opts.fast
             && settings.thinking == self.opts.thinking
@@ -1107,6 +1109,27 @@ mod tests {
             serde_json::json!([{ "name": "with-workflow" }]),
             "the schema is rebuilt for the new flag"
         );
+    }
+
+    #[test]
+    fn adopting_settings_takes_provider_swap_for_the_same_model() {
+        let mut history = History::new(Vec::new());
+        let (raw_tx, event_rx) = flume::unbounded();
+        let (mut agent, _rx) =
+            make_agent_with_sender(MockProvider::new(vec![]), &mut history, raw_tx, event_rx);
+        let replacement: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
+        let source = Arc::new(StubSettings(std::sync::Mutex::new(RunSettings {
+            provider: Arc::clone(&replacement),
+            model: default_model(),
+            fast: false,
+            workflow: false,
+            thinking: ThinkingConfig::Off,
+        })));
+        agent.settings_source = Some(source as Arc<dyn RunSettingsSource>);
+
+        agent.adopt_pending_settings();
+
+        assert!(Arc::ptr_eq(&agent.provider, &replacement));
     }
 
     /// `/thinking` mid-turn used to sit unread until the next turn, because
