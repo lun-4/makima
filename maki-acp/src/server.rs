@@ -4269,6 +4269,36 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_model_errors_follow_each_prompt() {
+        let (mut srv, _, _, input_rx) = server_awaiting_answer();
+
+        let first = smol::block_on(dispatch_prompt(
+            &mut srv,
+            "/model definitely-invalid-provider/test",
+            false,
+            &RequestId::Number(3),
+        ))
+        .unwrap_err();
+        let second = smol::block_on(dispatch_prompt(
+            &mut srv,
+            "/model codex/gpt-5.6-sol",
+            false,
+            &RequestId::Number(4),
+        ))
+        .unwrap_err();
+
+        assert_eq!(
+            first.message,
+            "command failed: unsupported provider 'definitely-invalid-provider'"
+        );
+        assert_eq!(
+            second.message,
+            "command failed: unsupported provider 'codex'"
+        );
+        assert!(input_rx.is_empty());
+    }
+
+    #[test]
     fn portable_bare_model_returns_shared_usage_error() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
 
