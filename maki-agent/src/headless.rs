@@ -1298,23 +1298,21 @@ mod tests {
             };
             let (raw_tx, raw_rx) = flume::unbounded();
             let history = [Message::user("first".into())];
-            let mut checkpoint = Box::pin(checkpoint_and_forward_terminal(
+            let checkpoint = checkpoint_and_forward_terminal(
                 Some(committer),
                 session_id,
                 &history,
                 std::time::Duration::ZERO,
                 Some(terminal),
                 &raw_tx,
-            ));
-            assert!(
-                futures_lite::future::poll_once(&mut checkpoint)
-                    .await
-                    .is_none()
             );
+            let (checkpoint_result, forwarded) =
+                futures_lite::future::zip(checkpoint, raw_rx.recv_async()).await;
 
-            let forwarded = raw_rx.recv_async().await.unwrap();
-            assert!(matches!(forwarded.event, AgentEvent::TurnOutcome(got) if got == outcome));
-            assert!(checkpoint.await.is_err());
+            assert!(
+                matches!(forwarded.unwrap().event, AgentEvent::TurnOutcome(got) if got == outcome)
+            );
+            assert!(checkpoint_result.is_err());
             drop(lease);
 
             let next = coordinator.acquire_lease().await.unwrap();

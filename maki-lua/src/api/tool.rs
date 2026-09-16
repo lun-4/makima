@@ -29,6 +29,7 @@ use maki_commands::{
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::id::SessionRef;
 use mlua::{
     Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
     Value as LuaValue,
@@ -423,7 +424,7 @@ impl ToolInvocation for LuaToolInvocation {
 
     fn permission_scopes(
         &self,
-        session_id: Option<&maki_storage::id::SessionRef>,
+        session_id: Option<&SessionRef>,
     ) -> BoxFuture<'_, Option<PermissionScopes>> {
         match &self.permission_state {
             PermissionState::Ready(v) => Box::pin(std::future::ready(v.clone())),

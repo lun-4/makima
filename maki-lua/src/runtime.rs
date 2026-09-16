@@ -38,6 +38,7 @@ use maki_commands::{
     Registration, RegistrationError, TargetCapabilities, TargetCapability,
 };
 use maki_config::RawConfig;
+use maki_storage::id::SessionRef;
 
 use crate::api::autocmd::{self, AutocmdStore};
 use crate::api::completion::{self, CompletionCtx, ItemSpec};
@@ -197,7 +198,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
-        session_id: Option<maki_storage::id::SessionRef>,
+        session_id: Option<SessionRef>,
         reply: flume::Sender<Option<PermissionScopes>>,
     },
     MutablePath {
@@ -3243,7 +3244,7 @@ impl LuaRuntime {
         plugin: &str,
         tool: &str,
         input: Value,
-        session_id: Option<maki_storage::id::SessionRef>,
+        session_id: Option<SessionRef>,
     ) -> Option<PermissionScopes> {
         let (func, lua_input) = match plugin_fn(
             &self.lua,
