@@ -1187,8 +1187,7 @@ fn apply_permission_option(
     }) else {
         return;
     };
-    let enabled =
-        option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE;
+    let enabled = option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE;
     permissions.set_yolo(enabled);
     shared.lock().unwrap().permission_mode = if enabled {
         PermissionMode::BypassPermissions
@@ -2160,12 +2159,10 @@ mod tests {
             turn_start: Instant::now(),
             pending: HashSet::new(),
         }));
-        let snapshot = smol::block_on(
-            coordinator.set_option(
-                maki_agent::session_options::YOLO_OPTION_ID,
-                maki_agent::session_options::ENABLED_VALUE,
-            ),
-        )
+        let snapshot = smol::block_on(coordinator.set_option(
+            maki_agent::session_options::YOLO_OPTION_ID,
+            maki_agent::session_options::ENABLED_VALUE,
+        ))
         .unwrap();
         apply_permission_option(&snapshot, &permissions, &shared);
 
