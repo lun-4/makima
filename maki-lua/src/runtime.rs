@@ -197,6 +197,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
+        session_id: Option<maki_storage::id::SessionRef>,
         reply: flume::Sender<Option<PermissionScopes>>,
     },
     MutablePath {
@@ -208,7 +209,7 @@ pub enum Request {
     },
     ClearPlugin {
         plugin: Arc<str>,
-        reply: flume::Sender<()>,
+        reply: flume::Sender<Result<(), PluginError>>,
     },
     DropCommandKeys {
         plugin: Arc<str>,
@@ -3175,18 +3176,18 @@ impl LuaRuntime {
         Ok(())
     }
 
-    async fn clear_plugin(&mut self, plugin: &str) {
+    async fn clear_plugin(&mut self, plugin: &str) -> Result<(), PluginError> {
         let session_options = self
             .lua
             .app_data_ref::<maki_agent::session_coordinator::SessionOptionCatalog>()
             .expect("session option catalog installed")
             .clone();
-        if let Err(error) = unload_session_options(&self.lua, &session_options, plugin).await {
+        let session_option_error =
+            unload_session_options(&self.lua, &session_options, plugin).await;
+        if let Err(error) = &session_option_error {
             tracing::warn!(plugin, %error, "failed to unload plugin session options");
-            return;
-        }
-        if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
-            store.remove(plugin);
+        } else if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
+            store.invalidate(plugin);
         }
         self.registry.clear_plugin(plugin);
         if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
@@ -3227,6 +3228,10 @@ impl LuaRuntime {
             }
         }
         completion::clear_plugin(&self.lua, plugin);
+        session_option_error.map_err(|error| PluginError::Unload {
+            plugin: plugin.to_owned(),
+            error,
+        })
     }
 
     fn evict_warm(&self, tool_use_id: &str) {
@@ -3238,6 +3243,7 @@ impl LuaRuntime {
         plugin: &str,
         tool: &str,
         input: Value,
+        session_id: Option<maki_storage::id::SessionRef>,
     ) -> Option<PermissionScopes> {
         let (func, lua_input) = match plugin_fn(
             &self.lua,
@@ -3252,13 +3258,18 @@ impl LuaRuntime {
             // No callback to ask: fail closed to a prompt.
             None => return Some(PermissionScopes::force_prompt(input.to_string())),
         };
-        let result: LuaValue = match run_detached(&self.lua, func.call_async(lua_input)).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(plugin, tool, error = %e, "permission_scopes callback failed");
-                return Some(PermissionScopes::force_prompt(input.to_string()));
-            }
-        };
+        let context = self.lua.create_table().ok()?;
+        if let Some(session_id) = session_id {
+            context.set("session_id", session_id.to_string()).ok()?;
+        }
+        let result: LuaValue =
+            match run_detached(&self.lua, func.call_async((lua_input, context))).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(plugin, tool, error = %e, "permission_scopes callback failed");
+                    return Some(PermissionScopes::force_prompt(input.to_string()));
+                }
+            };
         let table = match result {
             LuaValue::Table(t) => t,
             // Returning nil means "nothing to enforce": skip the gate
@@ -4208,8 +4219,8 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         }
                         Request::ClearPlugin { plugin, reply } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            rt.clear_plugin(&plugin).await;
-                            let _ = reply.send(());
+                            let result = rt.clear_plugin(&plugin).await;
+                            let _ = reply.send(result);
                         }
                         Request::DropCommandKeys { plugin } => {
                             let entries = rt
@@ -4356,9 +4367,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             plugin,
                             tool,
                             input,
+                            session_id,
                             reply,
                         } => {
-                            let res = rt.compute_permission_scopes(&plugin, &tool, input).await;
+                            let res = rt
+                                .compute_permission_scopes(&plugin, &tool, input, session_id)
+                                .await;
                             let _ = reply.send(res);
                         }
                         Request::MutablePath {

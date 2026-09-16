@@ -4266,12 +4266,14 @@ fn restore_rebuilds_body_from_input_content(
 #[test_case::test_case("git status" ; "parseable command")]
 #[test_case::test_case("echo 'unterminated" ; "unparseable command")]
 fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
-    let (reg, _host) = builtins_host();
+    let (reg, host) = builtins_host();
+    let session = test_session(&host);
 
     let input = serde_json::json!({ "command": command });
     let entry = reg.get("bash").expect("bash registered");
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let scopes = smol::block_on(inv.permission_scopes())
+    let session_ref = SessionRef::from(session.read().session_id());
+    let scopes = smol::block_on(inv.permission_scopes(Some(&session_ref)))
         .expect("permission_scopes returned None (would fall back to raw JSON)");
 
     assert!(
@@ -4279,6 +4281,23 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
         "fell back to raw JSON scope: {:?}",
         scopes.scopes
     );
+    smol::block_on(session.close()).unwrap();
+}
+
+#[test]
+fn bash_auto_mode_skips_outer_permission_gate_for_its_session() {
+    let (reg, host) = builtins_host();
+    let session = test_session(&host);
+    smol::block_on(session.set_option("bash.auto_mode", "enabled")).unwrap();
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry
+        .tool
+        .parse(&serde_json::json!({ "command": "rm -rf target" }))
+        .expect("parse failed");
+    let session_ref = SessionRef::from(session.read().session_id());
+
+    assert!(smol::block_on(inv.permission_scopes(Some(&session_ref))).is_none());
+    smol::block_on(session.close()).unwrap();
 }
 
 fn exec_tool_with_perms(

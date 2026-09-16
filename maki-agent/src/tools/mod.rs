@@ -572,7 +572,10 @@ pub mod test_support {
         fn start_header(&self) -> registry::HeaderFuture {
             registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
         }
-        fn permission_scopes(&self) -> registry::BoxFuture<'_, Option<registry::PermissionScopes>> {
+        fn permission_scopes(
+            &self,
+            _session_id: Option<&SessionRef>,
+        ) -> registry::BoxFuture<'_, Option<registry::PermissionScopes>> {
             Box::pin(std::future::ready(Some(
                 registry::PermissionScopes::single("guarded".into()),
             )))

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use color_eyre::Result;
@@ -34,7 +34,7 @@ use maki_commands::{
 };
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
-use maki_providers::provider::available_model_specs;
+use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -554,7 +554,7 @@ async fn route_model(
 
 struct SdkCommandHost {
     tx: Sender<CommandRoute>,
-    model_specs: Arc<[Arc<str>]>,
+    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
 }
 
 impl CommandHost for SdkCommandHost {
@@ -564,7 +564,9 @@ impl CommandHost for SdkCommandHost {
         Box::pin(async move {
             match request {
                 HostRequest::Context(maki_commands::HostContextRequest::ModelSpecs) => Ok(
-                    HostResponse::Context(maki_commands::HostContextResponse::Values(model_specs)),
+                    HostResponse::Context(maki_commands::HostContextResponse::Values(
+                        model_specs.read().unwrap().clone(),
+                    )),
                 ),
                 HostRequest::Context(_) => Ok(HostResponse::Context(
                     maki_commands::HostContextResponse::Unavailable,
@@ -602,6 +604,7 @@ struct SdkCommands {
     target: TargetHandle,
     route_tx: Sender<CommandRoute>,
     route_rx: Receiver<CommandRoute>,
+    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
     _standard_commands: StandardCommands,
 }
 
@@ -612,13 +615,14 @@ impl SdkCommands {
         model_specs: Arc<[Arc<str>]>,
     ) -> Result<Self> {
         let (route_tx, route_rx) = flume::unbounded();
+        let model_specs = Arc::new(RwLock::new(model_specs));
         let standard_commands =
             StandardCommands::register(&registry, custom, StandardCompletions::default())?;
         let target = registry.bind_target(
             sdk_capabilities(),
             Arc::new(SdkCommandHost {
                 tx: route_tx.clone(),
-                model_specs,
+                model_specs: Arc::clone(&model_specs),
             }),
         );
         Ok(Self {
@@ -626,6 +630,7 @@ impl SdkCommands {
             registry,
             route_tx,
             route_rx,
+            model_specs,
             _standard_commands: standard_commands,
         })
     }
@@ -722,6 +727,12 @@ pub fn run(params: SdkParams) -> Result<()> {
     } else {
         workflow
     };
+    let thinking = restored
+        .meta
+        .thinking
+        .map(maki_agent::ThinkingConfig::from)
+        .filter(|_| model.supports_thinking())
+        .unwrap_or_default();
     let persisted_options = restored.meta.session_options;
     let session_id = restored.id;
     let initial_history = restored.history;
@@ -774,7 +785,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         yolo,
         fast,
         workflow,
-        maki_agent::ThinkingConfig::Off,
+        thinking,
     );
     let checkpoint = Arc::new(maki_agent::session_checkpoint::SessionLogCheckpoint::open(
         storage.clone(),
@@ -946,6 +957,11 @@ pub fn run(params: SdkParams) -> Result<()> {
         Arc::clone(&handle.permissions),
         Arc::clone(&shared),
     );
+    let model_discovery = watch_model_discovery(
+        Arc::clone(&model_policy),
+        coordinator.clone(),
+        Arc::clone(&sdk_commands.model_specs),
+    );
 
     let input_result = (|| -> Result<()> {
         for line in io::stdin().lock().lines() {
@@ -1025,7 +1041,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 mode: mode.agent_mode(&cwd),
                                 images: command_attachments::into_images(&content.attachments)?,
                                 preamble: Vec::new(),
-                                thinking: Default::default(),
+                                thinking,
                                 fast,
                                 workflow,
                                 prompt: None,
@@ -1050,7 +1066,6 @@ pub fn run(params: SdkParams) -> Result<()> {
                             handle: &handle,
                             coordinator: &coordinator,
                             shared: &shared,
-                            startup_model: &startup_model,
                             model_policy: &model_policy,
                             commands: &sdk_commands,
                         },
@@ -1095,6 +1110,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         projection_watcher,
         command_driver,
         permission_watcher,
+        model_discovery,
     ));
     let InteractiveHandle { input_tx, task, .. } = handle;
     drop(input_tx);
@@ -1163,10 +1179,46 @@ async fn stop_sdk_tasks(
     projection_watcher: smol::Task<()>,
     command_driver: smol::Task<()>,
     permission_watcher: smol::Task<()>,
+    model_discovery: smol::Task<()>,
 ) {
     projection_watcher.cancel().await;
     command_driver.cancel().await;
     permission_watcher.cancel().await;
+    model_discovery.cancel().await;
+}
+
+fn watch_model_discovery(
+    policy: Arc<ModelPolicy>,
+    coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
+    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
+) -> smol::Task<()> {
+    smol::spawn(async move {
+        fetch_all_models(
+            &policy,
+            |batch| {
+                let mut specs = model_specs
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                specs.extend(batch.models.into_iter().map(Arc::from));
+                specs.sort_unstable();
+                specs.dedup();
+                let specs: Arc<[Arc<str>]> = specs.into();
+                *model_specs.write().unwrap() = Arc::clone(&specs);
+                let coordinator = coordinator.clone();
+                smol::spawn(async move {
+                    if let Err(error) = coordinator.update_model_values(specs.to_vec()).await {
+                        warn!(%error, "failed to publish discovered SDK models");
+                    }
+                })
+                .detach();
+            },
+            None,
+        )
+        .await;
+    })
 }
 
 fn watch_permission_option(
@@ -1440,7 +1492,6 @@ struct ControlRequestContext<'a> {
     handle: &'a InteractiveHandle,
     coordinator: &'a maki_agent::session_coordinator::SessionCoordinatorHandle,
     shared: &'a Mutex<Shared>,
-    startup_model: &'a Model,
     model_policy: &'a ModelPolicy,
     commands: &'a SdkCommands,
 }
@@ -1454,7 +1505,6 @@ fn handle_control_request(
         handle,
         coordinator,
         shared,
-        startup_model,
         model_policy,
         commands,
     } = ctx;
@@ -1500,7 +1550,8 @@ fn handle_control_request(
             }
         }
         InboundControlRequestType::SetModel => {
-            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
+            let current_model = shared.lock().unwrap().model.clone();
+            match resolve_set_model(cr.request.extra.get("model"), &current_model, model_policy) {
                 Some(model) => {
                     match smol::block_on(route_model(&commands.route_tx, model.spec())) {
                         Ok(HostResponse::Completed) => {
@@ -1535,11 +1586,11 @@ fn handle_control_request(
 
 fn resolve_set_model(
     model_val: Option<&Value>,
-    startup_model: &Model,
+    current_model: &Model,
     model_policy: &ModelPolicy,
 ) -> Option<Model> {
     match model_val? {
-        Value::Null => Some(startup_model.clone()),
+        Value::Null => Some(current_model.clone()),
         Value::String(model_str) => {
             let spec = resolve_model_spec(model_str);
             if !model_policy.allows(&spec) {
@@ -2807,15 +2858,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_set_model_null_returns_startup() {
-        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+    fn resolve_set_model_null_keeps_current_model() {
+        let current = Model::from_spec("openai/gpt-5").unwrap();
         let result = resolve_set_model(
             Some(&Value::Null),
-            &startup,
+            &current,
             &maki_config::ModelPolicy::default(),
         )
         .unwrap();
-        assert_eq!(result.id, startup.id);
+        assert_eq!(result.id, current.id);
     }
 
     #[test]

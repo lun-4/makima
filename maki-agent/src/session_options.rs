@@ -433,6 +433,34 @@ impl SessionOptions {
         Ok(snapshot)
     }
 
+    pub(crate) fn set_values_atomically(
+        &self,
+        values: &[(&str, &str)],
+    ) -> Result<SessionOptionsSnapshot, SessionOptionError> {
+        let mut state = lock(&self.state);
+        let mut resolved = Vec::with_capacity(values.len());
+        for (id, value) in values {
+            let definition = state
+                .definitions
+                .iter()
+                .find(|definition| definition.id.as_ref() == *id)
+                .ok_or_else(|| SessionOptionError::UnknownId(Arc::from(*id)))?;
+            if !definition.accepts(value) {
+                return Err(SessionOptionError::InvalidValue {
+                    id: Arc::from(*id),
+                    value: Arc::from(*value),
+                });
+            }
+            resolved.push((Arc::clone(&definition.id), Arc::from(*value)));
+        }
+        state.values.extend(resolved);
+        state.version += 1;
+        let snapshot = snapshot(&state);
+        drop(state);
+        self.changed.notify(usize::MAX);
+        Ok(snapshot)
+    }
+
     pub fn set(&self, id: &str, value: &str) -> Result<SessionOptionsSnapshot, SessionOptionError> {
         let Some(candidate) = self.prepare_set(id, value)? else {
             return Ok(self.snapshot());

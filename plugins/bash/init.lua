@@ -359,7 +359,14 @@ maki.api.register_tool({
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
   },
-  permission_scopes = function(input)
+  permission_scopes = function(input, ctx)
+    local enabled = auto_mode_enabled(ctx.session_id)
+    if enabled == nil then
+      return command_scopes(input.command)
+    end
+    if enabled then
+      return nil
+    end
     return command_scopes(input.command)
   end,
 

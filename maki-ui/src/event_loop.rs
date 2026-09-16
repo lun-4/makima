@@ -843,6 +843,7 @@ fn register_coordinator<H: CoordinatorHandles>(
         handles,
         permissions,
         thinking,
+        true,
     )?
     .activate()
     .map_err(|error| eyre!(error))
@@ -858,6 +859,7 @@ fn prepare_coordinator<H: CoordinatorHandles>(
     handles: &H,
     permissions: &Arc<PermissionManager>,
     thinking: DomainThinkingConfig,
+    seed_snapshot: bool,
 ) -> Result<PreparedSessionCoordinator> {
     let mailbox = handles
         .mailbox()
@@ -872,6 +874,7 @@ fn prepare_coordinator<H: CoordinatorHandles>(
         permissions,
         mailbox,
         thinking,
+        seed_snapshot,
     )
 }
 
@@ -923,6 +926,7 @@ fn register_coordinator_with_mailbox<H: CoordinatorHandles>(
         permissions,
         mailbox,
         thinking,
+        true,
     )?
     .activate()
     .map_err(|error| eyre!(error))
@@ -939,12 +943,11 @@ fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
     permissions: &Arc<PermissionManager>,
     mailbox: SessionMailbox,
     thinking: DomainThinkingConfig,
+    seed_snapshot: bool,
 ) -> Result<PreparedSessionCoordinator> {
-    // The coordinator checkpoints by merging into the writer's snapshot for
-    // this session, so the snapshot has to exist first. Seeding it here rather
-    // than at each call site is what keeps a newly rotated session from
-    // failing its first checkpoint with "session snapshot is unavailable".
-    deps.storage_writer.send(Arc::new(session.clone()));
+    if seed_snapshot {
+        deps.storage_writer.send(Arc::new(session.clone()));
+    }
     let model_spec = session.model.clone();
     let definitions = builtin_option_definitions(
         Arc::from(model_spec.as_str()),
@@ -1056,11 +1059,19 @@ impl SpawnCtx {
 
     fn prepare_replacement_runtime(
         &self,
-        session: AppSession,
+        mut session: AppSession,
+        current_id: MakiId,
         permissions: &PermissionManager,
     ) -> Result<PreparedSessionRuntime, String> {
+        session.meta.yolo = permissions.is_yolo();
         let provider = self.prepare_replacement_provider(&session)?;
-        Ok(self.prepare_runtime_with_provider_and_permissions(session, provider, permissions))
+        let seed_snapshot = session.id != current_id;
+        Ok(self.prepare_runtime_with_provider_and_permissions(
+            session,
+            provider,
+            permissions,
+            seed_snapshot,
+        ))
     }
 
     fn prepare_replacement_provider(
@@ -1086,8 +1097,15 @@ impl SpawnCtx {
         mut session: AppSession,
         provider: Option<PreparedProvider>,
     ) -> PreparedSessionRuntime {
-        session.meta.yolo |= self.permissions.is_yolo();
-        self.prepare_runtime_with_provider_and_permissions(session, provider, &self.permissions)
+        if !session_has_content(&session) {
+            session.meta.yolo = self.permissions.is_yolo();
+        }
+        self.prepare_runtime_with_provider_and_permissions(
+            session,
+            provider,
+            &self.permissions,
+            true,
+        )
     }
 
     fn prepare_runtime_with_provider_and_permissions(
@@ -1095,6 +1113,7 @@ impl SpawnCtx {
         session: AppSession,
         provider: Option<PreparedProvider>,
         permissions: &PermissionManager,
+        seed_snapshot: bool,
     ) -> PreparedSessionRuntime {
         let resumed = session_has_content(&session);
         let session_id = session.id;
@@ -1116,6 +1135,7 @@ impl SpawnCtx {
             self.model_slot.change_tx(),
         );
         let permissions = Arc::new(permissions.fork());
+        permissions.set_yolo(session.meta.yolo);
         permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
         let handles = AgentHandles::prepare(
             &model_slot,
@@ -1141,6 +1161,7 @@ impl SpawnCtx {
             &handles,
             &permissions,
             crate::app::session_state::resolve_thinking(&session, &model, &self.storage),
+            seed_snapshot,
         )
         .expect("session coordinator registration");
         let app = App::prepare(
@@ -2649,9 +2670,11 @@ impl<'t> EventLoop<'t> {
             return Err(LOCK_LOST_REPLACEMENT_ERR.into());
         }
         self.sessions[idx].app.checkpoint_now();
-        let prepared = self
-            .ctx
-            .prepare_replacement_runtime(session, self.sessions[idx].app.permissions.as_ref())?;
+        let prepared = self.ctx.prepare_replacement_runtime(
+            session,
+            self.sessions[idx].id(),
+            self.sessions[idx].app.permissions.as_ref(),
+        )?;
         self.replace_prepared_runtime(idx, prepared)
     }
 
@@ -2711,9 +2734,11 @@ impl<'t> EventLoop<'t> {
             kind,
             post_commit,
         } = request;
-        let prepared = self
-            .ctx
-            .prepare_replacement_runtime(session, self.sessions[idx].app.permissions.as_ref())?;
+        let prepared = self.ctx.prepare_replacement_runtime(
+            session,
+            self.sessions[idx].id(),
+            self.sessions[idx].app.permissions.as_ref(),
+        )?;
         Ok(PendingReplacement {
             prepared,
             kind,
@@ -4044,7 +4069,11 @@ mod tests {
         assert!(
             harness
                 .ctx()
-                .prepare_replacement_runtime(session, runtime.app.permissions.as_ref())
+                .prepare_replacement_runtime(
+                    session,
+                    runtime.id(),
+                    runtime.app.permissions.as_ref(),
+                )
                 .is_err()
         );
 
@@ -4105,6 +4134,40 @@ mod tests {
         release_runtime(current);
     }
 
+    #[test_case(true, false ; "persisted_enabled_wins_over_startup_disabled")]
+    #[test_case(false, true ; "persisted_disabled_wins_over_startup_enabled")]
+    fn resumed_session_yolo_wins_over_startup(persisted_yolo: bool, startup_yolo: bool) {
+        let harness = RuntimeHarness::new();
+        harness.ctx().permissions.set_yolo(startup_yolo);
+        let mut session = harness.session();
+        session.meta.yolo = persisted_yolo;
+        session.push_message(Message::user("resumed".into()));
+
+        let runtime = harness.runtime(session);
+
+        assert_eq!(runtime.app.permissions.is_yolo(), persisted_yolo);
+        assert_eq!(
+            runtime
+                .coordinator
+                .read()
+                .options()
+                .options
+                .iter()
+                .find(|option| {
+                    option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+                })
+                .unwrap()
+                .current_value
+                .as_ref(),
+            if persisted_yolo {
+                maki_agent::session_options::ENABLED_VALUE
+            } else {
+                maki_agent::session_options::DISABLED_VALUE
+            }
+        );
+        release_runtime(runtime);
+    }
+
     #[test]
     fn startup_yolo_seeds_new_session_and_coordinator() {
         let harness = RuntimeHarness::new();
@@ -4152,16 +4215,20 @@ mod tests {
             &PermissionAnswer::AllowSession,
         );
         let mut replacement = if reset { harness.session() } else { session };
+        replacement.model = runtime.app.state.model.spec();
         replacement.meta.session_rules = vec![maki_storage::sessions::StoredRule {
             tool: "bash".into(),
             scope: Some("target".into()),
             effect: maki_storage::sessions::StoredEffect::Allow,
         }];
-        let prepared = harness.ctx().prepare_runtime_with_provider_and_permissions(
-            replacement,
-            None,
-            runtime.app.permissions.as_ref(),
-        );
+        let prepared = harness
+            .ctx()
+            .prepare_replacement_runtime(
+                replacement,
+                runtime.id(),
+                runtime.app.permissions.as_ref(),
+            )
+            .unwrap();
 
         let old = replace_session_runtime(
             &mut runtime,
@@ -4172,6 +4239,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(runtime.app.permissions.is_yolo(), current_yolo);
+        assert_eq!(
+            runtime
+                .coordinator
+                .read()
+                .options()
+                .options
+                .iter()
+                .find(|option| {
+                    option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+                })
+                .unwrap()
+                .current_value
+                .as_ref(),
+            if current_yolo {
+                maki_agent::session_options::ENABLED_VALUE
+            } else {
+                maki_agent::session_options::DISABLED_VALUE
+            }
+        );
         let rules = runtime.app.permissions.session_rules_snapshot();
         assert!(
             rules
@@ -4318,6 +4404,8 @@ mod tests {
         let mut session = harness.session();
         let id = session.id;
         let path = session_lock::lock_path(&harness.ctx().sessions_dir, &id);
+        session.push_message(Message::user("kept".into()));
+        session.push_message(Message::user("truncated".into()));
         session.save(&harness.ctx().storage).unwrap();
         let stored_before = AppSession::load(id, &harness.ctx().storage).unwrap();
         let mut runtime = harness.runtime(session.clone());
@@ -4332,7 +4420,24 @@ mod tests {
             .state
             .session_mut()
             .push_message(Message::user("must not save".into()));
-        let prepared = harness.ctx().prepare_runtime(session);
+        session.truncate_messages(1);
+        session.model = runtime.app.state.model.spec();
+        let prepared = harness
+            .ctx()
+            .prepare_replacement_runtime(session, runtime.id(), runtime.app.permissions.as_ref())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                harness
+                    .ctx()
+                    .storage_writer
+                    .latest_snapshot(id)
+                    .unwrap()
+                    .messages()
+            )
+            .unwrap(),
+            serde_json::to_value(stored_before.messages()).unwrap()
+        );
 
         let error = match replace_session_runtime(
             &mut runtime,
@@ -4351,12 +4456,20 @@ mod tests {
         assert!(runtime.lock_lost);
         assert!(runtime.session_lock.is_none());
         checkpoint_runtime(&mut runtime);
+        let (done_tx, done_rx) = flume::bounded(1);
+        harness
+            .ctx()
+            .storage_writer
+            .delete(MakiId::generate(), move |_| done_tx.send(()).unwrap());
+        done_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
         assert_eq!(
-            AppSession::load(id, &harness.ctx().storage)
-                .unwrap()
-                .messages()
-                .len(),
-            stored_before.messages().len()
+            serde_json::to_value(
+                AppSession::load(id, &harness.ctx().storage)
+                    .unwrap()
+                    .messages()
+            )
+            .unwrap(),
+            serde_json::to_value(stored_before.messages()).unwrap()
         );
         lease.release().unwrap();
         release_runtime(runtime);
@@ -4470,6 +4583,7 @@ mod tests {
             session,
             None,
             runtime.app.permissions.as_ref(),
+            false,
         );
         let old = replace_session_runtime(
             &mut runtime,

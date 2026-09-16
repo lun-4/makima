@@ -104,8 +104,10 @@ impl SessionOptionStore {
         self.generations.insert(plugin, generation);
     }
 
-    pub(crate) fn remove(&mut self, plugin: &str) {
-        self.generations.remove(plugin);
+    pub(crate) fn invalidate(&mut self, plugin: &str) {
+        if let Some(generation) = self.generations.get_mut(plugin) {
+            *generation += 1;
+        }
     }
 
     fn is_current(&self, plugin: &str, generation: u64) -> bool {
@@ -552,6 +554,21 @@ mod tests {
         )
         .eval()
         .unwrap()
+    }
+
+    #[test]
+    fn generations_remain_monotonic_across_unload_and_reload() {
+        let mut store = SessionOptionStore::default();
+        let plugin = Arc::from("test");
+
+        let first = store.next_generation(&plugin);
+        store.commit(Arc::clone(&plugin), first);
+        store.invalidate(&plugin);
+        let reloaded = store.next_generation(&plugin);
+        store.commit(plugin, reloaded);
+
+        assert!(reloaded > first);
+        assert!(!store.is_current("test", first));
     }
 
     #[test]

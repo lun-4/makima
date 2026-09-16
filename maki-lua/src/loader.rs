@@ -524,8 +524,7 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?;
-        Ok(())
+        reply_rx.recv().map_err(|_| PluginError::HostDead)?
     }
 
     pub fn load_source(&self, name: &str, source: &str) -> Result<(), PluginError> {
@@ -1138,7 +1137,7 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use maki_providers::Model;
     use maki_storage::checkpoint::{
-        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+        CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
     };
     use maki_storage::id::MakiId;
     use std::collections::BTreeMap;
@@ -1176,7 +1175,6 @@ mod tests {
         catalog: SessionOptionCatalog,
         persisted_options: BTreeMap<String, String>,
     ) -> SessionCoordinatorHandle {
-        let id = MakiId::generate();
         let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
             Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
                 Box::pin(async move {
@@ -1186,6 +1184,15 @@ mod tests {
                     })
                 }) as CheckpointFuture
             });
+        test_coordinator_with_checkpoint(catalog, persisted_options, checkpoint)
+    }
+
+    fn test_coordinator_with_checkpoint(
+        catalog: SessionOptionCatalog,
+        persisted_options: BTreeMap<String, String>,
+        checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
+    ) -> SessionCoordinatorHandle {
+        let id = MakiId::generate();
         SessionCoordinatorHandle::register(SessionCoordinatorParams {
             session_id: id,
             catalog,
@@ -1260,7 +1267,23 @@ mod tests {
                     .current_value
                     .to_string()
             };
+            let generation = || {
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .find_map(|option| match &option.definition.owner {
+                        maki_agent::session_options::SessionOptionOwner::Plugin {
+                            plugin,
+                            generation,
+                        } if plugin.as_ref() == "choice" => Some(*generation),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
             assert_eq!(current(), "b");
+            let before_unload = generation();
 
             assert!(
                 host.load_source("choice", "maki.api.register_session_option({ id = 'bad' })")
@@ -1268,6 +1291,88 @@ mod tests {
             );
             assert_eq!(current(), "b");
 
+            host.unload("choice").unwrap();
+            assert!(
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .all(|option| option.definition.id.as_ref() != "choice.value")
+            );
+            host.load_source("choice", SOURCE).unwrap();
+            assert!(generation() > before_unload);
+            host.unload("choice").unwrap();
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn unload_failure_clears_generic_state_and_can_retry_session_options() {
+        const SOURCE: &str = r#"
+            maki.api.register_tool({
+                name = "choice_tool",
+                description = "Test tool",
+                schema = { type = "object", properties = {}, additionalProperties = false },
+                handler = function() return "ok" end,
+            })
+            maki.api.register_session_option({
+                id = "choice.value",
+                name = "Choice",
+                description = "Test choice",
+                category = "mode",
+                values = {
+                    { value = "a", name = "A" },
+                    { value = "b", name = "B" },
+                },
+                initial_value = "a",
+                validate = function(value)
+                    if value == "b" then return false, "validator remains active" end
+                    return true
+                end,
+            })
+        "#;
+        smol::block_on(async {
+            let registry = Arc::new(ToolRegistry::new());
+            let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+            host.load_source("choice", SOURCE).unwrap();
+            let fail = Arc::new(AtomicBool::new(true));
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = {
+                let fail = Arc::clone(&fail);
+                Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let fail = Arc::clone(&fail);
+                    Box::pin(async move {
+                        if fail.load(Ordering::Relaxed) {
+                            Err(CheckpointError::Save {
+                                session_id: request.session_id,
+                                message: Arc::from("deterministic unload failure"),
+                            })
+                        } else {
+                            Ok(CheckpointAck {
+                                session_id: request.session_id,
+                                version: request.version,
+                            })
+                        }
+                    }) as CheckpointFuture
+                })
+            };
+            let coordinator = test_coordinator_with_checkpoint(
+                host.event_handle().session_option_catalog(),
+                Default::default(),
+                checkpoint,
+            );
+            let error = host.unload("choice").unwrap_err();
+            assert!(matches!(error, PluginError::Unload { .. }));
+            assert!(!registry.has("choice_tool"));
+            assert!(
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .any(|option| option.definition.id.as_ref() == "choice.value")
+            );
+            fail.store(false, Ordering::Relaxed);
             host.unload("choice").unwrap();
             assert!(
                 coordinator

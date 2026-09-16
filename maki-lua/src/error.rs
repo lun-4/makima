@@ -23,6 +23,8 @@ pub enum PluginError {
     UnknownPluginOptions { plugin: String, keys: String },
     #[error("no bundled plugin named \"{plugin}\" (enabled via plugins.{plugin})")]
     UnknownPlugin { plugin: String },
+    #[error("failed to unload plugin {plugin}: {error}")]
+    Unload { plugin: String, error: String },
     #[error("plugin host is not running")]
     HostDead,
 }

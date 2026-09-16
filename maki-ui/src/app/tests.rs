@@ -1355,6 +1355,19 @@ fn reset_session_request_defers_autocmd_and_names_ended_session() {
 }
 
 #[test]
+fn reset_session_carries_current_yolo() {
+    let mut app = test_app();
+    app.permissions.set_yolo(true);
+
+    let actions = app.reset_session();
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+
+    assert!(request.session.meta.yolo);
+}
+
+#[test]
 fn reset_session_clears_plan() {
     let mut app = test_app();
     app.state.token_usage.input = 500;

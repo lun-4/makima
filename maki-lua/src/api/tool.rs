@@ -421,7 +421,10 @@ impl ToolInvocation for LuaToolInvocation {
         })
     }
 
-    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+    fn permission_scopes(
+        &self,
+        session_id: Option<&maki_storage::id::SessionRef>,
+    ) -> BoxFuture<'_, Option<PermissionScopes>> {
         match &self.permission_state {
             PermissionState::Ready(v) => Box::pin(std::future::ready(v.clone())),
             PermissionState::NeedsCompute => {
@@ -431,12 +434,14 @@ impl ToolInvocation for LuaToolInvocation {
                 let tool = Arc::clone(&self.tool);
                 let input = self.input.clone();
                 let fallback = input.to_string();
+                let session_id = session_id.cloned();
                 Box::pin(async move {
                     if tx
                         .send_async(Request::ComputePermissionScopes {
                             plugin,
                             tool,
                             input,
+                            session_id,
                             reply: reply_tx,
                         })
                         .await
@@ -714,7 +719,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   start           (function) Optional. Called when the tool call starts, before the handler runs.
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
-///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission.
+///   permission_scopes (string|function) Field name in schema (string) or `function(input, ctx)` returning a list of path scopes that need write permission. `ctx.session_id` identifies the invocation session when available.
 ///   mutable_path    (string|function) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
@@ -2498,7 +2503,7 @@ mod tests {
         let inv = tool
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        let scopes = smol::block_on(inv.permission_scopes());
+        let scopes = smol::block_on(inv.permission_scopes(None));
         assert_eq!(
             scopes.unwrap().scopes,
             vec!["https://example.com".to_string()]
@@ -2512,7 +2517,7 @@ mod tests {
         let inv = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from(field))))
             .parse(&input)
             .unwrap();
-        let scopes = smol::block_on(inv.permission_scopes()).expect("should fail closed");
+        let scopes = smol::block_on(inv.permission_scopes(None)).expect("should fail closed");
         assert!(scopes.force_prompt);
         assert_eq!(scopes.scopes, vec![input.to_string()]);
     }
@@ -2522,7 +2527,7 @@ mod tests {
         let unconfigured = make_lua_tool(None)
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
-        assert!(smol::block_on(unconfigured.permission_scopes()).is_none());
+        assert!(smol::block_on(unconfigured.permission_scopes(None)).is_none());
     }
 
     #[test]
@@ -2593,7 +2598,7 @@ mod tests {
             start_annotation: None,
             has_start_fn: false,
         };
-        let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
+        let scopes = smol::block_on(inv.permission_scopes(None)).expect("should fallback");
         assert!(scopes.force_prompt);
         assert!(!scopes.scopes.is_empty());
 
@@ -2617,7 +2622,7 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let scopes2 = smol::block_on(inv2.permission_scopes());
+        let scopes2 = smol::block_on(inv2.permission_scopes(None));
         assert!(scopes2.is_none(), "nil/empty scopes must skip enforcement");
     }
 
@@ -2645,7 +2650,7 @@ mod tests {
                 }));
             }
         });
-        let result = smol::block_on(inv.permission_scopes());
+        let result = smol::block_on(inv.permission_scopes(None));
         let scopes = result.unwrap();
         assert_eq!(scopes.scopes, vec!["cargo", "test"]);
         assert!(!scopes.force_prompt);

@@ -293,6 +293,7 @@ impl App {
         session.meta.thinking = Some(self.state.thinking.into());
         session.meta.fast = self.state.fast;
         session.meta.workflow = self.state.workflow;
+        session.meta.yolo = self.permissions.is_yolo();
         vec![Action::ReplaceSession(Box::new(
             SessionReplacementRequest {
                 session,

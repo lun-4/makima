@@ -198,6 +198,11 @@ impl StorageWriter {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn latest_snapshot(&self, id: MakiId) -> Option<Arc<AppSession>> {
+        lock(&self.pending).latest.get(&id).cloned()
+    }
+
     fn enqueue_checkpoint(&self, request: CheckpointRequest<AppSession>) -> CheckpointFuture {
         let session_id = request.session_id;
         let version = request.version;

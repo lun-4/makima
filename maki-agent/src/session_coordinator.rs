@@ -73,7 +73,9 @@ pub enum SessionCoordinatorError {
     Checkpoint(#[from] CheckpointError),
     #[error("model runtime transition failed: {0}")]
     ModelAdoption(Arc<str>),
-    #[error("model checkpoint failed and runtime rollback also failed: {0}")]
+    #[error(
+        "model checkpoint failed and runtime rollback also failed; runtime state was adopted: {0}"
+    )]
     ModelRollback(Arc<str>),
     #[error("directory runtime transition failed: {0}")]
     DirectoryAdoption(Arc<str>),
@@ -828,6 +830,30 @@ fn defers_behind_lease(operation: &Operation) -> bool {
     )
 }
 
+fn reject_operation(operation: Operation, session_id: MakiId) {
+    let error = || SessionCoordinatorError::StaleSession(session_id);
+    match operation {
+        Operation::AcquireLease { reply } => {
+            let _ = reply.send(Err(error()));
+        }
+        Operation::SetOption { reply, .. } | Operation::UpdateModelValues { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Operation::ReplaceHistory { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Operation::ChangeDirectory { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Operation::PreparePluginOptions { prepared, .. } => {
+            let _ = prepared.send(Err(error()));
+        }
+        Operation::Close { reply } => {
+            let _ = reply.send(());
+        }
+    }
+}
+
 async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> ControlFlow<()> {
     match operation {
         Operation::AcquireLease { .. } => {
@@ -994,6 +1020,9 @@ async fn run(
             }
             other => {
                 if handle_operation(&ctx, other).await.is_break() {
+                    for operation in deferred.drain(..).chain(rx.try_iter()) {
+                        reject_operation(operation, ctx.session_id);
+                    }
                     return;
                 }
             }
@@ -1012,6 +1041,7 @@ async fn hold_lease(
     wait: &flume::Receiver<LeaseRelease>,
     deferred: &mut VecDeque<Operation>,
 ) {
+    let mut closing = false;
     loop {
         let release = std::pin::pin!(wait.recv_async());
         let incoming = std::pin::pin!(rx.recv_async());
@@ -1033,10 +1063,14 @@ async fn hold_lease(
             // Released without a commit, or the holder dropped.
             Either::Left(_) => return,
             Either::Right(Ok(operation)) => {
-                if defers_behind_lease(&operation) {
+                if closing {
+                    reject_operation(operation, ctx.session_id);
+                } else if matches!(operation, Operation::Close { .. }) {
+                    deferred.push_back(operation);
+                    closing = true;
+                } else if defers_behind_lease(&operation) {
                     deferred.push_back(operation);
                 } else {
-                    // Only `Close` breaks, and it defers.
                     let _ = handle_operation(ctx, operation).await;
                 }
             }
@@ -1304,8 +1338,14 @@ async fn set_model(
             SessionCoordinatorError::ModelRollback(Arc::from(rollback_error.to_string()))
         })?;
         if let Err(rollback_error) = model_adopter.adopt(previous_model).await {
+            lock(&read.state).model = Arc::from(spec);
+            read.options.set_values_atomically(&[
+                (MODEL_OPTION_ID, spec),
+                (FAST_OPTION_ID, fast_value.as_ref()),
+                (THINKING_OPTION_ID, thinking_value.as_ref()),
+            ])?;
             return Err(SessionCoordinatorError::ModelRollback(Arc::from(format!(
-                "{error}; rollback: {rollback_error}"
+                "{error}; rollback: {rollback_error}; live runtime remains on {spec}"
             ))));
         }
         return Err(error.into());
@@ -1862,6 +1902,38 @@ mod tests {
     }
 
     #[test]
+    fn close_rejects_later_deferred_operations_explicitly() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let coordinator = register(id);
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let (close_reply, close_response) = flume::bounded(1);
+            coordinator
+                .tx
+                .send_async(Operation::Close { reply: close_reply })
+                .await
+                .unwrap();
+            let (replace_reply, replace_response) = flume::bounded(1);
+            coordinator
+                .tx
+                .send_async(Operation::ReplaceHistory {
+                    history: Arc::new(vec![Message::user("late".into())]),
+                    reply: replace_reply,
+                })
+                .await
+                .unwrap();
+
+            drop(lease);
+
+            close_response.recv_async().await.unwrap();
+            assert!(matches!(
+                replace_response.recv_async().await,
+                Ok(Err(SessionCoordinatorError::StaleSession(stale))) if stale == id
+            ));
+        });
+    }
+
+    #[test]
     fn lease_history_commit_precedes_queued_mutation_and_release() {
         smol::block_on(async {
             let id = MakiId::generate();
@@ -2301,6 +2373,63 @@ mod tests {
                 Err(SessionCoordinatorError::Checkpoint(_))
             ));
             assert_eq!(coordinator.read().options(), before);
+            assert_eq!(
+                lock(&adopted).as_slice(),
+                [
+                    "openai/gpt-5".to_string(),
+                    "anthropic/claude-opus-4-8".to_string(),
+                ]
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn failed_model_checkpoint_and_rollback_adopts_live_runtime_in_coordinator() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let adopted = Arc::new(Mutex::new(Vec::new()));
+            let mut params = params(id, writer(true));
+            params.model = Arc::from("anthropic/claude-opus-4-8");
+            params.definitions = builtin_option_definitions(
+                "anthropic/claude-opus-4-8",
+                [
+                    Arc::from("anthropic/claude-opus-4-8"),
+                    Arc::from("openai/gpt-5"),
+                ],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let adopted = Arc::clone(&adopted);
+                move |model: Model| {
+                    let spec = model.spec();
+                    let fail = spec == "anthropic/claude-opus-4-8";
+                    lock(&adopted).push(spec);
+                    Box::pin(async move {
+                        if fail {
+                            Err(Arc::from("rollback rejected"))
+                        } else {
+                            Ok(())
+                        }
+                    }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+
+            let error = coordinator
+                .set_option(MODEL_OPTION_ID, "openai/gpt-5")
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, SessionCoordinatorError::ModelRollback(_)));
+            assert_eq!(coordinator.read().model().as_ref(), "openai/gpt-5");
+            assert_eq!(
+                current_option_value(&coordinator.read(), MODEL_OPTION_ID).as_deref(),
+                Some("openai/gpt-5")
+            );
             assert_eq!(
                 lock(&adopted).as_slice(),
                 [

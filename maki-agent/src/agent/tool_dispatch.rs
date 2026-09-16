@@ -356,7 +356,7 @@ async fn enforce_permission(
             "enforce_permission called with dotted name: {name}"
         ));
     }
-    if let Some(scopes) = inv.permission_scopes().await {
+    if let Some(scopes) = inv.permission_scopes(ctx.session_id.as_ref()).await {
         let scopes = if FILE_WRITE_TOOLS.contains(&name) {
             crate::tools::PermissionScopes {
                 scopes: scopes
@@ -1111,7 +1111,10 @@ mod tests {
             self.started.store(true, Ordering::SeqCst);
             Box::pin(std::future::ready(()))
         }
-        fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+        fn permission_scopes(
+            &self,
+            _session_id: Option<&maki_storage::id::SessionRef>,
+        ) -> BoxFuture<'_, Option<PermissionScopes>> {
             Box::pin(std::future::ready(Some(PermissionScopes::single(
                 "probe".into(),
             ))))

@@ -12,6 +12,8 @@ use arc_swap::ArcSwap;
 use bitflags::bitflags;
 use serde_json::{Value, json};
 
+use maki_storage::id::SessionRef;
+
 use crate::template::Vars;
 use crate::{BufferSnapshot, ToolOutput};
 
@@ -206,7 +208,10 @@ pub trait ToolInvocation: Send + Sync {
     fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
         None
     }
-    fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+    fn permission_scopes(
+        &self,
+        _session_id: Option<&SessionRef>,
+    ) -> BoxFuture<'_, Option<PermissionScopes>> {
         Box::pin(std::future::ready(None))
     }
     /// Runs after `ToolStart` but before permission enforcement, so a tool

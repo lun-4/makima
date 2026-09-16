@@ -15,9 +15,15 @@ use crate::session_options::{
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
+struct SaveJob {
+    request: CheckpointRequest<SessionCheckpoint>,
+    reply: flume::Sender<Result<CheckpointAck, CheckpointError>>,
+}
+
 pub struct SessionLogCheckpoint {
-    dir: StateDir,
-    session: Mutex<StoredSession>,
+    save_tx: flume::Sender<SaveJob>,
+    #[cfg(test)]
+    session: Arc<Mutex<StoredSession>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -36,9 +42,22 @@ impl SessionLogCheckpoint {
             session.id = session_id;
             session
         });
+        let session = Arc::new(Mutex::new(session));
+        let (save_tx, save_rx) = flume::unbounded::<SaveJob>();
+        let worker_session = Arc::clone(&session);
+        smol::spawn(async move {
+            while let Ok(job) = save_rx.recv_async().await {
+                let dir = dir.clone();
+                let session = Arc::clone(&worker_session);
+                let result = smol::unblock(move || Self::save(&dir, &session, job.request)).await;
+                let _ = job.reply.send(result);
+            }
+        })
+        .detach();
         Self {
-            dir,
-            session: Mutex::new(session),
+            save_tx,
+            #[cfg(test)]
+            session,
         }
     }
 
@@ -55,10 +74,11 @@ impl SessionLogCheckpoint {
     }
 
     fn save(
-        &self,
+        dir: &StateDir,
+        session: &Mutex<StoredSession>,
         request: CheckpointRequest<SessionCheckpoint>,
     ) -> Result<CheckpointAck, CheckpointError> {
-        let mut session = lock(&self.session);
+        let mut session = lock(session);
         let checkpoint = &request.snapshot;
         // Only a history replacement carries messages; an option or model
         // change leaves the stored ones alone rather than rewinding them to
@@ -70,12 +90,10 @@ impl SessionLogCheckpoint {
         session.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
         session.update_title_if_default();
         session.meta = checkpoint_meta(&session.meta, checkpoint);
-        session
-            .save(&self.dir)
-            .map_err(|error| CheckpointError::Save {
-                session_id: request.session_id,
-                message: Arc::from(error.to_string()),
-            })?;
+        session.save(dir).map_err(|error| CheckpointError::Save {
+            session_id: request.session_id,
+            message: Arc::from(error.to_string()),
+        })?;
         Ok(CheckpointAck {
             session_id: request.session_id,
             version: request.version,
@@ -85,8 +103,17 @@ impl SessionLogCheckpoint {
 
 impl CheckpointWriter<SessionCheckpoint> for SessionLogCheckpoint {
     fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
-        let result = self.save(request);
-        Box::pin(async move { result })
+        let session_id = request.session_id;
+        let (reply, response) = flume::bounded(1);
+        if self.save_tx.send(SaveJob { request, reply }).is_err() {
+            return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
+        }
+        Box::pin(async move {
+            response
+                .recv_async()
+                .await
+                .unwrap_or(Err(CheckpointError::Closed(session_id)))
+        })
     }
 }
 
@@ -131,6 +158,129 @@ mod tests {
     use super::*;
     use crate::session_coordinator::builtin_option_definitions;
     use crate::session_options::SessionOptions;
+
+    fn request(
+        id: MakiId,
+        revision: u64,
+        model: &'static str,
+        options: &SessionOptions,
+    ) -> CheckpointRequest<SessionCheckpoint> {
+        CheckpointRequest {
+            session_id: id,
+            version: CheckpointVersion { revision, epoch: 1 },
+            snapshot: Arc::new(SessionCheckpoint {
+                history: None,
+                model: Arc::from(model),
+                cwd: PathBuf::from("/project"),
+                options: options.snapshot(),
+            }),
+        }
+    }
+
+    #[test]
+    fn checkpoint_call_does_not_run_disk_save_on_the_executor() {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let options = SessionOptions::new(
+                builtin_option_definitions(
+                    "test/model",
+                    [Arc::from("test/model")],
+                    false,
+                    false,
+                    false,
+                    ThinkingConfig::Off,
+                ),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let writer = Arc::new(SessionLogCheckpoint::open(
+                dir,
+                id,
+                "test/model",
+                "/project",
+            ));
+            let session_guard = lock(&writer.session);
+            let (checkpoint_tx, checkpoint_rx) = flume::bounded(1);
+            let checkpoint_writer = Arc::clone(&writer);
+            let checkpoint_request = request(id, 1, "test/model", &options);
+            let call = std::thread::spawn(move || {
+                checkpoint_tx
+                    .send(checkpoint_writer.checkpoint(checkpoint_request))
+                    .unwrap();
+            });
+
+            let checkpoint = checkpoint_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("checkpoint construction must not perform the save");
+            drop(session_guard);
+            call.join().unwrap();
+            checkpoint.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn concurrent_checkpoints_preserve_submission_order() {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let dir = StateDir::from_path(tmp.path().to_path_buf());
+            let id = MakiId::generate();
+            let options = SessionOptions::new(
+                builtin_option_definitions(
+                    "test/model",
+                    [Arc::from("test/model")],
+                    false,
+                    false,
+                    false,
+                    ThinkingConfig::Off,
+                ),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let writer = SessionLogCheckpoint::open(dir.clone(), id, "test/model", "/project");
+            let first = writer.checkpoint(request(id, 1, "test/first", &options));
+            let second = writer.checkpoint(request(id, 2, "test/second", &options));
+
+            let (first, second) = futures_lite::future::zip(first, second).await;
+            first.unwrap();
+            second.unwrap();
+
+            let loaded: StoredSession = StoredSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, "test/second");
+        });
+    }
+
+    #[test]
+    fn checkpoint_errors_survive_unblock() {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let state_path = tmp.path().join("not-a-directory");
+            std::fs::write(&state_path, "file").unwrap();
+            let dir = StateDir::from_path(state_path);
+            let id = MakiId::generate();
+            let options = SessionOptions::new(
+                builtin_option_definitions(
+                    "test/model",
+                    [Arc::from("test/model")],
+                    false,
+                    false,
+                    false,
+                    ThinkingConfig::Off,
+                ),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let writer = SessionLogCheckpoint::open(dir, id, "test/model", "/project");
+
+            assert!(matches!(
+                writer
+                    .checkpoint(request(id, 1, "test/model", &options))
+                    .await,
+                Err(CheckpointError::Save { session_id, .. }) if session_id == id
+            ));
+        });
+    }
 
     #[test]
     fn projected_options_round_trip_session_storage() {
