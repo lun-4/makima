@@ -602,6 +602,8 @@ mod tests {
 
     #[test]
     fn available_specs_apply_model_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        maki_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
         unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-model-policy") };
         let policy = policy(&["openai/*"], &["*/gpt-5.6-terra"]);
 

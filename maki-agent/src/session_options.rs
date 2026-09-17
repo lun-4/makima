@@ -359,9 +359,13 @@ impl SessionOptions {
     pub(crate) fn restore_batch_if_versions(
         snapshots: Vec<(Arc<SessionOptions>, u64, SessionOptionsSnapshot)>,
     ) -> bool {
-        let mut guards = snapshots
+        let changed = snapshots
             .iter()
-            .map(|(options, _, _)| lock(&options.state))
+            .map(|(options, _, _)| Arc::clone(options))
+            .collect::<Vec<_>>();
+        let mut guards = changed
+            .iter()
+            .map(|options| lock(&options.state))
             .collect::<Vec<_>>();
         if guards
             .iter()
@@ -370,10 +374,6 @@ impl SessionOptions {
         {
             return false;
         }
-        let changed = snapshots
-            .iter()
-            .map(|(options, _, _)| Arc::clone(options))
-            .collect::<Vec<_>>();
         for (guard, (_, _, snapshot)) in guards.iter_mut().zip(snapshots) {
             **guard = State {
                 version: snapshot.version,

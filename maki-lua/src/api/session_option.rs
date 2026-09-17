@@ -472,6 +472,7 @@ pub(crate) fn activate_pending(lua: &Lua, pending: &PendingSessionOptions) {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn commit_pending(
     lua: &Lua,
     catalog: &SessionOptionCatalog,
@@ -818,7 +819,7 @@ mod tests {
     fn validator_rejects_invalid_return_values(body: &str, expected: &str) {
         let lua = Lua::new();
         let function = lua
-            .load(&format!("function() {body} end"))
+            .load(format!("function() {body} end"))
             .eval::<Function>()
             .unwrap();
 

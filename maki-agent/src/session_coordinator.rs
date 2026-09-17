@@ -397,13 +397,14 @@ impl SessionOptionCatalog {
         let mut commit_error = None;
         for ((prepared, decision), snapshot) in prepared.into_iter().zip(snapshots) {
             let (reply, response) = flume::bounded(1);
-            let result = if decision.send(PluginOptionDecision::Commit(reply)).is_err() {
-                Err(SessionCoordinatorError::StaleSession(prepared.session_id))
-            } else {
-                response.recv_async().await.unwrap_or_else(|_| {
+            let result =
+                if decision.send(PluginOptionDecision::Commit(reply)).is_err() {
                     Err(SessionCoordinatorError::StaleSession(prepared.session_id))
-                })
-            };
+                } else {
+                    response.recv_async().await.unwrap_or(Err(
+                        SessionCoordinatorError::StaleSession(prepared.session_id),
+                    ))
+                };
             if let Err(error) = result {
                 commit_error.get_or_insert(error);
             }
@@ -1120,16 +1121,17 @@ async fn hold_lease(
                                 .into())
                             },
                             async {
-                                completed_rx.recv_async().await.unwrap_or_else(|_| {
-                                    Err(SessionCoordinatorError::StaleSession(ctx.session_id))
-                                })
+                                completed_rx.recv_async().await.unwrap_or(Err(
+                                    SessionCoordinatorError::StaleSession(ctx.session_id),
+                                ))
                             },
                         )
                         .await
                     }
-                    None => completed_rx.recv_async().await.unwrap_or_else(|_| {
-                        Err(SessionCoordinatorError::StaleSession(ctx.session_id))
-                    }),
+                    None => completed_rx
+                        .recv_async()
+                        .await
+                        .unwrap_or(Err(SessionCoordinatorError::StaleSession(ctx.session_id))),
                 };
                 let timed_out = matches!(
                     &result,

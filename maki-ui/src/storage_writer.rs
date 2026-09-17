@@ -174,7 +174,9 @@ impl StorageWriter {
                     let wake = if let Some(deadline) = retry_at {
                         wake_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     } else {
-                        wake_rx.recv().map_err(|_| flume::RecvTimeoutError::Disconnected)
+                        wake_rx
+                            .recv()
+                            .map_err(|_| flume::RecvTimeoutError::Disconnected)
                     };
                     if matches!(wake, Err(flume::RecvTimeoutError::Disconnected)) {
                         break;
@@ -477,7 +479,10 @@ impl Writer {
         for (id, entry) in batch {
             match entry {
                 Entry::Save(mut save) => {
-                    if save.retry_at.is_some_and(|retry_at| retry_at > Instant::now()) {
+                    if save
+                        .retry_at
+                        .is_some_and(|retry_at| retry_at > Instant::now())
+                    {
                         lock(pending).entries.entry(id).or_insert(Entry::Save(save));
                         continue;
                     }
@@ -507,9 +512,8 @@ impl Writer {
                         Err(error) => {
                             let message = error.to_string();
                             let waiters = mem::take(&mut save.waiters);
-                            let backoff = BACKGROUND_RETRY_BACKOFFS[save
-                                .retry_attempt
-                                .min(BACKGROUND_RETRY_BACKOFFS.len() - 1)];
+                            let backoff = BACKGROUND_RETRY_BACKOFFS
+                                [save.retry_attempt.min(BACKGROUND_RETRY_BACKOFFS.len() - 1)];
                             save.retry_attempt = save.retry_attempt.saturating_add(1);
                             save.retry_at = Some(Instant::now() + backoff);
                             let replaced_by_delete = {

@@ -819,7 +819,6 @@ fn append_record<R: Serialize>(buf: &mut Vec<u8>, record: &R) -> Result<(), Sess
 
 /// Tag-only probe used to classify a line that failed the strict `LogRecord`
 /// parse: distinguishes a header with a bad id from a genuinely unknown record.
-
 fn load_jsonl<M, U, T>(data: &[u8], display_path: &str) -> Result<Session<M, U, T>, SessionError>
 where
     M: DeserializeOwned,
@@ -3196,7 +3195,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_header_line_only_returns_not_found() {
+    fn corrupt_header_line_only_reports_missing_header() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let id: MakiId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
@@ -3204,10 +3203,7 @@ mod tests {
         fs::write(&path, "NOT_A_HEADER\n").unwrap();
 
         let err = TestSession::load_from(id, dir).unwrap_err();
-        assert!(matches!(
-            err,
-            SessionError::Storage(StorageError::NotFound(_))
-        ));
+        assert!(matches!(err, SessionError::MissingHeader { .. }));
     }
 
     #[test]

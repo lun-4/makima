@@ -3050,8 +3050,10 @@ impl LuaRuntime {
                 self.discard_pending_autocmds(pending_autocmds);
                 self.discard_pending_timers(pending_timers);
                 self.discard_pending_plugin_slice(pending_prompts);
-                self.lua.remove_app_data::<crate::api::slot::PendingSlotStore>();
-                self.lua.remove_app_data::<crate::api::ui::PendingHintStore>();
+                self.lua
+                    .remove_app_data::<crate::api::slot::PendingSlotStore>();
+                self.lua
+                    .remove_app_data::<crate::api::ui::PendingHintStore>();
                 self.lua.remove_app_data::<PendingPromptHintCallbacks>();
                 return Err(error);
             }
@@ -3062,12 +3064,9 @@ impl LuaRuntime {
             .expect("session option catalog installed")
             .clone();
         let previous_option_definitions = session_options.plugin_definitions(&name);
-        if let Err(error) = commit_session_option_catalog(
-            &self.lua,
-            &session_options,
-            &pending_session_options,
-        )
-        .await
+        if let Err(error) =
+            commit_session_option_catalog(&self.lua, &session_options, &pending_session_options)
+                .await
         {
             self.abort_candidate_jobs(&name, generation);
             self.discard_pending(pending);
@@ -3109,8 +3108,10 @@ impl LuaRuntime {
             self.discard_pending_autocmds(pending_autocmds);
             self.discard_pending_timers(pending_timers);
             self.discard_pending_plugin_slice(pending_prompts);
-            self.lua.remove_app_data::<crate::api::slot::PendingSlotStore>();
-            self.lua.remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
             self.lua.remove_app_data::<PendingPromptHintCallbacks>();
             return Err(PluginError::Lua {
                 plugin: name.to_string(),
@@ -3139,8 +3140,10 @@ impl LuaRuntime {
             self.discard_pending_autocmds(pending_autocmds);
             self.discard_pending_timers(pending_timers);
             self.discard_pending_plugin_slice(pending_prompts);
-            self.lua.remove_app_data::<crate::api::slot::PendingSlotStore>();
-            self.lua.remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
             self.lua.remove_app_data::<PendingPromptHintCallbacks>();
             return Err(match error {
                 RegistryError::NameConflict { name: tool, .. } => PluginError::NameConflict {

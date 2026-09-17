@@ -2958,7 +2958,9 @@ mod tests {
         let pending = &srv.session.as_ref().unwrap().pending;
         let (subagent_answer_tx, subagent_answer_rx) = flume::unbounded();
         let mut pending = pending.lock().unwrap();
-        pending.permissions.insert(ANSWERED_ID + 1, subagent_answer_tx);
+        pending
+            .permissions
+            .insert(ANSWERED_ID + 1, subagent_answer_tx);
         pending.operation = Some(PendingOperation {
             id: 1,
             request_id: RequestId::Number(41),
@@ -2978,7 +2980,10 @@ mod tests {
             }),
         );
 
-        assert_eq!(answer_rx.try_recv().ok(), Some(PermissionAnswer::Deny.encode()));
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(PermissionAnswer::Deny.encode())
+        );
         assert_eq!(
             subagent_answer_rx.try_recv().ok(),
             Some(PermissionAnswer::Deny.encode())
@@ -3041,7 +3046,10 @@ mod tests {
                 PermissionAnswer::Deny.encode()
             );
             handle_incoming_response(&srv, &allow_once(permission_id));
-            assert!(answer_rx.is_empty(), "the late permission answer must be dropped");
+            assert!(
+                answer_rx.is_empty(),
+                "the late permission answer must be dropped"
+            );
 
             event_tx
                 .send_async(Envelope {
