@@ -382,6 +382,35 @@ impl ToolRegistry {
             .collect()
     }
 
+    pub fn validate_plugin_replacement(
+        &self,
+        plugin: &str,
+        new_entries: &[(Arc<dyn Tool>, ToolSource)],
+    ) -> Result<(), RegistryError> {
+        let current = self.tools.load();
+        let mut existing: Vec<(&str, &ToolSource)> = current
+            .iter()
+            .filter(|tool| {
+                !matches!(&tool.source, ToolSource::Lua { plugin: owner } if owner.as_ref() == plugin)
+            })
+            .map(|tool| (tool.name(), &tool.source))
+            .collect();
+        for (tool, source) in new_entries {
+            let name = tool.name();
+            if let Some((_, existing_source)) = existing
+                .iter()
+                .find(|(existing_name, _)| *existing_name == name)
+            {
+                return Err(RegistryError::NameConflict {
+                    name: name.to_owned(),
+                    existing: existing_source.as_log_field().into_owned(),
+                });
+            }
+            existing.push((name, source));
+        }
+        Ok(())
+    }
+
     pub fn replace_plugin(
         &self,
         plugin: &str,

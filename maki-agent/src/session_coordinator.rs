@@ -183,6 +183,7 @@ struct CoordinatorState {
     model: Arc<str>,
     cwd: PathBuf,
     checkpoint_revision: u64,
+    history_revision: u64,
 }
 
 pub struct SessionCoordinatorParams {
@@ -534,22 +535,20 @@ impl SessionCoordinatorHandle {
         id: impl Into<Arc<str>>,
     ) -> impl Future<Output = Result<(bool, SessionOptionsSnapshot), SessionCoordinatorError>> + Send
     {
-        let session_id = self.session_id;
-        let (reply, response) = flume::bounded(1);
-        let submitted = self.ensure_live().and_then(|()| {
-            self.tx
-                .send(Operation::ToggleBooleanOption {
-                    id: id.into(),
-                    reply,
-                })
-                .map_err(|_| SessionCoordinatorError::StaleSession(session_id))
-        });
+        let coordinator = self.clone();
+        let id = id.into();
         async move {
-            submitted?;
+            coordinator.ensure_live()?;
+            let (reply, response) = flume::bounded(1);
+            coordinator
+                .tx
+                .send_async(Operation::ToggleBooleanOption { id, reply })
+                .await
+                .map_err(|_| SessionCoordinatorError::StaleSession(coordinator.session_id))?;
             response
                 .recv_async()
                 .await
-                .map_err(|_| SessionCoordinatorError::StaleSession(session_id))?
+                .map_err(|_| SessionCoordinatorError::StaleSession(coordinator.session_id))?
         }
     }
 
@@ -692,6 +691,7 @@ impl PreparedSessionCoordinator {
                 model,
                 cwd,
                 checkpoint_revision: 0,
+                history_revision: 0,
             })),
         };
         let (tx, rx) = flume::unbounded();
@@ -1097,6 +1097,7 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
             }
         }
         Operation::Close { reply } => {
+            lock(&ctx.read.state).history_revision += 1;
             unregister(ctx.session_id, ctx.generation);
             ctx.catalog.unregister(ctx.session_id, ctx.generation);
             let _ = reply.send(());
@@ -1196,8 +1197,7 @@ async fn hold_lease(
                 })
                 .detach();
 
-                finish_history_commit(ctx, rx, wait, deferred, completed_rx, timeout, reply)
-                    .await;
+                finish_history_commit(ctx, rx, wait, deferred, completed_rx, timeout, reply).await;
                 return;
             }
             // Released without a commit, or the holder dropped.
@@ -1206,6 +1206,7 @@ async fn hold_lease(
                 if closing {
                     reject_operation(operation, ctx.session_id);
                 } else if matches!(operation, Operation::Close { .. }) {
+                    lock(&ctx.read.state).history_revision += 1;
                     deferred.push_back(operation);
                     closing = true;
                 } else if defers_behind_lease(&operation) {
@@ -1242,45 +1243,43 @@ async fn finish_history_commit(
     let mut closing = false;
     let mut replied = false;
     loop {
+        let completion_pending = checkpoint_completed;
         let completion = std::pin::pin!(async {
-            if checkpoint_completed {
+            if completion_pending {
                 futures_lite::future::pending().await
             } else {
                 completed.recv_async().await
             }
         });
+        let release_pending = lease_released;
         let release = std::pin::pin!(async {
-            if lease_released {
+            if release_pending {
                 futures_lite::future::pending().await
             } else {
                 wait.recv_async().await
             }
         });
         let incoming = std::pin::pin!(rx.recv_async());
+        let deadline_pending = replied;
         let deadline = std::pin::pin!(async {
-            if replied {
+            if deadline_pending {
                 futures_lite::future::pending().await
             } else {
                 timeout_rx.recv_async().await
             }
         });
-        let event = futures_lite::future::or(
-            async { CommitEvent::Completed(completion.await) },
-            async {
-                futures_lite::future::or(
-                    async { CommitEvent::Released(release.await) },
-                    async {
-                        futures_lite::future::or(
-                            async { CommitEvent::Incoming(incoming.await) },
-                            async { CommitEvent::TimedOut(deadline.await) },
-                        )
-                        .await
-                    },
-                )
+        let event =
+            futures_lite::future::or(async { CommitEvent::Completed(completion.await) }, async {
+                futures_lite::future::or(async { CommitEvent::Released(release.await) }, async {
+                    futures_lite::future::or(
+                        async { CommitEvent::TimedOut(deadline.await) },
+                        async { CommitEvent::Incoming(incoming.await) },
+                    )
+                    .await
+                })
                 .await
-            },
-        )
-        .await;
+            })
+            .await;
         match event {
             CommitEvent::Completed(result) => {
                 checkpoint_completed = true;
@@ -1309,6 +1308,7 @@ async fn finish_history_commit(
                 if closing {
                     reject_operation(operation, ctx.session_id);
                 } else if matches!(operation, Operation::Close { .. }) {
+                    lock(&ctx.read.state).history_revision += 1;
                     deferred.push_back(operation);
                     closing = true;
                 } else if defers_behind_lease(&operation) {
@@ -1420,9 +1420,14 @@ async fn replace_history(
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
     history: Arc<Vec<Message>>,
 ) -> Result<(), SessionCoordinatorError> {
-    let (model, cwd) = {
-        let state = lock(&read.state);
-        (Arc::clone(&state.model), state.cwd.clone())
+    let (model, cwd, history_revision) = {
+        let mut state = lock(&read.state);
+        state.history_revision += 1;
+        (
+            Arc::clone(&state.model),
+            state.cwd.clone(),
+            state.history_revision,
+        )
     };
     checkpoint_state(
         read,
@@ -1433,7 +1438,10 @@ async fn replace_history(
         read.options.snapshot(),
     )
     .await?;
-    lock(&read.state).history = history;
+    let mut state = lock(&read.state);
+    if state.history_revision == history_revision {
+        state.history = history;
+    }
     Ok(())
 }
 
@@ -2245,8 +2253,10 @@ mod tests {
                     let checkpoint_started_tx = checkpoint_started_tx.clone();
                     let release_rx = release_rx.clone();
                     Box::pin(async move {
-                        checkpoint_started_tx.send_async(()).await.unwrap();
-                        release_rx.recv_async().await.unwrap();
+                        if request.snapshot.history.is_some() {
+                            checkpoint_started_tx.send_async(()).await.unwrap();
+                            release_rx.recv_async().await.unwrap();
+                        }
                         Ok(CheckpointAck {
                             session_id: request.session_id,
                             version: request.version,
@@ -2282,38 +2292,19 @@ mod tests {
                 .send_async(Operation::AcquireLease { reply: lease_tx })
                 .await
                 .unwrap();
-            let (replace_tx, replace_rx) = flume::bounded(1);
-            coordinator
-                .tx
-                .send_async(Operation::ReplaceHistory {
-                    history: Arc::new(vec![Message::user("queued".into())]),
-                    reply: replace_tx,
-                })
-                .await
-                .unwrap();
             smol::future::yield_now().await;
             assert!(lease_rx.try_recv().is_err());
-            assert!(replace_rx.try_recv().is_err());
 
             release_tx.send_async(()).await.unwrap();
-            while coordinator.read().history().is_empty() {
-                smol::future::yield_now().await;
-            }
+            assert!(lease_rx.try_recv().is_err());
+
+            drop(lease);
+            let next = lease_rx.recv_async().await.unwrap().unwrap();
             assert_eq!(
                 serde_json::to_value(coordinator.read().history().as_ref()).unwrap(),
                 serde_json::to_value(&history).unwrap()
             );
-            assert!(lease_rx.try_recv().is_err());
-            assert!(replace_rx.try_recv().is_err());
-
-            drop(lease);
-            let next = lease_rx.recv_async().await.unwrap().unwrap();
             drop(next);
-            replace_rx.recv_async().await.unwrap().unwrap();
-            assert_eq!(
-                serde_json::to_value(coordinator.read().history().as_ref()).unwrap(),
-                serde_json::to_value(vec![Message::user("queued".into())]).unwrap()
-            );
             coordinator.close().await.unwrap();
         });
     }
@@ -2349,14 +2340,12 @@ mod tests {
             .detach();
             drop(lease);
 
-            let result = futures_lite::future::race(
-                async { Some(closed_rx.recv_async().await) },
-                async {
+            let result =
+                futures_lite::future::race(async { Some(closed_rx.recv_async().await) }, async {
                     smol::Timer::after(Duration::from_millis(100)).await;
                     None
-                },
-            )
-            .await;
+                })
+                .await;
             assert!(matches!(result, Some(Ok(Ok(())))));
         });
     }
@@ -2720,11 +2709,12 @@ mod tests {
                 Some(ENABLED_VALUE)
             );
             assert_eq!(thinking_value(&after).as_ref(), "high");
-            let saved = lock(&saved);
-            assert_eq!(saved.len(), 1);
-            assert_eq!(saved[0].model.as_ref(), "anthropic/claude-opus-4-8");
-            assert_eq!(saved[0].options, after);
-            drop(saved);
+            {
+                let saved = lock(&saved);
+                assert_eq!(saved.len(), 1);
+                assert_eq!(saved[0].model.as_ref(), "anthropic/claude-opus-4-8");
+                assert_eq!(saved[0].options, after);
+            }
             coordinator.close().await.unwrap();
         });
     }

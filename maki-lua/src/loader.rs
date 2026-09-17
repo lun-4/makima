@@ -1447,6 +1447,109 @@ mod tests {
     }
 
     #[test]
+    fn tool_conflict_preserves_plugin_catalog_and_commands() {
+        const ORIGINAL: &str = r#"
+            maki.api.register_tool({
+                name = "original_tool",
+                description = "Original tool",
+                schema = { type = "object", properties = {}, additionalProperties = false },
+                handler = function() return "ok" end,
+            })
+            maki.api.register_command({
+                name = "/original",
+                description = "Original command",
+                tui_only = false,
+                handler = function() end,
+            })
+            maki.api.register_session_option({
+                id = "choice.original",
+                name = "Original option",
+                description = "Original option",
+                category = "mode",
+                values = {{ value = "on", name = "On" }},
+                initial_value = "on",
+            })
+        "#;
+        const CANDIDATE: &str = r#"
+            maki.api.register_tool({
+                name = "shared_tool",
+                description = "Conflicting tool",
+                schema = { type = "object", properties = {}, additionalProperties = false },
+                handler = function() return "ok" end,
+            })
+            maki.api.register_command({
+                name = "/candidate",
+                description = "Candidate command",
+                tui_only = false,
+                handler = function() end,
+            })
+            maki.api.register_session_option({
+                id = "choice.candidate",
+                name = "Candidate option",
+                description = "Candidate option",
+                category = "mode",
+                values = {{ value = "on", name = "On" }},
+                initial_value = "on",
+            })
+        "#;
+        smol::block_on(async {
+            let registry = Arc::new(ToolRegistry::new());
+            let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+            host.load_source("choice", ORIGINAL).unwrap();
+            host.load_source(
+                "other",
+                r#"
+                maki.api.register_tool({
+                    name = "shared_tool",
+                    description = "Shared tool",
+                    schema = { type = "object", properties = {}, additionalProperties = false },
+                    handler = function() return "ok" end,
+                })
+                "#,
+            )
+            .unwrap();
+            let coordinator = test_coordinator(host.event_handle().session_option_catalog());
+
+            assert!(matches!(
+                host.load_source("choice", CANDIDATE),
+                Err(PluginError::NameConflict { .. })
+            ));
+            assert!(registry.has("original_tool"));
+            assert!(registry.has("shared_tool"));
+            let commands = command_snapshot(&host);
+            assert!(
+                commands
+                    .commands()
+                    .iter()
+                    .any(|command| command.spec().name.as_ref() == "/original")
+            );
+            assert!(
+                commands
+                    .commands()
+                    .iter()
+                    .all(|command| command.spec().name.as_ref() != "/candidate")
+            );
+            assert!(
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .any(|option| option.definition.id.as_ref() == "choice.original")
+            );
+            assert!(
+                coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .all(|option| option.definition.id.as_ref() != "choice.candidate")
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn event_handle_validates_and_commits_session_option() {
         const SOURCE: &str = r#"
             maki.api.register_session_option({

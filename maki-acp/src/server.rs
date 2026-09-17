@@ -89,26 +89,24 @@ type PendingState = Arc<Mutex<Pending>>;
 /// also covers process shutdown after stdin EOF, where `close_session` never
 /// runs.
 struct SessionLock {
-    dir: PathBuf,
-    id: MakiId,
     stop_tx: flume::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SessionLock {
-    /// Stop the heartbeat thread and release the lock. Only releases if the
-    /// thread stopped cleanly, so no beat can land after the release.
+    /// Stop the heartbeat thread, wait until it cannot beat again, and release the lock.
     fn shutdown(mut self) {
         self.release();
     }
 
     fn release(&mut self) {
         let _ = self.stop_tx.send(());
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                warn!(session_id = %self.id, "session lock heartbeat thread terminated abnormally");
-            }
-            session_lock::release(&self.dir, &self.id);
+        if self
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err())
+        {
+            warn!("session lock heartbeat thread terminated abnormally");
         }
     }
 }
@@ -701,12 +699,10 @@ async fn close_session(srv: &mut Server) {
 }
 
 fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String> {
-    match session_lock::heartbeat(&dir, &id).map_err(|error| error.to_string())? {
-        session_lock::LockBeat::Lost => return Err(session_lock::OPEN_ELSEWHERE_MSG.to_owned()),
-        session_lock::LockBeat::Held | session_lock::LockBeat::Claimed => {}
-    }
+    let mut lease = session_lock::claim(&dir, &id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| session_lock::OPEN_ELSEWHERE_MSG.to_owned())?;
     let (stop_tx, stop_rx) = flume::bounded(1);
-    let beat_dir = dir.clone();
     let thread = std::thread::spawn(move || {
         loop {
             if stop_rx
@@ -715,7 +711,7 @@ fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String
             {
                 return;
             }
-            match session_lock::heartbeat(&beat_dir, &id) {
+            match lease.heartbeat() {
                 Ok(session_lock::LockBeat::Lost) => {
                     warn!(session_id = %id, "session lock heartbeat lost ownership");
                     return;
@@ -726,8 +722,6 @@ fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String
         }
     });
     Ok(SessionLock {
-        dir,
-        id,
         stop_tx,
         thread: Some(thread),
     })
@@ -752,10 +746,14 @@ async fn install_session(
     params: &AcpParams,
     session: InstallSession<'_>,
 ) -> Result<maki_agent::session_options::SessionOptionsSnapshot, String> {
-    let sessions_dir = params
-        .storage
-        .ensure_subdir(SESSIONS_DIR)
-        .map_err(|error| error.to_string())?;
+    let sessions_dir = match params.storage.ensure_subdir(SESSIONS_DIR) {
+        Ok(sessions_dir) => sessions_dir,
+        Err(error) => {
+            let InstallSession { handle, mcp, .. } = session;
+            rollback_install(handle, mcp, None).await;
+            return Err(error.to_string());
+        }
+    };
     install_session_with_lock(srv, params, session, |id| {
         start_session_lock_in(sessions_dir, id)
     })
@@ -1860,6 +1858,9 @@ fn start_event_pump(
             event, subagent, ..
         }) = event_rx.recv_async().await
         {
+            if let AgentEvent::TurnComplete(tc) = &event {
+                add_cost(&mut cost_total, tc.cost);
+            }
             let permission_answer_tx = if let Some(subagent) = subagent {
                 if !matches!(&event, AgentEvent::PermissionRequest { .. }) {
                     continue;
@@ -1872,9 +1873,6 @@ fn start_event_pump(
             } else {
                 None
             };
-            if let AgentEvent::TurnComplete(tc) = &event {
-                add_cost(&mut cost_total, tc.cost);
-            }
 
             let update = match event {
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
@@ -2399,15 +2397,13 @@ mod tests {
     fn abnormal_heartbeat_thread_termination_releases_lock() {
         let dir = TempDir::new().unwrap();
         let id = MakiId::generate();
-        assert_eq!(
-            session_lock::heartbeat(dir.path(), &id).unwrap(),
-            session_lock::LockBeat::Claimed
-        );
+        let lease = session_lock::claim(dir.path(), &id).unwrap().unwrap();
         let (stop_tx, _) = flume::bounded(1);
-        let thread = std::thread::spawn(|| panic!("heartbeat failed"));
+        let thread = std::thread::spawn(move || {
+            let _lease = lease;
+            panic!("heartbeat failed");
+        });
         let lock = SessionLock {
-            dir: dir.path().to_path_buf(),
-            id,
             stop_tx,
             thread: Some(thread),
         };
@@ -2426,6 +2422,64 @@ mod tests {
             error.data,
             Some(json_str(&session_lock::OPEN_ELSEWHERE_MSG))
         );
+    }
+
+    #[test]
+    fn sessions_directory_failure_rolls_back_install() {
+        smol::block_on(async {
+            let cwd = TempDir::new().unwrap();
+            let state_path = cwd.path().join("not-a-directory");
+            std::fs::write(&state_path, "file").unwrap();
+            let params = test_params(Model::from_spec(OFFLINE_SPEC).unwrap(), state_path);
+            let (out_tx, _) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                model_specs: vec![OFFLINE_SPEC.to_owned()],
+                modes: Arc::clone(&params.modes),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+            };
+            let handle = spawn_session(
+                &params,
+                SpawnSession {
+                    model: params.model.clone(),
+                    cwd: cwd.path().to_path_buf(),
+                    session_id: None,
+                    history: Vec::new(),
+                    mcp_handle: None,
+                    elicitation: false,
+                    yolo: false,
+                    workflow: false,
+                },
+            );
+            let input_tx = handle.input_tx.clone();
+            let persisted_options = BTreeMap::new();
+
+            let error = install_session(
+                &mut srv,
+                &params,
+                InstallSession {
+                    handle,
+                    mcp: None,
+                    current_model: OFFLINE_SPEC.to_owned(),
+                    history: Vec::new(),
+                    initial_cost: None,
+                    cwd: cwd.path().to_path_buf(),
+                    fast: false,
+                    workflow: false,
+                    thinking: maki_agent::ThinkingConfig::Off,
+                    persisted_options: &persisted_options,
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(!error.is_empty());
+            assert!(input_tx.is_disconnected(), "session task was not cancelled");
+            assert!(srv.session.is_none());
+        });
     }
 
     #[test]
@@ -3716,6 +3770,62 @@ mod tests {
             assert_eq!(executing["params"]["update"]["status"], "in_progress");
             assert!(out_rx.is_empty());
         });
+        smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test]
+    fn event_pump_includes_subagent_cost_in_next_root_usage_update() {
+        const INITIAL_COST: f64 = 0.25;
+        const SUBAGENT_COST: f64 = 0.5;
+        const ROOT_COST: f64 = 1.0;
+
+        let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+        let (out_tx, out_rx) = flume::unbounded::<Value>();
+        let (answer_tx, _) = flume::unbounded::<String>();
+        let session_id = SessionRef::from(MakiId::generate());
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+        start_event_pump(
+            event_rx,
+            session_id,
+            out_tx,
+            PendingState::default(),
+            false,
+            answer_tx,
+            coordinator.read(),
+            None,
+            Some(INITIAL_COST),
+        );
+        let turn_complete = |cost| {
+            AgentEvent::TurnComplete(Box::new(maki_agent::TurnCompleteEvent {
+                message: Message::default(),
+                usage: TokenUsage::default(),
+                model: OFFLINE_SPEC.to_owned(),
+                cost: Some(cost),
+                context_size: Some(0),
+                context_window: 1,
+            }))
+        };
+
+        event_tx
+            .send(subagent_activity(turn_complete(SUBAGENT_COST)))
+            .unwrap();
+        event_tx
+            .send(Envelope {
+                event: turn_complete(ROOT_COST),
+                subagent: None,
+                run_id: 0,
+            })
+            .unwrap();
+
+        let update = out_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(update["params"]["update"]["sessionUpdate"], "usage_update");
+        assert_eq!(
+            update["params"]["update"]["cost"]["amount"],
+            INITIAL_COST + SUBAGENT_COST + ROOT_COST
+        );
+        assert!(out_rx.is_empty(), "subagent completion must stay hidden");
         smol::block_on(coordinator.close()).unwrap();
     }
 

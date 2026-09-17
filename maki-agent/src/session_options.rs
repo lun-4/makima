@@ -359,6 +359,17 @@ impl SessionOptions {
     pub(crate) fn restore_batch_if_versions(
         snapshots: Vec<(Arc<SessionOptions>, u64, SessionOptionsSnapshot)>,
     ) -> bool {
+        if snapshots
+            .iter()
+            .enumerate()
+            .any(|(index, (options, _, _))| {
+                snapshots[..index]
+                    .iter()
+                    .any(|(previous, _, _)| Arc::ptr_eq(options, previous))
+            })
+        {
+            return false;
+        }
         let changed = snapshots
             .iter()
             .map(|(options, _, _)| Arc::clone(options))
@@ -694,6 +705,21 @@ mod tests {
             previous,
         )]));
         assert_eq!(options.snapshot(), concurrent);
+    }
+
+    #[test]
+    fn duplicate_restore_target_is_rejected() {
+        let options = SessionOptions::new(
+            vec![definition(YOLO_OPTION_ID, DISABLED_VALUE)],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let snapshot = options.snapshot();
+
+        assert!(!SessionOptions::restore_batch_if_versions(vec![
+            (Arc::clone(&options), snapshot.version, snapshot.clone()),
+            (Arc::clone(&options), snapshot.version, snapshot),
+        ]));
     }
 
     #[test]

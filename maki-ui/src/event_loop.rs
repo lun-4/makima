@@ -3053,14 +3053,6 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn boolean_option_value(enabled: bool) -> &'static str {
-        if enabled {
-            maki_agent::session_options::ENABLED_VALUE
-        } else {
-            maki_agent::session_options::DISABLED_VALUE
-        }
-    }
-
     /// Runs `op` off the event-loop thread and delivers its result back as an
     /// [`InternalEvent::SessionOp`]. See [`SessionOpKind`] for why.
     fn dispatch_session_op<F>(&self, idx: usize, kind: SessionOpKind, op: F)

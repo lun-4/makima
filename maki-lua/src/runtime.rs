@@ -3022,6 +3022,34 @@ impl LuaRuntime {
             })
             .collect();
 
+        if let Err(error) = self
+            .registry
+            .validate_plugin_replacement(&name, &registry_entries)
+        {
+            self.abort_candidate_jobs(&name, generation);
+            self.discard_pending(pending);
+            self.discard_pending_commands(pending_commands);
+            self.discard_pending_keymaps(pending_keymaps);
+            self.discard_pending_completion(
+                Arc::clone(&pending_sources),
+                Arc::clone(&pending_expanders),
+            );
+            self.discard_pending_autocmds(Arc::clone(&pending_autocmds));
+            self.discard_pending_timers(Arc::clone(&pending_timers));
+            self.discard_pending_plugin_slice(Arc::clone(&pending_prompts));
+            self.lua
+                .remove_app_data::<crate::api::slot::PendingSlotStore>();
+            self.lua
+                .remove_app_data::<crate::api::ui::PendingHintStore>();
+            self.lua.remove_app_data::<PendingPromptHintCallbacks>();
+            return Err(match error {
+                RegistryError::NameConflict { name: tool, .. } => PluginError::NameConflict {
+                    plugin: name.to_string(),
+                    tool,
+                },
+            });
+        }
+
         let command_registrations = match self.prepare_pending_commands(&name, &pending_commands) {
             Ok(registrations) => registrations,
             Err(error) => {

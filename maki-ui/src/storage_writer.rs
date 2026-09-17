@@ -124,23 +124,22 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
         let session_id = request.session_id;
         let version = request.version;
         let mut state = lock(&self.pending);
-        let (base, mut history_base) = if let Some(pending) =
-            state.coordinator_pending.get(&session_id)
-        {
-            (Arc::clone(&pending.session), pending.history_base.clone())
-        } else if let Some(latest) = state.latest.get(&session_id) {
-            (
-                Arc::clone(latest),
-                state.coordinator_history_bases.get(&session_id).cloned(),
-            )
-        } else {
-            return Box::pin(async move {
-                Err(CheckpointError::Save {
-                    session_id,
-                    message: Arc::from("session snapshot is unavailable"),
-                })
-            });
-        };
+        let (base, mut history_base) =
+            if let Some(pending) = state.coordinator_pending.get(&session_id) {
+                (Arc::clone(&pending.session), pending.history_base.clone())
+            } else if let Some(latest) = state.latest.get(&session_id) {
+                (
+                    Arc::clone(latest),
+                    state.coordinator_history_bases.get(&session_id).cloned(),
+                )
+            } else {
+                return Box::pin(async move {
+                    Err(CheckpointError::Save {
+                        session_id,
+                        message: Arc::from("session snapshot is unavailable"),
+                    })
+                });
+            };
         if history_base.is_none()
             && let Some(history) = &request.snapshot.history
             && !histories_match(base.messages(), history)
@@ -633,7 +632,9 @@ impl Writer {
                         .retry_at
                         .is_some_and(|retry_at| retry_at > Instant::now())
                     {
-                        lock(pending).entries.entry(id).or_insert(Entry::Save(save));
+                        if let Err(waiters) = requeue_save(pending, id, save) {
+                            fail_waiters(id, waiters, "checkpoint superseded by session deletion");
+                        }
                         continue;
                     }
                     save.retry_at = None;
@@ -854,6 +855,72 @@ mod tests {
         commit_save(&pending, id, &old_in_flight);
 
         assert_eq!(lock(&pending).latest[&id].title, "new authoritative");
+    }
+
+    #[test]
+    fn deferred_retry_merges_into_newer_generation_without_losing_waiters() {
+        const OLD_GENERATION: u64 = 1;
+        const NEW_GENERATION: u64 = 2;
+        const RETRY_ATTEMPT: usize = 1;
+
+        let pending: Pending = Arc::default();
+        let mut old = AppSession::new(MODEL, CWD);
+        let id = old.id;
+        old.set_title("old retry".into());
+        let mut newer = old.clone();
+        newer.set_title("new generation".into());
+        let old_version = CheckpointVersion {
+            revision: old.revision(),
+            epoch: OLD_GENERATION,
+        };
+        let newer_version = CheckpointVersion {
+            revision: newer.revision(),
+            epoch: NEW_GENERATION,
+        };
+        let (old_reply, old_ack) = flume::bounded(1);
+        let (newer_reply, newer_ack) = flume::bounded(1);
+        let retry_at = Instant::now() + Duration::from_secs(60);
+        let old_retry = PendingSave {
+            session: Arc::new(old),
+            waiters: vec![CheckpointWaiter {
+                version: old_version,
+                reply: old_reply,
+            }],
+            generation: OLD_GENERATION,
+            coordinator_generation: Some(OLD_GENERATION),
+            coordinator_history_base: None,
+            retry_attempt: RETRY_ATTEMPT,
+            retry_at: Some(retry_at),
+        };
+        lock(&pending).entries.insert(
+            id,
+            Entry::Save(PendingSave {
+                session: Arc::new(newer),
+                waiters: vec![CheckpointWaiter {
+                    version: newer_version,
+                    reply: newer_reply,
+                }],
+                generation: NEW_GENERATION,
+                coordinator_generation: Some(NEW_GENERATION),
+                coordinator_history_base: None,
+                retry_attempt: 0,
+                retry_at: None,
+            }),
+        );
+
+        assert!(requeue_save(&pending, id, old_retry).is_ok());
+
+        let Entry::Save(merged) = lock(&pending).entries.remove(&id).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(merged.session.title, "new generation");
+        assert_eq!(merged.generation, NEW_GENERATION);
+        assert_eq!(merged.coordinator_generation, Some(NEW_GENERATION));
+        assert_eq!(merged.retry_attempt, RETRY_ATTEMPT);
+        assert_eq!(merged.retry_at, Some(retry_at));
+        acknowledge_waiters(id, merged.waiters);
+        assert_eq!(old_ack.recv().unwrap().unwrap().version, old_version);
+        assert_eq!(newer_ack.recv().unwrap().unwrap().version, newer_version);
     }
 
     #[test]
