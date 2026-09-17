@@ -2410,7 +2410,7 @@ mod tests {
 
         drop(lock);
 
-        assert!(!session_lock::open_elsewhere(dir.path(), &id));
+        assert!(session_lock::claim(dir.path(), &id).unwrap().is_some());
     }
 
     #[test]
