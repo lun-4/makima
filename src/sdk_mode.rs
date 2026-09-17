@@ -504,6 +504,7 @@ impl SdkWriter {
 pub struct SdkParams {
     pub cli: Cli,
     pub model: Model,
+    pub explicit_model: bool,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
@@ -669,9 +670,10 @@ struct LockGuard {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(());
-        if let Some(t) = self.thread.take()
-            && t.join().is_ok()
-        {
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                warn!(session_id = %self.id, "session lock heartbeat thread terminated abnormally");
+            }
             session_lock::release(&self.dir, &self.id);
         }
     }
@@ -681,6 +683,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let SdkParams {
         cli,
         model,
+        explicit_model,
         mut config,
         permissions_config,
         timeouts,
@@ -708,12 +711,12 @@ pub fn run(params: SdkParams) -> Result<()> {
     let storage = StateDir::resolve().context("resolve state dir")?;
     let restored = resolve_session(&cli, &working_dir, &storage)?;
     let restored_state = restored.model.is_some();
-    let model = restored
-        .model
-        .as_deref()
-        .and_then(|spec| Model::from_spec(spec).ok())
-        .filter(|candidate| model_policy.allows(&candidate.spec()))
-        .unwrap_or(model);
+    let model = resolve_startup_model(
+        model,
+        restored.model.as_deref(),
+        explicit_model,
+        &model_policy,
+    );
     let permission_mode =
         restored_permission_mode(restored_state, restored.meta.yolo, startup_permission_mode);
     let yolo = permission_mode == PermissionMode::BypassPermissions;
@@ -893,11 +896,15 @@ pub fn run(params: SdkParams) -> Result<()> {
             {
                 return;
             }
-            if matches!(
-                session_lock::heartbeat(&lock_dir, &locked_id),
-                Ok(session_lock::LockBeat::Lost)
-            ) {
-                return;
+            match session_lock::heartbeat(&lock_dir, &locked_id) {
+                Ok(session_lock::LockBeat::Lost) => {
+                    warn!(session_id = %locked_id, "session lock heartbeat lost ownership");
+                    return;
+                }
+                Err(error) => {
+                    warn!(session_id = %locked_id, %error, "session lock heartbeat failed");
+                }
+                Ok(session_lock::LockBeat::Claimed | session_lock::LockBeat::Held) => {}
             }
         }
     });
@@ -1362,6 +1369,21 @@ struct ResolvedSession {
     history: Vec<Message>,
     model: Option<String>,
     meta: SessionMeta,
+}
+
+fn resolve_startup_model(
+    startup: Model,
+    restored: Option<&str>,
+    explicit_model: bool,
+    model_policy: &ModelPolicy,
+) -> Model {
+    if explicit_model {
+        return startup;
+    }
+    restored
+        .and_then(|spec| Model::from_spec(spec).ok())
+        .filter(|candidate| model_policy.allows(&candidate.spec()))
+        .unwrap_or(startup)
 }
 
 fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedSession> {
@@ -1922,6 +1944,21 @@ mod tests {
     const REJECTED_ATTACHMENT: &str = "command rejected attachment";
     const STARTUP_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const TARGET_MODEL: &str = "openai/gpt-5";
+    const RESTORED_MODEL: &str = "anthropic/claude-opus-4-6";
+
+    #[test_case(false, RESTORED_MODEL; "restores_persisted_model_without_explicit_flag")]
+    #[test_case(true, STARTUP_MODEL; "explicit_model_overrides_persisted_model")]
+    fn sdk_startup_model_precedence(explicit_model: bool, expected: &str) {
+        let startup = Model::from_spec(STARTUP_MODEL).unwrap();
+        let resolved = resolve_startup_model(
+            startup,
+            Some(RESTORED_MODEL),
+            explicit_model,
+            &ModelPolicy::default(),
+        );
+
+        assert_eq!(resolved.spec(), expected);
+    }
 
     struct OutcomeBehavior(CommandOutcome);
 

@@ -329,7 +329,8 @@ pub fn run(
             plugin_rules: Arc::clone(&plugin_rules),
             modes: Arc::clone(&modes),
             session_options: session_options.clone(),
-        });
+        })
+        .map_err(|error| eyre!("register print session coordinator: {error}"))?;
 
         let HeadlessHandle {
             event_rx,

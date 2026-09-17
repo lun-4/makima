@@ -119,7 +119,16 @@ fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String>
     extract_tool_names(&probe)
 }
 
-pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
+pub fn spawn(
+    params: HeadlessParams,
+) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
+    spawn_with_session_id(params, MakiId::generate())
+}
+
+fn spawn_with_session_id(
+    params: HeadlessParams,
+    session_id: MakiId,
+) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = params.input.mode.clone();
     let workflow = params.input.workflow;
@@ -153,7 +162,6 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
-    let session_id = MakiId::generate();
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::new(session_id);
@@ -201,15 +209,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             },
         ),
         mailbox: mailbox.clone(),
-    })
-    .map_err(|error| error.to_string());
-    let coordinator = match coordinator {
-        Ok(coordinator) => Some(coordinator),
-        Err(error) => {
-            error!(%error, "session coordinator registration failed");
-            None
-        }
-    };
+    })?;
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
     let task = smol::spawn({
         let file_write_locks = Arc::clone(&file_write_locks);
@@ -226,9 +226,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         let _ = event_tx.send(AgentEvent::ControlError {
                             message: e.user_message(),
                         });
-                        if let Some(coordinator) = coordinator {
-                            let _ = coordinator.close().await;
-                        }
+                        let _ = coordinator.close().await;
                         return;
                     }
                 };
@@ -277,19 +275,17 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             if let Some(handle) = mcp_shutdown {
                 handle.shutdown().await;
             }
-            if let Some(coordinator) = coordinator {
-                let _ = coordinator.close().await;
-            }
+            let _ = coordinator.close().await;
         }
     });
 
-    HeadlessHandle {
+    Ok(HeadlessHandle {
         event_rx,
         tool_names,
         session_id: session_ref,
         cwd: working_dir,
         task,
-    }
+    })
 }
 
 pub struct InteractiveParams {
@@ -966,15 +962,9 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// A print-mode run needs a coordinator like any other session: tools read
-    /// their options through one, and `SessionMailbox::notify` resolves through
-    /// one. Without it every option read fails with `session not live` and
-    /// `bash` cannot run at all.
-    #[test]
-    fn spawn_registers_a_resolvable_coordinator() {
-        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let handle = spawn(HeadlessParams {
-            model: model.clone(),
+    fn test_params() -> HeadlessParams {
+        HeadlessParams {
+            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
             config: AgentConfig::default(),
             permissions_config: PermissionsConfig::default(),
             timeouts: Timeouts::default(),
@@ -999,7 +989,16 @@ mod tests {
             plugin_rules: Arc::default(),
             modes: Arc::default(),
             session_options: Default::default(),
-        });
+        }
+    }
+
+    /// A print-mode run needs a coordinator like any other session: tools read
+    /// their options through one, and `SessionMailbox::notify` resolves through
+    /// one. Without it every option read fails with `session not live` and
+    /// `bash` cannot run at all.
+    #[test]
+    fn spawn_registers_a_resolvable_coordinator() {
+        let handle = spawn(test_params()).unwrap();
 
         let session_id = handle.session_id.id();
         let coordinator = SessionCoordinatorHandle::resolve(session_id)
@@ -1012,6 +1011,52 @@ mod tests {
 
         drop(handle.task);
         let _ = futures_lite::future::block_on(coordinator.close());
+    }
+
+    #[test]
+    fn spawn_stops_when_coordinator_registration_fails() {
+        let session_id = MakiId::generate();
+        let existing = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id,
+            catalog: Default::default(),
+            definitions: Vec::new(),
+            persisted_options: Default::default(),
+            history: Vec::new(),
+            model: Arc::from("test"),
+            cwd: PathBuf::from("/tmp"),
+            model_policy: Arc::default(),
+            model_adopter: Arc::new(|_| {
+                Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
+            }),
+            directory_adopter: Arc::new(|path| {
+                Box::pin(async move { Ok(path) })
+                    as crate::session_coordinator::DirectoryAdoptionFuture
+            }),
+            checkpoint: Arc::new(
+                |request: maki_storage::checkpoint::CheckpointRequest<
+                    crate::session_coordinator::SessionCheckpoint,
+                >| {
+                    Box::pin(async move {
+                        Ok(maki_storage::checkpoint::CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as maki_storage::checkpoint::CheckpointFuture
+                },
+            ),
+            mailbox: SessionMailbox::new(session_id),
+        })
+        .unwrap();
+
+        let error = match spawn_with_session_id(test_params(), session_id) {
+            Ok(_) => panic!("duplicate coordinator registration succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            crate::session_coordinator::SessionCoordinatorError::DuplicateSession(session_id)
+        );
+        futures_lite::future::block_on(existing.close()).unwrap();
     }
 
     /// `/compact` reports success only when the compacted history is durable.

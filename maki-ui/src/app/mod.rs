@@ -2343,12 +2343,11 @@ impl App {
     /// deadlocks outright when the turn is itself waiting on the UI.
     /// Without a coordinator there is nothing to await, so it applies at once.
     fn toggle_coordinator_option(&mut self, id: &'static str, current: bool) -> Vec<Action> {
-        let enabled = !current;
         if self.coordinator.is_none() {
-            self.apply_toggled_option(id, enabled);
+            self.apply_toggled_option(id, !current);
             return Vec::new();
         }
-        vec![Action::ToggleSessionOption { id, enabled }]
+        vec![Action::ToggleSessionOption { id }]
     }
 
     /// The app-side half of a toggle, run once the coordinator has committed

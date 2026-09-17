@@ -38,7 +38,7 @@ const CHECKPOINT_RETRY_BACKOFFS: &[Duration] = &[
 ];
 #[cfg(test)]
 const CHECKPOINT_RETRY_BACKOFFS: &[Duration] =
-    &[Duration::from_millis(10), Duration::from_millis(20)];
+    &[Duration::from_millis(250), Duration::from_millis(500)];
 #[cfg(not(test))]
 const BACKGROUND_RETRY_BACKOFFS: &[Duration] = &[
     Duration::from_secs(1),
@@ -54,10 +54,19 @@ type Pending = Arc<Mutex<PendingState>>;
 #[derive(Default)]
 struct PendingState {
     entries: HashMap<MakiId, Entry>,
-    /// Latest state requested by the app. It may be newer than durable storage
-    /// while an entry is pending or being retried.
+    /// Latest authoritative state from the app or a successful coordinator
+    /// checkpoint. It may still be newer than durable storage.
     latest: HashMap<MakiId, Arc<AppSession>>,
+    latest_generations: HashMap<MakiId, u64>,
+    coordinator_pending: HashMap<MakiId, CoordinatorPending>,
     coordinator_history_bases: HashMap<MakiId, Arc<Vec<maki_providers::Message>>>,
+    next_generation: u64,
+}
+
+struct CoordinatorPending {
+    generation: u64,
+    session: Arc<AppSession>,
+    history_base: Option<Arc<Vec<maki_providers::Message>>>,
 }
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
@@ -74,6 +83,9 @@ enum Entry {
 struct PendingSave {
     session: Arc<AppSession>,
     waiters: Vec<CheckpointWaiter>,
+    generation: u64,
+    coordinator_generation: Option<u64>,
+    coordinator_history_base: Option<Arc<Vec<maki_providers::Message>>>,
     retry_attempt: usize,
     retry_at: Option<Instant>,
 }
@@ -112,7 +124,16 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
         let session_id = request.session_id;
         let version = request.version;
         let mut state = lock(&self.pending);
-        let Some(base) = state.latest.get(&session_id).cloned() else {
+        let (base, mut history_base) = if let Some(pending) =
+            state.coordinator_pending.get(&session_id)
+        {
+            (Arc::clone(&pending.session), pending.history_base.clone())
+        } else if let Some(latest) = state.latest.get(&session_id) {
+            (
+                Arc::clone(latest),
+                state.coordinator_history_bases.get(&session_id).cloned(),
+            )
+        } else {
             return Box::pin(async move {
                 Err(CheckpointError::Save {
                     session_id,
@@ -120,22 +141,32 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
                 })
             });
         };
-        if let Some(history) = &request.snapshot.history
+        if history_base.is_none()
+            && let Some(history) = &request.snapshot.history
             && !histories_match(base.messages(), history)
         {
-            state
-                .coordinator_history_bases
-                .entry(session_id)
-                .or_insert_with(|| Arc::new(base.messages().to_vec()));
+            history_base = Some(Arc::new(base.messages().to_vec()));
         }
         let merged = Arc::new(merge_checkpoint(&base, &request.snapshot));
-        state.latest.insert(session_id, Arc::clone(&merged));
+        let generation = next_generation(&mut state);
+        state.latest_generations.insert(session_id, generation);
+        state.coordinator_pending.insert(
+            session_id,
+            CoordinatorPending {
+                generation,
+                session: Arc::clone(&merged),
+                history_base: history_base.clone(),
+            },
+        );
         let (reply, response) = flume::bounded(1);
         enqueue_locked(
             &mut state.entries,
             PendingSave {
                 session: merged,
                 waiters: vec![CheckpointWaiter { version, reply }],
+                generation,
+                coordinator_generation: Some(generation),
+                coordinator_history_base: history_base,
                 retry_attempt: 0,
                 retry_at: None,
             },
@@ -214,17 +245,40 @@ impl StorageWriter {
         if !preserve_history {
             state.coordinator_history_bases.remove(&id);
         }
-        let session = state
+        let authoritative = state
             .latest
             .get(&id)
             .map(|latest| Arc::new(merge_tui_snapshot(&session, latest, preserve_history)))
             .unwrap_or(session);
-        state.latest.insert(id, Arc::clone(&session));
+        let generation = next_generation(&mut state);
+        state.latest.insert(id, Arc::clone(&authoritative));
+        state.latest_generations.insert(id, generation);
+        let coordinator_generation = state
+            .coordinator_pending
+            .contains_key(&id)
+            .then_some(generation);
+        let (session, coordinator_history_base) = state
+            .coordinator_pending
+            .get_mut(&id)
+            .map(|pending| {
+                let merged = Arc::new(merge_tui_snapshot(
+                    &authoritative,
+                    &pending.session,
+                    pending.history_base.is_some(),
+                ));
+                pending.generation = coordinator_generation.unwrap();
+                pending.session = Arc::clone(&merged);
+                (merged, pending.history_base.clone())
+            })
+            .unwrap_or((authoritative, None));
         enqueue_locked(
             &mut state.entries,
             PendingSave {
                 session,
                 waiters: Vec::new(),
+                generation,
+                coordinator_generation,
+                coordinator_history_base,
                 retry_attempt: 0,
                 retry_at: None,
             },
@@ -250,14 +304,19 @@ impl StorageWriter {
         let version = request.version;
         let (reply, response) = flume::bounded(1);
         let mut state = lock(&self.pending);
+        let generation = next_generation(&mut state);
         state
             .latest
             .insert(session_id, Arc::clone(&request.snapshot));
+        state.latest_generations.insert(session_id, generation);
         enqueue_locked(
             &mut state.entries,
             PendingSave {
                 session: request.snapshot,
                 waiters: vec![CheckpointWaiter { version, reply }],
+                generation,
+                coordinator_generation: None,
+                coordinator_history_base: None,
                 retry_attempt: 0,
                 retry_at: None,
             },
@@ -279,6 +338,8 @@ impl StorageWriter {
     pub fn forget(&self, id: MakiId) {
         let mut state = lock(&self.pending);
         state.latest.remove(&id);
+        state.latest_generations.remove(&id);
+        state.coordinator_pending.remove(&id);
         state.coordinator_history_bases.remove(&id);
     }
 
@@ -309,11 +370,14 @@ impl StorageWriter {
         let mut state = lock(&self.pending);
         if forget_snapshot {
             state.latest.remove(&id);
+            state.latest_generations.remove(&id);
+            state.coordinator_pending.remove(&id);
             state.coordinator_history_bases.remove(&id);
         }
         let replaced = state.entries.insert(id, Entry::Delete(Box::new(done)));
         drop(state);
         if let Some(Entry::Save(save)) = replaced {
+            discard_coordinator_candidate(&self.pending, id, &save);
             fail_waiters(
                 id,
                 save.waiters,
@@ -345,9 +409,19 @@ fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, PendingState> {
     pending.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn next_generation(state: &mut PendingState) -> u64 {
+    let generation = state.next_generation;
+    state.next_generation = generation.wrapping_add(1);
+    generation
+}
+
 fn enqueue_locked(entries: &mut HashMap<MakiId, Entry>, mut save: PendingSave) {
     let id = save.session.id;
     if let Some(Entry::Save(previous)) = entries.remove(&id) {
+        if !previous.waiters.is_empty() {
+            save.retry_attempt = previous.retry_attempt;
+            save.retry_at = previous.retry_at;
+        }
         save.waiters.extend(previous.waiters);
     }
     entries.insert(id, Entry::Save(save));
@@ -357,7 +431,83 @@ fn wake_checkpoint(pending: &Pending, wake: &flume::Sender<()>, id: MakiId) {
     if wake.send(()).is_err()
         && let Some(Entry::Save(save)) = lock(pending).entries.remove(&id)
     {
+        discard_coordinator_candidate(pending, id, &save);
         fail_waiters(id, save.waiters, "storage writer unavailable");
+    }
+}
+
+fn commit_save(pending: &Pending, id: MakiId, save: &PendingSave) {
+    let mut state = lock(pending);
+    if state.latest_generations.get(&id) != Some(&save.generation) {
+        return;
+    }
+    let Some(generation) = save.coordinator_generation else {
+        return;
+    };
+    let authoritative = state
+        .latest
+        .get(&id)
+        .map(|latest| {
+            Arc::new(merge_tui_snapshot(
+                latest,
+                &save.session,
+                save.coordinator_history_base.is_some(),
+            ))
+        })
+        .unwrap_or_else(|| Arc::clone(&save.session));
+    state.latest.insert(id, authoritative);
+    if let Some(history_base) = &save.coordinator_history_base {
+        state
+            .coordinator_history_bases
+            .insert(id, Arc::clone(history_base));
+    }
+    if state
+        .coordinator_pending
+        .get(&id)
+        .is_some_and(|pending| pending.generation == generation)
+    {
+        state.coordinator_pending.remove(&id);
+    }
+}
+
+fn discard_coordinator_candidate(pending: &Pending, id: MakiId, save: &PendingSave) {
+    let Some(generation) = save.coordinator_generation else {
+        return;
+    };
+    let mut state = lock(pending);
+    if state
+        .coordinator_pending
+        .get(&id)
+        .is_some_and(|pending| pending.generation == generation)
+    {
+        state.coordinator_pending.remove(&id);
+    }
+}
+
+fn requeue_save(
+    pending: &Pending,
+    id: MakiId,
+    save: PendingSave,
+) -> Result<(), Vec<CheckpointWaiter>> {
+    let mut state = lock(pending);
+    match state.entries.remove(&id) {
+        Some(Entry::Save(mut newer)) => {
+            if !save.waiters.is_empty() {
+                newer.retry_attempt = newer.retry_attempt.max(save.retry_attempt);
+                newer.retry_at = save.retry_at;
+            }
+            newer.waiters.extend(save.waiters);
+            state.entries.insert(id, Entry::Save(newer));
+            Ok(())
+        }
+        Some(Entry::Delete(done)) => {
+            state.entries.insert(id, Entry::Delete(done));
+            Err(save.waiters)
+        }
+        None => {
+            state.entries.insert(id, Entry::Save(save));
+            Ok(())
+        }
     }
 }
 
@@ -487,53 +637,46 @@ impl Writer {
                         continue;
                     }
                     save.retry_at = None;
-                    let mut result = self.write(&save.session);
-                    if result.is_err() && !save.waiters.is_empty() {
-                        self.report(
-                            id,
-                            result
-                                .as_ref()
-                                .map(|_| ())
-                                .map_err(|error| error.to_string()),
-                        );
-                        for backoff in CHECKPOINT_RETRY_BACKOFFS {
-                            std::thread::sleep(*backoff);
-                            result = self.write(&save.session);
-                            if result.is_ok() {
-                                break;
-                            }
-                        }
-                    }
-                    match result {
+                    match self.write(&save.session) {
                         Ok(()) => {
+                            commit_save(pending, id, &save);
                             acknowledge_waiters(id, save.waiters);
                             self.report(id, Ok::<(), &str>(()));
                         }
                         Err(error) => {
                             let message = error.to_string();
+                            self.report(id, Err(&message));
+                            if !save.waiters.is_empty()
+                                && save.retry_attempt < CHECKPOINT_RETRY_BACKOFFS.len()
+                            {
+                                save.retry_at = Some(
+                                    Instant::now() + CHECKPOINT_RETRY_BACKOFFS[save.retry_attempt],
+                                );
+                                save.retry_attempt += 1;
+                                if let Err(waiters) = requeue_save(pending, id, save) {
+                                    fail_waiters(
+                                        id,
+                                        waiters,
+                                        "checkpoint superseded by session deletion",
+                                    );
+                                }
+                                continue;
+                            }
+
                             let waiters = mem::take(&mut save.waiters);
+                            if save.coordinator_generation.is_some() {
+                                discard_coordinator_candidate(pending, id, &save);
+                                fail_waiters(id, waiters, &message);
+                                continue;
+                            }
+                            if !waiters.is_empty() {
+                                save.retry_attempt = 0;
+                            }
                             let backoff = BACKGROUND_RETRY_BACKOFFS
                                 [save.retry_attempt.min(BACKGROUND_RETRY_BACKOFFS.len() - 1)];
                             save.retry_attempt = save.retry_attempt.saturating_add(1);
                             save.retry_at = Some(Instant::now() + backoff);
-                            let replaced_by_delete = {
-                                let mut state = lock(pending);
-                                match state.entries.remove(&id) {
-                                    Some(Entry::Save(mut newer)) => {
-                                        newer.waiters.extend(save.waiters);
-                                        state.entries.insert(id, Entry::Save(newer));
-                                        false
-                                    }
-                                    Some(Entry::Delete(done)) => {
-                                        state.entries.insert(id, Entry::Delete(done));
-                                        true
-                                    }
-                                    None => {
-                                        state.entries.insert(id, Entry::Save(save));
-                                        false
-                                    }
-                                }
-                            };
+                            let replaced_by_delete = requeue_save(pending, id, save).is_err();
                             if !waiters.is_empty() {
                                 fail_waiters(
                                     id,
@@ -545,7 +688,6 @@ impl Writer {
                                     },
                                 );
                             }
-                            self.report(id, Err(message));
                         }
                     }
                 }
@@ -614,6 +756,7 @@ mod tests {
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const MODEL: &str = "test-model";
+    const FAILED_MODEL: &str = "failed-model";
     const CWD: &str = "/tmp/writer";
     const MSG_PREFIX: &str = "msg-";
     const RESUMED_MSG: &str = "resumed";
@@ -671,6 +814,46 @@ mod tests {
 
         assert!(AppSession::load(a_id, &dir).is_ok());
         assert_eq!(AppSession::load(b_id, &dir).unwrap().title, "renamed");
+    }
+
+    #[test]
+    fn older_in_flight_success_cannot_replace_newer_authoritative_snapshot() {
+        let pending: Pending = Arc::default();
+        let mut old = AppSession::new(MODEL, CWD);
+        let id = old.id;
+        old.set_title("old write".into());
+        let old = Arc::new(old);
+        {
+            let mut state = lock(&pending);
+            state.latest.insert(id, Arc::clone(&old));
+            state.latest_generations.insert(id, 1);
+            state.entries.insert(
+                id,
+                Entry::Save(PendingSave {
+                    session: Arc::clone(&old),
+                    waiters: Vec::new(),
+                    generation: 1,
+                    coordinator_generation: Some(1),
+                    coordinator_history_base: None,
+                    retry_attempt: 0,
+                    retry_at: None,
+                }),
+            );
+        }
+        let Entry::Save(old_in_flight) = lock(&pending).entries.remove(&id).unwrap() else {
+            unreachable!()
+        };
+        let mut newer = old.as_ref().clone();
+        newer.set_title("new authoritative".into());
+        {
+            let mut state = lock(&pending);
+            state.latest.insert(id, Arc::new(newer));
+            state.latest_generations.insert(id, 2);
+        }
+
+        commit_save(&pending, id, &old_in_flight);
+
+        assert_eq!(lock(&pending).latest[&id].title, "new authoritative");
     }
 
     #[test]
@@ -905,6 +1088,62 @@ mod tests {
     }
 
     #[test]
+    fn failed_coordinator_checkpoint_is_not_a_later_tui_merge_base() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            block_sessions_dir(&dir);
+            let (writer, warn_rx) = writer(&dir);
+            let session = AppSession::new(MODEL, CWD);
+            let id = session.id;
+            writer.send(Arc::new(session.clone()));
+            let warning = warn_rx.recv_async().await.unwrap();
+            assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
+
+            let options = maki_agent::session_options::SessionOptions::new(
+                maki_agent::session_coordinator::builtin_option_definitions(
+                    FAILED_MODEL,
+                    [Arc::from(FAILED_MODEL)],
+                    true,
+                    true,
+                    true,
+                    maki_agent::ThinkingConfig::Off,
+                ),
+                &Default::default(),
+            )
+            .unwrap()
+            .snapshot();
+            let result = writer
+                .coordinator_checkpoint()
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: 1,
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(SessionCheckpoint {
+                        history: None,
+                        model: Arc::from(FAILED_MODEL),
+                        cwd: CWD.into(),
+                        options,
+                    }),
+                })
+                .await;
+            assert!(matches!(result, Err(CheckpointError::Save { .. })));
+
+            std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+            writer.send(Arc::new(session));
+            writer.shutdown(DRAIN_TIMEOUT);
+
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, MODEL);
+            assert!(!loaded.meta.yolo);
+            assert!(!loaded.meta.fast);
+            assert!(!loaded.meta.workflow);
+            assert!(loaded.meta.session_options.is_empty());
+        });
+    }
+
+    #[test]
     fn failed_checkpoint_retries_without_another_wake() {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
@@ -930,6 +1169,61 @@ mod tests {
             assert_eq!(warn_rx.recv_async().await.unwrap(), SAVE_RECOVERED);
             writer.shutdown(DRAIN_TIMEOUT);
             assert!(AppSession::load(id, &dir).is_ok());
+        });
+    }
+
+    #[test]
+    fn failed_checkpoint_does_not_delay_another_session() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let sessions_dir = dir.path().join(SESSIONS_DIR);
+            std::fs::create_dir(&sessions_dir).unwrap();
+            let (writer, warn_rx) = writer(&dir);
+            let blocked = AppSession::new(MODEL, CWD);
+            let blocked_id = blocked.id;
+            let blocked_tmp = sessions_dir.join(format!("{blocked_id}.jsonl.tmp"));
+            std::fs::create_dir(&blocked_tmp).unwrap();
+            let blocked_ack = writer.checkpoint(CheckpointRequest {
+                session_id: blocked_id,
+                version: CheckpointVersion {
+                    revision: blocked.revision(),
+                    epoch: 1,
+                },
+                snapshot: Arc::new(blocked),
+            });
+            let warning = warn_rx.recv_async().await.unwrap();
+            assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
+
+            let healthy = AppSession::new(MODEL, CWD);
+            let healthy_id = healthy.id;
+            let healthy_version = CheckpointVersion {
+                revision: healthy.revision(),
+                epoch: 1,
+            };
+            let healthy_ack = writer.checkpoint(CheckpointRequest {
+                session_id: healthy_id,
+                version: healthy_version,
+                snapshot: Arc::new(healthy),
+            });
+            let healthy_result =
+                futures_lite::future::race(async { Some(healthy_ack.await) }, async {
+                    smol::Timer::after(Duration::from_millis(100)).await;
+                    None
+                })
+                .await;
+            assert_eq!(
+                healthy_result
+                    .expect("healthy checkpoint was delayed by another session")
+                    .unwrap()
+                    .version,
+                healthy_version
+            );
+
+            std::fs::remove_dir(blocked_tmp).unwrap();
+            assert!(blocked_ack.await.is_ok());
+            writer.shutdown(DRAIN_TIMEOUT);
+            assert!(AppSession::load(healthy_id, &dir).is_ok());
+            assert!(AppSession::load(blocked_id, &dir).is_ok());
         });
     }
 

@@ -1251,7 +1251,10 @@ enum SessionOpKind {
     /// `/model` from a keybinding or command: apply the adopted model.
     ModelChanged { spec: String },
     /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
-    OptionToggled { id: &'static str, enabled: bool },
+    OptionToggled {
+        id: &'static str,
+        committed: Arc<std::sync::Mutex<Option<bool>>>,
+    },
     /// `/cd`: apply the canonical path the coordinator resolved, which is not
     /// necessarily the one that was typed.
     DirectoryChanged {
@@ -2561,8 +2564,8 @@ impl<'t> EventLoop<'t> {
         );
     }
 
-    /// `maki.model.set`: adopt the model and the fast flag through the
-    /// coordinator off-thread, then apply the app-side state and reply.
+    /// `maki.model.set`: atomically adopt all requested model settings through
+    /// the coordinator off-thread, then apply the app-side state and reply.
     fn dispatch_model_set(
         &mut self,
         spec: Option<String>,
@@ -2587,8 +2590,7 @@ impl<'t> EventLoop<'t> {
             }
         };
         let coordinator = self.sessions[idx].coordinator.clone();
-        let op_spec = spec.clone();
-        let op_thinking = thinking.map(|thinking| thinking.to_string());
+        let op_spec = spec.as_deref().map(Arc::from);
         self.dispatch_session_op(
             idx,
             SessionOpKind::ModelSet {
@@ -2598,33 +2600,11 @@ impl<'t> EventLoop<'t> {
                 reply_tx,
             },
             async move {
-                if let Some(spec) = op_spec {
-                    coordinator
-                        .set_option("model", spec.as_str())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                if let Some(fast) = fast {
-                    coordinator
-                        .set_option(
-                            maki_agent::session_options::FAST_OPTION_ID,
-                            Self::boolean_option_value(fast),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                // After the model, so a switch to a thinking model can turn
-                // thinking on in the same call.
-                if let Some(thinking) = op_thinking {
-                    coordinator
-                        .set_option(
-                            maki_agent::session_options::THINKING_OPTION_ID,
-                            thinking.as_str(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok(())
+                coordinator
+                    .set_model(op_spec, fast, thinking)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             },
         );
     }
@@ -2972,21 +2952,12 @@ impl<'t> EventLoop<'t> {
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
-            Action::ToggleSessionOption { id, enabled } => {
-                let coordinator = self.sessions[idx].coordinator.clone();
-                let value = Self::boolean_option_value(enabled);
-                self.dispatch_session_op(
-                    idx,
-                    SessionOpKind::OptionToggled { id, enabled },
-                    async move {
-                        coordinator
-                            .set_option(id, value)
-                            .await
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    },
-                );
-            }
+            Action::ToggleSessionOption { id } => dispatch_option_toggle(
+                self.sessions[idx].coordinator.clone(),
+                self.sessions[idx].id(),
+                id,
+                &self.internal_tx,
+            ),
             Action::ChangeDirectory(path) => {
                 self.note_if_deferred(idx, "cd");
                 let coordinator = self.sessions[idx].coordinator.clone();
@@ -3142,8 +3113,16 @@ impl<'t> EventLoop<'t> {
                 Ok(()) => self.apply_model_change(idx, &spec),
                 Err(error) => self.sessions[idx].app.flash(error),
             },
-            SessionOpKind::OptionToggled { id, enabled } => match result {
-                Ok(()) => self.sessions[idx].app.apply_toggled_option(id, enabled),
+            SessionOpKind::OptionToggled { id, committed } => match result {
+                Ok(()) => {
+                    let enabled = committed
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take();
+                    if let Some(enabled) = enabled {
+                        self.sessions[idx].app.apply_toggled_option(id, enabled);
+                    }
+                }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::DirectoryChanged { adopted } => match result {
@@ -3491,6 +3470,32 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+fn dispatch_option_toggle(
+    coordinator: SessionCoordinatorHandle,
+    session: MakiId,
+    id: &'static str,
+    internal_tx: &flume::Sender<InternalEvent>,
+) {
+    let committed: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
+    let slot = Arc::clone(&committed);
+    let internal_tx = internal_tx.clone();
+    smol::spawn(async move {
+        let result = coordinator
+            .toggle_boolean_option(id)
+            .await
+            .map(|(enabled, _)| {
+                *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
+            })
+            .map_err(|error| error.to_string());
+        let _ = internal_tx.send(InternalEvent::SessionOp {
+            session,
+            kind: SessionOpKind::OptionToggled { id, committed },
+            result,
+        });
+    })
+    .detach();
+}
+
 fn ring_bell() {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -3511,6 +3516,61 @@ mod tests {
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
+
+    #[test]
+    fn rapid_double_toggle_preserves_both_intents() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let coordinator = test_coordinator(id);
+            let (internal_tx, internal_rx) = flume::unbounded();
+
+            dispatch_option_toggle(
+                coordinator.clone(),
+                id,
+                maki_agent::session_options::YOLO_OPTION_ID,
+                &internal_tx,
+            );
+            dispatch_option_toggle(
+                coordinator.clone(),
+                id,
+                maki_agent::session_options::YOLO_OPTION_ID,
+                &internal_tx,
+            );
+
+            let mut committed = Vec::new();
+            for _ in 0..2 {
+                let InternalEvent::SessionOp {
+                    session,
+                    kind:
+                        SessionOpKind::OptionToggled {
+                            committed: value, ..
+                        },
+                    result,
+                } = internal_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected option toggle completion");
+                };
+                assert_eq!(session, id);
+                result.unwrap();
+                committed.push(value.lock().unwrap().take().unwrap());
+            }
+
+            assert_eq!(committed, [true, false]);
+            let yolo = coordinator
+                .read()
+                .options()
+                .options
+                .iter()
+                .find(|option| {
+                    option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+                })
+                .unwrap()
+                .current_value
+                .clone();
+            assert_eq!(yolo.as_ref(), maki_agent::session_options::DISABLED_VALUE);
+            coordinator.close().await.unwrap();
+        });
+    }
 
     fn model_named(id: &str) -> Model {
         let mut model = crate::components::test_model();

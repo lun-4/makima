@@ -104,9 +104,10 @@ impl SessionLock {
 
     fn release(&mut self) {
         let _ = self.stop_tx.send(());
-        if let Some(t) = self.thread.take()
-            && t.join().is_ok()
-        {
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                warn!(session_id = %self.id, "session lock heartbeat thread terminated abnormally");
+            }
             session_lock::release(&self.dir, &self.id);
         }
     }
@@ -496,14 +497,10 @@ async fn load_session(
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history_from(&params.storage, session_ref.id())?;
     close_session(srv).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers, params).await;
+    let session_cwd = effective_session_cwd(restored.cwd.as_deref(), &req.cwd);
+    let mcp = start_mcp(&session_cwd, &req.mcp_servers, params).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
-    let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
-    for update in translate::replay_history(&restored.history, replay_cwd, home.as_deref()) {
-        session_update(&srv.out_tx, &sid, update);
-    }
-    let session_cwd = restored.cwd.clone().unwrap_or(req.cwd);
     let recorded_model = match Model::from_spec(&restored.model) {
         Ok(model) if params.model_policy.allows(&model.spec()) => model,
         _ => params.model.clone(),
@@ -518,6 +515,7 @@ async fn load_session(
         .map(maki_agent::ThinkingConfig::from)
         .filter(|_| recorded_model.supports_thinking())
         .unwrap_or_default();
+    let replay_history = restored.history.clone();
     let coordinator_history = restored.history.clone();
     let handle = spawn_session(
         params,
@@ -547,7 +545,7 @@ async fn load_session(
             current_model: spec,
             history: coordinator_history,
             initial_cost: restored_cost,
-            cwd: session_cwd,
+            cwd: session_cwd.clone(),
             fast,
             workflow,
             thinking,
@@ -556,6 +554,9 @@ async fn load_session(
     )
     .await
     .map_err(session_registration_error)?;
+    for update in translate::replay_history(&replay_history, &session_cwd, home.as_deref()) {
+        session_update(&srv.out_tx, &sid, update);
+    }
     let resp = methods::load_session_response(&srv.modes).config_options(
         methods::session_config_options(&snapshot, srv.supports_boolean),
     );
@@ -650,7 +651,7 @@ fn pairs<T>(items: &[T], split: impl Fn(&T) -> (&String, &String)) -> HashMap<St
         .collect()
 }
 
-/// MCP is per session: the client picks the cwd and may inject its own servers.
+/// MCP is per session: its effective cwd selects project config and the client may inject servers.
 /// Returns as soon as the config is read, the first prompt waits for the tools.
 async fn start_mcp(cwd: &Path, servers: &[McpServer], params: &AcpParams) -> Option<McpHandle> {
     let (handle, errors) = mcp::start_with_extra_and_commands(
@@ -714,7 +715,14 @@ fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String
             {
                 return;
             }
-            let _ = session_lock::heartbeat(&beat_dir, &id);
+            match session_lock::heartbeat(&beat_dir, &id) {
+                Ok(session_lock::LockBeat::Lost) => {
+                    warn!(session_id = %id, "session lock heartbeat lost ownership");
+                    return;
+                }
+                Err(error) => warn!(session_id = %id, %error, "session lock heartbeat failed"),
+                Ok(session_lock::LockBeat::Claimed | session_lock::LockBeat::Held) => {}
+            }
         }
     });
     Ok(SessionLock {
@@ -1672,6 +1680,10 @@ async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentRespons
     ))
 }
 
+fn effective_session_cwd(restored: Option<&Path>, client: &Path) -> PathBuf {
+    restored.unwrap_or(client).to_path_buf()
+}
+
 fn handle_notification(srv: &Server, method: &str, raw: &Value) {
     match method {
         "session/cancel" => {
@@ -1683,7 +1695,7 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                 return;
             };
             if let Ok(session) = validate_session(srv, requested) {
-                let (cancellation, permission_answers) = {
+                let (cancellation, permission_answers, elicitation) = {
                     let mut pending = session.pending.lock().unwrap();
                     let Some(operation) = pending
                         .operation
@@ -1695,12 +1707,18 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     operation.cancelling = true;
                     let cancellation = operation.cancel.take();
                     let permission_answers = std::mem::take(&mut pending.permissions);
-                    pending.elicitation = None;
-                    (cancellation, permission_answers)
+                    let elicitation = pending.elicitation.take();
+                    (cancellation, permission_answers, elicitation)
                 };
                 let denial = PermissionAnswer::Deny.encode();
                 for answer_tx in permission_answers.into_values() {
                     let _ = answer_tx.send(denial.clone());
+                }
+                if elicitation.is_some() {
+                    let _ = session
+                        .handle
+                        .answer_tx
+                        .send(serde_json::json!({ "dismissed": true }).to_string());
                 }
                 if let Some(trigger) = cancellation {
                     trigger.cancel();
@@ -1923,15 +1941,32 @@ fn start_event_pump(
                     {
                         let request = AgentRequest::CreateElicitationRequest(request);
                         let request_id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-                        pending.lock().unwrap().elicitation = Some(request_id);
-                        send(
-                            &out_tx,
-                            Request {
-                                id: RequestId::Number(request_id),
-                                method: Arc::from(request.method()),
-                                params: Some(request),
-                            },
-                        );
+                        let should_send = {
+                            let mut pending = pending.lock().unwrap();
+                            if pending
+                                .operation
+                                .as_ref()
+                                .is_some_and(|operation| operation.cancelling)
+                            {
+                                false
+                            } else {
+                                pending.elicitation = Some(request_id);
+                                true
+                            }
+                        };
+                        if should_send {
+                            send(
+                                &out_tx,
+                                Request {
+                                    id: RequestId::Number(request_id),
+                                    method: Arc::from(request.method()),
+                                    params: Some(request),
+                                },
+                            );
+                        } else {
+                            let _ = answer_tx
+                                .send(serde_json::json!({ "dismissed": true }).to_string());
+                        }
                     } else {
                         // A question we cannot render as a form (non-array
                         // input, or a host without elicitation) still has a
@@ -2358,6 +2393,28 @@ mod tests {
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
         };
         (server, answer_rx, out_rx, input_rx)
+    }
+
+    #[test]
+    fn abnormal_heartbeat_thread_termination_releases_lock() {
+        let dir = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        assert_eq!(
+            session_lock::heartbeat(dir.path(), &id).unwrap(),
+            session_lock::LockBeat::Claimed
+        );
+        let (stop_tx, _) = flume::bounded(1);
+        let thread = std::thread::spawn(|| panic!("heartbeat failed"));
+        let lock = SessionLock {
+            dir: dir.path().to_path_buf(),
+            id,
+            stop_tx,
+            thread: Some(thread),
+        };
+
+        drop(lock);
+
+        assert!(!session_lock::open_elsewhere(dir.path(), &id));
     }
 
     #[test]
@@ -2993,6 +3050,39 @@ mod tests {
     }
 
     #[test]
+    fn cancel_dismisses_pending_elicitation_and_rejects_late_answer() {
+        let (srv, answer_rx, ..) = server_awaiting_answer();
+        let session = srv.session.as_ref().unwrap();
+        let mut pending = session.pending.lock().unwrap();
+        pending.permissions.clear();
+        pending.elicitation = Some(ANSWERED_ID);
+        pending.operation = Some(PendingOperation {
+            id: 1,
+            request_id: RequestId::Number(41),
+            kind: OperationKind::TestLocal,
+            cancelling: false,
+            cancel: None,
+            _lease: None,
+        });
+        drop(pending);
+
+        handle_notification(
+            &srv,
+            "session/cancel",
+            &serde_json::json!({
+                "params": { "sessionId": session.handle.session_id.to_string() }
+            }),
+        );
+
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(r#"{"dismissed":true}"#.to_string())
+        );
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(answer_rx.is_empty(), "the late answer must be ignored");
+    }
+
+    #[test]
     fn cancel_during_permission_allows_the_next_prompt() {
         smol::block_on(async {
             let (mut srv, answer_rx, out_rx, input_rx) = server_awaiting_answer();
@@ -3434,6 +3524,65 @@ mod tests {
             Some(r#"{"dismissed":true}"#.to_string()),
             "a broken answer must still unblock the waiting tool"
         );
+    }
+
+    #[test]
+    fn cancelled_operation_dismisses_late_question() {
+        let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+        let (out_tx, out_rx) = flume::unbounded::<Value>();
+        let (answer_tx, answer_rx) = flume::unbounded::<String>();
+        let pending = Arc::new(Mutex::new(Pending {
+            operation: Some(PendingOperation {
+                id: 1,
+                request_id: RequestId::Number(41),
+                kind: OperationKind::TestLocal,
+                cancelling: true,
+                cancel: None,
+                _lease: None,
+            }),
+            ..Default::default()
+        }));
+        let session_id = SessionRef::from(MakiId::generate());
+        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+
+        start_event_pump(
+            event_rx,
+            session_id,
+            out_tx,
+            pending,
+            true,
+            answer_tx,
+            coordinator.read(),
+            maki_storage::paths::home(),
+            None,
+        );
+        event_tx
+            .send(Envelope {
+                event: AgentEvent::Question {
+                    id: "t1".to_string(),
+                    questions: serde_json::json!([{
+                        "question": "Continue?",
+                        "header": "Confirm",
+                        "options": [{ "label": "Yes", "description": "Continue" }],
+                        "multiSelect": false
+                    }]),
+                },
+                subagent: None,
+                run_id: 0,
+            })
+            .unwrap();
+
+        assert_eq!(
+            answer_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .unwrap(),
+            r#"{"dismissed":true}"#
+        );
+        assert!(
+            out_rx.is_empty(),
+            "cancelled turn must not solicit the client"
+        );
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]
@@ -4684,6 +4833,56 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, AcpError::internal_error().code);
         assert!(input_rx.is_empty());
+    }
+
+    #[test]
+    fn restored_cwd_overrides_client_cwd() {
+        let restored = PathBuf::from("/restored/project");
+        let client = PathBuf::from("/client/project");
+
+        assert_eq!(effective_session_cwd(Some(&restored), &client), restored);
+        assert_eq!(effective_session_cwd(None, &client), client);
+    }
+
+    #[test]
+    fn load_failure_does_not_replay_transcript() {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+                Session::new(OFFLINE_SPEC, &tmp.path().to_string_lossy());
+            session.replace_messages(vec![Message::user("not yet visible".into())]);
+            let storage = StateDir::from_path(tmp.path().to_path_buf());
+            session.save(&storage).unwrap();
+            let coordinator = test_coordinator(session.id, OFFLINE_SPEC, tmp.path().to_path_buf());
+            let params = test_params(
+                Model::from_spec(OFFLINE_SPEC).unwrap(),
+                tmp.path().to_path_buf(),
+            );
+            let (out_tx, out_rx) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                model_specs: vec![OFFLINE_SPEC.to_owned()],
+                modes: Arc::clone(&params.modes),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+            };
+            let raw = serde_json::json!({
+                "params": {
+                    "sessionId": session.id.to_string(),
+                    "cwd": tmp.path(),
+                    "mcpServers": []
+                }
+            });
+
+            assert!(load_session(&mut srv, &raw, &params).await.is_err());
+            assert!(
+                out_rx.is_empty(),
+                "failed installation must not replay history"
+            );
+            coordinator.close().await.unwrap();
+        });
     }
 
     #[test]

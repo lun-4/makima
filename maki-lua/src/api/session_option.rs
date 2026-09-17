@@ -129,6 +129,14 @@ fn required_string(spec: &Table, id: &str, key: &str) -> LuaResult<Arc<str>> {
         .ok_or_else(|| spec_error(id, format!("{key} is required")))
 }
 
+fn required_category(spec: &Table, id: &str) -> LuaResult<SessionOptionCategory> {
+    match required_string(spec, id, "category")?.as_ref() {
+        "model" => Ok(SessionOptionCategory::Model),
+        "mode" => Ok(SessionOptionCategory::Mode),
+        category => Err(spec_error(id, format!("unknown category {category:?}"))),
+    }
+}
+
 fn parse_values(spec: &Table, id: &str) -> LuaResult<Arc<[SessionOptionValue]>> {
     let values = spec
         .get::<Table>("values")?
@@ -165,11 +173,7 @@ fn parse_definition(
             return Err(spec_error(&id, format!("unknown spec key {key:?}")));
         }
     }
-    let category = match spec.get::<String>("category")?.as_str() {
-        "model" => SessionOptionCategory::Model,
-        "mode" => SessionOptionCategory::Mode,
-        category => return Err(spec_error(&id, format!("unknown category {category:?}"))),
-    };
+    let category = required_category(spec, &id)?;
     let definition = SessionOptionDefinition {
         id: Arc::clone(&id),
         owner: SessionOptionOwner::Plugin {
@@ -853,6 +857,29 @@ mod tests {
             .eval::<Function>()
             .unwrap();
         assert!(validate_function(&lua, valid, "a").is_ok());
+    }
+
+    const MISSING_CATEGORY_ERR: &str =
+        "register_session_option: option \"test.choice\": category is required";
+
+    #[test_case("spec.category = nil"; "missing")]
+    #[test_case("spec.category = ''"; "empty")]
+    fn missing_category_is_a_programmer_error(mutation: &str) {
+        let lua = Lua::new();
+        lua.set_app_data(crate::runtime::LoadingPlugin(Arc::from("test"), 1));
+        let pending = PendingSessionOptions::new(Arc::from("test"), 1);
+        let api = lua.create_table().unwrap();
+        add_session_option_fn(&api, &lua, pending, None).unwrap();
+        lua.globals().set("api", api).unwrap();
+        lua.globals().set("spec", option_spec(&lua)).unwrap();
+
+        let error = lua
+            .load(format!(
+                "{mutation}; return api.register_session_option(spec)"
+            ))
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(error.to_string().contains(MISSING_CATEGORY_ERR));
     }
 
     #[test]

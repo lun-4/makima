@@ -2110,6 +2110,18 @@ struct LuaRuntime {
     command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
 }
 
+fn discard_pending_prompt_callbacks(lua: &Lua, pending: PendingPromptHintCallbacks) {
+    let map = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+    for regs in map.into_values() {
+        for reg in regs {
+            if let HintContent::Callback(key) = reg.content {
+                let _ = lua.remove_registry_value(key);
+            }
+        }
+    }
+    lua.remove_app_data::<PendingPromptHintCallbacks>();
+}
+
 impl LuaRuntime {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2697,14 +2709,7 @@ impl LuaRuntime {
     }
 
     fn discard_pending_plugin_slice(&mut self, pending: PendingPromptHintCallbacks) {
-        let map = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
-        for regs in map.into_values() {
-            for reg in regs {
-                if let HintContent::Callback(key) = reg.content {
-                    let _ = self.lua.remove_registry_value(key);
-                }
-            }
-        }
+        discard_pending_prompt_callbacks(&self.lua, pending);
     }
 
     fn discard_pending_completion(
@@ -4922,6 +4927,26 @@ mod tests {
         change_identity(&mut pending);
 
         assert!(!lifecycle_superseded(&this, &pending));
+    }
+
+    #[test]
+    fn discarded_prompt_callbacks_leave_no_stale_candidate() {
+        let lua = test_lua();
+        let pending: PendingPromptHintCallbacks = Arc::default();
+        let callback = lua.create_function(|_, ()| Ok(())).unwrap();
+        let key = lua.create_registry_value(callback).unwrap();
+        pending.lock().unwrap().insert(
+            Arc::from("failed"),
+            vec![PromptHintRegistration {
+                prompts: None,
+                slot: Slot::ToolUsage,
+                content: HintContent::Callback(key),
+            }],
+        );
+        lua.set_app_data(Arc::clone(&pending));
+        discard_pending_prompt_callbacks(&lua, pending);
+
+        assert!(lua.app_data_ref::<PendingPromptHintCallbacks>().is_none());
     }
 
     #[test]

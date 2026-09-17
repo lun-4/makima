@@ -232,7 +232,6 @@ pub enum Action {
     /// through the coordinator, off the event-loop thread.
     ToggleSessionOption {
         id: &'static str,
-        enabled: bool,
     },
     /// `/cd`, adopted through the coordinator off the event-loop thread.
     ChangeDirectory(std::path::PathBuf),

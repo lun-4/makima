@@ -222,6 +222,16 @@ enum Operation {
         version: Option<u64>,
         reply: flume::Sender<Result<SessionOptionsSnapshot, SessionCoordinatorError>>,
     },
+    ToggleBooleanOption {
+        id: Arc<str>,
+        reply: flume::Sender<Result<(bool, SessionOptionsSnapshot), SessionCoordinatorError>>,
+    },
+    SetModel {
+        spec: Option<Arc<str>>,
+        fast: Option<bool>,
+        thinking: Option<ThinkingConfig>,
+        reply: flume::Sender<Result<SessionOptionsSnapshot, SessionCoordinatorError>>,
+    },
     ReplaceHistory {
         history: Arc<Vec<Message>>,
         reply: flume::Sender<Result<(), SessionCoordinatorError>>,
@@ -509,6 +519,53 @@ impl SessionCoordinatorHandle {
                 id: id.into(),
                 value: value.into(),
                 version,
+                reply,
+            })
+            .await
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
+        response
+            .recv_async()
+            .await
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?
+    }
+
+    pub fn toggle_boolean_option(
+        &self,
+        id: impl Into<Arc<str>>,
+    ) -> impl Future<Output = Result<(bool, SessionOptionsSnapshot), SessionCoordinatorError>> + Send
+    {
+        let session_id = self.session_id;
+        let (reply, response) = flume::bounded(1);
+        let submitted = self.ensure_live().and_then(|()| {
+            self.tx
+                .send(Operation::ToggleBooleanOption {
+                    id: id.into(),
+                    reply,
+                })
+                .map_err(|_| SessionCoordinatorError::StaleSession(session_id))
+        });
+        async move {
+            submitted?;
+            response
+                .recv_async()
+                .await
+                .map_err(|_| SessionCoordinatorError::StaleSession(session_id))?
+        }
+    }
+
+    pub async fn set_model(
+        &self,
+        spec: Option<Arc<str>>,
+        fast: Option<bool>,
+        thinking: Option<ThinkingConfig>,
+    ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
+        self.ensure_live()?;
+        let (reply, response) = flume::bounded(1);
+        self.tx
+            .send_async(Operation::SetModel {
+                spec,
+                fast,
+                thinking,
                 reply,
             })
             .await
@@ -884,6 +941,12 @@ fn reject_operation(operation: Operation, session_id: MakiId) {
         Operation::SetOption { reply, .. } | Operation::UpdateModelValues { reply, .. } => {
             let _ = reply.send(Err(error()));
         }
+        Operation::ToggleBooleanOption { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Operation::SetModel { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
         Operation::ReplaceHistory { reply, .. } => {
             let _ = reply.send(Err(error()));
         }
@@ -923,12 +986,36 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
                     &*ctx.model_policy,
                     &*ctx.model_adopter,
                     &*ctx.checkpoint,
-                    &value,
+                    Some(Arc::clone(&value)),
+                    None,
+                    None,
                 )
                 .await
             } else {
                 set_option(&ctx.read, &*ctx.checkpoint, &id, &value).await
             };
+            let _ = reply.send(result);
+        }
+        Operation::ToggleBooleanOption { id, reply } => {
+            let result = toggle_boolean_option(&ctx.read, &*ctx.checkpoint, &id).await;
+            let _ = reply.send(result);
+        }
+        Operation::SetModel {
+            spec,
+            fast,
+            thinking,
+            reply,
+        } => {
+            let result = set_model(
+                &ctx.read,
+                &ctx.model_policy,
+                &*ctx.model_adopter,
+                &*ctx.checkpoint,
+                spec,
+                fast,
+                thinking,
+            )
+            .await;
             let _ = reply.send(result);
         }
         Operation::ReplaceHistory { history, reply } => {
@@ -1109,41 +1196,8 @@ async fn hold_lease(
                 })
                 .detach();
 
-                let result = match timeout {
-                    Some(timeout) => {
-                        futures_lite::future::or(
-                            async {
-                                smol::Timer::after(timeout).await;
-                                Err(CheckpointError::Save {
-                                    session_id: ctx.session_id,
-                                    message: Arc::from(CHECKPOINT_TIMEOUT_MESSAGE),
-                                }
-                                .into())
-                            },
-                            async {
-                                completed_rx.recv_async().await.unwrap_or(Err(
-                                    SessionCoordinatorError::StaleSession(ctx.session_id),
-                                ))
-                            },
-                        )
-                        .await
-                    }
-                    None => completed_rx
-                        .recv_async()
-                        .await
-                        .unwrap_or(Err(SessionCoordinatorError::StaleSession(ctx.session_id))),
-                };
-                let timed_out = matches!(
-                    &result,
-                    Err(SessionCoordinatorError::Checkpoint(CheckpointError::Save {
-                        message,
-                        ..
-                    })) if message.as_ref() == CHECKPOINT_TIMEOUT_MESSAGE
-                );
-                let _ = reply.send(result);
-                if !timed_out {
-                    let _ = wait.recv_async().await;
-                }
+                finish_history_commit(ctx, rx, wait, deferred, completed_rx, timeout, reply)
+                    .await;
                 return;
             }
             // Released without a commit, or the holder dropped.
@@ -1164,6 +1218,119 @@ async fn hold_lease(
             Either::Right(Err(_)) => return,
         }
     }
+}
+
+async fn finish_history_commit(
+    ctx: &CoordinatorCtx,
+    rx: &flume::Receiver<Operation>,
+    wait: &flume::Receiver<LeaseRelease>,
+    deferred: &mut VecDeque<Operation>,
+    completed: flume::Receiver<Result<(), SessionCoordinatorError>>,
+    timeout: Option<Duration>,
+    reply: flume::Sender<Result<(), SessionCoordinatorError>>,
+) {
+    let (timeout_tx, timeout_rx) = flume::bounded(1);
+    if let Some(timeout) = timeout {
+        smol::spawn(async move {
+            smol::Timer::after(timeout).await;
+            let _ = timeout_tx.send(());
+        })
+        .detach();
+    }
+    let mut checkpoint_completed = false;
+    let mut lease_released = false;
+    let mut closing = false;
+    let mut replied = false;
+    loop {
+        let completion = std::pin::pin!(async {
+            if checkpoint_completed {
+                futures_lite::future::pending().await
+            } else {
+                completed.recv_async().await
+            }
+        });
+        let release = std::pin::pin!(async {
+            if lease_released {
+                futures_lite::future::pending().await
+            } else {
+                wait.recv_async().await
+            }
+        });
+        let incoming = std::pin::pin!(rx.recv_async());
+        let deadline = std::pin::pin!(async {
+            if replied {
+                futures_lite::future::pending().await
+            } else {
+                timeout_rx.recv_async().await
+            }
+        });
+        let event = futures_lite::future::or(
+            async { CommitEvent::Completed(completion.await) },
+            async {
+                futures_lite::future::or(
+                    async { CommitEvent::Released(release.await) },
+                    async {
+                        futures_lite::future::or(
+                            async { CommitEvent::Incoming(incoming.await) },
+                            async { CommitEvent::TimedOut(deadline.await) },
+                        )
+                        .await
+                    },
+                )
+                .await
+            },
+        )
+        .await;
+        match event {
+            CommitEvent::Completed(result) => {
+                checkpoint_completed = true;
+                if !replied {
+                    let result = result
+                        .unwrap_or(Err(SessionCoordinatorError::StaleSession(ctx.session_id)));
+                    let _ = reply.send(result);
+                    replied = true;
+                }
+            }
+            CommitEvent::TimedOut(Ok(())) if !replied => {
+                let _ = reply.send(Err(CheckpointError::Save {
+                    session_id: ctx.session_id,
+                    message: Arc::from(CHECKPOINT_TIMEOUT_MESSAGE),
+                }
+                .into()));
+                replied = true;
+            }
+            CommitEvent::Released(Ok(LeaseRelease::Release)) | CommitEvent::Released(Err(_)) => {
+                lease_released = true;
+            }
+            CommitEvent::Released(Ok(LeaseRelease::CommitHistory { reply, .. })) => {
+                let _ = reply.send(Err(SessionCoordinatorError::SessionBusy(ctx.session_id)));
+            }
+            CommitEvent::Incoming(Ok(operation)) => {
+                if closing {
+                    reject_operation(operation, ctx.session_id);
+                } else if matches!(operation, Operation::Close { .. }) {
+                    deferred.push_back(operation);
+                    closing = true;
+                } else if defers_behind_lease(&operation) {
+                    deferred.push_back(operation);
+                } else {
+                    let _ = handle_operation(ctx, operation).await;
+                }
+            }
+            CommitEvent::Incoming(Err(_)) => closing = true,
+            CommitEvent::TimedOut(_) => {}
+        }
+        if lease_released && (checkpoint_completed || closing) {
+            return;
+        }
+    }
+}
+
+enum CommitEvent {
+    Completed(Result<Result<(), SessionCoordinatorError>, flume::RecvError>),
+    Released(Result<LeaseRelease, flume::RecvError>),
+    Incoming(Result<Operation, flume::RecvError>),
+    TimedOut(Result<(), flume::RecvError>),
 }
 
 enum Either<L, R> {
@@ -1357,64 +1524,74 @@ async fn set_model(
     model_policy: &ModelPolicy,
     model_adopter: &dyn ModelAdopter,
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
-    spec: &str,
+    spec: Option<Arc<str>>,
+    fast: Option<bool>,
+    thinking: Option<ThinkingConfig>,
 ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
-    if !model_policy.allows(spec) {
-        return Err(SessionOptionError::PolicyRejected(Arc::from(spec)).into());
+    let previous_spec = read.model();
+    let target_spec = spec.as_deref().unwrap_or(&previous_spec);
+    if !model_policy.allows(target_spec) {
+        return Err(SessionOptionError::PolicyRejected(Arc::from(target_spec)).into());
     }
-    let model = Model::from_spec(spec).map_err(|_| SessionOptionError::InvalidValue {
+    let model = Model::from_spec(target_spec).map_err(|_| SessionOptionError::InvalidValue {
         id: Arc::from(MODEL_OPTION_ID),
-        value: Arc::from(spec),
+        value: Arc::from(target_spec),
     })?;
-    let previous_spec = {
-        let state = lock(&read.state);
-        Arc::clone(&state.model)
+    if fast == Some(true) && !model.supports_fast() {
+        return Err(SessionOptionError::FastUnsupported.into());
+    }
+    if thinking.is_some_and(ThinkingConfig::is_enabled) && !model.supports_thinking() {
+        return Err(SessionOptionError::ThinkingUnsupported.into());
+    }
+    let fast_value: Arc<str> = match fast {
+        Some(true) => Arc::from(ENABLED_VALUE),
+        Some(false) => Arc::from(DISABLED_VALUE),
+        None if model.supports_fast() => {
+            current_option_value(read, FAST_OPTION_ID).unwrap_or_else(|| Arc::from(DISABLED_VALUE))
+        }
+        None => Arc::from(DISABLED_VALUE),
     };
-    let fast_value: Arc<str> = if model.supports_fast() {
-        current_option_value(read, FAST_OPTION_ID).unwrap_or_else(|| Arc::from(DISABLED_VALUE))
-    } else {
-        Arc::from(DISABLED_VALUE)
+    let thinking_value: Arc<str> = match thinking {
+        Some(thinking) => Arc::from(thinking.to_string()),
+        None if model.supports_thinking() => current_option_value(read, THINKING_OPTION_ID)
+            .unwrap_or_else(|| Arc::from(ThinkingConfig::Off.to_string())),
+        None => Arc::from(ThinkingConfig::Off.to_string()),
     };
-    let thinking_value: Arc<str> = if model.supports_thinking() {
-        current_option_value(read, THINKING_OPTION_ID)
-            .unwrap_or_else(|| Arc::from(ThinkingConfig::Off.to_string()))
-    } else {
-        Arc::from(ThinkingConfig::Off.to_string())
-    };
-    let Some(candidate) = read.options.prepare_set_values(&[
-        (MODEL_OPTION_ID, spec),
+    let values = [
+        (MODEL_OPTION_ID, target_spec),
         (FAST_OPTION_ID, fast_value.as_ref()),
         (THINKING_OPTION_ID, thinking_value.as_ref()),
-    ])?
-    else {
+    ];
+    let Some(candidate) = read.options.prepare_set_values(&values)? else {
         return Ok(read.options.snapshot());
     };
     let options = SessionOptions::candidate_snapshot(&candidate);
-    model_adopter
-        .adopt(model)
-        .await
-        .map_err(SessionCoordinatorError::ModelAdoption)?;
+    let model_changed = target_spec != previous_spec.as_ref();
+    if model_changed {
+        model_adopter
+            .adopt(model)
+            .await
+            .map_err(SessionCoordinatorError::ModelAdoption)?;
+    }
     let cwd = lock(&read.state).cwd.clone();
     let checkpoint_result =
-        checkpoint_state(read, checkpoint, None, Arc::from(spec), cwd, options).await;
+        checkpoint_state(read, checkpoint, None, Arc::from(target_spec), cwd, options).await;
     if let Err(error) = checkpoint_result {
-        let previous_model = Model::from_spec(&previous_spec).map_err(|rollback_error| {
-            SessionCoordinatorError::ModelRollback(Arc::from(rollback_error.to_string()))
-        })?;
-        if let Err(rollback_error) = model_adopter.adopt(previous_model).await {
-            lock(&read.state).model = Arc::from(spec);
-            read.options.set_values_atomically(&[
-                (MODEL_OPTION_ID, spec),
-                (FAST_OPTION_ID, fast_value.as_ref()),
-                (THINKING_OPTION_ID, thinking_value.as_ref()),
-            ])?;
-            return Err(SessionCoordinatorError::ModelRollback(Arc::from(format!(
-                "{error}; rollback: {rollback_error}; live runtime remains on {spec}"
-            ))));
+        if model_changed {
+            let previous_model = Model::from_spec(&previous_spec).map_err(|rollback_error| {
+                SessionCoordinatorError::ModelRollback(Arc::from(rollback_error.to_string()))
+            })?;
+            if let Err(rollback_error) = model_adopter.adopt(previous_model).await {
+                lock(&read.state).model = Arc::from(target_spec);
+                read.options.set_values_atomically(&values)?;
+                return Err(SessionCoordinatorError::ModelRollback(Arc::from(format!(
+                    "{error}; rollback: {rollback_error}; live runtime remains on {target_spec}"
+                ))));
+            }
         }
         return Err(error.into());
     }
-    lock(&read.state).model = Arc::from(spec);
+    lock(&read.state).model = Arc::from(target_spec);
     match read.options.commit(candidate) {
         Ok(snapshot) => Ok(snapshot),
         Err(error) => {
@@ -1431,6 +1608,30 @@ fn current_option_value(read: &SessionReadHandle, id: &str) -> Option<Arc<str>> 
         .iter()
         .find(|option| option.definition.id.as_ref() == id)
         .map(|option| Arc::clone(&option.current_value))
+}
+
+async fn toggle_boolean_option(
+    read: &SessionReadHandle,
+    checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
+    id: &str,
+) -> Result<(bool, SessionOptionsSnapshot), SessionCoordinatorError> {
+    if !matches!(id, YOLO_OPTION_ID | FAST_OPTION_ID | WORKFLOW_OPTION_ID) {
+        return Err(SessionOptionError::InvalidValue {
+            id: Arc::from(id),
+            value: Arc::from("toggle"),
+        }
+        .into());
+    }
+    let enabled =
+        current_option_value(read, id).is_some_and(|value| value.as_ref() == DISABLED_VALUE);
+    let value = if enabled {
+        ENABLED_VALUE
+    } else {
+        DISABLED_VALUE
+    };
+    set_option(read, checkpoint, id, value)
+        .await
+        .map(|snapshot| (enabled, snapshot))
 }
 
 async fn set_option(
@@ -2070,9 +2271,29 @@ mod tests {
                 })) if message.as_ref() == CHECKPOINT_TIMEOUT_MESSAGE
             ));
             assert!(coordinator.read().history().is_empty());
+            coordinator
+                .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                .await
+                .expect("non-history operations must run while timed-out commit is observed");
 
-            let next = coordinator.acquire_lease().await.unwrap();
-            drop(next);
+            let (lease_tx, lease_rx) = flume::bounded(1);
+            coordinator
+                .tx
+                .send_async(Operation::AcquireLease { reply: lease_tx })
+                .await
+                .unwrap();
+            let (replace_tx, replace_rx) = flume::bounded(1);
+            coordinator
+                .tx
+                .send_async(Operation::ReplaceHistory {
+                    history: Arc::new(vec![Message::user("queued".into())]),
+                    reply: replace_tx,
+                })
+                .await
+                .unwrap();
+            smol::future::yield_now().await;
+            assert!(lease_rx.try_recv().is_err());
+            assert!(replace_rx.try_recv().is_err());
 
             release_tx.send_async(()).await.unwrap();
             while coordinator.read().history().is_empty() {
@@ -2082,9 +2303,61 @@ mod tests {
                 serde_json::to_value(coordinator.read().history().as_ref()).unwrap(),
                 serde_json::to_value(&history).unwrap()
             );
+            assert!(lease_rx.try_recv().is_err());
+            assert!(replace_rx.try_recv().is_err());
 
             drop(lease);
+            let next = lease_rx.recv_async().await.unwrap().unwrap();
+            drop(next);
+            replace_rx.recv_async().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(coordinator.read().history().as_ref()).unwrap(),
+                serde_json::to_value(vec![Message::user("queued".into())]).unwrap()
+            );
             coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn close_can_finish_after_timed_out_commit_owner_releases() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new(|_| {
+                Box::pin(async { futures_lite::future::pending().await }) as CheckpointFuture
+            });
+            let coordinator = SessionCoordinatorHandle::register(params(id, checkpoint)).unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let commit = lease
+                .committer()
+                .unwrap()
+                .begin_history_commit(Vec::new(), Some(Duration::ZERO))
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                commit.wait().await,
+                Err(SessionCoordinatorError::Checkpoint(CheckpointError::Save {
+                    message,
+                    ..
+                })) if message.as_ref() == CHECKPOINT_TIMEOUT_MESSAGE
+            ));
+            let (closed_tx, closed_rx) = flume::bounded(1);
+            let closing = coordinator.clone();
+            smol::spawn(async move {
+                let _ = closed_tx.send(closing.close().await);
+            })
+            .detach();
+            drop(lease);
+
+            let result = futures_lite::future::race(
+                async { Some(closed_rx.recv_async().await) },
+                async {
+                    smol::Timer::after(Duration::from_millis(100)).await;
+                    None
+                },
+            )
+            .await;
+            assert!(matches!(result, Some(Ok(Ok(())))));
         });
     }
 
@@ -2391,6 +2664,119 @@ mod tests {
                 .unwrap();
 
             assert_eq!(thinking_value(&after).as_ref(), "off");
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn model_settings_commit_atomically_with_one_checkpoint() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new({
+                let saved = Arc::clone(&saved);
+                move |request: CheckpointRequest<SessionCheckpoint>| {
+                    lock(&saved).push(Arc::clone(&request.snapshot));
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                }
+            });
+            let mut params = params(id, checkpoint);
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [
+                    Arc::from("ollama/llama3"),
+                    Arc::from("anthropic/claude-opus-4-8"),
+                ],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let before = coordinator.read().options();
+
+            let after = coordinator
+                .set_model(
+                    Some(Arc::from("anthropic/claude-opus-4-8")),
+                    Some(true),
+                    Some(ThinkingConfig::Effort(maki_providers::Effort::High)),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(after.version, before.version + 1);
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
+            );
+            assert_eq!(
+                current_option_value(&coordinator.read(), FAST_OPTION_ID).as_deref(),
+                Some(ENABLED_VALUE)
+            );
+            assert_eq!(thinking_value(&after).as_ref(), "high");
+            let saved = lock(&saved);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].model.as_ref(), "anthropic/claude-opus-4-8");
+            assert_eq!(saved[0].options, after);
+            drop(saved);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn model_settings_checkpoint_failure_rolls_back_runtime_and_options() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let adopted = Arc::new(Mutex::new(Vec::new()));
+            let mut params = params(id, writer(true));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [
+                    Arc::from("ollama/llama3"),
+                    Arc::from("anthropic/claude-opus-4-8"),
+                ],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let adopted = Arc::clone(&adopted);
+                move |model: Model| {
+                    lock(&adopted).push(model.spec());
+                    Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let before = coordinator.read().options();
+
+            assert!(matches!(
+                coordinator
+                    .set_model(
+                        Some(Arc::from("anthropic/claude-opus-4-8")),
+                        Some(true),
+                        Some(ThinkingConfig::Effort(maki_providers::Effort::High)),
+                    )
+                    .await,
+                Err(SessionCoordinatorError::Checkpoint(_))
+            ));
+
+            assert_eq!(coordinator.read().model().as_ref(), "ollama/llama3");
+            assert_eq!(coordinator.read().options(), before);
+            assert_eq!(
+                lock(&adopted).as_slice(),
+                [
+                    "anthropic/claude-opus-4-8".to_string(),
+                    "ollama/llama3".to_string(),
+                ]
+            );
             coordinator.close().await.unwrap();
         });
     }
