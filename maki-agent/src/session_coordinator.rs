@@ -32,6 +32,7 @@ struct LiveSessions {
 struct CatalogState {
     definitions: BTreeMap<Arc<str>, Vec<SessionOptionDefinition>>,
     sessions: HashMap<MakiId, CatalogSession>,
+    revision: u64,
 }
 
 #[derive(Clone)]
@@ -107,6 +108,7 @@ pub struct SessionCoordinatorHandle {
 pub struct PreparedSessionCoordinator {
     handle: SessionCoordinatorHandle,
     catalog: SessionOptionCatalog,
+    catalog_revision: u64,
     model_policy: Arc<ModelPolicy>,
     model_adopter: Arc<dyn ModelAdopter>,
     directory_adopter: Arc<dyn DirectoryAdopter>,
@@ -203,6 +205,7 @@ pub struct SessionCoordinatorParams {
 
 struct PreparedPluginOptions {
     session_id: MakiId,
+    generation: u64,
     options: Arc<SessionOptions>,
     previous: SessionOptionsSnapshot,
     candidate: crate::session_options::SessionOptionsCandidate,
@@ -300,98 +303,108 @@ impl SessionOptionCatalog {
         Fut: Future<Output = Result<(), SessionCoordinatorError>>,
     {
         let plugin = plugin.into();
-        let mut sessions = lock(&self.state)
-            .sessions
-            .iter()
-            .map(|(session_id, session)| (*session_id, session.tx.clone()))
-            .collect::<Vec<_>>();
-        sessions.sort_by_key(|(session_id, _)| session_id.to_string());
+        let mut prepared: Vec<(PreparedPluginOptions, flume::Sender<PluginOptionDecision>)> =
+            Vec::new();
+        let (snapshots, previous_definitions) = loop {
+            let mut sessions = lock(&self.state)
+                .sessions
+                .iter()
+                .map(|(session_id, session)| (*session_id, session.generation, session.tx.clone()))
+                .collect::<Vec<_>>();
+            sessions
+                .sort_by_key(|(session_id, generation, _)| (session_id.to_string(), *generation));
+            let current = sessions
+                .iter()
+                .map(|(session_id, generation, _)| (*session_id, *generation))
+                .collect::<HashMap<_, _>>();
+            let (stale, retained): (Vec<_>, Vec<_>) =
+                prepared.into_iter().partition(|(staged, _)| {
+                    current.get(&staged.session_id) != Some(&staged.generation)
+                });
+            prepared = retained;
+            abort_plugin_options(stale).await?;
 
-        let mut prepared = Vec::with_capacity(sessions.len());
-        for (session_id, tx) in sessions {
-            let (prepared_tx, prepared_rx) = flume::bounded(1);
-            let (decision_tx, decision_rx) = flume::bounded(1);
-            if tx
-                .send_async(Operation::PreparePluginOptions {
-                    plugin: Arc::clone(&plugin),
-                    definitions: definitions.clone(),
-                    prepared: prepared_tx,
-                    decision: decision_rx,
-                })
-                .await
-                .is_err()
-            {
-                abort_plugin_options(prepared).await?;
-                return Err(SessionCoordinatorError::StaleSession(session_id));
-            }
-            let result = match prepared_rx.recv_async().await {
-                Ok(result) => result,
-                Err(_) => {
+            for (session_id, generation, tx) in sessions {
+                if prepared.iter().any(|(staged, _)| {
+                    staged.session_id == session_id && staged.generation == generation
+                }) {
+                    continue;
+                }
+                let (prepared_tx, prepared_rx) = flume::bounded(1);
+                let (decision_tx, decision_rx) = flume::bounded(1);
+                if tx
+                    .send_async(Operation::PreparePluginOptions {
+                        plugin: Arc::clone(&plugin),
+                        definitions: definitions.clone(),
+                        prepared: prepared_tx,
+                        decision: decision_rx,
+                    })
+                    .await
+                    .is_err()
+                {
                     abort_plugin_options(prepared).await?;
                     return Err(SessionCoordinatorError::StaleSession(session_id));
                 }
-            };
-            match result {
-                Ok(candidate) => prepared.push((candidate, decision_tx)),
-                Err(error) => {
-                    abort_plugin_options(prepared).await?;
-                    return Err(error);
-                }
-            }
-        }
-
-        for (staged, _) in &prepared {
-            let previous = &staged.previous;
-            let candidate = SessionOptions::candidate_snapshot(&staged.candidate);
-            for option in candidate.options.iter() {
-                let is_plugin_option = matches!(
-                    &option.definition.owner,
-                    SessionOptionOwner::Plugin { plugin: owner, .. } if owner == &plugin
-                );
-                if !is_plugin_option {
-                    continue;
-                }
-                let changed = previous
-                    .options
-                    .iter()
-                    .find(|old| old.definition.id == option.definition.id)
-                    .is_none_or(|old| old.current_value != option.current_value);
-                if changed
-                    && let Err(error) = validator(
-                        staged.session_id,
-                        Arc::clone(&option.definition.id),
-                        Arc::clone(&option.current_value),
-                    )
-                    .await
-                {
+                let staged = match prepared_rx.recv_async().await {
+                    Ok(Ok(staged)) => staged,
+                    Ok(Err(error)) => {
+                        abort_plugin_options(prepared).await?;
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        abort_plugin_options(prepared).await?;
+                        return Err(SessionCoordinatorError::StaleSession(session_id));
+                    }
+                };
+                if let Err(error) = validate_plugin_options(&plugin, &staged, &validator).await {
+                    prepared.push((staged, decision_tx));
                     if let Err(abort_error) = abort_plugin_options(prepared).await {
                         tracing::warn!(%abort_error, "failed to abort session option validation");
                     }
                     return Err(error);
                 }
+                prepared.push((staged, decision_tx));
             }
-        }
 
-        let candidates = prepared
-            .iter()
-            .map(|(prepared, _)| (Arc::clone(&prepared.options), prepared.candidate.clone()))
-            .collect();
-        let (snapshots, previous_definitions) = {
-            let mut state = lock(&self.state);
-            let snapshots = match SessionOptions::commit_batch(candidates) {
-                Ok(snapshots) => snapshots,
-                Err(error) => {
-                    drop(state);
+            let commit = {
+                let mut state = lock(&self.state);
+                let participants = prepared
+                    .iter()
+                    .map(|(staged, _)| (staged.session_id, staged.generation))
+                    .collect::<HashMap<_, _>>();
+                let current = state
+                    .sessions
+                    .iter()
+                    .map(|(session_id, session)| (*session_id, session.generation))
+                    .collect::<HashMap<_, _>>();
+                if participants != current {
+                    None
+                } else {
+                    let candidates = prepared
+                        .iter()
+                        .map(|(staged, _)| (Arc::clone(&staged.options), staged.candidate.clone()))
+                        .collect();
+                    Some(SessionOptions::commit_batch(candidates).map(|snapshots| {
+                        let previous_definitions = if definitions.is_empty() {
+                            state.definitions.remove(plugin.as_ref())
+                        } else {
+                            state
+                                .definitions
+                                .insert(Arc::clone(&plugin), definitions.clone())
+                        };
+                        state.revision += 1;
+                        (snapshots, previous_definitions)
+                    }))
+                }
+            };
+            match commit {
+                None => continue,
+                Some(Ok(committed)) => break committed,
+                Some(Err(error)) => {
                     abort_plugin_options(prepared).await?;
                     return Err(error.into());
                 }
-            };
-            let previous_definitions = if definitions.is_empty() {
-                state.definitions.remove(plugin.as_ref())
-            } else {
-                state.definitions.insert(Arc::clone(&plugin), definitions)
-            };
-            (snapshots, previous_definitions)
+            }
         };
         let restore = prepared
             .iter()
@@ -429,6 +442,7 @@ impl SessionOptionCatalog {
                 } else {
                     state.definitions.remove(plugin.as_ref());
                 }
+                state.revision += 1;
             } else {
                 tracing::warn!(%plugin, "session options advanced before plugin rollback");
             }
@@ -676,12 +690,16 @@ impl PreparedSessionCoordinator {
             checkpoint,
             mailbox,
         } = params;
-        definitions.extend(
-            lock(&catalog.state)
-                .definitions
-                .values()
-                .flat_map(|definitions| definitions.iter().cloned()),
-        );
+        let catalog_revision = {
+            let state = lock(&catalog.state);
+            definitions.extend(
+                state
+                    .definitions
+                    .values()
+                    .flat_map(|definitions| definitions.iter().cloned()),
+            );
+            state.revision
+        };
         let options = SessionOptions::new(definitions, &persisted_options)?;
         let read = SessionReadHandle {
             session_id,
@@ -705,6 +723,7 @@ impl PreparedSessionCoordinator {
                 catalog: catalog.clone(),
             },
             catalog,
+            catalog_revision,
             model_policy,
             model_adopter,
             directory_adopter,
@@ -735,6 +754,7 @@ impl PreparedSessionCoordinator {
         let Self {
             handle,
             catalog,
+            catalog_revision,
             model_policy,
             model_adopter,
             directory_adopter,
@@ -757,6 +777,9 @@ impl PreparedSessionCoordinator {
             _ => return Err(SessionCoordinatorError::StaleSession(handle.session_id)),
         };
         let mut catalog_state = lock(&catalog.state);
+        if catalog_revision != catalog_state.revision {
+            reconcile_options(&handle.read.options, &catalog_state.definitions)?;
+        }
         directory.entries.insert(
             handle.session_id,
             DirectoryEntry {
@@ -1073,6 +1096,7 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
             }
             let staged = PreparedPluginOptions {
                 session_id: ctx.session_id,
+                generation: ctx.generation,
                 options: Arc::clone(&ctx.read.options),
                 previous: previous.clone(),
                 candidate,
@@ -1140,7 +1164,7 @@ async fn run(
         };
         match operation {
             Operation::AcquireLease { reply } => {
-                let (released, wait) = flume::bounded(1);
+                let (released, wait) = flume::unbounded();
                 let lease = SessionLease {
                     session_id: ctx.session_id,
                     released: Some(released),
@@ -1174,7 +1198,6 @@ async fn hold_lease(
     wait: &flume::Receiver<LeaseRelease>,
     deferred: &mut VecDeque<Operation>,
 ) {
-    let mut closing = false;
     loop {
         let release = std::pin::pin!(wait.recv_async());
         let incoming = std::pin::pin!(rx.recv_async());
@@ -1203,12 +1226,20 @@ async fn hold_lease(
             // Released without a commit, or the holder dropped.
             Either::Left(_) => return,
             Either::Right(Ok(operation)) => {
-                if closing {
-                    reject_operation(operation, ctx.session_id);
-                } else if matches!(operation, Operation::Close { .. }) {
-                    lock(&ctx.read.state).history_revision += 1;
-                    deferred.push_back(operation);
-                    closing = true;
+                if matches!(operation, Operation::Close { .. }) {
+                    while let Some(queued) = deferred.pop_front() {
+                        reject_operation(queued, ctx.session_id);
+                    }
+                    while let Ok(queued) = rx.try_recv() {
+                        reject_operation(queued, ctx.session_id);
+                    }
+                    if let Ok(LeaseRelease::CommitHistory { history, reply, .. }) = wait.try_recv()
+                    {
+                        let result = replace_history(&ctx.read, &*ctx.checkpoint, history).await;
+                        let _ = reply.send(result);
+                    }
+                    let _ = handle_operation(ctx, operation).await;
+                    return;
                 } else if defers_behind_lease(&operation) {
                     deferred.push_back(operation);
                 } else {
@@ -1336,6 +1367,67 @@ enum CommitEvent {
 enum Either<L, R> {
     Left(L),
     Right(R),
+}
+
+async fn validate_plugin_options<F, Fut>(
+    plugin: &str,
+    staged: &PreparedPluginOptions,
+    validator: &F,
+) -> Result<(), SessionCoordinatorError>
+where
+    F: Fn(MakiId, Arc<str>, Arc<str>) -> Fut,
+    Fut: Future<Output = Result<(), SessionCoordinatorError>>,
+{
+    let previous = &staged.previous;
+    let candidate = SessionOptions::candidate_snapshot(&staged.candidate);
+    for option in candidate.options.iter() {
+        let is_plugin_option = matches!(
+            &option.definition.owner,
+            SessionOptionOwner::Plugin { plugin: owner, .. } if owner.as_ref() == plugin
+        );
+        if !is_plugin_option {
+            continue;
+        }
+        let changed = previous
+            .options
+            .iter()
+            .find(|old| old.definition.id == option.definition.id)
+            .is_none_or(|old| old.current_value != option.current_value);
+        if changed {
+            validator(
+                staged.session_id,
+                Arc::clone(&option.definition.id),
+                Arc::clone(&option.current_value),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_options(
+    options: &Arc<SessionOptions>,
+    definitions: &BTreeMap<Arc<str>, Vec<SessionOptionDefinition>>,
+) -> Result<(), SessionOptionError> {
+    let mut plugins = options
+        .snapshot()
+        .options
+        .iter()
+        .filter_map(|option| match &option.definition.owner {
+            SessionOptionOwner::Plugin { plugin, .. } => Some((Arc::clone(plugin), ())),
+            SessionOptionOwner::Builtin => None,
+        })
+        .collect::<BTreeMap<_, ()>>();
+    plugins.extend(definitions.keys().map(|plugin| (Arc::clone(plugin), ())));
+    for (plugin, ()) in plugins {
+        if let Some(candidate) = options.prepare_replace_plugin(
+            &plugin,
+            definitions.get(&plugin).cloned().unwrap_or_default(),
+        )? {
+            options.commit(candidate)?;
+        }
+    }
+    Ok(())
 }
 
 async fn abort_plugin_options(
@@ -1950,6 +2042,85 @@ mod tests {
     }
 
     #[test]
+    fn prepared_session_reconciles_plugin_replacement_before_activation() {
+        smol::block_on(async {
+            let catalog = SessionOptionCatalog::default();
+            let id = MakiId::generate();
+            let mut session_params = params(id, writer(false));
+            session_params.catalog = catalog.clone();
+            let prepared = SessionCoordinatorHandle::prepare(session_params).unwrap();
+
+            catalog
+                .replace_plugin_options("test", vec![plugin_option(1, &["a"], "a")])
+                .await
+                .unwrap();
+            let coordinator = prepared.activate().unwrap();
+
+            assert!(coordinator.read().options().options.iter().any(|option| {
+                option.definition.id.as_ref() == "test.choice"
+                    && option.current_value.as_ref() == "a"
+            }));
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn replacement_reprepares_session_activated_during_validator() {
+        smol::block_on(async {
+            let catalog = SessionOptionCatalog::default();
+            let id = MakiId::generate();
+            let current = register_with_catalog(id, writer(false), &catalog);
+            let mut replacement_params = params(id, writer(false));
+            replacement_params.catalog = catalog.clone();
+            let replacement = SessionCoordinatorHandle::prepare(replacement_params).unwrap();
+            let (validator_started_tx, validator_started_rx) = flume::bounded(1);
+            let (validator_release_tx, validator_release_rx) = flume::bounded(1);
+            let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let replacement_catalog = catalog.clone();
+            let replace = smol::spawn({
+                let gate = Arc::clone(&gate);
+                async move {
+                    replacement_catalog
+                        .replace_plugin_options_with_validator(
+                            "test",
+                            vec![plugin_option(1, &["a"], "a")],
+                            move |_, _, _| {
+                                let wait = gate.swap(false, Ordering::Relaxed);
+                                let validator_started_tx = validator_started_tx.clone();
+                                let validator_release_rx = validator_release_rx.clone();
+                                async move {
+                                    if wait {
+                                        validator_started_tx.send_async(()).await.unwrap();
+                                        validator_release_rx.recv_async().await.unwrap();
+                                    }
+                                    Ok(())
+                                }
+                            },
+                        )
+                        .await
+                }
+            });
+
+            validator_started_rx.recv_async().await.unwrap();
+            let activated = replacement.activate_replacing(&current).unwrap();
+            validator_release_tx.send_async(()).await.unwrap();
+            let committed = replace.await.unwrap();
+
+            assert_eq!(committed.len(), 1);
+            assert_eq!(committed[0].0, id);
+            assert!(activated.read().options().options.iter().any(|option| {
+                option.definition.id.as_ref() == "test.choice"
+                    && option.current_value.as_ref() == "a"
+            }));
+            assert!(matches!(
+                current.set_option(YOLO_OPTION_ID, ENABLED_VALUE).await,
+                Err(SessionCoordinatorError::StaleSession(stale)) if stale == id
+            ));
+            activated.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn plugin_prepare_checkpoint_failure_exposes_no_mixed_generation() {
         smol::block_on(async {
             let mut ids = [MakiId::generate(), MakiId::generate()];
@@ -2187,22 +2358,24 @@ mod tests {
                 .await
                 .unwrap();
             let (replace_reply, replace_response) = flume::bounded(1);
-            coordinator
+            let queued = coordinator
                 .tx
                 .send_async(Operation::ReplaceHistory {
                     history: Arc::new(vec![Message::user("late".into())]),
                     reply: replace_reply,
                 })
                 .await
-                .unwrap();
+                .is_ok();
 
             drop(lease);
 
             close_response.recv_async().await.unwrap();
-            assert!(matches!(
-                replace_response.recv_async().await,
-                Ok(Err(SessionCoordinatorError::StaleSession(stale))) if stale == id
-            ));
+            if queued {
+                assert!(matches!(
+                    replace_response.recv_async().await,
+                    Ok(Err(SessionCoordinatorError::StaleSession(stale))) if stale == id
+                ));
+            }
         });
     }
 
@@ -2238,6 +2411,59 @@ mod tests {
                 1,
                 "the queued replacement lands after the commit, not before it"
             );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn dropping_lease_never_waits_for_queued_history_commit() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let (option_started_tx, option_started_rx) = flume::bounded(1);
+            let (option_release_tx, option_release_rx) = flume::bounded(1);
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+                Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let option_started_tx = option_started_tx.clone();
+                    let option_release_rx = option_release_rx.clone();
+                    Box::pin(async move {
+                        if request.snapshot.history.is_none() {
+                            option_started_tx.send_async(()).await.unwrap();
+                            option_release_rx.recv_async().await.unwrap();
+                        }
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                });
+            let coordinator = SessionCoordinatorHandle::register(params(id, checkpoint)).unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let option_coordinator = coordinator.clone();
+            smol::spawn(async move {
+                option_coordinator
+                    .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                    .await
+                    .unwrap();
+            })
+            .detach();
+            option_started_rx.recv_async().await.unwrap();
+            let commit = lease
+                .committer()
+                .unwrap()
+                .begin_history_commit(vec![Message::user("complete".into())], None)
+                .await
+                .unwrap();
+            let (dropped_tx, dropped_rx) = flume::bounded(1);
+            std::thread::spawn(move || {
+                drop(lease);
+                dropped_tx.send(()).unwrap();
+            });
+
+            dropped_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("lease drop must not wait for coordinator channel capacity");
+            option_release_tx.send(()).unwrap();
+            commit.wait().await.unwrap();
             coordinator.close().await.unwrap();
         });
     }

@@ -190,7 +190,35 @@ pub struct ClaimedSessionLock {
     released: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionPublicationGuard {
+    path: PathBuf,
+    owner: LockOwner,
+}
+
+impl SessionPublicationGuard {
+    pub fn publish<T>(&self, publish: impl FnOnce() -> T) -> io::Result<Option<T>> {
+        let Some(mut file) = open_existing_locked(&self.path)? else {
+            return Ok(None);
+        };
+        if read_owner(&self.path, &mut file)?.as_ref() != Some(&self.owner) {
+            file.unlock()?;
+            return Ok(None);
+        }
+        let result = publish();
+        file.unlock()?;
+        Ok(Some(result))
+    }
+}
+
 impl ClaimedSessionLock {
+    pub fn publication_guard(&self) -> SessionPublicationGuard {
+        SessionPublicationGuard {
+            path: self.path.clone(),
+            owner: self.owner.clone(),
+        }
+    }
+
     /// Refresh the lease only while the on-disk lock still has this lease's identity.
     pub fn heartbeat(&mut self) -> io::Result<LockBeat> {
         let Some(mut file) = open_existing_locked(&self.path)? else {

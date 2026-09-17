@@ -75,7 +75,45 @@ pub(crate) struct KeymapStore {
     bindings: Vec<StoredKeymap>,
 }
 
-pub(crate) type PendingKeymapStore = Arc<Mutex<KeymapStore>>;
+pub(crate) type PendingKeymapStore = Arc<Mutex<PendingKeymaps>>;
+
+pub(crate) struct PendingKeymaps {
+    store: KeymapStore,
+    deletions: Vec<(KeyCode, KeyModifiers)>,
+}
+
+impl PendingKeymaps {
+    pub(crate) fn new() -> Self {
+        Self {
+            store: KeymapStore::new(),
+            deletions: Vec::new(),
+        }
+    }
+
+    fn set(
+        &mut self,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+        callback: RegistryKey,
+        plugin: Arc<str>,
+        desc: String,
+    ) -> (u64, Option<RegistryKey>) {
+        self.deletions
+            .retain(|deleted| *deleted != (key, modifiers));
+        self.store.set(key, modifiers, callback, plugin, desc)
+    }
+
+    fn del(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Option<RegistryKey> {
+        if !self.deletions.contains(&(key, modifiers)) {
+            self.deletions.push((key, modifiers));
+        }
+        self.store.del(key, modifiers)
+    }
+
+    pub(crate) fn drain(&mut self) -> (Vec<StoredKeymap>, Vec<(KeyCode, KeyModifiers)>) {
+        (self.store.drain(), std::mem::take(&mut self.deletions))
+    }
+}
 
 impl KeymapStore {
     pub fn new() -> Self {

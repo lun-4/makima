@@ -408,18 +408,22 @@ async fn checkpoint_and_forward_terminal(
         ),
         None => None,
     };
-    if let Some(terminal) = terminal {
-        let _ = raw_tx.send(terminal);
-    }
     let result = match commit {
         Some(Ok(commit)) => commit.wait().await.map_err(|error| error.to_string()),
         Some(Err(error)) => Err(error.to_string()),
         None => persist_history(session_id, history).await,
     };
-    if let Err(error) = &result {
-        let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::ControlError {
-            message: format!("failed to checkpoint completed turn: {error}"),
-        });
+    match &result {
+        Ok(()) => {
+            if let Some(terminal) = terminal {
+                let _ = raw_tx.send(terminal);
+            }
+        }
+        Err(error) => {
+            let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::ControlError {
+                message: format!("failed to checkpoint completed turn: {error}"),
+            });
+        }
     }
     result
 }
@@ -1298,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_forwards_while_checkpoint_is_blocked_then_commits_history() {
+    fn terminal_waits_for_checkpoint_then_forwards() {
         smol::block_on(async {
             let session_id = MakiId::generate();
             let (checkpoint_seen_tx, checkpoint_seen_rx) = flume::bounded(1);
@@ -1391,15 +1395,16 @@ mod tests {
 
             let checkpoint_history = checkpoint_seen_rx.recv_async().await.unwrap();
             assert_eq!(as_json(&checkpoint_history), as_json(&history));
+            assert!(raw_rx.is_empty());
+
+            release_tx.send_async(()).await.unwrap();
+            assert!(checkpoint_task.await.is_ok());
             let forwarded = raw_rx.recv_async().await.unwrap();
             assert!(
                 matches!(forwarded.event, AgentEvent::TurnOutcome(got) if got == outcome)
                     && forwarded.subagent.is_none()
                     && forwarded.run_id == 0
             );
-
-            release_tx.send_async(()).await.unwrap();
-            assert!(checkpoint_task.await.is_ok());
             assert_eq!(
                 as_json(coordinator.read().history().as_ref()),
                 as_json(&history)
@@ -1489,10 +1494,6 @@ mod tests {
 
             assert!(result.is_err());
             assert!(matches!(
-                raw_rx.recv_async().await.unwrap().event,
-                AgentEvent::TurnOutcome(got) if got == outcome
-            ));
-            assert!(matches!(
                 raw_rx.recv_async().await.unwrap(),
                 Envelope {
                     event: AgentEvent::ControlError { message },
@@ -1500,6 +1501,7 @@ mod tests {
                     ..
                 } if message.contains(SAVE_ERROR)
             ));
+            assert!(raw_rx.is_empty());
             coordinator.close().await.unwrap();
         });
     }

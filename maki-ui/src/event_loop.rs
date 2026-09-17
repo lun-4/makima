@@ -557,9 +557,16 @@ struct PreparedSessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     resumed: bool,
+    seed_snapshot: Option<(Arc<StorageWriter>, Arc<AppSession>)>,
 }
 
 impl PreparedSessionRuntime {
+    fn seed_storage(&self) {
+        if let Some((writer, session)) = &self.seed_snapshot {
+            writer.seed(Arc::clone(session));
+        }
+    }
+
     #[cfg(test)]
     fn snapshot(
         &self,
@@ -592,6 +599,7 @@ impl PreparedSessionRuntime {
             shell_tx,
             shell_rx,
             resumed,
+            seed_snapshot: _,
         } = self;
         let coordinator = match coordinator.activate() {
             Ok(coordinator) => coordinator,
@@ -642,6 +650,7 @@ impl PreparedSessionRuntime {
             shell_tx,
             shell_rx,
             resumed,
+            seed_snapshot: _,
         } = self;
         let session_id = app.session_id();
         let activated = if session_id == current.read().session_id() {
@@ -716,6 +725,7 @@ fn replace_session_runtime(
             claim_lock(sessions_dir, &target_id).map_err(|error| error.to_string())?,
         ))
     };
+    prepared.seed_storage();
     let mut runtime =
         match prepared.activate_replacing(model_slot, target_lock, &current.coordinator) {
             Ok(runtime) => runtime,
@@ -843,7 +853,6 @@ fn register_coordinator<H: CoordinatorHandles>(
         handles,
         permissions,
         thinking,
-        true,
     )?
     .activate()
     .map_err(|error| eyre!(error))
@@ -859,7 +868,6 @@ fn prepare_coordinator<H: CoordinatorHandles>(
     handles: &H,
     permissions: &Arc<PermissionManager>,
     thinking: DomainThinkingConfig,
-    seed_snapshot: bool,
 ) -> Result<PreparedSessionCoordinator> {
     let mailbox = handles
         .mailbox()
@@ -874,7 +882,6 @@ fn prepare_coordinator<H: CoordinatorHandles>(
         permissions,
         mailbox,
         thinking,
-        seed_snapshot,
     )
 }
 
@@ -926,7 +933,6 @@ fn register_coordinator_with_mailbox<H: CoordinatorHandles>(
         permissions,
         mailbox,
         thinking,
-        true,
     )?
     .activate()
     .map_err(|error| eyre!(error))
@@ -943,11 +949,7 @@ fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
     permissions: &Arc<PermissionManager>,
     mailbox: SessionMailbox,
     thinking: DomainThinkingConfig,
-    seed_snapshot: bool,
 ) -> Result<PreparedSessionCoordinator> {
-    if seed_snapshot {
-        deps.storage_writer.send(Arc::new(session.clone()));
-    }
     let model_spec = session.model.clone();
     let definitions = builtin_option_definitions(
         Arc::from(model_spec.as_str()),
@@ -1036,6 +1038,7 @@ fn rotate_session_coordinator(
         mailbox.clone(),
         thinking,
     )?;
+    deps.storage_writer.seed(session);
     rt.handles.set_mailbox(mailbox);
     let retired = std::mem::replace(&mut rt.coordinator, coordinator.clone());
     rt.app.coordinator = Some(coordinator);
@@ -1059,6 +1062,7 @@ impl SpawnCtx {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     fn prepare_runtime(&self, session: AppSession) -> Result<PreparedSessionRuntime> {
         self.prepare_runtime_with_provider(session, None)
     }
@@ -1168,8 +1172,9 @@ impl SpawnCtx {
             &handles,
             &permissions,
             crate::app::session_state::resolve_thinking(&session, &model, &self.storage),
-            seed_snapshot,
         )?;
+        let seed_snapshot =
+            seed_snapshot.then(|| (Arc::clone(&self.storage_writer), Arc::new(session.clone())));
         let app = App::prepare(
             &model,
             session,
@@ -1199,19 +1204,23 @@ impl SpawnCtx {
             shell_tx,
             shell_rx,
             resumed,
+            seed_snapshot,
         })
     }
 
     fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
+        self.spawn_runtime_with_provider(session, None)
+    }
+
+    fn spawn_runtime_with_provider(
+        &self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+    ) -> Result<SessionRuntime> {
         let id = session.id;
-        let prepared = self.prepare_runtime(session)?;
-        let session_lock = match claim_lock(&self.sessions_dir, &id) {
-            Ok(session_lock) => session_lock,
-            Err(error) => {
-                self.storage_writer.forget(id);
-                return Err(error);
-            }
-        };
+        let prepared = self.prepare_runtime_with_provider(session, provider)?;
+        let session_lock = claim_lock(&self.sessions_dir, &id)?;
+        prepared.seed_storage();
         prepared
             .activate(&self.model_slot, Some(SessionLockState::Held(session_lock)))
             .map_err(|error| eyre!(error))
@@ -1323,6 +1332,17 @@ struct BackgroundModels {
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     task: smol::Task<()>,
+}
+
+fn new_session_from_slot(slot: &ProviderSlot, cwd: &str) -> (AppSession, PreparedProvider) {
+    let current = slot.load();
+    (
+        AppSession::new(&current.model.spec(), cwd),
+        PreparedProvider {
+            model: current.model.clone(),
+            provider: Arc::clone(&current.provider) as Arc<dyn Provider>,
+        },
+    )
 }
 
 /// Brings each tab's displayed model in line with the slot that tab actually
@@ -2434,11 +2454,12 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(Ok(reply));
             }
             SessionRequest::New { prompt, focus } => {
-                let session = {
-                    let slot = self.focused_model_slot().load();
-                    AppSession::new(&slot.model.spec(), &self.session_cwd)
-                };
-                let runtime = match self.ctx.spawn_runtime(session) {
+                let (session, provider) =
+                    new_session_from_slot(self.focused_model_slot(), &self.session_cwd);
+                let runtime = match self
+                    .ctx
+                    .spawn_runtime_with_provider(session, Some(provider))
+                {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = reply_tx.send(Err(error.to_string()));
@@ -3682,6 +3703,35 @@ mod tests {
         }
     }
 
+    struct FocusedProvider;
+
+    impl Provider for FocusedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _opts: maki_providers::RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+        > {
+            Box::pin(async { Ok(vec![maki_providers::ModelInfo::id_only("focused".into())]) })
+        }
+    }
+
     /// A real `StorageWriter`, so the coordinator checkpoint path -- which
     /// merges into the writer's snapshot for the session -- is exercised
     /// rather than stubbed away.
@@ -3886,6 +3936,17 @@ mod tests {
         fn target_count(&self) -> usize {
             self.ctx().command_runtime.registry.target_count()
         }
+
+        fn shutdown_writer(&mut self) -> StateDir {
+            let ctx = self.ctx.take().unwrap();
+            let storage = ctx.storage.clone();
+            let writer = Arc::clone(&ctx.storage_writer);
+            drop(ctx);
+            Arc::try_unwrap(writer)
+                .unwrap_or_else(|_| panic!("runtime harness owns storage writer"))
+                .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+            storage
+        }
     }
 
     impl Drop for RuntimeHarness {
@@ -3917,6 +3978,59 @@ mod tests {
         let manager = handles.manager_and_root().0;
         drop(handles);
         shutdown_manager(&manager);
+    }
+
+    #[test]
+    fn failed_runtime_claim_cannot_rewrite_session() {
+        const OWNER_CONTENT: &str = "written by lock owner";
+        const LOSER_CONTENT: &str = "stale losing snapshot";
+
+        let mut harness = RuntimeHarness::new();
+        let mut owner = harness.session();
+        let id = owner.id;
+        owner.push_message(Message::user(OWNER_CONTENT.into()));
+        owner.save(&harness.ctx().storage).unwrap();
+        let lock = session_lock::claim(&harness.ctx().sessions_dir, &id)
+            .unwrap()
+            .unwrap();
+        let mut loser = owner.clone();
+        loser.replace_messages(vec![Message::user(LOSER_CONTENT.into())]);
+
+        assert!(harness.ctx().spawn_runtime(loser).is_err());
+        let storage = harness.shutdown_writer();
+        lock.release().unwrap();
+
+        let stored = AppSession::load(id, &storage).unwrap();
+        assert_eq!(stored.messages()[0].user_text(), Some(OWNER_CONTENT));
+    }
+
+    #[test]
+    fn new_session_inherits_focused_model_and_provider() {
+        const FOCUSED_MODEL: &str = "openai/gpt-5";
+
+        let harness = RuntimeHarness::new();
+        let focused_model = Model::from_spec(FOCUSED_MODEL).unwrap();
+        let (focused_slot, _) = ProviderSlot::new(focused_model, Arc::new(FocusedProvider));
+
+        let (session, provider) = new_session_from_slot(&focused_slot, "/tmp");
+        assert_eq!(
+            smol::block_on(provider.provider.list_models())
+                .unwrap()
+                .first()
+                .unwrap()
+                .id,
+            "focused"
+        );
+        let runtime = harness
+            .ctx()
+            .spawn_runtime_with_provider(session, Some(provider))
+            .unwrap();
+
+        let runtime_slot = runtime.model_slot.load();
+        assert_eq!(runtime_slot.model.spec(), FOCUSED_MODEL);
+        assert_eq!(runtime.coordinator.read().model().as_ref(), FOCUSED_MODEL);
+        drop(runtime_slot);
+        release_runtime(runtime);
     }
 
     #[test]

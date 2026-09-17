@@ -45,7 +45,7 @@ use crate::api::completion::{self, CompletionCtx, ItemSpec};
 use crate::api::r#fn::{JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::FsBackend;
 use crate::api::keymap::KeymapReader;
-use crate::api::keymap::{KeymapStore, KeymapWriter};
+use crate::api::keymap::{KeymapStore, KeymapWriter, PendingKeymaps};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::session_option::{
     PendingSessionOptions, SessionOptionStore, SessionOptionValidation, SessionOptionValidators,
@@ -2527,7 +2527,7 @@ impl LuaRuntime {
     }
 
     fn discard_pending_keymaps(&mut self, pending: crate::api::keymap::PendingKeymapStore) {
-        let bindings = pending.lock().unwrap_or_else(|e| e.into_inner()).drain();
+        let (bindings, _) = pending.lock().unwrap_or_else(|e| e.into_inner()).drain();
         for binding in bindings {
             let _ = self.lua.remove_registry_value(binding.callback);
         }
@@ -2618,13 +2618,16 @@ impl LuaRuntime {
                 plugin: Arc::clone(plugin),
             });
         }
-        let candidate = pending_keymaps
+        let (candidate, deletions) = pending_keymaps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain();
         let mut old_callbacks = Vec::new();
         if let Some(mut live) = self.lua.app_data_mut::<KeymapStore>() {
             old_callbacks.extend(live.clear_plugin(plugin));
+            for (key, modifiers) in deletions {
+                old_callbacks.extend(live.del(key, modifiers));
+            }
             for binding in candidate {
                 if let Some(old) = live.insert_stored(binding) {
                     old_callbacks.push(old);
@@ -2884,7 +2887,7 @@ impl LuaRuntime {
         // successful load commits them to the store.
         let pending_rules: PendingRules = Arc::default();
         let pending_commands = Arc::new(Mutex::new(HashMap::new()));
-        let pending_keymaps = Arc::new(Mutex::new(KeymapStore::new()));
+        let pending_keymaps = Arc::new(Mutex::new(PendingKeymaps::new()));
         let pending_store = Arc::new(Mutex::new(Store::default()));
         let pending_options = Arc::new(Mutex::new(None));
         let pending_sources = Arc::new(Mutex::new(completion::PendingCompletionStore::default()));

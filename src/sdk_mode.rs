@@ -700,6 +700,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     if let Some(max) = cli.max_turns {
         config.max_turns = Some(max);
     }
+    let explicit_permission_mode = cli.permission_mode.is_some();
     let permission_mode = PermissionMode::resolve(
         cli.permission_mode.as_deref(),
         cli.yolo || permissions_config.yolo,
@@ -717,8 +718,12 @@ pub fn run(params: SdkParams) -> Result<()> {
         explicit_model,
         &model_policy,
     );
-    let permission_mode =
-        restored_permission_mode(restored_state, restored.meta.yolo, startup_permission_mode);
+    let permission_mode = restored_permission_mode(
+        restored_state,
+        restored.meta.yolo,
+        startup_permission_mode,
+        explicit_permission_mode,
+    );
     let yolo = permission_mode == PermissionMode::BypassPermissions;
     let fast = if restored_state {
         restored.meta.fast && model.supports_fast()
@@ -1269,8 +1274,9 @@ fn restored_permission_mode(
     restored: bool,
     persisted_yolo: bool,
     startup: PermissionMode,
+    explicit: bool,
 ) -> PermissionMode {
-    if !restored {
+    if !restored || explicit {
         startup
     } else if persisted_yolo {
         PermissionMode::BypassPermissions
@@ -2396,18 +2402,23 @@ mod tests {
         assert_eq!(shared.lock().unwrap().permission_mode, PermissionMode::Plan);
     }
 
-    #[test_case(true, true, PermissionMode::Default, PermissionMode::BypassPermissions ; "restored_enabled_wins")]
-    #[test_case(true, false, PermissionMode::BypassPermissions, PermissionMode::Default ; "restored_disabled_wins")]
-    #[test_case(false, false, PermissionMode::BypassPermissions, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
-    #[test_case(true, false, PermissionMode::Plan, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
+    #[test_case(true, true, PermissionMode::Default, false, PermissionMode::BypassPermissions ; "bare_resume_restores_enabled")]
+    #[test_case(true, false, PermissionMode::BypassPermissions, false, PermissionMode::Default ; "bare_resume_restores_disabled")]
+    #[test_case(false, false, PermissionMode::BypassPermissions, false, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
+    #[test_case(true, false, PermissionMode::Plan, false, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
+    #[test_case(true, true, PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_resumed_yolo")]
+    #[test_case(true, true, PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_resumed_yolo")]
+    #[test_case(true, true, PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_forked_yolo")]
+    #[test_case(true, true, PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_forked_yolo")]
     fn sdk_yolo_restore_precedence(
         restored: bool,
         persisted: bool,
         startup: PermissionMode,
+        explicit: bool,
         expected: PermissionMode,
     ) {
         assert_eq!(
-            restored_permission_mode(restored, persisted, startup),
+            restored_permission_mode(restored, persisted, startup, explicit),
             expected
         );
     }

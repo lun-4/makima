@@ -2216,6 +2216,34 @@ mod tests {
     }
 
     #[test]
+    fn keymap_deletion_is_transactional_across_owners() {
+        const BINDING: &str = r#"
+            maki.keymap.set("n", "<C-p>", function() end, { desc = "bundled mapping" })
+        "#;
+        const FAILED_DELETE: &str = r#"
+            maki.keymap.del("n", "<C-p>")
+            error("reject deletion")
+        "#;
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("sessions", BINDING).unwrap();
+        assert_eq!(
+            host.keymap_reader().load().entries[0].plugin.as_ref(),
+            "sessions"
+        );
+
+        assert!(host.load_source("user", FAILED_DELETE).is_err());
+        let keymaps = host.keymap_reader().load();
+        assert_eq!(keymaps.entries.len(), 1);
+        assert_eq!(keymaps.entries[0].plugin.as_ref(), "sessions");
+        drop(keymaps);
+
+        host.load_source("user", r#"maki.keymap.del("n", "<C-p>")"#)
+            .unwrap();
+        assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
+    #[test]
     fn command_and_keymap_replacement_is_transactional() {
         const OLD: &str = r#"
             maki.api.register_command({

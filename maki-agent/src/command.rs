@@ -258,6 +258,17 @@ impl maki_commands::CommandHost for SessionCommandHost {
                     ))
                 });
             }
+            HostRequest::Context(HostContextRequest::SessionId) => {
+                let Some(coordinator) = &self.coordinator else {
+                    return Box::pin(async {
+                        Ok(HostResponse::Context(HostContextResponse::Unavailable))
+                    });
+                };
+                let id = Arc::from(coordinator.read().session_id().to_string());
+                return Box::pin(async move {
+                    Ok(HostResponse::Context(HostContextResponse::SessionId(id)))
+                });
+            }
             HostRequest::Builtin(operation) => operation,
         };
         match operation {
@@ -1003,6 +1014,9 @@ mod tests {
                         }
                         HostContextRequest::FastModeSupported => {
                             HostContextResponse::FastModeSupported(true)
+                        }
+                        HostContextRequest::SessionId => {
+                            HostContextResponse::SessionId(Arc::from("session-id"))
                         }
                     };
                     Ok(HostResponse::Context(response))

@@ -234,6 +234,14 @@ impl StorageWriter {
         }
     }
 
+    pub fn seed(&self, session: Arc<AppSession>) {
+        let id = session.id;
+        let mut state = lock(&self.pending);
+        let generation = next_generation(&mut state);
+        state.latest.insert(id, session);
+        state.latest_generations.insert(id, generation);
+    }
+
     pub fn send(&self, session: Arc<AppSession>) {
         let id = session.id;
         let mut state = lock(&self.pending);

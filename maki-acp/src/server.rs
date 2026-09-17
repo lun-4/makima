@@ -67,6 +67,7 @@ struct PendingOperation {
     id: u64,
     request_id: RequestId,
     kind: OperationKind,
+    run_id: Option<u64>,
     cancelling: bool,
     cancel: Option<maki_agent::cancel::CancelTrigger>,
     _lease: Option<maki_agent::session_coordinator::SessionLease>,
@@ -77,6 +78,7 @@ struct PendingOperation {
 #[derive(Default)]
 struct Pending {
     operation: Option<PendingOperation>,
+    retired_primary_run: Option<u64>,
     permissions: HashMap<i64, Sender<String>>,
     elicitation: Option<i64>,
 }
@@ -91,12 +93,17 @@ type PendingState = Arc<Mutex<Pending>>;
 struct SessionLock {
     stop_tx: flume::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
+    publication_guard: Option<maki_storage::session_lock::SessionPublicationGuard>,
 }
 
 impl SessionLock {
     /// Stop the heartbeat thread, wait until it cannot beat again, and release the lock.
     fn shutdown(mut self) {
         self.release();
+    }
+
+    fn publication_guard(&self) -> Option<maki_storage::session_lock::SessionPublicationGuard> {
+        self.publication_guard.clone()
     }
 
     fn release(&mut self) {
@@ -195,6 +202,7 @@ impl OptionProjection {
 struct SessionState {
     handle: InteractiveHandle,
     coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
+    checkpoint: Option<Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>>,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
     command_state: Arc<maki_agent::command::SessionCommandState>,
@@ -684,10 +692,17 @@ async fn close_session(srv: &mut Server) {
             respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
         });
     }
-    if let Some(coordinator) = state.coordinator.take() {
-        coordinator.retire();
-    }
     state.handle.task.cancel().await;
+    if let Some(coordinator) = state.coordinator.take()
+        && let Err(error) = coordinator.close().await
+    {
+        warn!(%error, "failed to drain session coordinator");
+    }
+    if let Some(checkpoint) = state.checkpoint
+        && let Err(error) = checkpoint.drain().await
+    {
+        warn!(%error, "failed to drain session checkpoint");
+    }
     state.command_projection_task.cancel().await;
     state.option_projection_task.cancel().await;
     if let Some(mcp) = state.mcp {
@@ -702,6 +717,7 @@ fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String
     let mut lease = session_lock::claim(&dir, &id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| session_lock::OPEN_ELSEWHERE_MSG.to_owned())?;
+    let publication_guard = lease.publication_guard();
     let (stop_tx, stop_rx) = flume::bounded(1);
     let thread = std::thread::spawn(move || {
         loop {
@@ -724,6 +740,7 @@ fn start_session_lock_in(dir: PathBuf, id: MakiId) -> Result<SessionLock, String
     Ok(SessionLock {
         stop_tx,
         thread: Some(thread),
+        publication_guard: Some(publication_guard),
     })
 }
 
@@ -786,12 +803,31 @@ async fn install_session_with_lock(
         workflow,
         thinking,
     );
-    let checkpoint = match maki_agent::session_checkpoint::SessionLogCheckpoint::open(
-        params.storage.clone(),
-        handle.session_id.id(),
-        &current_model,
-        &cwd.to_string_lossy(),
-    ) {
+    let lock = match lock_session(handle.session_id.id()) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!(%error, "session lock claim failed");
+            rollback_install(handle, mcp, None).await;
+            return Err(error);
+        }
+    };
+    let checkpoint = match match lock.publication_guard() {
+        Some(publication_guard) => {
+            maki_agent::session_checkpoint::SessionLogCheckpoint::open_owned(
+                params.storage.clone(),
+                handle.session_id.id(),
+                &current_model,
+                &cwd.to_string_lossy(),
+                publication_guard,
+            )
+        }
+        None => maki_agent::session_checkpoint::SessionLogCheckpoint::open(
+            params.storage.clone(),
+            handle.session_id.id(),
+            &current_model,
+            &cwd.to_string_lossy(),
+        ),
+    } {
         Ok(checkpoint) => Arc::new(checkpoint),
         Err(error) => {
             warn!(%error, "failed to open session checkpoint");
@@ -852,7 +888,7 @@ async fn install_session_with_lock(
                         as maki_agent::session_coordinator::DirectoryAdoptionFuture
                 }
             }),
-            checkpoint,
+            checkpoint: checkpoint.clone(),
             mailbox: handle.mailbox.clone(),
         },
     ) {
@@ -861,14 +897,6 @@ async fn install_session_with_lock(
             warn!(%error, "failed to register session coordinator");
             rollback_install(handle, mcp, None).await;
             return Err(error.to_string());
-        }
-    };
-    let lock = match lock_session(handle.session_id.id()) {
-        Ok(lock) => lock,
-        Err(error) => {
-            warn!(%error, "session lock claim failed");
-            rollback_install(handle, mcp, Some(coordinator)).await;
-            return Err(error);
         }
     };
     let pending = PendingState::default();
@@ -934,6 +962,7 @@ async fn install_session_with_lock(
     srv.session = Some(SessionState {
         handle,
         coordinator: Some(coordinator),
+        checkpoint: Some(checkpoint),
         mcp,
         current_mode: AgentMode::Build,
         command_state,
@@ -1181,6 +1210,7 @@ async fn send_manual_compaction(
             id: operation_id,
             request_id: id.clone(),
             kind: OperationKind::ManualCompaction,
+            run_id: None,
             cancelling: false,
             cancel: Some(trigger),
             _lease: Some(lease),
@@ -1333,6 +1363,7 @@ async fn send_isolated_turn(
             id: operation_id,
             request_id: id.clone(),
             kind: OperationKind::IsolatedTurn,
+            run_id: None,
             cancelling: false,
             cancel: Some(trigger),
             _lease: Some(lease),
@@ -1483,6 +1514,7 @@ async fn send_command_turn(
             id: operation_id,
             request_id: id.clone(),
             kind: OperationKind::PrimaryTurn,
+            run_id: None,
             cancelling: false,
             cancel: None,
             _lease: Some(lease),
@@ -1567,6 +1599,39 @@ fn finish_operation(
         {
             return false;
         }
+        pending.operation.take().unwrap()
+    };
+    let request_id = operation.request_id.clone();
+    drop(operation);
+    respond(request_id);
+    true
+}
+
+fn finish_primary_run(
+    pending: &PendingState,
+    run_id: u64,
+    respond: impl FnOnce(RequestId),
+) -> bool {
+    let operation = {
+        let mut pending = pending.lock().unwrap();
+        if pending
+            .retired_primary_run
+            .is_some_and(|retired_run| run_id <= retired_run)
+        {
+            return false;
+        }
+        let Some(operation) = pending.operation.as_mut() else {
+            return false;
+        };
+        if operation.kind != OperationKind::PrimaryTurn {
+            return false;
+        }
+        match operation.run_id {
+            Some(operation_run_id) if operation_run_id != run_id => return false,
+            None => operation.run_id = Some(run_id),
+            Some(_) => {}
+        }
+        pending.retired_primary_run = Some(run_id);
         pending.operation.take().unwrap()
     };
     let request_id = operation.request_id.clone();
@@ -1855,7 +1920,9 @@ fn start_event_pump(
         let mut cost_total = initial_cost;
 
         while let Ok(Envelope {
-            event, subagent, ..
+            event,
+            subagent,
+            run_id,
         }) = event_rx.recv_async().await
         {
             if let AgentEvent::TurnComplete(tc) = &event {
@@ -1976,7 +2043,7 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::TurnOutcome(outcome) => {
-                    finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
+                    finish_primary_run(&pending, run_id, |request_id| {
                         match outcome {
                             maki_agent::TurnOutcome::Completed { reason, .. } => {
                                 let resp = PromptResponse::new(translate::map_done_reason(reason));
@@ -2004,13 +2071,13 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::ControlComplete { .. } => {
-                    finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
+                    finish_primary_run(&pending, run_id, |request_id| {
                         respond_prompt(&out_tx, request_id, StopReason::EndTurn)
                     });
                     continue;
                 }
                 AgentEvent::ControlError { message } => {
-                    finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
+                    finish_primary_run(&pending, run_id, |request_id| {
                         let error = AcpError::internal_error().data(Value::String(message));
                         send(
                             &out_tx,
@@ -2373,6 +2440,7 @@ mod tests {
                 })),
                 handle,
                 coordinator: Some(coordinator),
+                checkpoint: None,
                 mcp: None,
                 current_mode: AgentMode::Build,
                 command_state,
@@ -2406,6 +2474,7 @@ mod tests {
         let lock = SessionLock {
             stop_tx,
             thread: Some(thread),
+            publication_guard: None,
         };
 
         drop(lock);
@@ -2579,6 +2648,7 @@ mod tests {
                 id: 7,
                 request_id: RequestId::Number(41),
                 kind: OperationKind::TestLocal,
+                run_id: None,
                 cancelling: false,
                 cancel: None,
                 _lease: None,
@@ -2600,6 +2670,7 @@ mod tests {
                 id: 8,
                 request_id: RequestId::Number(42),
                 kind: OperationKind::TestLocal,
+                run_id: None,
                 cancelling: true,
                 cancel: None,
                 _lease: None,
@@ -2625,6 +2696,7 @@ mod tests {
                 id: 9,
                 request_id: RequestId::Number(43),
                 kind: OperationKind::TestLocal,
+                run_id: None,
                 cancelling: false,
                 cancel: None,
                 _lease: None,
@@ -3076,6 +3148,7 @@ mod tests {
             id: 1,
             request_id: RequestId::Number(41),
             kind: OperationKind::TestLocal,
+            run_id: None,
             cancelling: false,
             cancel: None,
             _lease: None,
@@ -3114,6 +3187,7 @@ mod tests {
             id: 1,
             request_id: RequestId::Number(41),
             kind: OperationKind::TestLocal,
+            run_id: None,
             cancelling: false,
             cancel: None,
             _lease: None,
@@ -3590,6 +3664,7 @@ mod tests {
                 id: 1,
                 request_id: RequestId::Number(41),
                 kind: OperationKind::TestLocal,
+                run_id: None,
                 cancelling: true,
                 cancel: None,
                 _lease: None,
@@ -3693,6 +3768,84 @@ mod tests {
             }
         });
         smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test]
+    fn late_checkpoint_error_cannot_terminate_next_prompt() {
+        smol::block_on(async {
+            const OLD_RUN_ID: u64 = 7;
+            const NEXT_RUN_ID: u64 = 8;
+
+            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
+            let (out_tx, out_rx) = flume::unbounded::<Value>();
+            let (answer_tx, _) = flume::unbounded::<String>();
+            let pending = Arc::new(Mutex::new(Pending {
+                operation: Some(PendingOperation {
+                    id: 1,
+                    request_id: RequestId::Number(41),
+                    kind: OperationKind::PrimaryTurn,
+                    run_id: None,
+                    cancelling: false,
+                    cancel: None,
+                    _lease: None,
+                }),
+                ..Default::default()
+            }));
+            let session_id = SessionRef::from(MakiId::generate());
+            let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC, PathBuf::from("."));
+            start_event_pump(
+                event_rx,
+                session_id,
+                out_tx,
+                Arc::clone(&pending),
+                false,
+                answer_tx,
+                coordinator.read(),
+                None,
+                None,
+            );
+
+            let completed = |run_id| Envelope {
+                event: AgentEvent::TurnOutcome(maki_agent::TurnOutcome::Completed {
+                    agent_id: maki_agent::AgentId::generate(),
+                    turn_id: maki_agent::TurnId::generate(),
+                    usage: TokenUsage::default(),
+                    num_turns: 1,
+                    reason: maki_agent::DoneReason::EndTurn,
+                }),
+                subagent: None,
+                run_id,
+            };
+            event_tx.send_async(completed(OLD_RUN_ID)).await.unwrap();
+            assert_eq!(out_rx.recv_async().await.unwrap()["id"], 41);
+
+            pending.lock().unwrap().operation = Some(PendingOperation {
+                id: 2,
+                request_id: RequestId::Number(42),
+                kind: OperationKind::PrimaryTurn,
+                run_id: None,
+                cancelling: false,
+                cancel: None,
+                _lease: None,
+            });
+            event_tx
+                .send_async(Envelope {
+                    event: AgentEvent::ControlError {
+                        message: "failed to checkpoint completed turn".into(),
+                    },
+                    subagent: None,
+                    run_id: OLD_RUN_ID,
+                })
+                .await
+                .unwrap();
+            event_tx.send_async(completed(NEXT_RUN_ID)).await.unwrap();
+
+            let second = out_rx.recv_async().await.unwrap();
+            assert_eq!(second["id"], 42);
+            assert_eq!(second["result"]["stopReason"], "end_turn");
+            assert!(out_rx.is_empty());
+            coordinator.close().await.unwrap();
+        });
     }
 
     #[test]

@@ -7,6 +7,7 @@ use maki_agent::session_coordinator::SessionCoordinatorHandle;
 use maki_agent::session_options::{
     SessionOptionCategory, SessionOptionOwner, SessionOptionsSnapshot,
 };
+use maki_commands::{HostContextRequest, HostContextResponse, HostRequest, HostResponse};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
@@ -14,6 +15,7 @@ use mlua::{Lua, Result as LuaResult, Table, Value};
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::pair::{Pair, err_pair};
+use crate::runtime::command_invocation;
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
@@ -44,22 +46,34 @@ pub(crate) async fn resolve_coordinator(
     let raw_id = match raw_id {
         Some(id) => id,
         None => {
-            let (value, error) = ui_json_roundtrip(lua, tx, |reply_tx| UiAction::Session {
-                req: SessionRequest::Current,
-                reply_tx,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-            if let Some(error) = error {
-                return Err(error);
-            }
-            value
-                .and_then(|value| {
-                    value
-                        .as_string()
-                        .and_then(|value| value.to_str().ok().map(|value| value.to_string()))
+            if let Some(invocation) = command_invocation(lua) {
+                match invocation
+                    .invocation
+                    .host_request(HostRequest::Context(HostContextRequest::SessionId))
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    HostResponse::Context(HostContextResponse::SessionId(id)) => id.to_string(),
+                    _ => return Err(SESSION_REQUIRED_ERR.to_string()),
+                }
+            } else {
+                let (value, error) = ui_json_roundtrip(lua, tx, |reply_tx| UiAction::Session {
+                    req: SessionRequest::Current,
+                    reply_tx,
                 })
-                .ok_or_else(|| SESSION_REQUIRED_ERR.to_string())?
+                .await
+                .map_err(|e| e.to_string())?;
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                value
+                    .and_then(|value| {
+                        value
+                            .as_string()
+                            .and_then(|value| value.to_str().ok().map(|value| value.to_string()))
+                    })
+                    .ok_or_else(|| SESSION_REQUIRED_ERR.to_string())?
+            }
         }
     };
     let id = raw_id.parse::<MakiId>().map_err(|e| e.to_string())?;

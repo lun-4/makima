@@ -146,7 +146,7 @@ mod tests {
                 ),
                 pending_commands: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 pending_keymaps: Arc::new(std::sync::Mutex::new(
-                    crate::api::keymap::KeymapStore::new(),
+                    crate::api::keymap::PendingKeymaps::new(),
                 )),
                 pending_store: Arc::new(std::sync::Mutex::new(crate::api::store::Store::default())),
                 pending_options: Arc::new(std::sync::Mutex::new(None)),

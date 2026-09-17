@@ -2416,6 +2416,9 @@ impl App {
                     HostContextRequest::FastModeSupported => {
                         HostContextResponse::FastModeSupported(self.state.model.supports_fast())
                     }
+                    HostContextRequest::SessionId => {
+                        HostContextResponse::SessionId(Arc::from(self.state.session.id.to_string()))
+                    }
                 };
                 return Ok((HostResponse::Context(response), vec![]));
             }
