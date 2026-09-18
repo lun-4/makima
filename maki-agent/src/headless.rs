@@ -760,15 +760,20 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
                 let turn_id = TurnId::generate();
                 let lease_committer = input.lease_committer.clone();
-                let (trigger, cancel) = CancelToken::new();
-                let cancel_task = smol::spawn({
-                    let cancel_rx = cancel_rx.clone();
-                    async move {
-                        if cancel_rx.recv_async().await.is_ok() {
-                            trigger.cancel();
-                        }
+                let operation_cancel = input.cancel.clone();
+                let (cancel_task, cancel) = match operation_cancel {
+                    Some(cancel) => (None, cancel),
+                    None => {
+                        let (trigger, cancel) = CancelToken::new();
+                        let cancel_rx = cancel_rx.clone();
+                        let task = smol::spawn(async move {
+                            if cancel_rx.recv_async().await.is_ok() {
+                                trigger.cancel();
+                            }
+                        });
+                        (Some(task), cancel)
                     }
-                });
+                };
 
                 // MCP connects in the background, so a prompt that beats it waits
                 // here instead of shipping a turn without the MCP tools. The wait
@@ -814,7 +819,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                     "terminal outcome delivery failed"
                                 );
                             }
-                            cancel_task.cancel().await;
+                            if let Some(cancel_task) = cancel_task {
+                                cancel_task.cancel().await;
+                            }
                             run_id += 1;
                             continue;
                         }
@@ -907,7 +914,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 let outcome = agent.run(turn_id, input).await;
                 drop(agent);
                 drop(turn_event_tx);
-                cancel_task.cancel().await;
+                if let Some(cancel_task) = cancel_task {
+                    cancel_task.cancel().await;
+                }
                 let terminal = terminal_task.await;
 
                 if let TurnOutcome::Failed { failure, .. } = &outcome {
@@ -981,6 +990,7 @@ mod tests {
                 fast: false,
                 workflow: false,
                 prompt: None,
+                cancel: None,
                 lease_committer: None,
             },
             prompt_slots: ResolvedSlots::default(),

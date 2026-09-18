@@ -2825,9 +2825,10 @@ impl<'t> EventLoop<'t> {
         {
             return self.replace_runtime(self.focused, session);
         }
+        let provider = self.ctx.prepare_replacement_provider(&session)?;
         let runtime = self
             .ctx
-            .spawn_runtime(session)
+            .spawn_runtime_with_provider(session, provider)
             .map_err(|error| error.to_string())?;
         let idx = self.push_runtime(runtime);
         self.set_focused(idx);
@@ -4030,6 +4031,53 @@ mod tests {
         assert_eq!(runtime_slot.model.spec(), FOCUSED_MODEL);
         assert_eq!(runtime.coordinator.read().model().as_ref(), FOCUSED_MODEL);
         drop(runtime_slot);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn resumed_session_uses_its_stored_model_and_provider() {
+        const STORED_MODEL: &str = "openai/gpt-5";
+
+        let harness = RuntimeHarness::new();
+        assert_ne!(harness.ctx().model_slot.load().model.spec(), STORED_MODEL);
+        let mut session = harness.session();
+        session.model = STORED_MODEL.into();
+        session.push_message(Message::user("stored history".into()));
+        let provider = PreparedProvider {
+            model: Model::from_spec(STORED_MODEL).unwrap(),
+            provider: Arc::new(FocusedProvider),
+        };
+        let runtime = harness
+            .ctx()
+            .spawn_runtime_with_provider(session, Some(provider))
+            .unwrap();
+
+        assert_eq!(runtime.model_slot.load().model.spec(), STORED_MODEL);
+        assert_eq!(
+            smol::block_on(runtime.model_slot.load().provider.list_models()).unwrap()[0].id,
+            "focused"
+        );
+        assert_eq!(runtime.coordinator.read().model().as_ref(), STORED_MODEL);
+        let options = runtime.coordinator.read().options();
+        assert_eq!(
+            options
+                .options
+                .iter()
+                .find(|option| {
+                    option.definition.id.as_ref() == maki_agent::session_options::MODEL_OPTION_ID
+                })
+                .unwrap()
+                .current_value
+                .as_ref(),
+            STORED_MODEL
+        );
+        smol::block_on(
+            runtime
+                .coordinator
+                .set_model(Some(Arc::from(STORED_MODEL)), None, None),
+        )
+        .unwrap();
+        assert_eq!(runtime.model_slot.load().model.spec(), STORED_MODEL);
         release_runtime(runtime);
     }
 

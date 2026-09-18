@@ -369,6 +369,7 @@ impl<'h> Agent<'h> {
             fast,
             workflow,
             prompt: _,
+            cancel: _,
             lease_committer: _,
         } = input;
         self.push_input_context(preamble);
@@ -1241,6 +1242,7 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
+            cancel: None,
             lease_committer: None,
         }
     }

@@ -233,6 +233,7 @@ fn drive_print(
             fast: literal.fast,
             workflow: literal.workflow,
             prompt: None,
+            cancel: None,
             lease_committer: None,
         },
     };
@@ -289,6 +290,7 @@ pub fn run(
         fast,
         workflow,
         prompt: None,
+        cancel: None,
         lease_committer: None,
     };
     let _standard_commands =
@@ -586,6 +588,7 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
+            cancel: None,
             lease_committer: None,
         }
     }

@@ -705,6 +705,7 @@ mod tests {
                 qualified_name: "srv.missing".into(),
                 arguments: HashMap::new(),
             })),
+            cancel: None,
             lease_committer: None,
         };
         let context = TurnContext {

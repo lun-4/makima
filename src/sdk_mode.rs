@@ -1061,6 +1061,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 fast,
                                 workflow,
                                 prompt: None,
+                                cancel: None,
                                 lease_committer: None,
                             };
                             if handle.input_tx.send(input).is_err() {

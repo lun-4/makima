@@ -1485,6 +1485,7 @@ async fn send_command_turn(
                 && option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE
         })
     };
+    let (cancel_trigger, cancel) = maki_agent::cancel::CancelToken::new();
     let mut input = agent_input(
         turn.content.text.to_string(),
         images,
@@ -1503,6 +1504,7 @@ async fn send_command_turn(
         .acquire_lease()
         .await
         .map_err(coordinator_error)?;
+    input.cancel = Some(cancel);
     input.lease_committer = lease.committer();
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     {
@@ -1516,7 +1518,7 @@ async fn send_command_turn(
             kind: OperationKind::PrimaryTurn,
             run_id: None,
             cancelling: false,
-            cancel: None,
+            cancel: Some(cancel_trigger),
             _lease: Some(lease),
         });
     }
@@ -1544,6 +1546,7 @@ fn agent_input(
         fast,
         workflow,
         prompt: prompt.map(Box::new),
+        cancel: None,
         lease_committer: None,
     }
 }
@@ -2276,24 +2279,33 @@ mod tests {
         }
     }
 
-    fn test_coordinator(
-        session_id: MakiId,
-        model: &str,
-        cwd: PathBuf,
-    ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
-        let checkpoint: Arc<
-            dyn maki_storage::checkpoint::CheckpointWriter<
-                    maki_agent::session_coordinator::SessionCheckpoint,
-                >,
-        > = Arc::new(|request: maki_storage::checkpoint::CheckpointRequest<_>| {
+    fn successful_checkpoint() -> Arc<
+        dyn maki_storage::checkpoint::CheckpointWriter<
+                maki_agent::session_coordinator::SessionCheckpoint,
+            >,
+    > {
+        Arc::new(|request: maki_storage::checkpoint::CheckpointRequest<_>| {
             Box::pin(async move {
                 Ok(maki_storage::checkpoint::CheckpointAck {
                     session_id: request.session_id,
                     version: request.version,
                 })
             }) as maki_storage::checkpoint::CheckpointFuture
-        });
-        test_coordinator_with(session_id, model, cwd, Default::default(), checkpoint)
+        })
+    }
+
+    fn test_coordinator(
+        session_id: MakiId,
+        model: &str,
+        cwd: PathBuf,
+    ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
+        test_coordinator_with(
+            session_id,
+            model,
+            cwd,
+            Default::default(),
+            successful_checkpoint(),
+        )
     }
 
     fn test_coordinator_with(
@@ -2374,6 +2386,21 @@ mod tests {
         Receiver<Value>,
         Receiver<AgentInput>,
     ) {
+        server_awaiting_answer_with_checkpoint(successful_checkpoint())
+    }
+
+    fn server_awaiting_answer_with_checkpoint(
+        checkpoint: Arc<
+            dyn maki_storage::checkpoint::CheckpointWriter<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >,
+        >,
+    ) -> (
+        Server,
+        Receiver<String>,
+        Receiver<Value>,
+        Receiver<AgentInput>,
+    ) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
         let (input_tx, input_rx) = flume::unbounded();
@@ -2396,10 +2423,12 @@ mod tests {
             )),
             task: smol::spawn(async {}),
         };
-        let coordinator = test_coordinator(
+        let coordinator = test_coordinator_with(
             handle.session_id.id(),
             OFFLINE_SPEC,
             PathBuf::from("/project"),
+            Default::default(),
+            checkpoint,
         );
         let command_registry = test_registry(&[]);
         let command_state = Arc::new(maki_agent::command::SessionCommandState::new(
@@ -3557,16 +3586,45 @@ mod tests {
     }
 
     #[test]
-    fn idle_and_duplicate_cancel_do_not_poison_the_next_prompt() {
+    fn cancel_during_completed_turn_checkpoint_does_not_cancel_next_prompt() {
         smol::block_on(async {
-            let (mut srv, _, _, input_rx) = server_awaiting_answer();
-            let (cancel_tx, cancel_rx) = flume::unbounded();
-            srv.session.as_mut().unwrap().handle.cancel_tx = cancel_tx;
-            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
-            let cancel = serde_json::json!({ "params": { "sessionId": session_id } });
+            let (checkpoint_started_tx, checkpoint_started_rx) = flume::bounded(1);
+            let (checkpoint_release_tx, checkpoint_release_rx) = flume::bounded(1);
+            let checkpoint: Arc<
+                dyn maki_storage::checkpoint::CheckpointWriter<
+                        maki_agent::session_coordinator::SessionCheckpoint,
+                    >,
+            > = Arc::new(
+                move |request: maki_storage::checkpoint::CheckpointRequest<_>| {
+                    let checkpoint_started_tx = checkpoint_started_tx.clone();
+                    let checkpoint_release_rx = checkpoint_release_rx.clone();
+                    Box::pin(async move {
+                        checkpoint_started_tx.send_async(()).await.unwrap();
+                        checkpoint_release_rx.recv_async().await.unwrap();
+                        Ok(maki_storage::checkpoint::CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as maki_storage::checkpoint::CheckpointFuture
+                },
+            );
+            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer_with_checkpoint(checkpoint);
+            let session = srv.session.as_ref().unwrap();
+            let pending = Arc::clone(&session.pending);
+            let session_id = session.handle.session_id.to_string();
+            let (event_tx, event_rx) = flume::unbounded();
+            start_event_pump(
+                event_rx,
+                session.handle.session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&pending),
+                false,
+                session.handle.answer_tx.clone(),
+                session.coordinator.as_ref().unwrap().read(),
+                None,
+                None,
+            );
 
-            handle_notification(&srv, "session/cancel", &cancel);
-            assert!(cancel_rx.is_empty(), "idle cancel must not be queued");
             handle_prompt(
                 &mut srv,
                 &prompt_request(&session_id, "first", false),
@@ -3574,15 +3632,77 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(input_rx.recv_async().await.unwrap().message, "first");
+            let first = input_rx.recv_async().await.unwrap();
+            let checkpoint_task = smol::spawn(async move {
+                first
+                    .lease_committer
+                    .unwrap()
+                    .commit_history(vec![Message::user("first".into())])
+                    .await
+                    .unwrap();
+                event_tx
+                    .send_async(Envelope {
+                        event: AgentEvent::ControlComplete {
+                            usage: TokenUsage::default(),
+                        },
+                        subagent: None,
+                        run_id: 0,
+                    })
+                    .await
+                    .unwrap();
+            });
+            checkpoint_started_rx.recv_async().await.unwrap();
+
+            handle_notification(
+                &srv,
+                "session/cancel",
+                &serde_json::json!({ "params": { "sessionId": session_id } }),
+            );
+            checkpoint_release_tx.send_async(()).await.unwrap();
+            checkpoint_task.await;
+            let terminal = out_rx.recv_async().await.unwrap();
+            assert_eq!(terminal["id"], 41);
+            assert_eq!(terminal["result"]["stopReason"], "end_turn");
+
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "second", false),
+                &RequestId::Number(42),
+            )
+            .await
+            .unwrap();
+            let second = input_rx.recv_async().await.unwrap();
+            assert_eq!(second.message, "second");
+            assert!(!second.cancel.unwrap().is_cancelled());
+            take_active_operation(&pending, OperationKind::PrimaryTurn).unwrap();
+        });
+    }
+
+    #[test]
+    fn idle_and_duplicate_cancel_do_not_poison_the_next_prompt() {
+        smol::block_on(async {
+            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            let cancel = serde_json::json!({ "params": { "sessionId": session_id } });
+
+            handle_notification(&srv, "session/cancel", &cancel);
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "first", false),
+                &RequestId::Number(41),
+            )
+            .await
+            .unwrap();
+            let first = input_rx.recv_async().await.unwrap();
+            assert_eq!(first.message, "first");
+            let first_cancel = first.cancel.unwrap();
 
             handle_notification(&srv, "session/cancel", &cancel);
             handle_notification(&srv, "session/cancel", &cancel);
             assert!(
-                cancel_rx.try_recv().is_ok(),
+                first_cancel.is_cancelled(),
                 "active operation must be cancelled"
             );
-            assert!(cancel_rx.is_empty(), "duplicate cancel must not be queued");
             let pending = &srv.session.as_ref().unwrap().pending;
             take_active_operation(pending, OperationKind::PrimaryTurn).unwrap();
 
@@ -3593,9 +3713,10 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(input_rx.recv_async().await.unwrap().message, "second");
+            let second = input_rx.recv_async().await.unwrap();
+            assert_eq!(second.message, "second");
             assert!(
-                cancel_rx.is_empty(),
+                !second.cancel.unwrap().is_cancelled(),
                 "next prompt must not inherit cancellation"
             );
         });

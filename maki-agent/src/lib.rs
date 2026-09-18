@@ -114,5 +114,6 @@ pub struct AgentInput {
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
+    pub cancel: Option<CancelToken>,
     pub lease_committer: Option<session_coordinator::SessionLeaseCommitter>,
 }
