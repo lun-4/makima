@@ -2814,10 +2814,16 @@ impl<'t> EventLoop<'t> {
         request: SessionReplacementRequest,
     ) -> Result<PendingReplacement, String> {
         let SessionReplacementRequest {
-            session,
+            mut session,
             kind,
             post_commit,
         } = request;
+        if session.id == self.sessions[idx].id() {
+            apply_options_to_session(
+                &mut session,
+                &self.sessions[idx].coordinator.read().options(),
+            );
+        }
         let prepared = self.ctx.prepare_replacement_runtime(
             session,
             self.sessions[idx].id(),

@@ -290,6 +290,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     }
 
+    close_session(&mut server).await;
     drop(server);
     writer_task.await;
 

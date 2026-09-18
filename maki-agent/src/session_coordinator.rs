@@ -1705,12 +1705,12 @@ async fn set_model(
             .unwrap_or_else(|| Arc::from(ThinkingConfig::Off.to_string())),
         None => Arc::from(ThinkingConfig::Off.to_string()),
     };
-    let values = [
-        (MODEL_OPTION_ID, target_spec),
-        (FAST_OPTION_ID, fast_value.as_ref()),
-        (THINKING_OPTION_ID, thinking_value.as_ref()),
-    ];
-    let Some(candidate) = read.options.prepare_set_values(&values)? else {
+    let Some(candidate) = read.options.prepare_set_model(
+        target_spec,
+        fast_value.as_ref(),
+        thinking_value.as_ref(),
+    )?
+    else {
         return Ok(read.options.snapshot());
     };
     let options = SessionOptions::candidate_snapshot(&candidate);
@@ -1731,7 +1731,7 @@ async fn set_model(
             })?;
             if let Err(rollback_error) = model_adopter.adopt(previous_model).await {
                 lock(&read.state).model = Arc::from(target_spec);
-                read.options.set_values_atomically(&values)?;
+                read.options.commit(candidate)?;
                 return Err(SessionCoordinatorError::ModelRollback(Arc::from(format!(
                     "{error}; rollback: {rollback_error}; live runtime remains on {target_spec}"
                 ))));
@@ -3009,10 +3009,7 @@ mod tests {
             params.model = Arc::from("anthropic/claude-opus-4-8");
             params.definitions = builtin_option_definitions(
                 "anthropic/claude-opus-4-8",
-                [
-                    Arc::from("anthropic/claude-opus-4-8"),
-                    Arc::from("ollama/llama3"),
-                ],
+                [Arc::from("anthropic/claude-opus-4-8")],
                 false,
                 false,
                 false,
@@ -3051,10 +3048,7 @@ mod tests {
             params.model = Arc::from("ollama/llama3");
             params.definitions = builtin_option_definitions(
                 "ollama/llama3",
-                [
-                    Arc::from("ollama/llama3"),
-                    Arc::from("anthropic/claude-opus-4-8"),
-                ],
+                [Arc::from("ollama/llama3")],
                 false,
                 false,
                 false,
@@ -3082,11 +3076,25 @@ mod tests {
                 Some(ENABLED_VALUE)
             );
             assert_eq!(thinking_value(&after).as_ref(), "high");
+            let model = after
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == MODEL_OPTION_ID)
+                .unwrap();
+            assert!(
+                model
+                    .definition
+                    .values
+                    .iter()
+                    .any(|value| value.value.as_ref() == "anthropic/claude-opus-4-8"),
+                "the explicit target and settings must share one committed snapshot"
+            );
             {
                 let saved = lock(&saved);
                 assert_eq!(saved.len(), 1);
                 assert_eq!(saved[0].model.as_ref(), "anthropic/claude-opus-4-8");
                 assert_eq!(saved[0].options, after);
+                assert_eq!(saved[0].options.version, before.version + 1);
             }
             coordinator.close().await.unwrap();
         });
@@ -3294,9 +3302,20 @@ mod tests {
 
             assert!(matches!(error, SessionCoordinatorError::ModelRollback(_)));
             assert_eq!(coordinator.read().model().as_ref(), "openai/gpt-5");
-            assert_eq!(
-                current_option_value(&coordinator.read(), MODEL_OPTION_ID).as_deref(),
-                Some("openai/gpt-5")
+            let recovered = coordinator.read().options();
+            let model = recovered
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == MODEL_OPTION_ID)
+                .unwrap();
+            assert_eq!(model.current_value.as_ref(), "openai/gpt-5");
+            assert!(
+                model
+                    .definition
+                    .values
+                    .iter()
+                    .any(|value| value.value.as_ref() == "openai/gpt-5"),
+                "rollback failure must commit the live model and its definition together"
             );
             assert_eq!(
                 lock(&adopted).as_slice(),
@@ -3348,12 +3367,8 @@ mod tests {
         });
     }
 
-    /// A session registered before providers finish discovering models knows
-    /// only the model it started on, so selecting anything else is refused.
-    /// Every frontend must republish the discovered list, or that session is
-    /// stuck on its startup model for as long as it lives.
     #[test]
-    fn a_model_discovered_after_registration_becomes_selectable() {
+    fn policy_approved_explicit_model_is_selectable_before_discovery() {
         smol::block_on(async {
             let id = MakiId::generate();
             let mut params = params(id, writer(false));
@@ -3367,24 +3382,20 @@ mod tests {
             );
             let coordinator = SessionCoordinatorHandle::register(params).unwrap();
 
-            assert!(
-                matches!(
-                    coordinator.set_option("model", "openai/gpt-5").await,
-                    Err(SessionCoordinatorError::Option(
-                        SessionOptionError::InvalidValue { .. }
-                    ))
-                ),
-                "a model the session has never been told about must be refused"
-            );
-
-            coordinator
-                .update_model_values(vec![Arc::from("openai/gpt-5")])
-                .await
-                .expect("discovery republishes the model list");
-            coordinator
+            let before = coordinator.read().options();
+            let after = coordinator
                 .set_option("model", "openai/gpt-5")
                 .await
-                .expect("a discovered model must become selectable");
+                .expect("a valid explicit model does not depend on discovery");
+
+            assert_eq!(after.version, before.version + 1);
+            let model = after
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == MODEL_OPTION_ID)
+                .unwrap();
+            assert_eq!(model.current_value.as_ref(), "openai/gpt-5");
+            assert!(model.definition.accepts("openai/gpt-5"));
 
             coordinator.close().await.unwrap();
         });

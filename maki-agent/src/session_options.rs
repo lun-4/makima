@@ -209,6 +209,44 @@ impl SessionOptions {
         values: &[(&str, &str)],
     ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
         let state = lock(&self.state);
+        Self::prepare_set_values_from_state(&state, values)
+    }
+
+    pub(crate) fn prepare_set_model(
+        &self,
+        model: &str,
+        fast: &str,
+        thinking: &str,
+    ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
+        let state = lock(&self.state);
+        let mut candidate = state.clone();
+        let definition = candidate
+            .definitions
+            .iter_mut()
+            .find(|definition| definition.id.as_ref() == MODEL_OPTION_ID)
+            .ok_or_else(|| SessionOptionError::UnknownId(Arc::from(MODEL_OPTION_ID)))?;
+        if !definition.accepts(model) {
+            let mut choices = definition.values.to_vec();
+            choices.push(SessionOptionValue {
+                value: Arc::from(model),
+                name: Arc::from(model),
+            });
+            definition.values = choices.into();
+        }
+        Self::prepare_set_values_from_state(
+            &candidate,
+            &[
+                (MODEL_OPTION_ID, model),
+                (FAST_OPTION_ID, fast),
+                (THINKING_OPTION_ID, thinking),
+            ],
+        )
+    }
+
+    fn prepare_set_values_from_state(
+        state: &State,
+        values: &[(&str, &str)],
+    ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
         let mut resolved = Vec::with_capacity(values.len());
         for (id, value) in values {
             let definition = state
@@ -489,34 +527,6 @@ impl SessionOptions {
         Ok(snapshot)
     }
 
-    pub(crate) fn set_values_atomically(
-        &self,
-        values: &[(&str, &str)],
-    ) -> Result<SessionOptionsSnapshot, SessionOptionError> {
-        let mut state = lock(&self.state);
-        let mut resolved = Vec::with_capacity(values.len());
-        for (id, value) in values {
-            let definition = state
-                .definitions
-                .iter()
-                .find(|definition| definition.id.as_ref() == *id)
-                .ok_or_else(|| SessionOptionError::UnknownId(Arc::from(*id)))?;
-            if !definition.accepts(value) {
-                return Err(SessionOptionError::InvalidValue {
-                    id: Arc::from(*id),
-                    value: Arc::from(*value),
-                });
-            }
-            resolved.push((Arc::clone(&definition.id), Arc::from(*value)));
-        }
-        state.values.extend(resolved);
-        state.version += 1;
-        let snapshot = snapshot(&state);
-        drop(state);
-        self.changed.notify(usize::MAX);
-        Ok(snapshot)
-    }
-
     pub fn set(&self, id: &str, value: &str) -> Result<SessionOptionsSnapshot, SessionOptionError> {
         let Some(candidate) = self.prepare_set(id, value)? else {
             return Ok(self.snapshot());
@@ -666,6 +676,39 @@ mod tests {
                 WORKFLOW_OPTION_ID,
             ]
         );
+    }
+
+    #[test]
+    fn model_definition_and_settings_are_staged_in_one_candidate() {
+        let mut model = definition(MODEL_OPTION_ID, "old/model");
+        model.values = Arc::from([SessionOptionValue {
+            value: Arc::from("old/model"),
+            name: Arc::from("old/model"),
+        }]);
+        let options = SessionOptions::new(
+            vec![
+                model,
+                definition(FAST_OPTION_ID, DISABLED_VALUE),
+                definition(THINKING_OPTION_ID, DISABLED_VALUE),
+            ],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let before = options.snapshot();
+
+        let candidate = options
+            .prepare_set_model("new/model", ENABLED_VALUE, ENABLED_VALUE)
+            .unwrap()
+            .unwrap();
+        let staged = SessionOptions::candidate_snapshot(&candidate);
+
+        assert_eq!(options.snapshot(), before);
+        assert_eq!(staged.version, before.version + 1);
+        assert_eq!(staged.options[0].current_value.as_ref(), "new/model");
+        assert!(staged.options[0].definition.accepts("new/model"));
+        assert_eq!(staged.options[1].current_value.as_ref(), ENABLED_VALUE);
+        assert_eq!(staged.options[2].current_value.as_ref(), ENABLED_VALUE);
+        assert_eq!(options.commit(candidate).unwrap(), staged);
     }
 
     #[test]
