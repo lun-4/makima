@@ -745,6 +745,8 @@ impl PreparedSessionCoordinator {
         self.activate_inner(None)
     }
 
+    /// The checkpoint backend must order writes across generations or drain the
+    /// retired generation before replacement.
     pub fn activate_replacing(
         self,
         current: &SessionCoordinatorHandle,
