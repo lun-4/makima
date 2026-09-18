@@ -17,6 +17,7 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
+use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::command::{CustomCommand, StandardCommands, StandardCompletions};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
@@ -525,6 +526,8 @@ struct Shared {
     permission_mode: PermissionMode,
     turn_start: Instant,
     pending: HashSet<String>,
+    turn_active: bool,
+    active_cancel: Option<CancelTrigger>,
 }
 
 struct CommandDriverParams {
@@ -948,6 +951,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         permission_mode,
         turn_start: Instant::now(),
         pending: HashSet::new(),
+        turn_active: false,
+        active_cancel: None,
     }));
 
     let pump = EventPump {
@@ -1016,7 +1021,17 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 fast,
                                 workflow,
                             )?;
+                            let input = match prepare_sdk_turn(&shared, input) {
+                                Ok(input) => input,
+                                Err(error) => {
+                                    emit_command_result(&writer, &shared, true, error.into())?;
+                                    continue;
+                                }
+                            };
                             if handle.input_tx.send(input).is_err() {
+                                let mut shared = shared.lock().unwrap();
+                                shared.turn_active = false;
+                                shared.active_cancel.take();
                                 break;
                             }
                         }
@@ -1064,7 +1079,17 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 cancel: None,
                                 lease_committer: None,
                             };
+                            let input = match prepare_sdk_turn(&shared, input) {
+                                Ok(input) => input,
+                                Err(error) => {
+                                    emit_command_result(&writer, &shared, true, error.into())?;
+                                    continue;
+                                }
+                            };
                             if handle.input_tx.send(input).is_err() {
+                                let mut shared = shared.lock().unwrap();
+                                shared.turn_active = false;
+                                shared.active_cancel.take();
                                 break;
                             }
                         }
@@ -1535,6 +1560,21 @@ struct ControlRequestContext<'a> {
     commands: &'a SdkCommands,
 }
 
+fn prepare_sdk_turn(
+    shared: &Mutex<Shared>,
+    mut input: AgentInput,
+) -> Result<AgentInput, &'static str> {
+    let mut shared = shared.lock().unwrap();
+    if shared.turn_active {
+        return Err("a turn is already active");
+    }
+    let (trigger, cancel) = CancelToken::new();
+    shared.turn_active = true;
+    shared.active_cancel = Some(trigger);
+    input.cancel = Some(cancel);
+    Ok(input)
+}
+
 fn handle_control_request(
     cr: &InboundControlRequest,
     ctx: ControlRequestContext<'_>,
@@ -1562,7 +1602,9 @@ fn handle_control_request(
             )
         }
         InboundControlRequestType::Interrupt => {
-            let _ = handle.cancel_tx.try_send(());
+            if let Some(cancel) = shared.lock().unwrap().active_cancel.take() {
+                cancel.cancel();
+            }
             writer.emit_control_response(&cr.request_id, ok, None)
         }
         InboundControlRequestType::SetPermissionMode => {
@@ -1881,6 +1923,10 @@ impl EventPump {
                     }))?;
             }
             AgentEvent::TurnOutcome(outcome) => {
+                let mut shared = self.shared.lock().unwrap();
+                shared.turn_active = false;
+                shared.active_cancel.take();
+                drop(shared);
                 self.terminal_run_id = Some(envelope.run_id);
                 let result = mem::take(&mut self.result_text);
                 match outcome {
@@ -1909,6 +1955,10 @@ impl EventPump {
             }
             AgentEvent::ControlComplete { .. } => {}
             AgentEvent::ControlError { message } => {
+                let mut shared = self.shared.lock().unwrap();
+                shared.turn_active = false;
+                shared.active_cancel.take();
+                drop(shared);
                 if self.terminal_run_id == Some(envelope.run_id) {
                     self.writer
                         .emit_system("warning", serde_json::json!({ "message": message }))?;
@@ -2184,6 +2234,42 @@ mod tests {
     }
 
     #[test]
+    fn sdk_turn_cancellation_is_operation_scoped() {
+        let shared = Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Default,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
+        });
+        let input = |message: &str| AgentInput {
+            message: message.into(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: maki_agent::ThinkingConfig::Off,
+            fast: false,
+            workflow: false,
+            prompt: None,
+            cancel: None,
+            lease_committer: None,
+        };
+
+        let first = prepare_sdk_turn(&shared, input("first")).unwrap();
+        assert!(prepare_sdk_turn(&shared, input("concurrent")).is_err());
+        let first_cancel = first.cancel.unwrap();
+        let cancel = shared.lock().unwrap().active_cancel.take().unwrap();
+        cancel.cancel();
+        assert!(first_cancel.is_cancelled());
+        assert!(prepare_sdk_turn(&shared, input("during checkpoint")).is_err());
+
+        shared.lock().unwrap().turn_active = false;
+        let second = prepare_sdk_turn(&shared, input("second")).unwrap();
+        assert!(!second.cancel.unwrap().is_cancelled());
+    }
+
+    #[test]
     fn sdk_model_route_updates_coordinator_state_and_checkpoint() {
         use std::sync::Mutex as StdMutex;
 
@@ -2243,6 +2329,8 @@ mod tests {
             permission_mode: PermissionMode::Default,
             turn_start: Instant::now(),
             pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
         }));
         let (route_tx, route_rx) = flume::unbounded();
         let driver = spawn_command_driver(CommandDriverParams {
@@ -2336,6 +2424,8 @@ mod tests {
             permission_mode: PermissionMode::BypassPermissions,
             turn_start: Instant::now(),
             pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
         });
 
         set_permission_mode(mode, &coordinator, &permissions, &shared).unwrap();
@@ -2383,6 +2473,8 @@ mod tests {
             permission_mode: PermissionMode::Plan,
             turn_start: Instant::now(),
             pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
         });
         let snapshot = maki_agent::session_options::SessionOptions::new(
             maki_agent::session_coordinator::builtin_option_definitions(
@@ -2816,6 +2908,8 @@ mod tests {
                 permission_mode: PermissionMode::Default,
                 turn_start: Instant::now(),
                 pending: HashSet::new(),
+                turn_active: false,
+                active_cancel: None,
             })),
             answer_tx: flume::unbounded().0,
             include_partial_messages: false,

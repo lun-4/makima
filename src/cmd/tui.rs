@@ -391,6 +391,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             maki_ui::EventLoopParams {
                 model,
                 needs_login: stack.needs_login,
+                explicit_model,
                 commands: std::mem::take(&mut stack.commands),
                 sessions: std::mem::take(&mut tabs),
                 focused,

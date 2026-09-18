@@ -757,12 +757,20 @@ mod tests {
                 release.0.send(()).unwrap();
             }),
         ));
-        let publish = std::thread::spawn(move || guard.publish(|| "published"));
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            published_tx.send(guard.publish(|| "published")).unwrap();
+        });
 
         release.1.recv().unwrap();
+        assert!(
+            published_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
         lock.unlock().unwrap();
 
-        assert_eq!(publish.join().unwrap().unwrap(), Some("published"));
+        assert_eq!(published_rx.recv().unwrap().unwrap(), Some("published"));
         lease.release().unwrap();
     }
 

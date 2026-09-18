@@ -113,6 +113,7 @@ pub(crate) struct ShutdownReport {
 pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
+    pub explicit_model: bool,
     pub commands: Vec<CustomCommand>,
     pub sessions: Vec<AppSession>,
     pub focused: usize,
@@ -1121,7 +1122,7 @@ impl SpawnCtx {
 
     fn prepare_runtime_with_provider_and_permissions(
         &self,
-        session: AppSession,
+        mut session: AppSession,
         provider: Option<PreparedProvider>,
         permissions: &PermissionManager,
         seed_snapshot: bool,
@@ -1140,6 +1141,7 @@ impl SpawnCtx {
                 )
             }
         };
+        session.model = model.spec();
         let model_slot = ProviderSlot::with_change_tx(
             model.clone(),
             runtime_provider,
@@ -1208,6 +1210,7 @@ impl SpawnCtx {
         })
     }
 
+    #[cfg(test)]
     fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
         self.spawn_runtime_with_provider(session, None)
     }
@@ -1444,6 +1447,7 @@ impl<'t> EventLoop<'t> {
         let EventLoopParams {
             mut model,
             needs_login,
+            explicit_model,
             commands,
             sessions,
             focused,
@@ -1556,7 +1560,13 @@ impl<'t> EventLoop<'t> {
 
         let mut runtimes = Vec::with_capacity(sessions.len());
         for session in sessions {
-            match ctx.spawn_runtime(session) {
+            let provider = if explicit_model {
+                None
+            } else {
+                ctx.prepare_replacement_provider(&session)
+                    .map_err(|error| eyre!(error))?
+            };
+            match ctx.spawn_runtime_with_provider(session, provider) {
                 Ok(runtime) => runtimes.push(runtime),
                 Err(error) => {
                     rollback_startup_runtimes(runtimes);
