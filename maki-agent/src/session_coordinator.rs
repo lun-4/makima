@@ -1676,11 +1676,11 @@ async fn change_directory(
         }
         return Err(error.into());
     }
-    lock(&read.state).cwd = canonical.clone();
     directory_adopter
         .settle(canonical.clone(), true)
         .await
         .map_err(SessionCoordinatorError::DirectoryAdoption)?;
+    lock(&read.state).cwd = canonical.clone();
     Ok(canonical)
 }
 
@@ -2933,6 +2933,36 @@ mod tests {
                 lock(&adopted).as_slice(),
                 [PathBuf::from("/next"), PathBuf::from("/project")]
             );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn directory_settlement_failure_preserves_coordinator_state() {
+        struct FailingSettlement;
+
+        impl DirectoryAdopter for FailingSettlement {
+            fn adopt(&self, path: PathBuf) -> DirectoryAdoptionFuture {
+                Box::pin(async move { Ok(path) })
+            }
+
+            fn settle(&self, _: PathBuf, _: bool) -> DirectoryAdoptionFuture {
+                Box::pin(async { Err(Arc::from("settlement failed")) })
+            }
+        }
+
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mut params = params(id, writer(false));
+            params.directory_adopter = Arc::new(FailingSettlement);
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+
+            assert!(matches!(
+                coordinator.change_directory(PathBuf::from("/next")).await,
+                Err(SessionCoordinatorError::DirectoryAdoption(message))
+                    if message.as_ref() == "settlement failed"
+            ));
+            assert_eq!(coordinator.read().cwd(), PathBuf::from("/project"));
             coordinator.close().await.unwrap();
         });
     }
