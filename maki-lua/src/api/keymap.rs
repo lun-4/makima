@@ -338,9 +338,8 @@ fn publish_keymap_snapshot(lua: &Lua) {
     }
 }
 
-fn loading(lua: &Lua) -> bool {
-    lua.app_data_ref::<crate::runtime::LoadingPlugin>()
-        .is_some()
+fn loading(lua: &Lua, plugin: &str) -> bool {
+    crate::runtime::loading_plugin_is(lua, plugin)
 }
 
 /// Bind a key to a Lua function, just like `vim.keymap.set`. Only
@@ -377,7 +376,7 @@ fn set(
         .and_then(|o| o.get::<String>("desc").ok())
         .unwrap_or_default();
     let registry_key = lua.create_registry_value(rhs)?;
-    if loading(lua) {
+    if loading(lua, &plugin) {
         pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -412,9 +411,9 @@ fn del(
     mode: String,
     lhs: String,
 ) -> LuaResult<()> {
-    let _ = (mode, &plugin);
+    let _ = mode;
     let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
-    let old = if loading(lua) {
+    let old = if loading(lua, &plugin) {
         pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -426,7 +425,7 @@ fn del(
     if let Some(old_key) = old {
         let _ = lua.remove_registry_value(old_key);
     }
-    if !loading(lua) {
+    if !loading(lua, &plugin) {
         publish_keymap_snapshot(lua);
     }
     Ok(())

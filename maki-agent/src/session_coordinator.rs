@@ -1659,7 +1659,10 @@ async fn change_directory(
         .await
         .map_err(SessionCoordinatorError::DirectoryAdoption)?;
     if canonical == previous {
-        return Ok(canonical);
+        return directory_adopter
+            .settle(canonical, true)
+            .await
+            .map_err(SessionCoordinatorError::DirectoryAdoption);
     }
     let result = checkpoint_state(
         read,
@@ -2887,6 +2890,46 @@ mod tests {
             assert_eq!(canonical, PathBuf::from("/canonical"));
             assert_eq!(coordinator.read().cwd(), canonical);
             assert_eq!(lock(&saved).as_slice(), [PathBuf::from("/canonical")]);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn unchanged_canonical_directory_is_settled() {
+        struct MandatorySettlement {
+            settled: Arc<Mutex<Vec<(PathBuf, bool)>>>,
+        }
+
+        impl DirectoryAdopter for MandatorySettlement {
+            fn adopt(&self, _: PathBuf) -> DirectoryAdoptionFuture {
+                Box::pin(async { Ok(PathBuf::from("/project")) })
+            }
+
+            fn settle(&self, path: PathBuf, committed: bool) -> DirectoryAdoptionFuture {
+                lock(&self.settled).push((path.clone(), committed));
+                Box::pin(async move { Ok(path) })
+            }
+        }
+
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let settled = Arc::new(Mutex::new(Vec::new()));
+            let mut params = params(id, writer(false));
+            params.directory_adopter = Arc::new(MandatorySettlement {
+                settled: Arc::clone(&settled),
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+
+            let canonical = coordinator
+                .change_directory(PathBuf::from("."))
+                .await
+                .unwrap();
+
+            assert_eq!(canonical, PathBuf::from("/project"));
+            assert_eq!(
+                lock(&settled).as_slice(),
+                [(PathBuf::from("/project"), true)]
+            );
             coordinator.close().await.unwrap();
         });
     }

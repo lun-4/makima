@@ -409,7 +409,7 @@ fn jobstart(
         None | Some("task") => job_task_id(lua).map(JobOwner::Task).ok_or_else(|| {
             mlua::Error::runtime("jobstart: no active task; use owner = \"plugin\"")
         })?,
-        Some("plugin") => loading_plugin_generation(lua)
+        Some("plugin") => loading_plugin_generation(lua, &plugin)
             .map(|generation| JobOwner::PluginCandidate {
                 plugin: Arc::clone(&plugin),
                 generation,

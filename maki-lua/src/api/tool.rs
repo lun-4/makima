@@ -1946,7 +1946,7 @@ fn register_command_from_lua(
         argument_completions,
     };
 
-    if crate::runtime::loading_plugin(lua).is_some() {
+    if crate::runtime::loading_plugin_is(lua, &plugin) {
         let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(previous) = pending.insert(Arc::clone(&name), entry) {
             remove_command_registry_values(lua, previous);

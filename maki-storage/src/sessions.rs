@@ -169,6 +169,12 @@ pub struct HistorySnapshot<M> {
     pub messages: Arc<Vec<M>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryIdentity {
+    epoch: u64,
+    len: usize,
+}
+
 impl<M> HistorySnapshot<M> {
     pub fn new(messages: Vec<M>) -> Self {
         Self {
@@ -1305,6 +1311,20 @@ where
         &self.messages
     }
 
+    pub fn history_identity(&self) -> HistoryIdentity {
+        HistoryIdentity {
+            epoch: self.epoch,
+            len: self.messages.len(),
+        }
+    }
+
+    pub fn history_snapshot(&self) -> HistorySnapshot<M> {
+        HistorySnapshot {
+            epoch: self.epoch,
+            messages: Arc::clone(&self.messages),
+        }
+    }
+
     pub fn take_messages(self) -> Vec<M> {
         Arc::unwrap_or_clone(self.messages)
     }
@@ -1361,7 +1381,11 @@ where
     }
 
     pub fn replace_messages(&mut self, messages: Vec<M>) {
-        self.messages = Arc::new(messages);
+        self.replace_shared_messages(Arc::new(messages));
+    }
+
+    pub fn replace_shared_messages(&mut self, messages: Arc<Vec<M>>) {
+        self.messages = messages;
         self.rewrite_messages();
     }
 
@@ -1375,7 +1399,7 @@ where
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
-    fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
+    pub fn adopt_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
         self.touch();
@@ -1401,7 +1425,7 @@ where
         }
         let session = Arc::make_mut(this);
         if let Some(snapshot) = history {
-            session.set_history(snapshot);
+            session.adopt_history(snapshot);
             // The title comes from the messages, so it goes stale exactly when
             // they move.
             session.update_title_if_default();

@@ -2069,17 +2069,19 @@ struct CommandPublisher {
 
 pub(crate) struct LoadingPlugin(pub(crate) Arc<str>, pub(crate) u64);
 
-pub(crate) fn loading_plugin(lua: &Lua) -> Option<Arc<str>> {
+pub(crate) fn loading_plugin_is(lua: &Lua, plugin: &str) -> bool {
     lua.app_data_ref::<LoadingPlugin>()
-        .map(|loading| Arc::clone(&loading.0))
+        .is_some_and(|loading| loading.0.as_ref() == plugin)
 }
 
-pub(crate) fn loading_plugin_generation(lua: &Lua) -> Option<u64> {
-    lua.app_data_ref::<LoadingPlugin>().map(|loading| loading.1)
+pub(crate) fn loading_plugin_generation(lua: &Lua, plugin: &str) -> Option<u64> {
+    lua.app_data_ref::<LoadingPlugin>()
+        .filter(|loading| loading.0.as_ref() == plugin)
+        .map(|loading| loading.1)
 }
 
 pub(crate) fn require_plugin_load(lua: &Lua, plugin: &str, api: &str) -> mlua::Result<()> {
-    if loading_plugin(lua).as_deref() == Some(plugin) {
+    if loading_plugin_is(lua, plugin) {
         Ok(())
     } else {
         Err(mlua::Error::runtime(format!(
@@ -2688,15 +2690,23 @@ impl LuaRuntime {
         }
     }
 
-    fn commit_pending_autocmds(&mut self, pending: crate::api::autocmd::PendingAutocmdStore) {
+    fn commit_pending_autocmds(
+        &mut self,
+        plugin: &str,
+        pending: crate::api::autocmd::PendingAutocmdStore,
+    ) {
         let candidate =
             std::mem::take(&mut *pending.lock().unwrap_or_else(|error| error.into_inner()));
         if let Some(mut live) = self.lua.app_data_mut::<AutocmdStore>() {
-            *live = candidate;
+            live.replace_plugin(plugin, candidate);
         }
     }
 
-    fn commit_pending_timers(&mut self, pending: crate::api::timer::PendingTimerStore) {
+    fn commit_pending_timers(
+        &mut self,
+        plugin: &str,
+        pending: crate::api::timer::PendingTimerStore,
+    ) {
         let candidate = std::mem::replace(
             &mut *pending.lock().unwrap_or_else(|error| error.into_inner()),
             TimerStore::new(),
@@ -2704,7 +2714,7 @@ impl LuaRuntime {
         let old = self
             .lua
             .app_data_mut::<TimerStore>()
-            .map(|mut live| live.replace_entries(candidate))
+            .map(|mut live| live.replace_plugin(plugin, candidate))
             .unwrap_or_default();
         for key in old {
             let _ = self.lua.remove_registry_value(key);
@@ -3193,8 +3203,8 @@ impl LuaRuntime {
             store.commit(Arc::clone(&name), generation);
         }
         self.commit_pending_registrations(&name, pending_commands, pending_keymaps);
-        self.commit_pending_autocmds(pending_autocmds);
-        self.commit_pending_timers(pending_timers);
+        self.commit_pending_autocmds(&name, pending_autocmds);
+        self.commit_pending_timers(&name, pending_timers);
         if let Some(candidate) = self
             .lua
             .remove_app_data::<crate::api::slot::PendingSlotStore>()
@@ -3204,7 +3214,7 @@ impl LuaRuntime {
                 .unwrap_or_else(|error| error.into_inner())
                 .clone();
             if let Some(mut live) = self.lua.app_data_mut::<SlotStore>() {
-                *live = candidate;
+                live.replace_plugin(&name, candidate);
             }
         }
         if let Some(candidate) = self.lua.remove_app_data::<PendingPromptHintCallbacks>()

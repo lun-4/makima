@@ -43,7 +43,18 @@ impl AutocmdStore {
         for entries in self.listeners.values_mut() {
             entries.retain(|e| e.plugin.as_ref() != plugin);
         }
-        self.listeners.retain(|_, v| !v.is_empty());
+        self.listeners.retain(|_, entries| !entries.is_empty());
+    }
+
+    pub fn replace_plugin(&mut self, plugin: &str, mut candidate: Self) {
+        self.clear_plugin(plugin);
+        for (event, entries) in candidate.listeners.drain() {
+            self.listeners.entry(event).or_default().extend(
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.plugin.as_ref() == plugin),
+            );
+        }
     }
 }
 
@@ -194,7 +205,7 @@ fn create_autocmd(
         v => Some(parse_string_or_seq(v, "pattern")?),
     };
     let id = NEXT_AUTOCMD_ID.fetch_add(1, Ordering::Relaxed);
-    if crate::runtime::loading_plugin(lua).is_some() {
+    if crate::runtime::loading_plugin_is(lua, &plugin) {
         let mut store = pending.lock().unwrap_or_else(|error| error.into_inner());
         for event in events {
             store.register(
@@ -236,8 +247,13 @@ fn create_autocmd(
 /// @example
 /// maki.api.del_autocmd(id)
 #[lua_fn]
-fn del_autocmd(lua: &Lua, #[ctx] pending: PendingAutocmdStore, id: u64) -> LuaResult<()> {
-    if crate::runtime::loading_plugin(lua).is_some() {
+fn del_autocmd(
+    lua: &Lua,
+    #[ctx] pending: PendingAutocmdStore,
+    #[ctx] plugin: Arc<str>,
+    id: u64,
+) -> LuaResult<()> {
+    if crate::runtime::loading_plugin_is(lua, &plugin) {
         pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -265,6 +281,7 @@ fn del_autocmd(lua: &Lua, #[ctx] pending: PendingAutocmdStore, id: u64) -> LuaRe
 fn exec_autocmds(
     lua: &Lua,
     #[ctx] pending: PendingAutocmdStore,
+    #[ctx] plugin: Arc<str>,
     event: Value,
     opts: Option<Table>,
 ) -> LuaResult<()> {
@@ -281,7 +298,7 @@ fn exec_autocmds(
         None => (None, Value::Nil),
     };
     for event in events {
-        if crate::runtime::loading_plugin(lua).is_some() {
+        if crate::runtime::loading_plugin_is(lua, &plugin) {
             let snapshot = {
                 let mut store = pending.lock().unwrap_or_else(|error| error.into_inner());
                 snapshot(&mut store, &event, pattern.as_deref())
@@ -296,7 +313,7 @@ fn exec_autocmds(
 
 lua_table! {
     extend "maki.api" => pub(crate) fn add_autocmd_methods(pending: PendingAutocmdStore, plugin: Arc<str>), DOCS [
-        create_autocmd(pending, plugin), del_autocmd(pending), exec_autocmds(pending),
+        create_autocmd(pending, plugin), del_autocmd(pending, plugin), exec_autocmds(pending, plugin),
     ]
 }
 

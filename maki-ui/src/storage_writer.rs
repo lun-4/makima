@@ -17,7 +17,7 @@ use maki_storage::checkpoint::{
     CheckpointWriter,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SESSIONS_DIR, SessionError, SessionLog};
+use maki_storage::sessions::{HistoryIdentity, SESSIONS_DIR, SessionError, SessionLog};
 use maki_storage::{StateDir, StorageError};
 use tracing::warn;
 
@@ -61,14 +61,14 @@ struct PendingState {
     latest: HashMap<MakiId, Arc<AppSession>>,
     latest_generations: HashMap<MakiId, u64>,
     coordinator_pending: HashMap<MakiId, CoordinatorPending>,
-    coordinator_history_bases: HashMap<MakiId, Arc<Vec<maki_providers::Message>>>,
+    coordinator_history_bases: HashMap<MakiId, HistoryIdentity>,
     next_generation: u64,
 }
 
 struct CoordinatorPending {
     generation: u64,
     session: Arc<AppSession>,
-    history_base: Option<Arc<Vec<maki_providers::Message>>>,
+    history_base: Option<HistoryIdentity>,
 }
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
@@ -87,7 +87,7 @@ struct PendingSave {
     waiters: Vec<CheckpointWaiter>,
     generation: u64,
     coordinator_generation: Option<u64>,
-    coordinator_history_base: Option<Arc<Vec<maki_providers::Message>>>,
+    coordinator_history_base: Option<HistoryIdentity>,
     retry_attempt: usize,
     retry_at: Option<Instant>,
 }
@@ -128,11 +128,11 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
         let mut state = lock(&self.pending);
         let (base, mut history_base) =
             if let Some(pending) = state.coordinator_pending.get(&session_id) {
-                (Arc::clone(&pending.session), pending.history_base.clone())
+                (Arc::clone(&pending.session), pending.history_base)
             } else if let Some(latest) = state.latest.get(&session_id) {
                 (
                     Arc::clone(latest),
-                    state.coordinator_history_bases.get(&session_id).cloned(),
+                    state.coordinator_history_bases.get(&session_id).copied(),
                 )
             } else {
                 return Box::pin(async move {
@@ -142,11 +142,8 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
                     })
                 });
             };
-        if history_base.is_none()
-            && let Some(history) = &request.snapshot.history
-            && !histories_match(base.messages(), history)
-        {
-            history_base = Some(Arc::new(base.messages().to_vec()));
+        if history_base.is_none() && request.snapshot.history.is_some() {
+            history_base = Some(base.history_identity());
         }
         let merged = Arc::new(merge_checkpoint(&base, &request.snapshot));
         let generation = next_generation(&mut state);
@@ -156,7 +153,7 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
             CoordinatorPending {
                 generation,
                 session: Arc::clone(&merged),
-                history_base: history_base.clone(),
+                history_base,
             },
         );
         let (reply, response) = flume::bounded(1);
@@ -250,7 +247,7 @@ impl StorageWriter {
         let preserve_history = state
             .coordinator_history_bases
             .get(&id)
-            .is_some_and(|base| histories_match(session.messages(), base));
+            .is_some_and(|base| session.history_identity() == *base);
         if !preserve_history {
             state.coordinator_history_bases.remove(&id);
         }
@@ -277,7 +274,7 @@ impl StorageWriter {
                 ));
                 pending.generation = coordinator_generation.unwrap();
                 pending.session = Arc::clone(&merged);
-                (merged, pending.history_base.clone())
+                (merged, pending.history_base)
             })
             .unwrap_or((authoritative, None));
         enqueue_locked(
@@ -465,10 +462,8 @@ fn commit_save(pending: &Pending, id: MakiId, save: &PendingSave) {
         })
         .unwrap_or_else(|| Arc::clone(&save.session));
     state.latest.insert(id, authoritative);
-    if let Some(history_base) = &save.coordinator_history_base {
-        state
-            .coordinator_history_bases
-            .insert(id, Arc::clone(history_base));
+    if let Some(history_base) = save.coordinator_history_base {
+        state.coordinator_history_bases.insert(id, history_base);
     }
     if state
         .coordinator_pending
@@ -526,8 +521,8 @@ fn merge_tui_snapshot(
     preserve_history: bool,
 ) -> AppSession {
     let mut session = incoming.clone();
-    if preserve_history && !histories_match(session.messages(), latest.messages()) {
-        session.replace_messages(latest.messages().to_vec());
+    if preserve_history && session.history_identity() != latest.history_identity() {
+        session.adopt_history(&latest.history_snapshot());
     }
     session.set_model(latest.model.clone());
     session.set_cwd(latest.cwd.clone());
@@ -545,10 +540,8 @@ fn merge_checkpoint(base: &AppSession, checkpoint: &SessionCheckpoint) -> AppSes
     // leaves them alone: while a turn holds the lease the coordinator's copy
     // is the pre-turn one, and writing it would rewind the stored session to
     // before the running turn.
-    if let Some(history) = &checkpoint.history
-        && !histories_match(session.messages(), history)
-    {
-        session.replace_messages(history.as_ref().clone());
+    if let Some(history) = &checkpoint.history {
+        session.replace_shared_messages(Arc::clone(history));
     }
     session.set_model(checkpoint.model.to_string());
     session.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
@@ -578,17 +571,6 @@ fn merge_checkpoint(base: &AppSession, checkpoint: &SessionCheckpoint) -> AppSes
         })
         .collect();
     session
-}
-
-fn histories_match(
-    current: &[maki_providers::Message],
-    candidate: &[maki_providers::Message],
-) -> bool {
-    current.len() == candidate.len()
-        && matches!(
-            (serde_json::to_vec(current), serde_json::to_vec(candidate)),
-            (Ok(current), Ok(candidate)) if current == candidate
-        )
 }
 
 fn option_enabled(options: &maki_agent::session_options::SessionOptionsSnapshot, id: &str) -> bool {
@@ -1182,6 +1164,58 @@ mod tests {
                 })
             );
             assert_eq!(message_texts(&loaded), ["coordinator history"]);
+        });
+    }
+
+    #[test]
+    fn divergent_tui_history_is_not_overwritten_by_coordinator_history() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(MODEL, CWD);
+            session.push_message(maki_providers::Message::user("base".into()));
+            let id = session.id;
+            writer.send(Arc::new(session.clone()));
+
+            let options = maki_agent::session_options::SessionOptions::new(
+                maki_agent::session_coordinator::builtin_option_definitions(
+                    MODEL,
+                    [Arc::from(MODEL)],
+                    false,
+                    false,
+                    false,
+                    maki_agent::ThinkingConfig::Off,
+                ),
+                &Default::default(),
+            )
+            .unwrap()
+            .snapshot();
+            writer
+                .coordinator_checkpoint()
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: 1,
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(SessionCheckpoint {
+                        history: Some(Arc::new(vec![maki_providers::Message::user(
+                            "coordinator".into(),
+                        )])),
+                        model: Arc::from(MODEL),
+                        cwd: CWD.into(),
+                        options,
+                    }),
+                })
+                .await
+                .unwrap();
+
+            session.replace_messages(vec![maki_providers::Message::user("tui".into())]);
+            writer.send(Arc::new(session));
+            writer.shutdown(DRAIN_TIMEOUT);
+
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(message_texts(&loaded), ["tui"]);
         });
     }
 

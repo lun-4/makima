@@ -92,7 +92,7 @@ fn register(
     key: String,
     value: Value,
 ) -> LuaResult<()> {
-    if crate::runtime::loading_plugin(lua).is_some() {
+    if crate::runtime::loading_plugin_is(lua, &plugin) {
         if let Some(store) = lua.app_data_ref::<Store>()
             && let Some(existing) = store
                 .entries
@@ -137,7 +137,7 @@ fn collect(
     registry: String,
 ) -> LuaResult<Table> {
     let result = lua.create_table()?;
-    let loading = crate::runtime::loading_plugin(lua).is_some();
+    let loading = crate::runtime::loading_plugin_is(lua, &plugin);
     if let Some(store) = lua.app_data_ref::<Store>()
         && let Some(entries) = store.entries.get(&registry)
     {

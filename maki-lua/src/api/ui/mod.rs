@@ -722,7 +722,7 @@ pub(crate) fn create_ui_table(
     t.set(
         "set_status_hint",
         lua.create_function(move |lua, value: mlua::Value| {
-            if crate::runtime::loading_plugin(lua).is_some()
+            if crate::runtime::loading_plugin_is(lua, &p)
                 && let Some(pending) = &pending
             {
                 let spans = match value {

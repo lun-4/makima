@@ -679,20 +679,25 @@ async fn close_session(srv: &mut Server) {
     let Some(mut state) = srv.session.take() else {
         return;
     };
-    // The event pump dies with the session, so the prompt it owed an answer to
-    // has to be answered here or the client waits on it forever.
-    let operation = state
-        .pending
-        .lock()
-        .unwrap()
-        .operation
-        .as_ref()
-        .map(|operation| (operation.id, operation.kind));
+    // The event pump dies with the session, so the requests it owed answers to
+    // have to be answered here or the client waits on them forever.
+    let (operation, permission_answers, elicitation) = {
+        let mut pending = state.pending.lock().unwrap();
+        (
+            pending.operation.as_mut().map(|operation| {
+                operation.cancelling = true;
+                (operation.id, operation.kind)
+            }),
+            std::mem::take(&mut pending.permissions),
+            pending.elicitation.take(),
+        )
+    };
     if let Some((operation_id, kind)) = operation {
         finish_operation(&state.pending, operation_id, kind, |request_id| {
             respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
         });
     }
+    answer_cancelled_requests(&state.handle, permission_answers, elicitation);
     state.handle.task.cancel().await;
     if let Some(coordinator) = state.coordinator.take()
         && let Err(error) = coordinator.close().await
@@ -1732,6 +1737,22 @@ fn effective_session_cwd(restored: Option<&Path>, client: &Path) -> PathBuf {
     restored.unwrap_or(client).to_path_buf()
 }
 
+fn answer_cancelled_requests(
+    handle: &InteractiveHandle,
+    permission_answers: HashMap<i64, Sender<String>>,
+    elicitation: Option<i64>,
+) {
+    let denial = PermissionAnswer::Deny.encode();
+    for answer_tx in permission_answers.into_values() {
+        let _ = answer_tx.send(denial.clone());
+    }
+    if elicitation.is_some() {
+        let _ = handle
+            .answer_tx
+            .send(serde_json::json!({ "dismissed": true }).to_string());
+    }
+}
+
 fn handle_notification(srv: &Server, method: &str, raw: &Value) {
     match method {
         "session/cancel" => {
@@ -1758,16 +1779,7 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     let elicitation = pending.elicitation.take();
                     (cancellation, permission_answers, elicitation)
                 };
-                let denial = PermissionAnswer::Deny.encode();
-                for answer_tx in permission_answers.into_values() {
-                    let _ = answer_tx.send(denial.clone());
-                }
-                if elicitation.is_some() {
-                    let _ = session
-                        .handle
-                        .answer_tx
-                        .send(serde_json::json!({ "dismissed": true }).to_string());
-                }
+                answer_cancelled_requests(&session.handle, permission_answers, elicitation);
                 if let Some(trigger) = cancellation {
                     trigger.cancel();
                 } else {
@@ -2649,6 +2661,45 @@ mod tests {
 
             drop(committer);
             replacement.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn close_denies_outstanding_permission_requests() {
+        smol::block_on(async {
+            let (mut srv, ..) = server_awaiting_answer();
+            let pending = Arc::clone(&srv.session.as_ref().unwrap().pending);
+            let (permission_tx, permission_rx) = flume::unbounded();
+            pending.lock().unwrap().permissions = HashMap::from([(ANSWERED_ID, permission_tx)]);
+
+            close_session(&mut srv).await;
+
+            assert_eq!(
+                permission_rx.try_recv().ok(),
+                Some(PermissionAnswer::Deny.encode())
+            );
+            assert!(pending.lock().unwrap().permissions.is_empty());
+        });
+    }
+
+    #[test]
+    fn close_dismisses_outstanding_elicitation() {
+        smol::block_on(async {
+            let (mut srv, answer_rx, ..) = server_awaiting_answer();
+            let pending = Arc::clone(&srv.session.as_ref().unwrap().pending);
+            {
+                let mut pending = pending.lock().unwrap();
+                pending.permissions.clear();
+                pending.elicitation = Some(ANSWERED_ID);
+            }
+
+            close_session(&mut srv).await;
+
+            assert_eq!(
+                answer_rx.try_recv().ok(),
+                Some(r#"{"dismissed":true}"#.to_string())
+            );
+            assert!(pending.lock().unwrap().elicitation.is_none());
         });
     }
 

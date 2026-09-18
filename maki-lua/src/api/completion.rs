@@ -112,7 +112,7 @@ fn register_completion_source(
     let mut store = lua
         .app_data_mut::<CompletionStore>()
         .ok_or_else(|| mlua::Error::runtime("completion store not available"))?;
-    if crate::runtime::loading_plugin(lua).is_some() {
+    if crate::runtime::loading_plugin_is(lua, &plugin) {
         pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -152,7 +152,7 @@ fn register_expander(
     let mut store = lua
         .app_data_mut::<ExpanderStore>()
         .ok_or_else(|| mlua::Error::runtime("expander store not available"))?;
-    if crate::runtime::loading_plugin(lua).is_some() {
+    if crate::runtime::loading_plugin_is(lua, &plugin) {
         pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())

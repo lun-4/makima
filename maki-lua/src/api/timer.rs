@@ -45,43 +45,32 @@ impl TimerStore {
         }
     }
 
-    pub fn candidate(lua: &Lua, plugin: &str) -> LuaResult<Self> {
+    pub fn candidate(lua: &Lua, _plugin: &str) -> LuaResult<Self> {
         let live = lua
             .app_data_ref::<TimerStore>()
             .ok_or_else(|| mlua::Error::runtime("timer store not initialized"))?;
         let (wake_tx, wake_rx) = flume::bounded(1);
-        let mut candidate = Self {
+        Ok(Self {
             entries: HashMap::new(),
             next_id: live.next_id,
             wake_tx,
             wake_rx,
-        };
-        for (&id, entry) in &live.entries {
-            if entry.plugin.as_ref() == plugin {
-                continue;
-            }
-            candidate.entries.insert(
-                id,
-                TimerEntry {
-                    plugin: Arc::clone(&entry.plugin),
-                    key: lua.create_registry_value(entry.callback.clone())?,
-                    callback: entry.callback.clone(),
-                    interval: entry.interval,
-                    next_fire: entry.next_fire,
-                },
-            );
-        }
-        Ok(candidate)
+        })
     }
 
     pub fn discard_candidate(&mut self) -> Vec<RegistryKey> {
         self.entries.drain().map(|(_, entry)| entry.key).collect()
     }
 
-    pub fn replace_entries(&mut self, mut candidate: TimerStore) -> Vec<RegistryKey> {
-        let old = self.entries.drain().map(|(_, entry)| entry.key).collect();
-        self.entries = std::mem::take(&mut candidate.entries);
-        self.next_id = candidate.next_id;
+    pub fn replace_plugin(&mut self, plugin: &str, mut candidate: TimerStore) -> Vec<RegistryKey> {
+        let old = self.clear_plugin(plugin);
+        self.entries.extend(
+            candidate
+                .entries
+                .drain()
+                .filter(|(_, entry)| entry.plugin.as_ref() == plugin),
+        );
+        self.next_id = self.next_id.max(candidate.next_id);
         let _ = self.wake_tx.try_send(());
         old
     }
@@ -237,7 +226,7 @@ fn set(
     }
     let key = lua.create_registry_value(callback.clone())?;
     let interval = Duration::from_secs_f64(seconds);
-    if crate::runtime::loading_plugin(lua).is_some() {
+    if crate::runtime::loading_plugin_is(lua, &plugin) {
         Ok(pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -263,8 +252,13 @@ fn set(
 /// -- later
 /// maki.timer.del(id)
 #[lua_fn]
-fn del(lua: &Lua, #[ctx] pending: PendingTimerStore, id: u64) -> LuaResult<()> {
-    let key = if crate::runtime::loading_plugin(lua).is_some() {
+fn del(
+    lua: &Lua,
+    #[ctx] pending: PendingTimerStore,
+    #[ctx] plugin: Arc<str>,
+    id: u64,
+) -> LuaResult<()> {
+    let key = if crate::runtime::loading_plugin_is(lua, &plugin) {
         pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -295,7 +289,7 @@ lua_table! {
     /// end)
     /// ```
     "maki.timer" => pub(crate) fn create_timer_table(pending: PendingTimerStore, plugin: Arc<str>), DOCS [
-        set(pending, plugin), del(pending),
+        set(pending, plugin), del(pending, plugin),
     ]
 }
 
