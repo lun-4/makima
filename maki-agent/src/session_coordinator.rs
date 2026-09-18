@@ -156,6 +156,14 @@ pub type DirectoryAdoptionFuture =
 
 pub trait DirectoryAdopter: Send + Sync {
     fn adopt(&self, path: PathBuf) -> DirectoryAdoptionFuture;
+
+    fn settle(&self, path: PathBuf, committed: bool) -> DirectoryAdoptionFuture {
+        if committed {
+            Box::pin(async move { Ok(path) })
+        } else {
+            self.adopt(path)
+        }
+    }
 }
 
 impl<F> DirectoryAdopter for F
@@ -949,7 +957,6 @@ fn defers_behind_lease(operation: &Operation) -> bool {
         operation,
         Operation::ReplaceHistory { .. }
             | Operation::ChangeDirectory { .. }
-            | Operation::PreparePluginOptions { .. }
             | Operation::Close { .. }
             | Operation::AcquireLease { .. }
     )
@@ -1242,6 +1249,9 @@ async fn hold_lease(
                     }
                     let _ = handle_operation(ctx, operation).await;
                     return;
+                } else if let Operation::PreparePluginOptions { prepared, .. } = operation {
+                    let _ =
+                        prepared.send(Err(SessionCoordinatorError::SessionBusy(ctx.session_id)));
                 } else if defers_behind_lease(&operation) {
                     deferred.push_back(operation);
                 } else {
@@ -1344,6 +1354,9 @@ async fn finish_history_commit(
                     lock(&ctx.read.state).history_revision += 1;
                     deferred.push_back(operation);
                     closing = true;
+                } else if let Operation::PreparePluginOptions { prepared, .. } = operation {
+                    let _ =
+                        prepared.send(Err(SessionCoordinatorError::SessionBusy(ctx.session_id)));
                 } else if defers_behind_lease(&operation) {
                     deferred.push_back(operation);
                 } else {
@@ -1656,7 +1669,7 @@ async fn change_directory(
     )
     .await;
     if let Err(error) = result {
-        if let Err(rollback_error) = directory_adopter.adopt(previous).await {
+        if let Err(rollback_error) = directory_adopter.settle(previous, false).await {
             return Err(SessionCoordinatorError::DirectoryRollback(Arc::from(
                 format!("{error}; rollback: {rollback_error}"),
             )));
@@ -1664,6 +1677,10 @@ async fn change_directory(
         return Err(error.into());
     }
     lock(&read.state).cwd = canonical.clone();
+    directory_adopter
+        .settle(canonical.clone(), true)
+        .await
+        .map_err(SessionCoordinatorError::DirectoryAdoption)?;
     Ok(canonical)
 }
 
@@ -2084,6 +2101,55 @@ mod tests {
                     .iter()
                     .all(|option| option.definition.id.as_ref() != "test.choice")
             );
+            first.close().await.unwrap();
+            second.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn plugin_replacement_rejects_active_lease_without_partial_commit() {
+        smol::block_on(async {
+            let catalog = SessionOptionCatalog::default();
+            let mut ids = [MakiId::generate(), MakiId::generate()];
+            ids.sort_by_key(ToString::to_string);
+            let first = register_with_catalog(ids[0], writer(false), &catalog);
+            let second = register_with_catalog(ids[1], writer(false), &catalog);
+            let initial = vec![plugin_option(1, &["a", "b"], "a")];
+            catalog
+                .replace_plugin_options("test", initial.clone())
+                .await
+                .unwrap();
+            first.set_option("test.choice", "b").await.unwrap();
+            let before_first = first.read().options();
+            let before_second = second.read().options();
+            let lease = second.acquire_lease().await.unwrap();
+
+            let replacement =
+                catalog.replace_plugin_options("test", vec![plugin_option(2, &["c"], "c")]);
+            let result = futures_lite::future::race(async { Some(replacement.await) }, async {
+                smol::Timer::after(Duration::from_secs(1)).await;
+                None
+            })
+            .await
+            .expect("plugin replacement stalled behind the active lease");
+
+            assert!(matches!(
+                result,
+                Err(SessionCoordinatorError::SessionBusy(busy)) if busy == ids[1]
+            ));
+            assert_eq!(catalog.plugin_definitions("test"), initial);
+            assert_eq!(first.read().options(), before_first);
+            assert_eq!(second.read().options(), before_second);
+
+            drop(lease);
+            catalog
+                .replace_plugin_options("test", vec![plugin_option(2, &["c"], "c")])
+                .await
+                .unwrap();
+            assert!(first.read().options().options.iter().any(|option| {
+                option.definition.id.as_ref() == "test.choice"
+                    && option.current_value.as_ref() == "c"
+            }));
             first.close().await.unwrap();
             second.close().await.unwrap();
         });

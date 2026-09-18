@@ -75,6 +75,19 @@ fn slot_store(lua: &Lua) -> Option<SlotStore> {
     lua.app_data_ref::<SlotStore>().map(|store| store.clone())
 }
 
+fn slot_snapshot(lua: &Lua, name: &str) -> LuaResult<Option<(Function, Arc<[SlotLayer]>)>> {
+    let snapshot =
+        |entry: &SlotEntry| Some((entry.default.clone()?, Arc::from(entry.layers.as_slice())));
+    if let Some(pending) = lua.app_data_ref::<PendingSlotStore>() {
+        let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        return Ok(pending.slots.get(name).and_then(snapshot));
+    }
+    let store = lua
+        .app_data_ref::<SlotStore>()
+        .ok_or_else(|| mlua::Error::runtime("slot store not initialized"))?;
+    Ok(store.slots.get(name).and_then(snapshot))
+}
+
 fn with_slot_store<T>(lua: &Lua, f: impl FnOnce(&mut SlotStore) -> LuaResult<T>) -> LuaResult<T> {
     if let Some(pending) = lua.app_data_ref::<PendingSlotStore>() {
         return f(&mut pending.lock().unwrap_or_else(|e| e.into_inner()));
@@ -168,15 +181,8 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
                 "slot '{name}' exceeded max depth (recursive filler? call prev instead)"
             ))
         })?;
-        let (default, layers): (Function, Arc<[SlotLayer]>) = {
-            let store = slot_store(lua)
-                .ok_or_else(|| mlua::Error::runtime("slot store not initialized"))?;
-            store
-                .slots
-                .get(&name)
-                .and_then(|e| Some((e.default.clone()?, e.layers.as_slice().into())))
-                .ok_or_else(|| mlua::Error::runtime(format!("slot '{name}' is not declared")))?
-        };
+        let (default, layers) = slot_snapshot(lua, &name)?
+            .ok_or_else(|| mlua::Error::runtime(format!("slot '{name}' is not declared")))?;
         invoke_chain(lua, &name, &default, &layers, layers.len(), args)
     })
 }

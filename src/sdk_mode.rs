@@ -835,28 +835,9 @@ pub fn run(params: SdkParams) -> Result<()> {
                     }) as maki_agent::session_coordinator::ModelAdoptionFuture
                 }
             }),
-            directory_adopter: Arc::new({
-                let control_tx = handle.control_tx.clone();
-                move |path: PathBuf| {
-                    let control_tx = control_tx.clone();
-                    Box::pin(async move {
-                        let (reply, response) = flume::bounded(1);
-                        control_tx
-                            .send_async(maki_agent::headless::InteractiveControl::ChangeDirectory {
-                                path,
-                                reply,
-                            })
-                            .await
-                            .map_err(|_| Arc::from("session ended before directory adoption"))?;
-                        response
-                            .recv_async()
-                            .await
-                            .map_err(|_| Arc::from("session ended during directory adoption"))?
-                            .map_err(Arc::from)
-                    })
-                        as maki_agent::session_coordinator::DirectoryAdoptionFuture
-                }
-            }),
+            directory_adopter: maki_agent::headless::interactive_directory_adopter(
+                handle.control_tx.clone(),
+            ),
             checkpoint,
             mailbox: handle.mailbox.clone(),
         },

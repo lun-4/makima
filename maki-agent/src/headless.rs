@@ -332,6 +332,10 @@ pub enum InteractiveControl {
         path: PathBuf,
         reply: flume::Sender<Result<PathBuf, String>>,
     },
+    SettleDirectory {
+        path: PathBuf,
+        reply: flume::Sender<Result<PathBuf, String>>,
+    },
     IsolatedTurn {
         question: String,
         images: Vec<maki_providers::ImageSource>,
@@ -516,7 +520,7 @@ async fn apply_interactive_control(
                 .await
                 .inspect_err(|_| history.replace(previous))
         }
-        InteractiveControl::ChangeDirectory { .. } => {
+        InteractiveControl::ChangeDirectory { .. } | InteractiveControl::SettleDirectory { .. } => {
             Err("directory adoption was not intercepted by the session loop".into())
         }
         InteractiveControl::IsolatedTurn { .. } => {
@@ -527,13 +531,62 @@ async fn apply_interactive_control(
         InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply) => {
             let _ = reply.send(result);
         }
-        InteractiveControl::ChangeDirectory { reply, .. } => {
+        InteractiveControl::ChangeDirectory { reply, .. }
+        | InteractiveControl::SettleDirectory { reply, .. } => {
             let _ = reply.send(Err(
                 "directory adoption was not intercepted by the session loop".into(),
             ));
         }
         InteractiveControl::ManualCompaction { .. } | InteractiveControl::IsolatedTurn { .. } => {}
     }
+}
+
+pub fn interactive_directory_adopter(
+    control_tx: flume::Sender<InteractiveControl>,
+) -> Arc<dyn crate::session_coordinator::DirectoryAdopter> {
+    struct Adopter {
+        control_tx: flume::Sender<InteractiveControl>,
+    }
+
+    impl crate::session_coordinator::DirectoryAdopter for Adopter {
+        fn adopt(&self, path: PathBuf) -> crate::session_coordinator::DirectoryAdoptionFuture {
+            let control_tx = self.control_tx.clone();
+            Box::pin(async move {
+                let (reply, response) = flume::bounded(1);
+                control_tx
+                    .send_async(InteractiveControl::ChangeDirectory { path, reply })
+                    .await
+                    .map_err(|_| Arc::from("session ended before directory adoption"))?;
+                response
+                    .recv_async()
+                    .await
+                    .map_err(|_| Arc::from("session ended during directory adoption"))?
+                    .map_err(Arc::from)
+            })
+        }
+
+        fn settle(
+            &self,
+            path: PathBuf,
+            _committed: bool,
+        ) -> crate::session_coordinator::DirectoryAdoptionFuture {
+            let control_tx = self.control_tx.clone();
+            Box::pin(async move {
+                let (reply, response) = flume::bounded(1);
+                control_tx
+                    .send_async(InteractiveControl::SettleDirectory { path, reply })
+                    .await
+                    .map_err(|_| Arc::from("session ended before directory settlement"))?;
+                response
+                    .recv_async()
+                    .await
+                    .map_err(|_| Arc::from("session ended during directory settlement"))?
+                    .map_err(Arc::from)
+            })
+        }
+    }
+
+    Arc::new(Adopter { control_tx })
 }
 
 pub struct InteractiveHandle {
@@ -628,16 +681,25 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             let permissions = permissions;
             let agent_id = AgentId::generate();
             let mut run_id: u64 = 0;
+            let mut directory_pending = false;
 
             loop {
-                let wake = receive_wake_and_refresh(
-                    &input_rx,
-                    &control_rx,
-                    &shared_model,
-                    &mut provider,
-                    &mut model,
-                )
-                .await;
+                let wake = if directory_pending {
+                    control_rx
+                        .recv_async()
+                        .await
+                        .ok()
+                        .map(InteractiveWake::Control)
+                } else {
+                    receive_wake_and_refresh(
+                        &input_rx,
+                        &control_rx,
+                        &shared_model,
+                        &mut provider,
+                        &mut model,
+                    )
+                    .await
+                };
                 let input = match wake {
                     Some(InteractiveWake::Input(input)) => input,
                     Some(InteractiveWake::Control(InteractiveControl::ChangeDirectory {
@@ -656,12 +718,19 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                     ))
                                 }
                             })
-                            .inspect(|canonical| {
-                                working_dir = canonical.clone();
-                                permissions.set_cwd(canonical.clone());
-                            })
                             .map_err(|error| error.to_string());
+                        directory_pending = result.is_ok();
                         let _ = reply.send(result);
+                        continue;
+                    }
+                    Some(InteractiveWake::Control(InteractiveControl::SettleDirectory {
+                        path,
+                        reply,
+                    })) => {
+                        working_dir = path.clone();
+                        permissions.set_cwd(path.clone());
+                        directory_pending = false;
+                        let _ = reply.send(Ok(path));
                         continue;
                     }
                     Some(InteractiveWake::Control(InteractiveControl::ManualCompaction {
