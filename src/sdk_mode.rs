@@ -1922,6 +1922,7 @@ impl EventPump {
                         },
                     }))?;
             }
+            AgentEvent::TurnOutcome(_) if envelope.subagent.is_some() => {}
             AgentEvent::TurnOutcome(outcome) => {
                 let mut shared = self.shared.lock().unwrap();
                 shared.turn_active = false;
@@ -1954,6 +1955,7 @@ impl EventPump {
                 }
             }
             AgentEvent::ControlComplete { .. } => {}
+            AgentEvent::ControlError { .. } if envelope.subagent.is_some() => {}
             AgentEvent::ControlError { message } => {
                 let mut shared = self.shared.lock().unwrap();
                 shared.turn_active = false;
@@ -2893,6 +2895,95 @@ mod tests {
         assert!(content_images(&serde_json::json!("hi")).is_empty());
         let bad = serde_json::json!([{"type": "image", "source": {"data": "x"}}]);
         assert!(content_images(&bad).is_empty());
+    }
+
+    #[test]
+    fn subagent_outcome_does_not_retire_sdk_turn() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let shared = Arc::new(Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Default,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
+        }));
+        let input = AgentInput {
+            message: "parent".into(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: maki_agent::ThinkingConfig::Off,
+            fast: false,
+            workflow: false,
+            prompt: None,
+            cancel: None,
+            lease_committer: None,
+        };
+        let input = prepare_sdk_turn(&shared, input).unwrap();
+        let cancel = input.cancel.unwrap();
+        let mut pump = EventPump {
+            writer: SdkWriter {
+                session_id: SessionRef::generate(),
+                out_tx,
+            },
+            shared: Arc::clone(&shared),
+            answer_tx: flume::unbounded().0,
+            include_partial_messages: false,
+            synth: StreamSynth::new(),
+            tool_inputs: HashMap::new(),
+            result_text: String::new(),
+            cost: None,
+            request_counter: 0,
+            terminal_run_id: None,
+        };
+        let outcome = || TurnOutcome::Completed {
+            agent_id: maki_agent::AgentId::generate(),
+            turn_id: maki_agent::TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: maki_agent::DoneReason::EndTurn,
+        };
+        pump.handle(Envelope {
+            event: AgentEvent::TurnOutcome(outcome()),
+            subagent: Some(maki_agent::SubagentInfo {
+                agent_id: maki_agent::AgentId::generate(),
+                parent_agent_id: None,
+                parent_is_root: true,
+                auto_deliver: true,
+                parent_tool_use_id: "task".into(),
+                name: "research".into(),
+                prompt: None,
+                model: None,
+                answer_tx: None,
+                input_tx: None,
+                cancel: None,
+            }),
+            run_id: 9,
+        })
+        .unwrap();
+
+        assert!(!cancel.is_cancelled());
+        assert!(shared.lock().unwrap().turn_active);
+        assert!(shared.lock().unwrap().active_cancel.is_some());
+        assert!(out_rx.is_empty());
+        assert_eq!(pump.terminal_run_id, None);
+
+        pump.handle(Envelope {
+            event: AgentEvent::TurnOutcome(outcome()),
+            subagent: None,
+            run_id: 9,
+        })
+        .unwrap();
+        assert!(cancel.is_cancelled());
+        assert!(!shared.lock().unwrap().turn_active);
+        assert_eq!(
+            out_rx
+                .try_iter()
+                .filter(|line| serde_json::from_str::<Value>(line).unwrap()["type"] == "result")
+                .count(),
+            1
+        );
     }
 
     #[test]

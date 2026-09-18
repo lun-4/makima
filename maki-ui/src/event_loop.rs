@@ -1563,8 +1563,17 @@ impl<'t> EventLoop<'t> {
             let provider = if explicit_model {
                 None
             } else {
-                ctx.prepare_replacement_provider(&session)
-                    .map_err(|error| eyre!(error))?
+                match ctx.prepare_replacement_provider(&session) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        startup_warnings.push(format!(
+                            "failed to restore model {}: {error}; using {}",
+                            session.model,
+                            ctx.model_slot.load().model.spec()
+                        ));
+                        None
+                    }
+                }
             };
             match ctx.spawn_runtime_with_provider(session, provider) {
                 Ok(runtime) => runtimes.push(runtime),

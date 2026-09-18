@@ -21,9 +21,11 @@ use maki_storage::sessions::{SESSIONS_DIR, SessionError, SessionLog};
 use maki_storage::{StateDir, StorageError};
 use tracing::warn;
 
+use maki_agent::ThinkingConfig;
 use maki_agent::session_coordinator::SessionCheckpoint;
 use maki_agent::session_options::{
-    ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
+    ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
+    YOLO_OPTION_ID,
 };
 
 use crate::AppSession;
@@ -532,6 +534,7 @@ fn merge_tui_snapshot(
     session.meta.yolo = latest.meta.yolo;
     session.meta.fast = latest.meta.fast;
     session.meta.workflow = latest.meta.workflow;
+    session.meta.thinking = latest.meta.thinking;
     session.meta.session_options = latest.meta.session_options.clone();
     session
 }
@@ -552,6 +555,13 @@ fn merge_checkpoint(base: &AppSession, checkpoint: &SessionCheckpoint) -> AppSes
     session.meta.yolo = option_enabled(&checkpoint.options, YOLO_OPTION_ID);
     session.meta.fast = option_enabled(&checkpoint.options, FAST_OPTION_ID);
     session.meta.workflow = option_enabled(&checkpoint.options, WORKFLOW_OPTION_ID);
+    session.meta.thinking = checkpoint
+        .options
+        .options
+        .iter()
+        .find(|state| state.definition.id.as_ref() == THINKING_OPTION_ID)
+        .and_then(|state| state.current_value.parse::<ThinkingConfig>().ok())
+        .map(Into::into);
     session.meta.session_options = checkpoint
         .options
         .options
@@ -1112,7 +1122,7 @@ mod tests {
                     true,
                     true,
                     true,
-                    maki_agent::ThinkingConfig::Off,
+                    maki_agent::ThinkingConfig::Effort(maki_providers::Effort::High),
                 ),
                 &Default::default(),
             )
@@ -1139,6 +1149,13 @@ mod tests {
                 .unwrap();
 
             assert_eq!(ack.version, version);
+            let persisted = AppSession::load(id, &dir).unwrap();
+            assert_eq!(
+                persisted.meta.thinking,
+                Some(maki_storage::sessions::StoredThinking::Effort {
+                    level: maki_providers::Effort::High
+                })
+            );
             let mut later_ui = session;
             later_ui.set_title("later UI title".into());
             later_ui.meta.mode = Some(maki_storage::sessions::StoredMode::Plan);
@@ -1158,6 +1175,12 @@ mod tests {
             assert!(loaded.meta.yolo);
             assert!(loaded.meta.fast);
             assert!(loaded.meta.workflow);
+            assert_eq!(
+                loaded.meta.thinking,
+                Some(maki_storage::sessions::StoredThinking::Effort {
+                    level: maki_providers::Effort::High
+                })
+            );
             assert_eq!(message_texts(&loaded), ["coordinator history"]);
         });
     }

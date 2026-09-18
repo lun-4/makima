@@ -287,6 +287,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
     let explicit_model = cli.model.is_some();
+    let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -383,7 +384,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let model = restored_session_model(
             &stack.model,
             focused_tab,
-            explicit_model,
+            apply_explicit_model,
             &stack.config.provider.model_policy,
         );
 
@@ -391,7 +392,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             maki_ui::EventLoopParams {
                 model,
                 needs_login: stack.needs_login,
-                explicit_model,
+                explicit_model: apply_explicit_model,
                 commands: std::mem::take(&mut stack.commands),
                 sessions: std::mem::take(&mut tabs),
                 focused,
@@ -449,6 +450,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 // The picker is a one-shot startup request; a later
                 // `/reload` must reopen a fresh tab instead of re-prompting.
                 session_picker = false;
+                apply_explicit_model = false;
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
                 // Shut the old host down first so nothing can repopulate
