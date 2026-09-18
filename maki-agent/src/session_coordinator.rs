@@ -10,7 +10,7 @@ use std::time::Duration;
 use maki_config::ModelPolicy;
 use maki_providers::{Message, Model, ThinkingConfig};
 use maki_storage::checkpoint::{
-    CheckpointError, CheckpointRequest, CheckpointVersion, CheckpointWriter,
+    CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointVersion, CheckpointWriter,
 };
 use maki_storage::id::MakiId;
 use thiserror::Error;
@@ -1211,11 +1211,11 @@ async fn hold_lease(
                 timeout,
                 reply,
             })) => {
+                let pending = enqueue_history_checkpoint(&ctx.read, &*ctx.checkpoint, history);
                 let (completed_tx, completed_rx) = flume::bounded(1);
                 let read = ctx.read.clone();
-                let checkpoint = Arc::clone(&ctx.checkpoint);
                 smol::spawn(async move {
-                    let result = replace_history(&read, &*checkpoint, history).await;
+                    let result = finish_history_checkpoint(&read, pending).await;
                     let _ = completed_tx.send(result);
                 })
                 .detach();
@@ -1235,7 +1235,9 @@ async fn hold_lease(
                     }
                     if let Ok(LeaseRelease::CommitHistory { history, reply, .. }) = wait.try_recv()
                     {
-                        let result = replace_history(&ctx.read, &*ctx.checkpoint, history).await;
+                        let pending =
+                            enqueue_history_checkpoint(&ctx.read, &*ctx.checkpoint, history);
+                        let result = finish_history_checkpoint(&ctx.read, pending).await;
                         let _ = reply.send(result);
                     }
                     let _ = handle_operation(ctx, operation).await;
@@ -1477,26 +1479,8 @@ async fn checkpoint_state(
     cwd: PathBuf,
     options: SessionOptionsSnapshot,
 ) -> Result<(), CheckpointError> {
-    let version = {
-        let mut state = lock(&read.state);
-        state.checkpoint_revision += 1;
-        CheckpointVersion {
-            revision: state.checkpoint_revision,
-            epoch: options.version,
-        }
-    };
-    let ack = checkpoint
-        .checkpoint(CheckpointRequest {
-            session_id: read.session_id,
-            version,
-            snapshot: Arc::new(SessionCheckpoint {
-                history,
-                model,
-                cwd,
-                options,
-            }),
-        })
-        .await?;
+    let (version, ack) = enqueue_checkpoint(read, checkpoint, history, model, cwd, options);
+    let ack = ack.await?;
     if ack.session_id == read.session_id && ack.version == version {
         Ok(())
     } else {
@@ -1507,11 +1491,47 @@ async fn checkpoint_state(
     }
 }
 
-async fn replace_history(
+fn enqueue_checkpoint(
+    read: &SessionReadHandle,
+    checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
+    history: Option<Arc<Vec<Message>>>,
+    model: Arc<str>,
+    cwd: PathBuf,
+    options: SessionOptionsSnapshot,
+) -> (CheckpointVersion, CheckpointFuture) {
+    let version = {
+        let mut state = lock(&read.state);
+        state.checkpoint_revision += 1;
+        CheckpointVersion {
+            revision: state.checkpoint_revision,
+            epoch: options.version,
+        }
+    };
+    let ack = checkpoint.checkpoint(CheckpointRequest {
+        session_id: read.session_id,
+        version,
+        snapshot: Arc::new(SessionCheckpoint {
+            history,
+            model,
+            cwd,
+            options,
+        }),
+    });
+    (version, ack)
+}
+
+struct PendingHistoryCheckpoint {
+    history: Arc<Vec<Message>>,
+    history_revision: u64,
+    version: CheckpointVersion,
+    ack: CheckpointFuture,
+}
+
+fn enqueue_history_checkpoint(
     read: &SessionReadHandle,
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
     history: Arc<Vec<Message>>,
-) -> Result<(), SessionCoordinatorError> {
+) -> PendingHistoryCheckpoint {
     let (model, cwd, history_revision) = {
         let mut state = lock(&read.state);
         state.history_revision += 1;
@@ -1521,20 +1541,48 @@ async fn replace_history(
             state.history_revision,
         )
     };
-    checkpoint_state(
+    let (version, ack) = enqueue_checkpoint(
         read,
         checkpoint,
         Some(Arc::clone(&history)),
         model,
         cwd,
         read.options.snapshot(),
-    )
-    .await?;
+    );
+    PendingHistoryCheckpoint {
+        history,
+        history_revision,
+        version,
+        ack,
+    }
+}
+
+async fn finish_history_checkpoint(
+    read: &SessionReadHandle,
+    pending: PendingHistoryCheckpoint,
+) -> Result<(), SessionCoordinatorError> {
+    let ack = pending.ack.await?;
+    if ack.session_id != read.session_id || ack.version != pending.version {
+        return Err(CheckpointError::Save {
+            session_id: read.session_id,
+            message: Arc::from("checkpoint acknowledgement did not match request"),
+        }
+        .into());
+    }
     let mut state = lock(&read.state);
-    if state.history_revision == history_revision {
-        state.history = history;
+    if state.history_revision == pending.history_revision {
+        state.history = pending.history;
     }
     Ok(())
+}
+
+async fn replace_history(
+    read: &SessionReadHandle,
+    checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
+    history: Arc<Vec<Message>>,
+) -> Result<(), SessionCoordinatorError> {
+    let pending = enqueue_history_checkpoint(read, checkpoint, history);
+    finish_history_checkpoint(read, pending).await
 }
 
 async fn update_model_values(
@@ -2464,6 +2512,105 @@ mod tests {
                 .expect("lease drop must not wait for coordinator channel capacity");
             option_release_tx.send(()).unwrap();
             commit.wait().await.unwrap();
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn history_checkpoint_is_enqueued_before_concurrent_option_checkpoint() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let durable_options = Arc::new(Mutex::new(None));
+            let (first_started_tx, first_started_rx) = flume::bounded(1);
+            let (first_ack_tx, first_ack_rx) = flume::bounded(1);
+            let (history_ack_tx, history_ack_rx) = flume::bounded(1);
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new({
+                let calls = Arc::clone(&calls);
+                let durable_options = Arc::clone(&durable_options);
+                move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let options = &request.snapshot.options.options;
+                    let is_history = request.snapshot.history.is_some();
+                    let is_first = !is_history
+                        && options.iter().any(|option| {
+                            option.definition.id.as_ref() == WORKFLOW_OPTION_ID
+                                && option.current_value.as_ref() == ENABLED_VALUE
+                        })
+                        && options.iter().any(|option| {
+                            option.definition.id.as_ref() == YOLO_OPTION_ID
+                                && option.current_value.as_ref() == DISABLED_VALUE
+                        });
+                    lock(&calls).push(if is_history {
+                        "history"
+                    } else if is_first {
+                        "first option"
+                    } else {
+                        "second option"
+                    });
+                    *lock(&durable_options) = Some(request.snapshot.options.clone());
+                    let first_ack_rx = first_ack_rx.clone();
+                    let history_ack_rx = history_ack_rx.clone();
+                    if is_first {
+                        first_started_tx.send(()).unwrap();
+                    }
+                    Box::pin(async move {
+                        if is_first {
+                            first_ack_rx.recv_async().await.unwrap();
+                        } else if is_history {
+                            history_ack_rx.recv_async().await.unwrap();
+                        }
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params(id, checkpoint)).unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let first = coordinator.clone();
+            smol::spawn(async move {
+                first
+                    .set_option(WORKFLOW_OPTION_ID, ENABLED_VALUE)
+                    .await
+                    .unwrap();
+            })
+            .detach();
+            first_started_rx.recv_async().await.unwrap();
+
+            let commit = lease
+                .committer()
+                .unwrap()
+                .begin_history_commit(vec![Message::user("complete".into())], None)
+                .await
+                .unwrap();
+            let (option_reply, option_response) = flume::bounded(1);
+            coordinator
+                .tx
+                .send_async(Operation::SetOption {
+                    id: Arc::from(YOLO_OPTION_ID),
+                    value: Arc::from(ENABLED_VALUE),
+                    version: None,
+                    reply: option_reply,
+                })
+                .await
+                .unwrap();
+            first_ack_tx.send_async(()).await.unwrap();
+            option_response.recv_async().await.unwrap().unwrap();
+
+            assert_eq!(
+                lock(&calls).as_slice(),
+                ["first option", "history", "second option"]
+            );
+            let durable = lock(&durable_options).clone().unwrap();
+            assert!(durable.options.iter().any(|option| {
+                option.definition.id.as_ref() == YOLO_OPTION_ID
+                    && option.current_value.as_ref() == ENABLED_VALUE
+            }));
+
+            history_ack_tx.send_async(()).await.unwrap();
+            commit.wait().await.unwrap();
+            drop(lease);
             coordinator.close().await.unwrap();
         });
     }

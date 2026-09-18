@@ -31,6 +31,10 @@ use maki_agent::session_coordinator::{
     SessionCoordinatorError, SessionCoordinatorHandle, SessionCoordinatorParams,
     builtin_option_definitions,
 };
+use maki_agent::session_options::{
+    ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
+    WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
+};
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
@@ -496,7 +500,61 @@ fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
     }
 }
 
+fn project_committed_options_for_app(app: &mut App, snapshot: &SessionOptionsSnapshot) {
+    for option in snapshot.options.iter() {
+        match option.definition.id.as_ref() {
+            YOLO_OPTION_ID => app
+                .permissions
+                .set_yolo(option.current_value.as_ref() == ENABLED_VALUE),
+            FAST_OPTION_ID => app.state.fast = option.current_value.as_ref() == ENABLED_VALUE,
+            WORKFLOW_OPTION_ID => {
+                app.state.workflow = option.current_value.as_ref() == ENABLED_VALUE
+            }
+            THINKING_OPTION_ID => {
+                if let Ok(thinking) = option.current_value.parse() {
+                    app.state.thinking = thinking;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn project_committed_options(runtime: &mut SessionRuntime) {
+    let snapshot = runtime.coordinator.read().options();
+    project_committed_options_for_app(&mut runtime.app, &snapshot);
+}
+
+fn apply_options_to_session(session: &mut AppSession, snapshot: &SessionOptionsSnapshot) {
+    for option in snapshot.options.iter() {
+        let id = option.definition.id.as_ref();
+        let enabled = option.current_value.as_ref() == ENABLED_VALUE;
+        match id {
+            YOLO_OPTION_ID => session.meta.yolo = enabled,
+            FAST_OPTION_ID => session.meta.fast = enabled,
+            WORKFLOW_OPTION_ID => session.meta.workflow = enabled,
+            THINKING_OPTION_ID => {
+                session.meta.thinking = option
+                    .current_value
+                    .parse::<maki_agent::ThinkingConfig>()
+                    .ok()
+                    .map(Into::into);
+            }
+            _ if option.definition.persistent
+                && matches!(option.definition.owner, SessionOptionOwner::Plugin { .. }) =>
+            {
+                session
+                    .meta
+                    .session_options
+                    .insert(id.to_owned(), option.current_value.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
 fn checkpoint_runtime(runtime: &mut SessionRuntime) {
+    project_committed_options(runtime);
     if !runtime.lock_lost {
         runtime.app.checkpoint();
     }
@@ -3349,9 +3407,14 @@ impl<'t> EventLoop<'t> {
             let settled_lock = settle_lock_state(session_lock, heartbeat_timeout);
             match settled_lock {
                 LockSettlement::Held(lease) => {
+                    let snapshot = coordinator.read().options();
+                    project_committed_options_for_app(&mut app, &snapshot);
                     if !lock_lost {
                         app.checkpoint_now();
                     }
+                    let mut session = Arc::unwrap_or_clone(Arc::clone(&app.state.session));
+                    apply_options_to_session(&mut session, &snapshot);
+                    app.state.session = Arc::new(session);
                     session_leases.push((app.state.session.id, lease));
                 }
                 LockSettlement::TimedOut => {
@@ -4097,6 +4160,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(runtime.model_slot.load().model.spec(), STORED_MODEL);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn direct_option_changes_project_into_tui_and_reload_state() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        smol::block_on(
+            runtime
+                .coordinator
+                .set_option(YOLO_OPTION_ID, ENABLED_VALUE),
+        )
+        .unwrap();
+        smol::block_on(
+            runtime
+                .coordinator
+                .set_option(WORKFLOW_OPTION_ID, ENABLED_VALUE),
+        )
+        .unwrap();
+
+        project_committed_options(&mut runtime);
+        assert!(runtime.app.permissions.is_yolo());
+        assert!(runtime.app.state.workflow);
+
+        let snapshot = runtime.coordinator.read().options();
+        let mut reload = Arc::unwrap_or_clone(Arc::clone(&runtime.app.state.session));
+        apply_options_to_session(&mut reload, &snapshot);
+        assert!(reload.meta.yolo);
+        assert!(reload.meta.workflow);
         release_runtime(runtime);
     }
 
