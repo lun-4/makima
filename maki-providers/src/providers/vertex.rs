@@ -412,8 +412,13 @@ fn normalize_tool_schemas(body: &mut Value) {
 fn uppercase_schema_types(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            if let Some(Value::String(schema_type)) = map.get_mut("type") {
-                *schema_type = schema_type.to_uppercase();
+            if let Some(Value::String(schema_type)) = map.get_mut("type")
+                && matches!(
+                    schema_type.as_str(),
+                    "string" | "number" | "integer" | "boolean" | "array" | "object"
+                )
+            {
+                schema_type.make_ascii_uppercase();
             }
             for value in map.values_mut() {
                 uppercase_schema_types(value);
@@ -512,7 +517,10 @@ mod tests {
             }],
             "tools": [{"functionDeclarations": [{
                 "name": "read",
-                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "default": {"type": "file"}}}
+                }
             }]}]
         });
         normalize_tool_schemas(&mut body);
@@ -535,6 +543,11 @@ mod tests {
         assert_eq!(
             body["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["path"]["type"],
             "STRING"
+        );
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["path"]["default"]
+                ["type"],
+            "file"
         );
     }
 

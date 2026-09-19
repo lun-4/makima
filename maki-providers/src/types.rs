@@ -1050,8 +1050,8 @@ mod tests {
 
     #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]
     #[test_case(ThinkingConfig::Adaptive,     json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
-    #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped")]
+    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096, "includeThoughts": true}}}) ; "budget")]
+    #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192, "includeThoughts": true}}}) ; "budget_clamped")]
     fn thinking_apply_google_thinking(config: ThinkingConfig, expected: Value) {
         let mut body = json!({});
         config.apply_google_thinking(&mut body, 8192);

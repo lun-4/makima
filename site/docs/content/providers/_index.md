@@ -130,7 +130,7 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 
 ### Google Vertex AI
 
-- **Env var**: Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS` or `gcloud auth application-default login`)
+- **Env var**: `GOOGLE_CLOUD_PROJECT` plus Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS` or `gcloud auth application-default login`); optional `GOOGLE_CLOUD_LOCATION`
 - **API**: `https://aiplatform.googleapis.com/v1`
 - **Features**: Native Vertex AI Gemini API using Application Default Credentials
 

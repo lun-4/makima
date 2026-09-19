@@ -359,7 +359,7 @@ struct ProviderSection {
 fn format_auth(kind: ProviderKind) -> String {
     let env = kind.api_key_env();
     if kind == ProviderKind::Vertex {
-        "Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS` or `gcloud auth application-default login`)".into()
+        "`GOOGLE_CLOUD_PROJECT` plus Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS` or `gcloud auth application-default login`); optional `GOOGLE_CLOUD_LOCATION`".into()
     } else if kind == ProviderKind::Ollama {
         format!("`OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `{env}` for auth")
     } else if kind == ProviderKind::Aperture {

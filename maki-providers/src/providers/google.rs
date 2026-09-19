@@ -545,13 +545,12 @@ struct ApiModelInfo {
 }
 
 fn apply_usage(usage: &mut TokenUsage, meta: SseUsageMetadata) {
-    usage.input = meta.prompt_token_count;
+    let cached = meta.cached_content_token_count.unwrap_or_default();
+    usage.input = meta.prompt_token_count.saturating_sub(cached);
     usage.output = meta
         .candidates_token_count
         .saturating_add(meta.thoughts_token_count);
-    if let Some(cached) = meta.cached_content_token_count {
-        usage.cache_read = cached;
-    }
+    usage.cache_read = cached;
 }
 
 /// Append `text` to the last block when it is already a `Text`, else push a new
@@ -811,7 +810,7 @@ mod tests {
                 cached_content_token_count: Some(50),
             },
         );
-        assert_eq!(usage.input, 100);
+        assert_eq!(usage.input, 50);
         assert_eq!(usage.output, 500);
         assert_eq!(usage.cache_read, 50);
     }
@@ -1266,7 +1265,7 @@ mod tests {
         let response = mock_response(data);
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
-        assert_eq!(result.usage.input, 100);
+        assert_eq!(result.usage.input, 50);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, 50);
     }
