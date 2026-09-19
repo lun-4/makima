@@ -307,11 +307,13 @@ impl CatalogData {
                     .limit
                     .as_ref()
                     .and_then(|l| l.context)
+                    .filter(|tokens| *tokens > 0)
                     .unwrap_or(128_000);
                 let output = model_data
                     .limit
                     .as_ref()
                     .and_then(|l| l.output)
+                    .filter(|tokens| *tokens > 0)
                     .unwrap_or(64_000);
 
                 let cache_read = model_data
