@@ -30,6 +30,7 @@ use crate::providers::opencode::Opencode;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
+use crate::providers::vertex::Vertex;
 use crate::providers::zai::Zai;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -40,6 +41,7 @@ pub enum ProviderKind {
     #[strum(serialize = "openai")]
     OpenAi,
     Google,
+    Vertex,
     Copilot,
     Ollama,
     LlamaCpp,
@@ -63,6 +65,7 @@ impl ProviderKind {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::Google => "Google",
+            Self::Vertex => "Google Vertex AI",
             Self::Copilot => "Copilot",
             Self::Ollama => "Ollama",
             Self::LlamaCpp => "LlamaCpp",
@@ -82,6 +85,7 @@ impl ProviderKind {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Google => "GEMINI_API_KEY",
+            Self::Vertex => "",
             Self::Copilot => "GH_COPILOT_TOKEN",
             Self::Ollama => "OLLAMA_API_KEY",
             Self::LlamaCpp => "LLAMA_CPP_API_KEY",
@@ -101,6 +105,7 @@ impl ProviderKind {
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::OpenAi => "https://api.openai.com/v1",
             Self::Google => "https://generativelanguage.googleapis.com/v1beta",
+            Self::Vertex => "https://aiplatform.googleapis.com/v1",
             Self::Copilot => {
                 "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)"
             }
@@ -123,6 +128,9 @@ impl ProviderKind {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
             Self::Google => Some("Native Gemini API with thinking support"),
+            Self::Vertex => {
+                Some("Native Vertex AI Gemini API using Application Default Credentials")
+            }
             Self::Copilot => Some("Native Copilot Chat HTTP API with model endpoint discovery"),
             Self::Ollama => {
                 Some("Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY")
@@ -152,7 +160,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => ModelFamily::Claude,
             Self::OpenAi => ModelFamily::Gpt,
-            Self::Google => ModelFamily::Gemini,
+            Self::Google | Self::Vertex => ModelFamily::Gemini,
             Self::Copilot => ModelFamily::Generic,
             Self::Ollama => ModelFamily::Generic,
             Self::LlamaCpp => ModelFamily::Generic,
@@ -176,7 +184,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => Some(128_000),
             Self::OpenAi => Some(100_000),
-            Self::Google => Some(65_536),
+            Self::Google | Self::Vertex => Some(65_536),
             Self::Copilot => Some(100_000),
             Self::Ollama => Some(16_384),
             Self::LlamaCpp => None,
@@ -195,7 +203,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => 200_000,
             Self::OpenAi => 200_000,
-            Self::Google => 1_000_000,
+            Self::Google | Self::Vertex => 1_000_000,
             Self::Copilot => 200_000,
             Self::Ollama => 128_000,
             Self::LlamaCpp => 128_000,
@@ -221,6 +229,7 @@ impl ProviderKind {
             }
             Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
             Self::Google => Ok(Box::new(Google::new(timeouts)?)),
+            Self::Vertex => Ok(Box::new(Vertex::new(timeouts)?)),
             Self::Copilot => Ok(Box::new(Copilot::new(timeouts)?)),
             Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
             Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),

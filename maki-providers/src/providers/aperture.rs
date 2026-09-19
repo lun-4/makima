@@ -171,6 +171,7 @@ fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
     match kind {
         Some(ProviderKind::Anthropic | ProviderKind::Zai) => "",
         Some(ProviderKind::Google) => GEMINI_PATH_PREFIX,
+        Some(ProviderKind::Vertex) => DEFAULT_PATH_PREFIX,
         Some(
             ProviderKind::Ollama
             | ProviderKind::LlamaCpp

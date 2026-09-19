@@ -2,7 +2,7 @@ use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
-    openai, openrouter, synthetic, tensorx, zai,
+    openai, openrouter, synthetic, tensorx, vertex, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +53,18 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models: google::models(),
+    pricing_schedule: None,
+};
+
+const VERTEX: ProviderManifest = ProviderManifest {
+    slug: "vertex",
+    display_name: "Google Vertex AI",
+    family: ModelFamily::Gemini,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(65_536),
+    fallback_context_window: 1_000_000,
+    models: vertex::models(),
     pricing_schedule: None,
 };
 
@@ -204,6 +216,7 @@ const BUILTINS: &[ProviderManifest] = &[
     ANTHROPIC,
     OPENAI,
     GOOGLE,
+    VERTEX,
     COPILOT,
     OLLAMA,
     LLAMA_CPP,

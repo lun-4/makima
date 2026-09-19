@@ -133,6 +133,8 @@ pub struct BuiltInProvider {
 
 inventory::collect!(BuiltInProvider);
 
+pub const VERTEX_LOGIN_INSTRUCTIONS: &str = "Run `gcloud auth application-default login`, then set GOOGLE_CLOUD_PROJECT to the Vertex AI project. Optionally set GOOGLE_CLOUD_LOCATION.";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OverrideFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +181,10 @@ pub struct ProviderDef {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
     /// Opencode-only: when `Some(false)`, free catalog models are hidden

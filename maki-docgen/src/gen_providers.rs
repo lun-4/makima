@@ -252,7 +252,10 @@ Makima sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.
 }
 
 fn dynamic_providers_section() -> String {
-    let valid_values: Vec<String> = ProviderKind::iter().map(|k| format!("`{k}`")).collect();
+    let valid_values: Vec<String> = ProviderKind::iter()
+        .filter(|kind| *kind != ProviderKind::Vertex)
+        .map(|kind| format!("`{kind}`"))
+        .collect();
     let efforts: Vec<String> = Effort::ALL.iter().map(|e| format!("`{e}`")).collect();
 
     format!(
@@ -355,7 +358,9 @@ struct ProviderSection {
 
 fn format_auth(kind: ProviderKind) -> String {
     let env = kind.api_key_env();
-    if kind == ProviderKind::Ollama {
+    if kind == ProviderKind::Vertex {
+        "`GOOGLE_CLOUD_PROJECT` plus Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS` or `gcloud auth application-default login`); optional `GOOGLE_CLOUD_LOCATION`".into()
+    } else if kind == ProviderKind::Ollama {
         format!("`OLLAMA_HOST` for local/remote (e.g. `http://localhost:11434`), `{env}` for auth")
     } else if kind == ProviderKind::Aperture {
         "`APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`)".into()

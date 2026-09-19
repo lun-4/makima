@@ -551,6 +551,11 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
         ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
+        ProviderKind::Vertex => {
+            return Err(AgentError::Config {
+                message: "Vertex cannot be used as a dynamic provider base".into(),
+            });
+        }
         ProviderKind::Copilot => Box::new(
             Copilot::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
