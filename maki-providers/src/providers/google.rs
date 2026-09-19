@@ -518,6 +518,8 @@ struct SseUsageMetadata {
     #[serde(default)]
     candidates_token_count: u32,
     #[serde(default)]
+    thoughts_token_count: u32,
+    #[serde(default)]
     cached_content_token_count: Option<u32>,
 }
 
@@ -540,6 +542,16 @@ struct ApiModelInfo {
     name: String,
     #[serde(default)]
     supported_generation_methods: Vec<String>,
+}
+
+fn apply_usage(usage: &mut TokenUsage, meta: SseUsageMetadata) {
+    usage.input = meta.prompt_token_count;
+    usage.output = meta
+        .candidates_token_count
+        .saturating_add(meta.thoughts_token_count);
+    if let Some(cached) = meta.cached_content_token_count {
+        usage.cache_read = cached;
+    }
 }
 
 /// Append `text` to the last block when it is already a `Text`, else push a new
@@ -590,6 +602,7 @@ pub(crate) async fn parse_sse(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
+    let mut thinking_open = false;
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
@@ -607,11 +620,7 @@ pub(crate) async fn parse_sse(
         };
 
         if let Some(meta) = chunk.usage_metadata {
-            usage.input = meta.prompt_token_count;
-            usage.output = meta.candidates_token_count;
-            if let Some(cached) = meta.cached_content_token_count {
-                usage.cache_read = cached;
-            }
+            apply_usage(&mut usage, meta);
         }
 
         let Some(candidates) = chunk.candidates else {
@@ -632,6 +641,10 @@ pub(crate) async fn parse_sse(
 
             for part in parts {
                 if let Some(func_call) = part.function_call {
+                    if thinking_open {
+                        event_tx.send_async(ProviderEvent::ThinkingBlockEnd).await?;
+                        thinking_open = false;
+                    }
                     let id = format!("call_{}_{}", func_call.name, MakiId::generate());
                     let input = func_call.args.unwrap_or_default();
                     let thought_signature = func_call.thought_signature.or(part.thought_signature);
@@ -654,10 +667,14 @@ pub(crate) async fn parse_sse(
                             event_tx
                                 .send_async(ProviderEvent::ThinkingDelta { text: text.clone() })
                                 .await?;
+                            thinking_open = true;
                         }
                         push_or_extend_thinking(&mut content_blocks, text, part.thought_signature);
                     } else if !text.is_empty() {
-                        // TODO: preserve part.thought_signature if ContentBlock::Text adds signature support.
+                        if thinking_open {
+                            event_tx.send_async(ProviderEvent::ThinkingBlockEnd).await?;
+                            thinking_open = false;
+                        }
                         event_tx
                             .send_async(ProviderEvent::TextDelta { text: text.clone() })
                             .await?;
@@ -666,6 +683,10 @@ pub(crate) async fn parse_sse(
                 }
             }
         }
+    }
+
+    if thinking_open {
+        event_tx.send_async(ProviderEvent::ThinkingBlockEnd).await?;
     }
 
     Ok(StreamResponse {
@@ -772,6 +793,23 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             4096
         );
+    }
+
+    #[test]
+    fn usage_includes_thinking_tokens() {
+        let mut usage = TokenUsage::default();
+        apply_usage(
+            &mut usage,
+            SseUsageMetadata {
+                prompt_token_count: 100,
+                candidates_token_count: 200,
+                thoughts_token_count: 300,
+                cached_content_token_count: Some(50),
+            },
+        );
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.output, 500);
+        assert_eq!(usage.cache_read, 50);
     }
 
     #[test_case("STOP", StopReason::EndTurn ; "stop")]
@@ -1161,8 +1199,17 @@ mod tests {
     fn parse_sse_thinking_part() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20}}\n\n";
         let response = mock_response(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, rx) = flume::unbounded();
         let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let events = rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ProviderEvent::ThinkingDelta { text },
+                ProviderEvent::ThinkingBlockEnd,
+                ProviderEvent::TextDelta { text: answer },
+            ] if text == "thinking..." && answer == "answer"
+        ));
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::Thinking { thinking, signature } if thinking == "thinking..." && signature.as_deref() == Some("sig1")

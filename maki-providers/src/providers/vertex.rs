@@ -196,9 +196,11 @@ impl Vertex {
             .header("user-agent", user_agent())
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"));
-        if let Some(project) = self.tokens.quota_project() {
-            request = request.header("x-goog-user-project", project);
-        }
+        let quota_project = self
+            .tokens
+            .quota_project()
+            .unwrap_or(&self.endpoint.project);
+        request = request.header("x-goog-user-project", quota_project);
         Ok(self.client.send_async(request.body(body.to_vec())?).await?)
     }
 
@@ -212,7 +214,7 @@ impl Vertex {
         options: RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
         let mut body = google::build_body(model, messages, system, tools, options.thinking);
-        uppercase_schema_types(&mut body);
+        normalize_tool_schemas(&mut body);
         let body = serde_json::to_vec(&body)?;
         let response = self.send_stream(model, &body, false).await?;
         if response.status().as_u16() == 401 {
@@ -330,12 +332,21 @@ struct TokenResponse {
 
 impl AdcTokenProvider {
     fn from_environment() -> Result<Self, AgentError> {
-        let path = env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
-            .map(PathBuf::from)
-            .or_else(default_adc_path);
-        let source = match path {
-            Some(path) if path.exists() => Self::source_from_file(path)?,
-            _ => AdcSource::Metadata,
+        let source = if let Some(path) = env::var_os("GOOGLE_APPLICATION_CREDENTIALS") {
+            let path = PathBuf::from(path);
+            if !path.exists() {
+                return Err(AgentError::Config {
+                    message: format!(
+                        "GOOGLE_APPLICATION_CREDENTIALS does not exist: {}",
+                        path.display()
+                    ),
+                });
+            }
+            Self::source_from_file(path)?
+        } else if let Some(path) = default_adc_path().filter(|path| path.exists()) {
+            Self::source_from_file(path)?
+        } else {
+            AdcSource::Metadata
         };
         Ok(Self {
             source,
@@ -392,6 +403,12 @@ impl AdcTokenProvider {
     }
 }
 
+fn normalize_tool_schemas(body: &mut Value) {
+    if let Some(tools) = body.get_mut("tools") {
+        uppercase_schema_types(tools);
+    }
+}
+
 fn uppercase_schema_types(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -412,8 +429,18 @@ fn uppercase_schema_types(value: &mut Value) {
 }
 
 fn default_adc_path() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".config/gcloud/application_default_credentials.json"))
+    #[cfg(windows)]
+    {
+        return env::var_os("APPDATA").map(|appdata| {
+            PathBuf::from(appdata).join("gcloud/application_default_credentials.json")
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        env::var_os("HOME").map(|home| {
+            PathBuf::from(home).join(".config/gcloud/application_default_credentials.json")
+        })
+    }
 }
 
 async fn refresh_authorized_user(
@@ -441,7 +468,12 @@ async fn refresh_metadata_token(client: &HttpClient) -> Result<TokenResponse, Ag
         .uri(METADATA_TOKEN_URL)
         .header("metadata-flavor", "Google")
         .body(())?;
-    token_response(client.send_async(request).await?).await
+    let response = client.send_async(request).await.map_err(|error| AgentError::Config {
+        message: format!(
+            "no Application Default Credentials found and the GCP metadata service is unavailable: {error}"
+        ),
+    })?;
+    token_response(response).await
 }
 
 async fn token_response(
@@ -468,14 +500,54 @@ mod tests {
     }
 
     #[test]
-    fn schema_types_are_uppercase_for_vertex() {
-        let mut value = serde_json::json!({
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
+    fn normalizing_tool_schemas_preserves_contents() {
+        let mut body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": "{\"type\": \"file\"}"},
+                    {"functionCall": {"name": "read", "args": {"type": "file"}}},
+                    {"functionResponse": {"name": "read", "response": {"type": "error"}}}
+                ]
+            }],
+            "tools": [{"functionDeclarations": [{
+                "name": "read",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }]}]
         });
-        uppercase_schema_types(&mut value);
-        assert_eq!(value["type"], "OBJECT");
-        assert_eq!(value["properties"]["path"]["type"], "STRING");
+        normalize_tool_schemas(&mut body);
+        assert_eq!(
+            body["contents"][0]["parts"][0]["text"],
+            "{\"type\": \"file\"}"
+        );
+        assert_eq!(
+            body["contents"][0]["parts"][1]["functionCall"]["args"]["type"],
+            "file"
+        );
+        assert_eq!(
+            body["contents"][0]["parts"][2]["functionResponse"]["response"]["type"],
+            "error"
+        );
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parameters"]["type"],
+            "OBJECT"
+        );
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["path"]["type"],
+            "STRING"
+        );
+    }
+
+    #[test]
+    fn explicit_missing_adc_path_is_an_error() {
+        const PATH: &str = "/does/not/exist";
+        unsafe { env::set_var("GOOGLE_APPLICATION_CREDENTIALS", PATH) };
+        let result = AdcTokenProvider::from_environment();
+        unsafe { env::remove_var("GOOGLE_APPLICATION_CREDENTIALS") };
+        let Err(error) = result else {
+            panic!("missing ADC path unexpectedly succeeded");
+        };
+        assert!(matches!(error, AgentError::Config { .. }));
+        assert!(error.to_string().contains(PATH));
     }
 }
