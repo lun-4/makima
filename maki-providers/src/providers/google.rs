@@ -194,26 +194,7 @@ impl Google {
         tools: &Value,
         thinking: ThinkingConfig,
     ) -> Value {
-        let mut body = json!({
-            "contents": convert_messages(messages),
-        });
-
-        if !system.is_empty() {
-            body["systemInstruction"] = json!({"parts": [{"text": system}]});
-        }
-
-        thinking.apply_google_thinking(&mut body, max_thinking(model));
-
-        if let Some(max_output) = model.max_output_tokens {
-            body["generationConfig"]["maxOutputTokens"] = json!(max_output);
-        }
-
-        let tool_decls = convert_tools(tools);
-        if !tool_defs_empty(&tool_decls) {
-            body["tools"] = json!([{"functionDeclarations": tool_decls}]);
-        }
-
-        body
+        build_body(model, messages, system, tools, thinking)
     }
 
     async fn do_stream(
@@ -311,6 +292,35 @@ impl Provider for Google {
             }))
         })
     }
+}
+
+pub(crate) fn build_body(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: ThinkingConfig,
+) -> Value {
+    let mut body = json!({
+        "contents": convert_messages(messages),
+    });
+
+    if !system.is_empty() {
+        body["systemInstruction"] = json!({"parts": [{"text": system}]});
+    }
+
+    thinking.apply_google_thinking(&mut body, max_thinking(model));
+
+    if let Some(max_output) = model.max_output_tokens {
+        body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+    }
+
+    let tool_decls = convert_tools(tools);
+    if !tool_defs_empty(&tool_decls) {
+        body["tools"] = json!([{"functionDeclarations": tool_decls}]);
+    }
+
+    body
 }
 
 fn convert_messages(messages: &[Message]) -> Vec<Value> {
@@ -569,7 +579,7 @@ fn push_or_extend_thinking(
     }
 }
 
-async fn parse_sse(
+pub(crate) async fn parse_sse(
     response: isahc::Response<isahc::AsyncBody>,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
