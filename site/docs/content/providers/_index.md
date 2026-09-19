@@ -143,7 +143,8 @@ Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.0-flash-l
 | Medium | gemini-3-flash-preview | $0.50 / $3.00 | 1048K ctx / 65K out |
 | Medium | gemini-3.1-pro-preview | $2.00 / $12.00 | 1048K ctx / 65K out |
 | Medium | gemini-3.5-flash | $1.50 / $9.00 | 1048K ctx / 65K out |
-| Medium | gemini-3.6-flash, gemini-3.7-flash, gemini-3.8-flash | $0.75 / $3.75 | 1048K ctx / 65K out |
+| Medium | gemini-3.6-flash, gemini-3.7-flash | $0.75 / $3.75 | 1048K ctx / 65K out |
+| Medium | gemini-3.8-flash | $0.75 / $3.75 | 500K ctx / 65K out |
 | Strong | **gemini-2.5-pro** (default) | $1.25 / $10.00 | 1048K ctx / 65K out |
 
 Defaults: gemini-2.5-pro (strong), gemini-2.5-flash (medium), gemini-2.5-flash-lite (weak)

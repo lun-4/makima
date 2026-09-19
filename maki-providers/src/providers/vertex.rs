@@ -23,6 +23,8 @@ const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 const CONTEXT_WINDOW: u32 = 1_048_576;
 const MAX_OUTPUT_TOKENS: u32 = 65_536;
+// Capped at 500k due to errors getting HTTP 417 when passing the 500Ktok mark.
+const GEMINI_3_8_FLASH_CONTEXT_WINDOW: u32 = 500_000;
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "vertex",
@@ -110,7 +112,7 @@ const MODELS: &[ModelEntry] = &[
         0.03,
     ),
     model(
-        &["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"],
+        &["gemini-3.6-flash", "gemini-3.7-flash"],
         ModelTier::Medium,
         false,
         0.75,
@@ -118,10 +120,27 @@ const MODELS: &[ModelEntry] = &[
         0.041_666_666_666_666_7,
         0.075,
     ),
+    with_context_window(
+        model(
+            &["gemini-3.8-flash"],
+            ModelTier::Medium,
+            false,
+            0.75,
+            3.75,
+            0.041_666_666_666_666_7,
+            0.075,
+        ),
+        GEMINI_3_8_FLASH_CONTEXT_WINDOW,
+    ),
 ];
 
 pub(crate) const fn models() -> &'static [ModelEntry] {
     MODELS
+}
+
+const fn with_context_window(mut entry: ModelEntry, context_window: u32) -> ModelEntry {
+    entry.context_window = context_window;
+    entry
 }
 
 const fn model(
@@ -533,6 +552,14 @@ async fn token_response(
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test_case("vertex/gemini-3.6-flash", CONTEXT_WINDOW ; "gemini_3_6_flash")]
+    #[test_case("vertex/gemini-3.7-flash", CONTEXT_WINDOW ; "gemini_3_7_flash")]
+    #[test_case("vertex/gemini-3.8-flash", GEMINI_3_8_FLASH_CONTEXT_WINDOW ; "gemini_3_8_flash")]
+    fn model_context_window_resolution(spec: &str, expected: u32) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.context_window, expected);
+    }
 
     #[test_case("global", "https://aiplatform.googleapis.com/v1/projects/project/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse" ; "global")]
     #[test_case("us-central1", "https://us-central1-aiplatform.googleapis.com/v1/projects/project/locations/us-central1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse" ; "regional")]
