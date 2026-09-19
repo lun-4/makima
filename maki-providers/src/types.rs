@@ -662,7 +662,8 @@ impl ThinkingConfigExt for ThinkingConfig {
                 body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
             }
             Budgeted::Tokens(n) => {
-                body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": n});
+                body["generationConfig"]["thinkingConfig"] =
+                    json!({"thinkingBudget": n, "includeThoughts": true});
             }
         }
     }

@@ -793,6 +793,10 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             4096
         );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
     }
 
     #[test]
