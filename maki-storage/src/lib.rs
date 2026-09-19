@@ -3,6 +3,7 @@
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
 pub mod auth;
+pub mod checkpoint;
 pub mod id;
 pub mod input_history;
 pub mod log;
@@ -91,7 +92,7 @@ fn atomic_write_at(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     }
     tmp.as_file().sync_data()?;
     #[cfg(test)]
-    atomic_test_hook::wait_at_replacement_boundary();
+    atomic_test_hook::wait_at_replacement_boundary(path);
     persist(tmp, path)
 }
 
@@ -117,20 +118,38 @@ pub(crate) fn atomic_write_permissions(
 /// Unarmed (the default) it is a single relaxed atomic load.
 #[cfg(test)]
 pub mod atomic_test_hook {
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    static ARMED: AtomicBool = AtomicBool::new(false);
-    type Channels = (flume::Sender<()>, flume::Sender<()>, flume::Receiver<()>);
-    static CHANNELS: Mutex<Option<Channels>> = Mutex::new(None);
+    /// The hook is process-global; the tests using it are not. Keying it to one
+    /// path keeps an unrelated test's write from parking behind a release only
+    /// the arming test can hand out -- every other write walks straight past.
+    struct Armed {
+        path: PathBuf,
+        reached_tx: flume::Sender<()>,
+        release_rx: flume::Receiver<()>,
+        /// Held here and nowhere else. Waiters clone the receiver, so this
+        /// sender going away is what releases them, and it releases all of
+        /// them: a `send` per waiter would need to know how many there are.
+        _release_tx: flume::Sender<()>,
+    }
 
-    /// Arm once: the writer signals `reached` when the temp file is fully
-    /// prepared, then blocks until released via [`disarm`]. Returns the
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static STATE: Mutex<Option<Armed>> = Mutex::new(None);
+
+    /// Arm once for `path`: the writer signals `reached` when the temp file is
+    /// fully prepared, then blocks until released via [`disarm`]. Returns the
     /// test's `reached` receiver.
-    pub fn arm() -> flume::Receiver<()> {
+    pub fn arm(path: &Path) -> flume::Receiver<()> {
         let (reached_tx, reached_rx) = flume::unbounded();
         let (release_tx, release_rx) = flume::unbounded();
-        *CHANNELS.lock().expect("hook poisoned") = Some((reached_tx, release_tx, release_rx));
+        *STATE.lock().expect("hook poisoned") = Some(Armed {
+            path: path.to_owned(),
+            reached_tx,
+            release_rx,
+            _release_tx: release_tx,
+        });
         ARMED.store(true, Ordering::SeqCst);
         reached_rx
     }
@@ -138,24 +157,24 @@ pub mod atomic_test_hook {
     /// Send the writer past the boundary and disarm the hook.
     pub fn disarm() {
         ARMED.store(false, Ordering::SeqCst);
-        if let Some((_, release_tx, _)) = CHANNELS.lock().expect("hook poisoned").take() {
-            release_tx.send(()).ok();
-        }
+        STATE.lock().expect("hook poisoned").take();
     }
 
-    pub fn wait_at_replacement_boundary() {
+    pub fn wait_at_replacement_boundary(path: &Path) {
         if !ARMED.load(Ordering::SeqCst) {
             return;
         }
-        let channels = {
-            let guard = CHANNELS.lock().expect("hook poisoned");
+        let (reached_tx, release_rx) = {
+            let guard = STATE.lock().expect("hook poisoned");
             match &*guard {
-                Some(ch) => ch.clone(),
-                None => return,
+                Some(armed) if armed.path == path => {
+                    (armed.reached_tx.clone(), armed.release_rx.clone())
+                }
+                _ => return,
             }
         };
-        channels.0.send(()).ok();
-        let _ = channels.2.recv();
+        reached_tx.send(()).ok();
+        let _ = release_rx.recv();
     }
 }
 
@@ -318,7 +337,7 @@ mod tests {
         let new = vec![b'b'; BIG];
         fs::write(&path, &old).unwrap();
 
-        let reached_rx = atomic_test_hook::arm();
+        let reached_rx = atomic_test_hook::arm(&path);
         let path_writer = path.clone();
         let new_writer = new.clone();
         let writer = thread::spawn(move || {

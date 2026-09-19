@@ -21,7 +21,8 @@ pub const COMPACT_COMMAND_NAME: &str = "/compact";
 pub enum TargetCapability {
     AgentTurns,
     ModelSelection,
-    SessionControl,
+    HistoryCompaction,
+    SessionReplacement,
     WorkingDirectory,
     PermissionToggles,
     ConfigToggles,
@@ -35,7 +36,18 @@ pub struct TargetCapabilities(u16);
 
 impl TargetCapabilities {
     pub const NONE: Self = Self(0);
-    pub const ALL: Self = Self((1 << 9) - 1);
+    pub const ALL: Self = Self::from_slice(&[
+        TargetCapability::AgentTurns,
+        TargetCapability::ModelSelection,
+        TargetCapability::HistoryCompaction,
+        TargetCapability::SessionReplacement,
+        TargetCapability::WorkingDirectory,
+        TargetCapability::PermissionToggles,
+        TargetCapability::ConfigToggles,
+        TargetCapability::InteractiveUi,
+        TargetCapability::ApplicationLifecycle,
+        TargetCapability::Reload,
+    ]);
 
     pub const fn from_capability(capability: TargetCapability) -> Self {
         Self(1 << capability as u8)
@@ -127,6 +139,7 @@ pub enum HostContextRequest {
     ThemeNames,
     WorkingDirectory,
     FastModeSupported,
+    SessionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +147,7 @@ pub enum HostContextResponse {
     Values(Arc<[Arc<str>]>),
     WorkingDirectory(PathBuf),
     FastModeSupported(bool),
+    SessionId(Arc<str>),
     Unavailable,
 }
 
@@ -157,8 +171,10 @@ pub struct BuiltinDefinition {
 
 const INTERACTIVE: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::InteractiveUi);
-const SESSION: TargetCapabilities =
-    TargetCapabilities::from_capability(TargetCapability::SessionControl);
+const COMPACTION: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::HistoryCompaction);
+const SESSION_REPLACEMENT: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::SessionReplacement);
 const MODEL: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::ModelSelection);
 const CWD: TargetCapabilities =
@@ -249,7 +265,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        SESSION,
+        COMPACTION,
     ),
     builtin!(
         New,
@@ -259,7 +275,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        SESSION,
+        SESSION_REPLACEMENT,
     ),
     builtin!(
         Help,

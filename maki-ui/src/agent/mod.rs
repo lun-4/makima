@@ -4,6 +4,7 @@ pub(crate) mod shared_queue;
 
 #[cfg(test)]
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -140,43 +141,62 @@ pub(crate) struct ProviderSnapshot {
     pub(crate) provider: Arc<TrackedProvider>,
 }
 
+/// Process-wide: every session owns a slot, but they all report into one
+/// usage coordinator, which compares identities across slots it does not own.
+/// A per-slot counter would hand two sessions the same instance generation.
+static NEXT_PROVIDER_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_provider_instance() -> ProviderInstanceGeneration {
+    ProviderInstanceGeneration(NEXT_PROVIDER_INSTANCE.fetch_add(1, Ordering::AcqRel))
+}
+
 pub(crate) struct ProviderSlot {
     current: ArcSwap<ProviderSnapshot>,
-    next_instance: AtomicU64,
     change_tx: flume::Sender<ProviderChange>,
 }
 
 impl ProviderSlot {
+    /// The event loop's own slot: it owns the receiving end every other slot
+    /// reports into.
     pub(crate) fn new(
         model: Model,
         provider: Arc<dyn Provider>,
     ) -> (Arc<Self>, flume::Receiver<ProviderChange>) {
         let (change_tx, change_rx) = flume::unbounded();
+        (Self::with_change_tx(model, provider, change_tx), change_rx)
+    }
+
+    /// A session's slot, sharing the event loop's channel so that installs and
+    /// re-auths on a session-local provider still reach the usage coordinator.
+    pub(crate) fn with_change_tx(
+        model: Model,
+        provider: Arc<dyn Provider>,
+        change_tx: flume::Sender<ProviderChange>,
+    ) -> Arc<Self> {
         let tracked = Arc::new(TrackedProvider::new(
             provider,
-            ProviderInstanceGeneration(0),
+            next_provider_instance(),
             change_tx.clone(),
         ));
-        (
-            Arc::new(Self {
-                current: ArcSwap::from_pointee(ProviderSnapshot {
-                    model,
-                    provider: tracked,
-                }),
-                next_instance: AtomicU64::new(1),
-                change_tx,
+        Arc::new(Self {
+            current: ArcSwap::from_pointee(ProviderSnapshot {
+                model,
+                provider: tracked,
             }),
-            change_rx,
-        )
+            change_tx,
+        })
     }
 
     pub(crate) fn load(&self) -> Guard<Arc<ProviderSnapshot>> {
         self.current.load()
     }
 
+    pub(crate) fn change_tx(&self) -> flume::Sender<ProviderChange> {
+        self.change_tx.clone()
+    }
+
     pub(crate) fn install(&self, model: Model, provider: Arc<dyn Provider>) -> ProviderIdentity {
-        let instance =
-            ProviderInstanceGeneration(self.next_instance.fetch_add(1, Ordering::AcqRel));
+        let instance = next_provider_instance();
         let tracked = Arc::new(TrackedProvider::new(
             provider,
             instance,
@@ -189,6 +209,16 @@ impl ProviderSlot {
         }));
         let _ = self.change_tx.send(ProviderChange::Installed(identity));
         identity
+    }
+}
+
+impl maki_agent::ModelSource for ProviderSlot {
+    fn current(&self) -> Option<(Arc<dyn Provider>, Model)> {
+        let snapshot = self.load();
+        Some((
+            Arc::clone(&snapshot.provider) as Arc<dyn Provider>,
+            snapshot.model.clone(),
+        ))
     }
 }
 
@@ -232,6 +262,14 @@ impl PreparedAgentHandles {
             .mcp_reader()
     }
 
+    pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
+        self.handles.as_ref().expect("prepared handles").mailbox()
+    }
+
+    pub(crate) fn cwd_slot(&self) -> Arc<ArcSwap<PathBuf>> {
+        self.handles.as_ref().expect("prepared handles").cwd_slot()
+    }
+
     pub(crate) fn activate(mut self) -> AgentHandles {
         if let Some(mailbox) = self.mailbox.take() {
             let activated = mailbox.activate();
@@ -267,6 +305,7 @@ pub(crate) struct AgentHandles {
     #[cfg(test)]
     system_prompt: SystemPromptOverride,
     mailbox: Option<SessionMailbox>,
+    cwd: Arc<ArcSwap<PathBuf>>,
     subagent_cancels: Arc<CancelMap<String>>,
     manager: AgentManagerHandle,
     root_id: maki_agent::AgentId,
@@ -283,6 +322,7 @@ impl AgentHandles {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
+        initial_cwd: PathBuf,
         session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
@@ -297,6 +337,7 @@ impl AgentHandles {
             config,
             tool_output_lines,
             permissions,
+            initial_cwd,
             session_id,
             timeouts,
             lua_handle,
@@ -315,6 +356,7 @@ impl AgentHandles {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
+        initial_cwd: PathBuf,
         session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
@@ -330,6 +372,8 @@ impl AgentHandles {
             config,
             tool_output_lines,
             permissions,
+            Arc::new(ArcSwap::from_pointee(initial_cwd)),
+            None,
             mcp_handle,
             mcp_config_errors,
             session_id,
@@ -338,6 +382,19 @@ impl AgentHandles {
             model_policy,
             system_prompt,
         )
+    }
+
+    pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
+        self.mailbox.clone()
+    }
+
+    pub(crate) fn cwd_slot(&self) -> Arc<ArcSwap<PathBuf>> {
+        Arc::clone(&self.cwd)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_mailbox(&mut self, mailbox: SessionMailbox) {
+        self.mailbox = Some(mailbox);
     }
 
     #[cfg(test)]
@@ -418,6 +475,8 @@ impl AgentHandles {
             config,
             tool_output_lines,
             permissions,
+            Arc::clone(&self.cwd),
+            self.mailbox.clone(),
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
             Some(SessionRef::from(app.state.session.id)),
@@ -484,6 +543,8 @@ fn spawn_agent_internal(
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
+    cwd: Arc<ArcSwap<PathBuf>>,
+    mailbox: Option<SessionMailbox>,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     session_id: Option<SessionRef>,
@@ -502,12 +563,19 @@ fn spawn_agent_internal(
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
-    let prepared_mailbox = session_id
-        .as_ref()
-        .map(|session_id| SessionMailbox::prepare(session_id.id()));
-    let mailbox = prepared_mailbox
-        .as_ref()
-        .map(PreparedSessionMailbox::mailbox);
+    let prepared_mailbox = mailbox
+        .is_none()
+        .then(|| {
+            session_id
+                .as_ref()
+                .map(|session_id| SessionMailbox::prepare(session_id.id()))
+        })
+        .flatten();
+    let mailbox = mailbox.or_else(|| {
+        prepared_mailbox
+            .as_ref()
+            .map(PreparedSessionMailbox::mailbox)
+    });
 
     let (init_trigger, init_cancel) = maki_agent::CancelToken::new();
 
@@ -528,6 +596,7 @@ fn spawn_agent_internal(
                 Ok::<Box<dyn maki_agent::ActorBackend>, String>(Box::new(new_backend(
                     agent_id,
                     Arc::clone(model_slot),
+                    Arc::clone(&cwd),
                     config,
                     tool_output_lines,
                     Arc::clone(&btw_system),
@@ -598,6 +667,7 @@ fn spawn_agent_internal(
             #[cfg(test)]
             system_prompt,
             mailbox,
+            cwd,
             subagent_cancels,
             manager,
             root_id,
@@ -719,6 +789,7 @@ mod tests {
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
+            PathBuf::from("/tmp"),
             None,
             maki_providers::Timeouts::default(),
             EventHandle::disconnected_for_test(),
@@ -728,6 +799,51 @@ mod tests {
             SystemPromptOverride::default(),
         );
         (handles, model_slot, permissions)
+    }
+
+    /// Registers a coordinator so `SessionMailbox::notify` -- which resolves
+    /// through one -- has something to resolve.
+    fn register_coordinator(
+        session_id: maki_storage::id::MakiId,
+        mailbox: SessionMailbox,
+    ) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
+        use maki_agent::session_coordinator::{
+            DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint,
+            SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
+        };
+        use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture, CheckpointRequest};
+
+        SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id,
+            catalog: Default::default(),
+            definitions: builtin_option_definitions(
+                "test/model",
+                [Arc::from("test/model")],
+                false,
+                false,
+                false,
+                maki_agent::ThinkingConfig::Off,
+            ),
+            persisted_options: Default::default(),
+            history: Vec::new(),
+            model: Arc::from("test/model"),
+            cwd: PathBuf::from("/tmp"),
+            model_policy: Arc::default(),
+            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
+            directory_adopter: Arc::new(|path: PathBuf| {
+                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
+            }),
+            checkpoint: Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
+                Box::pin(async move {
+                    Ok(CheckpointAck {
+                        session_id: request.session_id,
+                        version: request.version,
+                    })
+                }) as CheckpointFuture
+            }),
+            mailbox,
+        })
+        .expect("coordinator registration")
     }
 
     fn respawn(
@@ -747,13 +863,19 @@ mod tests {
         );
     }
 
+    /// Instance generations come from a process-wide counter (sessions each
+    /// own a slot and share one usage coordinator), so this asserts the
+    /// invariants rather than absolute numbers.
     #[test]
     fn provider_install_increments_instance_and_resets_auth_generation() {
         let (slot, change_rx) = auth_slot(true, false);
-        assert_eq!(
-            slot.load().provider.identity(),
-            ProviderIdentity::new(ProviderInstanceGeneration(0), ProviderAuthGeneration(0))
-        );
+        let before = slot.load().provider.identity();
+        assert_eq!(before.auth, ProviderAuthGeneration(0));
+
+        let provider = Arc::clone(&slot.load().provider);
+        smol::block_on(provider.reload_auth()).expect("reload succeeds");
+        assert_eq!(provider.identity().auth, ProviderAuthGeneration(1));
+        change_rx.recv().expect("reload notification");
 
         let identity = slot.install(
             crate::components::test_model(),
@@ -763,9 +885,14 @@ mod tests {
             }),
         );
 
+        assert!(
+            identity.instance.0 > before.instance.0,
+            "an install must take a fresh instance generation"
+        );
         assert_eq!(
-            identity,
-            ProviderIdentity::new(ProviderInstanceGeneration(1), ProviderAuthGeneration(0))
+            identity.auth,
+            ProviderAuthGeneration(0),
+            "a new provider starts its auth generation over"
         );
         assert_eq!(slot.load().provider.identity(), identity);
         assert_eq!(
@@ -910,6 +1037,150 @@ mod tests {
             "a checkpoint right after respawn must not see the seeded empty snapshot"
         );
         assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
+    }
+
+    /// A respawn must keep the session's mailbox. The coordinator handed the
+    /// original out to `SessionMailbox::notify` at registration and has no way
+    /// to learn about a replacement, so minting a fresh one on respawn leaves
+    /// every later notification in an instance nobody polls.
+    #[test]
+    fn respawn_keeps_the_mailbox_the_coordinator_hands_out() {
+        let (model_slot, _change_rx) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+            Arc::default(),
+        ));
+        let mut app = crate::app::tests::test_app();
+        let session_id = app.state.session.id;
+        let mut handles = AgentHandles::spawn(
+            &model_slot,
+            Vec::new(),
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            &permissions,
+            PathBuf::from("/tmp"),
+            Some(SessionRef::from(session_id)),
+            maki_providers::Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            None,
+            McpConfigErrors::new(PathBuf::new()),
+            Arc::new(ModelPolicy::default()),
+            SystemPromptOverride::default(),
+        );
+        let coordinator = register_coordinator(
+            session_id,
+            handles
+                .mailbox()
+                .expect("a session-backed agent has a mailbox"),
+        );
+
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+
+        SessionMailbox::notify(session_id, "wake up".into(), true)
+            .expect("notify resolves through the registered coordinator");
+        let claimed = handles.claim_mailbox_wake();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a notification after respawn must reach the live agent's mailbox"
+        );
+        assert!(
+            format!("{:?}", claimed[0]).contains("wake up"),
+            "the notification text must survive: {:?}",
+            claimed[0]
+        );
+        let _ = smol::block_on(coordinator.close());
+    }
+
+    /// `/new` rotates the tab onto a fresh session id, and the coordinator
+    /// registered around it hands out the mailbox. Keeping the old one would
+    /// leave the new session's notifications going to the retired session's
+    /// instance.
+    #[test]
+    fn setting_a_mailbox_repoints_the_agent_at_the_new_session() {
+        let (model_slot, _change_rx) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+            Arc::default(),
+        ));
+        let first = maki_storage::id::MakiId::generate();
+        let mut handles = AgentHandles::spawn(
+            &model_slot,
+            Vec::new(),
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            &permissions,
+            PathBuf::from("/tmp"),
+            Some(SessionRef::from(first)),
+            maki_providers::Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            None,
+            McpConfigErrors::new(PathBuf::new()),
+            Arc::new(ModelPolicy::default()),
+            SystemPromptOverride::default(),
+        );
+        assert_eq!(handles.mailbox().map(|m| m.session_id()), Some(first));
+
+        let second = maki_storage::id::MakiId::generate();
+        handles.set_mailbox(SessionMailbox::new(second));
+        assert_eq!(
+            handles.mailbox().map(|m| m.session_id()),
+            Some(second),
+            "the agent must poll the mailbox the new session's coordinator owns"
+        );
+    }
+
+    /// A session owns its provider slot, but the usage coordinator listens on
+    /// exactly one channel. A re-auth on a session-local provider has to reach
+    /// it, or the status line and usage panel go stale with no way to notice.
+    #[test]
+    fn session_slot_reports_into_the_shared_change_channel() {
+        let (loop_slot, change_rx) = auth_slot(true, false);
+        let session_slot = ProviderSlot::with_change_tx(
+            crate::components::test_model(),
+            Arc::new(AuthProvider {
+                reload_ok: true,
+                rotate: false,
+            }),
+            loop_slot.change_tx(),
+        );
+        assert!(
+            change_rx.is_empty(),
+            "creating a session slot is not itself a provider change"
+        );
+        assert_ne!(
+            session_slot.load().provider.identity().instance,
+            loop_slot.load().provider.identity().instance,
+            "instance generations must be unique across slots, or the usage \
+             coordinator cannot tell two sessions' providers apart"
+        );
+
+        let provider = Arc::clone(&session_slot.load().provider);
+        smol::block_on(provider.reload_auth()).expect("reload succeeds");
+        assert_eq!(
+            change_rx
+                .recv_timeout(SHORT_TIMEOUT)
+                .expect("the re-auth reaches the event loop"),
+            ProviderChange::Auth(provider.identity())
+        );
+
+        let installed = session_slot.install(
+            crate::components::test_model(),
+            Arc::new(AuthProvider {
+                reload_ok: true,
+                rotate: false,
+            }),
+        );
+        assert_eq!(
+            change_rx
+                .recv_timeout(SHORT_TIMEOUT)
+                .expect("the install reaches the event loop"),
+            ProviderChange::Installed(installed)
+        );
     }
 
     #[test]

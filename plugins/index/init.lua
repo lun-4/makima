@@ -184,6 +184,11 @@ Return a compact overview of a source file: imports, type definitions, function 
     if not path then
       return { llm_output = "error: path is required", is_error = true }
     end
+    local resolved, resolve_err = ctx:resolve_path(path)
+    if not resolved then
+      return { llm_output = "error: " .. tostring(resolve_err), is_error = true }
+    end
+    path = resolved
 
     local meta = maki.fs.metadata(path)
     if not meta then

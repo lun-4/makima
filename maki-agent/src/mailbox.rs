@@ -1,14 +1,11 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_providers::Message;
 use maki_storage::id::MakiId;
 use thiserror::Error;
 
 const MAILBOX_CAPACITY: usize = 100;
-
-static MAILBOXES: LazyLock<Mutex<HashMap<MakiId, Weak<Mutex<State>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Default)]
 struct State {
@@ -33,44 +30,32 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl SessionMailbox {
-    pub fn register(session_id: MakiId) -> Self {
-        let mut mailboxes = lock(&MAILBOXES);
-        if let Some(state) = mailboxes.get(&session_id).and_then(Weak::upgrade) {
-            return Self { session_id, state };
-        }
-
-        let mailbox = Self {
+    pub fn new(session_id: MakiId) -> Self {
+        Self {
             session_id,
-            state: Arc::new(Mutex::new(State::default())),
-        };
-        mailboxes.insert(session_id, Arc::downgrade(&mailbox.state));
-        mailbox
+            state: Arc::default(),
+        }
     }
 
     pub fn prepare(session_id: MakiId) -> PreparedSessionMailbox {
-        let state = lock(&MAILBOXES)
-            .get(&session_id)
-            .and_then(Weak::upgrade)
-            .unwrap_or_else(|| Arc::new(Mutex::new(State::default())));
-        PreparedSessionMailbox(Self { session_id, state })
+        PreparedSessionMailbox(Self::new(session_id))
     }
 
     pub fn notify(session_id: MakiId, text: String, wake: bool) -> Result<(), MailboxError> {
-        let mailbox = {
-            let mut mailboxes = lock(&MAILBOXES);
-            let Some(state) = mailboxes.get(&session_id).and_then(Weak::upgrade) else {
-                mailboxes.remove(&session_id);
-                return Err(MailboxError(session_id));
-            };
-            Self { session_id, state }
-        };
-        let mut state = lock(&mailbox.state);
+        let mailbox = crate::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
+            .and_then(|coordinator| coordinator.mailbox())
+            .map_err(|_| MailboxError(session_id))?;
+        mailbox.push(text, wake);
+        Ok(())
+    }
+
+    pub(crate) fn push(&self, text: String, wake: bool) {
+        let mut state = lock(&self.state);
         if state.pending.len() == MAILBOX_CAPACITY {
             state.pending.pop_front();
         }
         state.pending.push_back(Message::observation(text));
         state.wake |= wake;
-        Ok(())
     }
 
     pub fn drain(&self) -> Vec<Message> {
@@ -87,6 +72,10 @@ impl SessionMailbox {
         state.wake = false;
         state.pending.drain(..).collect()
     }
+
+    pub fn session_id(&self) -> MakiId {
+        self.session_id
+    }
 }
 
 impl PreparedSessionMailbox {
@@ -95,25 +84,7 @@ impl PreparedSessionMailbox {
     }
 
     pub fn activate(self) -> SessionMailbox {
-        lock(&MAILBOXES).insert(self.0.session_id, Arc::downgrade(&self.0.state));
         self.0
-    }
-}
-
-impl Drop for SessionMailbox {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.state) != 1 {
-            return;
-        }
-        let weak = Arc::downgrade(&self.state);
-        let mut mailboxes = lock(&MAILBOXES);
-        if Arc::strong_count(&self.state) == 1
-            && mailboxes
-                .get(&self.session_id)
-                .is_some_and(|registered| registered.ptr_eq(&weak))
-        {
-            mailboxes.remove(&self.session_id);
-        }
     }
 }
 
@@ -126,52 +97,24 @@ mod tests {
     }
 
     #[test]
-    fn prepared_mailbox_is_not_addressable_until_activation() {
-        let id = MakiId::generate();
-        let prepared = SessionMailbox::prepare(id);
+    fn prepared_mailbox_preserves_state_on_activation() {
+        let prepared = SessionMailbox::prepare(MakiId::generate());
         let mailbox = prepared.mailbox();
+        mailbox.push("ready".into(), true);
 
-        assert!(SessionMailbox::notify(id, "early".into(), false).is_err());
         let activated = prepared.activate();
-        SessionMailbox::notify(id, "ready".into(), false).unwrap();
-        assert_eq!(activated.drain().len(), 1);
-        drop(mailbox);
-    }
-
-    #[test]
-    fn dropped_prepared_mailbox_is_never_addressable() {
-        let id = MakiId::generate();
-        drop(SessionMailbox::prepare(id));
-
-        assert!(SessionMailbox::notify(id, "late".into(), false).is_err());
-    }
-
-    #[test]
-    fn same_id_activation_preserves_notifications_exactly_once_and_wake() {
-        let id = MakiId::generate();
-        let current = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "before".into(), true).unwrap();
-        let prepared = SessionMailbox::prepare(id);
-        SessionMailbox::notify(id, "during".into(), false).unwrap();
-
-        let replacement = prepared.activate();
-        drop(current);
-
-        let messages = replacement.claim_wake();
         assert_eq!(
-            messages.iter().map(text).collect::<Vec<_>>(),
-            ["before", "during"]
+            activated.claim_wake().iter().map(text).collect::<Vec<_>>(),
+            ["ready"]
         );
-        assert!(replacement.claim_wake().is_empty());
-        assert!(replacement.drain().is_empty());
     }
 
     #[test]
     fn notifications_drain_in_order_and_clear_wake() {
         let id = MakiId::generate();
-        let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "first".into(), true).unwrap();
-        SessionMailbox::notify(id, "second".into(), true).unwrap();
+        let mailbox = SessionMailbox::new(id);
+        mailbox.push("first".into(), true);
+        mailbox.push("second".into(), true);
 
         let messages = mailbox.drain();
         assert_eq!(
@@ -184,9 +127,8 @@ mod tests {
 
     #[test]
     fn quiet_notifications_do_not_claim_a_wake() {
-        let id = MakiId::generate();
-        let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "built".into(), false).unwrap();
+        let mailbox = SessionMailbox::new(MakiId::generate());
+        mailbox.push("built".into(), false);
 
         assert!(mailbox.claim_wake().is_empty());
         assert_eq!(mailbox.drain().len(), 1);
@@ -194,10 +136,9 @@ mod tests {
 
     #[test]
     fn waking_notification_claims_all_pending_messages() {
-        let id = MakiId::generate();
-        let mailbox = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "quiet".into(), false).unwrap();
-        SessionMailbox::notify(id, "wake".into(), true).unwrap();
+        let mailbox = SessionMailbox::new(MakiId::generate());
+        mailbox.push("quiet".into(), false);
+        mailbox.push("wake".into(), true);
 
         let messages = mailbox.claim_wake();
         assert_eq!(
@@ -209,10 +150,9 @@ mod tests {
 
     #[test]
     fn notifications_drop_the_oldest_message_at_capacity() {
-        let id = MakiId::generate();
-        let mailbox = SessionMailbox::register(id);
+        let mailbox = SessionMailbox::new(MakiId::generate());
         for index in 0..=MAILBOX_CAPACITY {
-            SessionMailbox::notify(id, index.to_string(), false).unwrap();
+            mailbox.push(index.to_string(), false);
         }
 
         let messages = mailbox.drain();
@@ -222,61 +162,12 @@ mod tests {
     }
 
     #[test]
-    fn registrations_for_the_same_id_share_state() {
-        let id = MakiId::generate();
-        let first = SessionMailbox::register(id);
-        let second = SessionMailbox::register(id);
-        SessionMailbox::notify(id, "built".into(), false).unwrap();
+    fn clones_share_state_without_owning_registration_lifetime() {
+        let first = SessionMailbox::new(MakiId::generate());
+        let second = first.clone();
+        first.push("built".into(), false);
 
         assert_eq!(second.drain().len(), 1);
         assert!(first.drain().is_empty());
-    }
-
-    #[test]
-    fn dropping_the_last_registration_closes_the_mailbox() {
-        let id = MakiId::generate();
-        drop(SessionMailbox::register(id));
-
-        assert!(!lock(&MAILBOXES).contains_key(&id));
-        assert!(SessionMailbox::notify(id, "late".into(), false).is_err());
-    }
-
-    #[test]
-    fn dropping_one_registration_keeps_the_shared_mailbox() {
-        let id = MakiId::generate();
-        let first = SessionMailbox::register(id);
-        let second = SessionMailbox::register(id);
-
-        drop(first);
-
-        assert!(lock(&MAILBOXES).contains_key(&id));
-        SessionMailbox::notify(id, "built".into(), false).unwrap();
-        assert_eq!(second.drain().len(), 1);
-    }
-
-    #[test]
-    fn stale_drop_does_not_remove_a_replacement() {
-        let id = MakiId::generate();
-        let stale = SessionMailbox::register(id);
-        let replacement = SessionMailbox {
-            session_id: id,
-            state: Arc::new(Mutex::new(State::default())),
-        };
-        lock(&MAILBOXES).insert(id, Arc::downgrade(&replacement.state));
-
-        drop(stale);
-        SessionMailbox::notify(id, "built".into(), false).unwrap();
-
-        assert_eq!(replacement.drain().len(), 1);
-    }
-
-    #[test]
-    fn legacy_and_canonical_ids_address_the_same_mailbox() {
-        let legacy: MakiId = "01965087-4c71-7f00-8000-000000000001".parse().unwrap();
-        let canonical: MakiId = legacy.to_string().parse().unwrap();
-        let mailbox = SessionMailbox::register(legacy);
-        SessionMailbox::notify(canonical, "built".into(), false).unwrap();
-
-        assert_eq!(mailbox.drain().len(), 1);
     }
 }

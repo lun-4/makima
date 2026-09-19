@@ -439,14 +439,26 @@ impl App {
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let (mode_label, mode_style) = self.mode_label();
+        // A subagent chat names its own model. The main chat shows the model the
+        // run is on, and marks a change the run has not reached yet.
+        let (model_id, model_switch_queued) = match chat.model_id.as_deref() {
+            Some(model_id) => (model_id, false),
+            None => {
+                let session_model = self.state.session.model.as_str();
+                match self.run_model.as_deref() {
+                    Some(running) if self.status == Status::Streaming => {
+                        (running, running != session_model)
+                    }
+                    _ => (session_model, false),
+                }
+            }
+        };
         let ctx = StatusBarContext {
             status: self.status_for_chat(render_chat),
             mode_label,
             mode_style,
-            model_id: chat
-                .model_id
-                .as_deref()
-                .unwrap_or(&self.state.session.model),
+            model_id,
+            model_switch_queued,
             stats: UsageStats {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,

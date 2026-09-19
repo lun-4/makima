@@ -73,8 +73,10 @@ pub fn run(
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
-    let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
-    let modes = plugin_host.event_handle().mode_registry();
+    let lua_event_handle = plugin_host.event_handle();
+    let prompt_slots = lua_event_handle.collect_prompt_slots();
+    let modes = lua_event_handle.mode_registry();
+    let yolo = config.permissions.yolo;
 
     let result = maki_acp::run(maki_acp::AcpParams {
         model,
@@ -82,6 +84,7 @@ pub fn run(
         permissions_config: config.permissions,
         timeouts,
         initial_wd: cwd,
+        storage,
         prompt_slots: Arc::new(prompt_slots),
         modes,
         yolo,
@@ -89,6 +92,7 @@ pub fn run(
         append_system_prompt,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
+        lua_event_handle,
         command_registry,
     });
     drop(standard_commands);

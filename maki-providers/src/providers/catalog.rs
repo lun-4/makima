@@ -814,19 +814,44 @@ impl Provider for CatalogProvider {
     }
 }
 
+/// The catalog is one process-wide `OnceLock`, but the tests disagree about
+/// what belongs in it: most want it warm and empty, one wants a specific
+/// index. First-writer-wins turned that into a race in any runner that shares
+/// a process across tests, and the loser read someone else's catalog without
+/// failing to seed. Seeding now replaces the contents, and a seeding test
+/// holds this lock for as long as it depends on what it seeded.
 #[cfg(test)]
-pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
-    let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(
-        index,
-        false,
-        &state_dir,
-        std::collections::HashSet::new(),
-    )));
+static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+fn lock_catalog_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    CATALOG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Hold the returned guard for as long as the seeded catalog must stay put.
+#[cfg(test)]
+pub(crate) fn seed_catalog_for_tests(
+    index: schema::CatalogIndex,
+    state_dir: StateDir,
+) -> std::sync::MutexGuard<'static, ()> {
+    let guard = lock_catalog_for_tests();
+    let data = CatalogData::from_index(index, false, &state_dir, std::collections::HashSet::new());
+    match SHARED_CATALOG.get() {
+        Some(existing) => *existing.lock().unwrap_or_else(|p| p.into_inner()) = data,
+        None => {
+            let _ = SHARED_CATALOG.set(Mutex::new(data));
+        }
+    }
+    guard
 }
 
 #[cfg(test)]
-pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
-    seed_catalog_for_tests(HashMap::new(), state_dir);
+pub(crate) fn warm_empty_catalog_for_tests(
+    state_dir: StateDir,
+) -> std::sync::MutexGuard<'static, ()> {
+    seed_catalog_for_tests(HashMap::new(), state_dir)
 }
 
 /// Defers catalog resolution to first use so that provider construction
@@ -1632,7 +1657,7 @@ mod tests {
                 models,
             },
         )]);
-        super::seed_catalog_for_tests(index, state_dir);
+        let _catalog = super::seed_catalog_for_tests(index, state_dir);
 
         let model = super::Model::from_spec(&format!("opencode/{model_id}")).unwrap();
         assert_eq!(model.is_free(), expected);

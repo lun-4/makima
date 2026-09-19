@@ -9,6 +9,7 @@ maki-commands = { workspace = true }
 maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
+maki-lua = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
 smol = { workspace = true }
 flume = { workspace = true }

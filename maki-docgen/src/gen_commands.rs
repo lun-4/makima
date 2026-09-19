@@ -54,6 +54,14 @@ fn argument_hint(arguments: &CommandArguments, explicit_hint: Option<&str>) -> S
         .unwrap_or_default()
 }
 
+fn frontends(required: TargetCapabilities) -> &'static str {
+    if maki_agent::command::portable_capabilities().contains_all(required) {
+        "all"
+    } else {
+        "TUI only"
+    }
+}
+
 fn write_row(
     out: &mut String,
     name: &str,
@@ -69,11 +77,7 @@ fn write_row(
         markdown_cell(description),
         argument_mode(arguments),
         markdown_cell(&argument_hint(arguments, explicit_hint)),
-        if maki_agent::command::portable_capabilities().contains_all(required) {
-            "no"
-        } else {
-            "yes"
-        },
+        frontends(required),
     )
     .unwrap();
 }
@@ -121,12 +125,12 @@ pub fn generate() -> color_eyre::Result<String> {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "| Command | Description | Mode | Arguments | TUI-only |"
+        "| Command | Description | Mode | Arguments | Frontends |"
     )
     .unwrap();
     writeln!(
         out,
-        "|---------|-------------|------|-----------|----------|"
+        "|---------|-------------|------|-----------|-----------|"
     )
     .unwrap();
     for cmd in BUILTIN_COMMANDS {
@@ -154,7 +158,7 @@ pub fn generate() -> color_eyre::Result<String> {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`)."
+        "The portable built-ins are `/compact`, `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. ACP hides `/new` and `/clear`. The ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference or reset model history. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`)."
     )
     .unwrap();
 
@@ -169,12 +173,12 @@ pub fn generate() -> color_eyre::Result<String> {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "| Command | Description | Mode | Arguments | TUI-only |"
+        "| Command | Description | Mode | Arguments | Frontends |"
     )
     .unwrap();
     writeln!(
         out,
-        "|---------|-------------|------|-----------|----------|"
+        "|---------|-------------|------|-----------|-----------|"
     )
     .unwrap();
     for command in lua_util::load_builtin_plugin_commands()? {
@@ -380,7 +384,7 @@ mod tests {
         super::write_plugin_row(&mut generated, &command);
         assert_eq!(
             generated,
-            "| `/custom` | Custom | raw (optional) | <title> | no |\n"
+            "| `/custom` | Custom | raw (optional) | <title> | all |\n"
         );
     }
 
@@ -397,7 +401,7 @@ mod tests {
         );
         assert_eq!(
             generated,
-            "| `name\\|value` | line 1<br>line 2 | raw (required) |  | no |\n"
+            "| `name\\|value` | line 1<br>line 2 | raw (required) |  | all |\n"
         );
     }
 
@@ -426,16 +430,16 @@ mod tests {
             }
         }
         for row in [
-            "| `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | no |",
-            "| `/build` | Switch to build mode (full tool access) | none |  | no |",
-            "| `/memory` | View, edit, and delete memory files | none |  | yes |",
-            "| `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | no |",
-            "| `/rename` | Rename the current session | raw (required) |  | yes |",
-            "| `/sessions` | Browse and switch sessions | typed | [query] | yes |",
-            "| `/splash` | Preview and select a splash renderer | typed | [splash] | yes |",
-            "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | yes |",
-            "| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | yes |",
-            "| `/usage` | Show provider quota and focused-session token usage | none |  | yes |",
+            "| `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | all |",
+            "| `/build` | Switch to build mode (full tool access) | none |  | all |",
+            "| `/memory` | View, edit, and delete memory files | none |  | TUI only |",
+            "| `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | all |",
+            "| `/rename` | Rename the current session | raw (required) |  | TUI only |",
+            "| `/sessions` | Browse and switch sessions | typed | [query] | TUI only |",
+            "| `/splash` | Preview and select a splash renderer | typed | [splash] | TUI only |",
+            "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | TUI only |",
+            "| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | TUI only |",
+            "| `/usage` | Show provider quota and focused-session token usage | none |  | TUI only |",
         ] {
             assert!(plugins.contains(row), "{row}");
         }

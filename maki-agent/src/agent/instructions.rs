@@ -3,8 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use maki_providers::model::Model;
-
 use crate::AgentMode;
 use crate::ModeRegistry;
 use crate::command::find_project_ancestor_dirs;
@@ -58,12 +56,10 @@ pub fn build_system_prompt(
     mode: &AgentMode,
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
-    model: &Model,
 ) -> String {
     let env = vars.apply(
         "\n\nEnvironment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}",
     );
-    let env = format!("{env}\n- Model: {}", model.spec());
     let instructions = format!("{env}{instructions}");
     let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
 
@@ -233,13 +229,32 @@ mod tests {
     fn plan_section_presence(mode: &AgentMode, expect_plan: bool) {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
         let slots = crate::prompt::ResolvedSlots::default();
-        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let modes = crate::ModeRegistry::builtin();
-        let prompt = build_system_prompt(&vars, &modes, mode, "", &slots, &model);
+        let prompt = build_system_prompt(&vars, &modes, mode, "", &slots);
         assert_eq!(prompt.contains("Plan Mode"), expect_plan);
         if expect_plan {
             assert!(prompt.contains(PLAN_PATH));
         }
+    }
+
+    #[test]
+    fn system_prompt_contains_generated_environment() {
+        let vars = Vars::new()
+            .set("{cwd}", "/tmp/project")
+            .set("{platform}", "linux")
+            .set("{date}", "2025-01-02");
+        let prompt = build_system_prompt(
+            &vars,
+            &crate::ModeRegistry::builtin(),
+            &AgentMode::Build,
+            "",
+            &crate::prompt::ResolvedSlots::default(),
+        );
+
+        assert!(prompt.contains("Environment:"));
+        assert!(prompt.contains("- Working directory: /tmp/project"));
+        assert!(prompt.contains("- Platform: linux"));
+        assert!(prompt.contains("- Date: 2025-01-02"));
     }
 
     #[test_case(&AgentMode::Build, "[BUILD]", false ; "build_label")]
@@ -268,7 +283,6 @@ mod tests {
             &AgentMode::Plan(PathBuf::from("plan.md")),
             "",
             &slots,
-            &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
         );
         assert!(prompt.contains("Polytoken directive for plan.md"));
         assert!(!prompt.contains("Plan Mode"));
@@ -292,7 +306,6 @@ mod tests {
             &AgentMode::Custom(crate::ModeId::Custom("audit".into())),
             "",
             &slots,
-            &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
         );
         assert!(prompt.contains("AUDIT_DIRECTIVE"));
     }
@@ -318,7 +331,6 @@ mod tests {
             &AgentMode::Plan(PathBuf::from("plan.md")),
             &format!("\n{INSTR}"),
             &slots,
-            &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
         );
         let positions = [INSTR, EXTRA, "Plan Mode"].map(|n| prompt.find(n).unwrap());
         assert!(

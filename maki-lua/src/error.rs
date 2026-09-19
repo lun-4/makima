@@ -1,3 +1,4 @@
+use maki_agent::session_coordinator::SessionCoordinatorError;
 use std::io;
 use std::path::PathBuf;
 
@@ -23,6 +24,16 @@ pub enum PluginError {
     UnknownPluginOptions { plugin: String, keys: String },
     #[error("no bundled plugin named \"{plugin}\" (enabled via plugins.{plugin})")]
     UnknownPlugin { plugin: String },
+    #[error("failed to unload plugin {plugin}: {error}")]
+    Unload { plugin: String, error: String },
     #[error("plugin host is not running")]
     HostDead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SessionOptionMutationError {
+    #[error("plugin host is not running")]
+    HostDead,
+    #[error(transparent)]
+    Coordinator(#[from] SessionCoordinatorError),
 }

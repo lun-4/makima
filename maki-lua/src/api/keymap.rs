@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -75,6 +75,46 @@ pub(crate) struct KeymapStore {
     bindings: Vec<StoredKeymap>,
 }
 
+pub(crate) type PendingKeymapStore = Arc<Mutex<PendingKeymaps>>;
+
+pub(crate) struct PendingKeymaps {
+    store: KeymapStore,
+    deletions: Vec<(KeyCode, KeyModifiers)>,
+}
+
+impl PendingKeymaps {
+    pub(crate) fn new() -> Self {
+        Self {
+            store: KeymapStore::new(),
+            deletions: Vec::new(),
+        }
+    }
+
+    fn set(
+        &mut self,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+        callback: RegistryKey,
+        plugin: Arc<str>,
+        desc: String,
+    ) -> (u64, Option<RegistryKey>) {
+        self.deletions
+            .retain(|deleted| *deleted != (key, modifiers));
+        self.store.set(key, modifiers, callback, plugin, desc)
+    }
+
+    fn del(&mut self, key: KeyCode, modifiers: KeyModifiers) -> Option<RegistryKey> {
+        if !self.deletions.contains(&(key, modifiers)) {
+            self.deletions.push((key, modifiers));
+        }
+        self.store.del(key, modifiers)
+    }
+
+    pub(crate) fn drain(&mut self) -> (Vec<StoredKeymap>, Vec<(KeyCode, KeyModifiers)>) {
+        (self.store.drain(), std::mem::take(&mut self.deletions))
+    }
+}
+
 impl KeymapStore {
     pub fn new() -> Self {
         Self {
@@ -145,6 +185,20 @@ impl KeymapStore {
             .iter()
             .find(|b| b.id == id)
             .map(|b| &b.callback)
+    }
+
+    pub(crate) fn drain(&mut self) -> Vec<StoredKeymap> {
+        std::mem::take(&mut self.bindings)
+    }
+
+    pub(crate) fn insert_stored(&mut self, binding: StoredKeymap) -> Option<RegistryKey> {
+        let old = self
+            .bindings
+            .iter()
+            .position(|b| b.key == binding.key && b.modifiers == binding.modifiers)
+            .map(|pos| self.bindings.remove(pos).callback);
+        self.bindings.push(binding);
+        old
     }
 }
 
@@ -284,6 +338,10 @@ fn publish_keymap_snapshot(lua: &Lua) {
     }
 }
 
+fn loading(lua: &Lua, plugin: &str) -> bool {
+    crate::runtime::loading_plugin_is(lua, plugin)
+}
+
 /// Bind a key to a Lua function, just like `vim.keymap.set`. Only
 /// normal mode (`"n"`) is supported right now. If {lhs} is already
 /// mapped, the old binding is replaced and a warning is logged.
@@ -300,6 +358,7 @@ fn publish_keymap_snapshot(lua: &Lua) {
 #[lua_fn]
 fn set(
     lua: &Lua,
+    #[ctx] pending: PendingKeymapStore,
     #[ctx] plugin: Arc<str>,
     mode: String,
     lhs: String,
@@ -317,15 +376,23 @@ fn set(
         .and_then(|o| o.get::<String>("desc").ok())
         .unwrap_or_default();
     let registry_key = lua.create_registry_value(rhs)?;
-    let (_, old) = lua
-        .app_data_mut::<KeymapStore>()
-        .ok_or_else(|| mlua::Error::runtime("keymap store not initialized"))?
-        .set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
-    if let Some(old_key) = old {
-        tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
-        let _ = lua.remove_registry_value(old_key);
+    if loading(lua, &plugin) {
+        pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
+    } else {
+        let old = lua
+            .app_data_mut::<KeymapStore>()
+            .ok_or_else(|| mlua::Error::runtime("keymap store not initialized"))?
+            .set(key, modifiers, registry_key, Arc::clone(&plugin), desc)
+            .1;
+        if let Some(old_key) = old {
+            tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
+            let _ = lua.remove_registry_value(old_key);
+        }
+        publish_keymap_snapshot(lua);
     }
-    publish_keymap_snapshot(lua);
     Ok(())
 }
 
@@ -337,16 +404,30 @@ fn set(
 /// @example
 /// maki.keymap.del("n", "<C-t>")
 #[lua_fn]
-fn del(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String, lhs: String) -> LuaResult<()> {
-    let _ = (mode, &plugin);
+fn del(
+    lua: &Lua,
+    #[ctx] pending: PendingKeymapStore,
+    #[ctx] plugin: Arc<str>,
+    mode: String,
+    lhs: String,
+) -> LuaResult<()> {
+    let _ = mode;
     let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
-    let old = lua
-        .app_data_mut::<KeymapStore>()
-        .and_then(|mut store| store.del(key, modifiers));
+    let old = if loading(lua, &plugin) {
+        pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .del(key, modifiers)
+    } else {
+        lua.app_data_mut::<KeymapStore>()
+            .and_then(|mut store| store.del(key, modifiers))
+    };
     if let Some(old_key) = old {
         let _ = lua.remove_registry_value(old_key);
     }
-    publish_keymap_snapshot(lua);
+    if !loading(lua, &plugin) {
+        publish_keymap_snapshot(lua);
+    }
     Ok(())
 }
 
@@ -359,8 +440,8 @@ lua_table! {
     ///   print("hello")
     /// end, { desc = "Say hello" })
     /// ```
-    "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>), DOCS [
-        set(plugin), del(plugin),
+    "maki.keymap" => pub(crate) fn create_keymap_table(pending: PendingKeymapStore, plugin: Arc<str>), DOCS [
+        set(pending, plugin), del(pending, plugin),
     ]
 }
 

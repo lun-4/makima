@@ -45,8 +45,10 @@ local function scan_skill_dir(dir, skills)
   end
 end
 
-local function find_project_ancestors()
-  local cwd = maki.uv.cwd()
+local function find_project_ancestors(cwd)
+  -- Callers without a tool ctx (the completion source, the expander) have no
+  -- session cwd to pass, so they fall back to the process cwd.
+  cwd = cwd or maki.uv.cwd()
   if not cwd then
     return {}
   end
@@ -95,7 +97,7 @@ local function resolve_builtin_content()
   return content .. "\n---\n\n" .. reference.content
 end
 
-local function discover_skills()
+local function discover_skills(cwd)
   local skills = {}
 
   if builtin and opts.plugin_dev then
@@ -120,7 +122,7 @@ local function discover_skills()
     end
   end
 
-  for _, ancestor in ipairs(find_project_ancestors()) do
+  for _, ancestor in ipairs(find_project_ancestors(cwd)) do
     for _, rel in ipairs(PROJECT_SKILL_DIRS) do
       scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills)
     end
@@ -129,7 +131,7 @@ local function discover_skills()
   return skills
 end
 
-local boot_skills = discover_skills()
+local boot_skills = discover_skills(maki.uv.cwd())
 local description = "Load a skill that provides instructions and workflows for specific tasks."
   .. build_skill_list(boot_skills)
 
@@ -196,7 +198,11 @@ maki.api.register_tool({
       return { llm_output = "error: name is required", is_error = true }
     end
 
-    local skills = discover_skills()
+    local cwd, cwd_err = ctx:resolve_path(".")
+    if not cwd then
+      return { llm_output = "error: " .. tostring(cwd_err), is_error = true }
+    end
+    local skills = discover_skills(cwd)
     local skill = skills[input.name]
     if not skill then
       local available = build_skill_list(skills)

@@ -1355,6 +1355,19 @@ fn reset_session_request_defers_autocmd_and_names_ended_session() {
 }
 
 #[test]
+fn reset_session_carries_current_yolo() {
+    let mut app = test_app();
+    app.permissions.set_yolo(true);
+
+    let actions = app.reset_session();
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+
+    assert!(request.session.meta.yolo);
+}
+
+#[test]
 fn reset_session_clears_plan() {
     let mut app = test_app();
     app.state.token_usage.input = 500;
@@ -4279,6 +4292,19 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
 }
 
 #[test]
+fn loaded_session_restores_yolo() {
+    let mut app = test_app();
+    app.permissions.set_yolo(false);
+    let mut session = AppSession::new("test-model", "/tmp/test");
+    session.meta.yolo = true;
+
+    let model = app.state.model.clone();
+    app.apply_loaded_session(session, &model);
+
+    assert!(app.permissions.is_yolo());
+}
+
+#[test]
 fn yolo_toggle() {
     let mut app = test_app();
     assert!(!app.permissions.is_yolo());
@@ -6129,7 +6155,7 @@ fn thinking_restored_from_session_meta() {
         &storage,
         &maki_config::ModelPolicy::default(),
     );
-    assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
+    assert_eq!(state.thinking, maki_domain::ThinkingConfig::Budget(4096));
 }
 
 fn set_opus_model(app: &mut App) {

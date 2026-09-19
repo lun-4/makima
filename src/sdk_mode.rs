@@ -11,12 +11,13 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
+use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::command::{CustomCommand, StandardCommands, StandardCompletions};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
@@ -34,12 +35,12 @@ use maki_commands::{
 };
 use maki_config::ModelPolicy;
 use maki_providers::model::Model;
-use maki_providers::provider::available_model_specs;
+use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::session_lock;
-use maki_storage::sessions::{SESSIONS_DIR, Session};
+use maki_storage::sessions::{SESSIONS_DIR, Session, SessionMeta};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -504,6 +505,7 @@ impl SdkWriter {
 pub struct SdkParams {
     pub cli: Cli,
     pub model: Model,
+    pub explicit_model: bool,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
@@ -514,6 +516,9 @@ pub struct SdkParams {
     pub plugin_rules: Arc<PluginRuleStore>,
     pub commands: Vec<CustomCommand>,
     pub command_registry: CommandRegistry,
+    /// Plugin-registered session options, so a tool's options resolve here the
+    /// same way they do in the TUI.
+    pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
 }
 
 struct Shared {
@@ -521,13 +526,14 @@ struct Shared {
     permission_mode: PermissionMode,
     turn_start: Instant,
     pending: HashSet<String>,
+    turn_active: bool,
+    active_cancel: Option<CancelTrigger>,
 }
 
 struct CommandDriverParams {
     route_rx: Receiver<CommandRoute>,
-    model_tx: Sender<Model>,
+    coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
     shared: Arc<Mutex<Shared>>,
-    model_policy: Arc<ModelPolicy>,
 }
 
 enum CommandRoute {
@@ -537,9 +543,22 @@ enum CommandRoute {
     },
 }
 
+async fn route_model(
+    tx: &Sender<CommandRoute>,
+    argument: String,
+) -> Result<HostResponse, CommandError> {
+    let (response, response_rx) = flume::bounded(1);
+    tx.send(CommandRoute::Model { argument, response })
+        .map_err(|_| CommandError::StaleTarget)?;
+    response_rx
+        .recv_async()
+        .await
+        .map_err(|_| CommandError::StaleTarget)?
+}
+
 struct SdkCommandHost {
     tx: Sender<CommandRoute>,
-    model_specs: Arc<[Arc<str>]>,
+    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
 }
 
 impl CommandHost for SdkCommandHost {
@@ -549,22 +568,15 @@ impl CommandHost for SdkCommandHost {
         Box::pin(async move {
             match request {
                 HostRequest::Context(maki_commands::HostContextRequest::ModelSpecs) => Ok(
-                    HostResponse::Context(maki_commands::HostContextResponse::Values(model_specs)),
+                    HostResponse::Context(maki_commands::HostContextResponse::Values(
+                        model_specs.read().unwrap().clone(),
+                    )),
                 ),
                 HostRequest::Context(_) => Ok(HostResponse::Context(
                     maki_commands::HostContextResponse::Unavailable,
                 )),
                 HostRequest::Builtin(BuiltinOperation::SetModel { spec }) => {
-                    let (response, response_rx) = flume::bounded(1);
-                    tx.send(CommandRoute::Model {
-                        argument: spec.to_string(),
-                        response,
-                    })
-                    .map_err(|_| CommandError::StaleTarget)?;
-                    response_rx
-                        .recv_async()
-                        .await
-                        .map_err(|_| CommandError::StaleTarget)?
+                    route_model(&tx, spec.to_string()).await
                 }
                 HostRequest::Builtin(BuiltinOperation::QuickQuestion {
                     question,
@@ -594,7 +606,9 @@ fn sdk_capabilities() -> TargetCapabilities {
 struct SdkCommands {
     registry: CommandRegistry,
     target: TargetHandle,
+    route_tx: Sender<CommandRoute>,
     route_rx: Receiver<CommandRoute>,
+    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
     _standard_commands: StandardCommands,
 }
 
@@ -605,19 +619,22 @@ impl SdkCommands {
         model_specs: Arc<[Arc<str>]>,
     ) -> Result<Self> {
         let (route_tx, route_rx) = flume::unbounded();
+        let model_specs = Arc::new(RwLock::new(model_specs));
         let standard_commands =
             StandardCommands::register(&registry, custom, StandardCompletions::default())?;
         let target = registry.bind_target(
             sdk_capabilities(),
             Arc::new(SdkCommandHost {
                 tx: route_tx.clone(),
-                model_specs,
+                model_specs: Arc::clone(&model_specs),
             }),
         );
         Ok(Self {
             target,
             registry,
+            route_tx,
             route_rx,
+            model_specs,
             _standard_commands: standard_commands,
         })
     }
@@ -656,9 +673,10 @@ struct LockGuard {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(());
-        if let Some(t) = self.thread.take()
-            && t.join().is_ok()
-        {
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                warn!(session_id = %self.id, "session lock heartbeat thread terminated abnormally");
+            }
             session_lock::release(&self.dir, &self.id);
         }
     }
@@ -668,6 +686,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let SdkParams {
         cli,
         model,
+        explicit_model,
         mut config,
         permissions_config,
         timeouts,
@@ -678,17 +697,56 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         commands,
         command_registry,
+        session_options,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
         config.max_turns = Some(max);
     }
-    let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
+    let explicit_permission_mode = cli.permission_mode.is_some();
+    let permission_mode = PermissionMode::resolve(
+        cli.permission_mode.as_deref(),
+        cli.yolo || permissions_config.yolo,
+    );
+    let startup_permission_mode = permission_mode;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
     let storage = StateDir::resolve().context("resolve state dir")?;
-    let (session_id, initial_history) = resolve_session(&cli, &working_dir, &storage)?;
+    let restored = resolve_session(&cli, &working_dir, &storage)?;
+    let restored_state = restored.model.is_some();
+    let model = resolve_startup_model(
+        model,
+        restored.model.as_deref(),
+        explicit_model,
+        &model_policy,
+    );
+    let permission_mode = restored_permission_mode(
+        restored_state,
+        restored.meta.yolo,
+        startup_permission_mode,
+        explicit_permission_mode,
+    );
+    let yolo = permission_mode == PermissionMode::BypassPermissions;
+    let fast = if restored_state {
+        restored.meta.fast && model.supports_fast()
+    } else {
+        fast && model.supports_fast()
+    };
+    let workflow = if restored_state {
+        restored.meta.workflow
+    } else {
+        workflow
+    };
+    let thinking = restored
+        .meta
+        .thinking
+        .map(maki_agent::ThinkingConfig::from)
+        .filter(|_| model.supports_thinking())
+        .unwrap_or_default();
+    let persisted_options = restored.meta.session_options;
+    let session_id = restored.id;
+    let initial_history = restored.history;
 
     let model_specs = available_model_specs(&model_policy)
         .into_iter()
@@ -708,6 +766,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
 
     let startup_model = model.clone();
+    let coordinator_history = initial_history.clone();
     let handle = headless::spawn_interactive(InteractiveParams {
         model,
         config,
@@ -720,7 +779,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         initial_wd: cwd.clone(),
         session_id,
         initial_history,
-        yolo: permission_mode == PermissionMode::BypassPermissions,
+        yolo,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
@@ -729,6 +788,61 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         local_tools: Default::default(),
     });
+    let definitions = maki_agent::session_coordinator::builtin_option_definitions(
+        startup_model.spec(),
+        available_model_specs(&model_policy)
+            .into_iter()
+            .map(Arc::from),
+        yolo,
+        fast,
+        workflow,
+        thinking,
+    );
+    let checkpoint = Arc::new(
+        maki_agent::session_checkpoint::SessionLogCheckpoint::open(
+            storage.clone(),
+            handle.session_id.id(),
+            &startup_model.spec(),
+            &working_dir,
+        )
+        .map_err(|error| eyre!(error))?,
+    );
+    let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+        maki_agent::session_coordinator::SessionCoordinatorParams {
+            session_id: handle.session_id.id(),
+            catalog: session_options.clone(),
+            definitions,
+            persisted_options,
+            history: coordinator_history,
+            model: Arc::from(startup_model.spec()),
+            cwd: cwd.clone(),
+            model_policy: Arc::clone(&model_policy),
+            model_adopter: Arc::new({
+                // A store, not a round-trip to the session loop: the loop only
+                // reads its control channel between turns, so asking it to
+                // adopt would wait for the running turn, and that turn cannot
+                // finish while the coordinator is blocked here.
+                let shared = handle.model.clone();
+                move |mut model: Model| {
+                    let shared = shared.clone();
+                    Box::pin(async move {
+                        let provider =
+                            maki_providers::provider::from_model_async(&mut model, timeouts)
+                                .await
+                                .map_err(|error| Arc::from(error.user_message()))?;
+                        shared.install(Arc::from(provider), model);
+                        Ok(())
+                    }) as maki_agent::session_coordinator::ModelAdoptionFuture
+                }
+            }),
+            directory_adopter: maki_agent::headless::interactive_directory_adopter(
+                handle.control_tx.clone(),
+            ),
+            checkpoint,
+            mailbox: handle.mailbox.clone(),
+        },
+    )
+    .map_err(|error| eyre!("register session coordinator: {error}"))?;
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
     let writer_thread = std::thread::spawn(move || {
@@ -771,11 +885,15 @@ pub fn run(params: SdkParams) -> Result<()> {
             {
                 return;
             }
-            if matches!(
-                session_lock::heartbeat(&lock_dir, &locked_id),
-                Ok(session_lock::LockBeat::Lost)
-            ) {
-                return;
+            match session_lock::heartbeat(&lock_dir, &locked_id) {
+                Ok(session_lock::LockBeat::Lost) => {
+                    warn!(session_id = %locked_id, "session lock heartbeat lost ownership");
+                    return;
+                }
+                Err(error) => {
+                    warn!(session_id = %locked_id, %error, "session lock heartbeat failed");
+                }
+                Ok(session_lock::LockBeat::Claimed | session_lock::LockBeat::Held) => {}
             }
         }
     });
@@ -814,6 +932,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         permission_mode,
         turn_start: Instant::now(),
         pending: HashSet::new(),
+        turn_active: false,
+        active_cancel: None,
     }));
 
     let pump = EventPump {
@@ -826,14 +946,24 @@ pub fn run(params: SdkParams) -> Result<()> {
         result_text: String::new(),
         cost: None,
         request_counter: 0,
+        terminal_run_id: None,
     }
     .spawn(handle.event_rx.clone());
     let command_driver = spawn_command_driver(CommandDriverParams {
         route_rx: sdk_commands.route_rx.clone(),
-        model_tx: handle.model_tx.clone(),
+        coordinator: coordinator.clone(),
         shared: Arc::clone(&shared),
-        model_policy: Arc::clone(&model_policy),
     });
+    let permission_watcher = watch_permission_option(
+        coordinator.read(),
+        Arc::clone(&handle.permissions),
+        Arc::clone(&shared),
+    );
+    let model_discovery = watch_model_discovery(
+        Arc::clone(&model_policy),
+        coordinator.clone(),
+        Arc::clone(&sdk_commands.model_specs),
+    );
 
     let input_result = (|| -> Result<()> {
         for line in io::stdin().lock().lines() {
@@ -872,12 +1002,47 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 fast,
                                 workflow,
                             )?;
+                            let input = match prepare_sdk_turn(&shared, input) {
+                                Ok(input) => input,
+                                Err(error) => {
+                                    emit_command_result(&writer, &shared, true, error.into())?;
+                                    continue;
+                                }
+                            };
                             if handle.input_tx.send(input).is_err() {
+                                let mut shared = shared.lock().unwrap();
+                                shared.turn_active = false;
+                                shared.active_cancel.take();
                                 break;
                             }
                         }
                         InputDispatch::Dispatched(CommandOutcome::Completed) => {
                             emit_command_result(&writer, &shared, false, String::new())?
+                        }
+                        InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
+                            let result = match feedback {
+                                maki_commands::FrontendFeedback::WorkingDirectory(path) => {
+                                    format!("Working directory: {}", path.display())
+                                }
+                                maki_commands::FrontendFeedback::Text(text) => text.to_string(),
+                            };
+                            emit_command_result(&writer, &shared, false, result)?
+                        }
+                        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(_)) => {
+                            emit_command_result(
+                                &writer,
+                                &shared,
+                                true,
+                                "isolated turns are unavailable in SDK mode".into(),
+                            )?
+                        }
+                        InputDispatch::Dispatched(CommandOutcome::ManualCompaction) => {
+                            emit_command_result(
+                                &writer,
+                                &shared,
+                                true,
+                                "manual compaction is unavailable in SDK mode".into(),
+                            )?
                         }
                         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => {
                             emit_command_result(&writer, &shared, true, error.to_string())?
@@ -888,12 +1053,24 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 mode: mode.agent_mode(&cwd),
                                 images: command_attachments::into_images(&content.attachments)?,
                                 preamble: Vec::new(),
-                                thinking: Default::default(),
+                                thinking,
                                 fast,
                                 workflow,
                                 prompt: None,
+                                cancel: None,
+                                lease_committer: None,
+                            };
+                            let input = match prepare_sdk_turn(&shared, input) {
+                                Ok(input) => input,
+                                Err(error) => {
+                                    emit_command_result(&writer, &shared, true, error.into())?;
+                                    continue;
+                                }
                             };
                             if handle.input_tx.send(input).is_err() {
+                                let mut shared = shared.lock().unwrap();
+                                shared.turn_active = false;
+                                shared.active_cancel.take();
                                 break;
                             }
                         }
@@ -907,12 +1084,14 @@ pub fn run(params: SdkParams) -> Result<()> {
                     };
                     handle_control_request(
                         &cr,
-                        &writer,
-                        &handle,
-                        &shared,
-                        &startup_model,
-                        &model_policy,
-                        &sdk_commands,
+                        ControlRequestContext {
+                            writer: &writer,
+                            handle: &handle,
+                            coordinator: &coordinator,
+                            shared: &shared,
+                            model_policy: &model_policy,
+                            commands: &sdk_commands,
+                        },
                     )?;
                 }
                 InboundMessageType::ControlResponse => {
@@ -950,13 +1129,22 @@ pub fn run(params: SdkParams) -> Result<()> {
     })();
 
     drop(sdk_commands);
-    smol::block_on(stop_sdk_tasks(projection_watcher, command_driver));
+    smol::block_on(stop_sdk_tasks(
+        projection_watcher,
+        command_driver,
+        permission_watcher,
+        model_discovery,
+    ));
     let InteractiveHandle { input_tx, task, .. } = handle;
     drop(input_tx);
     smol::block_on(async {
         task.await;
         pump.await;
-    });
+        coordinator
+            .close()
+            .await
+            .map_err(|error| eyre!("close session coordinator: {error}"))
+    })?;
     drop(lock_guard);
     drop(writer);
     let _ = writer_thread.join();
@@ -1010,35 +1198,152 @@ fn watch_command_projection(
     })
 }
 
-async fn stop_sdk_tasks(projection_watcher: smol::Task<()>, command_driver: smol::Task<()>) {
+async fn stop_sdk_tasks(
+    projection_watcher: smol::Task<()>,
+    command_driver: smol::Task<()>,
+    permission_watcher: smol::Task<()>,
+    model_discovery: smol::Task<()>,
+) {
     projection_watcher.cancel().await;
     command_driver.cancel().await;
+    permission_watcher.cancel().await;
+    model_discovery.cancel().await;
+}
+
+fn watch_model_discovery(
+    policy: Arc<ModelPolicy>,
+    coordinator: maki_agent::session_coordinator::SessionCoordinatorHandle,
+    model_specs: Arc<RwLock<Arc<[Arc<str>]>>>,
+) -> smol::Task<()> {
+    smol::spawn(async move {
+        fetch_all_models(
+            &policy,
+            |batch| {
+                let mut specs = model_specs
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                specs.extend(batch.models.into_iter().map(Arc::from));
+                specs.sort_unstable();
+                specs.dedup();
+                let specs: Arc<[Arc<str>]> = specs.into();
+                *model_specs.write().unwrap() = Arc::clone(&specs);
+                let coordinator = coordinator.clone();
+                smol::spawn(async move {
+                    if let Err(error) = coordinator.update_model_values(specs.to_vec()).await {
+                        warn!(%error, "failed to publish discovered SDK models");
+                    }
+                })
+                .detach();
+            },
+            None,
+        )
+        .await;
+    })
+}
+
+fn watch_permission_option(
+    read: maki_agent::session_coordinator::SessionReadHandle,
+    permissions: Arc<maki_agent::permissions::PermissionManager>,
+    shared: Arc<Mutex<Shared>>,
+) -> smol::Task<()> {
+    smol::spawn(async move {
+        let mut subscription = read.subscribe();
+        loop {
+            apply_permission_option(&subscription.changed().await, &permissions, &shared);
+        }
+    })
+}
+
+fn apply_permission_option(
+    snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
+    permissions: &maki_agent::permissions::PermissionManager,
+    shared: &Mutex<Shared>,
+) {
+    let Some(option) = snapshot.options.iter().find(|option| {
+        option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+    }) else {
+        return;
+    };
+    let enabled = option.current_value.as_ref() == maki_agent::session_options::ENABLED_VALUE;
+    permissions.set_yolo(enabled);
+    let mut shared = shared.lock().unwrap();
+    if enabled {
+        shared.permission_mode = PermissionMode::BypassPermissions;
+    } else if shared.permission_mode == PermissionMode::BypassPermissions {
+        shared.permission_mode = PermissionMode::Default;
+    }
+}
+
+fn restored_permission_mode(
+    restored: bool,
+    persisted_yolo: bool,
+    startup: PermissionMode,
+    explicit: bool,
+) -> PermissionMode {
+    if !restored || explicit {
+        startup
+    } else if persisted_yolo {
+        PermissionMode::BypassPermissions
+    } else if startup == PermissionMode::BypassPermissions {
+        PermissionMode::Default
+    } else {
+        startup
+    }
+}
+
+fn set_permission_mode(
+    mode: PermissionMode,
+    coordinator: &maki_agent::session_coordinator::SessionCoordinatorHandle,
+    permissions: &maki_agent::permissions::PermissionManager,
+    shared: &Mutex<Shared>,
+) -> Result<(), maki_agent::session_coordinator::SessionCoordinatorError> {
+    let value = if mode == PermissionMode::BypassPermissions {
+        maki_agent::session_options::ENABLED_VALUE
+    } else {
+        maki_agent::session_options::DISABLED_VALUE
+    };
+    let snapshot =
+        smol::block_on(coordinator.set_option(maki_agent::session_options::YOLO_OPTION_ID, value))?;
+    apply_permission_option(&snapshot, permissions, shared);
+    shared.lock().unwrap().permission_mode = mode;
+    Ok(())
 }
 
 fn spawn_command_driver(params: CommandDriverParams) -> smol::Task<()> {
     smol::spawn(async move {
         let CommandDriverParams {
             route_rx,
-            model_tx,
+            coordinator,
             shared,
-            model_policy,
         } = params;
         while let Ok(route) = route_rx.recv_async().await {
             match route {
                 CommandRoute::Model { argument, response } => {
-                    let result = match Model::from_spec(&argument)
-                        .ok()
-                        .filter(|model| model_policy.allows(&model.spec()))
-                    {
-                        Some(model) if model_tx.send(model.clone()).is_ok() => {
+                    let result = coordinator
+                        .set_option(maki_agent::session_options::MODEL_OPTION_ID, argument)
+                        .await
+                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))
+                        .and_then(|snapshot| {
+                            let spec = snapshot
+                                .options
+                                .iter()
+                                .find(|option| {
+                                    option.definition.id.as_ref()
+                                        == maki_agent::session_options::MODEL_OPTION_ID
+                                })
+                                .map(|option| option.current_value.as_ref())
+                                .ok_or_else(|| {
+                                    CommandError::Producer(Arc::from("missing model option"))
+                                })?;
+                            let model = Model::from_spec(spec).map_err(|error| {
+                                CommandError::Producer(Arc::from(error.to_string()))
+                            })?;
                             shared.lock().unwrap().model = model;
                             Ok(HostResponse::Completed)
-                        }
-                        Some(_) => Err(CommandError::StaleTarget),
-                        None => Err(CommandError::Producer(Arc::from(
-                            "invalid or disallowed model",
-                        ))),
-                    };
+                        });
                     let _ = response.send(result);
                 }
             }
@@ -1071,17 +1376,36 @@ fn emit_command_result(
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
-fn resolve_session(
-    cli: &Cli,
-    cwd: &str,
-    storage: &StateDir,
-) -> Result<(Option<SessionRef>, Vec<Message>)> {
+#[derive(Debug)]
+struct ResolvedSession {
+    id: Option<SessionRef>,
+    history: Vec<Message>,
+    model: Option<String>,
+    meta: SessionMeta,
+}
+
+fn resolve_startup_model(
+    startup: Model,
+    restored: Option<&str>,
+    explicit_model: bool,
+    model_policy: &ModelPolicy,
+) -> Model {
+    if explicit_model {
+        return startup;
+    }
+    restored
+        .and_then(|spec| Model::from_spec(spec).ok())
+        .filter(|candidate| model_policy.allows(&candidate.spec()))
+        .unwrap_or(startup)
+}
+
+fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedSession> {
     let sessions_dir = storage
         .ensure_subdir(SESSIONS_DIR)
         .context("create sessions dir")?;
     // A bare continue flag (no ID) is rejected by the TUI guard before SDK
     // mode starts, so only a valued ID reaches this branch.
-    let (resumed_id, history) =
+    let (resumed_id, history, restored_model, meta) =
         if let Some(id) = cli.continue_session.as_ref().and_then(|o| o.as_deref()) {
             let session_ref: SessionRef = id
                 .parse()
@@ -1095,19 +1419,28 @@ fn resolve_session(
                 return Err(eyre!("session {id}: {block}"));
             }
             let resumed = (!cli.fork_session).then_some(session_ref);
-            (resumed, session.take_messages())
+            let model = session.model.clone();
+            let meta = session.meta.clone();
+            (resumed, session.take_messages(), Some(model), meta)
         } else if cli.last_session {
             match StoredSession::latest(cwd, storage) {
                 Ok(Some(session)) => {
                     if let Some(block) = resume_block_for(&sessions_dir, &session, cwd) {
                         return Err(eyre!("session {}: {block}", session.id));
                     }
-                    (Some(SessionRef::from(session.id)), session.take_messages())
+                    let model = session.model.clone();
+                    let meta = session.meta.clone();
+                    (
+                        Some(SessionRef::from(session.id)),
+                        session.take_messages(),
+                        Some(model),
+                        meta,
+                    )
                 }
-                _ => (None, Vec::new()),
+                _ => (None, Vec::new(), None, SessionMeta::default()),
             }
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), None, SessionMeta::default())
         };
 
     let cli_session_id = cli.session_id.as_deref().map(|s| {
@@ -1119,10 +1452,16 @@ fn resolve_session(
         // belong to this directory and be free of other holders; a fresh ID
         // simply starts new.
         Some(Ok(id)) => {
-            if let Ok(session) = StoredSession::load(id.id(), storage)
-                && let Some(block) = resume_block_for(&sessions_dir, &session, cwd)
-            {
-                return Err(eyre!("session {}: {block}", session.id));
+            match StoredSession::load(id.id(), storage) {
+                Ok(session) => {
+                    if let Some(block) = resume_block_for(&sessions_dir, &session, cwd) {
+                        return Err(eyre!("session {}: {block}", session.id));
+                    }
+                }
+                Err(maki_storage::sessions::SessionError::Storage(
+                    maki_storage::StorageError::NotFound(_),
+                )) => {}
+                Err(error) => return Err(eyre!("load session {id}: {error}")),
             }
             Some(id)
         }
@@ -1130,7 +1469,12 @@ fn resolve_session(
         None => None,
     };
 
-    Ok((cli_session_id.or(resumed_id), history))
+    Ok(ResolvedSession {
+        id: cli_session_id.or(resumed_id),
+        history,
+        model: restored_model,
+        meta,
+    })
 }
 
 fn resume_block_for(
@@ -1188,15 +1532,42 @@ fn content_images(content: &Value) -> Vec<ImageSource> {
         .collect()
 }
 
+struct ControlRequestContext<'a> {
+    writer: &'a SdkWriter,
+    handle: &'a InteractiveHandle,
+    coordinator: &'a maki_agent::session_coordinator::SessionCoordinatorHandle,
+    shared: &'a Mutex<Shared>,
+    model_policy: &'a ModelPolicy,
+    commands: &'a SdkCommands,
+}
+
+fn prepare_sdk_turn(
+    shared: &Mutex<Shared>,
+    mut input: AgentInput,
+) -> Result<AgentInput, &'static str> {
+    let mut shared = shared.lock().unwrap();
+    if shared.turn_active {
+        return Err("a turn is already active");
+    }
+    let (trigger, cancel) = CancelToken::new();
+    shared.turn_active = true;
+    shared.active_cancel = Some(trigger);
+    input.cancel = Some(cancel);
+    Ok(input)
+}
+
 fn handle_control_request(
     cr: &InboundControlRequest,
-    writer: &SdkWriter,
-    handle: &InteractiveHandle,
-    shared: &Mutex<Shared>,
-    startup_model: &Model,
-    model_policy: &ModelPolicy,
-    commands: &SdkCommands,
+    ctx: ControlRequestContext<'_>,
 ) -> Result<()> {
+    let ControlRequestContext {
+        writer,
+        handle,
+        coordinator,
+        shared,
+        model_policy,
+        commands,
+    } = ctx;
     let ok = Some(Value::Object(Default::default()));
     match &cr.request.subtype {
         InboundControlRequestType::Initialize => {
@@ -1212,15 +1583,23 @@ fn handle_control_request(
             )
         }
         InboundControlRequestType::Interrupt => {
-            let _ = handle.cancel_tx.try_send(());
+            if let Some(cancel) = shared.lock().unwrap().active_cancel.take() {
+                cancel.cancel();
+            }
             writer.emit_control_response(&cr.request_id, ok, None)
         }
         InboundControlRequestType::SetPermissionMode => {
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
-                    shared.lock().unwrap().permission_mode = mode;
-                    writer.emit_control_response(&cr.request_id, ok, None)
+                    match set_permission_mode(mode, coordinator, &handle.permissions, shared) {
+                        Ok(()) => writer.emit_control_response(&cr.request_id, ok, None),
+                        Err(error) => writer.emit_control_response(
+                            &cr.request_id,
+                            None,
+                            Some(error.to_string()),
+                        ),
+                    }
                 }
                 None => writer.emit_control_response(
                     &cr.request_id,
@@ -1233,11 +1612,24 @@ fn handle_control_request(
             }
         }
         InboundControlRequestType::SetModel => {
-            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
+            let current_model = shared.lock().unwrap().model.clone();
+            match resolve_set_model(cr.request.extra.get("model"), &current_model, model_policy) {
                 Some(model) => {
-                    let _ = handle.model_tx.send(model.clone());
-                    shared.lock().unwrap().model = model;
-                    writer.emit_control_response(&cr.request_id, ok, None)
+                    match smol::block_on(route_model(&commands.route_tx, model.spec())) {
+                        Ok(HostResponse::Completed) => {
+                            writer.emit_control_response(&cr.request_id, ok, None)
+                        }
+                        Ok(_) => writer.emit_control_response(
+                            &cr.request_id,
+                            None,
+                            Some("model change returned an unexpected response".into()),
+                        ),
+                        Err(error) => writer.emit_control_response(
+                            &cr.request_id,
+                            None,
+                            Some(error.to_string()),
+                        ),
+                    }
                 }
                 None => writer.emit_control_response(
                     &cr.request_id,
@@ -1256,11 +1648,11 @@ fn handle_control_request(
 
 fn resolve_set_model(
     model_val: Option<&Value>,
-    startup_model: &Model,
+    current_model: &Model,
     model_policy: &ModelPolicy,
 ) -> Option<Model> {
     match model_val? {
-        Value::Null => Some(startup_model.clone()),
+        Value::Null => Some(current_model.clone()),
         Value::String(model_str) => {
             let spec = resolve_model_spec(model_str);
             if !model_policy.allows(&spec) {
@@ -1313,6 +1705,7 @@ struct EventPump {
     /// the rate it paid.
     cost: Option<f64>,
     request_counter: u64,
+    terminal_run_id: Option<u64>,
 }
 
 impl EventPump {
@@ -1419,9 +1812,11 @@ impl EventPump {
                 self.tool_inputs.insert(ts.id.clone(), (name, input));
             }
             AgentEvent::ToolPending { .. }
+            | AgentEvent::ToolExecutionStart { .. }
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::ModelSwitched { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
@@ -1508,7 +1903,13 @@ impl EventPump {
                         },
                     }))?;
             }
+            AgentEvent::TurnOutcome(_) if envelope.subagent.is_some() => {}
             AgentEvent::TurnOutcome(outcome) => {
+                let mut shared = self.shared.lock().unwrap();
+                shared.turn_active = false;
+                shared.active_cancel.take();
+                drop(shared);
+                self.terminal_run_id = Some(envelope.run_id);
                 let result = mem::take(&mut self.result_text);
                 match outcome {
                     TurnOutcome::Completed {
@@ -1535,8 +1936,18 @@ impl EventPump {
                 }
             }
             AgentEvent::ControlComplete { .. } => {}
+            AgentEvent::ControlError { .. } if envelope.subagent.is_some() => {}
             AgentEvent::ControlError { message } => {
-                self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                let mut shared = self.shared.lock().unwrap();
+                shared.turn_active = false;
+                shared.active_cancel.take();
+                drop(shared);
+                if self.terminal_run_id == Some(envelope.run_id) {
+                    self.writer
+                        .emit_system("warning", serde_json::json!({ "message": message }))?;
+                } else {
+                    self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                }
             }
         }
         Ok(())
@@ -1571,6 +1982,23 @@ mod tests {
     use test_case::test_case;
 
     const REJECTED_ATTACHMENT: &str = "command rejected attachment";
+    const STARTUP_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const TARGET_MODEL: &str = "openai/gpt-5";
+    const RESTORED_MODEL: &str = "anthropic/claude-opus-4-6";
+
+    #[test_case(false, RESTORED_MODEL; "restores_persisted_model_without_explicit_flag")]
+    #[test_case(true, STARTUP_MODEL; "explicit_model_overrides_persisted_model")]
+    fn sdk_startup_model_precedence(explicit_model: bool, expected: &str) {
+        let startup = Model::from_spec(STARTUP_MODEL).unwrap();
+        let resolved = resolve_startup_model(
+            startup,
+            Some(RESTORED_MODEL),
+            explicit_model,
+            &ModelPolicy::default(),
+        );
+
+        assert_eq!(resolved.spec(), expected);
+    }
 
     struct OutcomeBehavior(CommandOutcome);
 
@@ -1708,9 +2136,9 @@ mod tests {
         }
         let cli = Cli::parse_from(args.iter().map(String::as_str));
 
-        let (resumed, _history) =
+        let resolved =
             resolve_session(&cli, THIS_CWD, &storage).expect("an unlocked session loads");
-        assert_eq!(resumed.map(|r| r.id()), Some(session.id));
+        assert_eq!(resolved.id.map(|r| r.id()), Some(session.id));
 
         fs::write(
             session_lock::lock_path(&sessions_dir, &session.id),
@@ -1786,6 +2214,289 @@ mod tests {
             smol::block_on(dispatch),
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
+    }
+
+    #[test]
+    fn sdk_turn_cancellation_is_operation_scoped() {
+        let shared = Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Default,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
+        });
+        let input = |message: &str| AgentInput {
+            message: message.into(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: maki_agent::ThinkingConfig::Off,
+            fast: false,
+            workflow: false,
+            prompt: None,
+            cancel: None,
+            lease_committer: None,
+        };
+
+        let first = prepare_sdk_turn(&shared, input("first")).unwrap();
+        assert!(prepare_sdk_turn(&shared, input("concurrent")).is_err());
+        let first_cancel = first.cancel.unwrap();
+        let cancel = shared.lock().unwrap().active_cancel.take().unwrap();
+        cancel.cancel();
+        assert!(first_cancel.is_cancelled());
+        assert!(prepare_sdk_turn(&shared, input("during checkpoint")).is_err());
+
+        shared.lock().unwrap().turn_active = false;
+        let second = prepare_sdk_turn(&shared, input("second")).unwrap();
+        assert!(!second.cancel.unwrap().is_cancelled());
+    }
+
+    #[test]
+    fn sdk_model_route_updates_coordinator_state_and_checkpoint() {
+        use std::sync::Mutex as StdMutex;
+
+        let checkpointed = Arc::new(StdMutex::new(Vec::new()));
+        let checkpointed_clone = Arc::clone(&checkpointed);
+        let id = MakiId::generate();
+        let checkpoint: Arc<
+            dyn maki_storage::checkpoint::CheckpointWriter<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >,
+        > = Arc::new(
+            move |request: maki_storage::checkpoint::CheckpointRequest<
+                maki_agent::session_coordinator::SessionCheckpoint,
+            >| {
+                let checkpointed = Arc::clone(&checkpointed_clone);
+                Box::pin(async move {
+                    checkpointed.lock().unwrap().push(request.snapshot);
+                    Ok(maki_storage::checkpoint::CheckpointAck {
+                        session_id: request.session_id,
+                        version: request.version,
+                    })
+                }) as maki_storage::checkpoint::CheckpointFuture
+            },
+        );
+        let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+            maki_agent::session_coordinator::SessionCoordinatorParams {
+                session_id: id,
+                catalog: Default::default(),
+                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                    STARTUP_MODEL,
+                    [Arc::from(STARTUP_MODEL), Arc::from(TARGET_MODEL)],
+                    false,
+                    true,
+                    false,
+                    maki_agent::ThinkingConfig::Off,
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(STARTUP_MODEL),
+                cwd: PathBuf::from("/project"),
+                model_policy: Arc::new(ModelPolicy::default()),
+                model_adopter: Arc::new(|_: Model| {
+                    Box::pin(async { Ok(()) })
+                        as maki_agent::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path: PathBuf| {
+                    Box::pin(async move { Ok(path) })
+                        as maki_agent::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint,
+                mailbox: maki_agent::SessionMailbox::new(id),
+            },
+        )
+        .unwrap();
+        let shared = Arc::new(Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Default,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
+        }));
+        let (route_tx, route_rx) = flume::unbounded();
+        let driver = spawn_command_driver(CommandDriverParams {
+            route_rx,
+            coordinator: coordinator.clone(),
+            shared: Arc::clone(&shared),
+        });
+
+        let result = smol::block_on(route_model(&route_tx, "not-a-model".into()));
+        assert!(matches!(result, Err(CommandError::Producer(_))));
+        assert_eq!(coordinator.read().model().as_ref(), STARTUP_MODEL);
+        assert_eq!(shared.lock().unwrap().model.spec(), STARTUP_MODEL);
+        assert!(checkpointed.lock().unwrap().is_empty());
+
+        let result = smol::block_on(route_model(&route_tx, TARGET_MODEL.into()));
+        assert!(matches!(result, Ok(HostResponse::Completed)));
+        assert_eq!(coordinator.read().model().as_ref(), TARGET_MODEL);
+        assert_eq!(
+            coordinator.read().options().options[0]
+                .current_value
+                .as_ref(),
+            TARGET_MODEL
+        );
+        assert_eq!(shared.lock().unwrap().model.spec(), TARGET_MODEL);
+        assert_eq!(checkpointed.lock().unwrap()[0].model.as_ref(), TARGET_MODEL);
+
+        smol::block_on(driver.cancel());
+        smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test_case(PermissionMode::Default ; "default")]
+    #[test_case(PermissionMode::AcceptEdits ; "accept_edits")]
+    #[test_case(PermissionMode::Plan ; "plan")]
+    fn sdk_permission_mode_disables_persisted_yolo(mode: PermissionMode) {
+        use std::sync::Mutex as StdMutex;
+
+        let checkpointed = Arc::new(StdMutex::new(Vec::new()));
+        let checkpointed_clone = Arc::clone(&checkpointed);
+        let id = MakiId::generate();
+        let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+            maki_agent::session_coordinator::SessionCoordinatorParams {
+                session_id: id,
+                catalog: Default::default(),
+                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                    STARTUP_MODEL,
+                    [Arc::from(STARTUP_MODEL)],
+                    true,
+                    false,
+                    false,
+                    maki_agent::ThinkingConfig::Off,
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(STARTUP_MODEL),
+                cwd: PathBuf::from("/project"),
+                model_policy: Arc::new(ModelPolicy::default()),
+                model_adopter: Arc::new(|_: Model| {
+                    Box::pin(async { Ok(()) })
+                        as maki_agent::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path: PathBuf| {
+                    Box::pin(async move { Ok(path) })
+                        as maki_agent::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint: Arc::new(
+                    move |request: maki_storage::checkpoint::CheckpointRequest<
+                        maki_agent::session_coordinator::SessionCheckpoint,
+                    >| {
+                        let checkpointed = Arc::clone(&checkpointed_clone);
+                        Box::pin(async move {
+                            checkpointed.lock().unwrap().push(request.snapshot);
+                            Ok(maki_storage::checkpoint::CheckpointAck {
+                                session_id: request.session_id,
+                                version: request.version,
+                            })
+                        }) as maki_storage::checkpoint::CheckpointFuture
+                    },
+                ),
+                mailbox: maki_agent::SessionMailbox::new(id),
+            },
+        )
+        .unwrap();
+        let permissions = maki_agent::permissions::PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/project"),
+            Arc::default(),
+        );
+        permissions.set_yolo(true);
+        let shared = Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::BypassPermissions,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
+        });
+
+        set_permission_mode(mode, &coordinator, &permissions, &shared).unwrap();
+
+        assert!(!permissions.is_yolo());
+        assert_eq!(shared.lock().unwrap().permission_mode, mode);
+        let snapshot = coordinator.read().options();
+        let yolo = snapshot
+            .options
+            .iter()
+            .find(|option| {
+                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+            })
+            .unwrap();
+        assert_eq!(
+            yolo.current_value.as_ref(),
+            maki_agent::session_options::DISABLED_VALUE
+        );
+        let checkpointed = checkpointed.lock().unwrap();
+        assert_eq!(checkpointed.len(), 1);
+        let checkpointed_yolo = checkpointed[0]
+            .options
+            .options
+            .iter()
+            .find(|option| {
+                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+            })
+            .unwrap();
+        assert_eq!(
+            checkpointed_yolo.current_value.as_ref(),
+            maki_agent::session_options::DISABLED_VALUE
+        );
+        smol::block_on(coordinator.close()).unwrap();
+    }
+
+    #[test]
+    fn disabled_yolo_preserves_non_bypass_permission_mode() {
+        let permissions = maki_agent::permissions::PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/project"),
+            Arc::default(),
+        );
+        let shared = Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Plan,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
+        });
+        let snapshot = maki_agent::session_options::SessionOptions::new(
+            maki_agent::session_coordinator::builtin_option_definitions(
+                STARTUP_MODEL,
+                [Arc::from(STARTUP_MODEL)],
+                false,
+                false,
+                false,
+                maki_agent::ThinkingConfig::Off,
+            ),
+            &Default::default(),
+        )
+        .unwrap()
+        .snapshot();
+
+        apply_permission_option(&snapshot, &permissions, &shared);
+
+        assert_eq!(shared.lock().unwrap().permission_mode, PermissionMode::Plan);
+    }
+
+    #[test_case(true, true, PermissionMode::Default, false, PermissionMode::BypassPermissions ; "bare_resume_restores_enabled")]
+    #[test_case(true, false, PermissionMode::BypassPermissions, false, PermissionMode::Default ; "bare_resume_restores_disabled")]
+    #[test_case(false, false, PermissionMode::BypassPermissions, false, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
+    #[test_case(true, false, PermissionMode::Plan, false, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
+    #[test_case(true, true, PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_resumed_yolo")]
+    #[test_case(true, true, PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_resumed_yolo")]
+    #[test_case(true, true, PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_forked_yolo")]
+    #[test_case(true, true, PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_forked_yolo")]
+    fn sdk_yolo_restore_precedence(
+        restored: bool,
+        persisted: bool,
+        startup: PermissionMode,
+        explicit: bool,
+        expected: PermissionMode,
+    ) {
+        assert_eq!(
+            restored_permission_mode(restored, persisted, startup, explicit),
+            expected
+        );
     }
 
     #[test]
@@ -2168,6 +2879,161 @@ mod tests {
     }
 
     #[test]
+    fn subagent_outcome_does_not_retire_sdk_turn() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let shared = Arc::new(Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Default,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+            turn_active: false,
+            active_cancel: None,
+        }));
+        let input = AgentInput {
+            message: "parent".into(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: maki_agent::ThinkingConfig::Off,
+            fast: false,
+            workflow: false,
+            prompt: None,
+            cancel: None,
+            lease_committer: None,
+        };
+        let input = prepare_sdk_turn(&shared, input).unwrap();
+        let cancel = input.cancel.unwrap();
+        let mut pump = EventPump {
+            writer: SdkWriter {
+                session_id: SessionRef::generate(),
+                out_tx,
+            },
+            shared: Arc::clone(&shared),
+            answer_tx: flume::unbounded().0,
+            include_partial_messages: false,
+            synth: StreamSynth::new(),
+            tool_inputs: HashMap::new(),
+            result_text: String::new(),
+            cost: None,
+            request_counter: 0,
+            terminal_run_id: None,
+        };
+        let outcome = || TurnOutcome::Completed {
+            agent_id: maki_agent::AgentId::generate(),
+            turn_id: maki_agent::TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: maki_agent::DoneReason::EndTurn,
+        };
+        pump.handle(Envelope {
+            event: AgentEvent::TurnOutcome(outcome()),
+            subagent: Some(maki_agent::SubagentInfo {
+                agent_id: maki_agent::AgentId::generate(),
+                parent_agent_id: None,
+                parent_is_root: true,
+                auto_deliver: true,
+                parent_tool_use_id: "task".into(),
+                name: "research".into(),
+                prompt: None,
+                model: None,
+                answer_tx: None,
+                input_tx: None,
+                cancel: None,
+            }),
+            run_id: 9,
+        })
+        .unwrap();
+
+        assert!(!cancel.is_cancelled());
+        assert!(shared.lock().unwrap().turn_active);
+        assert!(shared.lock().unwrap().active_cancel.is_some());
+        assert!(out_rx.is_empty());
+        assert_eq!(pump.terminal_run_id, None);
+
+        pump.handle(Envelope {
+            event: AgentEvent::TurnOutcome(outcome()),
+            subagent: None,
+            run_id: 9,
+        })
+        .unwrap();
+        assert!(cancel.is_cancelled());
+        assert!(!shared.lock().unwrap().turn_active);
+        assert_eq!(
+            out_rx
+                .try_iter()
+                .filter(|line| serde_json::from_str::<Value>(line).unwrap()["type"] == "result")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn persistence_error_after_outcome_emits_one_result_and_warning() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let mut pump = EventPump {
+            writer: SdkWriter {
+                session_id: SessionRef::generate(),
+                out_tx,
+            },
+            shared: Arc::new(Mutex::new(Shared {
+                model: Model::from_spec(STARTUP_MODEL).unwrap(),
+                permission_mode: PermissionMode::Default,
+                turn_start: Instant::now(),
+                pending: HashSet::new(),
+                turn_active: false,
+                active_cancel: None,
+            })),
+            answer_tx: flume::unbounded().0,
+            include_partial_messages: false,
+            synth: StreamSynth::new(),
+            tool_inputs: HashMap::new(),
+            result_text: String::new(),
+            cost: None,
+            request_counter: 0,
+            terminal_run_id: None,
+        };
+        let outcome = TurnOutcome::Completed {
+            agent_id: maki_agent::AgentId::generate(),
+            turn_id: maki_agent::TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: maki_agent::DoneReason::EndTurn,
+        };
+
+        pump.handle(Envelope {
+            event: AgentEvent::TurnOutcome(outcome),
+            subagent: None,
+            run_id: 9,
+        })
+        .unwrap();
+        pump.handle(Envelope {
+            event: AgentEvent::ControlError {
+                message: "checkpoint failed".into(),
+            },
+            subagent: None,
+            run_id: 9,
+        })
+        .unwrap();
+
+        let records: Vec<Value> = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["type"] == "result")
+                .count(),
+            1
+        );
+        assert!(records.iter().any(|record| {
+            record["type"] == "system"
+                && record["subtype"] == "warning"
+                && record["message"] == "checkpoint failed"
+        }));
+    }
+
+    #[test]
     fn wire_result_serializes_correctly() {
         let msg = WireMessage {
             inner: WireInner::Result(ResultPayload {
@@ -2288,15 +3154,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_set_model_null_returns_startup() {
-        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+    fn resolve_set_model_null_keeps_current_model() {
+        let current = Model::from_spec("openai/gpt-5").unwrap();
         let result = resolve_set_model(
             Some(&Value::Null),
-            &startup,
+            &current,
             &maki_config::ModelPolicy::default(),
         )
         .unwrap();
-        assert_eq!(result.id, startup.id);
+        assert_eq!(result.id, current.id);
     }
 
     #[test]

@@ -487,6 +487,7 @@ pub(crate) async fn parse_sse(
                     "incomplete" => StopReason::MaxTokens,
                     _ => StopReason::EndTurn,
                 });
+                break;
             }
 
             "response.incomplete" => {
@@ -499,6 +500,7 @@ pub(crate) async fn parse_sse(
                     usage = parse_usage(u);
                 }
                 stop_reason = Some(StopReason::MaxTokens);
+                break;
             }
 
             "response.failed" => {
@@ -593,6 +595,21 @@ mod tests {
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
+    struct NeverEndingSse(Cursor<Vec<u8>>);
+
+    impl futures_lite::io::AsyncRead for NeverEndingSse {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            match std::pin::Pin::new(&mut self.0).poll_read(cx, buf) {
+                std::task::Poll::Ready(Ok(0)) => std::task::Poll::Pending,
+                result => result,
+            }
+        }
+    }
+
     #[test_case(None, &dialect::STANDARD, None; "no_thinking_config")]
     #[test_case(Some(ThinkingConfig::Off), &dialect::STANDARD, None; "off_omitted")]
     #[test_case(Some(ThinkingConfig::Off), &dialect::TENSORX, Some(json!({"effort": "none"})); "off_explicit")]
@@ -619,6 +636,42 @@ mod tests {
         let (tx, rx) = flume::unbounded();
         let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT).await;
         (result, rx.drain().collect())
+    }
+
+    #[test]
+    fn parse_sse_returns_on_completed_before_stream_eof() {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let stream = NeverEndingSse(Cursor::new(
+                b"event: response.output_text.delta\ndata: {\"delta\":\"done\"}\n\nevent: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n".to_vec(),
+            ));
+            let response = parse_sse(BufReader::new(stream), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+            assert!(
+                matches!(&response.message.content[..], [ContentBlock::Text { text }] if text == "done")
+            );
+        });
+    }
+
+    #[test]
+    fn parse_sse_returns_on_incomplete_before_stream_eof() {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let stream = NeverEndingSse(Cursor::new(
+                b"event: response.output_text.delta\ndata: {\"delta\":\"partial\"}\n\nevent: response.incomplete\ndata: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n".to_vec(),
+            ));
+            let response = parse_sse(BufReader::new(stream), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+            assert_eq!(response.usage.input, 10);
+            assert_eq!(response.usage.output, 5);
+            assert!(
+                matches!(&response.message.content[..], [ContentBlock::Text { text }] if text == "partial")
+            );
+        });
     }
 
     #[test]

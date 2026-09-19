@@ -228,6 +228,13 @@ pub enum Action {
     },
     ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
+    /// A session option toggled from a command. Applied by the event loop
+    /// through the coordinator, off the event-loop thread.
+    ToggleSessionOption {
+        id: &'static str,
+    },
+    /// `/cd`, adopted through the coordinator off the event-loop thread.
+    ChangeDirectory(std::path::PathBuf),
     RefreshProvider {
         slug: String,
     },

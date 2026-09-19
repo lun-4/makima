@@ -15,17 +15,19 @@ pub(crate) struct SlotLayer {
 
 /// `owner: None` means orphan fillers: `set_slot` ran before the owner's
 /// `declare_slot`. They wait here and attach once the owner declares.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SlotEntry {
     pub owner: Option<Arc<str>>,
     pub default: Option<Function>,
     pub layers: Vec<SlotLayer>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SlotStore {
     pub slots: HashMap<String, SlotEntry>,
 }
+
+pub(crate) type PendingSlotStore = Arc<Mutex<SlotStore>>;
 
 impl SlotStore {
     pub fn clear_plugin(&mut self, plugin: &str) {
@@ -38,6 +40,28 @@ impl SlotStore {
         }
         self.slots
             .retain(|_, e| e.owner.is_some() || !e.layers.is_empty());
+    }
+
+    pub fn replace_plugin(&mut self, plugin: &str, candidate: Self) {
+        self.clear_plugin(plugin);
+        for (name, entry) in candidate.slots {
+            let default = (entry.owner.as_deref() == Some(plugin))
+                .then_some(entry.default)
+                .flatten();
+            let layers: Vec<_> = entry
+                .layers
+                .into_iter()
+                .filter(|layer| layer.plugin.as_ref() == plugin)
+                .collect();
+            if default.is_some() || !layers.is_empty() {
+                let live = self.slots.entry(name).or_default();
+                if let Some(default) = default {
+                    live.owner = Some(Arc::from(plugin));
+                    live.default = Some(default);
+                }
+                live.layers.extend(layers);
+            }
+        }
     }
 }
 
@@ -61,9 +85,53 @@ fn set_state(cell: &PrevCell, state: PrevState) {
     *cell.lock().expect("prev state poisoned") = state;
 }
 
-fn slot_store_mut(lua: &Lua) -> LuaResult<mlua::AppDataRefMut<'_, SlotStore>> {
-    lua.app_data_mut::<SlotStore>()
-        .ok_or_else(|| mlua::Error::runtime("slot store not initialized"))
+fn slot_store(lua: &Lua, plugin: &str) -> Option<SlotStore> {
+    if crate::runtime::loading_plugin_is(lua, plugin)
+        && let Some(pending) = lua.app_data_ref::<PendingSlotStore>()
+    {
+        return Some(
+            pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+        );
+    }
+    lua.app_data_ref::<SlotStore>().map(|store| store.clone())
+}
+
+fn slot_snapshot(
+    lua: &Lua,
+    plugin: Option<&str>,
+    name: &str,
+) -> LuaResult<Option<(Function, Arc<[SlotLayer]>)>> {
+    let snapshot =
+        |entry: &SlotEntry| Some((entry.default.clone()?, Arc::from(entry.layers.as_slice())));
+    if plugin.is_some_and(|plugin| crate::runtime::loading_plugin_is(lua, plugin))
+        && let Some(pending) = lua.app_data_ref::<PendingSlotStore>()
+    {
+        let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        return Ok(pending.slots.get(name).and_then(snapshot));
+    }
+    let store = lua
+        .app_data_ref::<SlotStore>()
+        .ok_or_else(|| mlua::Error::runtime("slot store not initialized"))?;
+    Ok(store.slots.get(name).and_then(snapshot))
+}
+
+fn with_slot_store<T>(
+    lua: &Lua,
+    plugin: &str,
+    f: impl FnOnce(&mut SlotStore) -> LuaResult<T>,
+) -> LuaResult<T> {
+    if crate::runtime::loading_plugin_is(lua, plugin)
+        && let Some(pending) = lua.app_data_ref::<PendingSlotStore>()
+    {
+        return f(&mut pending.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+    let mut store = lua
+        .app_data_mut::<SlotStore>()
+        .ok_or_else(|| mlua::Error::runtime("slot store not initialized"))?;
+    f(&mut store)
 }
 
 fn make_prev(
@@ -142,23 +210,15 @@ fn invoke_chain(
 
 /// The callable closes over `name` only and reads the store on every call,
 /// so a handle given out before a reload keeps working after it.
-fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
+fn make_callable(lua: &Lua, plugin: Option<Arc<str>>, name: String) -> LuaResult<Function> {
     lua.create_function(move |lua, args: MultiValue| {
         let _guard = DepthGuard::enter(lua, "slot", &name).map_err(|_| {
             mlua::Error::runtime(format!(
                 "slot '{name}' exceeded max depth (recursive filler? call prev instead)"
             ))
         })?;
-        let (default, layers): (Function, Arc<[SlotLayer]>) = {
-            let store = lua
-                .app_data_ref::<SlotStore>()
-                .ok_or_else(|| mlua::Error::runtime("slot store not initialized"))?;
-            store
-                .slots
-                .get(&name)
-                .and_then(|e| Some((e.default.clone()?, e.layers.as_slice().into())))
-                .ok_or_else(|| mlua::Error::runtime(format!("slot '{name}' is not declared")))?
-        };
+        let (default, layers) = slot_snapshot(lua, plugin.as_deref(), &name)?
+            .ok_or_else(|| mlua::Error::runtime(format!("slot '{name}' is not declared")))?;
         invoke_chain(lua, &name, &default, &layers, layers.len(), args)
     })
 }
@@ -170,7 +230,7 @@ pub(crate) fn invoke_slot_from_host(
     name: &str,
     args: MultiValue,
 ) -> LuaResult<MultiValue> {
-    make_callable(lua, name.to_owned())?.call(args)
+    make_callable(lua, None, name.to_owned())?.call(args)
 }
 
 /// Create a named extension point owned by your plugin. You provide a
@@ -195,8 +255,7 @@ fn declare_slot(
     name: String,
     default: Function,
 ) -> LuaResult<Function> {
-    {
-        let mut store = slot_store_mut(lua)?;
+    with_slot_store(lua, &plugin, |store| {
         let entry = store.slots.entry(name.clone()).or_default();
         if let Some(owner) = &entry.owner {
             return Err(mlua::Error::runtime(format!(
@@ -205,8 +264,9 @@ fn declare_slot(
         }
         entry.owner = Some(Arc::clone(&plugin));
         entry.default = Some(default);
-    }
-    make_callable(lua, name)
+        Ok(())
+    })?;
+    make_callable(lua, Some(plugin), name)
 }
 
 /// Add a layer around an existing (or future) slot. Layers wrap the
@@ -226,16 +286,13 @@ fn declare_slot(
 /// end)
 #[lua_fn]
 fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
-    slot_store_mut(lua)?
-        .slots
-        .entry(name)
-        .or_default()
-        .layers
-        .push(SlotLayer {
+    with_slot_store(lua, &plugin, |store| {
+        store.slots.entry(name).or_default().layers.push(SlotLayer {
             plugin: Arc::clone(&plugin),
             func: wrapper,
         });
-    Ok(())
+        Ok(())
+    })
 }
 
 /// List all known slots and their current state. Useful for debugging
@@ -247,9 +304,9 @@ fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function)
 ///   print(name, info.owner, info.declared)
 /// end
 #[lua_fn]
-fn get_slots(lua: &Lua) -> LuaResult<Table> {
+fn get_slots(lua: &Lua, #[ctx] plugin: Arc<str>) -> LuaResult<Table> {
     let out = lua.create_table()?;
-    let Some(store) = lua.app_data_ref::<SlotStore>() else {
+    let Some(store) = slot_store(lua, &plugin) else {
         return Ok(out);
     };
     for (name, entry) in &store.slots {
@@ -268,7 +325,7 @@ fn get_slots(lua: &Lua) -> LuaResult<Table> {
 
 lua_table! {
     extend "maki.api" => pub(crate) fn add_slot_methods(plugin: Arc<str>), DOCS [
-        declare_slot(plugin), set_slot(plugin), get_slots,
+        declare_slot(plugin), set_slot(plugin), get_slots(plugin),
     ]
 }
 

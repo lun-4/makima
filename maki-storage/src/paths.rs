@@ -9,6 +9,7 @@ const APP_NAME: &str = "makima";
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 
+#[derive(Debug, PartialEq, Eq)]
 struct Paths {
     config: PathBuf,
     data: PathBuf,
@@ -175,38 +176,85 @@ fn state_logs(s: &impl BaseStrategy, fallback: &Path) -> (PathBuf, PathBuf) {
     (state, logs)
 }
 
+/// Choose the real user directories, once, for this process.
+///
+/// Until this runs, [`resolve`] yields nothing and every directory accessor
+/// reports the same error it reports on a machine with no home directory. That
+/// is deliberate: a test binary never calls this, so a test cannot reach the
+/// directories the person running it keeps their sessions and credentials in.
+///
+/// A scan of test bodies would not give the same guarantee, because tests
+/// reach these directories transitively -- a provider script cache three
+/// frames below a test that only asked to scan a directory. The lookup itself
+/// has to be unavailable.
+///
+/// Call it first thing in `main`, before anything can ask for a path: code
+/// that resolves earlier gets the uninitialized answer and degrades to an
+/// error instead of working.
+pub fn init() -> Result<(), PathsInitError> {
+    initialize(&STRATEGY, discover())
+}
+
+/// Put every directory under `root`, for a test that needs somewhere real to
+/// write and for any future flag that relocates the state directory.
+pub fn init_at(root: PathBuf) -> Result<(), PathsInitError> {
+    initialize(
+        &STRATEGY,
+        Some(Paths {
+            config: root.clone(),
+            data: root.clone(),
+            state: root.clone(),
+            logs: root.clone(),
+            cache: root.clone(),
+            xdg_config: root,
+        }),
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("storage paths were already initialized with a different strategy")]
+pub struct PathsInitError;
+
+fn initialize(lock: &OnceLock<Option<Paths>>, paths: Option<Paths>) -> Result<(), PathsInitError> {
+    match lock.set(paths) {
+        Ok(()) => Ok(()),
+        Err(paths) if lock.get().is_some_and(|initialized| *initialized == paths) => Ok(()),
+        Err(_) => Err(PathsInitError),
+    }
+}
+
+fn discover() -> Option<Paths> {
+    let s = etcetera::base_strategy::choose_base_strategy().ok()?;
+    let fallback_dir = etcetera::home_dir()
+        .ok()
+        .map(|h| h.join(FALLBACK_DIR))
+        .filter(|d| d.is_dir());
+    let xdg_config = s.config_dir().join(APP_NAME);
+    let (data, cache, config) = match &fallback_dir {
+        Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
+        None => (
+            s.data_dir().join(APP_NAME),
+            s.cache_dir().join(APP_NAME),
+            xdg_config.clone(),
+        ),
+    };
+    let (state, logs) = if fallback_dir.is_some() {
+        (data.clone(), data.clone())
+    } else {
+        state_logs(&s, &data)
+    };
+    Some(Paths {
+        config,
+        data,
+        state,
+        logs,
+        cache,
+        xdg_config,
+    })
+}
+
 fn resolve() -> Option<&'static Paths> {
-    STRATEGY
-        .get_or_init(|| {
-            let s = etcetera::choose_base_strategy().ok()?;
-            let fallback_dir = etcetera::home_dir()
-                .ok()
-                .map(|h| h.join(FALLBACK_DIR))
-                .filter(|d| d.is_dir());
-            let xdg_config = s.config_dir().join(APP_NAME);
-            let (data, cache, config) = match &fallback_dir {
-                Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
-                None => (
-                    s.data_dir().join(APP_NAME),
-                    s.cache_dir().join(APP_NAME),
-                    xdg_config.clone(),
-                ),
-            };
-            let (state, logs) = if fallback_dir.is_some() {
-                (data.clone(), data.clone())
-            } else {
-                state_logs(&s, &data)
-            };
-            Some(Paths {
-                config,
-                data,
-                state,
-                logs,
-                cache,
-                xdg_config,
-            })
-        })
-        .as_ref()
+    STRATEGY.get()?.as_ref()
 }
 
 fn err() -> std::io::Error {
@@ -297,6 +345,29 @@ pub fn user_config_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_paths(root: &Path) -> Option<Paths> {
+        Some(Paths {
+            config: root.to_path_buf(),
+            data: root.to_path_buf(),
+            state: root.to_path_buf(),
+            logs: root.to_path_buf(),
+            cache: root.to_path_buf(),
+            xdg_config: root.to_path_buf(),
+        })
+    }
+
+    #[test]
+    fn path_initialization_is_idempotent_but_rejects_conflicts() {
+        let lock = OnceLock::new();
+        let first = Path::new("/first");
+        let second = Path::new("/second");
+
+        assert!(initialize(&lock, test_paths(first)).is_ok());
+        assert!(initialize(&lock, test_paths(first)).is_ok());
+        assert!(initialize(&lock, test_paths(second)).is_err());
+        assert_eq!(lock.get(), Some(&test_paths(first)));
+    }
 
     #[test]
     fn normalize_path_resolves_parent() {

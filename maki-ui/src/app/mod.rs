@@ -4,7 +4,6 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
-use maki_providers::ThinkingConfigExt;
 mod btw;
 mod image_paste;
 pub(crate) mod mode;
@@ -74,7 +73,6 @@ use maki_commands::{
     classify_input,
 };
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
-use maki_domain::ThinkingConfig;
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
@@ -100,6 +98,7 @@ pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::Sent;
 pub(crate) use session::session_has_content;
 use session_state::SessionState;
+pub(crate) use session_state::stored_to_rules;
 
 const CANCEL_MSG: &str = "Cancelled.";
 /// Bypasses the per-run staleness filter because re-bake replies
@@ -114,7 +113,7 @@ const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
 const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
 const FAST_UNSUPPORTED_MSG: &str = maki_agent::command::FAST_UNSUPPORTED;
-const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
+pub(crate) const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
@@ -367,6 +366,11 @@ pub struct App {
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
+    /// The model the in-flight turn started on. A turn captures its provider
+    /// when it starts, so a model changed part-way through applies to the next
+    /// turn; this is what lets the status bar say so instead of showing a name
+    /// the running turn is not using.
+    pub(crate) run_model: Option<String>,
     pub(super) retry_info: Option<RetryInfo>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
@@ -396,6 +400,7 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
+    pub(crate) coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
     pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
@@ -525,6 +530,7 @@ impl App {
             cmd_tx: None,
             pending_input: PendingInput::None,
             run_id: 0,
+            run_model: None,
             retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
@@ -547,6 +553,7 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
+            coordinator: None,
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             hints: Watch::seeded(hint_reader.load_full()),
@@ -666,15 +673,6 @@ impl App {
             );
         }
         self.lua_event_handle.fire_autocmd(event, data);
-    }
-
-    pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
-        if !self.state.model.supports_thinking() {
-            return Err(THINKING_UNSUPPORTED_MSG.into());
-        }
-        self.state.thinking =
-            ThinkingConfig::parse(input.trim(), self.state.thinking).map_err(str::to_owned)?;
-        Ok(self.state.thinking)
     }
 
     pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
@@ -1809,6 +1807,15 @@ impl App {
             return vec![];
         }
 
+        // The run reached its next request and picked the model up; the bar
+        // can stop marking the switch as queued.
+        if envelope.subagent.is_none()
+            && let AgentEvent::ModelSwitched { spec } = &envelope.event
+        {
+            self.run_model = Some(spec.clone());
+            return vec![];
+        }
+
         if let Some(subagent) = &envelope.subagent {
             if self.terminal_subagents.contains(&subagent.agent_id) {
                 match envelope.event {
@@ -2314,12 +2321,66 @@ impl App {
                     maki_commands::CommandOutcome::AgentTurn(turn) => {
                         actions.extend(self.submit_command_turn(turn))
                     }
+                    maki_commands::CommandOutcome::IsolatedTurn(turn) => {
+                        actions.extend(self.submit_isolated_turn(turn))
+                    }
+                    maki_commands::CommandOutcome::FrontendFeedback(feedback) => {
+                        self.present_frontend_feedback(feedback)
+                    }
                     maki_commands::CommandOutcome::Failed(error) => self.flash(error.to_string()),
-                    maki_commands::CommandOutcome::Completed => break,
+                    maki_commands::CommandOutcome::ManualCompaction
+                    | maki_commands::CommandOutcome::Completed => break,
                 },
             }
         }
         actions
+    }
+
+    /// Hands the toggle to the event loop rather than awaiting the
+    /// coordinator here. A running turn holds the session lease for its whole
+    /// duration and the coordinator parks every other operation behind it, so
+    /// blocking on this thread freezes the UI until the turn ends -- and
+    /// deadlocks outright when the turn is itself waiting on the UI.
+    /// Without a coordinator there is nothing to await, so it applies at once.
+    fn toggle_coordinator_option(&mut self, id: &'static str, current: bool) -> Vec<Action> {
+        if self.coordinator.is_none() {
+            self.apply_toggled_option(id, !current);
+            return Vec::new();
+        }
+        vec![Action::ToggleSessionOption { id }]
+    }
+
+    /// The app-side half of a toggle, run once the coordinator has committed
+    /// it (or immediately when there is no coordinator).
+    pub(crate) fn apply_toggled_option(&mut self, id: &str, enabled: bool) {
+        use maki_agent::session_options::{FAST_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
+        let message = match id {
+            YOLO_OPTION_ID => {
+                self.permissions.set_yolo(enabled);
+                if enabled {
+                    "YOLO mode enabled"
+                } else {
+                    "YOLO mode disabled"
+                }
+            }
+            FAST_OPTION_ID => {
+                self.state.fast = enabled;
+                if enabled { FAST_ON_MSG } else { FAST_OFF_MSG }
+            }
+            WORKFLOW_OPTION_ID => {
+                self.state.workflow = enabled;
+                if enabled {
+                    WORKFLOW_ON_MSG
+                } else {
+                    WORKFLOW_OFF_MSG
+                }
+            }
+            other => {
+                self.flash(format!("unknown session option: {other}"));
+                return;
+            }
+        };
+        self.flash(message.into());
     }
 
     pub(crate) fn execute_host_request(
@@ -2354,6 +2415,9 @@ impl App {
                     ),
                     HostContextRequest::FastModeSupported => {
                         HostContextResponse::FastModeSupported(self.state.model.supports_fast())
+                    }
+                    HostContextRequest::SessionId => {
+                        HostContextResponse::SessionId(Arc::from(self.state.session.id.to_string()))
                     }
                 };
                 return Ok((HostResponse::Context(response), vec![]));
@@ -2437,46 +2501,44 @@ impl App {
                     .collect();
                 vec![Action::Btw(question.to_string(), images)]
             }
-            BuiltinOperation::ToggleYolo => {
-                let enabled = self.permissions.toggle_yolo();
-                self.flash(
-                    if enabled {
-                        "YOLO mode enabled"
-                    } else {
-                        "YOLO mode disabled"
-                    }
-                    .into(),
-                );
-                vec![]
-            }
-            BuiltinOperation::ToggleFast => {
-                self.state.fast = !self.state.fast;
-                self.flash(
-                    if self.state.fast {
-                        FAST_ON_MSG
-                    } else {
-                        FAST_OFF_MSG
-                    }
-                    .into(),
-                );
-                vec![]
-            }
-            BuiltinOperation::ToggleWorkflow => {
-                self.state.workflow = !self.state.workflow;
-                self.flash(
-                    if self.state.workflow {
-                        WORKFLOW_ON_MSG
-                    } else {
-                        WORKFLOW_OFF_MSG
-                    }
-                    .into(),
-                );
-                vec![]
-            }
+            BuiltinOperation::ToggleYolo => self.toggle_coordinator_option(
+                maki_agent::session_options::YOLO_OPTION_ID,
+                self.permissions.is_yolo(),
+            ),
+            BuiltinOperation::ToggleFast => self.toggle_coordinator_option(
+                maki_agent::session_options::FAST_OPTION_ID,
+                self.state.fast,
+            ),
+            BuiltinOperation::ToggleWorkflow => self.toggle_coordinator_option(
+                maki_agent::session_options::WORKFLOW_OPTION_ID,
+                self.state.workflow,
+            ),
             BuiltinOperation::Exit => self.quit(),
             BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
         };
         Ok((HostResponse::Completed, actions))
+    }
+
+    pub(crate) fn submit_isolated_turn(&self, turn: maki_commands::IsolatedTurn) -> Vec<Action> {
+        let images = turn
+            .content
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                maki_agent::ImageMediaType::from_mime(&attachment.media_type)
+                    .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
+            })
+            .collect();
+        vec![Action::Btw(turn.content.text.to_string(), images)]
+    }
+
+    pub(crate) fn present_frontend_feedback(&mut self, feedback: maki_commands::FrontendFeedback) {
+        match feedback {
+            maki_commands::FrontendFeedback::WorkingDirectory(path) => {
+                self.flash(format!("Working directory: {}", path.display()));
+            }
+            maki_commands::FrontendFeedback::Text(text) => self.flash(text.to_string()),
+        }
     }
 
     pub(crate) fn submit_command_turn(&mut self, turn: AgentTurn) -> Vec<Action> {
@@ -2535,27 +2597,41 @@ impl App {
             .fire_autocmd(SESSION_PICKER_REQUESTED_EVENT, serde_json::json!({}));
     }
 
+    /// Adoption goes through the event loop for the same reason a toggle does:
+    /// awaiting the coordinator on this thread blocks every frame behind a
+    /// running turn's lease.
     fn change_directory(&mut self, path: PathBuf) -> Vec<Action> {
-        match path.canonicalize().and_then(|path| {
-            path.is_dir()
-                .then_some(path)
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
-        }) {
-            Ok(path) => {
-                self.state
-                    .session_mut()
-                    .set_cwd(path.to_string_lossy().into_owned());
-                self.status_bar.set_cwd(path.clone());
-                let input = self.input_box.buffer.value();
-                self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
-                if self.file_completion.is_active() {
-                    self.sync_file_completion();
-                }
-                self.flash(format!("cd {}", path.display()))
-            }
+        if self.coordinator.is_some() {
+            return vec![Action::ChangeDirectory(path)];
+        }
+        let result = path
+            .canonicalize()
+            .and_then(|path| {
+                path.is_dir()
+                    .then_some(path)
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
+            })
+            .map_err(|error| error.to_string());
+        match result {
+            Ok(path) => self.apply_directory_change(path),
             Err(error) => self.flash(format!("cd: {error}")),
         }
         vec![]
+    }
+
+    /// The app-side half of `/cd`, run once the coordinator has adopted the
+    /// canonical path.
+    pub(crate) fn apply_directory_change(&mut self, path: PathBuf) {
+        self.state
+            .session_mut()
+            .set_cwd(path.to_string_lossy().into_owned());
+        self.status_bar.set_cwd(path.clone());
+        let input = self.input_box.buffer.value();
+        self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
+        if self.file_completion.is_active() {
+            self.sync_file_completion();
+        }
+        self.flash(format!("cd {}", path.display()));
     }
 
     fn overlays(&self) -> [&dyn Overlay; 13] {

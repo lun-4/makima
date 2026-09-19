@@ -4,6 +4,7 @@ use maki_config::{AgentConfig, CompactionBuffer};
 use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
 };
+use maki_storage::id::SessionRef;
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
@@ -32,6 +33,7 @@ pub(super) async fn compact_history(
     event_tx: &EventSender,
     cancel: &CancelToken,
     config: &AgentConfig,
+    session_id: Option<&SessionRef>,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
@@ -62,7 +64,7 @@ pub(super) async fn compact_history(
             event_tx,
             cancel,
             RequestOptions::default(),
-            None,
+            session_id,
         )
         .await
         {
@@ -127,10 +129,14 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
+    cancel: &CancelToken,
     config: &AgentConfig,
+    session_id: Option<&SessionRef>,
 ) -> Result<(), AgentError> {
-    let cancel = CancelToken::none();
-    let usage = compact_history(provider, model, history, event_tx, &cancel, config).await?;
+    let usage = compact_history(
+        provider, model, history, event_tx, cancel, config, session_id,
+    )
+    .await?;
     if let Some(post) = normalize(&config.post_compaction_instructions) {
         history.push(Message::synthetic(post.to_string()));
     }
@@ -241,6 +247,7 @@ mod tests {
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
         requests: Mutex<Vec<Vec<Message>>>,
+        sessions: Mutex<Vec<Option<SessionRef>>>,
     }
 
     impl MockProvider {
@@ -248,6 +255,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 requests: Mutex::new(Vec::new()),
+                sessions: Mutex::new(Vec::new()),
             }
         }
     }
@@ -261,10 +269,11 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
+            Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
+                self.sessions.lock().unwrap().push(session_id.cloned());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 responses.remove(0)
@@ -301,6 +310,33 @@ mod tests {
     }
 
     #[test]
+    fn compact_forwards_session_to_provider() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let session = SessionRef::generate();
+            let mut history = History::new(vec![Message::user("work".into())]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                Some(&session),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                provider.sessions.lock().unwrap().as_slice(),
+                &[Some(session)]
+            );
+        });
+    }
+
+    #[test]
     fn compact_replaces_history_with_summary() {
         smol::block_on(async {
             let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
@@ -324,7 +360,9 @@ mod tests {
                 &model,
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();
@@ -358,7 +396,9 @@ mod tests {
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .expect_err("empty summary must fail");
@@ -389,7 +429,9 @@ mod tests {
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
                 &config,
+                None,
             )
             .await
             .unwrap();
@@ -448,6 +490,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();
@@ -675,6 +718,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();
@@ -717,6 +761,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
             )
             .await
             .unwrap();

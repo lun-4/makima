@@ -11,7 +11,7 @@ use crossterm::style::Stylize;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::{Config, load_env_files, load_permissions};
+use maki_config::{Config, ModelPolicy, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
@@ -198,6 +198,18 @@ fn build_stack(
     ))
 }
 
+fn restored_session_model(
+    startup: &Model,
+    session: &AppSession,
+    explicit_model: bool,
+    model_policy: &ModelPolicy,
+) -> Model {
+    if explicit_model || !model_policy.allows(&session.model) {
+        return startup.clone();
+    }
+    Model::from_spec(&session.model).unwrap_or_else(|_| startup.clone())
+}
+
 fn resolve_session(
     last_session: bool,
     session_id: Option<&str>,
@@ -274,6 +286,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
+    let explicit_model = cli.model.is_some();
+    let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -295,6 +309,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
             model: stack.model,
+            explicit_model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
             timeouts,
@@ -305,6 +320,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             plugin_rules: stack.plugin_host.plugin_rules(),
             commands: stack.commands,
             command_registry: stack.plugin_host.command_registry(),
+            session_options: stack.plugin_host.event_handle().session_option_catalog(),
         })
         .context("run sdk mode")?;
         return Ok(());
@@ -365,22 +381,18 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
         }
         let focused_tab = &tabs[focused];
-        let model = if focused_tab.messages().is_empty()
-            || !stack
-                .config
-                .provider
-                .model_policy
-                .allows(&focused_tab.model)
-        {
-            stack.model.clone()
-        } else {
-            Model::from_spec(&focused_tab.model).unwrap_or_else(|_| stack.model.clone())
-        };
+        let model = restored_session_model(
+            &stack.model,
+            focused_tab,
+            apply_explicit_model,
+            &stack.config.provider.model_policy,
+        );
 
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
                 model,
                 needs_login: stack.needs_login,
+                explicit_model: apply_explicit_model,
                 commands: std::mem::take(&mut stack.commands),
                 sessions: std::mem::take(&mut tabs),
                 focused,
@@ -438,6 +450,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 // The picker is a one-shot startup request; a later
                 // `/reload` must reopen a fresh tab instead of re-prompting.
                 session_picker = false;
+                apply_explicit_model = false;
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
                 // Shut the old host down first so nothing can repopulate
@@ -532,6 +545,18 @@ mod tests {
         RawConfig::default()
             .into_config(false)
             .expect("default config")
+    }
+
+    #[test_case(false, "anthropic/claude-opus-4-6"; "restores_persisted_model_without_explicit_flag")]
+    #[test_case(true, "openai/gpt-5"; "explicit_model_overrides_persisted_model")]
+    fn tui_restored_model_precedence(explicit_model: bool, expected: &str) {
+        let startup = Model::from_spec("openai/gpt-5").unwrap();
+        let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
+
+        let resolved =
+            restored_session_model(&startup, &session, explicit_model, &ModelPolicy::default());
+
+        assert_eq!(resolved.spec(), expected);
     }
 
     #[test]

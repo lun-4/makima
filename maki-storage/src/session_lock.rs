@@ -147,6 +147,9 @@ fn owner_token() -> io::Result<String> {
 type ReleaseHook = (PathBuf, Box<dyn FnOnce() + Send>);
 
 #[cfg(test)]
+type PublishHook = (PathBuf, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
 fn sidecar_read_error() -> &'static Mutex<Option<(PathBuf, io::ErrorKind)>> {
     static ERROR: OnceLock<Mutex<Option<(PathBuf, io::ErrorKind)>>> = OnceLock::new();
     ERROR.get_or_init(|| Mutex::new(None))
@@ -171,6 +174,24 @@ fn release_before_write_hook() -> &'static Mutex<Option<ReleaseHook>> {
 }
 
 #[cfg(test)]
+fn publish_before_lock_hook() -> &'static Mutex<Option<PublishHook>> {
+    static HOOK: OnceLock<Mutex<Option<PublishHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn run_publish_before_lock_hook(path: &Path) {
+    let mut hook = publish_before_lock_hook()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
+        let (_, callback) = hook.take().expect("matching publish hook");
+        drop(hook);
+        callback();
+    }
+}
+
+#[cfg(test)]
 fn run_release_before_write_hook(path: &Path) {
     let mut hook = release_before_write_hook()
         .lock()
@@ -190,7 +211,37 @@ pub struct ClaimedSessionLock {
     released: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionPublicationGuard {
+    path: PathBuf,
+    owner: LockOwner,
+}
+
+impl SessionPublicationGuard {
+    pub fn publish<T>(&self, publish: impl FnOnce() -> T) -> io::Result<Option<T>> {
+        #[cfg(test)]
+        run_publish_before_lock_hook(&self.path);
+        let Some(mut file) = open_existing_locked_blocking(&self.path)? else {
+            return Ok(None);
+        };
+        if read_owner(&self.path, &mut file)?.as_ref() != Some(&self.owner) {
+            file.unlock()?;
+            return Ok(None);
+        }
+        let result = publish();
+        file.unlock()?;
+        Ok(Some(result))
+    }
+}
+
 impl ClaimedSessionLock {
+    pub fn publication_guard(&self) -> SessionPublicationGuard {
+        SessionPublicationGuard {
+            path: self.path.clone(),
+            owner: self.owner.clone(),
+        }
+    }
+
     /// Refresh the lease only while the on-disk lock still has this lease's identity.
     pub fn heartbeat(&mut self) -> io::Result<LockBeat> {
         let Some(mut file) = open_existing_locked(&self.path)? else {
@@ -235,15 +286,31 @@ impl Drop for ClaimedSessionLock {
 }
 
 fn open_existing_locked(path: &Path) -> io::Result<Option<File>> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let file = open_lock_file(path)?;
+    let Some(file) = file else {
+        return Ok(None);
     };
     file.try_lock_exclusive()?;
     Ok(Some(file))
+}
+
+fn open_existing_locked_blocking(path: &Path) -> io::Result<Option<File>> {
+    let file = open_lock_file(path)?;
+    let Some(file) = file else {
+        return Ok(None);
+    };
+    file.lock_exclusive()?;
+    Ok(Some(file))
+}
+
+fn open_lock_file(path: &Path) -> io::Result<Option<File>> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    match options.open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Outcome of a `heartbeat` call.
@@ -672,6 +739,39 @@ mod tests {
             fs::read_to_string(owner_path(&path)).unwrap(),
             replacement_owner
         );
+    }
+
+    #[test]
+    fn owned_publication_waits_for_heartbeat_lock() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+        let guard = lease.publication_guard();
+        let lock = File::options().read(true).write(true).open(&path).unwrap();
+        lock.lock_exclusive().unwrap();
+        let release = std::sync::mpsc::channel();
+        *publish_before_lock_hook().lock().unwrap() = Some((
+            path,
+            Box::new(move || {
+                release.0.send(()).unwrap();
+            }),
+        ));
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            published_tx.send(guard.publish(|| "published")).unwrap();
+        });
+
+        release.1.recv().unwrap();
+        assert!(
+            published_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        lock.unlock().unwrap();
+
+        assert_eq!(published_rx.recv().unwrap().unwrap(), Some("published"));
+        lease.release().unwrap();
     }
 
     #[test]

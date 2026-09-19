@@ -296,6 +296,9 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
+        // The turn runs on whatever the model is now; a change after this
+        // point lands on the next turn.
+        self.run_model = Some(self.state.session.model.clone());
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
         if !display.is_empty() {
             self.main_chat().show_user_message(display);

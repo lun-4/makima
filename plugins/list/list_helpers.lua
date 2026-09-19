@@ -9,7 +9,10 @@ function M.handler(input, ctx)
   if not raw then
     return { llm_output = "error: path is required", is_error = true }
   end
-  local path = maki.fs.abspath(raw)
+  local path, path_err = ctx:resolve_path(raw)
+  if not path then
+    return { llm_output = "error: " .. tostring(path_err), is_error = true }
+  end
   local meta = maki.fs.metadata(path)
   if not meta then
     return { llm_output = "error: path not found: " .. path, is_error = true }

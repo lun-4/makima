@@ -208,7 +208,21 @@ fn drive_print(
                 literal.workflow,
             )?
         }
-        InputDispatch::Dispatched(CommandOutcome::Completed) => return Ok(()),
+        InputDispatch::Dispatched(
+            CommandOutcome::Completed | CommandOutcome::FrontendFeedback(_),
+        ) => {
+            return Ok(());
+        }
+        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(_)) => {
+            return Err(color_eyre::eyre::eyre!(
+                "isolated turns are unavailable in print mode"
+            ));
+        }
+        InputDispatch::Dispatched(CommandOutcome::ManualCompaction) => {
+            return Err(color_eyre::eyre::eyre!(
+                "manual compaction is unavailable in print mode"
+            ));
+        }
         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => return Err(error.into()),
         InputDispatch::LiteralInput(content) => AgentInput {
             message: content.text.to_string(),
@@ -219,6 +233,8 @@ fn drive_print(
             fast: literal.fast,
             workflow: literal.workflow,
             prompt: None,
+            cancel: None,
+            lease_committer: None,
         },
     };
     runner.run(input)
@@ -274,6 +290,8 @@ pub fn run(
         fast,
         workflow,
         prompt: None,
+        cancel: None,
+        lease_committer: None,
     };
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
@@ -281,6 +299,7 @@ pub fn run(
     let command_turn_marker = CommandTurnMarker;
 
     let prompt_slots = lua_handle.collect_prompt_slots();
+    let session_options = lua_handle.session_option_catalog();
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
         let (handle, errors) =
@@ -311,7 +330,9 @@ pub fn run(
             append_system_prompt,
             plugin_rules: Arc::clone(&plugin_rules),
             modes: Arc::clone(&modes),
-        });
+            session_options: session_options.clone(),
+        })
+        .map_err(|error| eyre!("register print session coordinator: {error}"))?;
 
         let HeadlessHandle {
             event_rx,
@@ -365,9 +386,11 @@ pub fn run(
                 AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
                 AgentEvent::ToolPending { .. }
                 | AgentEvent::ToolStart(_)
+                | AgentEvent::ToolExecutionStart { .. }
                 | AgentEvent::ToolOutput { .. }
                 | AgentEvent::ToolDone(_)
                 | AgentEvent::QueueItemConsumed { .. }
+                | AgentEvent::ModelSwitched { .. }
                 | AgentEvent::QueueDrained
                 | AgentEvent::AutoCompacting
                 | AgentEvent::CompactionDone
@@ -565,6 +588,8 @@ mod tests {
             fast: false,
             workflow: false,
             prompt: None,
+            cancel: None,
+            lease_committer: None,
         }
     }
 

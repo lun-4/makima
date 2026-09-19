@@ -1,29 +1,16 @@
 use std::sync::Arc;
 
-use flume::Sender;
-use futures_lite::future;
+use maki_agent::agent::isolated_turn::{IsolatedTurnEvent, IsolatedTurnRequest, run_isolated_turn};
 use maki_providers::provider::Provider;
-use maki_providers::{ImageSource, Message, Model, ProviderEvent, RequestOptions};
+use maki_providers::{ImageSource, Model};
 use maki_storage::id::SessionRef;
-use serde_json::Value;
 
 use crate::components::btw_modal::BtwEvent;
 
 use super::App;
 
-const BTW_REMINDER: &str = "<system-reminder>\nThis is a side question. Answer it directly in a \
-single response.\n- You have NO tools: you cannot read files, run commands, or take any action.\n\
-- One-off response: there are no follow-up turns.\n- Answer ONLY from the existing conversation \
-context.\n- Never say \"Let me...\", \"I'll now...\", or promise any action.\n- If you don't know, \
-say so; do not offer to look it up.\n</system-reminder>";
-
 const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
 from the conversation context.";
-
-#[cfg(test)]
-fn btw_question(question: &str) -> Message {
-    Message::user(format!("{BTW_REMINDER}\n\n{question}"))
-}
 
 impl App {
     pub(crate) fn start_btw(
@@ -33,107 +20,50 @@ impl App {
         provider: Arc<dyn Provider>,
         model: Model,
     ) {
-        // The mirror is verbatim, so mid-turn it can end on an open tool call.
-        // Providers reject that, so close them off on our own copy.
-        let mut messages = self
+        let history = self
             .shared_history
             .as_ref()
-            .map(|h| Vec::clone(&h.load().messages))
+            .map(|history| Vec::clone(&history.load().messages))
             .unwrap_or_default();
-        maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
         let system = self
             .btw_system
             .as_ref()
-            .map(|s| String::clone(&s.load()))
-            .filter(|s| !s.is_empty())
+            .map(|system| String::clone(&system.load()))
+            .filter(|system| !system.is_empty())
             .unwrap_or_else(|| BTW_FALLBACK_SYSTEM.to_string());
-        messages.push(Message::user_with_images(
-            format!("{BTW_REMINDER}\n\n{question}"),
-            images,
-        ));
+        let (service_tx, service_rx) = flume::bounded(64);
+        let (modal_tx, modal_rx) = flume::bounded(64);
+        self.btw_modal.open(&question, modal_rx);
 
-        let (tx, rx) = flume::bounded(64);
-        self.btw_modal.open(&question, rx);
-
-        let session_id = SessionRef::from(self.state.session.id);
-        smol::spawn(run_btw(
-            provider,
-            model,
-            system,
-            messages,
-            tx,
-            Some(session_id),
+        smol::spawn(run_isolated_turn(
+            IsolatedTurnRequest {
+                provider,
+                model,
+                history,
+                system,
+                question,
+                images,
+                session_id: Some(SessionRef::from(self.state.session.id)),
+                cancel: maki_agent::CancelToken::none(),
+            },
+            service_tx,
         ))
         .detach();
-    }
-}
-
-async fn run_btw(
-    provider: Arc<dyn Provider>,
-    model: Model,
-    system: String,
-    messages: Vec<Message>,
-    btw_tx: Sender<BtwEvent>,
-    session_id: Option<SessionRef>,
-) {
-    let (event_tx, event_rx) = flume::unbounded();
-    let tools = Value::Array(vec![]);
-    let messages = maki_providers::adapt_images_for_model(&model, &messages);
-
-    let stream_fut = provider.stream_message(
-        &model,
-        &messages,
-        &system,
-        &tools,
-        &event_tx,
-        RequestOptions::default(),
-        session_id.as_ref(),
-    );
-
-    let forward_fut = async {
-        while let Ok(event) = event_rx.recv_async().await {
-            let delta = match event {
-                ProviderEvent::TextDelta { text } | ProviderEvent::ThinkingDelta { text } => text,
-                _ => continue,
-            };
-            if btw_tx.send(BtwEvent::TextDelta(delta)).is_err() {
-                return;
+        smol::spawn(async move {
+            while let Ok(event) = service_rx.recv_async().await {
+                let event = match event {
+                    IsolatedTurnEvent::TextDelta(text) | IsolatedTurnEvent::ThinkingDelta(text) => {
+                        BtwEvent::TextDelta(text)
+                    }
+                    IsolatedTurnEvent::Done | IsolatedTurnEvent::Cancelled => BtwEvent::Done,
+                    IsolatedTurnEvent::Error(error) => BtwEvent::Error(error),
+                };
+                let terminal = matches!(event, BtwEvent::Done | BtwEvent::Error(_));
+                if modal_tx.send_async(event).await.is_err() || terminal {
+                    break;
+                }
             }
-        }
-    };
-
-    let (result, _) = future::zip(stream_fut, forward_fut).await;
-
-    match result {
-        Ok(_) => {
-            let _ = btw_tx.send(BtwEvent::Done);
-        }
-        Err(e) => {
-            let _ = btw_tx.send(BtwEvent::Error(e.to_string()));
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const Q: &str = "why sqlite?";
-
-    fn user_text(msg: &Message) -> String {
-        msg.content
-            .iter()
-            .filter_map(|b| match b {
-                maki_providers::ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn injects_reminder_before_question() {
-        let text = user_text(&btw_question(Q));
-        assert!(text.starts_with(BTW_REMINDER), "reminder leads the message");
-        assert!(text.ends_with(Q), "question trails the message");
+        })
+        .detach();
     }
 }

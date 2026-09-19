@@ -23,7 +23,7 @@ pub use api::util::command::{
 };
 pub use api::util::picker::{PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
-pub use error::PluginError;
+pub use error::{PluginError, SessionOptionMutationError};
 pub use loader::{EventHandle, PluginHost, TestCompletionBackend};
 pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{CommandArgumentContext, CommandArgumentLifecycle};

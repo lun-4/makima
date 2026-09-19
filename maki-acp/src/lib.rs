@@ -21,6 +21,7 @@ pub struct AcpParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,
+    pub storage: maki_storage::StateDir,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub modes: Arc<ModeRegistry>,
     pub yolo: bool,
@@ -28,6 +29,7 @@ pub struct AcpParams {
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub lua_event_handle: maki_lua::EventHandle,
     pub command_registry: CommandRegistry,
 }
 
