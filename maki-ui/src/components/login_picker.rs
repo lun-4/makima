@@ -8,7 +8,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 
-use maki_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
+use maki_config::providers::{
+    self, Protocol, ProviderDef, ProvidersConfig, VERTEX_LOGIN_INSTRUCTIONS, slugify,
+};
 use maki_providers::catalog_providers_if_available;
 use maki_providers::openai_auth;
 use maki_storage::StateDir;
@@ -146,6 +148,10 @@ enum Step {
     Done {
         message: String,
     },
+    Instructions {
+        display_name: String,
+        message: &'static str,
+    },
 }
 
 enum StepAction {
@@ -180,6 +186,10 @@ enum StepAction {
         message: String,
         model_spec: Option<String>,
         slug: String,
+    },
+    GoInstructions {
+        display_name: String,
+        message: &'static str,
     },
     Back,
     Close,
@@ -311,6 +321,10 @@ impl LoginPicker {
     pub fn handle_key(&mut self, key: KeyEvent) -> LoginPickerAction {
         let action = match &mut self.step {
             Step::Closed => return LoginPickerAction::Consumed,
+            Step::Instructions { .. } => match key.code {
+                KeyCode::Esc | KeyCode::Enter => StepAction::Back,
+                _ => return LoginPickerAction::Consumed,
+            },
             Step::PickProvider(picker) => match picker.handle_key(key) {
                 PickerAction::Select(item) => {
                     if item.slug == CATALOG_UNAVAILABLE_SLUG {
@@ -339,7 +353,12 @@ impl LoginPicker {
                                 };
                             let needs_url =
                                 providers::builtin_provider(&slug).is_some_and(|b| b.needs_url);
-                            if needs_url {
+                            if slug == "vertex" {
+                                StepAction::GoInstructions {
+                                    display_name,
+                                    message: VERTEX_LOGIN_INSTRUCTIONS,
+                                }
+                            } else if needs_url {
                                 StepAction::GoBuiltinUrl { slug, display_name }
                             } else {
                                 StepAction::GoEnterKey {
@@ -720,6 +739,16 @@ impl LoginPicker {
                 };
                 LoginPickerAction::Consumed
             }
+            StepAction::GoInstructions {
+                display_name,
+                message,
+            } => {
+                self.step = Step::Instructions {
+                    display_name,
+                    message,
+                };
+                LoginPickerAction::Consumed
+            }
             StepAction::GoDone {
                 message,
                 model_spec,
@@ -909,6 +938,24 @@ impl LoginPicker {
                 );
                 popup
             }
+            Step::Instructions {
+                display_name,
+                message,
+            } => {
+                let modal = Modal {
+                    title: &format!(" {display_name} "),
+                    width_percent: 65,
+                    max_height_percent: 40,
+                };
+                let (popup, inner) = modal.render(frame, area, 1);
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(Line::from(*message))
+                        .style(Style::new().bg(theme::current().background))
+                        .wrap(Wrap { trim: true }),
+                    inner,
+                );
+                popup
+            }
             Step::Done { message } => {
                 let modal = Modal {
                     title: " Login ",
@@ -976,6 +1023,23 @@ mod tests {
             .iter()
             .map(|p| p.slug.clone())
             .collect()
+    }
+
+    #[test]
+    fn vertex_picker_shows_adc_instructions() {
+        let mut picker = LoginPicker {
+            step: Step::PickProvider(ListPicker::new()),
+            provider_items: Vec::new(),
+            storage: None,
+        };
+        picker.transition(StepAction::GoInstructions {
+            display_name: "Google Vertex AI".into(),
+            message: VERTEX_LOGIN_INSTRUCTIONS,
+        });
+        assert!(matches!(
+            picker.step,
+            Step::Instructions { message, .. } if message == VERTEX_LOGIN_INSTRUCTIONS
+        ));
     }
 
     #[test]

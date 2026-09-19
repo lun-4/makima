@@ -9,8 +9,9 @@ use color_eyre::eyre::{Context, bail};
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
 use maki_config::providers::{
-    ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
-    resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
+    ProviderDef, ProvidersConfig, VERTEX_LOGIN_INSTRUCTIONS, all_builtins, builtin_provider,
+    resolve_api_key_env, resolve_base_url, resolve_default_model, resolve_display_name,
+    resolve_login_url, slugify,
 };
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
@@ -32,6 +33,7 @@ pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
         Some("copilot") => copilot_auth::login(storage)?,
+        Some("vertex") => println!("{VERTEX_LOGIN_INSTRUCTIONS}"),
         Some(slug) => {
             let slug = slugify(slug);
             if builtin_provider(&slug).is_none()

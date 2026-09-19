@@ -162,13 +162,15 @@ impl Vertex {
     pub fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
         let config = maki_config::providers::ProvidersConfig::load();
         let provider = config.get("vertex");
+        let tokens = AdcTokenProvider::from_environment()?;
         let project = env::var("GOOGLE_CLOUD_PROJECT")
             .ok()
             .filter(|value| !value.is_empty())
+            .or_else(|| env::var("GCLOUD_PROJECT").ok().filter(|value| !value.is_empty()))
             .or_else(|| provider.and_then(|def| def.project.clone()))
+            .or_else(|| tokens.quota_project().map(str::to_owned))
             .ok_or_else(|| AgentError::Config {
-                message: "Vertex AI requires GOOGLE_CLOUD_PROJECT or providers.vertex.project"
-                    .into(),
+                message: "Vertex AI requires GOOGLE_CLOUD_PROJECT, GCLOUD_PROJECT, providers.vertex.project, or an ADC quota project".into(),
             })?;
         let location = env::var("GOOGLE_CLOUD_LOCATION")
             .ok()
@@ -178,7 +180,7 @@ impl Vertex {
         Ok(Self {
             client: http_client(timeouts),
             endpoint: VertexEndpoint::new(project, location),
-            tokens: AdcTokenProvider::from_environment()?,
+            tokens,
             stream_timeout: timeouts.stream,
         })
     }
@@ -355,7 +357,11 @@ impl AdcTokenProvider {
     }
 
     fn source_from_file(path: PathBuf) -> Result<AdcSource, AgentError> {
-        let file: AdcFile = serde_json::from_slice(&std::fs::read(path)?)?;
+        Self::source_from_json(&std::fs::read(path)?)
+    }
+
+    fn source_from_json(bytes: &[u8]) -> Result<AdcSource, AgentError> {
+        let file: AdcFile = serde_json::from_slice(bytes)?;
         if file.r#type != "authorized_user" {
             return Err(AgentError::Config {
                 message: format!(
@@ -377,11 +383,8 @@ impl AdcTokenProvider {
     }
 
     async fn token(&self, client: &HttpClient, force_refresh: bool) -> Result<String, AgentError> {
-        if !force_refresh
-            && let Some(token) = self.cached.lock().unwrap().as_ref()
-            && token.expires_at > Instant::now() + REFRESH_MARGIN
-        {
-            return Ok(token.value.clone());
+        if let Some(token) = self.cached_token(force_refresh, Instant::now()) {
+            return Ok(token);
         }
         let token = match &self.source {
             AdcSource::AuthorizedUser { user, .. } => refresh_authorized_user(client, user).await?,
@@ -393,6 +396,17 @@ impl AdcTokenProvider {
             expires_at: Instant::now() + Duration::from_secs(token.expires_in),
         });
         Ok(value)
+    }
+
+    fn cached_token(&self, force_refresh: bool, now: Instant) -> Option<String> {
+        if force_refresh {
+            return None;
+        }
+        let token = self.cached.lock().unwrap();
+        token
+            .as_ref()
+            .filter(|token| token.expires_at > now + REFRESH_MARGIN)
+            .map(|token| token.value.clone())
     }
 
     fn quota_project(&self) -> Option<&str> {
@@ -434,14 +448,11 @@ fn uppercase_schema_types(value: &mut Value) {
 }
 
 fn default_adc_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        return env::var_os("APPDATA").map(|appdata| {
+    if cfg!(windows) {
+        env::var_os("APPDATA").map(|appdata| {
             PathBuf::from(appdata).join("gcloud/application_default_credentials.json")
-        });
-    }
-    #[cfg(not(windows))]
-    {
+        })
+    } else {
         env::var_os("HOME").map(|home| {
             PathBuf::from(home).join(".config/gcloud/application_default_credentials.json")
         })
@@ -549,6 +560,59 @@ mod tests {
                 ["type"],
             "file"
         );
+    }
+
+    #[test]
+    fn authorized_user_adc_preserves_quota_project() {
+        const ADC: &[u8] = br#"{
+            "type": "authorized_user",
+            "client_id": "client",
+            "client_secret": "secret",
+            "refresh_token": "refresh",
+            "quota_project_id": "quota-project"
+        }"#;
+        let source = AdcTokenProvider::source_from_json(ADC).unwrap();
+        let AdcSource::AuthorizedUser {
+            user,
+            quota_project,
+        } = source
+        else {
+            panic!("expected authorized user credentials");
+        };
+        assert_eq!(user.client_id, "client");
+        assert_eq!(user.token_uri, OAUTH_TOKEN_URL);
+        assert_eq!(quota_project.as_deref(), Some("quota-project"));
+    }
+
+    #[test_case("service_account" ; "service account")]
+    #[test_case("external_account" ; "external account")]
+    fn unsupported_adc_type_is_an_error(credential_type: &str) {
+        let adc = format!(r#"{{"type":"{credential_type}"}}"#);
+        let Err(error) = AdcTokenProvider::source_from_json(adc.as_bytes()) else {
+            panic!("unsupported ADC type unexpectedly succeeded");
+        };
+        assert!(matches!(error, AgentError::Config { .. }));
+        assert!(error.to_string().contains(credential_type));
+    }
+
+    #[test]
+    fn cached_token_respects_expiry_and_forced_refresh() {
+        const TOKEN: &str = "token";
+        let provider = AdcTokenProvider {
+            source: AdcSource::Metadata,
+            cached: Mutex::new(Some(CachedToken {
+                value: TOKEN.into(),
+                expires_at: Instant::now() + REFRESH_MARGIN + Duration::from_secs(1),
+            })),
+        };
+        let now = Instant::now();
+        assert_eq!(provider.cached_token(false, now).as_deref(), Some(TOKEN));
+        assert_eq!(provider.cached_token(true, now), None);
+        *provider.cached.lock().unwrap() = Some(CachedToken {
+            value: TOKEN.into(),
+            expires_at: now + REFRESH_MARGIN,
+        });
+        assert_eq!(provider.cached_token(false, now), None);
     }
 
     #[test]
