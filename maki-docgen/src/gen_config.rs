@@ -4,8 +4,8 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, BellConfig, ConfigField, DEFAULT_AUTOCOMPLETE_HEIGHT, DEFAULT_MAX_LOG_FILES,
-    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig,
-    StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
+    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig,
+    ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -197,16 +197,47 @@ fn write_bell_section(out: &mut String) {
     writeln!(out, "### `ui.bell`\n").unwrap();
     writeln!(
         out,
-        "Ring the terminal bell (`\\x07`) on these events. All values are \
-         `bool`, defaulting to `true`. Disable any of them to silence just \
-         that event.\n"
+        "Ring the terminal bell (`\\x07`) on these events. By default `on_prompt = true` \
+         and all other events are off. Bell notifications must also be enabled: \
+         either `ui.notifications = \"bell\"` or `ui.notifications = \"auto\"` with no OSC 9 support.\n"
     )
     .unwrap();
-    writeln!(out, "| Field | Default |").unwrap();
-    writeln!(out, "|-------|---------|").unwrap();
-    for (name, default) in BellConfig::FIELD_DEFAULTS {
-        writeln!(out, "| `{name}` | {default} |",).unwrap();
-    }
+    write_table_no_min(out, BellConfig::FIELDS);
+    writeln!(out).unwrap();
+}
+
+fn write_net_section(out: &mut String) {
+    write_section(out, "[net]", NetConfig::FIELDS);
+    writeln!(
+        out,
+        "`maki.net` refuses private, loopback and metadata addresses, because \
+         the model picks the URLs. List a host here to let it through:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "\
+```lua
+maki.setup({{
+    net = {{
+        allowed_private_hosts = {{ \"localhost:8080\", \"nas.lan\", \"10.0.0.0/8\" }},
+    }},
+}})
+```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "An entry with no port covers every port. A name you list is allowed \
+         whatever it resolves to. A name you did not list stays blocked when \
+         DNS lands it on a private address, unless that address falls in a \
+         range you allowed, so keep ranges as small as the service needs. \
+         Every redirect hop is checked against the same list. \
+         [Permissions](/docs/permissions/#network-addresses) covers what the \
+         guard protects.\n"
+    )
+    .unwrap();
+}
     writeln!(out).unwrap();
 }
 
@@ -295,6 +326,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
+    write_net_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(

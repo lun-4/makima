@@ -36,6 +36,7 @@ pub use api::completion::{
     ActiveAtToken, AtToken, AtTokenStatus, CompletionCtx, ItemSpec, active_at_token,
     at_is_token_start, is_trailing_at_token_punctuation, parse_at_tokens,
 };
+pub use api::net::set_allowed_private_hosts;
 
 #[cfg(feature = "test-support")]
 pub mod test_support {

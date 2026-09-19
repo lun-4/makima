@@ -267,6 +267,7 @@ pub struct RawConfig {
     pub agent: AgentFileConfig,
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
+    pub net: NetFileConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
     /// Renamed to `plugins`; kept so old configs fail with a pointer to the
     /// new name instead of a generic unknown-field error.
@@ -288,6 +289,7 @@ impl RawConfig {
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
+        self.net.merge(overlay.net);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
             if plugin.enabled.is_some() {
@@ -306,6 +308,8 @@ impl RawConfig {
             .filter(|(_, cfg)| cfg.enabled == Some(false))
             .map(|(name, _)| name.clone())
             .collect();
+        let net = NetConfig::from_file(self.net);
+        maki_lua::set_allowed_private_hosts(&net.allowed_private_hosts);
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_automode: self.always_automode.unwrap_or(false),
@@ -319,6 +323,7 @@ impl RawConfig {
             agent: AgentConfig::from_file(self.agent, no_rtk, disabled_tools),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
+            net,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
         })
@@ -903,6 +908,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
+    pub net: NetConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
 }
@@ -1413,6 +1419,29 @@ impl StorageConfig {
             max_log_bytes: f.max_log_bytes_mb.unwrap_or(DEFAULT_MAX_LOG_BYTES_MB) * 1024 * 1024,
             max_log_files: f.max_log_files.unwrap_or(DEFAULT_MAX_LOG_FILES),
             input_history_size: f.input_history_size.unwrap_or(DEFAULT_INPUT_HISTORY_SIZE),
+        }
+    }
+}
+
+/// Escape hatches for the SSRF guard in `maki.net`, which every HTTP tool
+/// goes through. The model picks the URL, so private and metadata addresses
+/// are refused unless the user named the host here.
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "net")]
+pub struct NetConfig {
+    #[config(
+        ty = "string[]",
+        default = "Vec::new()",
+        default_doc = "[]",
+        desc = "Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://`"
+    )]
+    pub allowed_private_hosts: Vec<String>,
+}
+
+impl NetConfig {
+    fn from_file(f: NetFileConfig) -> Self {
+        Self {
+            allowed_private_hosts: f.allowed_private_hosts.unwrap_or_default(),
         }
     }
 }
@@ -3011,6 +3040,7 @@ mod tests {
             agent: AgentConfig::default(),
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
+            net: NetConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
         };
@@ -3034,6 +3064,7 @@ mod tests {
                 agent: AgentConfig::default(),
                 provider: ProviderConfig::default(),
                 storage: StorageConfig::default(),
+                net: NetConfig::default(),
                 permissions: PermissionsConfig::default(),
                 plugins: PluginsConfig::default(),
             };
@@ -3525,6 +3556,32 @@ mod tests {
         assert_eq!(
             perms.rules[0].tool,
             ToolKey::parse("github.delete").unwrap()
+        );
+    }
+
+    const GLOBAL_ALLOWED_HOST: &str = "ollama.lan";
+    const PROJECT_ALLOWED_HOST: &str = "searx.lan:8888";
+
+    #[test]
+    fn allowed_private_hosts_merge_and_defaults() {
+        let global = RawConfig {
+            net: NetFileConfig {
+                allowed_private_hosts: Some(vec![GLOBAL_ALLOWED_HOST.into()]),
+            },
+            ..Default::default()
+        };
+        let project = RawConfig {
+            net: NetFileConfig {
+                allowed_private_hosts: Some(vec![PROJECT_ALLOWED_HOST.into()]),
+            },
+            ..Default::default()
+        };
+        let mut merged = global;
+        merged.merge(project);
+        let config = merged.into_config(false).unwrap();
+        assert_eq!(
+            config.net.allowed_private_hosts,
+            vec![PROJECT_ALLOWED_HOST.to_string()]
         );
     }
 }
