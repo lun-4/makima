@@ -163,20 +163,19 @@ impl Vertex {
         let config = maki_config::providers::ProvidersConfig::load();
         let provider = config.get("vertex");
         let tokens = AdcTokenProvider::from_environment()?;
-        let project = env::var("GOOGLE_CLOUD_PROJECT")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .or_else(|| env::var("GCLOUD_PROJECT").ok().filter(|value| !value.is_empty()))
-            .or_else(|| provider.and_then(|def| def.project.clone()))
-            .or_else(|| tokens.quota_project().map(str::to_owned))
-            .ok_or_else(|| AgentError::Config {
-                message: "Vertex AI requires GOOGLE_CLOUD_PROJECT, GCLOUD_PROJECT, providers.vertex.project, or an ADC quota project".into(),
-            })?;
-        let location = env::var("GOOGLE_CLOUD_LOCATION")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .or_else(|| provider.and_then(|def| def.location.clone()))
-            .unwrap_or_else(|| DEFAULT_LOCATION.into());
+        let project = resolve_project(
+            env::var("GOOGLE_CLOUD_PROJECT").ok(),
+            env::var("GCLOUD_PROJECT").ok(),
+            provider.and_then(|def| def.project.clone()),
+            tokens.quota_project(),
+        )
+        .ok_or_else(|| AgentError::Config {
+            message: "Vertex AI requires GOOGLE_CLOUD_PROJECT, GCLOUD_PROJECT, providers.vertex.project, or an ADC quota project".into(),
+        })?;
+        let location = resolve_location(
+            env::var("GOOGLE_CLOUD_LOCATION").ok(),
+            provider.and_then(|def| def.location.clone()),
+        );
         Ok(Self {
             client: http_client(timeouts),
             endpoint: VertexEndpoint::new(project, location),
@@ -417,6 +416,35 @@ impl AdcTokenProvider {
     }
 }
 
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn resolve_project(
+    google_cloud_project: Option<String>,
+    gcloud_project: Option<String>,
+    configured_project: Option<String>,
+    quota_project: Option<&str>,
+) -> Option<String> {
+    nonempty(google_cloud_project)
+        .or_else(|| nonempty(gcloud_project))
+        .or_else(|| nonempty(configured_project))
+        .or_else(|| {
+            quota_project
+                .filter(|project| !project.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn resolve_location(
+    google_cloud_location: Option<String>,
+    configured_location: Option<String>,
+) -> String {
+    nonempty(google_cloud_location)
+        .or_else(|| nonempty(configured_location))
+        .unwrap_or_else(|| DEFAULT_LOCATION.into())
+}
+
 fn normalize_tool_schemas(body: &mut Value) {
     if let Some(tools) = body.get_mut("tools") {
         uppercase_schema_types(tools);
@@ -511,6 +539,49 @@ mod tests {
     fn stream_url_uses_matching_location_host(location: &str, expected: &str) {
         assert_eq!(
             VertexEndpoint::new("project".into(), location.into()).stream_url("gemini-2.5-flash"),
+            expected
+        );
+    }
+
+    #[test_case(Some("environment"), Some("gcloud"), Some("configured"), Some("quota"), Some("environment") ; "google cloud project")]
+    #[test_case(None, Some("gcloud"), Some("configured"), Some("quota"), Some("gcloud") ; "gcloud project")]
+    #[test_case(None, None, Some("configured"), Some("quota"), Some("configured") ; "configured project")]
+    #[test_case(None, None, None, Some("quota"), Some("quota") ; "quota project")]
+    #[test_case(None, None, Some(""), Some("quota"), Some("quota") ; "empty configured project")]
+    #[test_case(None, None, None, None, None ; "missing project")]
+    fn project_resolution_precedence(
+        google_cloud_project: Option<&str>,
+        gcloud_project: Option<&str>,
+        configured_project: Option<&str>,
+        quota_project: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(
+            resolve_project(
+                google_cloud_project.map(str::to_owned),
+                gcloud_project.map(str::to_owned),
+                configured_project.map(str::to_owned),
+                quota_project,
+            )
+            .as_deref(),
+            expected
+        );
+    }
+
+    #[test_case(Some("us-central1"), Some("configured"), "us-central1" ; "environment")]
+    #[test_case(None, Some("configured"), "configured" ; "configured")]
+    #[test_case(None, Some(""), DEFAULT_LOCATION ; "empty configured")]
+    #[test_case(None, None, DEFAULT_LOCATION ; "default")]
+    fn location_resolution_precedence(
+        google_cloud_location: Option<&str>,
+        configured_location: Option<&str>,
+        expected: &str,
+    ) {
+        assert_eq!(
+            resolve_location(
+                google_cloud_location.map(str::to_owned),
+                configured_location.map(str::to_owned),
+            ),
             expected
         );
     }

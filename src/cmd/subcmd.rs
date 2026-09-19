@@ -30,20 +30,20 @@ const SESSIONS_JSON_ONLY_ERR: &str =
     "the sessions command only supports --json; use `makima sessions --json`";
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
-    match provider {
+    let provider = provider.map(slugify);
+    match provider.as_deref() {
         Some("openai") => openai_auth::login(storage)?,
         Some("copilot") => copilot_auth::login(storage)?,
         Some("vertex") => println!("{VERTEX_LOGIN_INSTRUCTIONS}"),
         Some(slug) => {
-            let slug = slugify(slug);
-            if builtin_provider(&slug).is_none()
-                && dynamic::display_name(&slug).is_none()
-                && ProvidersConfig::load().get(&slug).is_none()
-                && let Some(provider_data) = maki_providers::catalog_provider(&slug)
+            if builtin_provider(slug).is_none()
+                && dynamic::display_name(slug).is_none()
+                && ProvidersConfig::load().get(slug).is_none()
+                && let Some(provider_data) = maki_providers::catalog_provider(slug)
             {
                 login_catalog_provider(&provider_data, storage)?;
             } else {
-                login_provider(&slug, storage)?;
+                login_provider(slug, storage)?;
             }
         }
         None => login_interactive(storage)?,

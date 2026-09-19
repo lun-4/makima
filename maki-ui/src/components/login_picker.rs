@@ -33,6 +33,8 @@ const OPENAI_CODEX_DISPLAY: &str = "OpenAI Codex";
 const OPENAI_CODEX_LABEL: &str = "OpenAI Codex (ChatGPT login)";
 const CODEX_DONE_MESSAGE: &str = "Authenticated: OpenAI";
 const CODEX_ERROR_MESSAGE: &str = "Codex login failed: ";
+const INSTRUCTIONS_HEIGHT: u16 = 4;
+const INSTRUCTIONS_DISMISS: &str = "Press Enter or Esc to return";
 
 const PROTOCOLS: &[(&str, &str)] = &[
     ("openai", "OpenAI-compatible"),
@@ -947,11 +949,17 @@ impl LoginPicker {
                     width_percent: 65,
                     max_height_percent: 40,
                 };
-                let (popup, inner) = modal.render(frame, area, 1);
+                let (popup, inner) = modal.render(frame, area, INSTRUCTIONS_HEIGHT);
                 frame.render_widget(
-                    ratatui::widgets::Paragraph::new(Line::from(*message))
-                        .style(Style::new().bg(theme::current().background))
-                        .wrap(Wrap { trim: true }),
+                    ratatui::widgets::Paragraph::new(vec![
+                        Line::from(*message),
+                        Line::from(Span::styled(
+                            INSTRUCTIONS_DISMISS,
+                            theme::current().input_placeholder,
+                        )),
+                    ])
+                    .style(Style::new().bg(theme::current().background))
+                    .wrap(Wrap { trim: true }),
                     inner,
                 );
                 popup
@@ -1023,6 +1031,28 @@ mod tests {
             .iter()
             .map(|p| p.slug.clone())
             .collect()
+    }
+
+    #[test]
+    fn vertex_picker_instructions_render_completely() {
+        let mut picker = LoginPicker {
+            step: Step::Instructions {
+                display_name: "Google Vertex AI".into(),
+                message: VERTEX_LOGIN_INSTRUCTIONS,
+            },
+            provider_items: Vec::new(),
+            storage: None,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let screen = crate::components::buffer_text(terminal.backend().buffer());
+        assert!(screen.contains("GOOGLE_CLOUD_PROJECT"));
+        assert!(screen.contains(INSTRUCTIONS_DISMISS));
     }
 
     #[test]
