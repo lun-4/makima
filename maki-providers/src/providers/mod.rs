@@ -287,6 +287,10 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
     isahc::HttpClient::builder()
         .connect_timeout(timeouts.connect)
         .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
+        // libcurl sends `Expect: 100-continue` by default for HTTP/1.1 POST bodies
+        // over 1 KB. Edge proxies (notably Google's for Gemini/Vertex) reject this
+        // preflight check on large payloads with 417 Expectation Failed.
+        .expect_continue(false)
         .build()
         .expect("failed to build HTTP client")
 }
@@ -625,5 +629,39 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{result:?}");
         assert!(msg.contains(&env_var) || msg.contains(&slug));
+    }
+
+    #[test]
+    fn http_client_omits_expect_continue_on_large_payload() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = http_client(Timeouts::default());
+        let body = vec![b'x'; 2048];
+        let req = isahc::Request::post(format!("http://{addr}"))
+            .body(body)
+            .unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let received = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            received
+        });
+
+        smol::block_on(async {
+            let _ = client.send_async(req).await;
+        });
+
+        let received = handle.join().unwrap();
+        assert!(
+            !received.contains("100-continue"),
+            "large payload should omit Expect: 100-continue, got:\n{received}"
+        );
     }
 }
