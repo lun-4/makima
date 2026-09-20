@@ -3616,7 +3616,17 @@ impl LuaRuntime {
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
         let config_store: ConfigStore = Arc::new(Mutex::new(None));
-        let perms = load_plugin_permissions(plugin_dir.as_deref());
+        let perms = plugin_dir
+            .as_deref()
+            .and_then(|dir| {
+                let manifest = dir.join(crate::plugin_permissions::MANIFEST_FILE);
+                if manifest.is_file() {
+                    Some(load_plugin_permissions(Some(dir)))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(PluginPermissions::trusted);
         self.load_source(
             (owner, source_name),
             source,

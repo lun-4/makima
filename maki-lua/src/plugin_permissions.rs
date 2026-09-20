@@ -6,7 +6,7 @@ use tracing::warn;
 
 pub use maki_config::Permission;
 
-const MANIFEST_FILE: &str = "plugin.toml";
+pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
 
 #[derive(Debug, Clone)]
 pub struct PluginPermissions {
