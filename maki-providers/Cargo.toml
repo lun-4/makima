@@ -26,6 +26,7 @@ maki-config = { workspace = true }
 inventory = { workspace = true }
 jiff = { workspace = true }
 keyring = { workspace = true }
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 
 [dev-dependencies]
 test-case = { workspace = true }

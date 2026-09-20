@@ -446,6 +446,7 @@ pub enum SessionRequest {
     Live,
     Current,
     Usage,
+    Read { id: Option<String> },
     New { prompt: Option<String>, focus: bool },
     Prompt { id: Option<String>, text: String },
     Focus { id: String },

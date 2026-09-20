@@ -1,60 +1,28 @@
-use std::fmt;
 use std::io;
 use std::path::Path;
 
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use tracing::warn;
 
+pub use maki_config::Permission;
+
 const MANIFEST_FILE: &str = "plugin.toml";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Permission {
-    FsRead,
-    FsWrite,
-    Net,
-    Run,
-    Env,
-}
-
-impl Permission {
-    pub(crate) const ALL: [Permission; 5] = [
-        Permission::FsRead,
-        Permission::FsWrite,
-        Permission::Net,
-        Permission::Run,
-        Permission::Env,
-    ];
-
-    pub(crate) const fn manifest_key(self) -> &'static str {
-        match self {
-            Permission::FsRead => "fs_read",
-            Permission::FsWrite => "fs_write",
-            Permission::Net => "net",
-            Permission::Run => "run",
-            Permission::Env => "env",
-        }
-    }
-}
-
-impl fmt::Display for Permission {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.manifest_key())
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PluginPermissions {
-    allowed: [bool; 5],
+    allowed: [bool; Permission::COUNT],
 }
 
 impl PluginPermissions {
     pub fn trusted() -> Self {
-        Self { allowed: [true; 5] }
+        Self {
+            allowed: [true; Permission::COUNT],
+        }
     }
 
     pub fn denied() -> Self {
         Self {
-            allowed: [false; 5],
+            allowed: [false; Permission::COUNT],
         }
     }
 
@@ -62,10 +30,16 @@ impl PluginPermissions {
         self.allowed[perm as usize]
     }
 
+    /// Layering a call whose reach nobody declared takes full trust, since no
+    /// narrower price would be honest.
+    pub fn holds_all(&self) -> bool {
+        self.allowed.iter().all(|&allowed| allowed)
+    }
+
     pub fn from_manifest(manifest: &toml::Value) -> Self {
         let perms = manifest.get("permissions");
-        let mut allowed = [true; 5];
-        for perm in Permission::ALL {
+        let mut allowed = [true; Permission::COUNT];
+        for &perm in Permission::ALL {
             allowed[perm as usize] = perms
                 .and_then(|p| p.get(perm.manifest_key()))
                 .and_then(toml::Value::as_bool)
@@ -108,8 +82,8 @@ impl PluginPermissions {
         if self.is_allowed(perm) {
             lua.create_async_function(f)
         } else {
-            lua.create_function(move |_, _: mlua::MultiValue| -> LuaResult<mlua::Value> {
-                Err(denied_error(perm))
+            lua.create_async_function(move |_, _: mlua::MultiValue| async move {
+                Err::<mlua::Value, LuaError>(denied_error(perm))
             })
         }
     }
@@ -166,7 +140,7 @@ mod tests {
     #[test]
     fn trusted_allows_everything() {
         let p = PluginPermissions::trusted();
-        for perm in Permission::ALL {
+        for &perm in Permission::ALL {
             assert!(p.is_allowed(perm), "{perm} should be allowed");
         }
     }
@@ -174,7 +148,7 @@ mod tests {
     #[test]
     fn denied_blocks_everything() {
         let p = PluginPermissions::denied();
-        for perm in Permission::ALL {
+        for &perm in Permission::ALL {
             assert!(!p.is_allowed(perm), "{perm} should be denied");
         }
     }
@@ -201,7 +175,7 @@ mod tests {
     fn from_manifest_missing_section() {
         let val: toml::Value = toml::from_str("[package]\nname = \"test\"").unwrap();
         let p = PluginPermissions::from_manifest(&val);
-        for perm in Permission::ALL {
+        for &perm in Permission::ALL {
             assert!(p.is_allowed(perm), "{perm} should default to allowed");
         }
     }

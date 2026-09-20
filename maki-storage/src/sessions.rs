@@ -17,8 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::id::MakiId;
+use crate::paths::canonical_key;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -308,6 +310,12 @@ pub struct StoredSubagent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Absent on subagents written before this was recorded, and the one flag
+    /// that says whether `fast` below is the subagent's or just a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<StoredThinking>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Deserialize)]
@@ -945,6 +953,38 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// The directories sessions were recorded in, most recently used first and at
+/// most `limit` of them.
+///
+/// The index is append only and the caller pays filesystem work per entry, so
+/// a limit is what keeps a long history off a startup path. Order comes from
+/// the session id, which is a UUIDv7 and carries the time it was made, so a
+/// history over the limit keeps the directories somebody still works in. A
+/// legacy v4 id has no time in it and sorts last.
+///
+/// Keys go through `canonical_key`, because the index holds whatever string a
+/// session was saved with while callers compare against canonicalized paths: a
+/// symlinked home would otherwise hide a folder's own history from it. A key
+/// that is not valid UTF-8 is dropped, because the callers store what they get
+/// back as text and a lossy path must never stand in for a real one.
+pub(crate) fn recorded_cwds(sessions_dir: &Path, limit: usize) -> Vec<String> {
+    let mut entries: Vec<(Option<(u64, u32)>, String)> = load_cwd_index(sessions_dir)
+        .into_iter()
+        .map(|(cwd, session_id)| (session_time(&session_id), cwd))
+        .collect();
+    entries.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    entries.truncate(limit);
+    entries
+        .into_iter()
+        .filter_map(|(_, cwd)| canonical_key(Path::new(&cwd)).to_str().map(str::to_owned))
+        .collect()
+}
+
+fn session_time(session_id: &str) -> Option<(u64, u32)> {
+    let id: MakiId = session_id.parse().ok()?;
+    Some(Uuid::from_bytes(*id.as_bytes()).get_timestamp()?.to_unix())
+}
+
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
     let id_str = session_id.to_string();
@@ -1255,6 +1295,9 @@ where
     T: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
+    // Held across both formats: either one decodes the same image payload once
+    // per record that mentions it.
+    let _intern = crate::intern::Scope::enter();
     let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
         load_jsonl(&data, &path.display().to_string())?
     } else {
@@ -1759,6 +1802,8 @@ mod tests {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
+                thinking: None,
+                fast: false,
             }
         }
 

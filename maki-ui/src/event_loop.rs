@@ -38,8 +38,13 @@ use maki_agent::session_options::{
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
-use maki_config::{ModelPolicy, UiConfig};
+use maki_config::project::TrustQuestion;
+use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
+use maki_lua::session_snapshot::{
+    MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
+    SessionSnapshot,
+};
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, ModelRequest, ProviderUsageAck,
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
@@ -138,6 +143,9 @@ pub struct EventLoopParams {
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
+    pub project_config: ProjectConfig,
+    pub trust_question: Option<TrustQuestion>,
+    pub startup_notice: Option<String>,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
 }
@@ -254,9 +262,9 @@ impl SessionStatus {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Working => "working",
-            Self::NeedsInput => "needs_input",
-            Self::Idle => "idle",
+            Self::Working => STATUS_WORKING,
+            Self::NeedsInput => STATUS_NEEDS_INPUT,
+            Self::Idle => STATUS_IDLE,
         }
     }
 }
@@ -875,6 +883,7 @@ struct SpawnCtx {
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
     command_runtime: Arc<CommandRuntime>,
+    trust_question: Option<TrustQuestion>,
 }
 
 /// The slice of [`SpawnCtx`] that registering a coordinator needs. Split out
@@ -1235,7 +1244,7 @@ impl SpawnCtx {
         )?;
         let seed_snapshot =
             seed_snapshot.then(|| (Arc::clone(&self.storage_writer), Arc::new(session.clone())));
-        let app = App::prepare(
+        let mut app = App::prepare(
             &model,
             session,
             self.storage.clone(),
@@ -1254,6 +1263,7 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
         );
+        app.app.trust_question = self.trust_question.clone();
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         Ok(PreparedSessionRuntime {
             app,
@@ -1417,6 +1427,7 @@ fn sync_session_models(sessions: &mut [SessionRuntime]) -> bool {
         let slot_model = rt.model_slot.load();
         if rt.app.state.session.model != slot_model.model.spec()
             || rt.app.state.model.context_window != slot_model.model.context_window
+            || rt.app.state.model.supports_fast_override != slot_model.model.supports_fast_override
         {
             let model = slot_model.model.clone();
             drop(slot_model);
@@ -1525,6 +1536,9 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             lua_event_handle,
             model_policy,
+            project_config,
+            trust_question,
+            startup_notice,
             system_prompt_override,
             append_system_prompt,
         } = params;
@@ -1590,7 +1604,8 @@ impl<'t> EventLoop<'t> {
             theme_completion,
         );
         let command_runtime = Arc::new(command_runtime);
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+        let (mcp_handle, mcp_config_errors) =
+            smol::block_on(mcp::start(&cwd, project_config.clone()));
         let ctx = SpawnCtx {
             storage,
             sessions_dir: sessions_dir.clone(),
@@ -1614,6 +1629,7 @@ impl<'t> EventLoop<'t> {
                 append_text: append_system_prompt,
             },
             command_runtime,
+            trust_question,
         };
 
         let mut runtimes = Vec::with_capacity(sessions.len());
@@ -1656,6 +1672,9 @@ impl<'t> EventLoop<'t> {
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
             app.flash(msg);
+        }
+        if let Some(notice) = startup_notice {
+            app.flash(notice);
         }
         for w in startup_warnings {
             app.flash(w);
@@ -1827,9 +1846,10 @@ impl<'t> EventLoop<'t> {
                     // Sessions spawned before the fetch resolved copied the
                     // unrefined startup model; hand them the resolved one so
                     // context windows and capabilities are not left stale.
-                    for rt in &self.sessions {
+                    for rt in &mut self.sessions {
                         if rt.model_slot.load().model.spec() == requested_spec {
                             rt.model_slot.install(model.clone(), Arc::clone(&provider));
+                            rt.app.update_model(&model);
                         }
                     }
                 }
@@ -1956,7 +1976,7 @@ impl<'t> EventLoop<'t> {
                 maki_commands::CommandOutcome::Failed(error) => {
                     self.sessions[index].app.flash(error.to_string());
                 }
-                maki_commands::CommandOutcome::ManualCompaction
+                maki_commands::CommandOutcome::ManualCompaction(_)
                 | maki_commands::CommandOutcome::Completed => {}
             },
         }
@@ -2521,6 +2541,13 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Current => {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
+            SessionRequest::Read { id } => {
+                let reply = match self.resolve_session_index(id.as_deref()) {
+                    Ok(idx) => Ok(self.session_snapshot_json(idx)),
+                    Err(e) => Err(e),
+                };
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::Usage => {
                 let app = &self.sessions[self.focused].app;
                 let reply = session_usage(
@@ -2720,6 +2747,45 @@ impl<'t> EventLoop<'t> {
 
     fn position(&self, id: MakiId) -> Option<usize> {
         self.sessions.iter().position(|rt| rt.id() == id)
+    }
+
+    /// No id means the focused session. A plugin holding the id of a tab that
+    /// has since closed gets `session not live` back, so it knows to stop.
+    fn resolve_session_index(&self, id: Option<&str>) -> Result<usize, String> {
+        let Some(id) = id else {
+            return Ok(self.focused);
+        };
+        let parsed = parse_session_id(id)?;
+        self.position(parsed).ok_or_else(|| NOT_LIVE_ERR.into())
+    }
+
+    /// The totals live on the session, so a plugin that reloads mid run keeps
+    /// the accounting it would lose by summing `TurnEnd` payloads itself.
+    fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
+        let rt = &self.sessions[idx];
+        let app = &rt.app;
+        let snapshot = SessionSnapshot {
+            id: rt.id().to_string(),
+            cwd: app.state.session.cwd.clone(),
+            title: Some(app.state.session.title.clone()),
+            model: app.state.model.spec(),
+            mode: if app.state.mode == crate::app::mode::Mode::Plan {
+                MODE_PLAN
+            } else {
+                MODE_BUILD
+            },
+            status: SessionStatus::of(app).as_str(),
+            focused: idx == self.focused,
+            updated_at: app.state.session.updated_at,
+            queue: Some(SessionQueueSnapshot {
+                count: app.queue.text_messages().len(),
+            }),
+            usage: app.state.token_usage,
+            context_size: app.state.context_size,
+            context_window: app.state.model.context_window,
+            cost: app.state.cost,
+        };
+        serde_json::to_value(snapshot).unwrap_or_default()
     }
 
     /// The single place that removes a runtime: keeps `focused` pointing at
@@ -3089,11 +3155,14 @@ impl<'t> EventLoop<'t> {
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
-            Action::Compact => {
+            Action::Compact(instructions) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Compact { run_id });
+                rt.handles.queue.push(QueueItem::Compact {
+                    run_id,
+                    instructions,
+                });
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
@@ -3686,6 +3755,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             maki_config::PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(std::path::Path::new("/tmp")),
             Arc::default(),
         ));
         let mut app = crate::app::tests::test_app();
@@ -3970,6 +4040,7 @@ mod tests {
             let permissions = Arc::new(PermissionManager::new(
                 PermissionsConfig::default(),
                 temp_dir.path().to_path_buf(),
+                ProjectConfig::for_project(temp_dir.path()),
                 Arc::default(),
             ));
             let storage_writer =
@@ -3994,6 +4065,7 @@ mod tests {
                 model_policy: Arc::new(ModelPolicy::default()),
                 system_prompt: SystemPromptOverride::default(),
                 command_runtime,
+                trust_question: None,
             };
             Self {
                 _temp_dir: temp_dir,
@@ -5496,13 +5568,13 @@ mod tests {
     }
 
     fn done_event() -> AgentEvent {
-        AgentEvent::TurnOutcome(TurnOutcome::Completed {
-            agent_id: AgentId::generate(),
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        })
+        AgentEvent::TurnOutcome(TurnOutcome::completed(
+            AgentId::generate(),
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        ))
     }
 
     fn due_completion() -> RunNotificationState {

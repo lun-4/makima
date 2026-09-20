@@ -57,13 +57,14 @@ pub(crate) enum QueueItem {
     },
     Compact {
         run_id: u64,
+        instructions: Option<String>,
     },
 }
 
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
-            Self::Message { run_id, .. } | Self::Compact { run_id } => *run_id,
+            Self::Message { run_id, .. } | Self::Compact { run_id, .. } => *run_id,
         }
     }
 }
@@ -224,26 +225,30 @@ fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), Actor
     match entry {
         QueueItem::Message {
             text,
-            image_count,
+            image_count: _,
             input,
             run_id,
             displayed,
         } => {
+            let images = input.images.clone();
             if displayed {
                 let _ticket = actor.admit_turn(input, None, correlation(run_id))?;
                 Ok(())
             } else {
-                actor.rush(RootWork {
+                actor.rush(RootWork::new(
                     input,
                     run_id,
                     displayed,
                     text,
-                    image_count,
-                    correlation: correlation(run_id),
-                })
+                    images,
+                    correlation(run_id),
+                ))
             }
         }
-        QueueItem::Compact { run_id } => actor.push_compact(run_id),
+        QueueItem::Compact {
+            run_id,
+            instructions,
+        } => actor.push_compact(run_id, instructions),
     }
 }
 
@@ -252,7 +257,7 @@ fn visible_in_panel(entry: &QueueProjection) -> bool {
         QueueProjection::Message { displayed, .. } => !displayed,
         // Admitted turns project as `Turn`; they are already running or
         // already drawn, so the panel never reserves a row for them.
-        QueueProjection::Compact => true,
+        QueueProjection::Compact(_) => true,
         QueueProjection::Control(_) | QueueProjection::Turn(_) => false,
     }
 }
@@ -263,8 +268,11 @@ fn as_queue_entry(entry: &QueueProjection) -> QueueEntry<'static> {
             text: Cow::Owned(text.clone()),
             color: theme::current().foreground,
         },
-        QueueProjection::Compact => QueueEntry {
-            text: Cow::Borrowed(COMPACT_COMMAND_NAME),
+        QueueProjection::Compact(instructions) => QueueEntry {
+            text: match instructions {
+                Some(extra) => Cow::Owned(format!("{COMPACT_COMMAND_NAME} {extra}")),
+                None => Cow::Borrowed(COMPACT_COMMAND_NAME),
+            },
             color: theme::current()
                 .queue
                 .fg
@@ -290,7 +298,9 @@ impl From<&QueueItem> for QueueProjection {
                 image_count: *image_count,
                 displayed: *displayed,
             },
-            QueueItem::Compact { .. } => QueueProjection::Compact,
+            QueueItem::Compact { instructions, .. } => {
+                QueueProjection::Compact(instructions.clone())
+            }
         }
     }
 }
@@ -323,7 +333,7 @@ mod tests {
 
     #[test_case(msg(false), true  ; "deferred_message_visible")]
     #[test_case(msg(true),  false ; "displayed_message_hidden")]
-    #[test_case(QueueItem::Compact { run_id: 0 }, true  ; "compact_visible")]
+    #[test_case(QueueItem::Compact { run_id: 0, instructions: None }, true  ; "compact_visible")]
     fn panel_visibility(item: QueueItem, visible: bool) {
         let tx = queue();
         tx.push(item);

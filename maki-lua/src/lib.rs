@@ -1,12 +1,15 @@
+pub mod agent_autocmd;
 mod api;
 mod coalesced_latest;
 pub mod docs;
 pub mod docs_render;
 mod error;
+pub(crate) mod hook;
 pub mod language;
 mod loader;
 pub(crate) mod plugin_permissions;
 mod runtime;
+pub mod session_snapshot;
 mod splash;
 #[cfg(test)]
 mod write_lock_regression;
@@ -27,7 +30,7 @@ pub use error::{PluginError, SessionOptionMutationError};
 pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, TestCompletionBackend};
 pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{CommandArgumentContext, CommandArgumentLifecycle};
-pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
+pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
 pub use splash::{
     SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull, SplashRow, SplashStyle, VersionInfo,
 };
@@ -46,6 +49,8 @@ pub mod test_support {
         StatusContentWriter,
     };
     use crate::{EventHandle, KeymapReader, PluginHost, TestCompletionBackend};
+
+    pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
 
     /// Stands in for the Lua thread publishing a plugin's status hints.
     pub struct HintWriterHandle(HintWriter);

@@ -123,3 +123,5 @@ maki.api.register_command({
     open_selector()
   end,
 })
+
+maki.keymap.set("n", "<M-t>", open_selector, { desc = "Thinking effort" })

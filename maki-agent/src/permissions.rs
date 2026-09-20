@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
-    ToolKey, append_permission_rule,
+    ProjectConfig, ToolKey, append_permission_rule,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -145,10 +145,12 @@ impl ApprovalGate {
 pub enum PermissionAnswer {
     AllowOnce,
     AllowSession,
+    AllowAlwaysProject,
     AllowAlwaysLocal,
     AllowAlwaysGlobal,
     Deny,
     DenyWithGuidance(String),
+    DenyAlwaysProject,
     DenyAlwaysLocal,
     DenyAlwaysGlobal,
 }
@@ -157,7 +159,11 @@ impl PermissionAnswer {
     pub fn is_allow(&self) -> bool {
         matches!(
             self,
-            Self::AllowOnce | Self::AllowSession | Self::AllowAlwaysLocal | Self::AllowAlwaysGlobal
+            Self::AllowOnce
+                | Self::AllowSession
+                | Self::AllowAlwaysProject
+                | Self::AllowAlwaysLocal
+                | Self::AllowAlwaysGlobal
         )
     }
 
@@ -165,10 +171,12 @@ impl PermissionAnswer {
         match self {
             Self::AllowOnce => "allow".to_string(),
             Self::AllowSession => "allow_session".to_string(),
+            Self::AllowAlwaysProject => "allow_always_project".to_string(),
             Self::AllowAlwaysLocal => "allow_always_local".to_string(),
             Self::AllowAlwaysGlobal => "allow_always_global".to_string(),
             Self::Deny => "deny".to_string(),
             Self::DenyWithGuidance(g) => format!("deny:{g}"),
+            Self::DenyAlwaysProject => "deny_always_project".to_string(),
             Self::DenyAlwaysLocal => "deny_always_local".to_string(),
             Self::DenyAlwaysGlobal => "deny_always_global".to_string(),
         }
@@ -178,9 +186,11 @@ impl PermissionAnswer {
         match s {
             "allow" => Some(Self::AllowOnce),
             "allow_session" => Some(Self::AllowSession),
+            "allow_always_project" => Some(Self::AllowAlwaysProject),
             "allow_always_local" => Some(Self::AllowAlwaysLocal),
             "allow_always_global" => Some(Self::AllowAlwaysGlobal),
             "deny" => Some(Self::Deny),
+            "deny_always_project" => Some(Self::DenyAlwaysProject),
             "deny_always_local" => Some(Self::DenyAlwaysLocal),
             "deny_always_global" => Some(Self::DenyAlwaysGlobal),
             _ if s.starts_with("deny:") => {
@@ -200,6 +210,47 @@ impl PermissionAnswer {
             Self::DenyWithGuidance(g) => Some(g),
             _ => None,
         }
+    }
+}
+
+/// Splits the ask id from the encoded answer on the answer channel. A control
+/// character cannot appear in a tool-use id, and the answer is the tail, so
+/// deny guidance holding one still round-trips.
+const ANSWER_ID_SEPARATOR: char = '\u{1f}';
+
+/// An answer together with the id of the ask it answers.
+///
+/// The name is what makes a late answer harmless. The answer channel is a
+/// queue with no receiver parked between turns, so an answer to a cancelled
+/// turn's ask can sit there until the next turn's first permission wait pops
+/// it. Untagged, that stale answer is applied to a different tool and scope,
+/// and an `allow_always_*` then installs a rule for something the user never
+/// saw. Tagged, the waiter can tell it apart and drop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedAnswer {
+    pub request_id: String,
+    pub answer: PermissionAnswer,
+}
+
+impl TaggedAnswer {
+    pub fn new(request_id: impl Into<String>, answer: PermissionAnswer) -> Self {
+        Self {
+            request_id: request_id.into(),
+            answer,
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!(
+            "{}{ANSWER_ID_SEPARATOR}{}",
+            self.request_id,
+            self.answer.encode()
+        )
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        let (request_id, answer) = raw.split_once(ANSWER_ID_SEPARATOR)?;
+        Some(Self::new(request_id, PermissionAnswer::decode(answer)?))
     }
 }
 
@@ -246,6 +297,7 @@ pub struct PermissionManager {
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
     cwd: Mutex<PathBuf>,
+    project_config: ProjectConfig,
     plugin_rules: Arc<PluginRuleStore>,
 }
 
@@ -253,6 +305,7 @@ impl PermissionManager {
     pub fn new(
         config: PermissionsConfig,
         cwd: PathBuf,
+        project_config: ProjectConfig,
         plugin_rules: Arc<PluginRuleStore>,
     ) -> Self {
         let config_rules = config.rules;
@@ -289,6 +342,7 @@ impl PermissionManager {
             default: config.default,
             tool_defaults: config.tool_defaults,
             cwd: Mutex::new(cwd),
+            project_config,
             plugin_rules,
         }
     }
@@ -315,6 +369,7 @@ impl PermissionManager {
                     .unwrap_or_else(|error| error.into_inner())
                     .clone(),
             ),
+            project_config: self.project_config.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
         }
     }
@@ -519,6 +574,32 @@ impl PermissionManager {
         *self.session_rules() = rules;
     }
 
+    pub fn project_is_trusted(&self) -> bool {
+        self.project_config.is_trusted()
+    }
+
+    /// Where an always-answer gets written, or `None` when it only holds for
+    /// this session. An untrusted folder gets nothing, for a different reason
+    /// on each side. An allow saved there is stripped on the next start, so it
+    /// would only look forgotten. A deny would survive, because an untrusted
+    /// project still contributes its deny scopes, but saving it means Maki
+    /// writing `.maki/permissions.toml` into a checkout the user declined to
+    /// trust, and the next start would then ask them about a gated file Maki
+    /// created itself. The durable deny is the global one, which lands in the
+    /// user's own config and no repository can touch.
+    fn persist_target(&self, answer: &PermissionAnswer) -> Option<PermissionTarget> {
+        match answer {
+            PermissionAnswer::AllowAlwaysProject
+            | PermissionAnswer::AllowAlwaysLocal
+            | PermissionAnswer::DenyAlwaysProject
+            | PermissionAnswer::DenyAlwaysLocal => self
+                .project_config
+                .is_trusted()
+                .then(|| PermissionTarget::Project(self.project_config.clone())),
+            _ => Some(PermissionTarget::Global),
+        }
+    }
+
     pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
         let resolved = if answer.is_allow() || tool.is_mcp() {
             // MCP scopes are always wildcarded — both allow and deny generalize to "*".
@@ -542,8 +623,10 @@ impl PermissionManager {
                     });
                 }
             }
-            PermissionAnswer::AllowAlwaysLocal
+            PermissionAnswer::AllowAlwaysProject
+            | PermissionAnswer::AllowAlwaysLocal
             | PermissionAnswer::AllowAlwaysGlobal
+            | PermissionAnswer::DenyAlwaysProject
             | PermissionAnswer::DenyAlwaysLocal
             | PermissionAnswer::DenyAlwaysGlobal => {
                 let effect = if answer.is_allow() {
@@ -551,24 +634,22 @@ impl PermissionManager {
                 } else {
                     Effect::Deny
                 };
-                let target = match answer {
-                    PermissionAnswer::AllowAlwaysLocal | PermissionAnswer::DenyAlwaysLocal => {
-                        PermissionTarget::Project(
-                            self.cwd
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .clone(),
-                        )
-                    }
-                    _ => PermissionTarget::Global,
-                };
+                let target = self.persist_target(answer);
+                if target.is_none() {
+                    info!(
+                        tool = %tool,
+                        "project answer stays in this session because the folder is not trusted, the global answer is the one that lasts"
+                    );
+                }
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
                         tool: tool.clone(),
                         scope: Some(s.clone()),
                         effect,
                     });
-                    if let Err(e) = append_permission_rule(tool, Some(s), effect, &target) {
+                    if let Some(target) = &target
+                        && let Err(e) = append_permission_rule(tool, Some(s), effect, target)
+                    {
                         tracing::warn!(error = %e, "failed to persist permission rule");
                     }
                 }
@@ -624,21 +705,35 @@ impl PermissionManager {
             tool: t2.clone(),
             scopes: s2.clone(),
         });
-        let response = cancel.race(guard.recv_async()).await;
-        drop(guard);
-
-        let answer = match response {
-            Ok(Ok(a)) => a,
-            Ok(Err(_)) => {
-                warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
-                return Err(deny(None));
+        // Only the answer naming this ask may be applied. Anything else is a
+        // leftover from a cancelled or reassigned ask, so it is dropped and the
+        // wait continues: consuming it would approve or deny this tool on a
+        // decision the user made about another one.
+        let answer = loop {
+            let response = cancel.race(guard.recv_async()).await;
+            match response {
+                Ok(Ok(raw)) => match TaggedAnswer::decode(&raw) {
+                    Some(tagged) if tagged.request_id == request_id => break tagged.answer,
+                    tagged => warn!(
+                        tool = %tool,
+                        scope = %scope_display(),
+                        request_id,
+                        answered = tagged.map(|t| t.request_id).unwrap_or_default(),
+                        "discarding a permission answer that does not name this request"
+                    ),
+                },
+                Ok(Err(_)) => {
+                    drop(guard);
+                    warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
+                    return Err(deny(None));
+                }
+                Err(_) => {
+                    drop(guard);
+                    return Err(deny(None));
+                }
             }
-            Err(_) => return Err(deny(None)),
         };
-
-        let Some(answer) = PermissionAnswer::decode(&answer) else {
-            return Err(deny(None));
-        };
+        drop(guard);
         self.apply_decision(&t2, &s2, &answer);
         if answer.is_allow() {
             Ok(())
@@ -842,6 +937,8 @@ mod tests {
     const ALLOWED: &str = "allowed";
     const DENIED: &str = "denied";
     const PROMPTS: &str = "prompts";
+    const PROJECT_DIR: &str = ".makima";
+    const PROJECT_PERMISSIONS: &str = ".makima/permissions.toml";
 
     fn outcome(check: PermissionCheck) -> &'static str {
         match check {
@@ -888,7 +985,8 @@ mod tests {
     }
 
     fn mgr_with(config: PermissionsConfig, cwd: PathBuf) -> PermissionManager {
-        PermissionManager::new(config, cwd, Arc::default())
+        let project_config = ProjectConfig::for_project(&cwd);
+        PermissionManager::new(config, cwd, project_config, Arc::default())
     }
 
     fn default_mgr() -> PermissionManager {
@@ -1117,6 +1215,42 @@ mod tests {
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
             PermissionCheck::NeedsPrompt { .. }
         ));
+    }
+
+    /// A trusted folder collects the answer in `.makima/permissions.toml`. An
+    /// untrusted one keeps it for the session and gets no `.makima` directory,
+    /// for deny as much as for allow, because declining to trust a checkout
+    /// has to leave nothing behind in it. The deny that lasts is the global
+    /// one.
+    #[test_case(PermissionAnswer::AllowAlwaysProject, true, true ; "allow_is_written_when_trusted")]
+    #[test_case(PermissionAnswer::DenyAlwaysProject, false, true ; "deny_is_written_when_trusted")]
+    #[test_case(PermissionAnswer::AllowAlwaysProject, true, false ; "allow_stays_in_the_session_when_untrusted")]
+    #[test_case(PermissionAnswer::DenyAlwaysProject, false, false ; "deny_stays_in_the_session_when_untrusted")]
+    fn project_answer_is_written_only_in_a_trusted_folder(
+        answer: PermissionAnswer,
+        allowed: bool,
+        trusted: bool,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let mgr = PermissionManager::new(
+            PermissionsConfig::default(),
+            project.path().to_path_buf(),
+            if trusted {
+                ProjectConfig::for_project(project.path())
+            } else {
+                ProjectConfig::discover(project.path())
+            },
+            Arc::default(),
+        );
+
+        mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer);
+
+        assert_eq!(mgr.session_rules_snapshot().len(), 1);
+        assert_eq!(project.path().join(PROJECT_DIR).exists(), trusted);
+        assert_eq!(project.path().join(PROJECT_PERMISSIONS).is_file(), trusted);
+        let check = mgr.check(&ToolKey::native("bash"), "cargo test", None);
+        assert_eq!(matches!(check, PermissionCheck::Allowed), allowed);
+        assert_eq!(matches!(check, PermissionCheck::Denied), !allowed);
     }
 
     #[test]
@@ -1522,6 +1656,22 @@ mod tests {
         assert!(mgr.session_rules_snapshot().is_empty());
     }
 
+    #[test_case(PermissionAnswer::AllowAlwaysLocal ; "allow")]
+    #[test_case(PermissionAnswer::Deny ; "deny")]
+    #[test_case(PermissionAnswer::DenyWithGuidance("no\u{1f}way".into()) ; "guidance_with_separator")]
+    fn tagged_answer_roundtrip(answer: PermissionAnswer) {
+        let tagged = TaggedAnswer::new("toolu_1", answer);
+        assert_eq!(TaggedAnswer::decode(&tagged.encode()), Some(tagged));
+    }
+
+    #[test_case("" ; "empty")]
+    #[test_case("allow" ; "untagged_answer")]
+    #[test_case("toolu_1" ; "id_only")]
+    #[test_case("{\"json\": true}" ; "elicitation_result")]
+    fn untagged_payloads_never_decode_to_an_answer(raw: &str) {
+        assert_eq!(TaggedAnswer::decode(raw), None);
+    }
+
     #[test]
     fn default_deny_blocks_unmatched() {
         let mgr = mgr_with(
@@ -1780,6 +1930,7 @@ mod tests {
         let mgr = PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
             Arc::clone(&store),
         );
         let fork = mgr.fork();
@@ -1799,6 +1950,7 @@ mod tests {
         let mgr = PermissionManager::new(
             make_config(vec![plugin_edit_rule("/x/**", Effect::Deny)]),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
             store,
         );
         assert!(matches!(

@@ -43,6 +43,7 @@ flume = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
+maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
@@ -69,7 +70,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.11-makima"
+version = "0.5.5-makima"
 edition = "2024"
 authors = ["Luna <luna@l4.pm", "Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -99,6 +100,7 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["osc52"] }
 fs2 = "0.4"
+fs4 = "1"
 color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
 termini = "1"
 thiserror = "2"
@@ -131,6 +133,7 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 keyring = "4"
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }

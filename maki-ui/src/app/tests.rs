@@ -53,8 +53,7 @@ const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_IMAGE_DATA: &str = "dGVzdA==";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
     "command failed: local commands cannot include non-text content";
-const FAST_UNSUPPORTED_COMMAND_ERROR: &str =
-    "command failed: Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const FAST_UNSUPPORTED_COMMAND_ERROR: &str = "command failed: Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -384,6 +383,7 @@ fn build_app_with_full(
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
+            maki_config::ProjectConfig::for_project(Path::new("/tmp")),
             Arc::default(),
         )),
         handle,
@@ -431,6 +431,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
+            maki_config::ProjectConfig::for_project(Path::new("/tmp")),
             Arc::default(),
         )),
         handle,
@@ -514,13 +515,13 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
 }
 
 fn done() -> AgentEvent {
-    AgentEvent::TurnOutcome(TurnOutcome::Completed {
-        agent_id: AgentId::generate(),
-        turn_id: TurnId::generate(),
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        reason: DoneReason::EndTurn,
-    })
+    AgentEvent::TurnOutcome(TurnOutcome::completed(
+        AgentId::generate(),
+        TurnId::generate(),
+        TokenUsage::default(),
+        1,
+        DoneReason::EndTurn,
+    ))
 }
 
 fn done_event() -> Msg {
@@ -574,6 +575,7 @@ fn subagent_info_for_agent(
         name: name.into(),
         prompt: None,
         model: None,
+        opts: None,
         answer_tx,
         input_tx,
         cancel: None,
@@ -891,7 +893,7 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
             text: "queued".into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         app.run_id,
     ));
@@ -915,7 +917,7 @@ fn queue_item_consumed_marks_agent_streaming() {
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
             text: "restored".into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         app.run_id,
     ));
@@ -2397,6 +2399,8 @@ fn restored_subagents_have_no_ago_and_are_finished() {
         tool_use_id: id.clone(),
         name: "old task".into(),
         model: None,
+        thinking: None,
+        fast: false,
     }]);
     app.state
         .session_mut()
@@ -2605,24 +2609,31 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     );
 }
 
-#[test]
-fn compact_command_sets_streaming() {
+const COMPACT_GUIDANCE: &str = "keep the failing test names";
+const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
+
+#[test_case("/compact", None ; "no_guidance")]
+#[test_case(COMPACT_WITH_GUIDANCE, Some(COMPACT_GUIDANCE) ; "guidance_forwarded")]
+fn compact_command_sets_streaming(cmdline: &str, expected: Option<&str>) {
     let mut app = test_app();
-    let actions = app.execute_command(cmd("/compact"), 0);
-    assert!(matches!(&actions[0], Action::Compact));
+    let actions = app.execute_command(cmd(cmdline), 0);
+    assert!(
+        matches!(&actions[0], Action::Compact(instructions) if instructions.as_deref() == expected)
+    );
     assert_eq!(app.status, Status::Streaming);
 }
 
-#[test]
-fn compact_during_streaming_queues_item() {
+#[test_case("/compact" ; "bare")]
+#[test_case(COMPACT_WITH_GUIDANCE ; "guidance_shown_in_panel")]
+fn compact_during_streaming_queues_item(cmdline: &str) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
 
-    let actions = app.execute_command(cmd("/compact"), 0);
+    let actions = app.execute_command(cmd(cmdline), 0);
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, "/compact");
+    assert_eq!(app.queue.panel_entries()[0].text, cmdline);
 }
 
 #[test]
@@ -3735,7 +3746,7 @@ fn scroll_preserves_dragging_and_updates_cursor() {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
-            app.active_chat().view(frame, area, false);
+            app.active_chat().view(frame, area, false, true);
         })
         .unwrap();
 
@@ -5170,6 +5181,66 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
     assert_eq!(app.pending_input, PendingInput::None);
 }
 
+/// Output that mutates a segment already on screen, rather than appending a
+/// new one, still has to be searchable. A `!` shell command does exactly this
+/// and never sets `Status::Streaming`, so the status is no guide to staleness.
+#[test]
+fn search_reaches_output_that_lands_in_an_existing_segment() {
+    const LATE_TEXT: &str = "zzarrived";
+
+    let mut app = test_app();
+    app.run_id = 1;
+    app.update(agent_msg(tool_start("tool-1", "bash")));
+    rendered(&mut app);
+    app.update(Msg::Key(kb::SEARCH.to_key_event()));
+
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "tool-1".into(),
+        tool: "bash".into(),
+        output: ToolOutput::Plain(LATE_TEXT.into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }))));
+    rendered(&mut app);
+    for c in LATE_TEXT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+
+    assert!(
+        app.search_modal.current_segment_index().is_some(),
+        "search must see output that landed in a segment opened before it"
+    );
+}
+
+/// The messages that close a turn out land after the status has already left
+/// `Streaming`, so both statuses have to reach a freshly appended segment.
+#[test_case(Status::Streaming ; "mid_turn")]
+#[test_case(Status::Idle      ; "after_the_turn_ended")]
+fn search_reaches_output_that_lands_while_the_modal_is_open(status: Status) {
+    // Nothing else in the transcript holds this string, so a hit can only come
+    // from a corpus rebuilt after the modal opened.
+    const LATE_TEXT: &str = "zzarrived";
+
+    let mut app = test_app();
+    app.status = status;
+    app.update(Msg::Key(kb::SEARCH.to_key_event()));
+
+    app.active_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        LATE_TEXT.into(),
+    ));
+    rendered(&mut app);
+    for c in LATE_TEXT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+
+    assert!(
+        app.search_modal.current_segment_index().is_some(),
+        "search must see the message that arrived after the modal opened"
+    );
+}
+
 #[test_case(42, false ; "restores_scroll_position")]
 #[test_case(0,  true  ; "restores_auto_scroll")]
 fn search_escape_restores_scroll(scroll_top: u16, auto_scroll: bool) {
@@ -6177,6 +6248,43 @@ fn fast_toggle_on_off_on_opus() {
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
 
+fn pending_app() -> App {
+    let mut app = test_app();
+    app.state.model.supports_fast_override = Some(maki_providers::model::FastSupport::Pending);
+    app
+}
+
+#[test_case(false ; "kept")]
+#[test_case(true ; "cancelled")]
+fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
+    let mut app = pending_app();
+    app.set_fast(true).unwrap();
+    if cancel {
+        app.set_fast(false).unwrap();
+    }
+    assert!(!app.state.fast);
+    assert_eq!(app.state.pending_fast, !cancel);
+    assert_eq!(app.build_meta().fast, !cancel);
+
+    let mut model = app.state.model.clone();
+    model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+    app.update_model(&model);
+    assert_eq!(app.state.fast, !cancel);
+    assert!(!app.state.pending_fast);
+    assert_eq!(app.build_meta().fast, !cancel);
+}
+
+#[test]
+fn fast_command_flashes_pending_while_discovery_runs() {
+    let mut app = pending_app();
+    for expected in [FAST_PENDING_MSG, FAST_OFF_MSG] {
+        app.execute_command(cmd("/fast"), 0);
+        assert_eq!(app.status_bar.flash_text(), Some(expected));
+        assert!(!app.state.fast);
+    }
+    assert!(!app.state.pending_fast);
+}
+
 #[test]
 fn workflow_toggle_flows_into_agent_input() {
     let mut app = test_app();
@@ -6259,13 +6367,13 @@ fn stamped_child_tool_done_does_not_finish_the_child_turn() {
     assert_eq!(app.chats[1].in_progress_count(), 0);
 
     app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
-            agent_id: info.agent_id,
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        }),
+        event: AgentEvent::TurnOutcome(TurnOutcome::completed(
+            info.agent_id,
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        )),
         subagent: Some(info),
         run_id: 1,
     })));
@@ -6287,13 +6395,13 @@ fn outer_task_done_does_not_duplicate_stamped_child_completion() {
         run_id: 1,
     })));
     app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
-            agent_id: info.agent_id,
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        }),
+        event: AgentEvent::TurnOutcome(TurnOutcome::completed(
+            info.agent_id,
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        )),
         subagent: Some(info),
         run_id: 1,
     })));
@@ -6335,13 +6443,13 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
         run_id: 1,
     })));
 
-    app.update(envelope(TurnOutcome::Completed {
-        agent_id: AgentId::generate(),
-        turn_id: TurnId::generate(),
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        reason: DoneReason::EndTurn,
-    }));
+    app.update(envelope(TurnOutcome::completed(
+        AgentId::generate(),
+        TurnId::generate(),
+        TokenUsage::default(),
+        1,
+        DoneReason::EndTurn,
+    )));
     app.run_id = 2;
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
@@ -6373,18 +6481,18 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
         )],
         "old-run recovered history must queue a main-agent turn"
     );
-    app.update(envelope(TurnOutcome::Failed {
-        agent_id: AgentId::generate(),
-        turn_id: TurnId::generate(),
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        failure: TurnFailure {
+    app.update(envelope(TurnOutcome::failed(
+        AgentId::generate(),
+        TurnId::generate(),
+        TokenUsage::default(),
+        1,
+        TurnFailure {
             kind: TurnFailureKind::Provider,
             diagnostic: FAILURE_MESSAGE.into(),
             user_message: FAILURE_MESSAGE.into(),
             retryable: false,
         },
-    }));
+    )));
 
     assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
@@ -6454,13 +6562,13 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
         retryable: false,
     };
     app.update(subagent_msg_with_run_id(
-        AgentEvent::TurnOutcome(TurnOutcome::Failed {
-            agent_id: AgentId::generate(),
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
+        AgentEvent::TurnOutcome(TurnOutcome::failed(
+            AgentId::generate(),
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
             failure,
-        }),
+        )),
         TASK_ID,
         Some("worker"),
         1,
@@ -6486,18 +6594,18 @@ fn failed_subagent_delivery_obeys_ownership_policy(
     let mut info = subagent_info_full(TASK_ID, "worker", None, Some(input_tx));
     info.parent_is_root = parent_is_root;
     info.auto_deliver = auto_deliver;
-    let outcome = TurnOutcome::Failed {
-        agent_id: info.agent_id,
-        turn_id: TurnId::generate(),
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        failure: TurnFailure {
+    let outcome = TurnOutcome::failed(
+        info.agent_id,
+        TurnId::generate(),
+        TokenUsage::default(),
+        1,
+        TurnFailure {
             kind: TurnFailureKind::Provider,
             diagnostic: FAILURE_MESSAGE.into(),
             user_message: FAILURE_MESSAGE.into(),
             retryable: false,
         },
-    };
+    );
 
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TurnOutcome(outcome),
@@ -8555,13 +8663,13 @@ fn submit_after_subagent_completion_routes_to_reusable_child() {
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
     let input_tx = app.subagent_channels[&agent_id].input_tx.clone();
     app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
+        event: AgentEvent::TurnOutcome(TurnOutcome::completed(
             agent_id,
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        }),
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        )),
         subagent: Some(subagent_info_for_agent(
             agent_id, TASK_ID, "research", None, input_tx,
         )),
@@ -8605,18 +8713,18 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
     assert_eq!(app.chats[chat_idx].last_message_text(), CANCELLED_TEXT);
 
     app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TurnOutcome(TurnOutcome::Failed {
+        event: AgentEvent::TurnOutcome(TurnOutcome::failed(
             agent_id,
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            failure: TurnFailure {
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            TurnFailure {
                 kind: TurnFailureKind::Provider,
                 diagnostic: LATE_FAILURE.into(),
                 user_message: LATE_FAILURE.into(),
                 retryable: false,
             },
-        }),
+        )),
         subagent: Some(info),
         run_id: 1,
     })));

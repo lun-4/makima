@@ -19,7 +19,7 @@ use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
-    PERMISSION_NAME_WARNING, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
+    MAX_INFLIGHT_TOOLS, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
     WinCommand, WinEvent,
 };
 use maki_providers::Model;
@@ -44,9 +44,6 @@ const PICKER_CLOSE_TIMEOUT: &str = "sessions picker did not close";
 const SHADOWED_TOOL: &str = "skill";
 const REPLACEMENT_PLUGIN: &str = "my_skill";
 const REPLACEMENT_DESC: &str = "took the builtin name over";
-const PERMISSION_KEYED_TOOL: &str = "task";
-const OTHER_PERMISSION_KEYED_TOOL: &str = "write";
-const PLAIN_TOOL: &str = "plain_helper";
 
 struct FakeCommandHost;
 
@@ -111,12 +108,39 @@ fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
 }
 
-fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
+fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = fresh_registry();
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-        .unwrap();
+    host.load_builtins(config).unwrap();
     (reg, host)
+}
+
+fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
+    builtins_host_with(&PluginsConfig::from_plugins(HashMap::new()))
+}
+
+/// A tool can be registered and still stay invisible to the model, so this
+/// goes through the definitions a real request is built from.
+fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: &str) -> String {
+    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    let filter = ToolFilter::from_config(agent, &model, &[]);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+    let defs = reg.definitions(&Vars::new(), &ctx, false);
+    let def = defs
+        .as_array()
+        .expect("definitions returns an array")
+        .iter()
+        .find(|def| def["name"] == name)
+        .unwrap_or_else(|| panic!("{name} must reach the model"));
+    def["description"]
+        .as_str()
+        .expect("description is a string")
+        .to_owned()
 }
 
 fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
@@ -2881,6 +2905,37 @@ fn unknown_plugin_name_fails_load_builtins() {
     );
 }
 
+fn websearch_config(provider: &str) -> PluginsConfig {
+    PluginsConfig {
+        enabled: true,
+        names: vec!["websearch".to_owned()],
+        opts: HashMap::from([(
+            "websearch".to_owned(),
+            json_obj(serde_json::json!({ "provider": provider })),
+        )]),
+    }
+}
+
+/// The backend the plugin talks to is invisible from Rust, so we read it off
+/// the one thing it leaks: the description the model gets.
+#[test_case::test_case("exa", "Exa AI" ; "default_backend")]
+#[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
+fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
+    let (reg, _host) = builtins_host_with(&websearch_config(provider));
+    let description = tool_description(&reg, &maki_config::AgentConfig::default(), "websearch");
+    assert!(description.contains(expected), "got: {description}");
+}
+
+#[test]
+fn websearch_unknown_provider_fails_the_load() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_builtins(&websearch_config("altavista"))
+        .expect_err("unknown provider should fail");
+    assert!(err.to_string().contains("unknown provider"), "got: {err}");
+}
+
 fn shadow_src() -> String {
     format!(
         r#"maki.api.register_tool({{
@@ -2909,27 +2964,13 @@ fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
         )
         .unwrap()
         .expect("setup returns a config");
-    let config = raw.into_config(&[]).unwrap();
+    let config = raw.into_config(false).unwrap();
     host.load_builtins(&config.plugins).unwrap();
     host.load_source(REPLACEMENT_PLUGIN, &shadow_src())
         .expect("a disabled builtin leaves its tool name free");
 
-    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
-    let ctx = DescriptionContext {
-        filter: &filter,
-        audience: ToolAudience::MAIN,
-        workflow: false,
-        mcp: false,
-    };
-    let defs = reg.definitions(&Vars::new(), &ctx, false);
-    let shadowed = defs
-        .as_array()
-        .expect("definitions returns an array")
-        .iter()
-        .find(|def| def["name"] == SHADOWED_TOOL)
-        .expect("the replacement must reach the model, not just `maki prompt --tools`");
-    assert_eq!(shadowed["description"], REPLACEMENT_DESC);
+    let shadowed = tool_description(&reg, &config.agent, SHADOWED_TOOL);
+    assert_eq!(shadowed, REPLACEMENT_DESC);
 }
 
 #[test]
@@ -4416,7 +4457,8 @@ fn bash_permission_scopes_split_per_command(command: &str, expected: &[&str]) {
     let input = serde_json::json!({ "command": command });
     let entry = reg.get("bash").expect("bash registered");
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+    let scopes =
+        smol::block_on(inv.permission_scopes(None)).expect("permission_scopes returned None");
 
     assert!(!scopes.force_prompt, "command: {command}");
     assert_eq!(scopes.scopes, expected, "command: {command}");
@@ -4934,6 +4976,57 @@ fn interpreter_tools_gather_resolves_parallel_batch() {
     host.load_source("interp_gather_plugin", &src).unwrap();
     let out = exec_tool(&reg, "interp_gather", serde_json::json!({})).unwrap();
     assert_eq!(out, "A|B");
+}
+
+const NESTED_DEPTH_TOOL: &str = "nested_depth";
+const NESTED_DEPTH_BOTTOM: &str = "bottom";
+const NESTED_DEPTH_WEDGED: &str =
+    "nested call chain never replied: the in-flight gate charged a slot per level";
+const NESTED_DEPTH_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "nested_depth",
+    description = "dispatches itself one level deeper",
+    schema = {
+        type = "object",
+        properties = { depth = { type = "integer" } },
+        required = { "depth" },
+    },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        if input.depth == 0 then return "bottom" end
+        local out, err = maki.agent.call_tool(ctx, "nested_depth", { depth = input.depth - 1 })
+        if err then return { llm_output = err, is_error = true } end
+        return out
+    end,
+})
+"#;
+
+/// Every level stays parked on its child, so a slot per level wedges the gate
+/// for good once the chain is longer than the cap. A nested call rides its
+/// caller's slot instead, which leaves the depth up to the callers.
+#[test]
+fn nested_calls_run_deeper_than_the_inflight_cap() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("nested_depth_plugin", NESTED_DEPTH_PLUGIN)
+        .unwrap();
+
+    let (done_tx, done_rx) = flume::bounded(1);
+    let worker_reg = Arc::clone(&reg);
+    std::thread::spawn(move || {
+        let out = exec_tool_in(
+            &worker_reg,
+            NESTED_DEPTH_TOOL,
+            json!({ "depth": MAX_INFLIGHT_TOOLS + 1 }),
+            Some(Arc::clone(&worker_reg)),
+        );
+        let _ = done_tx.send(out);
+    });
+
+    let out = poll_until(NESTED_DEPTH_WEDGED, || done_rx.try_recv().ok());
+
+    assert_eq!(out, Ok(NESTED_DEPTH_BOTTOM.to_owned()));
+    drop(host);
 }
 
 #[test]

@@ -151,8 +151,10 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         supports_tool_examples_override,
         thinking_override,
         supports_vision_override,
+        supports_fast_override: None,
         pricing,
         max_output_tokens,
+        turn_output_tokens: None,
         context_window,
         thinking_fields: None,
     }

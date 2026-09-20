@@ -1,5 +1,7 @@
 local parse_sse_response = require("parse_sse")
 local NO_RESULTS_MSG = "No search results found"
+local RATE_LIMIT_MSG = "rate limit exceeded"
+local QUERY = "rust async runtime"
 
 local failures = {}
 
@@ -86,6 +88,45 @@ end)
 case("parse_sse_only_no_result_lines_returns_no_results", function()
   local body = sse_line({ id = 1, method = "something" })
   eq(parse_sse_response(body), NO_RESULTS_MSG)
+end)
+
+case("parse_sse_jsonrpc_error_is_error", function()
+  local body = sse_line({ id = 1, error = { code = -32000, message = RATE_LIMIT_MSG } })
+  local text, err = parse_sse_response(body)
+  eq(text, nil, "a jsonrpc error must not read as no results")
+  assert(err and err:find(RATE_LIMIT_MSG, 1, true), "should surface the server message, got: " .. tostring(err))
+end)
+
+case("parse_sse_tool_is_error_is_error", function()
+  local body = sse_line({
+    result = { isError = true, content = { { type = "text", text = RATE_LIMIT_MSG } } },
+  })
+  local text, err = parse_sse_response(body)
+  eq(text, nil, "an isError result must not read as a search result")
+  assert(err and err:find(RATE_LIMIT_MSG, 1, true), "should surface the tool message, got: " .. tostring(err))
+end)
+
+-- ── providers ──
+
+local providers = require("providers")
+
+-- init.lua reads these off whichever backend the user picked, so a new entry
+-- that forgets one would only blow up mid request, against the live server.
+case("providers_carry_what_init_consumes", function()
+  for name, p in pairs(providers) do
+    for _, field in ipairs({ "label", "endpoint", "env", "auth_header", "tool" }) do
+      assert(type(p[field]) == "string", name .. " is missing " .. field)
+    end
+    eq(p.arguments(QUERY, 5).query, QUERY, name .. " must pass the query through")
+  end
+end)
+
+-- Each server names the result count differently and quietly falls back to
+-- its own default when the argument it does not know shows up.
+case("providers_count_argument_matches_the_backend", function()
+  eq(providers.exa.arguments(QUERY, 5).numResults, 5)
+  eq(providers.youcom.arguments(QUERY, 5).count, 5)
+  eq(providers.youcom.arguments(QUERY, 5).numResults, nil)
 end)
 
 if #failures > 0 then

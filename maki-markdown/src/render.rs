@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::iter;
 use std::mem;
 
-use maki_highlight::CodeHighlighter;
+use maki_highlight::{CodeHighlighter, StyledSegment};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -106,17 +106,18 @@ impl Line {
 }
 
 pub fn render(text: &str, width: u16) -> Vec<Line> {
-    Renderer::new().render(text, width, 0)
+    Renderer::new().render(text, width)
 }
 
 /// Reuses highlighter and table-width caches across calls so streaming
 /// (successive prefixes of a growing message) doesn't re-highlight completed
-/// code lines. Bump `theme_gen` to flush caches after a theme change.
+/// code lines. Caches are flushed automatically when the syntax theme changes.
 pub struct Renderer {
     highlighters: Vec<CodeHighlighter>,
     table_col_widths: Vec<Vec<usize>>,
     theme_gen: u64,
     wrap_paragraphs: bool,
+    incremental: bool,
 }
 
 impl Default for Renderer {
@@ -124,8 +125,9 @@ impl Default for Renderer {
         Self {
             highlighters: Vec::new(),
             table_col_widths: Vec::new(),
-            theme_gen: 0,
+            theme_gen: maki_highlight::theme_generation(),
             wrap_paragraphs: true,
+            incremental: false,
         }
     }
 }
@@ -144,7 +146,18 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, text: &str, width: u16, theme_gen: u64) -> Vec<Line> {
+    /// For successive prefixes of one growing message: keeps per-block
+    /// highlighter state so a new token costs one line, not one block.
+    pub fn streaming() -> Self {
+        Self {
+            wrap_paragraphs: false,
+            incremental: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn render(&mut self, text: &str, width: u16) -> Vec<Line> {
+        let theme_gen = maki_highlight::theme_generation();
         if theme_gen != self.theme_gen {
             self.highlighters.clear();
             self.theme_gen = theme_gen;
@@ -157,6 +170,7 @@ impl Renderer {
             table_idx: 0,
             highlighters: &mut self.highlighters,
             table_col_widths: &mut self.table_col_widths,
+            incremental: self.incremental,
         };
         let ctx = RenderCtx {
             width,
@@ -184,6 +198,23 @@ struct RenderState<'a> {
     table_idx: usize,
     highlighters: &'a mut Vec<CodeHighlighter>,
     table_col_widths: &'a mut Vec<Vec<usize>>,
+    incremental: bool,
+}
+
+impl RenderState<'_> {
+    /// A streaming block keeps growing, so it advances its own highlighter and
+    /// pays only for the lines that just arrived. Everyone else renders text
+    /// that is already finished, where the shared content cache turns a
+    /// re-render at a new width into a lookup.
+    fn code_segments(&mut self, lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
+        if !self.incremental {
+            return maki_highlight::highlight_block(lang, code).as_ref().clone();
+        }
+        if self.code_idx >= self.highlighters.len() {
+            self.highlighters.push(CodeHighlighter::new(lang));
+        }
+        self.highlighters[self.code_idx].update(code).to_vec()
+    }
 }
 
 /// Streaming can split tokens differently than a oneshot render because the
@@ -223,10 +254,7 @@ fn render_block(
         }
         Block::Code { lang, code } => {
             ensure_blank_line(lines);
-            if state.code_idx >= state.highlighters.len() {
-                state.highlighters.push(CodeHighlighter::new(lang));
-            }
-            let segments: Vec<_> = state.highlighters[state.code_idx].update(code).to_vec();
+            let segments = state.code_segments(lang, code);
             let start = lines.len();
             for segs in segments {
                 let mut spans = vec![Span::new(CODE_BAR, StyleToken::CodeBar)];
@@ -944,12 +972,11 @@ mod tests {
     #[test]
     fn renderer_caches_table_column_widths_across_calls() {
         let mut r = Renderer::new();
-        r.render("| A | B |\n| --- | --- |\n| hi | there |", 120, 0);
+        r.render("| A | B |\n| --- | --- |\n| hi | there |", 120);
         let widths_before = r.table_col_widths[0].clone();
         r.render(
             "| A | B |\n| --- | --- |\n| hi | there |\n| longer | x |",
             120,
-            0,
         );
         for (i, (&old, &new)) in widths_before.iter().zip(&r.table_col_widths[0]).enumerate() {
             assert!(new >= old, "table width shrank at col {i}: {old} -> {new}");
@@ -1002,15 +1029,15 @@ mod tests {
         const WIDTHS: &[u16] = &[20, 40, 80];
         for text in CORPUS {
             for &w in WIDTHS {
-                let oneshot = Renderer::new().render(text, w, 0);
-                let mut streamer = Renderer::new();
+                let oneshot = Renderer::new().render(text, w);
+                let mut streamer = Renderer::streaming();
                 for end in 1..text.len() {
                     if !text.is_char_boundary(end) {
                         continue;
                     }
-                    let _ = streamer.render(&text[..end], w, 0);
+                    let _ = streamer.render(&text[..end], w);
                 }
-                let final_streamed = streamer.render(text, w, 0);
+                let final_streamed = streamer.render(text, w);
                 assert_eq!(final_streamed, oneshot, "mismatch text={text:?} width={w}");
             }
         }
@@ -1041,12 +1068,14 @@ mod tests {
 
     #[test]
     fn theme_gen_change_clears_highlighter_cache() {
-        let mut r = Renderer::new();
+        let mut r = Renderer::streaming();
         let code = "```rust\nlet x = 42;\n```";
-        r.render(code, TEST_WIDTH, 0);
+        let initial_gen = r.theme_gen;
+        r.render(code, TEST_WIDTH);
         assert_eq!(r.highlighters.len(), 1);
-        r.render(code, TEST_WIDTH, 1);
-        assert_eq!(r.theme_gen, 1);
+        maki_highlight::set_theme(maki_highlight::Theme::default());
+        r.render(code, TEST_WIDTH);
+        assert_eq!(r.theme_gen, initial_gen + 1);
         assert_eq!(r.highlighters.len(), 1);
     }
 
@@ -1054,7 +1083,7 @@ mod tests {
     fn unwrapped_mode_skips_paragraph_wrap_but_wraps_code() {
         let long_para = "word ".repeat(50);
         let mut r = Renderer::unwrapped();
-        let para_lines = r.render(long_para.trim(), 30, 0);
+        let para_lines = r.render(long_para.trim(), 30);
         assert_eq!(
             para_lines
                 .iter()
@@ -1065,7 +1094,7 @@ mod tests {
 
         let long_code = "a".repeat(60);
         let input = format!("```\n{long_code}\n```");
-        let code_lines = r.render(&input, 20, 0);
+        let code_lines = r.render(&input, 20);
         assert!(
             code_lines
                 .iter()
@@ -1090,14 +1119,13 @@ mod tests {
 
     #[test]
     fn multiple_code_blocks_get_separate_highlighters() {
-        let mut r = Renderer::new();
+        let mut r = Renderer::streaming();
         r.render(
             "```rust\nfn a() {}\n```\n\n```python\nx = 1\n```",
             TEST_WIDTH,
-            0,
         );
         assert_eq!(r.highlighters.len(), 2);
-        r.render("```rust\nfn a() {}\n```", TEST_WIDTH, 0);
+        r.render("```rust\nfn a() {}\n```", TEST_WIDTH);
         assert_eq!(r.highlighters.len(), 1);
     }
 
@@ -1183,7 +1211,7 @@ mod tests {
         let long_cell = "A".repeat(500);
         let text = format!("| What | Why |\n| --- | --- |\n| Short cell | {long_cell} |");
 
-        let full = Renderer::unwrapped().render(&text, 120, 0);
+        let full = Renderer::unwrapped().render(&text, 120);
         assert!(
             full.iter().any(|l| l.kind == LineKind::TableBorder),
             "full text must parse as a table"
@@ -1192,7 +1220,7 @@ mod tests {
         let truncated = truncate_long_lines_at(&text, 500);
         assert_ne!(truncated.as_ref(), text, "truncation must modify the text");
 
-        let trunc = Renderer::unwrapped().render(&truncated, 120, 0);
+        let trunc = Renderer::unwrapped().render(&truncated, 120);
         assert!(
             trunc.iter().any(|l| l.kind == LineKind::TableBorder),
             "table detection survives truncation (parser is lenient about missing closing |)"

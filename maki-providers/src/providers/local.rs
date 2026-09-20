@@ -16,7 +16,7 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 
 pub(crate) struct LocalEndpointConfig {
     pub slug: &'static str,
@@ -188,14 +188,12 @@ impl Provider for LocalEndpoint {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_headers(&self.auth, |key| {
-                    vec![("authorization".into(), format!("Bearer {key}"))]
-                })
-            }))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 }
 
@@ -582,6 +580,12 @@ mod tests {
         connect: std::time::Duration::from_secs(10),
         low_speed: std::time::Duration::from_secs(30),
         stream: std::time::Duration::from_secs(300),
+        retry: crate::retry::RetryPolicy {
+            base_delay: std::time::Duration::from_millis(2000),
+            max_delay: std::time::Duration::from_millis(60000),
+            max_retries: 5,
+            max_timeout_retries: 10,
+        },
     };
 
     #[test]

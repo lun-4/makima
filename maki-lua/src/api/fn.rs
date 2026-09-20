@@ -52,6 +52,55 @@ struct CheckedOutReceiver {
     receiver: Option<flume::Receiver<JobEvent>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum JobCommand {
+    Shell(String),
+    Argv(Vec<String>),
+}
+
+impl JobCommand {
+    fn build(&self) -> Command {
+        match self {
+            Self::Shell(cmd) => shell_command(cmd),
+            Self::Argv(argv) => {
+                let mut command = Command::new(&argv[0]);
+                command.args(&argv[1..]);
+                command
+            }
+        }
+    }
+}
+
+impl From<&str> for JobCommand {
+    fn from(s: &str) -> Self {
+        Self::Shell(s.to_string())
+    }
+}
+
+impl From<String> for JobCommand {
+    fn from(s: String) -> Self {
+        Self::Shell(s)
+    }
+}
+
+impl From<&String> for JobCommand {
+    fn from(s: &String) -> Self {
+        Self::Shell(s.clone())
+    }
+}
+
+impl From<Vec<String>> for JobCommand {
+    fn from(argv: Vec<String>) -> Self {
+        Self::Argv(argv)
+    }
+}
+
+impl From<&JobCommand> for JobCommand {
+    fn from(cmd: &JobCommand) -> Self {
+        cmd.clone()
+    }
+}
+
 impl JobStore {
     pub fn new() -> Self {
         Self {
@@ -64,14 +113,15 @@ impl JobStore {
     pub fn start(
         &mut self,
         owner: JobOwner,
-        cmd: &str,
+        cmd: impl Into<JobCommand>,
         cwd: Option<String>,
         env: Option<HashMap<String, String>>,
         on_stdout: Option<RegistryKey>,
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
-        let mut command = shell_command(cmd);
+        let cmd = cmd.into();
+        let mut command = cmd.build();
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -372,11 +422,27 @@ fn kill_job(meta: &mut JobMeta) {
     }
 }
 
+fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
+    match cmd {
+        Value::String(cmd) => Ok(JobCommand::Shell(cmd.to_str()?.to_string())),
+        Value::Table(argv) => {
+            let argv: Vec<String> = argv.sequence_values().collect::<LuaResult<_>>()?;
+            if argv.is_empty() {
+                return Err(mlua::Error::runtime("jobstart: empty argv"));
+            }
+            Ok(JobCommand::Argv(argv))
+        }
+        _ => Err(mlua::Error::runtime(
+            "jobstart: command must be string or table of strings",
+        )),
+    }
+}
+
 /// Run a shell command in the background. The command runs through
 /// `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
 /// that you can pass to `jobstop` or `jobwait` to control the process.
 ///
-/// @param cmd string Shell command to run.
+/// @param cmd string|string[] Shell command to run, or array of arguments.
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
 ///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
@@ -394,12 +460,8 @@ fn kill_job(meta: &mut JobMeta) {
 ///   on_exit = function(_, code) print("exit: " .. code) end,
 /// })
 #[lua_fn(guard = Run)]
-fn jobstart(
-    lua: &Lua,
-    #[ctx] plugin: Arc<str>,
-    cmd: String,
-    opts: Option<Table>,
-) -> LuaResult<u32> {
+fn jobstart(lua: &Lua, #[ctx] plugin: Arc<str>, cmd: Value, opts: Option<Table>) -> LuaResult<u32> {
+    let cmd = parse_command(cmd)?;
     let owner_name: Option<String> = opts
         .as_ref()
         .map(|opts| opts.get("owner"))

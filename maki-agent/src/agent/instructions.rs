@@ -22,6 +22,7 @@ const INSTRUCTION_FILES: &[&str] = &[
 ];
 
 const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
+const GLOBAL_INSTRUCTION_FILE: &str = "AGENTS.md";
 
 #[derive(Clone, Default)]
 pub struct LoadedInstructions(Arc<Mutex<HashSet<PathBuf>>>);
@@ -123,7 +124,8 @@ fn collect_instruction_files(
         }
     }
 
-    for path in maki_storage::paths::user_config_dirs(home, xdg_config, "AGENTS.md") {
+    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+        let path = dir.join(GLOBAL_INSTRUCTION_FILE);
         if let Some((canonical, content)) = read_instruction(&path, loaded) {
             let label = format!("Global instructions ({})", canonical.display());
             out.push((label, content));
@@ -138,7 +140,7 @@ pub fn load_instruction_text(cwd: &str) -> String {
     load_instruction_text_with_home(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::config_dir().ok().as_deref(),
+        maki_storage::paths::xdg_config_dir().ok().as_deref(),
     )
 }
 
@@ -161,7 +163,7 @@ pub fn load_instructions(cwd: &str) -> Instructions {
     load_instructions_with_home(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::config_dir().ok().as_deref(),
+        maki_storage::paths::xdg_config_dir().ok().as_deref(),
     )
 }
 

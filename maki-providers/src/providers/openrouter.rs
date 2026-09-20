@@ -12,8 +12,8 @@ use crate::{
     dialect,
 };
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
+use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 
 const REFERER: &str = "https://makima.ln4.net";
 const APP_TITLE: &str = "Makima";
@@ -224,17 +224,18 @@ impl Provider for OpenRouter {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            self.compat.fetch_and_parse_models(&auth, parse_model).await
+            self.compat
+                .fetch_and_parse_models(&auth, MODELS_PATH, parse_model)
+                .await
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 }
 
@@ -317,8 +318,10 @@ mod tests {
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: None,
+            supports_fast_override: None,
             pricing: ModelPricing::default(),
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
         };

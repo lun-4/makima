@@ -23,13 +23,14 @@ use crate::headless::InteractiveControl;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+const COMMANDS_DIR: &str = "commands";
 const PROJECT_COMMAND_DIRS: &[&str] = &[".makima/commands", ".claude/commands"];
 const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 const STANDARD_COMMANDS_ALREADY_REGISTERED: &str = "standard commands are already registered";
 const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text content";
 const NONINTERACTIVE_MODEL_USAGE: &str = "Usage: /model <model>";
-pub const FAST_UNSUPPORTED: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+pub const FAST_UNSUPPORTED: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 
 pub fn portable_capabilities() -> TargetCapabilities {
     TargetCapabilities::from_slice(&[
@@ -104,7 +105,10 @@ impl SessionCommandState {
 
     pub fn set_fast(&self, enabled: bool) -> Result<(), &'static str> {
         let mut state = self.model.lock().unwrap_or_else(|error| error.into_inner());
-        if enabled && !Model::from_spec(&state.current).is_ok_and(|model| model.supports_fast()) {
+        if enabled
+            && !Model::from_spec(&state.current)
+                .is_ok_and(|model| model.supports_fast() || model.fast_pending())
+        {
             return Err(FAST_UNSUPPORTED);
         }
         state.fast = enabled;
@@ -251,7 +255,8 @@ impl maki_commands::CommandHost for SessionCommandHost {
                     .as_ref()
                     .map(|coordinator| coordinator.read().model())
                     .unwrap_or_else(|| Arc::from(self.state.current_model()));
-                let supported = Model::from_spec(&model).is_ok_and(|model| model.supports_fast());
+                let supported = Model::from_spec(&model)
+                    .is_ok_and(|model| model.supports_fast() || model.fast_pending());
                 return Box::pin(async move {
                     Ok(HostResponse::Context(
                         HostContextResponse::FastModeSupported(supported),
@@ -272,8 +277,8 @@ impl maki_commands::CommandHost for SessionCommandHost {
             HostRequest::Builtin(operation) => operation,
         };
         match operation {
-            maki_commands::BuiltinOperation::Compact => {
-                Box::pin(async { Ok(HostResponse::ManualCompaction) })
+            maki_commands::BuiltinOperation::Compact(instructions) => {
+                Box::pin(async move { Ok(HostResponse::ManualCompaction(instructions)) })
             }
             maki_commands::BuiltinOperation::ResetSession => {
                 if let Some(guidance) = self.reset_session_guidance.clone() {
@@ -517,7 +522,10 @@ impl CommandBehavior for BuiltinBehavior {
         Box::pin(async move {
             let operation = match id {
                 maki_commands::BuiltinId::Tasks => BuiltinOperation::OpenTasks,
-                maki_commands::BuiltinId::Compact => BuiltinOperation::Compact,
+                maki_commands::BuiltinId::Compact => {
+                    let instructions = (!arguments.is_empty()).then_some(arguments);
+                    BuiltinOperation::Compact(instructions)
+                }
                 maki_commands::BuiltinId::New => BuiltinOperation::ResetSession,
                 maki_commands::BuiltinId::Help => BuiltinOperation::ToggleHelp,
                 maki_commands::BuiltinId::Queue => BuiltinOperation::FocusQueue,
@@ -615,6 +623,7 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::Workflow => BuiltinOperation::ToggleWorkflow,
                 maki_commands::BuiltinId::Exit => BuiltinOperation::Exit,
                 maki_commands::BuiltinId::Reload => BuiltinOperation::Reload,
+                maki_commands::BuiltinId::Trust => BuiltinOperation::Trust,
             };
             match invocation
                 .host_request(HostRequest::Builtin(operation))
@@ -623,7 +632,9 @@ impl CommandBehavior for BuiltinBehavior {
                 HostResponse::Completed => Ok(CommandOutcome::Completed),
                 HostResponse::AgentTurn(turn) => Ok(CommandOutcome::AgentTurn(turn)),
                 HostResponse::IsolatedTurn(turn) => Ok(CommandOutcome::IsolatedTurn(turn)),
-                HostResponse::ManualCompaction => Ok(CommandOutcome::ManualCompaction),
+                HostResponse::ManualCompaction(instructions) => {
+                    Ok(CommandOutcome::ManualCompaction(instructions))
+                }
                 HostResponse::FrontendFeedback(feedback) => {
                     Ok(CommandOutcome::FrontendFeedback(feedback))
                 }
@@ -802,7 +813,7 @@ pub fn discover_commands(cwd: &Path) -> Vec<CustomCommand> {
     discover_commands_inner(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::config_dir().ok().as_deref(),
+        maki_storage::paths::xdg_config_dir().ok().as_deref(),
     )
 }
 
@@ -813,8 +824,8 @@ fn discover_commands_inner(
 ) -> Vec<CustomCommand> {
     let mut commands: HashMap<String, CustomCommand> = HashMap::new();
 
-    for dir in maki_storage::paths::user_config_dirs(home, xdg_config, "commands") {
-        scan_command_dir(&dir, CommandScope::User, &mut commands);
+    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+        scan_command_dir(&dir.join(COMMANDS_DIR), CommandScope::User, &mut commands);
     }
     if let Some(home) = home {
         for dir in GLOBAL_THIRD_PARTY_COMMAND_DIRS {
@@ -1297,8 +1308,10 @@ mod tests {
         ));
 
         assert!(matches!(
-            smol::block_on(host.request(request(maki_commands::BuiltinOperation::Compact))),
-            Ok(HostResponse::ManualCompaction)
+            smol::block_on(host.request(request(maki_commands::BuiltinOperation::Compact(Some(
+                "keep failing tests".into()
+            ))))),
+            Ok(HostResponse::ManualCompaction(Some(ref s))) if s == "keep failing tests"
         ));
 
         let directory = smol::block_on(host.request(request(

@@ -1,4 +1,4 @@
-use maki_providers::ThinkingConfigExt;
+use maki_providers::{RequestOptions, ThinkingConfigExt};
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -253,10 +253,12 @@ impl App {
         {
             let _ = self.cancel_middle_scroll();
         }
+        let images_visible = !self.any_overlay_open();
         self.chats[render_chat].view(
             frame,
             layout.msg_area,
             self.selection_state.is_some() || self.middle_scroll.is_some(),
+            images_visible,
         );
     }
 
@@ -453,6 +455,10 @@ impl App {
                 }
             }
         };
+        let opts = chat.opts.unwrap_or(RequestOptions {
+            thinking: self.state.thinking,
+            fast: self.state.fast,
+        });
         let ctx = StatusBarContext {
             status: self.status_for_chat(render_chat),
             mode_label,
@@ -468,9 +474,10 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             retry_info: self.retry_info.as_ref(),
-            thinking_label: self.state.thinking.status_label(),
-            fast: self.state.fast,
+            thinking_label: opts.thinking.status_label(),
+            fast: opts.fast,
             workflow: self.state.workflow,
+            restricted: self.trust_question.is_some(),
             restoring: self.restoring.load(Ordering::Relaxed),
             status_content: self.status_content.get(),
             suppress_status_content: self.suppress_status_content.load(Ordering::Acquire),

@@ -11,7 +11,7 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::{AgentConfig, ModeRegistry, PermissionsConfig};
 use maki_commands::CommandRegistry;
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, TrustConfig, project::TrustMode};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 
@@ -31,6 +31,8 @@ pub struct AcpParams {
     pub plugin_rules: Arc<PluginRuleStore>,
     pub lua_event_handle: maki_lua::EventHandle,
     pub command_registry: CommandRegistry,
+    pub trust_mode: TrustMode,
+    pub trust_policy: Arc<TrustConfig>,
 }
 
 pub fn run(params: AcpParams) -> color_eyre::Result<()> {

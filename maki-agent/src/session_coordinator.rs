@@ -1182,7 +1182,12 @@ async fn run(
                 if reply.send(Ok(lease)).is_err() {
                     continue;
                 }
-                hold_lease(&ctx, &rx, &wait, &mut deferred).await;
+                if hold_lease(&ctx, &rx, &wait, &mut deferred).await.is_break() {
+                    for operation in deferred.drain(..).chain(rx.try_iter()) {
+                        reject_operation(operation, ctx.session_id);
+                    }
+                    return;
+                }
             }
             other => {
                 if handle_operation(&ctx, other).await.is_break() {
@@ -1206,7 +1211,7 @@ async fn hold_lease(
     rx: &flume::Receiver<Operation>,
     wait: &flume::Receiver<LeaseRelease>,
     deferred: &mut VecDeque<Operation>,
-) {
+) -> ControlFlow<()> {
     loop {
         let release = std::pin::pin!(wait.recv_async());
         let incoming = std::pin::pin!(rx.recv_async());
@@ -1230,10 +1235,10 @@ async fn hold_lease(
                 .detach();
 
                 finish_history_commit(ctx, rx, wait, deferred, completed_rx, timeout, reply).await;
-                return;
+                return ControlFlow::Continue(());
             }
             // Released without a commit, or the holder dropped.
-            Either::Left(_) => return,
+            Either::Left(_) => return ControlFlow::Continue(()),
             Either::Right(Ok(operation)) => {
                 if matches!(operation, Operation::Close { .. }) {
                     while let Some(queued) = deferred.pop_front() {
@@ -1250,7 +1255,7 @@ async fn hold_lease(
                         let _ = reply.send(result);
                     }
                     let _ = handle_operation(ctx, operation).await;
-                    return;
+                    return ControlFlow::Break(());
                 } else if let Operation::PreparePluginOptions { prepared, .. } = operation {
                     let _ =
                         prepared.send(Err(SessionCoordinatorError::SessionBusy(ctx.session_id)));
@@ -1261,7 +1266,7 @@ async fn hold_lease(
                 }
             }
             // The last handle is gone; nothing more will arrive.
-            Either::Right(Err(_)) => return,
+            Either::Right(Err(_)) => return ControlFlow::Break(()),
         }
     }
 }
@@ -1716,7 +1721,7 @@ async fn set_model(
     let fast_value: Arc<str> = match fast {
         Some(true) => Arc::from(ENABLED_VALUE),
         Some(false) => Arc::from(DISABLED_VALUE),
-        None if model.supports_fast() => {
+        None if model.supports_fast() || model.fast_pending() => {
             current_option_value(read, FAST_OPTION_ID).unwrap_or_else(|| Arc::from(DISABLED_VALUE))
         }
         None => Arc::from(DISABLED_VALUE),
@@ -1812,7 +1817,9 @@ async fn set_option(
 ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
     if id == FAST_OPTION_ID && value == ENABLED_VALUE {
         let state = lock(&read.state);
-        if !Model::from_spec(&state.model).is_ok_and(|model| model.supports_fast()) {
+        if !Model::from_spec(&state.model)
+            .is_ok_and(|model| model.supports_fast() || model.fast_pending())
+        {
             return Err(SessionOptionError::FastUnsupported.into());
         }
     }

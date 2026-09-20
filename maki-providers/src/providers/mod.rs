@@ -8,7 +8,10 @@ use isahc::config::Configurable;
 use isahc::http::request::Builder;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
+
+use maki_storage::StateDir;
+use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
 
@@ -28,6 +31,8 @@ pub(crate) mod openai;
 pub(crate) mod openai_compat;
 pub mod opencode;
 pub(crate) mod openrouter;
+pub(crate) mod regolo;
+pub(crate) mod requesty;
 pub(crate) mod synthetic;
 pub(crate) mod tensorx;
 pub(crate) mod vertex;
@@ -36,6 +41,8 @@ pub(crate) mod zai;
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
+const UNAUTHORIZED_STATUS: u16 = 401;
+const AUTHORIZATION_HEADER: &str = "authorization";
 
 pub(crate) fn user_agent() -> &'static str {
     concat!(
@@ -46,21 +53,68 @@ pub(crate) fn user_agent() -> &'static str {
     )
 }
 
+fn bearer_value(api_key: &str) -> String {
+    format!("Bearer {api_key}")
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     pub connect: Duration,
-    pub stream: Duration,
     pub low_speed: Duration,
+    pub stream: Duration,
+    pub retry: crate::retry::RetryPolicy,
 }
 
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
             connect: Duration::from_secs(10),
-            stream: Duration::from_secs(300),
             low_speed: Duration::from_secs(30),
+            stream: Duration::from_secs(300),
+            retry: crate::retry::RetryPolicy::default(),
         }
     }
+}
+
+impl From<&maki_config::ProviderConfig> for Timeouts {
+    fn from(config: &maki_config::ProviderConfig) -> Self {
+        Self {
+            connect: config.connect_timeout,
+            low_speed: config.low_speed_timeout,
+            stream: config.stream_timeout,
+            retry: crate::retry::RetryPolicy::from(config),
+        }
+    }
+}
+
+/// Reading, refreshing and writing tokens has to happen as one turn. Whoever
+/// queued behind a peer here is holding a copy the peer already spent, and
+/// replaying a rotated refresh token gets the whole family revoked, so the
+/// tokens are loaded again once the lock is in hand.
+pub(crate) fn refreshed_tokens(
+    dir: &StateDir,
+    provider: &str,
+    refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
+) -> Result<OAuthTokens, AgentError> {
+    let _lock = lock_tokens(dir, provider);
+    let current = load_tokens(dir, provider).ok_or_else(|| {
+        AgentError::api(
+            UNAUTHORIZED_STATUS,
+            format!("{provider} OAuth tokens not found on disk"),
+        )
+    })?;
+    if !current.is_expired() {
+        return Ok(current);
+    }
+    let fresh = refresh(&current)?;
+    // Not `?`: every caller reads an error here as "these credentials are
+    // dead" and deletes the token file, so a full disk would log the user out
+    // over a refresh that actually succeeded. The run keeps the token it just
+    // got and the next start refreshes again.
+    if let Err(e) = save_tokens(dir, provider, &fresh) {
+        warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
+    }
+    Ok(fresh)
 }
 
 #[derive(Clone)]
@@ -82,6 +136,21 @@ impl ResolvedAuth {
         self.headers.iter().fold(builder, |b, (key, value)| {
             b.header(key.as_str(), value.as_str())
         })
+    }
+
+    pub(crate) fn set_header(&mut self, name: &str, value: String) {
+        match self
+            .headers
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            Some((_, v)) => *v = value,
+            None => self.headers.push((name.to_string(), value)),
+        }
+    }
+
+    fn set_key_header(&mut self, name: &str, value: String) {
+        self.set_header(name, value);
     }
 }
 
@@ -188,7 +257,7 @@ impl SseErrorPayload {
         } else {
             self.error.message
         };
-        AgentError::Api { status, message }
+        AgentError::api(status, message)
     }
 }
 
@@ -280,7 +349,7 @@ impl KeyPool {
             .and_then(|d| d.api_key.clone())
     }
 
-    pub(crate) fn from_keys(keys: Vec<String>) -> Self {
+    pub fn from_keys(keys: Vec<String>) -> Self {
         Self {
             keys: Arc::new(keys),
             index: Arc::new(AtomicUsize::new(0)),
@@ -325,6 +394,69 @@ impl KeyPool {
 
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+/// Where a provider's key lands in its auth headers. Two shapes cover every
+/// provider we have, and an enum keeps "how a key becomes a header" in one
+/// place instead of one closure per provider.
+#[derive(Clone, Copy)]
+pub enum KeyHeader {
+    /// `Authorization: Bearer <key>`.
+    Bearer,
+    /// The key verbatim, in a provider specific header (`x-api-key`,
+    /// `x-goog-api-key`).
+    Raw(&'static str),
+}
+
+impl KeyHeader {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bearer => AUTHORIZATION_HEADER,
+            Self::Raw(name) => name,
+        }
+    }
+
+    fn value(self, key: &str) -> String {
+        match self {
+            Self::Bearer => bearer_value(key),
+            Self::Raw(_) => key.to_string(),
+        }
+    }
+}
+
+/// A provider's keys and the auth they are written into.
+pub struct KeyRotation<'a> {
+    pool: &'a KeyPool,
+    auth: &'a Mutex<ResolvedAuth>,
+    header: KeyHeader,
+}
+
+impl<'a> KeyRotation<'a> {
+    pub fn new(pool: &'a KeyPool, auth: &'a Mutex<ResolvedAuth>, header: KeyHeader) -> Self {
+        Self { pool, auth, header }
+    }
+
+    /// How many keys a walk can try before it is back where it started.
+    pub fn key_count(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// Advance to the next key and refresh only the header carrying it, so the
+    /// resolved `base_url` and any `[<slug>.headers]` survive the rotation.
+    pub fn rotate(&self) -> bool {
+        if !self.pool.rotate() {
+            return false;
+        }
+        self.auth
+            .lock()
+            .unwrap()
+            .set_key_header(self.header.name(), self.header.value(self.pool.current()));
+        true
     }
 }
 

@@ -272,6 +272,7 @@ pub fn generate() -> String {
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         },
         false,
     );

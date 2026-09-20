@@ -51,6 +51,10 @@ pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
     read().discovered(provider, model_id).cloned()
 }
 
+pub fn discovery_complete(provider: &str) -> bool {
+    read().known_models.contains_key(provider)
+}
+
 /// Typed `provider_info` for a discovered model. Key by the builtin slug, not
 /// `model.provider`: a dynamic wrap's model carries its own slug.
 pub fn provider_info<T: Send + Sync + 'static>(provider: &str, model_id: &str) -> Option<Arc<T>> {

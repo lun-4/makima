@@ -142,11 +142,11 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 ### `code_execution` {#code_execution}
 
-Execute Python code in a sandboxed interpreter with tools as callable functions.
+Execute Python in a sandbox where every tool is an async function.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency. |
+| `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. |
 | `timeout` | integer | no | 30 | Script execution timeout in seconds |
 
 ### `plan_submit` {#plan_submit}
@@ -181,6 +181,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default), "general" (can modify files), or "plan_reviewer" (read-only plan audit, plan mode only) |
+| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
 
 ### `task_spawn` {#task_spawn}
 
@@ -193,6 +194,7 @@ Start a background subagent and return its task_id immediately. Each task's mess
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default), "general" (can modify files), or "plan_reviewer" (read-only plan audit, plan mode only) |
+| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
 
 ### `task_get` {#task_get}
 

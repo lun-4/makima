@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use super::types::EarlierRoot;
 use super::{ActorWork, RootWork, TurnAdmission};
 use crate::ExtractedCommand;
 use crate::types::TurnId;
@@ -25,7 +26,7 @@ pub enum QueueProjection {
         image_count: usize,
         displayed: bool,
     },
-    Compact,
+    Compact(Option<String>),
     Control(String),
     Turn(String),
 }
@@ -34,7 +35,7 @@ impl From<&RootWork> for QueueProjection {
     fn from(root: &RootWork) -> Self {
         Self::Message {
             text: root.text.clone(),
-            image_count: root.image_count,
+            image_count: root.images.len(),
             displayed: root.displayed,
         }
     }
@@ -44,7 +45,7 @@ impl From<&ActorWork> for QueueProjection {
     fn from(work: &ActorWork) -> Self {
         match work {
             ActorWork::Root(root) => Self::from(root),
-            ActorWork::Compact { .. } => Self::Compact,
+            ActorWork::Compact { instructions, .. } => Self::Compact(instructions.clone()),
             ActorWork::Control(control) => Self::Control(control.name.clone()),
             ActorWork::Turn(admission) => Self::Turn(admission.correlation.clone()),
         }
@@ -75,8 +76,50 @@ impl ActorQueue {
     }
 
     /// Pops the front item, or `None` when the queue is empty.
+    /// Consecutive plain root inputs that share a batch key are condensed into a single turn.
     pub fn pop(&self) -> Option<ActorWork> {
-        lock(&self.items).pop_front()
+        let mut items = lock(&self.items);
+        let first = items.pop_front()?;
+        match first {
+            ActorWork::Root(root) => {
+                let key = crate::batch_key(&root.input);
+                if key.is_none() {
+                    return Some(ActorWork::Root(root));
+                }
+                let mut roots = vec![root];
+                while items.front().and_then(|w| match w {
+                    ActorWork::Root(r) => crate::batch_key(&r.input),
+                    _ => None,
+                }) == key
+                {
+                    let Some(ActorWork::Root(next)) = items.pop_front() else {
+                        break;
+                    };
+                    roots.push(next);
+                }
+                if roots.len() == 1 {
+                    return Some(ActorWork::Root(roots.pop().unwrap()));
+                }
+                let mut last = roots.pop().unwrap();
+                let mut inputs = Vec::with_capacity(roots.len() + 1);
+                let mut earlier = Vec::with_capacity(roots.len());
+                for r in roots {
+                    inputs.push(r.input);
+                    earlier.push(EarlierRoot {
+                        run_id: r.run_id,
+                        displayed: r.displayed,
+                        text: r.text,
+                        images: r.images,
+                        correlation: r.correlation,
+                    });
+                }
+                inputs.push(last.input);
+                last.input = crate::merge_inputs(inputs).expect("at least two inputs");
+                last.earlier = earlier;
+                Some(ActorWork::Root(last))
+            }
+            other => Some(other),
+        }
     }
 
     /// Extracts the given admitted turn from anywhere in the queue without
@@ -110,7 +153,7 @@ impl ActorQueue {
         match work {
             ActorWork::Turn(a) => Some(std::borrow::Cow::Borrowed(a.correlation.as_str())),
             ActorWork::Root(r) => Some(std::borrow::Cow::Borrowed(r.correlation.as_str())),
-            ActorWork::Compact { run_id } => {
+            ActorWork::Compact { run_id, .. } => {
                 Some(std::borrow::Cow::Owned(super::run_correlation(*run_id)))
             }
             ActorWork::Control(_) => None,
@@ -223,8 +266,25 @@ impl ActorQueue {
             _ => return None,
         }
         match items.pop_front()? {
-            ActorWork::Root(root) => Some(ExtractedCommand::Interrupt(root.input, root.run_id)),
-            ActorWork::Compact { run_id } => Some(ExtractedCommand::Compact(run_id)),
+            ActorWork::Root(first) => {
+                let key = crate::batch_key(&first.input);
+                let mut inputs = vec![first.input];
+                while key.is_some()
+                    && items.front().and_then(|w| match w {
+                        ActorWork::Root(r) => crate::batch_key(&r.input),
+                        _ => None,
+                    }) == key
+                {
+                    let Some(ActorWork::Root(next)) = items.pop_front() else {
+                        break;
+                    };
+                    inputs.push(next.input);
+                }
+                Some(ExtractedCommand::Interrupt(inputs))
+            }
+            ActorWork::Compact { instructions, .. } => {
+                Some(ExtractedCommand::Compact(instructions))
+            }
             _ => unreachable!("front was matched as root or compact"),
         }
     }

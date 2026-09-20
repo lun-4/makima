@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
+pub use syntect::highlighting::Theme;
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
-    Theme,
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
@@ -13,12 +15,16 @@ pub mod pool;
 
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
+const BLOCK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 type Rgb = (u8, u8, u8);
+pub type BlockSegments = Arc<Vec<Vec<StyledSegment>>>;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
 static UI_COLORS: OnceLock<RwLock<HashMap<String, Rgb>>> = OnceLock::new();
+static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
+static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
 fn theme_lock() -> &'static RwLock<Arc<Theme>> {
     THEME.get_or_init(|| RwLock::new(Arc::new(Theme::default())))
@@ -37,6 +43,103 @@ pub fn is_ready() -> bool {
 
 pub fn set_theme(theme: Theme) {
     *theme_lock().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(theme);
+    THEME_GEN.fetch_add(1, Ordering::Release);
+    block_cache_lock()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Bumped by every [`set_theme`]. Anything derived from the theme, like an
+/// incremental [`CodeHighlighter`] or a bag of painted lines, is stale once
+/// this changes.
+pub fn theme_generation() -> u64 {
+    THEME_GEN.load(Ordering::Acquire)
+}
+
+fn block_cache_lock() -> &'static RwLock<BlockCache> {
+    BLOCK_CACHE.get_or_init(RwLock::default)
+}
+
+/// The byte length rides along with the hash, so an accidental hit needs both
+/// to collide. A miss only costs a re-highlight, a false hit costs wrong colors.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct BlockKey {
+    hash: u64,
+    code_bytes: usize,
+    theme_gen: u64,
+}
+
+impl BlockKey {
+    fn new(lang: &str, code: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        lang.hash(&mut hasher);
+        code.hash(&mut hasher);
+        Self {
+            hash: hasher.finish(),
+            code_bytes: code.len(),
+            theme_gen: theme_generation(),
+        }
+    }
+}
+
+fn segments_bytes(segments: &[Vec<StyledSegment>]) -> usize {
+    segments
+        .iter()
+        .map(|line| {
+            size_of::<Vec<StyledSegment>>()
+                + line
+                    .iter()
+                    .map(|seg| size_of::<StyledSegment>() + seg.text.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Budgeted in bytes, since entries range from a one-liner to a whole file.
+///
+/// Eviction picks an arbitrary entry on purpose. A resize walks the transcript
+/// in order, so an LRU (or dropping a whole generation) always throws out
+/// exactly what the walk asks for next and misses every time once the
+/// transcript outgrows the budget. Arbitrary eviction keeps a stable subset
+/// instead, and the hit rate settles near `budget / working set`.
+#[derive(Default)]
+struct BlockCache {
+    entries: HashMap<BlockKey, (BlockSegments, usize)>,
+    bytes: usize,
+}
+
+impl BlockCache {
+    fn get(&self, key: BlockKey) -> Option<BlockSegments> {
+        self.entries.get(&key).map(|(segs, _)| Arc::clone(segs))
+    }
+
+    /// Evicts before inserting, so the incoming entry is never its own victim.
+    fn insert(&mut self, key: BlockKey, segments: BlockSegments, budget: usize) {
+        let bytes = segments_bytes(&segments);
+        if bytes > budget {
+            return;
+        }
+        self.remove(key);
+        while self.bytes + bytes > budget
+            && let Some(&victim) = self.entries.keys().next()
+        {
+            self.remove(victim);
+        }
+        self.entries.insert(key, (segments, bytes));
+        self.bytes += bytes;
+    }
+
+    fn remove(&mut self, key: BlockKey) {
+        if let Some((_, bytes)) = self.entries.remove(&key) {
+            self.bytes -= bytes;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
 }
 
 pub fn theme() -> Arc<Theme> {
@@ -215,6 +318,30 @@ pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSeg
     LinesWithEndings::from(code)
         .map(|raw| hl.highlight_line(raw))
         .collect()
+}
+
+/// Highlights a whole block, memoized on its content.
+///
+/// Highlighting is by far the most expensive part of a markdown render (syntect
+/// burns ~270us of regex per line) and the result does not depend on terminal
+/// width, so laying the same text out again after a resize should never pay for
+/// it twice. Callers streaming a growing block stay on [`CodeHighlighter`]:
+/// it is incremental, and would miss this cache on every token.
+pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
+    let key = BlockKey::new(lang, code);
+    if let Some(hit) = block_cache_lock()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+    {
+        return hit;
+    }
+    let segments: BlockSegments = Arc::new(highlight_code(lang, code, ""));
+    block_cache_lock()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, Arc::clone(&segments), BLOCK_CACHE_MAX_BYTES);
+    segments
 }
 
 pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {

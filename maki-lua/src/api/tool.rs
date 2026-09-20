@@ -27,7 +27,7 @@ use maki_commands::{
     ArgumentKind, CommandArguments, CommandContent, CommandError, CommandOutcome, CompletionPolicy,
     InputDispatch, PositionalArgument,
 };
-use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
+use maki_config::{Effect, Permission, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::SessionRef;
 use mlua::{
@@ -134,6 +134,7 @@ fn dctx_json(ctx: &DescriptionContext) -> Value {
     let mut obj = json!({
         "audience": ctx.audience.name().unwrap_or("main"),
         "workflow": ctx.workflow,
+        "mcp": ctx.mcp,
     });
     match ctx.filter {
         ToolFilter::All => {}
@@ -209,6 +210,7 @@ pub(crate) struct PendingTool {
     pub(crate) restore_key: Option<RegistryKey>,
     pub(crate) start_key: Option<RegistryKey>,
     pub(crate) permission_scopes: Option<PermissionScopeSpec>,
+    pub(crate) permission: Option<Permission>,
     pub(crate) mutable_path: Option<MutablePathSpec>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
@@ -231,6 +233,7 @@ pub(crate) struct LuaTool {
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
+    pub(crate) permission: Option<Permission>,
     pub(crate) mutable_path: Option<MutablePathKind>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) start_annotation: Option<StartAnnotation>,
@@ -292,6 +295,10 @@ impl Tool for LuaTool {
 
     fn examples(&self) -> Option<Value> {
         self.examples.clone()
+    }
+
+    fn required_permission(&self) -> Option<Permission> {
+        self.permission
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
@@ -413,6 +420,7 @@ impl ToolInvocation for LuaToolInvocation {
             },
             ctx: Box::new(LuaCtx::start(ctx)),
             reply: reply_tx,
+            nested: crate::runtime::under_inflight_slot(),
         };
         let tx = self.tx.clone();
         Box::pin(async move {
@@ -476,6 +484,10 @@ impl ToolInvocation for LuaToolInvocation {
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        // Read here on the caller's stack, not inside the future: a call a Lua
+        // tool dispatched is built while its parent is being polled, and that
+        // is the only moment we can tell it runs under the parent's slot.
+        let nested = crate::runtime::under_inflight_slot();
         let deadline = ctx.deadline;
         let plugin = self.plugin;
         let tool = self.tool;
@@ -517,6 +529,7 @@ impl ToolInvocation for LuaToolInvocation {
                     },
                     reply: reply_tx,
                     live,
+                    nested,
                 })
                 .await
                 .is_err()
@@ -823,6 +836,14 @@ fn register_permission_rule(
         }
     };
 
+    // A deny that covers everything is the safest rule a plugin can write, so
+    // only an allow is refused.
+    if effect == Effect::Allow && maki_agent::permissions::is_universal_scope(&scope) {
+        return Err(mlua::Error::runtime(format!(
+            "register_permission_rule: '{scope}' matches every scope; name the paths or commands the rule covers"
+        )));
+    }
+
     pending_rules
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1030,7 +1051,7 @@ fn nested_dispatch_result(cmdline: &str, result: InputDispatch) -> Result<(), St
         InputDispatch::Dispatched(
             CommandOutcome::AgentTurn(_)
             | CommandOutcome::IsolatedTurn(_)
-            | CommandOutcome::ManualCompaction
+            | CommandOutcome::ManualCompaction(_)
             | CommandOutcome::FrontendFeedback(_),
         ) => Err(format!("{cmdline} {NESTED_NEEDS_FRONTEND}")),
         InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
@@ -1270,18 +1291,21 @@ pub(crate) fn create_api_table(
     Ok(t)
 }
 
-fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
-    let audience = entry.tool.audience();
-    let audiences = lua.create_table()?;
+pub(crate) fn audiences_to_lua(lua: &Lua, audience: ToolAudience) -> LuaResult<Table> {
+    let out = lua.create_table()?;
     for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
         if audience.contains(*flag) {
-            audiences.push(*name)?;
+            out.push(*name)?;
         }
     }
+    Ok(out)
+}
+
+fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     let t = lua.create_table()?;
     t.set("name", entry.name())?;
     t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
-    t.set("audiences", audiences)?;
+    t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
     }
@@ -1401,9 +1425,12 @@ fn is_valid_tool_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
+pub(crate) fn parse_audience(
+    audiences: Option<mlua::Table>,
+    default: ToolAudience,
+) -> LuaResult<ToolAudience> {
     let Some(arr) = audiences else {
-        return Ok(ToolAudience::default());
+        return Ok(default);
     };
     let mut flags = ToolAudience::empty();
     let mut count = 0;
@@ -1530,6 +1557,28 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             ));
         }
     };
+    let declared_permission = spec.get::<Option<String>>("permission")?;
+    let permission = match declared_permission {
+        Some(ref key) => Some(Permission::from_key(key).ok_or_else(|| {
+            mlua::Error::runtime(format!(
+                "register_tool: unknown permission '{key}' (valid: {})",
+                Permission::ALL
+                    .iter()
+                    .map(|p| p.manifest_key())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?),
+        None => None,
+    };
+    if mutable_path.is_none() && permission == Some(Permission::FsWrite) {
+        return Err(mlua::Error::runtime(format!(
+            "register_tool: '{name}' declares permission 'fs_write' but no 'mutable_path', \
+             so write serialization, the stale-read check, the plan-mode block and the \
+             boundary check would all be silently skipped. Add 'mutable_path' naming the \
+             schema field that holds the path it writes"
+        )));
+    }
 
     let permission_scopes = match spec.get::<LuaValue>("permission_scopes")? {
         LuaValue::Nil => None,
@@ -1553,7 +1602,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .get::<String>("kind")
         .ok()
         .map(|s| Arc::from(s.as_str()));
-    let audience = parse_audience(audiences)?;
+    let audience = parse_audience(audiences, ToolAudience::default())?;
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1592,6 +1641,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             restore_key,
             start_key,
             permission_scopes,
+            permission,
             mutable_path,
             timeout,
             start_annotation,
@@ -2466,6 +2516,7 @@ mod tests {
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         assert_eq!(tool.description(&ctx), "test");
     }
@@ -2492,6 +2543,7 @@ mod tests {
             plugin: Arc::from("test"),
             has_header_fn: false,
             permission_scope_kind,
+            permission: None,
             mutable_path: None,
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
@@ -2893,7 +2945,7 @@ mod tests {
         "an isolated turn has no frontend to run it"
     )]
     #[test_case::test_case(
-        InputDispatch::Dispatched(CommandOutcome::ManualCompaction),
+        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(None)),
         Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
         "manual compaction has no frontend to run it"
     )]

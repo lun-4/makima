@@ -162,8 +162,12 @@ impl Runner {
             }
             ActorWork::Root(root) => self.run_root(root, cancellation_generation).await,
             ActorWork::Control(control) => self.run_control(control, cancellation_generation).await,
-            ActorWork::Compact { run_id } => {
-                self.run_compact(run_id, cancellation_generation).await
+            ActorWork::Compact {
+                run_id,
+                instructions,
+            } => {
+                self.run_compact(run_id, instructions.as_deref(), cancellation_generation)
+                    .await
             }
         }
     }
@@ -225,6 +229,11 @@ impl Runner {
             // A precancelled correlation's mark is retired once its matching
             // work is consumed, so it cannot poison a later generation.
             state.cancelled_correlations.remove(&correlation);
+            if let WorkKind::Root { ref earlier, .. } = work {
+                for item in earlier {
+                    state.cancelled_correlations.remove(&item.correlation);
+                }
+            }
             state.active = Some(active);
             state.status = ActorStatus::Running(turn_id);
         }
@@ -295,18 +304,18 @@ impl Runner {
             // A setup failure never entered a run: synthesize one Failed
             // outcome and attempt its single delivery.
             BackendResult::SetupFailed { .. } => (
-                TurnOutcome::Failed {
+                TurnOutcome::failed(
                     agent_id,
                     turn_id,
-                    usage: TokenUsage::default(),
-                    num_turns: 0,
-                    failure: crate::types::TurnFailure {
+                    TokenUsage::default(),
+                    0,
+                    crate::types::TurnFailure {
                         kind: crate::types::TurnFailureKind::Internal,
                         diagnostic: "actor setup failed".to_string(),
                         user_message: "The agent could not start this turn.".to_string(),
                         retryable: true,
                     },
-                },
+                ),
                 true,
             ),
             other => {
@@ -343,7 +352,8 @@ impl Runner {
                 run_id: root.run_id,
                 displayed: root.displayed,
                 text: root.text,
-                image_count: root.image_count,
+                images: root.images,
+                earlier: root.earlier,
             },
             cancellation_generation,
         )
@@ -388,7 +398,12 @@ impl Runner {
         }
     }
 
-    async fn run_compact(&mut self, run_id: u64, popped_generation: u64) {
+    async fn run_compact(
+        &mut self,
+        run_id: u64,
+        instructions: Option<&str>,
+        popped_generation: u64,
+    ) {
         // Consumed: retire any precancel mark for this run_id's canonical
         // correlation.
         {
@@ -413,6 +428,7 @@ impl Runner {
                     interrupt: None,
                     managed_turn: None,
                 },
+                instructions,
             )
             .await;
         if !matches!(result, BackendResult::CompactDone) {

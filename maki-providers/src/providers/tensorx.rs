@@ -10,7 +10,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth, deepseek};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, deepseek};
 
 /// TensorX namespaces resold models by vendor, so DeepSeek ids arrive as
 /// `deepseek/deepseek-flash`.
@@ -228,12 +228,11 @@ impl Provider for TensorX {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 }

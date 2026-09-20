@@ -60,6 +60,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/commands/"><span class="card-title">Commands</span><span class="card-desc">The / palette, sessions, toggles, custom commands.</span></a>
     <a class="card" href="/docs/keybindings/"><span class="card-title">Keybindings</span><span class="card-desc">Defaults, precedence, rebinding from Lua.</span></a>
     <a class="card" href="/docs/lua-api/"><span class="card-title">Lua API</span><span class="card-desc">The plugin surface, mirrored from Neovim.</span></a>
+    <a class="card" href="/docs/hooks/"><span class="card-title">Hooks</span><span class="card-desc">Rewrite, block, or trim a tool call from Lua.</span></a>
     <a class="card" href="/docs/cli/"><span class="card-title">CLI</span><span class="card-desc">Flags and subcommands (auth, models, acp, prompt, ...).</span></a>
     <a class="card" href="/docs/references/"><span class="card-title">References</span><span class="card-desc">The @ popup: files, skills, subagents, models, and what each does at submit.</span></a>
   </div>

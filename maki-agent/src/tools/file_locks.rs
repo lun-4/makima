@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use maki_storage::paths::incremental_canonicalize;
+use maki_storage::paths::canonical_key;
 
 use super::{DEADLINE_EXCEEDED, Deadline, resolve_path_from};
 use crate::cancel::CancelToken;
@@ -72,11 +72,7 @@ impl FileWriteLocks {
     /// a synchronization key and is never used for filesystem access.
     pub(crate) fn lock_key(path: &str, cwd: &Path) -> Result<PathBuf, String> {
         let resolved = resolve_path_from(path, cwd)?;
-        let canonical =
-            incremental_canonicalize(std::path::Path::new(&resolved)).unwrap_or_else(|| {
-                maki_storage::paths::canonicalize_clean(std::path::Path::new(&resolved))
-            });
-        Ok(canonical)
+        Ok(canonical_key(Path::new(&resolved)))
     }
 
     fn entry(&self, key: PathBuf) -> Arc<KeyEntry> {

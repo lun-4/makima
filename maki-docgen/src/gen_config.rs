@@ -9,6 +9,8 @@ use maki_config::{
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
+use crate::gen_folder_trust::POLICY_EXAMPLE;
+
 fn write_table_with_min(out: &mut String, fields: &[ConfigField]) {
     writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
     writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
@@ -197,12 +199,16 @@ fn write_bell_section(out: &mut String) {
     writeln!(out, "### `ui.bell`\n").unwrap();
     writeln!(
         out,
-        "Ring the terminal bell (`\\x07`) on these events. By default `on_prompt = true` \
-         and all other events are off. Bell notifications must also be enabled: \
-         either `ui.notifications = \"bell\"` or `ui.notifications = \"auto\"` with no OSC 9 support.\n"
+        "Ring the terminal bell (`\\x07`) on these events. All values are \
+         `bool`, defaulting to `true`. Disable any of them to silence just \
+         that event.\n"
     )
     .unwrap();
-    write_table_no_min(out, BellConfig::FIELDS);
+    writeln!(out, "| Field | Default |").unwrap();
+    writeln!(out, "|-------|---------|").unwrap();
+    for (name, default) in BellConfig::FIELD_DEFAULTS {
+        writeln!(out, "| `{name}` | {default} |",).unwrap();
+    }
     writeln!(out).unwrap();
 }
 
@@ -238,7 +244,29 @@ maki.setup({{
     )
     .unwrap();
 }
-    writeln!(out).unwrap();
+
+/// `paths` is a `Vec<String>`, which the `ConfigValue` table cannot describe,
+/// so this section is prose like `net.allowed_private_hosts`.
+fn write_trust_section(out: &mut String) {
+    writeln!(out, "### `trust`\n").unwrap();
+    writeln!(
+        out,
+        "Answers the folder trust question in advance. Read from the global \
+         `~/.config/makima/init.lua` only, since a project file that could set \
+         it would be trusting itself:\n"
+    )
+    .unwrap();
+    writeln!(out, "{POLICY_EXAMPLE}\n").unwrap();
+    writeln!(
+        out,
+        "`paths` is a list of globs matched against the project root, empty by \
+         default. `prompt` is a bool, `true` by default. Setting it to `false` \
+         drops the startup card and leaves the folder restricted unless a \
+         `paths` entry matches. \
+         [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax \
+         and which run modes apply the policy.\n"
+    )
+    .unwrap();
 }
 
 pub fn generate() -> String {
@@ -327,6 +355,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_net_section(&mut out);
+    write_trust_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(

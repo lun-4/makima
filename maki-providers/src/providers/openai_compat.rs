@@ -26,6 +26,7 @@ const UNNAMED_TOOL_ID_PREFIX: &str = "maki_unnamed_";
 const PROCESS_TAG_LEN: usize = 8;
 /// The listing every OpenAI compatible API serves, relative to the base URL.
 /// Providers with a second catalog pass their own path instead.
+#[allow(dead_code)]
 pub(crate) const MODELS_PATH: &str = "/models";
 static NEXT_UNNAMED_TOOL_ID: AtomicU64 = AtomicU64::new(0);
 /// Minted once per process: the counter alone restarts at 0 on every run, so a
@@ -159,7 +160,7 @@ impl OpenAiCompatProvider {
     /// Effective base URL: an auth-supplied value (dynamic/custom providers)
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
-    fn base_url(&self, auth: &ResolvedAuth) -> String {
+    pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
         if let Some(explicit) = auth.base_url.as_deref() {
             return explicit.to_string();
         }
@@ -225,10 +226,11 @@ impl OpenAiCompatProvider {
     pub async fn fetch_and_parse_models(
         &self,
         auth: &ResolvedAuth,
+        path: &str,
         parse_fn: impl Fn(&Value) -> Option<crate::model::ModelInfo>,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
         let base = self.base_url(auth);
-        let url = format!("{base}/models");
+        let url = format!("{base}{path}");
         let body_text = self.get_text(auth, &url).await?;
         let body: Value = serde_json::from_str(&body_text)?;
 
@@ -289,7 +291,7 @@ impl OpenAiCompatProvider {
         &self,
         auth: &ResolvedAuth,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
-        self.fetch_and_parse_models(auth, Self::default_model_parser)
+        self.fetch_and_parse_models(auth, MODELS_PATH, Self::default_model_parser)
             .await
     }
 }
@@ -759,6 +761,7 @@ mod tests {
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    #[allow(dead_code)]
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
     const TOOL_NAME: &str = "word_count";
@@ -1070,7 +1073,9 @@ data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\
                 .unwrap_err();
 
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Server overloaded");
                 }

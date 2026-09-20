@@ -831,7 +831,15 @@ Create a named extension point owned by your plugin. You provide a
 `set_slot`. The returned callable runs the full chain: outermost
 layer first, then inward, ending at {default}.
 
-Throws if another plugin already owns a slot with the same {name}.
+Throws if another plugin already owns a slot with the same {name}, or
+if {name} starts with `"tool."`, which the host fires itself.
+
+The chain is async: the default and every layer may park (`maki.fs.*`,
+`maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
+returned callable. Call it from a tool handler, a command, or an
+autocmd, rather than from a `header` or `restore` function, which
+cannot wait. The chain runs in your task, so cancelling the caller
+cancels the layers it is waiting on.
 
 **Parameters:**
 
@@ -865,6 +873,21 @@ Calling `prev` more than once throws.
 You can call this before the owner runs `declare_slot`. The layer
 is queued and attached when the slot is declared.
 
+A layer may park, and one that throws is skipped: the chain continues
+as if it had returned `prev(...)` untouched, so a broken layer never
+takes the seam down with it.
+
+Layers wrap in registration order, so the last one registered runs
+first and sees the value before the others do.
+
+Maki fires two slots per tool itself: `tool.<name>.input` before
+permissions look at the call, and `tool.<name>.output` on the text it
+produced. Both take `function(prev, value, ctx)` and answer with a
+table to replace the value, nothing to leave it alone, or
+`nil, reason` to stop the call. Wrapping one costs the capability the
+tool declares, and a tool declaring none costs every permission. See
+[Hooks](/docs/hooks/).
+
 **Parameters:**
 
 - `{name}` (`string`) Slot name to wrap.
@@ -889,15 +912,7 @@ maki.api.get_slots()
 List all known slots and their current state. Useful for debugging
 which plugins own or wrap each slot.
 
-**Returns:** (`table`) Map of slot name to `{ owner, declared, fillers }`.
-
-**Example:**
-
-```lua
-for name, info in pairs(maki.api.get_slots()) do
-  print(name, info.owner, info.declared)
-end
-```
+**Returns:** table<string, { owner: string?, has_default: boolean, layers: { plugin: string }[] }>
 
 ---
 
@@ -1150,6 +1165,48 @@ local defs, err = maki.agent.tools(ctx, {
 })
 if err then error(err) end
 print(#defs .. " tools available")
+```
+
+---
+
+### `maki.agent.callable_tools()` {#maki-agent-callable_tools}
+
+```lua
+maki.agent.callable_tools({ctx})
+```
+
+Every tool name this context can dispatch: registry tools, MCP tools
+(deferred ones included), host tools (ACP client tools, a subagent's
+`structured_output`) and `tool_search`. Reach for it when you expose tools
+inside a sandbox and need the names to bind. `maki.api.get_tools()` covers
+the registry alone and has no view of the session.
+
+The list already accounts for this session's audience, the config's
+`disabled_tools` and the model's capabilities. Read `audiences` to layer
+your own policy on top. A sandbox wants `interpreter`.
+
+Each name shows up once, described by the tool a call would really reach, so
+a host tool that shadows a registry name reports its own audience rather
+than the shadowed one's.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`table?`, `string?`) Array of `{ name, alias?, source, audiences, schema? }`,
+  or `(nil, err)` on failure. `source` is one of `"native"`, `"local"`,
+  `"mcp"`. `alias` is a safe identifier to bind, set only when `name` is not
+  one (say `srv__get-docs`). Dispatch `name` in every case. `schema` comes
+  with registry tools only.
+
+**Example:**
+
+```lua
+local tools, err = maki.agent.callable_tools(ctx)
+if err then error(err) end
+for _, t in ipairs(tools) do
+  print(t.source, t.alias or t.name)
+end
 ```
 
 ---
@@ -1895,7 +1952,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
-- `{cmd}` (`string`) Shell command to run.
+- `{cmd}` (`string|string[]`) Shell command to run, or array of arguments.
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
@@ -3362,8 +3419,9 @@ maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 
 HTTP client for fetching web content. All traffic goes over HTTPS
 (plain HTTP is upgraded). Private and metadata IP addresses are
-blocked to prevent SSRF. Failed requests (5xx) are retried
-automatically.
+blocked to prevent SSRF, including after a redirect. Hosts listed in
+the `net.allowed_private_hosts` config option are exempt.
+Failed requests (5xx) are retried automatically.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -3380,7 +3438,8 @@ maki.net.request({url}, {opts?})
 
 Make an HTTP request and return the response body. Plain `http://`
 URLs are automatically upgraded to `https://`. Requests to private
-or metadata IP addresses are blocked for safety.
+or metadata IP addresses are blocked for safety, unless the host is
+listed in `net.allowed_private_hosts`.
 
 {opts} fields:
   `method` (string) HTTP verb (default `"GET"`).
@@ -3526,6 +3585,53 @@ descending, then model spec ascending.
 
 ```lua
 local usage, err = maki.session.usage()
+```
+
+---
+
+### `maki.session.read()` {#maki-session-read}
+
+```lua
+maki.session.read({opts?})
+```
+
+One-call snapshot of a session: queue, usage, context, cost, mode, and
+status. Reads the focused session, or the one you name in `session` when
+you act on a background tab.
+
+The returned table:
+```lua
+{
+  id, cwd, model, mode = "build" | "plan",
+  status = "idle" | "working" | "needs_input",
+  focused, updated_at,
+  usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
+  context_size, context_window,
+  cost,
+  queue = { count }, -- nil under headless drivers
+  title,             -- nil under headless drivers
+}
+```
+
+`usage` and `cost` include subagent spend. `context_size` is the main
+session's own, since a subagent runs its own window. There is no
+`list_cost` here because `cost` is re-settled from stored usage when a
+session resumes and list price is not stored, so per-turn list price
+lives on the `TurnEnd` autocmd instead.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` (string?) Session id; defaults to focused.
+
+**Returns:** (`table|nil`, `string|nil`) Snapshot table, or nil and an error.
+
+**Example:**
+
+```lua
+local s = maki.session.read()
+if s.context_size > s.context_window * 0.8 then
+  maki.ui.notify("context is nearly full")
+end
 ```
 
 ---

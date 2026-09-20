@@ -10,7 +10,7 @@ use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::session_coordinator::SessionOptionCatalog;
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_commands::CommandRegistry;
-use maki_config::{PluginsConfig, RawConfig};
+use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::completion::{CompletionCtx, ItemSpec};
 use crate::api::fs::{FsBackend, RealFs};
@@ -32,10 +32,38 @@ use maki_agent::prompt::ResolvedSlots;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const GLOBAL_INIT_OWNER: &str = "maki_init.global";
 const PROJECT_INIT_OWNER: &str = "maki_init.project";
+#[allow(dead_code)]
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 /// Tests assert on this exact text, so a wording tweak here updates them too.
 pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
      tool of the same name, together with any \"always allow\" you saved";
+pub const TRUST_SCOPE_WARNING: &str =
+    "trust is only read from the global init.lua; ignoring the trust table in";
+
+/// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
+/// project folder nobody vouched for stops at the global file.
+///
+/// The project variant carries the path instead of a trust verdict, so the only
+/// way to build one is a `Some` out of [`ProjectConfig::gated_path`] and
+/// "trusted" cannot disagree with "which file".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InitFiles {
+    Disabled,
+    Global,
+    GlobalAndProject(PathBuf),
+}
+
+impl InitFiles {
+    pub fn resolve(project_config: &ProjectConfig, no_plugins: bool) -> Self {
+        if no_plugins {
+            return InitFiles::Disabled;
+        }
+        match project_config.gated_path(GatedFile::InitLua) {
+            Some(path) => InitFiles::GlobalAndProject(path),
+            None => InitFiles::Global,
+        }
+    }
+}
 
 struct BundledPlugin {
     name: &'static str,
@@ -307,26 +335,54 @@ impl PluginHost {
         Ok(host)
     }
 
-    pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
+    /// `warnings` collects non-fatal startup problems for the caller to surface.
+    pub fn load_init_files(
+        &self,
+        init_files: InitFiles,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        self.load_init_files_from_dirs(
+            init_files,
+            maki_storage::paths::config_search_dirs(),
+            warnings,
+        )
+    }
+
+    fn load_init_files_from_dirs(
+        &self,
+        init_files: InitFiles,
+        global_dirs: impl IntoIterator<Item = PathBuf>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        if init_files == InitFiles::Disabled {
+            return Ok(None);
+        }
+
         let mut merged: Option<RawConfig> = None;
 
-        for global_dir in maki_config::global_config_dirs() {
+        for global_dir in global_dirs {
             self.run_init_file(
                 &global_dir.join("init.lua"),
                 "global/init.lua",
                 GLOBAL_INIT_OWNER,
+                true,
                 &mut merged,
+                warnings,
             )?;
             if merged.is_some() {
                 break;
             }
         }
-        self.run_init_file(
-            &cwd.join(".makima/init.lua"),
-            "project/init.lua",
-            PROJECT_INIT_OWNER,
-            &mut merged,
-        )?;
+        if let InitFiles::GlobalAndProject(path) = &init_files {
+            self.run_init_file(
+                path,
+                "project/init.lua",
+                PROJECT_INIT_OWNER,
+                false,
+                &mut merged,
+                warnings,
+            )?;
+        }
 
         Ok(merged)
     }
@@ -337,12 +393,10 @@ impl PluginHost {
     pub fn load_init_files_or_skip(
         &self,
         no_plugins: bool,
-        cwd: &Path,
+        project_config: &ProjectConfig,
+        warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
-        if no_plugins {
-            return Ok(None);
-        }
-        self.load_init_files(cwd)
+        self.load_init_files(InitFiles::resolve(project_config, no_plugins), warnings)
     }
 
     fn run_init_file(
@@ -350,7 +404,9 @@ impl PluginHost {
         path: &Path,
         source_name: &str,
         owner: &str,
+        global: bool,
         merged: &mut Option<RawConfig>,
+        warnings: &mut Vec<String>,
     ) -> Result<(), PluginError> {
         if !path.is_file() {
             return Ok(());
@@ -360,16 +416,19 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
-        if let Some(raw) =
+        if let Some(mut raw) =
             self.send_run_init_lua_as(source, source_name.to_owned(), Arc::from(owner), plugin_dir)?
         {
+            if !global && std::mem::take(&mut raw.trust).is_set() {
+                warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+            }
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
             }
         }
         if let Some(warning) = self.permission_name_warning(owner) {
-            tracing::warn!("{warning}");
+            warnings.push(warning);
         }
         Ok(())
     }
@@ -975,6 +1034,16 @@ impl EventHandle {
             completion: Some(completion),
         });
         rx
+    }
+
+    /// Headless drivers install their own provider so `maki.session.read` has
+    /// something to answer with instead of "no interactive UI attached". The UI
+    /// leaves the slot empty and answers through its event loop, which owns the
+    /// live session runtimes.
+    pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
+        let _ = self
+            .tx
+            .try_send(Request::InstallSessionSnapshot { provider });
     }
 
     pub fn collect_prompt_slots(&self) -> ResolvedSlots {
@@ -2761,16 +2830,18 @@ mod tests {
         .unwrap();
 
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut warnings = Vec::new();
+        let project_config = ProjectConfig::for_project(dir.path());
 
         let skipped = host
-            .load_init_files_or_skip(true, dir.path())
+            .load_init_files_or_skip(true, &project_config, &mut warnings)
             .expect("no-plugins skips broken init.lua");
         assert!(
             skipped.is_none(),
             "--no-plugins must skip user init.lua entirely"
         );
 
-        let ran = host.load_init_files_or_skip(false, dir.path());
+        let ran = host.load_init_files_or_skip(false, &project_config, &mut warnings);
         assert!(
             ran.is_err(),
             "without --no-plugins the broken init.lua must surface as an error"

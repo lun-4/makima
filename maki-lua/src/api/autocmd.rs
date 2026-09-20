@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::dispatch::{DepthGuard, call_isolated};
+use crate::api::util::dispatch::{DepthGuard, Reentry, call_isolated};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -115,7 +115,7 @@ fn dispatch_snapshot(
     data: Value,
     snapshot: Vec<(u64, Arc<str>, Function)>,
 ) {
-    let Ok(_guard) = DepthGuard::enter(lua, "autocmd", event) else {
+    let Ok(_guard) = DepthGuard::enter(lua, "autocmd", event, Reentry::Vm) else {
         tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
         return;
     };

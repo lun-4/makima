@@ -8,8 +8,8 @@ use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig,
-    TokenUsage,
+    ContentBlock, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 use super::compaction;
@@ -20,11 +20,13 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
+use crate::tools::{
+    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
+};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentId, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, SessionMailbox, TurnCancellationReason, TurnCompleteEvent,
-    TurnFailure, TurnId, TurnOutcome,
+    ExtractedCommand, InterruptSource, RunLedger, SessionMailbox, TurnCancellationReason,
+    TurnCompleteEvent, TurnFailure, TurnId, TurnOutcome,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -40,6 +42,8 @@ const RECENT_TOOL_WINDOW: usize = 5;
 /// turn, and a model resuming its own cut-off text can wedge the session
 /// (seen with llama.cpp stuck on an unterminated tool call).
 const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
+const INTERRUPT_NOTE: &str =
+    "The user sent a new message while you were working. Address it and continue.";
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -85,7 +89,7 @@ fn filter_tools(all: &Value, allowed: &[String]) -> Value {
 /// Rebuilds a run's base tool schema for a model and workflow flag. The
 /// schema belongs to the frontend, so a run that can be reconfigured has to be
 /// handed the means to rebuild it.
-pub type ToolBuilder = Arc<dyn Fn(&Model, bool) -> Value + Send + Sync>;
+pub type ToolBuilder = Arc<dyn Fn(&Model, bool) -> RequestTools + Send + Sync>;
 
 /// What a run should use from its next request onward.
 pub struct RunSettings {
@@ -203,6 +207,7 @@ pub struct AgentParams {
     pub audience: ToolAudience,
     pub question_mode: crate::tools::QuestionMode,
     pub model_policy: Arc<ModelPolicy>,
+    pub ledger: Arc<RunLedger>,
     /// Same-process per-path mutation locks, cloned from the parent context
     /// for subagents so concurrent same-path mutations stay serialized.
     pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
@@ -213,7 +218,7 @@ pub struct AgentRunParams<'h> {
     pub history: &'h mut History,
     pub system: String,
     pub event_tx: EventSender,
-    pub tools: Value,
+    pub tools: RequestTools,
 }
 
 pub struct Agent<'h> {
@@ -225,13 +230,13 @@ pub struct Agent<'h> {
     history: &'h mut History,
     system: String,
     event_tx: EventSender,
-    tools: Value,
+    tools: RequestTools,
     mode: AgentMode,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
     cancel_reason_source: Option<ReasonedCancelToken>,
-    total_usage: TokenUsage,
+    ledger: Arc<RunLedger>,
     context_size: u32,
     num_turns: u32,
     recent_calls: RecentCalls,
@@ -282,7 +287,7 @@ impl<'h> Agent<'h> {
             interrupt_source: None,
             cancel: CancelToken::none(),
             cancel_reason_source: None,
-            total_usage: TokenUsage::default(),
+            ledger: params.ledger,
             context_size: 0,
             num_turns: 0,
             recent_calls: RecentCalls::new(),
@@ -355,10 +360,10 @@ impl<'h> Agent<'h> {
     /// Exactly one terminal event delivery is attempted. A closed event channel
     /// does not change the returned outcome and is never retried.
     pub async fn run(&mut self, turn_id: TurnId, input: AgentInput) -> TurnOutcome {
-        self.total_usage = TokenUsage::default();
         self.num_turns = 0;
         self.reauth_attempts = 0;
         self.rollback_len = self.history.len();
+        self.ledger = Arc::new(RunLedger::default());
 
         let AgentInput {
             message,
@@ -390,13 +395,21 @@ impl<'h> Agent<'h> {
             "agent run started"
         );
 
-        let outcome = match self.run_loop().await {
+        let loop_result = self.run_loop().await;
+        let totals = self.ledger.totals();
+        let context_size = self.context_size;
+        let context_window = self.model.context_window;
+        let outcome = match loop_result {
             Ok(reason) => TurnOutcome::Completed {
                 agent_id: self.agent_id,
                 turn_id,
-                usage: self.total_usage,
+                usage: totals.usage,
                 num_turns: self.num_turns,
                 reason,
+                cost: totals.cost,
+                list_cost: totals.list_cost,
+                context_size,
+                context_window,
             },
             Err(AgentError::Cancelled) => {
                 sanitize_cancelled_history(self.history, self.rollback_len);
@@ -409,17 +422,25 @@ impl<'h> Agent<'h> {
                 TurnOutcome::Cancelled {
                     agent_id: self.agent_id,
                     turn_id,
-                    usage: self.total_usage,
+                    usage: totals.usage,
                     num_turns: self.num_turns,
                     reason,
+                    cost: totals.cost,
+                    list_cost: totals.list_cost,
+                    context_size,
+                    context_window,
                 }
             }
             Err(error) => TurnOutcome::Failed {
                 agent_id: self.agent_id,
                 turn_id,
-                usage: self.total_usage,
+                usage: totals.usage,
                 num_turns: self.num_turns,
                 failure: TurnFailure::from_agent_error(&error),
+                cost: totals.cost,
+                list_cost: totals.list_cost,
+                context_size,
+                context_window,
             },
         };
         self.emit_outcome(&outcome);
@@ -509,8 +530,8 @@ impl<'h> Agent<'h> {
     fn request_tools(&self) -> Cow<'_, Value> {
         let def = self.modes.current(&self.mode);
         let base = match &def.tools {
-            Some(names) => Cow::Owned(filter_tools(&self.tools, names)),
-            None => Cow::Borrowed(&self.tools),
+            Some(names) => Cow::Owned(filter_tools(self.tools.definitions(), names)),
+            None => Cow::Borrowed(self.tools.definitions()),
         };
         match &self.mcp {
             Some(mcp) => {
@@ -538,6 +559,7 @@ impl<'h> Agent<'h> {
             &self.cancel,
             self.opts,
             self.session_id.as_ref(),
+            self.timeouts.retry,
         )
         .await
         {
@@ -582,10 +604,8 @@ impl<'h> Agent<'h> {
             "API response received"
         );
 
+        self.context_size = response.usage.total_input();
         self.emit_turn_complete(&response)?;
-        let usage = response.usage;
-        self.total_usage += usage;
-        self.context_size = usage.total_input();
 
         if has_tools {
             let history_len_before = self.history.len();
@@ -649,15 +669,17 @@ impl<'h> Agent<'h> {
     }
 
     fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
+        let fast = self.opts.clamped(&self.model).fast;
+        let cost = self.model.billed_cost(&response.usage, fast);
+        let list_cost = self.model.list_cost(&response.usage, fast);
+        self.ledger.add(response.usage, cost, list_cost);
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
                 message: response.message.clone(),
                 usage: response.usage,
                 model: self.model.id.clone(),
-                cost: self
-                    .model
-                    .billed_cost(&response.usage, self.opts.clamped(&self.model).fast),
-                context_size: Some(response.usage.context_tokens()),
+                cost,
+                context_size: Some(self.context_size),
                 context_window: self.model.context_window,
             })))
     }
@@ -715,7 +737,6 @@ impl<'h> Agent<'h> {
         tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
-            self.mcp.as_ref(),
             self.history,
             &self.event_tx,
             &ctx,
@@ -748,6 +769,7 @@ impl<'h> Agent<'h> {
             mcp: self.mcp.clone(),
             deadline: Deadline::None,
             config: self.config.clone(),
+            tool_filter: Arc::clone(self.tools.filter()),
             tool_output_lines: self.tool_output_lines,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
@@ -756,6 +778,7 @@ impl<'h> Agent<'h> {
             modes: Arc::clone(&self.modes),
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
+            ledger: Arc::clone(&self.ledger),
             registry: Arc::clone(&self.registry),
             workflow: self.workflow,
             audience: self.audience,
@@ -776,36 +799,52 @@ impl<'h> Agent<'h> {
                     ..Default::default()
                 },
                 &self.model,
-                self.config.compaction_buffer,
+                &self.config,
             )
         {
             return Ok(false);
         }
         info!(context_size = self.context_size, "auto-compacting");
-        self.event_tx.send(AgentEvent::AutoCompacting)?;
-        self.do_compact().await?;
+        self.event_tx.send(AgentEvent::AutoCompacting {
+            context_size: self.context_size,
+            context_window: self.model.context_window,
+        })?;
+        self.do_compact(None).await?;
         Ok(true)
     }
 
-    async fn do_compact(&mut self) -> Result<(), AgentError> {
+    async fn do_compact(&mut self, instructions: Option<&str>) -> Result<(), AgentError> {
+        let context_size_before = self.context_size;
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
             self.timeouts,
             &self.model_policy,
         );
-        self.total_usage += compaction::compact_history(
+        let compaction_usage = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
             &self.event_tx,
             &self.cancel,
             &self.config,
+            instructions,
             self.session_id.as_ref(),
         )
         .await?;
+        let fast = self.opts.clamped(&compact_model).fast;
+        let compact_cost = compact_model.billed_cost(&compaction_usage, fast);
+        let compact_list_cost = compact_model.list_cost(&compaction_usage, fast);
+        self.ledger
+            .add(compaction_usage, compact_cost, compact_list_cost);
+        let context_size_after = compaction_usage.output;
+        self.context_size = context_size_after;
         self.rollback_len = self.history.len();
-        self.event_tx.send(AgentEvent::CompactionDone)?;
+        self.event_tx.send(AgentEvent::CompactionDone {
+            context_size_before,
+            context_size_after,
+            context_window: self.model.context_window,
+        })?;
         self.history
             .push(Message::synthetic(compaction::continue_message(
                 &self.config,
@@ -821,21 +860,32 @@ impl<'h> Agent<'h> {
             return Ok(false);
         };
         match cmd {
-            ExtractedCommand::Interrupt(mut input, _) => {
-                self.event_tx.send(AgentEvent::QueueItemConsumed {
-                    text: input.message.clone(),
-                    image_count: input.images.len(),
-                })?;
-                self.push_input_context(std::mem::take(&mut input.preamble));
-                self.mode = input.mode.clone();
-                let display = input.message.clone();
-                let wrapped = format!(
-                    "<user-interrupt>\nThe user sent a new message while you were working. Address it and continue.\n\n{display}\n</user-interrupt>"
-                );
-                self.history.push(Message::user_display(wrapped, display));
+            ExtractedCommand::Interrupt(inputs) => {
+                for input in inputs {
+                    self.event_tx.send(AgentEvent::QueueItemConsumed {
+                        text: input.message.clone(),
+                        images: input.images.clone(),
+                    })?;
+                    self.push_input_context(input.preamble);
+                    self.mode = input.mode;
+                    let wrapped = format!(
+                        "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
+                        input.message
+                    );
+                    self.history.push(Message {
+                        display_text: Some(
+                            if input.message.is_empty() && !input.images.is_empty() {
+                                IMAGE_PLACEHOLDER.into()
+                            } else {
+                                input.message
+                            },
+                        ),
+                        ..Message::user_with_images(wrapped, input.images)
+                    });
+                }
             }
-            ExtractedCommand::Compact(_) => {
-                self.do_compact().await?;
+            ExtractedCommand::Compact(instructions) => {
+                self.do_compact(instructions.as_deref()).await?;
             }
         }
         Ok(true)
@@ -997,10 +1047,7 @@ mod tests {
                     trigger.cancel();
                 }
                 match self.fail_status {
-                    Some(status) => Err(AgentError::Api {
-                        status,
-                        message: "stub".into(),
-                    }),
+                    Some(status) => Err(AgentError::api(status, "stub")),
                     None => futures_lite::future::pending().await,
                 }
             })
@@ -1096,18 +1143,26 @@ mod tests {
             thinking: ThinkingConfig::Off,
         })));
         agent.settings_source = Some(Arc::clone(&source) as Arc<dyn RunSettingsSource>);
-        agent.tool_builder = Some(Arc::new(
-            |_model: &Model, workflow: bool| serde_json::json!([{ "name": if workflow { "with-workflow" } else { "without" } }]),
-        ));
+        agent.tool_builder = Some(Arc::new(|_model: &Model, workflow: bool| {
+            RequestTools::assembled(
+                serde_json::json!([{ "name": if workflow { "with-workflow" } else { "without" } }]),
+                &AgentConfig::default(),
+                &Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+            )
+        }));
         agent.workflow = false;
-        agent.tools = serde_json::json!([{ "name": "without" }]);
+        agent.tools = RequestTools::assembled(
+            serde_json::json!([{ "name": "without" }]),
+            &AgentConfig::default(),
+            &Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+        );
 
         agent.adopt_pending_settings();
 
         assert!(agent.workflow, "the flag is adopted");
         assert_eq!(
-            agent.tools,
-            serde_json::json!([{ "name": "with-workflow" }]),
+            agent.tools.definitions(),
+            &serde_json::json!([{ "name": "with-workflow" }]),
             "the schema is rebuilt for the new flag"
         );
     }
@@ -1206,6 +1261,7 @@ mod tests {
                         ..Default::default()
                     },
                     std::path::PathBuf::from("/tmp"),
+                    maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
                     Arc::default(),
                 )),
                 session_id: None,
@@ -1215,6 +1271,7 @@ mod tests {
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 modes: crate::ModeRegistry::builtin().into(),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
+                ledger: Arc::new(RunLedger::default()),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
                 question_mode: crate::tools::QuestionMode::Tui,
@@ -1226,7 +1283,7 @@ mod tests {
                 history,
                 system: "system".into(),
                 event_tx: EventSender::new(raw_tx, 0),
-                tools: serde_json::json!([]),
+                tools: RequestTools::default(),
             },
         );
         (agent, event_rx)
@@ -1279,7 +1336,7 @@ mod tests {
             mailbox.push("mailbox".into(), false);
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
-            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(input, 0)]);
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
             agent.mailbox = Some(mailbox);
@@ -1396,10 +1453,7 @@ mod tests {
         smol::block_on(async {
             let provider = ScriptedProvider {
                 results: Mutex::new(VecDeque::from([
-                    Err(AgentError::Api {
-                        status: 400,
-                        message: "bad request".into(),
-                    }),
+                    Err(AgentError::api(400, "bad request")),
                     Ok(text_response(StopReason::EndTurn)),
                 ])),
             };
@@ -1518,7 +1572,7 @@ mod tests {
             let captured = Arc::clone(&provider.captured_tools);
             let mut history = History::new(Vec::new());
             let (agent, _event_rx) = make_agent(provider, &mut history);
-            let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(&[(
+            let mut agent = agent.with_mcp(Some(crate::mcp::test_support::stub_session(&[(
                 "srv.fetch_issue",
                 "Fetch a GitHub issue",
             )])));
@@ -1577,8 +1631,7 @@ mod tests {
         smol::block_on(async {
             let source = if queued.is_some() {
                 Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
-                    default_input(),
-                    0,
+                    vec![default_input()],
                 )]))
             } else {
                 None
@@ -1621,7 +1674,7 @@ mod tests {
 
     #[test_case(
         (0..10).map(|i| Message::user(format!("msg {i}"))).collect(),
-        vec![ExtractedCommand::Compact(0)],
+        vec![ExtractedCommand::Compact(None)],
         vec![tool_call_response("glob", "t1"), text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)]
         ; "compaction_via_interrupt_source"
     )]
@@ -1666,7 +1719,7 @@ mod tests {
             assert_eq!(
                 has_event(&drain_events(&event_rx), |e| matches!(
                     e,
-                    AgentEvent::AutoCompacting
+                    AgentEvent::AutoCompacting { .. }
                 )),
                 expected,
             );
@@ -1683,7 +1736,7 @@ mod tests {
                 &mut history,
             );
             agent.config.post_compaction_instructions = Some(POST.into());
-            agent.do_compact().await.unwrap();
+            agent.do_compact(None).await.unwrap();
             drop(agent);
 
             let last = history.as_slice().last().unwrap();

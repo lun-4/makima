@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 use maki_agent::AgentEvent;
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::{
-    FileReadTracker, LocalTools, QuestionMode, ToolAudience, ToolContext, ToolLive,
-};
+use maki_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
@@ -53,7 +51,6 @@ impl From<&ToolContext> for AgentContext {
         let mut c = ctx.clone();
         c.loaded_instructions = LoadedInstructions::new();
         c.tool_output_lines = ToolOutputLines::default();
-        c.local_tools = LocalTools::default();
         Self(c)
     }
 }
@@ -347,17 +344,14 @@ impl UserData for LuaCtx {
             Ok((Some(true), None))
         });
 
-        methods.add_method("check_before_edit", |_, this, path: String| {
-            let Some(agent) = this.agent() else {
+        // The matching check before a write is run by the dispatcher under the
+        // file write lock for every tool declaring `mutable_path`. Kept as a
+        // compatibility shim returning (Some(true), None).
+        methods.add_method("check_before_edit", |_, this, _path: String| {
+            if this.agent().is_none() {
                 return Ok(this.cap_err_pair("check_before_edit"));
-            };
-            if !agent.config.stale_read_check {
-                return Ok((Some(true), None));
             }
-            match agent.file_tracker.check_before_edit(Path::new(&path)) {
-                Ok(()) => Ok((Some(true), None)),
-                Err(msg) => Ok((Some(false), Some(msg))),
-            }
+            Ok((Some(true), None))
         });
 
         methods.add_async_method(
@@ -474,8 +468,8 @@ mod tests {
 
     use maki_agent::AgentMode;
     use maki_agent::tools::Deadline;
-    use maki_agent::tools::LocalToolFn;
     use maki_agent::tools::test_support::stub_ctx_with;
+    use maki_agent::tools::{LocalTool, ToolAudience};
 
     use super::*;
 
@@ -501,10 +495,12 @@ mod tests {
             !ctx.loaded_instructions
                 .contains_or_insert(PathBuf::from(INSTRUCTION_PATH))
         );
-        let mut tools: HashMap<String, LocalToolFn> = HashMap::new();
+        let mut tools: HashMap<String, LocalTool> = HashMap::new();
         tools.insert(
             LOCAL_TOOL_NAME.into(),
-            maki_agent::tools::local_tool(|_, _| Box::pin(async { Ok(String::new()) })),
+            maki_agent::tools::local_tool(ToolAudience::MODEL, |_, _| {
+                Box::pin(async { Ok(String::new()) })
+            }),
         );
         ctx.local_tools = Arc::new(tools);
         ctx.live_sink = Some(flume::unbounded().0);
@@ -525,7 +521,10 @@ mod tests {
             "the parent deadline must be inherited, not discarded"
         );
         assert_eq!(agent.tool_output_lines, ToolOutputLines::default());
-        assert!(agent.local_tools.is_empty());
+        assert!(
+            agent.local_tools.contains_key(LOCAL_TOOL_NAME),
+            "a nested call must route names exactly like the model's own call"
+        );
         assert!(
             !agent
                 .loaded_instructions

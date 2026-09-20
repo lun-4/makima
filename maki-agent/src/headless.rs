@@ -1,10 +1,12 @@
+#[cfg(test)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_lock::Mutex;
 use flume::Receiver;
 use futures_lite::future;
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, ProjectConfig};
 use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
@@ -22,12 +24,10 @@ use crate::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
 };
 use crate::template;
-use crate::tools::{
-    DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
-};
+use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    Envelope, EventSender, McpHandle, McpSession, PermissionsConfig, SessionMailbox,
+    Envelope, EventSender, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionMailbox,
     ToolOutputLines, TurnFailure, TurnId, TurnOutcome,
 };
 
@@ -45,6 +45,7 @@ pub struct HeadlessParams {
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub project_config: ProjectConfig,
     pub modes: Arc<crate::ModeRegistry>,
     /// Plugin-registered session options. A print-mode run still needs a
     /// coordinator: tools read their options through one, and
@@ -63,24 +64,28 @@ pub struct HeadlessHandle {
 struct AgentSetup {
     vars: template::Vars,
     instructions: agent::Instructions,
-    tools: Value,
+    tools: RequestTools,
 }
 
+/// Takes the handle rather than a second `bool`: two adjacent flags is one
+/// too many to read call sites of.
 fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     workflow: bool,
+    mcp: Option<&McpHandle>,
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = tool_definitions(
+    let tools = RequestTools::build(
+        ToolRegistry::global(),
         &vars,
         model,
         config,
         excluded_tools,
         workflow,
-        ToolRegistry::global(),
+        mcp.is_some(),
     );
 
     AgentSetup {
@@ -88,25 +93,6 @@ fn setup(
         instructions,
         tools,
     }
-}
-
-/// Base definitions only. MCP definitions are injected per request by
-/// `Agent::request_tools`; storing them here would freeze the catalog.
-fn tool_definitions(
-    vars: &template::Vars,
-    model: &Model,
-    config: &AgentConfig,
-    excluded_tools: &[&'static str],
-    workflow: bool,
-    registry: &ToolRegistry,
-) -> Value {
-    let filter = ToolFilter::from_config(config, model, excluded_tools);
-    let ctx = DescriptionContext {
-        filter: &filter,
-        audience: ToolAudience::MAIN,
-        workflow,
-    };
-    registry.definitions(vars, &ctx, model.supports_tool_examples())
 }
 
 /// Names advertised to SDK clients: base tools plus what the first request
@@ -141,6 +127,7 @@ fn spawn_with_session_id(
         &params.config,
         &params.excluded_tools,
         workflow,
+        params.mcp_handle.as_ref(),
     );
 
     let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
@@ -158,7 +145,7 @@ fn spawn_with_session_id(
     }
 
     let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
-    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
+    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
@@ -243,6 +230,7 @@ fn spawn_with_session_id(
                     permissions: Arc::new(PermissionManager::new(
                         params.permissions_config,
                         working_dir_path,
+                        params.project_config,
                         params.plugin_rules,
                     )),
                     session_id: Some(session_ref_clone.clone()),
@@ -252,6 +240,7 @@ fn spawn_with_session_id(
                     prompt_slots: Arc::new(params.prompt_slots),
                     modes: Arc::clone(&params.modes),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    ledger: Arc::new(RunLedger::default()),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     question_mode: crate::tools::QuestionMode::Headless,
@@ -307,6 +296,7 @@ pub struct InteractiveParams {
     pub modes: Arc<crate::ModeRegistry>,
     pub question_mode: crate::tools::QuestionMode,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub project_config: ProjectConfig,
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
@@ -323,6 +313,7 @@ pub enum ManualCompactionEvent {
 pub enum InteractiveControl {
     Compact(flume::Sender<Result<(), String>>),
     ManualCompaction {
+        instructions: Option<String>,
         output: flume::Sender<ManualCompactionEvent>,
         cancel: CancelToken,
         lease_committer: Option<crate::session_coordinator::SessionLeaseCommitter>,
@@ -500,6 +491,7 @@ async fn apply_interactive_control(
                 &EventSender::new(raw_tx.clone(), run_id),
                 &CancelToken::none(),
                 config,
+                None,
                 Some(&SessionRef::from(session_id)),
             )
             .await
@@ -608,20 +600,21 @@ pub struct InteractiveHandle {
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
-    let initial_tools = tool_definitions(
+    let initial_tools = RequestTools::build(
+        ToolRegistry::global(),
         &template::env_vars(),
         &params.model,
         &params.config,
         &params.excluded_tools,
         params.workflow,
-        ToolRegistry::global(),
+        params.mcp_handle.is_some(),
     );
 
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.initial_history));
-    let tool_names = advertised_tool_names(&initial_tools, mcp.as_ref());
+    let tool_names = advertised_tool_names(initial_tools.definitions(), mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
@@ -648,6 +641,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let permissions = Arc::new(PermissionManager::new(
         params.permissions_config.clone(),
         params.initial_wd,
+        params.project_config,
         Arc::clone(&params.plugin_rules),
     ));
     permissions.set_yolo(params.yolo);
@@ -734,6 +728,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         continue;
                     }
                     Some(InteractiveWake::Control(InteractiveControl::ManualCompaction {
+                        instructions,
                         output,
                         cancel,
                         lease_committer,
@@ -748,6 +743,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                             &EventSender::new(private_tx, run_id),
                             &cancel,
                             &params.config,
+                            instructions.as_deref(),
                             Some(&session_ref_clone),
                         )
                         .await
@@ -872,13 +868,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         }
                         Err(e) => {
                             error!(error = %e, agent_id = %agent_id, %turn_id, "provider error");
-                            let outcome = TurnOutcome::Failed {
+                            let outcome = TurnOutcome::failed(
                                 agent_id,
                                 turn_id,
-                                usage: TokenUsage::default(),
-                                num_turns: 0,
-                                failure: TurnFailure::from_agent_error(&e),
-                            };
+                                TokenUsage::default(),
+                                0,
+                                TurnFailure::from_agent_error(&e),
+                            );
                             if let Err(send_error) = error_tx.send(AgentEvent::TurnOutcome(outcome))
                             {
                                 error!(
@@ -899,13 +895,15 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
                 let turn_vars = template::env_vars_for(&working_dir);
                 let turn_instructions = agent::load_instructions(&working_dir.to_string_lossy());
-                let tools = tool_definitions(
+                let has_mcp = mcp.is_some();
+                let tools = RequestTools::build(
+                    ToolRegistry::global(),
                     &turn_vars,
                     &model,
                     &params.config,
                     &params.excluded_tools,
                     input.workflow,
-                    ToolRegistry::global(),
+                    has_mcp,
                 );
                 let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
                     agent::build_system_prompt(
@@ -942,8 +940,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                             let excluded = params.excluded_tools.clone();
                             let registry = Arc::clone(ToolRegistry::global_arc());
                             Arc::new(move |model: &Model, workflow: bool| {
-                                tool_definitions(
-                                    &vars, model, &config, &excluded, workflow, &registry,
+                                RequestTools::build(
+                                    &registry, &vars, model, &config, &excluded, workflow, has_mcp,
                                 )
                             })
                         }),
@@ -960,6 +958,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         modes: Arc::clone(&modes),
                         subagent_cancels: Arc::new(CancelMap::new()),
+                        ledger: Arc::new(RunLedger::default()),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
                         question_mode: params.question_mode,
@@ -1070,6 +1069,7 @@ mod tests {
             append_system_prompt: None,
             model_policy: Arc::default(),
             plugin_rules: Arc::default(),
+            project_config: ProjectConfig::for_project(Path::new("/tmp")),
             modes: Arc::default(),
             session_options: Default::default(),
         }
@@ -1325,13 +1325,13 @@ mod tests {
             let retained_tx = turn_tx.clone();
             let (raw_tx, raw_rx) = flume::unbounded();
             let run_id = 17;
-            let outcome = TurnOutcome::Completed {
-                agent_id: AgentId::generate(),
-                turn_id: TurnId::generate(),
-                usage: TokenUsage::default(),
-                num_turns: 1,
-                reason: crate::DoneReason::EndTurn,
-            };
+            let outcome = TurnOutcome::completed(
+                AgentId::generate(),
+                TurnId::generate(),
+                TokenUsage::default(),
+                1,
+                crate::DoneReason::EndTurn,
+            );
             let collector = smol::spawn(collect_turn_events(turn_rx, raw_tx));
 
             turn_tx
@@ -1442,13 +1442,13 @@ mod tests {
             .unwrap();
             let lease = coordinator.acquire_lease().await.unwrap();
             let committer = lease.committer().unwrap();
-            let outcome = TurnOutcome::Completed {
-                agent_id: AgentId::generate(),
-                turn_id: TurnId::generate(),
-                usage: TokenUsage::default(),
-                num_turns: 1,
-                reason: crate::DoneReason::EndTurn,
-            };
+            let outcome = TurnOutcome::completed(
+                AgentId::generate(),
+                TurnId::generate(),
+                TokenUsage::default(),
+                1,
+                crate::DoneReason::EndTurn,
+            );
             let terminal = Envelope {
                 event: AgentEvent::TurnOutcome(outcome.clone()),
                 subagent: None,
@@ -1546,13 +1546,13 @@ mod tests {
                 mailbox: SessionMailbox::new(session_id),
             })
             .unwrap();
-            let outcome = TurnOutcome::Completed {
-                agent_id: AgentId::generate(),
-                turn_id: TurnId::generate(),
-                usage: TokenUsage::default(),
-                num_turns: 1,
-                reason: crate::DoneReason::EndTurn,
-            };
+            let outcome = TurnOutcome::completed(
+                AgentId::generate(),
+                TurnId::generate(),
+                TokenUsage::default(),
+                1,
+                crate::DoneReason::EndTurn,
+            );
             let terminal = Envelope {
                 event: AgentEvent::TurnOutcome(outcome.clone()),
                 subagent: None,
@@ -1629,7 +1629,8 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
-        let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+        let mcp =
+            crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
         let names = advertised_tool_names(&base, Some(&mcp));
         assert_eq!(
             names,

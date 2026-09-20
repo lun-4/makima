@@ -320,8 +320,6 @@ mod tests {
     use crate::components::key;
     use crate::components::keybindings::key as kb;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use maki_providers::ModelInfo;
-    use maki_providers::ModelPricing;
     use test_case::test_case;
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";

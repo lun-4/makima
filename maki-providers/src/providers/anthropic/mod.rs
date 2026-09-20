@@ -22,7 +22,9 @@ use crate::{
     UsageWindow,
 };
 
-use super::KeyPool;
+use super::{KeyHeader, KeyPool, KeyRotation};
+
+const API_KEY_HEADER: &str = "x-api-key";
 
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
@@ -210,7 +212,11 @@ impl From<OauthUsage> for ProviderUsage {
             }));
         }
         limits.extend(credits_limit(&u));
-        ProviderUsage { plan: None, limits }
+        ProviderUsage {
+            plan: None,
+            limits,
+            by_model_today: Vec::new(),
+        }
     }
 }
 
@@ -454,15 +460,12 @@ impl Provider for Anthropic {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            let base_url = self.resolved_base_url.clone();
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_auth(&self.auth, |key| {
-                    resolve_auth_from_key(key, base_url.clone())
-                })
-            }))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Raw(API_KEY_HEADER),
+        ))
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -1043,7 +1046,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 .await
                 .unwrap_err();
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Overloaded");
                 }
@@ -1061,7 +1066,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 .await
                 .unwrap_err();
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 400);
                     assert_eq!(message, "not-json");
                 }

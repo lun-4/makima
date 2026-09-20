@@ -378,6 +378,9 @@ maki.api.register_tool({
     },
   },
   permission_scopes = function(input, ctx)
+    if not ctx or not ctx.session_id then
+      return command_scopes(input.command)
+    end
     local enabled = auto_mode_enabled(ctx.session_id)
     if enabled == nil then
       return command_scopes(input.command)

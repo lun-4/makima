@@ -24,6 +24,7 @@ const PROVIDER_PRIORITY: &[&str] = &[
     "zai",
     "synthetic",
     "deepseek",
+    "regolo",
 ];
 
 pub fn resolve_model(

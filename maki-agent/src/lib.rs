@@ -57,11 +57,12 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, AgentId, BufferSnapshot, DoneReason, Envelope, EventSender, GrepFileEntry,
-    GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine,
-    SnapshotSpan, SpanStyle, SubagentCancel, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput,
-    ToolOutput, ToolStartEvent, TurnCancellationReason, TurnCompleteEvent, TurnFailure,
-    TurnFailureKind, TurnId, TurnOutcome,
+    AgentEvent, AgentId, BufferSnapshot, DoneReason, Envelope, EventSender, EventStreamGuard,
+    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger,
+    RunTotals, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SubagentCancel,
+    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
+    TurnCancellationReason, TurnCompleteEvent, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -90,12 +91,70 @@ impl AgentMode {
 }
 
 pub enum ExtractedCommand {
-    Interrupt(AgentInput, u64),
-    Compact(u64),
+    /// Every message the user queued back to back, so one turn answers them
+    /// all. A source must stop there and hand anything else over on its own,
+    /// since a command like `/compact` rewrites the history the later messages
+    /// land in.
+    Interrupt(Vec<AgentInput>),
+    /// Carries the guidance typed as `/compact <instructions>`, for this one
+    /// summary.
+    Compact(Option<String>),
 }
 
 pub trait InterruptSource: Send + Sync {
     fn poll(&self) -> Option<ExtractedCommand>;
+}
+
+/// What a message must agree on with its neighbours to share their turn.
+pub type BatchKey = (AgentMode, bool);
+
+/// The set of messages this one may share a turn with, or `None` when it
+/// has to run alone: the agent resolves one MCP prompt per run. `mode` is
+/// a permission boundary and `workflow` picks the tool catalog, so a
+/// message queued under either may not execute under another one.
+///
+/// Destructured on purpose: a new `AgentInput` field then has to be
+/// classified here instead of silently merging across.
+pub fn batch_key(input: &AgentInput) -> Option<BatchKey> {
+    let AgentInput {
+        mode,
+        workflow,
+        prompt,
+        cancel,
+        lease_committer,
+        message: _,
+        images: _,
+        preamble: _,
+        thinking: _,
+        fast: _,
+    } = input;
+    if prompt.is_some() || cancel.is_some() || lease_committer.is_some() {
+        return None;
+    }
+    Some((mode.clone(), *workflow))
+}
+
+/// Folds a run of queued messages into one agent input. The last message
+/// drives the run and the earlier ones ride in front of it as their own user
+/// messages, so each keeps its images and the model answers the burst in one
+/// request. The run shares one mode and one workflow by construction, so only
+/// the preferences (thinking, fast) come from the last message, the user's
+/// most recent intent.
+pub fn merge_inputs(mut inputs: Vec<AgentInput>) -> Option<AgentInput> {
+    let mut last = inputs.pop()?;
+    let mut preamble = Vec::new();
+    for earlier in inputs {
+        preamble.extend(earlier.preamble);
+        let message = maki_providers::Message::user_with_images(earlier.message, earlier.images);
+        // An input with neither text nor images would become a user message
+        // with no content at all, which providers reject.
+        if !message.content.is_empty() {
+            preamble.push(message);
+        }
+    }
+    preamble.append(&mut last.preamble);
+    last.preamble = preamble;
+    Some(last)
 }
 
 #[derive(Clone)]

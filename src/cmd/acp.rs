@@ -5,12 +5,14 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use maki_agent::{command, tools::ToolRegistry};
+use maki_config::project::{self, TrustMode};
 use maki_config::{load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_storage::StateDir;
 
 use crate::setup;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     model_arg: Option<String>,
     yolo: bool,
@@ -19,12 +21,14 @@ pub fn run(
     no_jit: bool,
     system_prompt_override: Option<String>,
     append_system_prompt: Option<String>,
+    trust_mode: TrustMode,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let trust = project::resolve(&storage, &cwd, trust_mode);
+    load_env_files(&trust.project_config);
 
     let command_registry = maki_commands::CommandRegistry::new();
     let standard_commands = command::StandardCommands::register(
@@ -40,15 +44,17 @@ pub fn run(
     )
     .context("initialize lua plugin host")?;
 
+    let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let raw_config = plugin_host
-        .load_init_files_or_skip(no_plugins, &cwd)
+        .load_init_files_or_skip(no_plugins, &trust.project_config, &mut warnings)
         .context("load init.lua files")?;
 
     let mut config = raw_config
         .unwrap_or_default()
         .into_config(false)
         .context("invalid config")?;
-    config.permissions = load_permissions(&cwd);
+    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    config.permissions = load_permissions(&trust.project_config);
 
     if yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -61,11 +67,7 @@ pub fn run(
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
-    let timeouts = maki_providers::Timeouts {
-        connect: config.provider.connect_timeout,
-        low_speed: config.provider.low_speed_timeout,
-        stream: config.provider.stream_timeout,
-    };
+    let timeouts = maki_providers::Timeouts::from(&config.provider);
 
     let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
 
@@ -94,6 +96,8 @@ pub fn run(
         plugin_rules: plugin_host.plugin_rules(),
         lua_event_handle,
         command_registry,
+        trust_mode,
+        trust_policy: Arc::new(config.trust),
     });
     drop(standard_commands);
     result

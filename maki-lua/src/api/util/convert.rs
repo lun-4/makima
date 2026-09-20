@@ -3,6 +3,13 @@ use serde_json::Value as JsonValue;
 
 pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error message";
 
+/// How many nulls an array encoding may invent for keys the table does not
+/// hold. A JSON null arrives as an absent Lua key, so a round trip has to be
+/// able to put a few back, but nothing bounds the largest key a table carries.
+/// Past this the table is a sparse map, not an array, and the object encoding
+/// keeps every key while allocating per entry.
+const MAX_ARRAY_HOLES: usize = 4096;
+
 pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
     let mut iter = values.into_iter();
     match iter.next() {
@@ -53,11 +60,31 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
     })
 }
 
-/// Convert a Lua value into a [`serde_json::Value`] by hand.
-///
 /// Symmetric counterpart to [`json_to_lua`]. We avoid mlua's `from_value`
 /// for the same `arbitrary_precision` reason documented above.
 pub(crate) fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
+    within_template(lua, val, None)
+}
+
+/// [`lua_to_json`], guided by the JSON that [`json_to_lua`] built `val` from:
+/// whatever the Lua side produced wins, and a null the Lua side left absent is
+/// restored from `template`.
+///
+/// A JSON null arrives as a Lua nil, and assigning nil to a table key is a
+/// no-op, so a layer never sees a null and cannot hand one back. They have to
+/// be carried across instead. Guiding stops wherever the two sides stop being
+/// the same container kind, so a layer that swapped a subtree for a scalar owns
+/// it outright. The price: a layer cannot delete a key whose value is null, it
+/// comes back, while deleting a key holding a real value works.
+pub(crate) fn lua_to_json_within(
+    lua: &Lua,
+    val: &Value,
+    template: &JsonValue,
+) -> LuaResult<JsonValue> {
+    within_template(lua, val, Some(template))
+}
+
+fn within_template(lua: &Lua, val: &Value, template: Option<&JsonValue>) -> LuaResult<JsonValue> {
     Ok(match val {
         Value::Nil => JsonValue::Null,
         Value::Boolean(b) => JsonValue::Bool(*b),
@@ -67,11 +94,16 @@ pub(crate) fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
             .unwrap_or(JsonValue::Null),
         Value::String(s) => JsonValue::String(s.to_str()?.to_owned()),
         Value::Table(tbl) => {
-            // A table serializes as a JSON array only when every key is a
-            // positive integer and they are dense from 1 (count == max), so no
-            // string key silently disappears and sparse tables like
+            // An untagged table serializes as a JSON array only when every key
+            // is a positive integer and they are dense from 1 (count == max),
+            // so no string key silently disappears and sparse tables like
             // `{ [1] = "a", [3] = "c" }` deterministically become objects
             // (`lua_rawlen` borders are implementation-defined for those).
+            // The array metatable outranks that, since `json_to_lua` writes it
+            // on every JSON array and a null element leaves an absent key:
+            // density cannot be re-derived, and the gaps are holes to fill with
+            // null. Keys an array cannot express still fall back to the object
+            // encoding, which keeps all of them.
             let mut has_non_int = false;
             let mut int_count = 0;
             let mut max_int = 0;
@@ -88,18 +120,37 @@ pub(crate) fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
                 entries.push((k, v));
             }
 
+            let tagged = tbl.metatable().as_ref() == Some(&lua.array_metatable());
+            // Slots the entries do not pay for. The array encoding has to
+            // materialize every one of them, and the largest key alone decides
+            // how many, so this is the only thing standing between
+            // `decoded[os.time()] = 1` and an allocation the size of a clock.
+            let holes = max_int - int_count;
             let is_array = !has_non_int
-                && int_count == max_int
-                && (int_count > 0 || tbl.metatable().as_ref() == Some(&lua.array_metatable()));
+                && if tagged {
+                    holes <= MAX_ARRAY_HOLES
+                } else {
+                    int_count > 0 && holes == 0
+                };
             if is_array {
-                let mut arr = vec![JsonValue::Null; int_count];
+                let template = template.and_then(JsonValue::as_array);
+                // A trailing null never moved `max_int`, so only the template
+                // knows the array ran on past the last key the Lua side kept.
+                // A trailing non-null there was a real value the layer dropped.
+                let mut len = max_int;
+                while template.is_some_and(|t| t.get(len).is_some_and(JsonValue::is_null)) {
+                    len += 1;
+                }
+                let mut arr = vec![JsonValue::Null; len];
                 for (k, v) in entries {
                     let Value::Integer(i) = k else { unreachable!() };
-                    arr[i as usize - 1] = lua_to_json(lua, &v)?;
+                    let idx = i as usize - 1;
+                    arr[idx] = within_template(lua, &v, template.and_then(|t| t.get(idx)))?;
                 }
                 return Ok(JsonValue::Array(arr));
             }
 
+            let template = template.and_then(JsonValue::as_object);
             let mut map = serde_json::Map::new();
             for (k, v) in entries {
                 let key = match k {
@@ -109,7 +160,11 @@ pub(crate) fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
                     Value::Boolean(b) => b.to_string(),
                     _ => continue,
                 };
-                map.insert(key, lua_to_json(lua, &v)?);
+                let child = template.and_then(|t| t.get(&key));
+                map.insert(key, within_template(lua, &v, child)?);
+            }
+            for (key, _) in template.into_iter().flatten().filter(|(_, v)| v.is_null()) {
+                map.entry(key.as_str()).or_insert(JsonValue::Null);
             }
             JsonValue::Object(map)
         }

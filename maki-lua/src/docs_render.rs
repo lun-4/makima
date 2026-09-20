@@ -47,16 +47,25 @@ The rules:
   `false` to revoke it. An empty file grants everything.
 - Invalid TOML: everything denied, with a warning in the log.
 "#;
-    let keys = Permission::ALL.map(Permission::manifest_key);
+    let keys: Vec<&'static str> = Permission::ALL.iter().map(|p| p.manifest_key()).collect();
     let anchor = if anchored {
         format!(" {{#{PERMISSIONS_ANCHOR}}}")
     } else {
         String::new()
     };
+    let names = keys
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table_keys = keys
+        .iter()
+        .map(|k| format!("{k} = true\n"))
+        .collect::<String>();
     TEMPLATE
         .replace("{ANCHOR}", &anchor)
-        .replace("{NAMES}", &keys.map(|k| format!("`{k}`")).join(", "))
-        .replace("{KEYS}", &keys.map(|k| format!("{k} = true\n")).concat())
+        .replace("{NAMES}", &names)
+        .replace("{KEYS}", &table_keys)
 }
 
 const GUIDE: &str = r#"# Writing makima plugins

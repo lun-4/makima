@@ -207,8 +207,8 @@ impl Provider for Opencode {
 
             let model = Model {
                 id: actual_id.to_string(),
-                max_output_tokens: Some(meta.output),
-                context_window: meta.context,
+                max_output_tokens: Some(meta.max_output()),
+                context_window: meta.context_window(),
                 ..model_for_stream
             };
 
@@ -313,7 +313,11 @@ pub(crate) fn parse_usage(response: &str) -> Result<ProviderUsage, AgentError> {
             message: EMPTY_USAGE_ERROR.into(),
         });
     }
-    Ok(ProviderUsage { plan: None, limits })
+    Ok(ProviderUsage {
+        plan: None,
+        limits,
+        by_model_today: Vec::new(),
+    })
 }
 
 /// `/usage` timestamps are RFC 3339; the UI expects epoch milliseconds.
