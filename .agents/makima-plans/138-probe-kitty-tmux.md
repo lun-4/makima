@@ -39,22 +39,22 @@ Scope boundaries:
    ```
 2. Define the probe query strings:
    - Direct Kitty query (`i=31`) followed by direct sentinel: `\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[5n`
-   - DCS-wrapped Kitty query (`i=32`) followed by DCS-wrapped sentinel: `\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\x1b\\\x1b\x1b[5n\x1b\\`
-   Placing the sentinel inside the DCS envelope guarantees that Ghostty processes `_Gi=32` before emitting the DCS-wrapped `\x1b[0n`.
-3. Implement `parse_probe_stream(buffer: &[u8]) -> Option<DetectedGraphics>`:
-   - If bytes contain `_Gi=32;OK` or `_Gi=32;`, return `Some(DetectedGraphics { protocol: ProtocolType::Kitty, is_tmux: true })`.
-   - If bytes contain `_Gi=31;OK` or `_Gi=31;`, return `Some(DetectedGraphics { protocol: ProtocolType::Kitty, is_tmux: false })`.
-   - If neither probe matches, return `None`.
-   The read loop terminates immediately upon observing a matching probe response. If an isolated `\x1b[0n` is observed without a preceding `_Gi` match, the read loop continues polling until the deadline expires to allow in-flight DCS responses across SSH to arrive.
+   - DCS-wrapped Kitty query (`i=32`) followed by DCS-wrapped sentinel: `\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b\x1b[5n\x1b\\`
+   Terminating the Kitty query inside DCS with BEL (`\x07`) ensures no embedded String Terminator (`\x1b\`) causes non-tmux terminals to prematurely terminate DCS mode.
+3. Implement `parse_probe_stream(buffer: &[u8], in_tmux: bool) -> ProbeResult`:
+   - If bytes contain terminated `Gi=32;` reply (terminated with ST `\x1b\` or BEL `\x07`), return `ProbeResult::Detected(DetectedGraphics { protocol: ProtocolType::Kitty, is_tmux: true })`.
+   - If bytes contain terminated `Gi=31;` reply, return `ProbeResult::Detected(DetectedGraphics { protocol: ProtocolType::Kitty, is_tmux: in_tmux })`.
+   - If direct DSR sentinel `\x1b[0n` is observed with no Kitty reply and `!in_tmux`, return `ProbeResult::Unsupported` to abort immediately and avoid startup delay on non-Kitty terminals.
+   - If under tmux (`in_tmux`), an initial `\x1b[0n` is expected from local tmux; wait for outer terminal DCS response or deadline.
 4. Implement non-blocking stdio handshake:
    - Implement `probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraphics>`:
      - On Unix platforms (`#[cfg(unix)]`):
        - Verify both `std::io::stdout().is_terminal()` and `std::io::stdin().is_terminal()`. Return `None` if either is false.
        - Write the probe sequences to standard output and flush.
-       - Use `libc::poll` on `libc::STDIN_FILENO` with a 10 millisecond slice timeout up to the total 100 millisecond deadline.
+       - Poll `libc::STDIN_FILENO` in 50ms slices up to 350ms deadline.
        - Read incoming chunks into an accumulation buffer.
-       - Check `parse_probe_stream`. If a positive match occurs, terminate immediately.
-       - If the deadline expires without a match, return `None`.
+       - Check `parse_probe_stream`. If `Detected` or `Unsupported`, break immediately.
+       - Run `drain_stdin()` before returning to flush any trailing echoes or sentinels so crossterm's `InputReader` starts with a clean buffer.
      - On non-Unix platforms (`#[cfg(not(unix))]`): return `None`.
 5. Retain the static multiplexer check in `protocol_from_env`. The handshake is the sole authority for enabling graphics under multiplexers.
 
