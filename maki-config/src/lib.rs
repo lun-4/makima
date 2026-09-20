@@ -1126,7 +1126,7 @@ pub struct UiConfig {
 
     #[config(
         default = true,
-        desc = "Render inline images in terminals with graphics support, falling back to an [image] line when off"
+        desc = "Render inline images in terminals with graphics support (Kitty graphics and tmux passthrough are detected automatically without manual multiplexer flags), falling back to an [image] line when off"
     )]
     pub inline_images: bool,
 

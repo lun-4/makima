@@ -250,6 +250,7 @@ impl TerminalMux {
 impl TerminalGuard {
     pub(crate) fn init() -> Result<(Self, ratatui::DefaultTerminal)> {
         let terminal = ratatui::init();
+        crate::terminal_image::init_graphics_detection();
         stdout().execute(EnableBracketedPaste)?;
         stdout().execute(EnableMouseCapture)?;
         enable_focus_change();
