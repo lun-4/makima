@@ -22,7 +22,7 @@ const NO_SHARED_FILES_YET: &str =
 const ADDED_SINCE_TRUSTED: &str = "since you trusted it";
 /// An answer given without knowing what the question covers is not consent, and
 /// the card is too small to explain the whole gate.
-pub const TRUST_DOCS: &str = "Learn more: https://maki.sh/docs/folder-trust/";
+pub const TRUST_DOCS: &str = "Learn more: https://lun-4.github.io/makima/docs/folder-trust/";
 const DECLINED: &str = "Shared project config was skipped.";
 /// Every skip says how to undo itself. `--trust` is here because the runs that
 /// cannot answer a question are the ones that see these warnings.
