@@ -11,11 +11,12 @@ use maki_storage::id::SessionRef;
 use super::ResolvedAuth;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::dialect;
 use crate::manifest::ManifestRegistry;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
-use crate::types::ThinkingConfig;
+use crate::types::{ThinkingConfig, ThinkingConfigExt};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
@@ -304,6 +305,10 @@ impl Provider for CustomOpenAiProvider {
             let mut body = self.compat.build_body(model, messages, system, tools);
             if matches!(opts.thinking, ThinkingConfig::Off) {
                 body["thinking"] = serde_json::json!({"type": "disabled"});
+                body["reasoning_effort"] = serde_json::json!("none");
+            } else {
+                opts.thinking
+                    .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
             }
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
@@ -388,5 +393,28 @@ mod tests {
         overlay_declared_tiers(&def, &mut models);
         assert_eq!(models[0].tier, Some(ModelTier::Strong));
         assert_eq!(models[1].tier, None);
+    }
+
+    #[test]
+    fn custom_openai_body_thinking_serialization() {
+        let def = openai_def("test-model");
+        let model = model_from_def(&def, ProviderKind::OpenAi, "custom", "test-model");
+        let compat = OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default());
+
+        // 1. Thinking High
+        let mut body_high = compat.build_body(&model, &[], "", &serde_json::json!({}));
+        ThinkingConfig::Effort(maki_domain::Effort::High).apply_reasoning_effort(
+            &mut body_high,
+            &dialect::STANDARD,
+            &model,
+        );
+        assert_eq!(body_high["reasoning_effort"], "high");
+
+        // 2. Thinking Off
+        let mut body_off = compat.build_body(&model, &[], "", &serde_json::json!({}));
+        body_off["thinking"] = serde_json::json!({"type": "disabled"});
+        body_off["reasoning_effort"] = serde_json::json!("none");
+        assert_eq!(body_off["thinking"]["type"], "disabled");
+        assert_eq!(body_off["reasoning_effort"], "none");
     }
 }
