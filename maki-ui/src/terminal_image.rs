@@ -28,8 +28,9 @@ const DECODE_THREAD: &str = "inline-image";
 const PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 const PROBE_POLL_SLICE: Duration = Duration::from_millis(50);
 const PROBE_PAYLOAD: &[u8] =
-    b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[5n\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b\x1b[5n\x1b\\";
+    b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b[>c\x1b[5n\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b\x1b[5n\x1b\\";
 const DSR_RESPONSE: &[u8] = b"\x1b[0n";
+const TMUX_DA2_REPLY: &[u8] = b">84;";
 const KITTY_PROBE_TMUX_REPLY: &[u8] = b"Gi=32;";
 const KITTY_PROBE_DIRECT_REPLY: &[u8] = b"Gi=31;";
 const BEL_BYTE: u8 = 0x07;
@@ -81,6 +82,13 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+fn contains_subslice(buffer: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || buffer.len() < needle.len() {
+        return false;
+    }
+    buffer.windows(needle.len()).any(|window| window == needle)
+}
+
 fn count_subslice(buffer: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || buffer.len() < needle.len() {
         return 0;
@@ -91,20 +99,28 @@ fn count_subslice(buffer: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
-fn find_terminated_reply(buffer: &[u8], prefix: &[u8]) -> Option<bool> {
+fn find_terminated_reply(buffer: &[u8], prefix: &[u8]) -> Option<(bool, bool)> {
     if prefix.is_empty() || buffer.len() < prefix.len() {
         return None;
     }
     let pos = buffer.windows(prefix.len()).position(|w| w == prefix)?;
     let rest = &buffer[pos + prefix.len()..];
-    let has_terminator =
+    let is_terminated =
         rest.contains(&BEL_BYTE) || rest.windows(ST_BYTES.len()).any(|w| w == ST_BYTES);
-    Some(has_terminator)
+    let has_sentinel = contains_subslice(rest, DSR_RESPONSE);
+    Some((is_terminated, has_sentinel))
 }
 
-pub(crate) fn parse_probe_stream(buffer: &[u8], in_tmux: bool) -> ProbeResult {
-    if let Some(complete) = find_terminated_reply(buffer, KITTY_PROBE_TMUX_REPLY) {
-        return if complete {
+fn is_tmux_detected(buffer: &[u8]) -> bool {
+    env::var_os("TMUX").is_some() || contains_subslice(buffer, TMUX_DA2_REPLY)
+}
+
+pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
+    let in_tmux = is_tmux_detected(buffer);
+
+    if let Some((terminated, has_sentinel)) = find_terminated_reply(buffer, KITTY_PROBE_TMUX_REPLY)
+    {
+        return if terminated && (has_sentinel || contains_subslice(buffer, DSR_RESPONSE)) {
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -114,8 +130,10 @@ pub(crate) fn parse_probe_stream(buffer: &[u8], in_tmux: bool) -> ProbeResult {
         };
     }
 
-    if let Some(complete) = find_terminated_reply(buffer, KITTY_PROBE_DIRECT_REPLY) {
-        return if complete {
+    if let Some((terminated, has_sentinel)) =
+        find_terminated_reply(buffer, KITTY_PROBE_DIRECT_REPLY)
+    {
+        return if terminated && (has_sentinel || contains_subslice(buffer, DSR_RESPONSE)) {
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: in_tmux,
@@ -173,7 +191,6 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
     out.flush().ok()?;
     drop(out);
 
-    let in_tmux = env::var_os("TMUX").is_some();
     let deadline = Instant::now() + timeout;
     let mut buf = Vec::with_capacity(256);
     let mut detected = None;
@@ -186,7 +203,7 @@ pub(crate) fn probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraph
                 unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
             if n > 0 {
                 buf.extend_from_slice(&chunk[..n as usize]);
-                match parse_probe_stream(&buf, in_tmux) {
+                match parse_probe_stream(&buf) {
                     ProbeResult::Detected(graphics) => {
                         detected = Some(graphics);
                         break;
@@ -227,14 +244,6 @@ pub(crate) fn init_graphics_detection() {
     ensure_tmux_passthrough();
 
     let detected = probe_terminal_graphics(PROBE_TIMEOUT);
-    let is_tmux = detected.is_some_and(|d| d.is_tmux) || env::var_os("TMUX").is_some();
-    if is_tmux && detected.is_some() {
-        // SAFETY: Called during single-threaded startup in TerminalGuard::init()
-        // prior to spawning worker threads or the event loop.
-        unsafe {
-            env::set_var("TERM_PROGRAM", "tmux");
-        }
-    }
     if let Some(detected) = detected {
         tracing::info!(
             protocol = ?detected.protocol,
@@ -274,14 +283,18 @@ fn create_picker(
     if !inline_images {
         return None;
     }
-    let protocol = if let Some(detected) = detected {
-        detected.protocol
+    let (protocol, is_tmux) = if let Some(detected) = detected {
+        (detected.protocol, detected.is_tmux)
     } else {
-        protocol_from_env(inline_images, env_fallback)?
+        let is_tmux = env_fallback("TMUX").is_some()
+            || env_fallback("TERM").is_some_and(|t| t.starts_with("tmux"))
+            || env_fallback("TERM_PROGRAM").is_some_and(|p| p == "tmux");
+        (protocol_from_env(inline_images, env_fallback)?, is_tmux)
     };
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(font);
     picker.set_protocol_type(protocol);
+    picker.set_is_tmux(is_tmux);
     Some(picker)
 }
 
@@ -508,31 +521,15 @@ mod tests {
     const KITTY_TERM: &str = "xterm-kitty";
     const UNKNOWN_PROGRAM: &str = "unknown";
     const TMUX_DCS_PREFIX: &str = "\x1bPtmux;";
-    const DIRECT_PROBE_RESPONSE: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[0n";
-    const TMUX_PROBE_RESPONSE: &[u8] = b"\x1b_Gi=32;OK\x1b\\\x1b[0n";
-    const TMUX_PROBE_RESPONSE_NO_UNDERSCORE: &[u8] = b"Gi=32;OK\x1b\\\x1b[0n";
-    const LOCAL_DSR_RESPONSE: &[u8] = b"\x1b[0n";
-    const GHOSTTY_KITTY_RESPONSE: &[u8] = b"\x1b_Gi=32;OK\x1b\\";
-    const UNKNOWN_DCS_STREAM: &[u8] = b"\x1bPsomething_unknown\x1b\\\x1b_Gi=31;OK\x1b\\";
+    const DIRECT_PROBE_RESPONSE: &[u8] = b"\x1b_Gi=31;OK\x1b\\\x1b[>0;1;0c\x1b[0n";
+    const TMUX_PROBE_RESPONSE: &[u8] = b"\x1b[>84;0;0c\x1b[0n\x1b_Gi=32;OK\x1b\\\x1b[0n";
+    const TMUX_PROBE_RESPONSE_NO_UNDERSCORE: &[u8] = b"\x1b[>84;0;0c\x1b[0nGi=32;OK\x1b\\\x1b[0n";
+    const DIRECT_DSR_RESPONSE: &[u8] = b"\x1b[>0;1;0c\x1b[0n";
+    const TMUX_LOCAL_DSR_RESPONSE: &[u8] = b"\x1b[>84;0;0c\x1b[0n";
+    const GHOSTTY_KITTY_RESPONSE: &[u8] = b"\x1b_Gi=32;OK\x1b\\\x1b[0n";
+    const UNKNOWN_DCS_STREAM: &[u8] = b"\x1bPsomething_unknown\x1b\\\x1b_Gi=31;OK\x1b\\\x1b[0n";
     const BEL_TERMINATED_RESPONSE: &[u8] = b"\x1b_Gi=31;OK\x07\x1b[0n";
     const INCOMPLETE_KITTY_RESPONSE: &[u8] = b"\x1b_Gi=31;O";
-
-    fn force_picker_tmux(picker: &mut Picker) {
-        let size = std::mem::size_of::<Picker>();
-        let ptr = picker as *mut Picker as *mut u8;
-        for offset in 0..size {
-            unsafe {
-                let original = *ptr.add(offset);
-                if original == 0 {
-                    *ptr.add(offset) = 1;
-                    if picker.tmux_detected() {
-                        return;
-                    }
-                    *ptr.add(offset) = 0;
-                }
-            }
-        }
-    }
 
     fn protocol(inline_images: bool, env: &[(&str, &str)]) -> Option<ProtocolType> {
         protocol_from_env(inline_images, |key| {
@@ -627,7 +624,7 @@ mod tests {
     #[test]
     fn test_parse_probe_direct_kitty() {
         assert_eq!(
-            parse_probe_stream(DIRECT_PROBE_RESPONSE, false),
+            parse_probe_stream(DIRECT_PROBE_RESPONSE),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: false,
@@ -638,7 +635,7 @@ mod tests {
     #[test]
     fn test_parse_probe_tmux_kitty() {
         assert_eq!(
-            parse_probe_stream(TMUX_PROBE_RESPONSE, true),
+            parse_probe_stream(TMUX_PROBE_RESPONSE),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -649,18 +646,7 @@ mod tests {
     #[test]
     fn test_parse_probe_tmux_kitty_without_leading_underscore() {
         assert_eq!(
-            parse_probe_stream(TMUX_PROBE_RESPONSE_NO_UNDERSCORE, true),
-            ProbeResult::Detected(DetectedGraphics {
-                protocol: ProtocolType::Kitty,
-                is_tmux: true,
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_probe_direct_kitty_with_tmux_env() {
-        assert_eq!(
-            parse_probe_stream(DIRECT_PROBE_RESPONSE, true),
+            parse_probe_stream(TMUX_PROBE_RESPONSE_NO_UNDERSCORE),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -670,11 +656,11 @@ mod tests {
 
     #[test]
     fn test_parse_probe_delayed_dcs_response_after_local_dsr() {
-        let mut stream = LOCAL_DSR_RESPONSE.to_vec();
-        assert_eq!(parse_probe_stream(&stream, true), ProbeResult::Pending);
+        let mut stream = TMUX_LOCAL_DSR_RESPONSE.to_vec();
+        assert_eq!(parse_probe_stream(&stream), ProbeResult::Pending);
         stream.extend_from_slice(GHOSTTY_KITTY_RESPONSE);
         assert_eq!(
-            parse_probe_stream(&stream, true),
+            parse_probe_stream(&stream),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -683,17 +669,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_probe_unsupported_terminal_deadline() {
+    fn test_parse_probe_direct_unsupported_terminal_immediate() {
         assert_eq!(
-            parse_probe_stream(LOCAL_DSR_RESPONSE, false),
+            parse_probe_stream(DIRECT_DSR_RESPONSE),
             ProbeResult::Unsupported
         );
     }
 
     #[test]
+    fn test_parse_probe_tmux_unsupported_terminal_both_dsrs() {
+        let stream = b"\x1b[>84;0;0c\x1b[0n\x1b[0n";
+        assert_eq!(parse_probe_stream(stream), ProbeResult::Unsupported);
+    }
+
+    #[test]
     fn test_parse_probe_unknown_dcs_ignored() {
         assert_eq!(
-            parse_probe_stream(UNKNOWN_DCS_STREAM, false),
+            parse_probe_stream(UNKNOWN_DCS_STREAM),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: false,
@@ -704,7 +696,7 @@ mod tests {
     #[test]
     fn test_parse_probe_bel_terminated_response() {
         assert_eq!(
-            parse_probe_stream(BEL_TERMINATED_RESPONSE, false),
+            parse_probe_stream(BEL_TERMINATED_RESPONSE),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: false,
@@ -715,7 +707,7 @@ mod tests {
     #[test]
     fn test_parse_probe_incomplete_response_pending() {
         assert_eq!(
-            parse_probe_stream(INCOMPLETE_KITTY_RESPONSE, false),
+            parse_probe_stream(INCOMPLETE_KITTY_RESPONSE),
             ProbeResult::Pending
         );
     }
@@ -724,11 +716,20 @@ mod tests {
     fn test_create_picker_from_detected_graphics() {
         let detected = DetectedGraphics {
             protocol: ProtocolType::Kitty,
+            is_tmux: true,
+        };
+        let picker = create_picker(Some(detected), true, FALLBACK_FONT_SIZE, |_| None).unwrap();
+        assert_eq!(picker.protocol_type(), ProtocolType::Kitty);
+        assert!(picker.tmux_detected());
+
+        let detected_direct = DetectedGraphics {
+            protocol: ProtocolType::Kitty,
             is_tmux: false,
         };
-        let picker = create_picker(Some(detected), true, FALLBACK_FONT_SIZE, |_| None);
-        assert!(picker.is_some());
-        assert_eq!(picker.unwrap().protocol_type(), ProtocolType::Kitty);
+        let picker_direct =
+            create_picker(Some(detected_direct), true, FALLBACK_FONT_SIZE, |_| None).unwrap();
+        assert_eq!(picker_direct.protocol_type(), ProtocolType::Kitty);
+        assert!(!picker_direct.tmux_detected());
 
         let picker_disabled = create_picker(Some(detected), false, FALLBACK_FONT_SIZE, |_| None);
         assert!(picker_disabled.is_none());
@@ -759,7 +760,7 @@ mod tests {
         #[allow(deprecated)]
         let mut picker = Picker::from_fontsize(FALLBACK_FONT_SIZE);
         picker.set_protocol_type(ProtocolType::Kitty);
-        force_picker_tmux(&mut picker);
+        picker.set_is_tmux(true);
         assert!(picker.tmux_detected());
         let protocol = encode(&source, &picker, IMAGE_WIDTH)?;
 

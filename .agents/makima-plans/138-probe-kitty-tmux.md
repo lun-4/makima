@@ -38,14 +38,16 @@ Scope boundaries:
    }
    ```
 2. Define the probe query strings:
-   - Direct Kitty query (`i=31`) followed by direct sentinel: `\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[5n`
+   - Direct Kitty query (`i=31`) followed by DA2 query (`\x1b[>c`) and direct sentinel: `\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b[>c\x1b[5n`
    - DCS-wrapped Kitty query (`i=32`) followed by DCS-wrapped sentinel: `\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b\x1b[5n\x1b\\`
-   Terminating the Kitty query inside DCS with BEL (`\x07`) ensures no embedded String Terminator (`\x1b\`) causes non-tmux terminals to prematurely terminate DCS mode.
-3. Implement `parse_probe_stream(buffer: &[u8], in_tmux: bool) -> ProbeResult`:
-   - If bytes contain terminated `Gi=32;` reply (terminated with ST `\x1b\` or BEL `\x07`), return `ProbeResult::Detected(DetectedGraphics { protocol: ProtocolType::Kitty, is_tmux: true })`.
-   - If bytes contain terminated `Gi=31;` reply, return `ProbeResult::Detected(DetectedGraphics { protocol: ProtocolType::Kitty, is_tmux: in_tmux })`.
+   - Tmux intercepts `\x1b[>c` and immediately answers `\x1b[>84;...c` (<0.1ms), enabling in-band detection of tmux even over SSH when `$TMUX` is not forwarded.
+   - Terminating the Kitty query inside DCS with BEL (`\x07`) ensures no embedded String Terminator (`\x1b\`) causes non-tmux terminals to prematurely terminate DCS mode.
+3. Implement `parse_probe_stream(buffer: &[u8]) -> ProbeResult`:
+   - Detect tmux presence via `$TMUX` or in-band DA2 reply `>84;`.
+   - If bytes contain terminated `Gi=32;` reply and sentinel, return `ProbeResult::Detected(DetectedGraphics { protocol: ProtocolType::Kitty, is_tmux: true })`.
+   - If bytes contain terminated `Gi=31;` reply and sentinel, return `ProbeResult::Detected(DetectedGraphics { protocol: ProtocolType::Kitty, is_tmux: in_tmux })`.
    - If direct DSR sentinel `\x1b[0n` is observed with no Kitty reply and `!in_tmux`, return `ProbeResult::Unsupported` to abort immediately and avoid startup delay on non-Kitty terminals.
-   - If under tmux (`in_tmux`), an initial `\x1b[0n` is expected from local tmux; wait for outer terminal DCS response or deadline.
+   - If under tmux (`in_tmux`), an initial `\x1b[0n` is expected from local tmux; wait for outer terminal DCS response or outer sentinel. If two `\x1b[0n` sentinels arrive without Kitty reply, return `ProbeResult::Unsupported`.
 4. Implement non-blocking stdio handshake:
    - Implement `probe_terminal_graphics(timeout: Duration) -> Option<DetectedGraphics>`:
      - On Unix platforms (`#[cfg(unix)]`):
@@ -58,7 +60,7 @@ Scope boundaries:
      - On non-Unix platforms (`#[cfg(not(unix))]`): return `None`.
 5. Retain the static multiplexer check in `protocol_from_env`. The handshake is the sole authority for enabling graphics under multiplexers.
 
-### Phase 2: Single-threaded initialization seam (`maki-ui/src/terminal.rs`)
+### Phase 2: Picker construction and testable decomposition (`maki-ui/src/terminal_image.rs`)
 
 1. Define global detected state:
    ```rust
@@ -66,11 +68,11 @@ Scope boundaries:
    ```
 2. In `TerminalGuard::init()`:
    - After `ratatui::init()` enables raw mode and alternate screen, call `terminal_image::init_graphics_detection()`.
-   - If `DetectedGraphics { is_tmux: true, .. }` is detected, set `unsafe { std::env::set_var("TERM_PROGRAM", "tmux"); }`. Because this executes during single-threaded startup prior to spawning worker threads or the event loop, setting the environment variable is safe and allows `ratatui_image::Picker::from_fontsize` to initialize `is_tmux = true`.
-   - Store the outcome in `DETECTED_GRAPHICS`.
-   - Because `InputReader::spawn()` has not run, no background thread contends for standard input.
-
-### Phase 3: Picker construction and testable decomposition (`maki-ui/src/terminal_image.rs`)
+   - Store the outcome in `DETECTED_GRAPHICS`. Zero environment variables are mutated.
+3. In `create_picker`:
+   - Accept `detected: Option<DetectedGraphics>`.
+   - If `detected` is present, set protocol and call `picker.set_is_tmux(is_tmux)` directly from `detected.is_tmux` using the patched `ratatui_image::Picker`.
+   - Neither `create_picker` nor `init_graphics_detection` mutates environment variables.
 
 1. Decompose picker construction into a testable pure helper:
    ```rust

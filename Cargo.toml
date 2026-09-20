@@ -231,3 +231,4 @@ debug = false
 [patch.crates-io]
 crossterm = { git = "https://github.com/crossterm-rs/crossterm", rev = "3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" }
 syntect = { git = "https://github.com/tontinton/syntect", rev = "01df275f6f25da670e5ba5b7128cb89d03795119" }
+ratatui-image = { path = "patches/ratatui-image" }
