@@ -118,7 +118,7 @@ Scope boundaries:
 | Acceptance Criterion | Verification / Named Test Case | File Location | Test Layer |
 |---|---|---|---|
 | AC.1 | `test_parse_probe_direct_kitty` | `maki-ui/src/terminal_image.rs` | Pure logic unit test |
-| AC.2 | `test_parse_probe_tmux_kitty` | `maki-ui/src/terminal_image.rs` | Pure logic unit test |
+| AC.2 | `test_parse_probe_tmux_kitty`, `test_parse_probe_tmux_kitty_waits_for_trailing_sentinel` | `maki-ui/src/terminal_image.rs` | Pure logic unit test |
 | AC.3 | `test_parse_probe_delayed_dcs_response_after_local_dsr` | `maki-ui/src/terminal_image.rs` | Pure logic unit test |
 | AC.4 | `test_parse_probe_unsupported_terminal_deadline` | `maki-ui/src/terminal_image.rs` | Pure logic unit test |
 | AC.5 | `test_parse_probe_unknown_dcs_ignored` | `maki-ui/src/terminal_image.rs` | Pure logic unit test |

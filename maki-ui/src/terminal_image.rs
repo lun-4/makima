@@ -120,7 +120,7 @@ pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
 
     if let Some((terminated, has_sentinel)) = find_terminated_reply(buffer, KITTY_PROBE_TMUX_REPLY)
     {
-        return if terminated && (has_sentinel || contains_subslice(buffer, DSR_RESPONSE)) {
+        return if terminated && has_sentinel {
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
@@ -133,7 +133,7 @@ pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
     if let Some((terminated, has_sentinel)) =
         find_terminated_reply(buffer, KITTY_PROBE_DIRECT_REPLY)
     {
-        return if terminated && (has_sentinel || contains_subslice(buffer, DSR_RESPONSE)) {
+        return if terminated && has_sentinel {
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: in_tmux,
@@ -636,6 +636,24 @@ mod tests {
     fn test_parse_probe_tmux_kitty() {
         assert_eq!(
             parse_probe_stream(TMUX_PROBE_RESPONSE),
+            ProbeResult::Detected(DetectedGraphics {
+                protocol: ProtocolType::Kitty,
+                is_tmux: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_probe_tmux_kitty_waits_for_trailing_sentinel() {
+        let stream_without_trailing_dsr = b"\x1b[>84;0;0c\x1b[0n\x1b_Gi=32;OK\x1b\\";
+        assert_eq!(
+            parse_probe_stream(stream_without_trailing_dsr),
+            ProbeResult::Pending,
+        );
+
+        let stream_with_trailing_dsr = b"\x1b[>84;0;0c\x1b[0n\x1b_Gi=32;OK\x1b\\\x1b[0n";
+        assert_eq!(
+            parse_probe_stream(stream_with_trailing_dsr),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
                 is_tmux: true,
