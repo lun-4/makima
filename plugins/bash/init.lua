@@ -368,6 +368,7 @@ maki.api.register_tool({
   name = "bash",
   kind = "execute",
   description = description,
+  permission = "run",
   schema = {
     type = "object",
     properties = {
