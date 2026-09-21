@@ -107,7 +107,7 @@ end
 
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
-  if config and config.no_rtk then
+  if config and not config.rtk then
     return nil
   end
 

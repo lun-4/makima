@@ -107,11 +107,11 @@ fn resolve_google_base_url() -> Option<String> {
     maki_config::providers::resolve_base_url("google", config.get("google"))
 }
 
-fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> ResolvedAuth {
-    ResolvedAuth {
-        base_url,
-        headers: vec![("x-goog-api-key".into(), key.to_string())],
-    }
+fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<ResolvedAuth, AgentError> {
+    Ok(
+        ResolvedAuth::new("google", vec![(API_KEY_HEADER.into(), key.to_string())])?
+            .with_base_url(base_url),
+    )
 }
 
 pub struct Google {
@@ -120,6 +120,7 @@ pub struct Google {
     key_pool: Option<KeyPool>,
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
+    /// Reused by key rotation / reload so they do not re-parse providers.toml.
     resolved_base_url: Option<String>,
 }
 
@@ -127,7 +128,7 @@ impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("google", ENV_VAR)?;
         let resolved_base_url = resolve_google_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone());
+        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
         Ok(Self {
             client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
@@ -279,7 +280,7 @@ impl Provider for Google {
         Box::pin(async {
             let pool = KeyPool::resolve("google", ENV_VAR)?;
             *self.auth.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone());
+                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())
         })
     }
@@ -718,10 +719,10 @@ mod tests {
     const GEMINI_API_KEY: &str = "test-key";
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
-        Arc::new(Mutex::new(ResolvedAuth {
-            base_url: None,
-            headers: vec![("x-goog-api-key".into(), GEMINI_API_KEY.into())],
-        }))
+        Arc::new(Mutex::new(ResolvedAuth::for_test(
+            None,
+            vec![(API_KEY_HEADER.into(), GEMINI_API_KEY.into())],
+        )))
     }
 
     fn test_timeouts() -> super::super::Timeouts {

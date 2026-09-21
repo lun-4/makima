@@ -26,6 +26,7 @@ pub(crate) mod text;
 pub(crate) mod time;
 pub(crate) mod timer;
 pub(crate) mod tool;
+pub(crate) mod top;
 pub(crate) mod treesitter;
 pub(crate) mod ui;
 pub(crate) mod usage;
@@ -35,7 +36,7 @@ pub(crate) mod yaml;
 
 use std::sync::{Arc, Mutex};
 
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, Result as LuaResult, Table, Value};
 
 use crate::api::keymap::PendingKeymapStore;
 use crate::api::options::PluginOpts;
@@ -152,6 +153,25 @@ pub(crate) fn create_maki_global(
     maki.set("time", time::create_time_table(lua)?)?;
     maki.set("perf", perf::create_perf_table(lua)?)?;
     crate::splash::register_version_api(lua, &maki)?;
+    top::add_top_methods(&maki, lua, Arc::clone(&plugin))?;
+
+    // `notify` sits on the metatable's `__index` rather than on the table
+    // itself, because Lua only fires `__newindex` for keys missing from the
+    // raw table. That is what gives `maki.notify = fn` somewhere to be caught
+    // and routed into the one shared slot, instead of quietly shadowing notify
+    // for the assigning plugin alone.
+    let index = lua.create_table()?;
+    top::notify__register(&index, lua, ui_action_tx, Arc::clone(&plugin))?;
+    let notify_router = lua.create_function(
+        move |lua, (t, k, v): (Table, String, Value)| match k.as_str() {
+            "notify" => top::install_notify_handler(lua, Arc::clone(&plugin), v),
+            _ => t.raw_set(k, v),
+        },
+    )?;
+    let meta = lua.create_table()?;
+    meta.set("__index", index)?;
+    meta.set("__newindex", notify_router)?;
+    maki.set_metatable(Some(meta))?;
 
     Ok(maki)
 }

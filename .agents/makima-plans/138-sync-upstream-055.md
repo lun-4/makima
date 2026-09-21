@@ -312,15 +312,9 @@ Every feature area is classified into:
 
 ### Feature 6: Theme Terminal Colors & Diff Styling
 * **Commits**: `eb70f92e`, `86c5c387`, `97f94e28`, `0da492df` (4 commits).
-* **Makima Current State**:
-  * Makima uses `Arc<dyn ThemesProvider>` (`maki-ui/src/theme.rs`).
-  * Only hex colors are supported. Terminals in nested tmux/SSH sessions mangle truecolor.
-* **Classification**: **Additive-Merge**.
-* **Synthesis & Architecture**:
-  1. Adopt 16-color named colors (`blue`, `light-gray`) and 0-255 palette indices in `maki-highlight` and `maki-theme` (`eb70f92e`). Syntect encodes the index in the alpha byte.
-  2. Add separate styling tokens for diff signs (`diff_old_sign`, `diff_new_sign`) and line numbers (`diff_old_line_nr`, `diff_new_line_nr`) into `ThemeData` and `ThemesProvider` (`86c5c387`).
-  3. Update `plugins/edit/init.lua` with `0da492df` to render diff blocks with the new tokens.
-  4. Port diff styling unit tests to `ThemesProvider` (`97f94e28`).
+* **Classification**: **Deferred**.
+* **Status**: **Deferred to dedicated theming issue** (per PR review remediation).
+* **Rationale**: Upstream's ANSI 16-color names, palette indexing, and diff styling overhaul in `maki-highlight` and `maki-theme` are deeply entangled with upstream's splash refactors. Merging this into the v0.5.5 sync would risk regressions in Makima's custom splash screens (`aesthetic-splash-screens`), Elm UI architecture, and `Arc<dyn ThemesProvider>` theme system. Officially deferred for isolated implementation in a dedicated follow-up issue.
 
 ---
 

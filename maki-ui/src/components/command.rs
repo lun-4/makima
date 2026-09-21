@@ -1087,10 +1087,10 @@ impl CommandPalette {
         self.cwd = cwd;
     }
 
-    pub fn sync(&mut self, input: &str) {
+    pub fn sync(&mut self, input: &str) -> Dirty {
         let Ok(snapshot) = self.registry.snapshot_for(&self.target) else {
             self.close();
-            return;
+            return Dirty::YES;
         };
         let registry_changed = snapshot.generation() != self.snapshot.generation();
         if registry_changed {
@@ -1102,7 +1102,7 @@ impl CommandPalette {
             self.current_arg_count = 0;
             self.pending_command = None;
             self.command_publication.clear();
-            return;
+            return Dirty::YES;
         };
         let stripped = &trimmed[1..]; // trimmed starts with exactly one '/'
 
@@ -1138,7 +1138,7 @@ impl CommandPalette {
                 self.command_publication.commit_sync(request.clone(), ());
                 self.refresh_matches(&request.query);
             }
-            return;
+            return Dirty::YES;
         }
 
         let pending_same_query = self
@@ -1155,7 +1155,7 @@ impl CommandPalette {
             self.command_publication.commit_sync(request.clone(), ());
             self.current_arg_count = request.argument_count;
             self.refresh_matches(&request.query);
-            return;
+            return Dirty::YES;
         }
 
         self.nucleo.pattern.reparse(
@@ -1171,7 +1171,7 @@ impl CommandPalette {
 
         let generation = self.command_publication.begin(request.clone());
         self.pending_command = Some((generation, request));
-        let _ = self.tick_commands();
+        self.tick_commands()
     }
 
     pub fn tick(&mut self) -> Dirty {
@@ -2006,7 +2006,7 @@ mod tests {
     fn typed_command_keeps_ownership_beyond_final_argument(input: &str, cursor: usize) {
         let (mut palette, _started, _release, _) =
             gated_directory_palette_with_policy(CompletionPolicy::Disabled);
-        palette.sync("/cd");
+        let _ = palette.sync("/cd");
         settle(&mut palette);
         palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), "/cd");
         assert_eq!(
@@ -2014,7 +2014,7 @@ mod tests {
             "/cdebug"
         );
 
-        palette.sync(input);
+        let _ = palette.sync(input);
         settle(&mut palette);
         palette.sync_arguments(input, cursor, "insert");
 
@@ -2064,7 +2064,7 @@ mod tests {
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
-        palette.sync("/cd");
+        let _ = palette.sync("/cd");
         settle(&mut palette);
         palette.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), "/cd");
         assert_eq!(
@@ -2147,7 +2147,7 @@ mod tests {
         let (mut palette, _started, _release, _) =
             gated_directory_palette_with_policy(CompletionPolicy::Disabled);
         let input = "/cd missing";
-        palette.sync(input);
+        let _ = palette.sync(input);
         settle(&mut palette);
         assert!(!palette.filtered.is_empty());
         palette.sync_arguments(input, input.len(), "insert");
@@ -2582,7 +2582,7 @@ mod tests {
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
-        palette.sync("/cop");
+        let _ = palette.sync("/cop");
         settle(&mut palette);
         assert_eq!(palette.filtered[0].command.invoked_name(), "/copy");
         assert!(matches!(
@@ -2601,7 +2601,7 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
 
-        palette.sync("/");
+        let _ = palette.sync("/");
         settle(&mut palette);
 
         assert_eq!(palette.filtered.len(), 1);
@@ -2620,7 +2620,7 @@ mod tests {
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
-        palette.sync("/one");
+        let _ = palette.sync("/one");
         settle(&mut palette);
         assert_eq!(palette.selected_command().unwrap().invoked_name(), "/one");
 
@@ -2665,11 +2665,11 @@ mod tests {
     fn quoted_scalar_argument_keeps_command_visible(input: &str, settle_command_first: bool) {
         let mut palette = provider_free_typed_palette();
         if settle_command_first {
-            palette.sync("/sessions");
+            let _ = palette.sync("/sessions");
             settle(&mut palette);
         }
 
-        palette.sync(input);
+        let _ = palette.sync(input);
         settle(&mut palette);
 
         assert_eq!(palette.filtered.len(), 1);
@@ -2706,11 +2706,11 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
 
-        palette.sync("/model");
+        let _ = palette.sync("/model");
         settle(&mut palette);
         assert!(palette.is_active());
 
-        palette.sync("//model");
+        let _ = palette.sync("//model");
         assert!(!palette.is_active());
         assert!(palette.filtered.is_empty());
     }
@@ -2761,7 +2761,7 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
 
-        palette.sync("/model");
+        let _ = palette.sync("/model");
         settle(&mut palette);
         assert!(palette.is_active());
         palette
@@ -2772,7 +2772,7 @@ mod tests {
         if close {
             palette.close();
         } else {
-            palette.sync("model");
+            let _ = palette.sync("model");
         }
 
         let deadline = std::time::Instant::now() + MATCHER_SETTLE_TIMEOUT;
@@ -2801,7 +2801,7 @@ mod tests {
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
-        palette.sync("  /dynamic arg");
+        let _ = palette.sync("  /dynamic arg");
         settle(&mut palette);
         let confirmed = palette.confirm("  /dynamic arg").unwrap();
 
@@ -2822,7 +2822,7 @@ mod tests {
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
-        palette.sync("/dynamic");
+        let _ = palette.sync("/dynamic");
         settle(&mut palette);
         assert_eq!(
             palette.filtered[0].command.spec().docs.summary.as_ref(),
@@ -2832,7 +2832,7 @@ mod tests {
         producer
             .replace(vec![registration("/dynamic", "Second")])
             .unwrap();
-        palette.sync("/dynamic");
+        let _ = palette.sync("/dynamic");
         settle(&mut palette);
 
         assert_eq!(palette.filtered.len(), 1);
@@ -2866,7 +2866,7 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
 
-        palette.sync("/deploy a");
+        let _ = palette.sync("/deploy a");
         settle(&mut palette);
         palette.set_argument_completion(
             (8, 9),
@@ -2878,7 +2878,7 @@ mod tests {
         );
         assert!(!palette.argument_items.is_empty());
 
-        palette.sync("/plain value");
+        let _ = palette.sync("/plain value");
         settle(&mut palette);
 
         assert!(palette.argument_items.is_empty());
@@ -2905,7 +2905,7 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
 
-        palette.sync("/mo");
+        let _ = palette.sync("/mo");
         settle(&mut palette);
 
         let names: Vec<&str> = palette
@@ -2988,7 +2988,7 @@ mod tests {
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
-        palette.sync("/");
+        let _ = palette.sync("/");
         settle(&mut palette);
 
         palette.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), "/");

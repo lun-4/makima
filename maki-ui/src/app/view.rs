@@ -477,6 +477,7 @@ impl App {
             thinking_label: opts.thinking.status_label(),
             fast: opts.fast,
             workflow: self.state.workflow,
+            yolo: self.permissions.is_yolo(),
             restricted: self.trust_question.is_some(),
             restoring: self.restoring.load(Ordering::Relaxed),
             status_content: self.status_content.get(),

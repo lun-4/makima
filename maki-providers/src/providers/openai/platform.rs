@@ -329,7 +329,7 @@ impl OpenAi {
         })?;
         let resolved = smol::unblock(move || {
             match refreshed_tokens(&storage, auth::PROVIDER, auth::refresh_tokens) {
-                Ok(fresh) => Ok(auth::build_oauth_resolved(&fresh)),
+                Ok(fresh) => auth::build_oauth_resolved(&fresh),
                 Err(e) => {
                     warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
                     let _ = maki_storage::auth::delete_tokens(&storage, auth::PROVIDER);
@@ -363,7 +363,7 @@ impl OpenAi {
         if let Some(storage) = self.storage.as_ref()
             && let Some(tokens) = maki_storage::auth::load_tokens(storage, auth::PROVIDER)
         {
-            return Ok(auth::build_coding_plan_resolved(&tokens));
+            return auth::build_coding_plan_resolved(&tokens);
         }
         // Fall back to standard API key via the Responses API. Env /
         // providers.toml base_url overrides the platform API only, never the
@@ -650,13 +650,13 @@ mod tests {
     const OTHER_ACCOUNT_ID: &str = "account-b";
 
     fn plan_auth(oauth: bool, account_id: Option<&str>) -> ResolvedAuth {
-        ResolvedAuth {
-            base_url: oauth.then(|| auth::CODING_PLAN_BASE_URL.into()),
-            headers: account_id
+        ResolvedAuth::for_test(
+            oauth.then(|| auth::CODING_PLAN_BASE_URL.into()),
+            account_id
                 .map(|id| (ACCOUNT_ID_HEADER.into(), id.into()))
                 .into_iter()
                 .collect(),
-        }
+        )
     }
 
     fn plan_info(info: &ModelInfo) -> Arc<PlanModelInfo> {

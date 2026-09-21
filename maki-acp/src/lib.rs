@@ -11,7 +11,7 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::{AgentConfig, ModeRegistry, PermissionsConfig};
 use maki_commands::CommandRegistry;
-use maki_config::{ModelPolicy, TrustConfig, project::TrustMode};
+use maki_config::{ModelPolicy, SessionDefaults, TrustConfig, project::TrustMode};
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 
@@ -25,6 +25,7 @@ pub struct AcpParams {
     pub prompt_slots: Arc<ResolvedSlots>,
     pub modes: Arc<ModeRegistry>,
     pub yolo: bool,
+    pub defaults: SessionDefaults,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,

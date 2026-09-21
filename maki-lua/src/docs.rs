@@ -94,6 +94,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::ui::buf::DOCS,
         &api::uv::DOCS,
         &api::yaml::DOCS,
+        &api::top::DOCS,
     ]
 }
 
@@ -196,6 +197,8 @@ mod tests {
             if name == "maki" {
                 // Documented here, but injected later by the runtime.
                 expected.remove("setup");
+                // Handled via metatable __index for __newindex assignment interception.
+                expected.remove("notify");
             }
             let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(

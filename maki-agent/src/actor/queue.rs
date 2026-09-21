@@ -315,3 +315,119 @@ impl crate::InterruptSource for InterruptQueue {
         self.queue.pop_interrupt()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentInput, AgentMode, SessionDefaults};
+    use maki_providers::{ContentBlock, ImageMediaType, ImageSource};
+
+    fn test_image() -> ImageSource {
+        ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
+    }
+
+    fn test_input(message: &str) -> AgentInput {
+        AgentInput::from_defaults(
+            message.into(),
+            AgentMode::Build,
+            Vec::new(),
+            SessionDefaults::default(),
+        )
+    }
+
+    fn test_root(message: &str, run_id: u64, images: Vec<ImageSource>) -> RootWork {
+        let mut input = test_input(message);
+        input.images = images.clone();
+        RootWork::new(
+            input,
+            run_id,
+            true,
+            message.into(),
+            images,
+            format!("r{run_id}"),
+        )
+    }
+
+    #[test]
+    fn test_actor_condenses_consecutive_plain_user_messages() {
+        let queue = ActorQueue::new();
+        queue.push(ActorWork::Root(test_root("first", 1, Vec::new())));
+        queue.push(ActorWork::Root(test_root("second", 2, Vec::new())));
+        queue.push(ActorWork::Root(test_root("third", 3, Vec::new())));
+
+        let popped = queue.pop().expect("must pop work");
+        let ActorWork::Root(merged) = popped else {
+            panic!("expected Root work");
+        };
+
+        assert_eq!(merged.input.message, "third");
+        assert_eq!(merged.run_id, 3);
+        assert_eq!(merged.earlier.len(), 2);
+        assert_eq!(merged.earlier[0].text, "first");
+        assert_eq!(merged.earlier[0].run_id, 1);
+        assert_eq!(merged.earlier[1].text, "second");
+        assert_eq!(merged.earlier[1].run_id, 2);
+
+        assert_eq!(merged.input.preamble.len(), 2);
+        assert_eq!(merged.input.preamble[0].user_text(), Some("first"));
+        assert_eq!(merged.input.preamble[1].user_text(), Some("second"));
+
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn test_actor_preserves_images_in_condensed_burst() {
+        let queue = ActorQueue::new();
+        let img1 = test_image();
+        let img2 = test_image();
+        queue.push(ActorWork::Root(test_root("first", 1, vec![img1.clone()])));
+        queue.push(ActorWork::Root(test_root("second", 2, vec![img2.clone()])));
+        queue.push(ActorWork::Root(test_root("third", 3, Vec::new())));
+
+        let popped = queue.pop().expect("must pop work");
+        let ActorWork::Root(merged) = popped else {
+            panic!("expected Root work");
+        };
+
+        assert_eq!(merged.earlier[0].images.len(), 1);
+        assert_eq!(merged.earlier[1].images.len(), 1);
+        assert_eq!(merged.input.preamble.len(), 2);
+
+        let img_count = |msg: &maki_providers::Message| {
+            msg.content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                .count()
+        };
+        assert_eq!(img_count(&merged.input.preamble[0]), 1);
+        assert_eq!(img_count(&merged.input.preamble[1]), 1);
+    }
+
+    #[test]
+    fn test_actor_does_not_condense_tool_results_or_slash_commands() {
+        let queue = ActorQueue::new();
+        queue.push(ActorWork::Root(test_root("first", 1, Vec::new())));
+        queue.push(ActorWork::Compact {
+            run_id: 2,
+            instructions: None,
+        });
+        queue.push(ActorWork::Root(test_root("second", 3, Vec::new())));
+
+        let first_pop = queue.pop().expect("first item");
+        let ActorWork::Root(r1) = first_pop else {
+            panic!("expected Root");
+        };
+        assert_eq!(r1.input.message, "first");
+        assert_eq!(r1.earlier.len(), 0);
+
+        let second_pop = queue.pop().expect("second item");
+        assert!(matches!(second_pop, ActorWork::Compact { run_id: 2, .. }));
+
+        let third_pop = queue.pop().expect("third item");
+        let ActorWork::Root(r2) = third_pop else {
+            panic!("expected Root");
+        };
+        assert_eq!(r2.input.message, "second");
+        assert_eq!(r2.earlier.len(), 0);
+    }
+}

@@ -307,7 +307,7 @@ impl Regolo {
         let pool = KeyPool::resolve("regolo", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer("regolo", pool.current())?)),
             key_pool: Some(pool),
             system_prefix: None,
         })

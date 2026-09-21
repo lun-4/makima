@@ -1153,7 +1153,7 @@ fn lifecycle_app() -> (
         UiConfig::default(),
     );
     app.input_box.set_input("/deploy a".into());
-    app.command_palette.sync("/deploy a");
+    let _ = app.command_palette.sync("/deploy a");
     settle_command_palette(&mut app);
     app.command_palette
         .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
@@ -1193,7 +1193,7 @@ fn argument_completion_retains_old_rows_while_request_pending() {
         UiConfig::default(),
     );
     app.input_box.set_input("/deploy a".into());
-    app.command_palette.sync("/deploy a");
+    let _ = app.command_palette.sync("/deploy a");
     app.command_palette.set_argument_completion(
         (8, 9),
         CommandArgumentItem {
@@ -1204,7 +1204,7 @@ fn argument_completion_retains_old_rows_while_request_pending() {
     );
 
     app.input_box.set_input("/deploy b".into());
-    app.command_palette.sync("/deploy b");
+    let _ = app.command_palette.sync("/deploy b");
     app.command_palette
         .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
     assert!(app.command_palette.completion_session_id().is_some());
@@ -1238,7 +1238,7 @@ fn unmatched_completion_items_keep_session_until_dismissal() {
         UiConfig::default(),
     );
     app.input_box.set_input("/deploy z".into());
-    app.command_palette.sync("/deploy z");
+    let _ = app.command_palette.sync("/deploy z");
     settle_command_palette(&mut app);
     app.command_palette
         .sync_arguments("/deploy z", 9, &app.state.mode.id_key());
@@ -1366,7 +1366,7 @@ fn reset_session_carries_current_yolo() {
         panic!("expected replacement request");
     };
 
-    assert!(request.session.meta.yolo);
+    assert_eq!(request.session.meta.yolo, Some(true));
 }
 
 #[test]
@@ -1513,7 +1513,7 @@ fn argument_completion_enter_fills_then_next_enter_executes() {
         UiConfig::default(),
     );
     app.input_box.set_input("/rename dråft tail".into());
-    app.command_palette.sync("/rename dråft tail");
+    let _ = app.command_palette.sync("/rename dråft tail");
     app.input_box.buffer.set_cursor(0, 11);
     app.command_palette.set_argument_completion(
         (8, 14),
@@ -1573,7 +1573,7 @@ fn scrolled_argument_completion_accepts_offscreen_candidate() {
         ui,
     );
     app.input_box.set_input("/de a".into());
-    app.command_palette.sync("/de a");
+    let _ = app.command_palette.sync("/de a");
     settle_command_palette(&mut app);
     app.command_palette.move_down();
     assert_eq!(
@@ -1648,7 +1648,7 @@ fn argument_completion_tab_preserves_command_for_next_request() {
         UiConfig::default(),
     );
     app.input_box.set_input("/de a".into());
-    app.command_palette.sync("/de a");
+    let _ = app.command_palette.sync("/de a");
     settle_command_palette(&mut app);
     app.command_palette.move_down();
     app.command_palette.set_argument_completions(
@@ -1725,7 +1725,7 @@ fn argument_completion_enter_on_exact_match_executes_immediately() {
         UiConfig::default(),
     );
     app.input_box.set_input("/rename final".into());
-    app.command_palette.sync("/rename final");
+    let _ = app.command_palette.sync("/rename final");
     app.command_palette.set_argument_completion(
         (8, 13),
         CommandArgumentItem {
@@ -4307,7 +4307,7 @@ fn loaded_session_restores_yolo() {
     let mut app = test_app();
     app.permissions.set_yolo(false);
     let mut session = AppSession::new("test-model", "/tmp/test");
-    session.meta.yolo = true;
+    session.meta.yolo = Some(true);
 
     let model = app.state.model.clone();
     app.apply_loaded_session(session, &model);
@@ -7530,7 +7530,7 @@ fn at_completion_insertion_synchronizes_argument_completion() {
         app.command_target.clone(),
     );
     app.input_box.set_input("/deploy @rev".into());
-    app.command_palette.sync("/deploy @rev");
+    let _ = app.command_palette.sync("/deploy @rev");
     settle_command_palette(&mut app);
     let value = app.input_box.buffer.value();
     app.sync_command_arguments(&value, app.input_box.buffer.cursor_byte_offset());
@@ -8211,7 +8211,7 @@ fn cd_completion_cursor_in_whitespace_before_path_does_not_panic() {
     let input = "/cd  ./alpha";
     app.input_box.set_input(input.into());
     app.input_box.buffer.set_cursor_byte_offset(4);
-    app.command_palette.sync(input);
+    let _ = app.command_palette.sync(input);
     app.sync_command_arguments(input, 4);
 
     assert!(app.typed_path_completion_context().is_some());
@@ -8228,7 +8228,7 @@ fn cd_completion_preserves_text_outside_path(prefix: &str, remainder: &str) {
     let input = format!("{partial}{remainder}");
     app.input_box.set_input(input.clone());
     app.input_box.buffer.set_cursor_byte_offset(partial.len());
-    app.command_palette.sync(&input);
+    let _ = app.command_palette.sync(&input);
     app.sync_command_arguments(&input, partial.len());
     app.sync_file_completion();
     converge_completion(&mut app);
@@ -10278,4 +10278,30 @@ fn defer_hint_pins_above_status_bar_until_restored() {
         !hint_row(&restored).contains("Undefer"),
         "hint clears once the demand is restored"
     );
+}
+
+#[test]
+fn plan_ready_fires_once_per_draft() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+    app.state.plan.allocate_path(&state_dir);
+    assert!(!app.state.plan.is_ready());
+
+    // First WriteDone marks plan ready
+    app.transition_plan(PlanTrigger::WriteDone);
+    assert!(app.state.plan.is_ready());
+
+    // Duplicate WriteDone while still ready does not transition again
+    app.transition_plan(PlanTrigger::WriteDone);
+    assert!(app.state.plan.is_ready());
+
+    // Interactive prompt marks plan drafting again
+    app.transition_plan(PlanTrigger::InteractivePrompt);
+    assert!(!app.state.plan.is_ready());
+
+    // Subsequent WriteDone marks plan ready for the new draft
+    app.transition_plan(PlanTrigger::WriteDone);
+    assert!(app.state.plan.is_ready());
 }

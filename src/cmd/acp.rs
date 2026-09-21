@@ -51,7 +51,7 @@ pub fn run(
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(&trust.project_config);
@@ -90,6 +90,7 @@ pub fn run(
         prompt_slots: Arc::new(prompt_slots),
         modes,
         yolo,
+        defaults: config.session_defaults,
         system_prompt_override,
         append_system_prompt,
         model_policy: Arc::new(config.provider.model_policy.clone()),

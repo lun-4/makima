@@ -247,7 +247,7 @@ mod tests {
             let pool = maki_providers::KeyPool::from_keys(
                 POOL_KEYS[..keys].iter().map(|k| (*k).into()).collect(),
             );
-            let auth = maki_providers::ResolvedAuth::bearer(pool.current());
+            let auth = maki_providers::ResolvedAuth::bearer("test", pool.current()).unwrap();
             Self {
                 pool,
                 auth: std::sync::Mutex::new(auth),

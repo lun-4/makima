@@ -59,7 +59,10 @@ impl Requesty {
         let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
+                CONFIG.slug,
+                pool.current(),
+            )?)),
             key_pool: Some(pool),
             system_prefix: None,
         })

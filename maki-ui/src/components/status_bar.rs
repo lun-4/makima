@@ -24,6 +24,8 @@ const TRUNCATE_PREFIX: &str = "..";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const RESTRICTED_LABEL: &str = " [restricted]";
+const YOLO_LABEL: &str = " [yolo]";
+const YOLO_DIM_FACTOR: f32 = 0.15;
 const SUBAGENT_LABEL_PREFIX: &str = "\u{21b3} ";
 
 /// Distinct footer badge for a focused subagent chat, contrasted with the
@@ -60,6 +62,7 @@ pub struct StatusBarContext<'a> {
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
+    pub yolo: bool,
     pub restricted: bool,
     pub restoring: bool,
     pub status_content: Option<&'a StatusContentSnapshot>,
@@ -193,9 +196,17 @@ impl StatusBar {
 
         let mut right_spans = Vec::new();
 
+        let yolo_span = ctx.yolo.then(|| {
+            Span::styled(
+                YOLO_LABEL,
+                theme::dim_style(theme::current().error, YOLO_DIM_FACTOR),
+            )
+        });
+
         match ctx.status {
             Status::Error { message: e, .. } => {
                 left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
+                right_spans.extend(yolo_span);
             }
             _ => {
                 let pct = if ctx.stats.context_window > 0 {
@@ -221,6 +232,9 @@ impl StatusBar {
                 }
                 if ctx.restricted {
                     rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
+                }
+                if let Some(span) = yolo_span {
+                    rest_spans.push(span);
                 }
 
                 let context_text = format!(
@@ -506,6 +520,7 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            yolo: false,
             restricted: false,
             restoring: false,
             status_content,
@@ -613,6 +628,7 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            yolo: false,
             restricted: false,
             restoring: false,
             status_content: None,
@@ -649,6 +665,7 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            yolo: false,
             restricted,
             restoring: false,
             status_content: None,
@@ -657,6 +674,40 @@ mod tests {
         terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
             .contains(RESTRICTED_LABEL.trim())
+    }
+
+    #[test_case(true  => true  ; "a_bypassed_session_says_so")]
+    #[test_case(false => false ; "a_prompting_session_stays_quiet")]
+    fn the_bar_advertises_yolo(yolo: bool) -> bool {
+        let bar = StatusBar::new(FLASH_TTL);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+        let ctx = StatusBarContext {
+            status: &Status::Idle,
+            mode_label: Cow::Borrowed("NORMAL"),
+            mode_style: Style::default(),
+            model_id: MODEL_ID,
+            model_switch_queued: false,
+            stats: UsageStats {
+                global_cost: None,
+                context_size: CONTEXT_SIZE,
+                cost: Some(CHAT_COST),
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                show_global: false,
+            },
+            auto_scroll: true,
+            retry_info: None,
+            thinking_label: None,
+            fast: false,
+            workflow: false,
+            yolo,
+            restricted: false,
+            restoring: false,
+            status_content: None,
+            suppress_status_content: false,
+        };
+        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer()).contains(YOLO_LABEL.trim())
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it
@@ -837,6 +888,7 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            yolo: false,
             restricted: false,
             restoring: false,
             status_content: None,

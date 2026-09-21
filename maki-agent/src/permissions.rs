@@ -294,6 +294,8 @@ pub struct PermissionManager {
     config_rules: Vec<PermissionRule>,
     builtin_rules: Mutex<Vec<PermissionRule>>,
     yolo: AtomicBool,
+    yolo_explicit: AtomicBool,
+    seed_yolo: bool,
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
     cwd: Mutex<PathBuf>,
@@ -339,6 +341,8 @@ impl PermissionManager {
             session_rules: Mutex::new(Vec::new()),
             config_rules,
             yolo: AtomicBool::new(config.yolo),
+            yolo_explicit: AtomicBool::new(false),
+            seed_yolo: config.yolo,
             default: config.default,
             tool_defaults: config.tool_defaults,
             cwd: Mutex::new(cwd),
@@ -361,6 +365,8 @@ impl PermissionManager {
                     .clone(),
             ),
             yolo: AtomicBool::new(self.is_yolo()),
+            yolo_explicit: AtomicBool::new(self.yolo_explicit.load(Ordering::Relaxed)),
+            seed_yolo: self.seed_yolo,
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
             cwd: Mutex::new(
@@ -530,17 +536,36 @@ impl PermissionManager {
     }
 
     pub fn toggle_yolo(&self) -> bool {
-        let enabled = !self.is_yolo();
-        self.set_yolo(enabled);
+        let enabled = !self.yolo.fetch_xor(true, Ordering::Relaxed);
+        self.yolo_explicit.store(true, Ordering::Relaxed);
         enabled
     }
 
     pub fn set_yolo(&self, enabled: bool) {
         self.yolo.store(enabled, Ordering::Relaxed);
+        self.yolo_explicit.store(true, Ordering::Relaxed);
+    }
+
+    /// Replaces whatever this session was running with: `Some` is the user's
+    /// stored intent, `None` means they never expressed one and the seed
+    /// applies again.
+    pub fn set_session_yolo(&self, stored: Option<bool>) {
+        self.yolo
+            .store(stored.unwrap_or(self.seed_yolo), Ordering::Relaxed);
+        self.yolo_explicit
+            .store(stored.is_some(), Ordering::Relaxed);
     }
 
     pub fn is_yolo(&self) -> bool {
         self.yolo.load(Ordering::Relaxed)
+    }
+
+    /// What the session may persist. A one-shot `--yolo` is a property of the
+    /// invocation, so on its own it stores nothing.
+    pub fn persisted_yolo(&self) -> Option<bool> {
+        self.yolo_explicit
+            .load(Ordering::Relaxed)
+            .then(|| self.is_yolo())
     }
 
     pub fn set_cwd(&self, cwd: PathBuf) {
@@ -1621,6 +1646,48 @@ mod tests {
         mgr.set_yolo(false);
         mgr.set_yolo(false);
         assert!(!mgr.is_yolo());
+    }
+
+    fn seeded_mgr(yolo: bool) -> PermissionManager {
+        mgr_with(
+            PermissionsConfig {
+                yolo,
+                ..Default::default()
+            },
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    fn yolo_state(mgr: &PermissionManager) -> (bool, Option<bool>) {
+        let forked = mgr.fork();
+        assert_eq!(
+            (forked.is_yolo(), forked.persisted_yolo()),
+            (mgr.is_yolo(), mgr.persisted_yolo()),
+        );
+        (mgr.is_yolo(), mgr.persisted_yolo())
+    }
+
+    #[test_case(false, None        => (false, None)        ; "no_flag_and_no_intent_stays_off")]
+    #[test_case(true,  None        => (true,  None)        ; "the_flag_applies_but_is_never_stored")]
+    #[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
+    #[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
+    #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
+    #[test_case(false, Some(false) => (false, Some(false)) ; "stored_off_stays_off")]
+    fn a_stored_yolo_intent_replaces_the_seed(
+        seed: bool,
+        stored: Option<bool>,
+    ) -> (bool, Option<bool>) {
+        let mgr = seeded_mgr(seed);
+        mgr.set_session_yolo(stored);
+        yolo_state(&mgr)
+    }
+
+    #[test_case(false => (true,  Some(true))  ; "toggling_on_claims_the_session")]
+    #[test_case(true  => (false, Some(false)) ; "toggling_off_under_the_flag_claims_the_session")]
+    fn toggling_yolo_records_the_intent(seed: bool) -> (bool, Option<bool>) {
+        let mgr = seeded_mgr(seed);
+        assert_eq!(mgr.toggle_yolo(), !seed);
+        yolo_state(&mgr)
     }
 
     #[test]

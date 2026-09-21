@@ -291,7 +291,7 @@ pub struct Zai {
 impl Zai {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("zai", CONFIG_STANDARD.api_key_env)?;
-        let mut auth = ResolvedAuth::bearer(pool.current());
+        let mut auth = ResolvedAuth::bearer("zai", pool.current())?;
         let provider_config = maki_config::providers::ProvidersConfig::load();
         if let Some(url) =
             maki_config::providers::resolve_base_url("zai", provider_config.get("zai"))

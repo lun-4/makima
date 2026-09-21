@@ -33,7 +33,7 @@ use maki_commands::{
     CommandOutcome, CommandRegistry, HostRequest, HostResponse, InputDispatch, TargetCapabilities,
     TargetCapability, TargetHandle,
 };
-use maki_config::{ModelPolicy, ProjectConfig};
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -511,8 +511,7 @@ pub struct SdkParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
-    pub fast: bool,
-    pub workflow: bool,
+    pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
@@ -694,8 +693,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         permissions_config,
         timeouts,
         prompt_slots,
-        fast,
-        workflow,
+        mut defaults,
         model_policy,
         plugin_rules,
         project_config,
@@ -736,13 +734,15 @@ pub fn run(params: SdkParams) -> Result<()> {
     let fast = if restored_state {
         restored.meta.fast && model.supports_fast()
     } else {
-        fast && model.supports_fast()
+        defaults.fast && model.supports_fast()
     };
     let workflow = if restored_state {
         restored.meta.workflow
     } else {
-        workflow
+        defaults.workflow
     };
+    defaults.fast = fast;
+    defaults.workflow = workflow;
     let thinking = restored
         .meta
         .thinking
@@ -789,7 +789,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         yolo,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
-        workflow,
+        defaults,
         modes: Arc::new(maki_agent::ModeRegistry::builtin()),
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
@@ -1026,8 +1026,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                             let input = command_attachments::agent_input(
                                 turn,
                                 mode.agent_mode(&cwd),
-                                fast,
-                                workflow,
+                                defaults,
                             )?;
                             let input = match prepare_sdk_turn(&shared, input) {
                                 Ok(input) => input,
@@ -1075,18 +1074,12 @@ pub fn run(params: SdkParams) -> Result<()> {
                             emit_command_result(&writer, &shared, true, error.to_string())?
                         }
                         InputDispatch::LiteralInput(content) => {
-                            let input = AgentInput {
-                                message: content.text.to_string(),
-                                mode: mode.agent_mode(&cwd),
-                                images: command_attachments::into_images(&content.attachments)?,
-                                preamble: Vec::new(),
-                                thinking,
-                                fast,
-                                workflow,
-                                prompt: None,
-                                cancel: None,
-                                lease_committer: None,
-                            };
+                            let input = AgentInput::from_defaults(
+                                content.text.to_string(),
+                                mode.agent_mode(&cwd),
+                                command_attachments::into_images(&content.attachments)?,
+                                defaults,
+                            );
                             let input = match prepare_sdk_turn(&shared, input) {
                                 Ok(input) => input,
                                 Err(error) => {
@@ -1308,16 +1301,20 @@ fn apply_permission_option(
 
 fn restored_permission_mode(
     restored: bool,
-    persisted_yolo: bool,
+    persisted_yolo: Option<bool>,
     startup: PermissionMode,
     explicit: bool,
 ) -> PermissionMode {
     if !restored || explicit {
         startup
-    } else if persisted_yolo {
-        PermissionMode::BypassPermissions
-    } else if startup == PermissionMode::BypassPermissions {
-        PermissionMode::Default
+    } else if let Some(yolo) = persisted_yolo {
+        if yolo {
+            PermissionMode::BypassPermissions
+        } else if startup == PermissionMode::BypassPermissions {
+            PermissionMode::Default
+        } else {
+            startup
+        }
     } else {
         startup
     }
@@ -1744,6 +1741,9 @@ impl EventPump {
     fn spawn(mut self, event_rx: Receiver<Envelope>) -> smol::Task<()> {
         smol::spawn(async move {
             while let Ok(envelope) = event_rx.recv_async().await {
+                if matches!(envelope.event, AgentEvent::StreamClosed) {
+                    break;
+                }
                 // Folded in first, so a plugin handling `TurnEnd` finds the
                 // finished totals when it calls `maki.session.read()`.
                 self.snapshot.observe(&envelope);
@@ -2527,17 +2527,17 @@ mod tests {
         assert_eq!(shared.lock().unwrap().permission_mode, PermissionMode::Plan);
     }
 
-    #[test_case(true, true, PermissionMode::Default, false, PermissionMode::BypassPermissions ; "bare_resume_restores_enabled")]
-    #[test_case(true, false, PermissionMode::BypassPermissions, false, PermissionMode::Default ; "bare_resume_restores_disabled")]
-    #[test_case(false, false, PermissionMode::BypassPermissions, false, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
-    #[test_case(true, false, PermissionMode::Plan, false, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
-    #[test_case(true, true, PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_resumed_yolo")]
-    #[test_case(true, true, PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_resumed_yolo")]
-    #[test_case(true, true, PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_forked_yolo")]
-    #[test_case(true, true, PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_forked_yolo")]
+    #[test_case(true, Some(true), PermissionMode::Default, false, PermissionMode::BypassPermissions ; "bare_resume_restores_enabled")]
+    #[test_case(true, Some(false), PermissionMode::BypassPermissions, false, PermissionMode::Default ; "bare_resume_restores_disabled")]
+    #[test_case(false, None, PermissionMode::BypassPermissions, false, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
+    #[test_case(true, Some(false), PermissionMode::Plan, false, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
+    #[test_case(true, Some(true), PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_resumed_yolo")]
+    #[test_case(true, Some(true), PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_resumed_yolo")]
+    #[test_case(true, Some(true), PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_forked_yolo")]
+    #[test_case(true, Some(true), PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_forked_yolo")]
     fn sdk_yolo_restore_precedence(
         restored: bool,
-        persisted: bool,
+        persisted: Option<bool>,
         startup: PermissionMode,
         explicit: bool,
         expected: PermissionMode,
@@ -2579,7 +2579,9 @@ mod tests {
         else {
             panic!("attachment-aware command did not return an agent turn");
         };
-        let input = command_attachments::agent_input(turn, AgentMode::Build, false, false).unwrap();
+        let input =
+            command_attachments::agent_input(turn, AgentMode::Build, SessionDefaults::default())
+                .unwrap();
         assert_eq!(input.message, "inspected");
         assert_eq!(input.images.len(), 1);
         assert_eq!(
@@ -3230,7 +3232,7 @@ mod tests {
             "provider": {"allowed_models": [startup.spec()]}
         }))
         .unwrap();
-        let policy = raw.into_config(false).unwrap().provider.model_policy;
+        let policy = raw.into_config().unwrap().provider.model_policy;
 
         assert!(
             resolve_set_model(

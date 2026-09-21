@@ -156,6 +156,7 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
+| `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
 
 ### `provider`
 
@@ -258,7 +259,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `edit_lines` | boolean | `false` | - | Provide the opt-in `edit_lines` tool. |
+| `edit_lines` | boolean | `true` | - | Provide the `edit_lines` tool. |
 | `insert_lines` | boolean | `false` | - | Provide the opt-in `insert_lines` tool. |
 | `multiedit` | boolean | `true` | - | Provide the `multiedit` tool. |
 

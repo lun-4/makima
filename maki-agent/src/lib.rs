@@ -32,7 +32,7 @@ pub use cancel::{
     CancelMap, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
 };
 pub use mailbox::{MailboxError, PreparedSessionMailbox, SessionMailbox};
-pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
+pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub use manager::{
     AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentRef,
     CurrentManagedTurn, GraphLifecycle, ManagedPromptWait, ManagerError, PromptWaitError,
@@ -175,4 +175,29 @@ pub struct AgentInput {
     pub prompt: Option<Box<McpPromptRef>>,
     pub cancel: Option<CancelToken>,
     pub lease_committer: Option<session_coordinator::SessionLeaseCommitter>,
+}
+
+impl AgentInput {
+    /// What a host with no toggle UI sends. `-p`, the SDK and ACP know nothing
+    /// about the toggles beyond what config says, so they all build their input
+    /// here and a knob added to [`SessionDefaults`] reaches every one of them.
+    pub fn from_defaults(
+        message: String,
+        mode: AgentMode,
+        images: Vec<ImageSource>,
+        defaults: SessionDefaults,
+    ) -> Self {
+        Self {
+            message,
+            mode,
+            images,
+            preamble: Vec::new(),
+            thinking: defaults.thinking.into(),
+            fast: defaults.fast,
+            workflow: defaults.workflow,
+            prompt: None,
+            cancel: None,
+            lease_committer: None,
+        }
+    }
 }

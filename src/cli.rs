@@ -65,10 +65,6 @@ pub struct Cli {
     #[arg(long)]
     pub no_commands: bool,
 
-    /// Disable rtk command rewriting
-    #[arg(long)]
-    pub no_rtk: bool,
-
     /// Skip user `init.lua` files (global and project) but keep the Lua
     /// host and every builtin plugin running, so tools and the default
     /// keymap still load. Use this to recover from a broken `init.lua`

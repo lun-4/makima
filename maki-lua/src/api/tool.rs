@@ -48,6 +48,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, try_pair};
+use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintRegistration, Request, command_depth, command_invocation,
 };
@@ -220,7 +221,13 @@ pub(crate) struct PendingTool {
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
 
-pub(crate) type PendingRules = Arc<Mutex<Vec<PermissionRule>>>;
+pub(crate) struct PendingRule {
+    pub(crate) tool: Arc<str>,
+    pub(crate) scope: String,
+    pub(crate) effect: Effect,
+}
+
+pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
 
 pub(crate) struct LuaTool {
     pub(crate) name: Arc<str>,
@@ -801,7 +808,7 @@ fn register_permission_rule(
         mlua::Error::runtime("register_permission_rule: 'tool' must be a native tool name string")
     })?;
     let tool = match ToolKey::parse(&tool) {
-        Ok(key @ ToolKey::Native(_)) => key,
+        Ok(ToolKey::Native(name)) => name,
         Ok(_) => {
             return Err(mlua::Error::runtime(
                 "register_permission_rule: only native tools are allowed (no wildcard or MCP)",
@@ -847,12 +854,65 @@ fn register_permission_rule(
     pending_rules
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(PermissionRule {
+        .push(PendingRule {
             tool,
-            scope: Some(scope),
+            scope,
             effect,
         });
     Ok(())
+}
+
+/// Turns the rules a load declared into the rules that take effect. Runs once,
+/// at the commit point of that load, so the answer never depends on which
+/// plugin happened to run first and the plugin's own tools already exist.
+///
+/// A rule that does not survive is dropped with a warning rather than failing
+/// the load: losing an allow only puts the call back in front of the user,
+/// which is no reason to take the plugin's tools and commands down with it.
+pub(crate) fn resolve_rules(
+    registry: &ToolRegistry,
+    plugin: &str,
+    permissions: &PluginPermissions,
+    rules: Vec<PendingRule>,
+) -> Vec<PermissionRule> {
+    rules
+        .into_iter()
+        .filter(|rule| {
+            rule.effect != Effect::Allow || allow_is_delegated(registry, plugin, permissions, rule)
+        })
+        .map(|rule| PermissionRule {
+            tool: ToolKey::Native(rule.tool),
+            scope: Some(rule.scope),
+            effect: rule.effect,
+        })
+        .collect()
+}
+
+/// An allow has to name a tool that exists, is permission checked at all, and
+/// exposes no more than the plugin already holds.
+fn allow_is_delegated(
+    registry: &ToolRegistry,
+    plugin: &str,
+    permissions: &PluginPermissions,
+    rule: &PendingRule,
+) -> bool {
+    let dropped = |reason: &str| {
+        tracing::warn!(plugin, tool = %rule.tool, reason, "permission rule dropped");
+        false
+    };
+    let Some(registered) = registry.get(&rule.tool) else {
+        // Disabled by config, or owned by a plugin nobody loaded.
+        return dropped("no such tool is registered");
+    };
+    let Some(required) = registered.tool.required_permission() else {
+        return dropped(
+            "the tool declares no permission_scopes, so it is never permission checked",
+        );
+    };
+    permissions.is_allowed(required)
+        || dropped(&format!(
+            "allowing it exposes '{required}', which this plugin was not granted"
+        ))
 }
 
 /// Register a slash-command that appears in the user input bar.

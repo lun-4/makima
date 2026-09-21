@@ -61,9 +61,7 @@ fn resolve_custom_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
     let pool = super::KeyPool::resolve(slug, env_var)?;
 
     let base_url = resolve_base_url(slug, Some(def));
-    let mut auth = ResolvedAuth::bearer(pool.current());
-    auth.base_url = base_url;
-    Ok(auth)
+    Ok(ResolvedAuth::bearer(slug, pool.current())?.with_base_url(base_url))
 }
 
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {

@@ -10,7 +10,6 @@ use tracing::{debug, info, warn};
 use super::queue::{ActorQueue, InterruptQueue};
 use super::types::{ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind};
 use super::{ActiveCancel, ActorInner, ActorWork, TurnAdmission, cancelled_outcome, finalize_turn};
-use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::types::{TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
 
@@ -363,14 +362,23 @@ impl Runner {
     /// Runs a standalone control. Never carries a [`TurnId`] and never
     /// produces a [`TurnOutcome`].
     async fn run_control(&mut self, control: ControlWork, popped_generation: u64) {
-        if self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .cancellation_generation
-            != popped_generation
+        let correlation = control.correlation.clone();
+        let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.cancellation_generation != popped_generation {
+                return;
+            }
+            state.cancelled_correlations.remove(&correlation);
+            state.active = Some(active);
+        }
+        if plain.is_cancelled() {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.active = None;
             return;
         }
         let result = self
@@ -380,8 +388,8 @@ impl Runner {
                 TurnContext {
                     agent_id: self.inner.agent_id,
                     turn_id: None,
-                    cancel: CancelToken::none(),
-                    cancel_reason: ReasonedCancelToken::none(),
+                    cancel: plain,
+                    cancel_reason: reasoned,
                     correlation: control.correlation.clone(),
                     interrupt: None,
                     managed_turn: None,
@@ -389,6 +397,10 @@ impl Runner {
                 &control,
             )
             .await;
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.active = None;
+        }
         match result {
             BackendResult::ControlDone => {}
             BackendResult::ControlFailed => {
@@ -406,14 +418,20 @@ impl Runner {
     ) {
         // Consumed: retire any precancel mark for this run_id's canonical
         // correlation.
+        let correlation = super::run_correlation(run_id);
+        let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.cancellation_generation != popped_generation {
                 return;
             }
-            state
-                .cancelled_correlations
-                .remove(&super::run_correlation(run_id));
+            state.cancelled_correlations.remove(&correlation);
+            state.active = Some(active);
+        }
+        if plain.is_cancelled() {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.active = None;
+            return;
         }
         let result = self
             .backend
@@ -422,15 +440,19 @@ impl Runner {
                 TurnContext {
                     agent_id: self.inner.agent_id,
                     turn_id: None,
-                    cancel: CancelToken::none(),
-                    cancel_reason: ReasonedCancelToken::none(),
-                    correlation: String::new(),
+                    cancel: plain,
+                    cancel_reason: reasoned,
+                    correlation: correlation.clone(),
                     interrupt: None,
                     managed_turn: None,
                 },
                 instructions,
             )
             .await;
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.active = None;
+        }
         if !matches!(result, BackendResult::CompactDone) {
             warn!(?result, "compact returned unexpected result");
         }

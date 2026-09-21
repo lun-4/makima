@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_lock::Mutex;
 use flume::Receiver;
 use futures_lite::future;
-use maki_config::{ModelPolicy, ProjectConfig};
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::Message;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
@@ -147,7 +147,9 @@ fn spawn_with_session_id(
     let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
     let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
 
-    let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
+    let (guard, events) = crate::types::event_stream();
+    let raw_tx = guard.tx().clone();
+    let event_rx = events.into_receiver();
 
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
@@ -202,6 +204,7 @@ fn spawn_with_session_id(
         let file_write_locks = Arc::clone(&file_write_locks);
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
+        let _stream_guard = guard;
         async move {
             let event_tx = EventSender::new(raw_tx, 0);
             let mut model = params.model;
@@ -265,6 +268,7 @@ fn spawn_with_session_id(
                 handle.shutdown().await;
             }
             let _ = coordinator.close().await;
+            drop(_stream_guard);
         }
     });
 
@@ -291,7 +295,7 @@ pub struct InteractiveParams {
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
-    pub workflow: bool,
+    pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub modes: Arc<crate::ModeRegistry>,
     pub question_mode: crate::tools::QuestionMode,
@@ -606,7 +610,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.workflow,
+        params.defaults.workflow,
         params.mcp_handle.is_some(),
     );
 
@@ -616,7 +620,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         .map(|h| McpSession::new(h, &params.initial_history));
     let tool_names = advertised_tool_names(initial_tools.definitions(), mcp.as_ref());
 
-    let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
+    let (guard, events) = crate::types::event_stream();
+    let raw_tx = guard.tx().clone();
+    let event_rx = events.into_receiver();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
@@ -655,6 +661,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let task = smol::spawn({
         let permissions = Arc::clone(&permissions);
         let file_write_locks = Arc::clone(&file_write_locks);
+        let _stream_guard = guard;
         async move {
             let mut model = params.model;
             let mut provider: Arc<dyn Provider> =
@@ -1009,6 +1016,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             if let Some(handle) = params.mcp_handle {
                 handle.shutdown().await;
             }
+            drop(_stream_guard);
         }
     });
 

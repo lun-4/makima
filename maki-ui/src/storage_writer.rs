@@ -545,7 +545,7 @@ fn merge_checkpoint(base: &AppSession, checkpoint: &SessionCheckpoint) -> AppSes
     }
     session.set_model(checkpoint.model.to_string());
     session.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
-    session.meta.yolo = option_enabled(&checkpoint.options, YOLO_OPTION_ID);
+    session.meta.yolo = Some(option_enabled(&checkpoint.options, YOLO_OPTION_ID));
     session.meta.fast = option_enabled(&checkpoint.options, FAST_OPTION_ID);
     session.meta.workflow = option_enabled(&checkpoint.options, WORKFLOW_OPTION_ID);
     session.meta.thinking = checkpoint
@@ -1154,7 +1154,7 @@ mod tests {
             assert_eq!(loaded.meta.queued_messages, ["queued"]);
             assert_eq!(loaded.model, "next/model");
             assert_eq!(loaded.cwd, "/tmp/next");
-            assert!(loaded.meta.yolo);
+            assert_eq!(loaded.meta.yolo, Some(true));
             assert!(loaded.meta.fast);
             assert!(loaded.meta.workflow);
             assert_eq!(
@@ -1268,7 +1268,7 @@ mod tests {
 
             let loaded = AppSession::load(id, &dir).unwrap();
             assert_eq!(loaded.model, MODEL);
-            assert!(!loaded.meta.yolo);
+            assert!(loaded.meta.yolo.is_none());
             assert!(!loaded.meta.fast);
             assert!(!loaded.meta.workflow);
             assert!(loaded.meta.session_options.is_empty());

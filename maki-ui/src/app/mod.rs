@@ -61,7 +61,11 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::text_buffer::is_newline_key;
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+#[cfg(test)]
+pub(crate) use crossterm::event::KeyEventKind;
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
+};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
@@ -392,6 +396,7 @@ pub struct App {
     /// Armed by a keyboard submit (main or subagent input) to release a manual
     /// Alt+M hold; consumed by the next promotion pass.
     pub(super) submit_released: bool,
+    pub(crate) pending_dirty: Dirty,
 
     pub(crate) storage: StateDir,
     pub(crate) trust_question: Option<TrustQuestion>,
@@ -573,6 +578,7 @@ impl App {
             subagent_channels: HashMap::new(),
             stamped_subagent_outcomes: HashSet::new(),
             delivered_subagent_histories: HashMap::new(),
+            pending_dirty: Dirty::NO,
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -769,16 +775,18 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
         match &msg {
-            Msg::Key(key) if key.kind == KeyEventKind::Release => return vec![],
+            Msg::Key(key) if key.kind == CrosstermKeyEventKind::Release => return vec![],
             Msg::Key(key) => {
                 let active = self.middle_scroll.is_some();
-                let _ = self.cancel_middle_scroll();
+                let dirty = self.cancel_middle_scroll();
+                self.pending_dirty |= dirty;
                 if active && key.code == KeyCode::Esc {
                     return vec![];
                 }
             }
             Msg::Paste(_) | Msg::Scroll { .. } => {
-                let _ = self.cancel_middle_scroll();
+                let dirty = self.cancel_middle_scroll();
+                self.pending_dirty |= dirty;
             }
             _ => {}
         }
@@ -811,7 +819,8 @@ impl App {
                 vec![]
             }
             Msg::Mouse(event) => {
-                self.handle_mouse(event);
+                let dirty = self.handle_mouse(event);
+                self.pending_dirty |= dirty;
                 vec![]
             }
             Msg::Scroll { column, row, delta } => {
@@ -822,8 +831,10 @@ impl App {
         };
         // A modal-closing key or an answered permission yields the next demand
         // immediately, rather than waiting for the next 100ms tick.
-        let _ = self.promote_deferred_if_ready();
-        let _ = self.validate_middle_scroll();
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
+        let dirty = self.validate_middle_scroll();
+        self.pending_dirty |= dirty;
         actions
     }
 
@@ -1103,7 +1114,7 @@ impl App {
                     if let InputAction::PaletteSync(val) =
                         self.input_box.handle_paste_with_spaces(&path)
                     {
-                        self.command_palette.sync(&val);
+                        self.pending_dirty |= self.command_palette.sync(&val);
                         self.sync_command_arguments(
                             &val,
                             self.input_box.buffer.cursor_byte_offset(),
@@ -1433,7 +1444,7 @@ impl App {
                     });
             }
             CommandAction::AcceptArgument { text, cursor } => {
-                self.command_palette.sync(&text);
+                self.pending_dirty |= self.command_palette.sync(&text);
                 self.refresh_at_ref_labels(&text);
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
@@ -1441,7 +1452,7 @@ impl App {
                 return vec![];
             }
             CommandAction::Complete { text, cursor } => {
-                self.command_palette.sync(&text);
+                self.pending_dirty |= self.command_palette.sync(&text);
                 self.refresh_at_ref_labels(&text);
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
@@ -1479,7 +1490,7 @@ impl App {
                 self.handle_submit(sub)
             }
             InputAction::PaletteSync(val) => {
-                self.command_palette.sync(&val);
+                self.pending_dirty |= self.command_palette.sync(&val);
                 self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
                 self.sync_file_completion();
                 vec![]
@@ -1638,7 +1649,7 @@ impl App {
             .buffer
             .replace_range_on_current_line(start, end, &replacement);
         let value = self.input_box.buffer.value();
-        self.command_palette.sync(&value);
+        self.pending_dirty |= self.command_palette.sync(&value);
         self.sync_command_arguments(&value, self.input_box.buffer.cursor_byte_offset());
     }
 
@@ -2731,7 +2742,8 @@ impl App {
             self.pending_input = PendingInput::None;
         }
         self.reconcile_active();
-        let _ = self.promote_deferred_if_ready();
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
     }
 
     pub(crate) fn permission_active(&self) -> bool {
@@ -2863,7 +2875,8 @@ impl App {
         // Arm the submit release so `promote_deferred_if_ready` treats the held
         // head as ready regardless of idle/modal timers.
         self.submit_released = true;
-        let _ = self.promote_deferred_if_ready();
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
         true
     }
 
@@ -2974,10 +2987,10 @@ impl App {
 
     /// Every poller that feeds the screen, in one place and never in `view`;
     /// see [`crate::repaint`] for why.
-    pub(crate) fn reconcile_status_content(&mut self) -> u64 {
+    pub(crate) fn reconcile_status_content(&mut self) -> (u64, Dirty) {
         let snapshot = self.status_content_reader.load_full();
-        let _ = self.status_content.poll(Arc::clone(&snapshot));
-        snapshot.generation
+        let dirty = self.status_content.poll(Arc::clone(&snapshot));
+        (snapshot.generation, dirty)
     }
 
     pub fn tick(&mut self) -> Dirty {
@@ -2986,7 +2999,8 @@ impl App {
 
     pub(crate) fn tick_at(&mut self, now: Instant) -> Dirty {
         // `|` never short-circuits: every poller must run on every tick.
-        let mut dirty = self.float_mgr.tick()
+        let mut dirty = std::mem::take(&mut self.pending_dirty)
+            | self.float_mgr.tick()
             | self.lua_picker.tick()
             | self.tick_edge_scroll()
             | self.tick_error_expiry()
@@ -3189,7 +3203,7 @@ impl App {
             return;
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
-            self.command_palette.sync(&val);
+            self.pending_dirty |= self.command_palette.sync(&val);
             self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
             self.sync_file_completion();
         }

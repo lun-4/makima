@@ -100,7 +100,7 @@ fn load_config(
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(cli.no_rtk)
+        .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(project_config);
@@ -354,7 +354,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 
     if cli.is_sdk_mode() {
-        let fast = stack.config.always_fast && stack.model.supports_fast();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
@@ -365,8 +364,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             permissions_config: stack.config.permissions,
             timeouts,
             prompt_slots,
-            fast,
-            workflow: stack.config.always_workflow,
+            defaults: stack.config.session_defaults,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
@@ -379,7 +377,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
         return Ok(());
     }
     if cli.print {
-        let fast = stack.config.always_fast && stack.model.supports_fast();
         let timeouts = stack.timeouts();
         crate::print::run(
             &stack.model,
@@ -391,8 +388,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.config.permissions,
             timeouts,
             stack.plugin_host.event_handle(),
-            fast,
-            stack.config.always_workflow,
+            stack.config.session_defaults,
             Arc::new(stack.config.provider.model_policy.clone()),
             cli.system_prompt,
             cli.append_system_prompt,
@@ -422,16 +418,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let mut teardown = Teardown::default();
     let default_thinking: Option<StoredThinking> = maki_storage::sessions::read_prefs(&storage)
         .default_thinking
-        .or(stack.config.always_thinking);
+        .or(stack.config.session_defaults.thinking);
 
     loop {
         for session in &mut tabs {
             if session.messages().is_empty() {
-                session.meta.fast |= stack.config.always_fast;
-                session.meta.workflow |= stack.config.always_workflow;
-                if let Some(thinking) = default_thinking {
-                    session.meta.thinking = Some(thinking);
-                }
+                let mut defaults = stack.config.session_defaults;
+                defaults.thinking = default_thinking;
+                defaults.seed(&mut session.meta);
             }
         }
         let focused_tab = &tabs[focused];
@@ -617,9 +611,7 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        RawConfig::default()
-            .into_config(false)
-            .expect("default config")
+        RawConfig::default().into_config().expect("default config")
     }
 
     #[test_case(false, "anthropic/claude-opus-4-6"; "restores_persisted_model_without_explicit_flag")]
@@ -655,13 +647,13 @@ mod tests {
     #[test]
     fn broken_config_with_fallback_uses_last_good_and_warns() {
         let mut last_good = test_config();
-        last_good.always_fast = true;
+        last_good.session_defaults.fast = true;
         let mut warnings = Vec::new();
 
         let config = config_or_fallback(Err(eyre!("boom")), Some(last_good), &mut warnings)
             .expect("fallback config");
 
-        assert!(config.always_fast);
+        assert!(config.session_defaults.fast);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].starts_with(CONFIG_FALLBACK_WARNING),

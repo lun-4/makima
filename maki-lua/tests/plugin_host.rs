@@ -445,12 +445,24 @@ fn unload_round_trip() {
 const PERMISSION_RULE_SRC: &str =
     r#"maki.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
 const NO_RULE_SRC: &str = "local _ = 1";
+/// A rule can only name a registered tool, and it reads the permission it needs
+/// off that tool, so the rule tests have to provide one.
+const EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "edit",
+    description = "test edit tool",
+    schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
+    mutable_path = "path",
+    permission = "fs_write",
+    permission_scopes = "path",
+    handler = function() return "" end,
+})"#;
 
 #[test]
 fn permission_rule_lands_in_store_and_unload_clears() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     host.load_source("perm_plugin", PERMISSION_RULE_SRC)
         .unwrap();
     let rules = host.plugin_rules().snapshot();
@@ -468,6 +480,7 @@ fn permission_rule_failed_load_leaves_store_empty() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     let src = format!("{PERMISSION_RULE_SRC}\nerror('boom after rule')");
     let err = host
         .load_source("perm_broken", &src)
@@ -481,6 +494,7 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     host.load_source("perm_a", PERMISSION_RULE_SRC).unwrap();
     host.load_source(
         "perm_b",
@@ -495,6 +509,25 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     assert_eq!(rules[0].tool, ToolKey::native("write"));
     assert_eq!(rules[0].scope.as_deref(), Some("/tmp/y/**"));
     assert_eq!(rules[0].effect, Effect::Deny);
+}
+
+#[test]
+fn permission_rule_without_capability_is_dropped() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
+    host.load_source("perm_trusted", PERMISSION_RULE_SRC)
+        .unwrap();
+    assert_eq!(host.plugin_rules().snapshot().len(), 1);
+
+    host.load_source_with_permissions(
+        "perm_unprivileged",
+        PERMISSION_RULE_SRC,
+        maki_lua::PluginPermissions::denied(),
+    )
+    .unwrap();
+    assert_eq!(host.plugin_rules().snapshot().len(), 1);
 }
 
 #[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
@@ -2832,12 +2865,12 @@ fn builtin_opts_flow_from_setup_plugins() {
 
 #[test_case::test_case(
     serde_json::json!({}),
-    &["edit", "multiedit"], &["edit_lines", "insert_lines"]
-    ; "multiedit_on_others_opt_in"
+    &["edit", "multiedit", "edit_lines"], &["insert_lines"]
+    ; "defaults_on_insert_lines_opt_in"
 )]
 #[test_case::test_case(
-    serde_json::json!({ "multiedit": false, "edit_lines": true }),
-    &["edit", "edit_lines"], &["multiedit", "insert_lines"]
+    serde_json::json!({ "multiedit": false, "edit_lines": false, "insert_lines": true }),
+    &["edit", "insert_lines"], &["multiedit", "edit_lines"]
     ; "toggles_flip_sub_tools"
 )]
 fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[&str]) {
@@ -2964,7 +2997,7 @@ fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
         )
         .unwrap()
         .expect("setup returns a config");
-    let config = raw.into_config(false).unwrap();
+    let config = raw.into_config().unwrap();
     host.load_builtins(&config.plugins).unwrap();
     host.load_source(REPLACEMENT_PLUGIN, &shadow_src())
         .expect("a disabled builtin leaves its tool name free");
@@ -4237,7 +4270,7 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
         ctx.cancel = token;
         // The rtk probe costs up to two 2s job waits before the command even
         // starts: pointless here, and a flake risk under load.
-        ctx.config.no_rtk = true;
+        ctx.config.rtk = false;
         let input = json!({ "command": BASH_PARTIAL_CMD });
         result_tx
             .send(exec_with_ctx(&reg, "bash", input, &ctx))
@@ -4637,6 +4670,32 @@ fn mutable_path_returns_path_from_input() {
         .expect("parse failed");
     let ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
     assert_eq!(inv.mutable_path(&ctx), Some(PathBuf::from("/tmp/foo.txt")));
+}
+
+#[test]
+fn registration_rejects_fs_write_without_mutable_path() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = r#"maki.api.register_tool({
+        name = "bad_write_tool",
+        description = "test write tool without mutable_path",
+        schema = {
+            type = "object",
+            properties = { path = { type = "string" } }
+        },
+        permission = "fs_write",
+        permission_scopes = "path",
+        handler = function() return "" end
+    })"#;
+    let err = host
+        .load_source("bad_write_plugin", src)
+        .expect_err("expected error for fs_write without mutable_path");
+    assert!(
+        err.to_string()
+            .contains("declares permission 'fs_write' but no 'mutable_path'"),
+        "got: {err}"
+    );
 }
 
 #[test]

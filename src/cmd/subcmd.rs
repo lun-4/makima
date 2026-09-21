@@ -589,7 +589,7 @@ fn load_effective_config(
         .load_init_files_or_skip(no_plugins, project_config, warnings)
         .context("load init.lua files")?
         .unwrap_or_default()
-        .into_config(false)
+        .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     Ok(config)
@@ -619,7 +619,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(&trust.project_config);
@@ -719,7 +719,7 @@ pub fn prompt(
         .context("load init.lua files")?;
     let config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config()
         .context("invalid config")?;
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     host.load_builtins(&config.plugins)

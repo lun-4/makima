@@ -157,8 +157,10 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub yolo: bool,
+    /// `None` when the user never set yolo for this session, which is what
+    /// makes `--yolo` a property of the invocation rather than of the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_options: BTreeMap<String, String>,
 }
@@ -3067,6 +3069,24 @@ mod tests {
             TestSession::load_from(s.id, dir).unwrap().messages().len(),
             2
         );
+    }
+
+    #[test]
+    fn session_meta_default_yolo_is_none() {
+        let meta = SessionMeta::default();
+        assert!(meta.yolo.is_none());
+    }
+
+    #[test]
+    fn session_meta_yolo_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("test/model", "/tmp");
+        session.meta.yolo = Some(true);
+        session.save_to(dir).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.meta.yolo, Some(true));
     }
 
     #[test]

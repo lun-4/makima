@@ -139,7 +139,7 @@ impl App {
             thinking: Some(state.thinking.into()),
             fast: state.fast_intent(),
             workflow: state.workflow,
-            yolo: self.permissions.is_yolo(),
+            yolo: self.permissions.persisted_yolo(),
             session_options: Default::default(),
         }
     }
@@ -284,6 +284,8 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
+        self.permissions
+            .set_session_yolo(self.state.session.meta.yolo);
         self.restore_display();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
@@ -300,7 +302,7 @@ impl App {
         session.meta.thinking = Some(self.state.thinking.into());
         session.meta.fast = self.state.fast_intent();
         session.meta.workflow = self.state.workflow;
-        session.meta.yolo = self.permissions.is_yolo();
+        session.meta.yolo = self.permissions.persisted_yolo();
         vec![Action::ReplaceSession(Box::new(
             SessionReplacementRequest {
                 session,
@@ -347,7 +349,7 @@ impl App {
     pub(crate) fn apply_loaded_session(&mut self, session: AppSession, fallback_model: &Model) {
         self.checkpoint_now();
         self.rotate_command_target();
-        self.permissions.set_yolo(session.meta.yolo);
+        self.permissions.set_session_yolo(session.meta.yolo);
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.state =

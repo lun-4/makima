@@ -1408,6 +1408,10 @@ pub struct EventStreamGuard {
 }
 
 impl EventStreamGuard {
+    pub fn tx(&self) -> &Sender<Envelope> {
+        &self.tx
+    }
+
     pub fn sender(&self, run_id: u64) -> EventSender {
         EventSender::new(self.tx.clone(), run_id)
     }
@@ -1435,6 +1439,10 @@ pub struct SessionEvents {
 }
 
 impl SessionEvents {
+    pub fn into_receiver(self) -> Receiver<Envelope> {
+        self.rx
+    }
+
     /// `None` once the stream closed, forever after. The marker rides the same
     /// FIFO as the events, so everything sent before the guard dropped is
     /// delivered first and everything sent after it is lost. That is why a
@@ -1460,6 +1468,24 @@ impl SessionEvents {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn test_session_events_guard_emits_stream_closed_on_drop() {
+        let (guard, mut events) = event_stream();
+        let sender = guard.sender(1);
+        sender.send(AgentEvent::Nudge).unwrap();
+        drop(guard);
+
+        smol::block_on(async {
+            let first = events.next().await;
+            assert!(first.is_some());
+            assert!(matches!(first.unwrap().event, AgentEvent::Nudge));
+
+            // StreamClosed causes next() to return None and close the stream.
+            let second = events.next().await;
+            assert!(second.is_none());
+        });
+    }
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]

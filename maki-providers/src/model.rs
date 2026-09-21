@@ -584,7 +584,7 @@ impl Model {
     /// what they paid: the rate back then is unknown, and the table price is
     /// the honest guess.
     pub fn list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
-        (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))
+        (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast && self.supports_fast()))
     }
 
     pub fn provider_display_name(&self) -> &'static str {

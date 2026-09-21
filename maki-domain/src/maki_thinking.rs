@@ -251,6 +251,15 @@ impl From<StoredThinking> for ThinkingConfig {
     }
 }
 
+/// One place decides what silence means, so a session that never set a level, a
+/// config without `always_thinking` and a frontend with no toggle all read it
+/// the same way: off.
+impl From<Option<StoredThinking>> for ThinkingConfig {
+    fn from(s: Option<StoredThinking>) -> Self {
+        s.map_or(Self::Off, Self::from)
+    }
+}
+
 impl From<ThinkingConfig> for StoredThinking {
     fn from(value: ThinkingConfig) -> Self {
         match value {
@@ -512,6 +521,19 @@ mod tests {
         assert_eq!(
             ThinkingConfig::Budget(LARGE_BUDGET).clamp_to(ThinkingConfig::Effort(Minimal)),
             ThinkingConfig::Effort(Minimal)
+        );
+    }
+
+    #[test]
+    fn optional_stored_thinking_into_config_none() {
+        assert_eq!(ThinkingConfig::from(None), ThinkingConfig::Off);
+    }
+
+    #[test]
+    fn optional_stored_thinking_into_config_some() {
+        assert_eq!(
+            ThinkingConfig::from(Some(StoredThinking::Adaptive)),
+            ThinkingConfig::Adaptive
         );
     }
 }

@@ -29,7 +29,7 @@ use maki_commands::{
     TargetHandle,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
-use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, TrustConfig};
+use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
@@ -227,7 +227,7 @@ struct SpawnSession {
     mcp_handle: Option<McpHandle>,
     elicitation: bool,
     yolo: bool,
-    workflow: bool,
+    defaults: SessionDefaults,
     project_config: ProjectConfig,
 }
 
@@ -253,6 +253,7 @@ struct Server {
     elicitation: bool,
     supports_boolean: bool,
     lua_event_handle: maki_lua::EventHandle,
+    defaults: SessionDefaults,
 }
 
 impl Server {
@@ -283,6 +284,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         elicitation: false,
         supports_boolean: false,
         lua_event_handle: params.lua_event_handle.clone(),
+        defaults: params.defaults,
     };
 
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
@@ -499,7 +501,7 @@ async fn new_session(
             mcp_handle: mcp.clone(),
             elicitation: srv.elicitation,
             yolo: params.yolo,
-            workflow: false,
+            defaults: params.defaults,
             project_config,
         },
     );
@@ -565,7 +567,7 @@ async fn load_session(
     };
     let spec = recorded_model.spec();
     let fast = restored.meta.fast && recorded_model.supports_fast();
-    let yolo = restored.meta.yolo;
+    let yolo = restored.meta.yolo.unwrap_or(params.yolo);
     let workflow = restored.meta.workflow;
     let thinking = restored
         .meta
@@ -585,7 +587,12 @@ async fn load_session(
             mcp_handle: mcp.clone(),
             elicitation: srv.elicitation,
             yolo,
-            workflow,
+            defaults: {
+                let mut d = params.defaults;
+                d.workflow |= workflow;
+                d.fast |= fast;
+                d
+            },
             project_config,
         },
     );
@@ -631,7 +638,7 @@ fn spawn_session(params: &AcpParams, session: SpawnSession) -> InteractiveHandle
         mcp_handle,
         elicitation,
         yolo,
-        workflow,
+        defaults,
         project_config,
     } = session;
     let permissions_config = maki_config::load_permissions(&project_config);
@@ -650,7 +657,7 @@ fn spawn_session(params: &AcpParams, session: SpawnSession) -> InteractiveHandle
         yolo,
         system_prompt_override: params.system_prompt_override.clone(),
         append_system_prompt: params.append_system_prompt.clone(),
-        workflow,
+        defaults,
         model_policy: Arc::clone(&params.model_policy),
         question_mode: if elicitation {
             QuestionMode::Elicitation
@@ -1198,6 +1205,7 @@ async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<
                     content,
                     prompt: None,
                 },
+                srv.defaults,
             )
             .await
         }
@@ -1209,7 +1217,7 @@ async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<
             Ok(())
         }
         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-            send_command_turn(session, id, turn).await
+            send_command_turn(session, id, turn, srv.defaults).await
         }
         InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
             send_isolated_turn(session, &srv.out_tx, id, turn).await
@@ -1510,6 +1518,7 @@ async fn send_command_turn(
     session: &SessionState,
     id: &RequestId,
     turn: AgentTurn,
+    mut defaults: SessionDefaults,
 ) -> Result<(), AcpError> {
     let prompt = turn.prompt.map(|prompt| maki_agent::McpPromptRef {
         qualified_name: prompt.qualified_name.to_string(),
@@ -1543,12 +1552,13 @@ async fn send_command_turn(
         })
     };
     let (cancel_trigger, cancel) = maki_agent::cancel::CancelToken::new();
+    defaults.fast |= enabled(maki_agent::session_options::FAST_OPTION_ID);
+    defaults.workflow |= enabled(maki_agent::session_options::WORKFLOW_OPTION_ID);
     let mut input = agent_input(
         turn.content.text.to_string(),
         images,
         session.current_mode.clone(),
-        enabled(maki_agent::session_options::FAST_OPTION_ID),
-        enabled(maki_agent::session_options::WORKFLOW_OPTION_ID),
+        defaults,
         prompt,
     );
     if session.pending.lock().unwrap().operation.is_some() {
@@ -1590,22 +1600,12 @@ fn agent_input(
     message: String,
     images: Vec<ImageSource>,
     mode: AgentMode,
-    fast: bool,
-    workflow: bool,
+    defaults: SessionDefaults,
     prompt: Option<maki_agent::McpPromptRef>,
 ) -> AgentInput {
-    AgentInput {
-        message,
-        mode,
-        images,
-        preamble: Vec::new(),
-        thinking: Default::default(),
-        fast,
-        workflow,
-        prompt: prompt.map(Box::new),
-        cancel: None,
-        lease_committer: None,
-    }
+    let mut input = AgentInput::from_defaults(message, mode, images, defaults);
+    input.prompt = prompt.map(Box::new);
+    input
 }
 
 fn command_error(error: maki_commands::CommandError) -> AcpError {
@@ -2340,6 +2340,7 @@ mod tests {
             prompt_slots: Arc::default(),
             modes: Arc::default(),
             yolo: false,
+            defaults: Default::default(),
             system_prompt_override: Some(String::new()),
             append_system_prompt: None,
             model_policy: Arc::default(),
@@ -2595,6 +2596,7 @@ mod tests {
             elicitation: false,
             supports_boolean: false,
             lua_event_handle: maki_lua::EventHandle::disconnected_for_test(),
+            defaults: SessionDefaults::default(),
         };
         (server, answer_rx, out_rx, input_rx)
     }
@@ -2647,6 +2649,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                defaults: SessionDefaults::default(),
             };
             let handle = spawn_session(
                 &params,
@@ -2658,7 +2661,7 @@ mod tests {
                     mcp_handle: None,
                     elicitation: false,
                     yolo: false,
-                    workflow: false,
+                    defaults: SessionDefaults::default(),
                     project_config: ProjectConfig::for_project(cwd.path()),
                 },
             );
@@ -2707,6 +2710,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                defaults: SessionDefaults::default(),
             };
             let session_id = SessionRef::from(MakiId::generate());
             let persisted_options = BTreeMap::new();
@@ -2721,7 +2725,7 @@ mod tests {
                     mcp_handle: None,
                     elicitation: false,
                     yolo: false,
-                    workflow: false,
+                    defaults: SessionDefaults::default(),
                     project_config: ProjectConfig::for_project(cwd.path()),
                 },
             );
@@ -4790,6 +4794,7 @@ mod tests {
                     prompt_slots: Arc::default(),
                     modes: Arc::default(),
                     yolo: false,
+                    defaults: SessionDefaults::default(),
                     system_prompt_override: Some(String::new()),
                     append_system_prompt: None,
                     model_policy: Arc::default(),
@@ -4807,7 +4812,7 @@ mod tests {
                     mcp_handle: None,
                     elicitation: false,
                     yolo: false,
-                    workflow: false,
+                    defaults: SessionDefaults::default(),
                     project_config: ProjectConfig::for_project(Path::new("/project")),
                 },
             );
@@ -5431,6 +5436,7 @@ mod tests {
                 elicitation: false,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
+                defaults: SessionDefaults::default(),
             };
             let raw = serde_json::json!({
                 "params": {
@@ -5483,7 +5489,7 @@ mod tests {
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
             Session::new("anthropic/test-model", "/project");
-        session.meta.yolo = true;
+        session.meta.yolo = Some(true);
         session.meta.fast = true;
         session.meta.workflow = true;
         session
@@ -5494,7 +5500,7 @@ mod tests {
 
         let restored = load_history_from(&dir, session.id).unwrap();
 
-        assert!(restored.meta.yolo);
+        assert_eq!(restored.meta.yolo, Some(true));
         assert!(restored.meta.fast);
         assert!(restored.meta.workflow);
         assert_eq!(

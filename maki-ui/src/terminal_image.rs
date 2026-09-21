@@ -28,7 +28,7 @@ const DECODE_THREAD: &str = "inline-image";
 const PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 const PROBE_POLL_SLICE: Duration = Duration::from_millis(50);
 const PROBE_PAYLOAD: &[u8] =
-    b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b[>c\x1b[5n\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b\x1b[5n\x1b\\";
+    b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b[>c\x1b[c\x1b[5n\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b\x1b[5n\x1b\\";
 const DSR_RESPONSE: &[u8] = b"\x1b[0n";
 const TMUX_DA2_REPLY: &[u8] = b">84;";
 const KITTY_PROBE_TMUX_REPLY: &[u8] = b"Gi=32;";
@@ -115,6 +115,24 @@ fn is_tmux_detected(buffer: &[u8]) -> bool {
     env::var_os("TMUX").is_some() || contains_subslice(buffer, TMUX_DA2_REPLY)
 }
 
+fn has_sixel_da1(buffer: &[u8]) -> (bool, bool) {
+    let mut i = 0;
+    while i < buffer.len() {
+        if buffer[i..].starts_with(b"\x1b[?") {
+            let start = i + 3;
+            if let Some(end_rel) = buffer[start..].iter().position(|&b| b == b'c') {
+                let params = &buffer[start..start + end_rel];
+                let is_sixel = params.split(|&b| b == b';').any(|part| part == b"4");
+                let rest = &buffer[start + end_rel + 1..];
+                let has_sentinel = contains_subslice(rest, DSR_RESPONSE);
+                return (is_sixel, has_sentinel);
+            }
+        }
+        i += 1;
+    }
+    (false, false)
+}
+
 pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
     let in_tmux = is_tmux_detected(buffer);
 
@@ -143,7 +161,15 @@ pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
         };
     }
 
+    let (is_sixel, sixel_sentinel) = has_sixel_da1(buffer);
     let dsr_count = count_subslice(buffer, DSR_RESPONSE);
+    if is_sixel && sixel_sentinel {
+        return ProbeResult::Detected(DetectedGraphics {
+            protocol: ProtocolType::Sixel,
+            is_tmux: in_tmux,
+        });
+    }
+
     if (!in_tmux && dsr_count > 0) || (in_tmux && dsr_count >= 2) {
         ProbeResult::Unsupported
     } else {
@@ -319,10 +345,14 @@ fn protocol_from_env(
     match get("TERM_PROGRAM").as_deref() {
         Some("ghostty" | "kitty") => return Some(ProtocolType::Kitty),
         Some("iTerm.app" | "WezTerm") => return Some(ProtocolType::Iterm2),
+        Some("foot" | "mlterm") => return Some(ProtocolType::Sixel),
         _ => {}
     }
     match get("TERM").as_deref() {
         Some("xterm-kitty" | "xterm-ghostty") => Some(ProtocolType::Kitty),
+        Some(t) if t.contains("sixel") || t.starts_with("foot") || t.starts_with("mlterm") => {
+            Some(ProtocolType::Sixel)
+        }
         _ => None,
     }
 }
@@ -527,6 +557,8 @@ mod tests {
     const DIRECT_DSR_RESPONSE: &[u8] = b"\x1b[>0;1;0c\x1b[0n";
     const TMUX_LOCAL_DSR_RESPONSE: &[u8] = b"\x1b[>84;0;0c\x1b[0n";
     const GHOSTTY_KITTY_RESPONSE: &[u8] = b"\x1b_Gi=32;OK\x1b\\\x1b[0n";
+    const SIXEL_PROBE_RESPONSE: &[u8] = b"\x1b[?62;4;6c\x1b[0n";
+    const TMUX_SIXEL_PROBE_RESPONSE: &[u8] = b"\x1b[>84;0;0c\x1b[0n\x1b[?62;4;6c\x1b[0n";
     const UNKNOWN_DCS_STREAM: &[u8] = b"\x1bPsomething_unknown\x1b\\\x1b_Gi=31;OK\x1b\\\x1b[0n";
     const BEL_TERMINATED_RESPONSE: &[u8] = b"\x1b_Gi=31;OK\x07\x1b[0n";
     const INCOMPLETE_KITTY_RESPONSE: &[u8] = b"\x1b_Gi=31;O";
@@ -541,6 +573,8 @@ mod tests {
 
     #[test_case(&[(TERM_PROGRAM, "iTerm.app")], Some(ProtocolType::Iterm2); "known_terminal")]
     #[test_case(&[(TERM, KITTY_TERM)], Some(ProtocolType::Kitty); "known_term")]
+    #[test_case(&[(TERM_PROGRAM, "foot")], Some(ProtocolType::Sixel); "foot_terminal")]
+    #[test_case(&[(TERM, "xterm-sixel")], Some(ProtocolType::Sixel); "sixel_term")]
     #[test_case(&[(TERM_PROGRAM, UNKNOWN_PROGRAM), (TERM, KITTY_TERM)], Some(ProtocolType::Kitty); "unsupported_program_falls_back_to_term")]
     #[test_case(&[(TERM_PROGRAM, UNKNOWN_PROGRAM), (TERM, "xterm-256color")], None; "unsupported_program_and_term")]
     #[test_case(&[], None; "missing_env")]
@@ -681,6 +715,28 @@ mod tests {
             parse_probe_stream(&stream),
             ProbeResult::Detected(DetectedGraphics {
                 protocol: ProtocolType::Kitty,
+                is_tmux: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_probe_direct_sixel() {
+        assert_eq!(
+            parse_probe_stream(SIXEL_PROBE_RESPONSE),
+            ProbeResult::Detected(DetectedGraphics {
+                protocol: ProtocolType::Sixel,
+                is_tmux: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_probe_tmux_sixel() {
+        assert_eq!(
+            parse_probe_stream(TMUX_SIXEL_PROBE_RESPONSE),
+            ProbeResult::Detected(DetectedGraphics {
+                protocol: ProtocolType::Sixel,
                 is_tmux: true,
             })
         );

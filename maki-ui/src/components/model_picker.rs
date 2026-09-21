@@ -128,7 +128,7 @@ impl ModelPicker {
         self.current_spec = current_spec.to_owned();
         self.anchor = None;
         self.needs_rebuild = false;
-        let _ = self.available.poll(self.models.load_full());
+        self.available = Watch::seeded(self.models.load_full());
         let entries = self.load_entries();
         self.picker.open(entries, TITLE);
         self.preselect_current_model();

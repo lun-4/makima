@@ -112,12 +112,10 @@ impl LocalEndpoint {
             None => Vec::new(),
         };
         let compat_config = &cfg.compat;
+        let auth = ResolvedAuth::new(cfg.slug, headers)?.with_base_url(Some(base_url));
         Ok(Self {
             compat: OpenAiCompatProvider::new(compat_config, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth {
-                base_url: Some(base_url),
-                headers,
-            })),
+            auth: Arc::new(Mutex::new(auth)),
             key_pool,
             system_prefix: None,
             thinking_budget_field: cfg.thinking_budget_field,

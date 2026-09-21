@@ -415,7 +415,7 @@ mod tests {
             "provider": {"allowed_models": [fallback.spec()]}
         }))
         .unwrap();
-        let policy = raw.into_config(false).unwrap().provider.model_policy;
+        let policy = raw.into_config().unwrap().provider.model_policy;
 
         let state = SessionState::from_session(session, &fallback, &storage, &policy);
 

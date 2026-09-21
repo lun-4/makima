@@ -150,7 +150,10 @@ impl DeepSeek {
         let pool = KeyPool::resolve("deepseek", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
+                "deepseek",
+                pool.current(),
+            )?)),
             key_pool: Some(pool),
             system_prefix: None,
         })

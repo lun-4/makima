@@ -151,28 +151,27 @@ impl ProviderData {
         }
     }
 
-    pub fn build_auth(&self, state_dir: &StateDir) -> Authentication {
+    fn auth_for(&self, api_key: &str) -> Result<ResolvedAuth, AgentError> {
+        Ok(ResolvedAuth::new(&self.slug, self.auth_headers(api_key))?
+            .with_base_url(self.base_url.clone()))
+    }
+
+    pub fn build_auth(&self, state_dir: &StateDir) -> Result<Authentication, AgentError> {
         let api_key = match self.resolve_api_key(state_dir) {
             Some(key) => key,
             None if OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str()) => {
-                return Authentication::OpenCodeFreeKey(ResolvedAuth {
-                    base_url: self.base_url.clone(),
-                    headers: self.auth_headers("public"),
-                });
+                return Ok(Authentication::OpenCodeFreeKey(self.auth_for("public")?));
             }
-            None => return Authentication::NoAuth,
+            None => return Ok(Authentication::NoAuth),
         };
-        Authentication::KeyBased(ResolvedAuth {
-            base_url: self.base_url.clone(),
-            headers: self.auth_headers(&api_key),
-        })
+        Ok(Authentication::KeyBased(self.auth_for(&api_key)?))
     }
 
-    pub fn resolve_auth(&self, state_dir: &StateDir) -> Option<ResolvedAuth> {
-        match self.build_auth(state_dir) {
+    pub fn resolve_auth(&self, state_dir: &StateDir) -> Result<Option<ResolvedAuth>, AgentError> {
+        Ok(match self.build_auth(state_dir)? {
             Authentication::KeyBased(auth) | Authentication::OpenCodeFreeKey(auth) => Some(auth),
             Authentication::NoAuth => None,
-        }
+        })
     }
 
     /// Resolve auth with optional dynamic override (e.g. from Lua).
@@ -180,11 +179,11 @@ impl ProviderData {
         &self,
         override_auth: Option<&Arc<Mutex<ResolvedAuth>>>,
         state_dir: &StateDir,
-    ) -> Option<ResolvedAuth> {
+    ) -> Result<Option<ResolvedAuth>, AgentError> {
         if OPENCODE_FAMILY_SLUGS.contains(&self.slug.as_str())
             && let Some(auth) = override_auth
         {
-            return Some(auth.lock().unwrap().clone());
+            return Ok(Some(auth.lock().unwrap().clone()));
         }
         self.resolve_auth(state_dir)
     }
@@ -194,7 +193,11 @@ impl ProviderData {
         state_dir: &StateDir,
         enable_free_models: bool,
     ) -> Vec<ModelInfo> {
-        let auth = self.build_auth(state_dir);
+        // A broken `[<slug>.headers]` hides the models instead of killing the
+        // whole listing; creating the provider reports the real error.
+        let Ok(auth) = self.build_auth(state_dir) else {
+            return Vec::new();
+        };
         let mut models: Vec<ModelInfo> = self
             .models
             .iter()
@@ -471,7 +474,7 @@ pub fn available_if_warm(slug: &str) -> bool {
     let Ok(state_dir) = StateDir::resolve() else {
         return false;
     };
-    data.resolve_auth(&state_dir).is_some()
+    matches!(data.resolve_auth(&state_dir), Ok(Some(_)))
 }
 
 fn catalog_cache_path() -> Option<PathBuf> {
@@ -713,7 +716,7 @@ impl CatalogProvider {
         timeouts: Timeouts,
         allow_free_fallback: bool,
     ) -> Result<Self, AgentError> {
-        let auth = match data.build_auth(state_dir) {
+        let auth = match data.build_auth(state_dir)? {
             Authentication::KeyBased(auth) => CatalogAuth::Keyed(auth),
             Authentication::OpenCodeFreeKey(auth) if allow_free_fallback => {
                 CatalogAuth::FreeOnly(auth)
@@ -1434,7 +1437,7 @@ mod tests {
         );
         // No env vars and no OPENCODE_API_KEY fallback — no auth
         assert!(matches!(
-            provider_data.build_auth(&state_dir),
+            provider_data.build_auth(&state_dir).unwrap(),
             Authentication::NoAuth
         ));
     }
@@ -1458,7 +1461,7 @@ mod tests {
             EndpointType::ChatCompletions,
             HashMap::new(),
         );
-        let auth = provider_data.build_auth(&state_dir);
+        let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::OpenCodeFreeKey(resolved) => {
                 assert_eq!(resolved.headers[0].0, "authorization");
@@ -1488,7 +1491,7 @@ mod tests {
             EndpointType::ChatCompletions,
             HashMap::new(),
         );
-        let auth = provider_data.build_auth(&state_dir);
+        let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::KeyBased(resolved) => {
                 assert_eq!(resolved.headers[0].0, "authorization");
@@ -1519,7 +1522,7 @@ mod tests {
             EndpointType::Messages,
             HashMap::new(),
         );
-        let auth = provider_data.build_auth(&state_dir);
+        let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::KeyBased(resolved) => {
                 assert_eq!(resolved.headers[0].0, "x-api-key");
@@ -1642,7 +1645,7 @@ mod tests {
         assert_eq!(opencode.models.len(), 2, "all models included");
         // Public fallback auth registered
         assert!(matches!(
-            opencode.build_auth(&state_dir),
+            opencode.build_auth(&state_dir).unwrap(),
             Authentication::OpenCodeFreeKey(_)
         ));
     }
@@ -2120,7 +2123,7 @@ mod tests {
         assert!(opencode.models.contains_key("free-model"));
         assert!(opencode.models.contains_key("paid-model"));
         assert!(matches!(
-            opencode.build_auth(&state_dir),
+            opencode.build_auth(&state_dir).unwrap(),
             Authentication::KeyBased(_)
         ));
         unsafe { std::env::remove_var("MAKI_TEST_OPENCODE_ALL_81274") };
@@ -2183,7 +2186,7 @@ mod tests {
         assert!(opencode.models.contains_key("paid-model"));
         // Provider ID is "opencode" so slug becomes "opencode" -> OpenCodeFreeKey fallback
         assert!(matches!(
-            opencode.build_auth(&state_dir),
+            opencode.build_auth(&state_dir).unwrap(),
             Authentication::OpenCodeFreeKey(_)
         ));
         // all_models with OpenCodeFreeKey only shows free models; with enable_free_models=false, no models shown
@@ -2203,7 +2206,7 @@ mod tests {
         assert!(opencode.models.contains_key("paid-model"));
         // Provider ID is "opencode" so slug becomes "opencode" -> OpenCodeFreeKey fallback
         assert!(matches!(
-            opencode.build_auth(&state_dir),
+            opencode.build_auth(&state_dir).unwrap(),
             Authentication::OpenCodeFreeKey(_)
         ));
         // all_models filters both free (enable_free_models=false) and paid (OpenCodeFreeKey only shows free)

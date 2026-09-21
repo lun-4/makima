@@ -90,7 +90,7 @@ impl McpPicker {
     }
 
     pub fn open(&mut self) {
-        let _ = self.servers.poll(self.reader.load_full());
+        self.servers = Watch::seeded(self.reader.load_full());
         let (entries, enabled) = self.entries();
         let errors = (!self.config_errors.is_empty()).then(|| self.config_errors.to_string());
         self.picker.set_error_text(errors);

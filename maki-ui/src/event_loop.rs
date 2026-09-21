@@ -321,13 +321,15 @@ fn terminal_input_proves_focus(_event: &Event) -> bool {
 
 fn route_terminal_lifecycle(app: &mut App, event: &Event) {
     if matches!(event, Event::FocusLost | Event::Resize(..)) {
-        let _ = app.cancel_middle_scroll();
+        let dirty = app.cancel_middle_scroll();
+        app.pending_dirty |= dirty;
     }
 }
 
 fn assign_session_focus(outgoing: &mut App, focused: &mut usize, next: usize) {
     if *focused != next {
-        let _ = outgoing.cancel_middle_scroll();
+        let dirty = outgoing.cancel_middle_scroll();
+        outgoing.pending_dirty |= dirty;
         *focused = next;
     }
 }
@@ -337,7 +339,8 @@ fn prepare_terminal_handoff<'a>(
     terminal_focused: &mut bool,
 ) {
     for app in apps {
-        let _ = app.cancel_middle_scroll();
+        let dirty = app.cancel_middle_scroll();
+        app.pending_dirty |= dirty;
     }
     *terminal_focused = false;
 }
@@ -348,7 +351,7 @@ fn tick_session(app: &mut App, focused: bool, now: Instant) -> (Dirty, Vec<Actio
     if focused {
         dirty |= app.tick_at(now);
     } else {
-        let _ = app.float_mgr.tick();
+        dirty |= app.float_mgr.tick();
         dirty |= app.tick_edge_scroll();
         dirty |= app.tick_error_expiry();
         dirty |= app.poll_image_paste();
@@ -538,7 +541,7 @@ fn apply_options_to_session(session: &mut AppSession, snapshot: &SessionOptionsS
         let id = option.definition.id.as_ref();
         let enabled = option.current_value.as_ref() == ENABLED_VALUE;
         match id {
-            YOLO_OPTION_ID => session.meta.yolo = enabled,
+            YOLO_OPTION_ID => session.meta.yolo = Some(enabled),
             FAST_OPTION_ID => session.meta.fast = enabled,
             WORKFLOW_OPTION_ID => session.meta.workflow = enabled,
             THINKING_OPTION_ID => {
@@ -1022,7 +1025,7 @@ fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
     let definitions = builtin_option_definitions(
         Arc::from(model_spec.as_str()),
         available_models,
-        session.meta.yolo,
+        session.meta.yolo.unwrap_or(false),
         session.meta.fast,
         session.meta.workflow,
         thinking,
@@ -1141,7 +1144,7 @@ impl SpawnCtx {
         current_id: MakiId,
         permissions: &PermissionManager,
     ) -> Result<PreparedSessionRuntime, String> {
-        session.meta.yolo = permissions.is_yolo();
+        session.meta.yolo = permissions.persisted_yolo();
         let provider = self.prepare_replacement_provider(&session)?;
         let seed_snapshot = session.id != current_id;
         self.prepare_runtime_with_provider_and_permissions(
@@ -1177,7 +1180,7 @@ impl SpawnCtx {
         provider: Option<PreparedProvider>,
     ) -> Result<PreparedSessionRuntime> {
         if !session_has_content(&session) {
-            session.meta.yolo = self.permissions.is_yolo();
+            session.meta.yolo = self.permissions.persisted_yolo();
         }
         self.prepare_runtime_with_provider_and_permissions(
             session,
@@ -1215,7 +1218,7 @@ impl SpawnCtx {
             self.model_slot.change_tx(),
         );
         let permissions = Arc::new(permissions.fork());
-        permissions.set_yolo(session.meta.yolo);
+        permissions.set_session_yolo(session.meta.yolo);
         permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
         let handles = AgentHandles::prepare(
             &model_slot,
@@ -2097,6 +2100,11 @@ impl<'t> EventLoop<'t> {
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
             }
+            UiAction::SetWindowTitle(title) => {
+                if let Err(error) = terminal::set_window_title(&title) {
+                    tracing::warn!(%error, "failed to set window title");
+                }
+            }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);
                 let _ = reply_tx.send(code);
@@ -2198,7 +2206,11 @@ impl<'t> EventLoop<'t> {
         let generations = self
             .sessions
             .iter_mut()
-            .map(|runtime| runtime.app.reconcile_status_content())
+            .map(|runtime| {
+                let (generation, d) = runtime.app.reconcile_status_content();
+                runtime.app.pending_dirty |= d;
+                generation
+            })
             .collect::<Vec<_>>();
         if generations
             .iter()
@@ -4265,7 +4277,7 @@ mod tests {
         let snapshot = runtime.coordinator.read().options();
         let mut reload = Arc::unwrap_or_clone(Arc::clone(&runtime.app.state.session));
         apply_options_to_session(&mut reload, &snapshot);
-        assert!(reload.meta.yolo);
+        assert_eq!(reload.meta.yolo, Some(true));
         assert!(reload.meta.workflow);
         release_runtime(runtime);
     }
@@ -4568,7 +4580,7 @@ mod tests {
         let harness = RuntimeHarness::new();
         harness.ctx().permissions.set_yolo(startup_yolo);
         let mut session = harness.session();
-        session.meta.yolo = persisted_yolo;
+        session.meta.yolo = Some(persisted_yolo);
         session.push_message(Message::user("resumed".into()));
 
         let runtime = harness.runtime(session);
@@ -4607,7 +4619,7 @@ mod tests {
             .unwrap();
 
         assert!(runtime.app.permissions.is_yolo());
-        assert!(runtime.app.state.session.meta.yolo);
+        assert_eq!(runtime.app.state.session.meta.yolo, Some(true));
         let options = runtime.coordinator.read().options();
         let yolo = options
             .options

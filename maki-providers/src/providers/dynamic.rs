@@ -129,12 +129,10 @@ struct ScriptResolvedAuth {
     headers: HashMap<String, String>,
 }
 
-impl From<ScriptResolvedAuth> for ResolvedAuth {
-    fn from(s: ScriptResolvedAuth) -> Self {
-        Self {
-            base_url: s.base_url,
-            headers: s.headers.into_iter().collect(),
-        }
+impl ScriptResolvedAuth {
+    fn into_resolved(self, slug: &str) -> Result<ResolvedAuth, AgentError> {
+        Ok(ResolvedAuth::new(slug, self.headers.into_iter().collect())?
+            .with_base_url(self.base_url))
     }
 }
 
@@ -238,7 +236,7 @@ fn resolve_auth(meta: &DynamicProviderMeta) -> Result<ResolvedAuth, AgentError> 
         serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
             message: format!("{} resolve: invalid JSON: {e}", meta.script_path.display()),
         })?;
-    Ok(parsed.into())
+    parsed.into_resolved(&meta.slug)
 }
 
 /// `info` and `models` describe the script, not the world, so their output only
@@ -619,6 +617,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
     };
 
     Ok(Box::new(DynamicProvider {
+        slug: &meta.slug,
         script_path: &meta.script_path,
         inner,
         auth,
@@ -677,6 +676,7 @@ pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
 }
 
 struct DynamicProvider {
+    slug: &'static str,
     script_path: &'static Path,
     inner: Box<dyn Provider>,
     auth: Arc<Mutex<ResolvedAuth>>,
@@ -708,6 +708,7 @@ struct Winner {
 impl RefreshGate {
     async fn refresh(
         &self,
+        slug: &str,
         script_path: &Path,
         auth: &Arc<Mutex<ResolvedAuth>>,
     ) -> Result<(), AgentError> {
@@ -721,7 +722,7 @@ impl RefreshGate {
             }
             return Ok(());
         }
-        run_auth_script(script_path, auth, "refresh").await?;
+        run_auth_script(slug, script_path, auth, "refresh").await?;
         *self.winner.lock().unwrap() = Winner {
             refreshes: before + 1,
             auth: Some(auth.lock().unwrap().clone()),
@@ -731,12 +732,14 @@ impl RefreshGate {
 }
 
 async fn run_auth_script(
+    slug: &str,
     script_path: &Path,
     auth: &Arc<Mutex<ResolvedAuth>>,
     subcommand: &'static str,
 ) -> Result<(), AgentError> {
     let script_path = script_path.to_path_buf();
     let auth = auth.clone();
+    let slug = slug.to_string();
     smol::unblock(move || {
         // `reload` only re-reads what a login wrote, so it spends no token and
         // must not park the ui behind someone else's refresh.
@@ -746,7 +749,7 @@ async fn run_auth_script(
             serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
                 message: format!("{} {subcommand}: invalid JSON: {e}", script_path.display()),
             })?;
-        let mut fresh: ResolvedAuth = parsed.into();
+        let mut fresh: ResolvedAuth = parsed.into_resolved(&slug)?;
         let mut guard = auth.lock().unwrap();
         // A script that omits base_url keeps the resolved one; falling back to
         // the provider's default origin would silently repoint the token.
@@ -802,7 +805,7 @@ impl Provider for DynamicProvider {
                     debug!(error = %e, "auth error, refreshing script-backed credentials");
                     match self
                         .refresh_gate
-                        .refresh(self.script_path, &self.auth)
+                        .refresh(self.slug, self.script_path, &self.auth)
                         .await
                     {
                         Ok(()) => {
@@ -846,13 +849,17 @@ impl Provider for DynamicProvider {
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(self.refresh_gate.refresh(self.script_path, &self.auth))
+        Box::pin(
+            self.refresh_gate
+                .refresh(self.slug, self.script_path, &self.auth),
+        )
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         // Deliberately ungated: this runs under block_on on the ui thread, and
         // parking it behind someone else's slow refresh script freezes the ui.
         Box::pin(run_auth_script(
+            self.slug,
             self.script_path,
             &self.auth,
             RELOAD_SUBCOMMAND,
@@ -878,6 +885,8 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const TEST_SLUG: &str = "script-provider";
+
     #[cfg(unix)]
     const STALE_TOKEN: &str = "Bearer stale";
     #[cfg(unix)]
@@ -900,16 +909,18 @@ mod tests {
     fn script_resolved_auth_deserialization() {
         let with_base =
             r#"{"base_url": "https://example.com", "headers": {"authorization": "Bearer tok"}}"#;
-        let resolved: ResolvedAuth = serde_json::from_str::<ScriptResolvedAuth>(with_base)
+        let resolved = serde_json::from_str::<ScriptResolvedAuth>(with_base)
             .unwrap()
-            .into();
+            .into_resolved(TEST_SLUG)
+            .unwrap();
         assert_eq!(resolved.base_url.as_deref(), Some("https://example.com"));
         assert_eq!(resolved.headers[0].1, "Bearer tok");
 
         let without_base = r#"{"headers": {"authorization": "Bearer x"}}"#;
-        let resolved: ResolvedAuth = serde_json::from_str::<ScriptResolvedAuth>(without_base)
+        let resolved = serde_json::from_str::<ScriptResolvedAuth>(without_base)
             .unwrap()
-            .into();
+            .into_resolved(TEST_SLUG)
+            .unwrap();
         assert!(resolved.base_url.is_none());
     }
 
@@ -1088,18 +1099,18 @@ esac
         let counter = tmp.path().join("count");
         let script = write_counting_refresh_script(tmp.path(), &counter, rotating);
         let stale = || {
-            Arc::new(Mutex::new(ResolvedAuth {
-                base_url: None,
-                headers: vec![("authorization".into(), STALE_TOKEN.into())],
-            }))
+            Arc::new(Mutex::new(ResolvedAuth::for_test(
+                None,
+                vec![("authorization".into(), STALE_TOKEN.into())],
+            )))
         };
         let (first, second) = (stale(), stale());
         let gate = RefreshGate::default();
 
         smol::block_on(async {
             let (a, b) = futures_lite::future::zip(
-                gate.refresh(&script, &first),
-                gate.refresh(&script, &second),
+                gate.refresh(TEST_SLUG, &script, &first),
+                gate.refresh(TEST_SLUG, &script, &second),
             )
             .await;
             a.unwrap();
@@ -1116,7 +1127,7 @@ esac
 
             // The late caller snapshots the count before locking, so a refresh
             // that overlaps nobody still runs the script.
-            gate.refresh(&script, &first).await.unwrap();
+            gate.refresh(TEST_SLUG, &script, &first).await.unwrap();
         });
 
         assert_eq!(
