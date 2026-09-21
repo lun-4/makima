@@ -1401,3 +1401,61 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
         task.await;
     });
 }
+
+#[test]
+fn cancel_active_compact_cancels_cleanly_without_panic() {
+    smol::block_on(async {
+        let (started_tx, started_rx) = flume::bounded(1);
+        struct BlockingCompactBackend {
+            state: Arc<ScriptedState>,
+            started_tx: flume::Sender<()>,
+        }
+        impl ActorBackend for BlockingCompactBackend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                context: TurnContext,
+                _input: crate::AgentInput,
+                _work: WorkKind,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async move { default_completed(&context) })
+            }
+            fn run_control<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                _context: TurnContext,
+                _control: &'a ControlWork,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+            fn run_compact<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                context: TurnContext,
+                _instructions: Option<&'a str>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    self.state.compacts.fetch_add(1, Ordering::SeqCst);
+                    let _ = self.started_tx.send(());
+                    context.cancel.cancelled().await;
+                    BackendResult::CompactDone
+                })
+            }
+        }
+        let state = Arc::new(ScriptedState::default());
+        let backend = BlockingCompactBackend {
+            state: Arc::clone(&state),
+            started_tx,
+        };
+        let (handle, task) = spawn(backend);
+        handle.push_compact(7, None).unwrap();
+        started_rx.recv_async().await.unwrap();
+        handle.cancel_correlation("r7", TurnCancellationReason::User);
+        handle.close();
+        task.await;
+        assert_eq!(state.compacts.load(Ordering::SeqCst), 1);
+    });
+}

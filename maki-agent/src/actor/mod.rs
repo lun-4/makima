@@ -652,7 +652,7 @@ impl AgentActorHandle {
             let active = state.active.take();
             match state.status {
                 ActorStatus::Running(turn_id) => operation(turn_id),
-                ActorStatus::Idle => unreachable!("active cancellation requires a running turn"),
+                ActorStatus::Idle => {}
             }
             active
         } else {

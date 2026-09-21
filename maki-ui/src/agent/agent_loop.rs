@@ -532,7 +532,7 @@ impl ActorBackend for TuiActorBackend {
     fn run_compact<'a>(
         &'a mut self,
         history: &'a mut History,
-        _context: TurnContext,
+        context: TurnContext,
         instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
@@ -568,7 +568,7 @@ impl ActorBackend for TuiActorBackend {
                 &model,
                 history,
                 &event_tx,
-                &maki_agent::cancel::CancelToken::none(),
+                &context.cancel,
                 &self.config,
                 instructions,
                 self.session_id.as_ref(),

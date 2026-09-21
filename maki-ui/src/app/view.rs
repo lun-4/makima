@@ -65,7 +65,8 @@ impl App {
         self.render_defer_hint(frame, layout.defer_hint_area);
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
-        let _ = self.validate_middle_scroll();
+        let dirty = self.validate_middle_scroll();
+        self.pending_dirty |= dirty;
         self.apply_selection(frame, render_chat);
         if let Some(state) = &self.middle_scroll
             && layout.msg_area.contains(state.origin)
@@ -244,14 +245,16 @@ impl App {
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
         let accent = self.effective_mode_color();
         self.chats[render_chat].set_accent(accent);
-        let _ = self.validate_middle_scroll();
+        let dirty = self.validate_middle_scroll();
+        self.pending_dirty |= dirty;
         if self.middle_scroll.is_some()
             && self
                 .zones
                 .find(SelectionZone::Messages)
                 .is_none_or(|zone| zone.area != layout.msg_area)
         {
-            let _ = self.cancel_middle_scroll();
+            let dirty = self.cancel_middle_scroll();
+            self.pending_dirty |= dirty;
         }
         let images_visible = !self.any_overlay_open();
         self.chats[render_chat].view(
