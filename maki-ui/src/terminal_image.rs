@@ -1,12 +1,16 @@
 use std::env;
-use std::io::{Cursor, IsTerminal, Write, stdout};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{Cursor, IsTerminal, stdout};
 #[cfg(unix)]
 use std::os::fd::RawFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use color_eyre::eyre::{Result, ensure};
@@ -26,14 +30,22 @@ const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
 const DECODE_THREAD: &str = "inline-image";
 const PROBE_TIMEOUT: Duration = Duration::from_millis(350);
+#[cfg(unix)]
 const PROBE_POLL_SLICE: Duration = Duration::from_millis(50);
+#[cfg(unix)]
 const PROBE_PAYLOAD: &[u8] =
     b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b[>c\x1b[c\x1b[5n\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b\x1b[5n\x1b\\";
+#[cfg(any(unix, test))]
 const DSR_RESPONSE: &[u8] = b"\x1b[0n";
+#[cfg(any(unix, test))]
 const TMUX_DA2_REPLY: &[u8] = b">84;";
+#[cfg(any(unix, test))]
 const KITTY_PROBE_TMUX_REPLY: &[u8] = b"Gi=32;";
+#[cfg(any(unix, test))]
 const KITTY_PROBE_DIRECT_REPLY: &[u8] = b"Gi=31;";
+#[cfg(any(unix, test))]
 const BEL_BYTE: u8 = 0x07;
+#[cfg(any(unix, test))]
 const ST_BYTES: &[u8] = b"\x1b\\";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static DECODE_JOBS: OnceLock<flume::Sender<DecodeJob>> = OnceLock::new();
@@ -45,6 +57,7 @@ pub(crate) struct DetectedGraphics {
     pub is_tmux: bool,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeResult {
     Detected(DetectedGraphics),
@@ -82,6 +95,7 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+#[cfg(any(unix, test))]
 fn contains_subslice(buffer: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || buffer.len() < needle.len() {
         return false;
@@ -89,6 +103,7 @@ fn contains_subslice(buffer: &[u8], needle: &[u8]) -> bool {
     buffer.windows(needle.len()).any(|window| window == needle)
 }
 
+#[cfg(any(unix, test))]
 fn count_subslice(buffer: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || buffer.len() < needle.len() {
         return 0;
@@ -99,6 +114,7 @@ fn count_subslice(buffer: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+#[cfg(any(unix, test))]
 fn find_terminated_reply(buffer: &[u8], prefix: &[u8]) -> Option<(bool, bool)> {
     if prefix.is_empty() || buffer.len() < prefix.len() {
         return None;
@@ -111,10 +127,12 @@ fn find_terminated_reply(buffer: &[u8], prefix: &[u8]) -> Option<(bool, bool)> {
     Some((is_terminated, has_sentinel))
 }
 
+#[cfg(any(unix, test))]
 fn is_tmux_detected(buffer: &[u8]) -> bool {
     env::var_os("TMUX").is_some() || contains_subslice(buffer, TMUX_DA2_REPLY)
 }
 
+#[cfg(any(unix, test))]
 fn has_sixel_da1(buffer: &[u8]) -> (bool, bool) {
     let mut i = 0;
     while i < buffer.len() {
@@ -133,6 +151,7 @@ fn has_sixel_da1(buffer: &[u8]) -> (bool, bool) {
     (false, false)
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
     let in_tmux = is_tmux_detected(buffer);
 
