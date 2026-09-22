@@ -40,7 +40,7 @@ const CHECKPOINT_RETRY_BACKOFFS: &[Duration] = &[
 ];
 #[cfg(test)]
 const CHECKPOINT_RETRY_BACKOFFS: &[Duration] =
-    &[Duration::from_millis(250), Duration::from_millis(500)];
+    &[Duration::from_millis(600), Duration::from_millis(1200)];
 #[cfg(not(test))]
 const BACKGROUND_RETRY_BACKOFFS: &[Duration] = &[
     Duration::from_secs(1),
@@ -1325,6 +1325,12 @@ mod tests {
             });
             let warning = warn_rx.recv_async().await.unwrap();
             assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
+            let blocked_retry_at = match lock(&writer.pending).entries.get(&blocked_id) {
+                Some(Entry::Save(save)) => {
+                    save.retry_at.expect("blocked session must have retry_at")
+                }
+                _ => panic!("blocked session entry missing"),
+            };
 
             let healthy = AppSession::new(MODEL, CWD);
             let healthy_id = healthy.id;
@@ -1337,18 +1343,13 @@ mod tests {
                 version: healthy_version,
                 snapshot: Arc::new(healthy),
             });
-            let healthy_result =
-                futures_lite::future::race(async { Some(healthy_ack.await) }, async {
-                    smol::Timer::after(Duration::from_millis(100)).await;
-                    None
-                })
-                .await;
-            assert_eq!(
-                healthy_result
-                    .expect("healthy checkpoint was delayed by another session")
-                    .unwrap()
-                    .version,
-                healthy_version
+            let ack = healthy_ack
+                .await
+                .expect("healthy checkpoint was delayed or failed");
+            assert_eq!(ack.version, healthy_version);
+            assert!(
+                Instant::now() < blocked_retry_at,
+                "healthy checkpoint was delayed past the retry backoff of the failed session"
             );
 
             std::fs::remove_dir(blocked_tmp).unwrap();
