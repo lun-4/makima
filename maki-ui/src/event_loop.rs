@@ -514,9 +514,12 @@ fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
 fn project_committed_options_for_app(app: &mut App, snapshot: &SessionOptionsSnapshot) {
     for option in snapshot.options.iter() {
         match option.definition.id.as_ref() {
-            YOLO_OPTION_ID => app
-                .permissions
-                .set_yolo(option.current_value.as_ref() == ENABLED_VALUE),
+            YOLO_OPTION_ID => {
+                let enabled = option.current_value.as_ref() == ENABLED_VALUE;
+                if app.permissions.is_yolo() != enabled {
+                    app.permissions.set_yolo(enabled);
+                }
+            }
             FAST_OPTION_ID => app.state.fast = option.current_value.as_ref() == ENABLED_VALUE,
             WORKFLOW_OPTION_ID => {
                 app.state.workflow = option.current_value.as_ref() == ENABLED_VALUE
@@ -1025,7 +1028,7 @@ fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
     let definitions = builtin_option_definitions(
         Arc::from(model_spec.as_str()),
         available_models,
-        session.meta.yolo.unwrap_or(false),
+        permissions.is_yolo(),
         session.meta.fast,
         session.meta.workflow,
         thinking,
@@ -3501,6 +3504,7 @@ impl<'t> EventLoop<'t> {
                     }
                     let mut session = Arc::unwrap_or_clone(Arc::clone(&app.state.session));
                     apply_options_to_session(&mut session, &snapshot);
+                    session.meta.yolo = app.permissions.persisted_yolo();
                     app.state.session = Arc::new(session);
                     session_leases.push((app.state.session.id, lease));
                 }
@@ -4032,7 +4036,7 @@ mod tests {
     }
 
     impl RuntimeHarness {
-        fn new() -> Self {
+        fn with_permissions_config(permissions_config: PermissionsConfig) -> Self {
             let temp_dir = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(temp_dir.path().to_path_buf());
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
@@ -4050,7 +4054,7 @@ mod tests {
             let (model_slot, _provider_change_rx) =
                 ProviderSlot::new(model, Arc::new(StubProvider));
             let permissions = Arc::new(PermissionManager::new(
-                PermissionsConfig::default(),
+                permissions_config,
                 temp_dir.path().to_path_buf(),
                 ProjectConfig::for_project(temp_dir.path()),
                 Arc::default(),
@@ -4083,6 +4087,10 @@ mod tests {
                 _temp_dir: temp_dir,
                 ctx: Some(ctx),
             }
+        }
+
+        fn new() -> Self {
+            Self::with_permissions_config(PermissionsConfig::default())
         }
 
         fn ctx(&self) -> &SpawnCtx {
@@ -4632,6 +4640,39 @@ mod tests {
             yolo.current_value.as_ref(),
             maki_agent::session_options::ENABLED_VALUE
         );
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn startup_yolo_seed_applies_without_marking_session() {
+        let harness = RuntimeHarness::with_permissions_config(PermissionsConfig {
+            yolo: true,
+            ..Default::default()
+        });
+
+        let mut runtime = harness
+            .prepare()
+            .activate(&harness.ctx().model_slot, None)
+            .unwrap();
+
+        assert!(runtime.app.permissions.is_yolo());
+        assert_eq!(runtime.app.state.session.meta.yolo, None);
+        let options = runtime.coordinator.read().options();
+        let yolo = options
+            .options
+            .iter()
+            .find(|option| {
+                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+            })
+            .unwrap();
+        assert_eq!(
+            yolo.current_value.as_ref(),
+            maki_agent::session_options::ENABLED_VALUE
+        );
+
+        checkpoint_runtime(&mut runtime);
+        assert!(runtime.app.permissions.is_yolo());
+        assert_eq!(runtime.app.state.session.meta.yolo, None);
         release_runtime(runtime);
     }
 

@@ -644,13 +644,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let handle_model = shared_model.clone();
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
+    let mut permissions_config = params.permissions_config.clone();
+    permissions_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new(
-        params.permissions_config.clone(),
+        permissions_config,
         params.initial_wd,
         params.project_config,
         Arc::clone(&params.plugin_rules),
     ));
-    permissions.set_yolo(params.yolo);
     let modes = Arc::clone(&params.modes);
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
