@@ -253,6 +253,13 @@ impl Picker {
         &self.capabilities
     }
 
+    /// Add a capability to the picker.
+    pub fn add_capability(&mut self, capability: Capability) {
+        if !self.capabilities.contains(&capability) {
+            self.capabilities.push(capability);
+        }
+    }
+
     /// Returns a new protocol.
     ///
     /// The image must match the given area at the terminal's current font size.

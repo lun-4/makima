@@ -19,7 +19,7 @@ use maki_providers::ImageSource;
 use ratatui::layout::Size;
 use ratatui_image::{
     FontSize,
-    picker::{Picker, ProtocolType},
+    picker::{Capability, Picker, ProtocolType},
     sliced::SlicedProtocol,
 };
 
@@ -34,7 +34,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 const PROBE_POLL_SLICE: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const PROBE_PAYLOAD: &[u8] =
-    b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b[>c\x1b[c\x1b[5n\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x07\x1b\x1b[5n\x1b\\";
+    b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[>c\x1b[c\x1b[5n\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\x1b\\\x1b\x1b[5n\x1b\\";
 #[cfg(any(unix, test))]
 const DSR_RESPONSE: &[u8] = b"\x1b[0n";
 #[cfg(any(unix, test))]
@@ -182,7 +182,7 @@ pub(crate) fn parse_probe_stream(buffer: &[u8]) -> ProbeResult {
 
     let (is_sixel, sixel_sentinel) = has_sixel_da1(buffer);
     let dsr_count = count_subslice(buffer, DSR_RESPONSE);
-    if is_sixel && sixel_sentinel {
+    if is_sixel && sixel_sentinel && (!in_tmux || dsr_count >= 2) {
         return ProbeResult::Detected(DetectedGraphics {
             protocol: ProtocolType::Sixel,
             is_tmux: in_tmux,
@@ -301,6 +301,10 @@ pub(crate) fn init_graphics_detection() {
     let _ = DETECTED_GRAPHICS.set(detected);
 }
 
+pub(crate) fn detected_graphics() -> Option<DetectedGraphics> {
+    DETECTED_GRAPHICS.get().copied().flatten()
+}
+
 pub(crate) fn picker(inline_images: bool) -> Option<Picker> {
     if !stdout().is_terminal() {
         return None;
@@ -340,6 +344,9 @@ fn create_picker(
     let mut picker = Picker::from_fontsize(font);
     picker.set_protocol_type(protocol);
     picker.set_is_tmux(is_tmux);
+    if protocol == ProtocolType::Kitty {
+        picker.add_capability(Capability::KittyCompression);
+    }
     Some(picker)
 }
 
@@ -728,6 +735,22 @@ mod tests {
     #[test]
     fn test_parse_probe_delayed_dcs_response_after_local_dsr() {
         let mut stream = TMUX_LOCAL_DSR_RESPONSE.to_vec();
+        assert_eq!(parse_probe_stream(&stream), ProbeResult::Pending);
+        stream.extend_from_slice(GHOSTTY_KITTY_RESPONSE);
+        assert_eq!(
+            parse_probe_stream(&stream),
+            ProbeResult::Detected(DetectedGraphics {
+                protocol: ProtocolType::Kitty,
+                is_tmux: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_probe_tmux_kitty_not_preempted_by_sixel_da1() {
+        // Real tmux DA2 + DA1 with Sixel (1;2;4c) + local DSR (0n)
+        let mut stream = b"\x1b[>84;0;0c\x1b[?1;2;4c\x1b[0n".to_vec();
+        // Must stay Pending rather than falsely detecting Sixel before outer Kitty response arrives
         assert_eq!(parse_probe_stream(&stream), ProbeResult::Pending);
         stream.extend_from_slice(GHOSTTY_KITTY_RESPONSE);
         assert_eq!(
