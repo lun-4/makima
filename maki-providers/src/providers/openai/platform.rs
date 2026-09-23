@@ -35,6 +35,8 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
@@ -600,6 +602,8 @@ mod tests {
     #[test_case("gpt-5.6-terra")]
     #[test_case("gpt-5.6-sol")]
     #[test_case("gpt-6-astra")]
+    #[test_case("gpt-6-sol")]
+    #[test_case("gpt-6-luna")]
     fn gpt_5_6_models_use_coding_plan(model_id: &str) {
         assert!(is_codex_model(model_id));
     }
@@ -608,6 +612,8 @@ mod tests {
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]
     #[test_case("gpt-6-astra", Some(272_000))]
+    #[test_case("gpt-6-sol", Some(272_000))]
+    #[test_case("gpt-6-luna", Some(272_000))]
     #[test_case("gpt-5.5", Some(272_000))]
     #[test_case("gpt-5.3-codex", Some(272_000))]
     #[test_case("gpt-5.7-codex", Some(272_000) ; "unlisted codex model still routes")]

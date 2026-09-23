@@ -7,7 +7,7 @@ pub use platform::OpenAi;
 use crate::model::{ModelEntry, ModelFamily, ModelPricing, ModelTier};
 
 const GPT_5_6_CONTEXT_WINDOW: u32 = 372_000;
-const GPT_6_ASTRA_CONTEXT_WINDOW: u32 = 272_000;
+const GPT_6_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_MAX_OUTPUT_TOKENS: u32 = 128_000;
 
 inventory::submit!(maki_config::providers::BuiltInProvider {
@@ -38,7 +38,39 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 fast: None,
             },
             max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
-            context_window: GPT_6_ASTRA_CONTEXT_WINDOW,
+            context_window: GPT_6_CONTEXT_WINDOW,
+        },
+        ModelEntry {
+            prefixes: &["gpt-6-sol"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 10.00,
+                cache_write: 2.50,
+                cache_read: 0.20,
+                fast: None,
+            },
+            max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
+            context_window: GPT_6_CONTEXT_WINDOW,
+        },
+        ModelEntry {
+            prefixes: &["gpt-6-luna"],
+            tier: ModelTier::Weak,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.10,
+                output: 0.50,
+                cache_write: 0.125,
+                cache_read: 0.01,
+                fast: None,
+            },
+            max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
+            context_window: GPT_6_CONTEXT_WINDOW,
         },
         ModelEntry {
             prefixes: &["gpt-5.6-luna"],
@@ -321,24 +353,76 @@ mod tests {
 
     use super::*;
 
-    #[test_case("gpt-5.6-luna", ModelTier::Weak, 1.0, 0.1, 1.25, 6.0)]
-    #[test_case("gpt-5.6-terra", ModelTier::Medium, 2.5, 0.25, 3.125, 15.0)]
-    #[test_case("gpt-5.6-sol", ModelTier::Strong, 5.0, 0.5, 6.25, 30.0)]
-    fn gpt_5_6_models_have_expected_tier_and_short_context_pricing(
+    #[test_case(
+        "gpt-5.6-luna",
+        ModelTier::Weak,
+        1.0,
+        0.1,
+        1.25,
+        6.0,
+        GPT_5_6_CONTEXT_WINDOW
+    )]
+    #[test_case(
+        "gpt-5.6-terra",
+        ModelTier::Medium,
+        2.5,
+        0.25,
+        3.125,
+        15.0,
+        GPT_5_6_CONTEXT_WINDOW
+    )]
+    #[test_case(
+        "gpt-5.6-sol",
+        ModelTier::Strong,
+        5.0,
+        0.5,
+        6.25,
+        30.0,
+        GPT_5_6_CONTEXT_WINDOW
+    )]
+    #[test_case(
+        "gpt-6-astra",
+        ModelTier::Strong,
+        10.0,
+        1.0,
+        12.5,
+        50.0,
+        GPT_6_CONTEXT_WINDOW
+    )]
+    #[test_case(
+        "gpt-6-sol",
+        ModelTier::Medium,
+        2.0,
+        0.2,
+        2.5,
+        10.0,
+        GPT_6_CONTEXT_WINDOW
+    )]
+    #[test_case(
+        "gpt-6-luna",
+        ModelTier::Weak,
+        0.1,
+        0.01,
+        0.125,
+        0.5,
+        GPT_6_CONTEXT_WINDOW
+    )]
+    fn gpt_models_have_expected_tier_and_short_context_pricing(
         model_id: &str,
         tier: ModelTier,
         input: f64,
         cache_read: f64,
         cache_write: f64,
         output: f64,
+        context_window: u32,
     ) {
         let model = models()
             .iter()
             .find(|model| model.prefixes.contains(&model_id))
-            .expect("GPT-5.6 model should be registered");
+            .expect("model should be registered");
 
         assert_eq!(model.tier, tier);
-        assert_eq!(model.context_window, GPT_5_6_CONTEXT_WINDOW);
+        assert_eq!(model.context_window, context_window);
         assert_eq!(model.pricing.input, input);
         assert_eq!(model.pricing.cache_read, cache_read);
         assert_eq!(model.pricing.cache_write, cache_write);
