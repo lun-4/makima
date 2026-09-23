@@ -1,19 +1,28 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use maki_agent::ToolOutput;
+use crossterm::event::{KeyCode, KeyModifiers};
+use maki_agent::template::Vars;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
-    ToolContext, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
-    timeout_annotation,
+    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
+    ToolSource, timeout_annotation,
 };
+use maki_agent::{AgentMode, SharedBuf, ToolOutput};
+use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
-use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
+use maki_lua::{
+    MAX_INFLIGHT_TOOLS, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
+    WinCommand, WinEvent,
+};
+use maki_providers::Model;
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
@@ -22,6 +31,19 @@ use serde_json::{Value, json};
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
+const PICKER_TITLE: &str = " Sessions ";
+const PICKER_COMMAND: &str = "/sessions";
+const PICKER_MATCH_TITLE: &str = "Orchid";
+const PICKER_OTHER_TITLE: &str = "Birch";
+const PICKER_QUERY: &str = "orch";
+const PICKER_FILTER_PREFIX: &str = "❯";
+const PICKER_LOADING_HINT: &str = "Loading sessions…";
+const PICKER_ACTION_TIMEOUT: &str = "sessions picker did not send the expected UI action";
+const PICKER_RENDER_TIMEOUT: &str = "sessions picker did not render the expected content";
+const PICKER_CLOSE_TIMEOUT: &str = "sessions picker did not close";
+const SHADOWED_TOOL: &str = "skill";
+const REPLACEMENT_PLUGIN: &str = "my_skill";
+const REPLACEMENT_DESC: &str = "took the builtin name over";
 
 struct FakeCommandHost;
 
@@ -86,12 +108,86 @@ fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
 }
 
-fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
+fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = fresh_registry();
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-        .unwrap();
+    host.load_builtins(config).unwrap();
     (reg, host)
+}
+
+fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
+    builtins_host_with(&PluginsConfig::from_plugins(HashMap::new()))
+}
+
+/// A tool can be registered and still stay invisible to the model, so this
+/// goes through the definitions a real request is built from.
+fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: &str) -> String {
+    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    let filter = ToolFilter::from_config(agent, &model, &[]);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+    let defs = reg.definitions(&Vars::new(), &ctx, false);
+    let def = defs
+        .as_array()
+        .expect("definitions returns an array")
+        .iter()
+        .find(|def| def["name"] == name)
+        .unwrap_or_else(|| panic!("{name} must reach the model"));
+    def["description"]
+        .as_str()
+        .expect("description is a string")
+        .to_owned()
+}
+
+fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCoordinatorHandle {
+    use maki_agent::session_coordinator::{
+        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorParams,
+        builtin_option_definitions,
+    };
+    use maki_storage::checkpoint::{
+        CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
+    };
+
+    let id = maki_storage::id::MakiId::generate();
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+        Arc::new(|request: CheckpointRequest<SessionCheckpoint>| {
+            Box::pin(async move {
+                Ok(CheckpointAck {
+                    session_id: request.session_id,
+                    version: request.version,
+                })
+            }) as CheckpointFuture
+        });
+    maki_agent::session_coordinator::SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id: id,
+        catalog: host.event_handle().session_option_catalog(),
+        definitions: builtin_option_definitions(
+            "test/model",
+            [Arc::from("test/model")],
+            false,
+            false,
+            false,
+            maki_agent::ThinkingConfig::Off,
+        ),
+        persisted_options: Default::default(),
+        history: Vec::new(),
+        model: Arc::from("test/model"),
+        cwd: "/tmp".into(),
+        model_policy: Arc::default(),
+        model_adopter: Arc::new(|_: maki_providers::Model| {
+            Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+        }),
+        directory_adopter: Arc::new(|path| {
+            Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
+        }),
+        checkpoint,
+        mailbox: maki_agent::SessionMailbox::new(id),
+    })
+    .unwrap()
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result<String, String> {
@@ -349,12 +445,24 @@ fn unload_round_trip() {
 const PERMISSION_RULE_SRC: &str =
     r#"maki.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
 const NO_RULE_SRC: &str = "local _ = 1";
+/// A rule can only name a registered tool, and it reads the permission it needs
+/// off that tool, so the rule tests have to provide one.
+const EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "edit",
+    description = "test edit tool",
+    schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
+    mutable_path = "path",
+    permission = "fs_write",
+    permission_scopes = "path",
+    handler = function() return "" end,
+})"#;
 
 #[test]
 fn permission_rule_lands_in_store_and_unload_clears() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     host.load_source("perm_plugin", PERMISSION_RULE_SRC)
         .unwrap();
     let rules = host.plugin_rules().snapshot();
@@ -372,6 +480,7 @@ fn permission_rule_failed_load_leaves_store_empty() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     let src = format!("{PERMISSION_RULE_SRC}\nerror('boom after rule')");
     let err = host
         .load_source("perm_broken", &src)
@@ -385,6 +494,7 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     host.load_source("perm_a", PERMISSION_RULE_SRC).unwrap();
     host.load_source(
         "perm_b",
@@ -399,6 +509,25 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     assert_eq!(rules[0].tool, ToolKey::native("write"));
     assert_eq!(rules[0].scope.as_deref(), Some("/tmp/y/**"));
     assert_eq!(rules[0].effect, Effect::Deny);
+}
+
+#[test]
+fn permission_rule_without_capability_is_dropped() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
+    host.load_source("perm_trusted", PERMISSION_RULE_SRC)
+        .unwrap();
+    assert_eq!(host.plugin_rules().snapshot().len(), 1);
+
+    host.load_source_with_permissions(
+        "perm_unprivileged",
+        PERMISSION_RULE_SRC,
+        maki_lua::PluginPermissions::denied(),
+    )
+    .unwrap();
+    assert_eq!(host.plugin_rules().snapshot().len(), 1);
 }
 
 #[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
@@ -1085,6 +1214,13 @@ fn bundled_commands_project_complete_metadata() {
             (
                 "/memory".into(),
                 "View, edit, and delete memory files".into(),
+                None,
+                None,
+                true
+            ),
+            (
+                "/options".into(),
+                "Browse and change session options".into(),
                 None,
                 None,
                 true
@@ -2193,6 +2329,148 @@ fn unloading_plugin_kills_its_jobs() {
     }
 }
 
+#[cfg(unix)]
+fn process_group_pid(path: &Path) -> Pid {
+    poll_until("job did not publish its process id", || {
+        std::fs::read_to_string(path)
+            .ok()?
+            .parse::<i32>()
+            .ok()
+            .and_then(Pid::from_raw)
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_exit(pid: Pid) {
+    poll_until("process group survived cleanup", || {
+        test_kill_process_group(pid).is_err().then_some(())
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_plugin_reload_preserves_old_job_and_kills_candidate() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.pid");
+    let candidate_path = dir.path().join("candidate.pid");
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            old_path.display()
+        ),
+    )
+    .unwrap();
+    let old_pid = process_group_pid(&old_path);
+
+    let result = host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"
+            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
+            maki.fn.jobwait(id, 100)
+            error("reject candidate")
+            "#,
+            candidate_path.display()
+        ),
+    );
+    assert!(result.is_err());
+
+    let candidate_pid = process_group_pid(&candidate_path);
+    wait_for_process_group_exit(candidate_pid);
+    assert!(test_kill_process_group(old_pid).is_ok());
+
+    host.unload("transactional_jobs").unwrap();
+    wait_for_process_group_exit(old_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_plugin_reload_kills_old_job_and_keeps_candidate() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.pid");
+    let candidate_path = dir.path().join("candidate.pid");
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            old_path.display()
+        ),
+    )
+    .unwrap();
+    let old_pid = process_group_pid(&old_path);
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"
+            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
+            maki.fn.jobwait(id, 100)
+            maki.api.register_tool({{
+                name = "stop_candidate_job",
+                description = "stops the candidate job",
+                schema = {MINIMAL_SCHEMA},
+                audiences = {{ "main" }},
+                handler = function()
+                    maki.fn.jobstop(id)
+                    return "stopped"
+                end,
+            }})
+            "#,
+            candidate_path.display()
+        ),
+    )
+    .unwrap();
+
+    let candidate_pid = process_group_pid(&candidate_path);
+    wait_for_process_group_exit(old_pid);
+    assert!(test_kill_process_group(candidate_pid).is_ok());
+    assert_eq!(
+        exec_tool(&reg, "stop_candidate_job", json!({})).unwrap(),
+        "stopped"
+    );
+    wait_for_process_group_exit(candidate_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn unloading_promoted_plugin_job_kills_candidate() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let old_path = dir.path().join("old.pid");
+    let candidate_path = dir.path().join("candidate.pid");
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})"#,
+            old_path.display()
+        ),
+    )
+    .unwrap();
+
+    host.load_source(
+        "transactional_jobs",
+        &format!(
+            r#"
+            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
+            maki.fn.jobwait(id, 100)
+            "#,
+            candidate_path.display()
+        ),
+    )
+    .unwrap();
+    let candidate_pid = process_group_pid(&candidate_path);
+
+    host.unload("transactional_jobs").unwrap();
+    wait_for_process_group_exit(candidate_pid);
+}
+
 #[test]
 fn vm_recovers_after_async_job_tool() {
     let reg = fresh_registry();
@@ -2587,12 +2865,12 @@ fn builtin_opts_flow_from_setup_plugins() {
 
 #[test_case::test_case(
     serde_json::json!({}),
-    &["edit", "multiedit"], &["edit_lines", "insert_lines"]
-    ; "multiedit_on_others_opt_in"
+    &["edit", "multiedit", "edit_lines"], &["insert_lines"]
+    ; "defaults_on_insert_lines_opt_in"
 )]
 #[test_case::test_case(
-    serde_json::json!({ "multiedit": false, "edit_lines": true }),
-    &["edit", "edit_lines"], &["multiedit", "insert_lines"]
+    serde_json::json!({ "multiedit": false, "edit_lines": false, "insert_lines": true }),
+    &["edit", "insert_lines"], &["multiedit", "edit_lines"]
     ; "toggles_flip_sub_tools"
 )]
 fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[&str]) {
@@ -2656,6 +2934,86 @@ fn unknown_plugin_name_fails_load_builtins() {
         .expect_err("load_builtins should fail");
     assert!(
         err.to_string().contains("no bundled plugin named \"gerp\""),
+        "got: {err}"
+    );
+}
+
+fn websearch_config(provider: &str) -> PluginsConfig {
+    PluginsConfig {
+        enabled: true,
+        names: vec!["websearch".to_owned()],
+        opts: HashMap::from([(
+            "websearch".to_owned(),
+            json_obj(serde_json::json!({ "provider": provider })),
+        )]),
+    }
+}
+
+/// The backend the plugin talks to is invisible from Rust, so we read it off
+/// the one thing it leaks: the description the model gets.
+#[test_case::test_case("exa", "Exa AI" ; "default_backend")]
+#[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
+fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
+    let (reg, _host) = builtins_host_with(&websearch_config(provider));
+    let description = tool_description(&reg, &maki_config::AgentConfig::default(), "websearch");
+    assert!(description.contains(expected), "got: {description}");
+}
+
+#[test]
+fn websearch_unknown_provider_fails_the_load() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_builtins(&websearch_config("altavista"))
+        .expect_err("unknown provider should fail");
+    assert!(err.to_string().contains("unknown provider"), "got: {err}");
+}
+
+fn shadow_src() -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{SHADOWED_TOOL}",
+            description = "{REPLACEMENT_DESC}",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "replaced" end
+        }})"#
+    )
+}
+
+/// Turning a builtin off used to copy its name into `agent.disabled_tools`,
+/// the name filter every request runs over the tool array, so a replacement
+/// could load and still stay invisible to the model. That is why this walks
+/// the whole path: init.lua, config, builtins, then the definitions a request
+/// is built from.
+#[test]
+fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            format!("maki.setup({{ plugins = {{ {SHADOWED_TOOL} = {{ enabled = false }} }} }})"),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("setup returns a config");
+    let config = raw.into_config().unwrap();
+    host.load_builtins(&config.plugins).unwrap();
+    host.load_source(REPLACEMENT_PLUGIN, &shadow_src())
+        .expect("a disabled builtin leaves its tool name free");
+
+    let shadowed = tool_description(&reg, &config.agent, SHADOWED_TOOL);
+    assert_eq!(shadowed, REPLACEMENT_DESC);
+}
+
+#[test]
+fn enabled_builtin_still_rejects_a_shadowing_plugin() {
+    let (_reg, host) = builtins_host();
+    let err = host
+        .load_source(REPLACEMENT_PLUGIN, &shadow_src())
+        .expect_err("an enabled builtin owns its tool name");
+    assert!(
+        matches!(err, PluginError::NameConflict { .. }),
         "got: {err}"
     );
 }
@@ -3902,15 +4260,17 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
     let (result_tx, result_rx) = flume::bounded(1);
     std::thread::spawn(move || {
         let (reg, host) = builtins_host();
-        let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
+        let session = test_session(&host);
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
             &maki_agent::AgentMode::Build,
             Some(&event_tx),
             Some(BASH_CANCEL_ID),
+            session.read().session_id(),
         );
         ctx.cancel = token;
         // The rtk probe costs up to two 2s job waits before the command even
         // starts: pointless here, and a flake risk under load.
-        ctx.config.no_rtk = true;
+        ctx.config.rtk = false;
         let input = json!({ "command": BASH_PARTIAL_CMD });
         result_tx
             .send(exec_with_ctx(&reg, "bash", input, &ctx))
@@ -4066,12 +4426,14 @@ fn restore_rebuilds_body_from_input_content(
 #[test_case::test_case("git status" ; "parseable command")]
 #[test_case::test_case("echo 'unterminated" ; "unparseable command")]
 fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
-    let (reg, _host) = builtins_host();
+    let (reg, host) = builtins_host();
+    let session = test_session(&host);
 
     let input = serde_json::json!({ "command": command });
     let entry = reg.get("bash").expect("bash registered");
     let inv = entry.tool.parse(&input).expect("parse failed");
-    let scopes = smol::block_on(inv.permission_scopes())
+    let session_ref = SessionRef::from(session.read().session_id());
+    let scopes = smol::block_on(inv.permission_scopes(Some(&session_ref)))
         .expect("permission_scopes returned None (would fall back to raw JSON)");
 
     assert!(
@@ -4079,6 +4441,60 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
         "fell back to raw JSON scope: {:?}",
         scopes.scopes
     );
+    smol::block_on(session.close()).unwrap();
+}
+
+#[test]
+fn bash_auto_mode_skips_outer_permission_gate_for_its_session() {
+    let (reg, host) = builtins_host();
+    let session = test_session(&host);
+    smol::block_on(session.set_option("bash.auto_mode", "enabled")).unwrap();
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry
+        .tool
+        .parse(&serde_json::json!({ "command": "rm -rf target" }))
+        .expect("parse failed");
+    let session_ref = SessionRef::from(session.read().session_id());
+
+    assert!(smol::block_on(inv.permission_scopes(Some(&session_ref))).is_none());
+    smol::block_on(session.close()).unwrap();
+}
+
+/// Every command in a chain needs its own scope, otherwise one allow rule
+/// covers commands nobody approved. The redirect case is the one that used to
+/// slip: tree-sitter hangs a trailing `2>&1` off the whole chain, so the chain
+/// arrived as a single scope starting with `cd `, and a `cd *` rule took it.
+#[test_case::test_case(
+    "cd /tmp && cargo check 2>&1 | tail -3",
+    &["cd /tmp", "cargo check 2>&1", "tail -3"]
+    ; "chain_with_redirect_and_pipe"
+)]
+#[test_case::test_case(
+    "ls\n# a note\npwd",
+    &["ls", "pwd"]
+    ; "comments_are_not_scopes"
+)]
+#[test_case::test_case(
+    "if [ -f x ]; then rm x; fi",
+    &["if [ -f x ]; then rm x; fi"]
+    ; "block_stays_one_scope"
+)]
+#[test_case::test_case(
+    "cd /tmp && > log",
+    &["cd /tmp", "> log"]
+    ; "bodiless_redirect_is_its_own_scope"
+)]
+fn bash_permission_scopes_split_per_command(command: &str, expected: &[&str]) {
+    let (reg, _host) = builtins_host();
+
+    let input = serde_json::json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes =
+        smol::block_on(inv.permission_scopes(None)).expect("permission_scopes returned None");
+
+    assert!(!scopes.force_prompt, "command: {command}");
+    assert_eq!(scopes.scopes, expected, "command: {command}");
 }
 
 fn exec_tool_with_perms(
@@ -4252,7 +4668,34 @@ fn mutable_path_returns_path_from_input() {
         .tool
         .parse(&serde_json::json!({ "path": "/tmp/foo.txt" }))
         .expect("parse failed");
-    assert_eq!(inv.mutable_path(), Some(Path::new("/tmp/foo.txt")));
+    let ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    assert_eq!(inv.mutable_path(&ctx), Some(PathBuf::from("/tmp/foo.txt")));
+}
+
+#[test]
+fn registration_rejects_fs_write_without_mutable_path() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let src = r#"maki.api.register_tool({
+        name = "bad_write_tool",
+        description = "test write tool without mutable_path",
+        schema = {
+            type = "object",
+            properties = { path = { type = "string" } }
+        },
+        permission = "fs_write",
+        permission_scopes = "path",
+        handler = function() return "" end
+    })"#;
+    let err = host
+        .load_source("bad_write_plugin", src)
+        .expect_err("expected error for fs_write without mutable_path");
+    assert!(
+        err.to_string()
+            .contains("declares permission 'fs_write' but no 'mutable_path'"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -4592,6 +5035,57 @@ fn interpreter_tools_gather_resolves_parallel_batch() {
     host.load_source("interp_gather_plugin", &src).unwrap();
     let out = exec_tool(&reg, "interp_gather", serde_json::json!({})).unwrap();
     assert_eq!(out, "A|B");
+}
+
+const NESTED_DEPTH_TOOL: &str = "nested_depth";
+const NESTED_DEPTH_BOTTOM: &str = "bottom";
+const NESTED_DEPTH_WEDGED: &str =
+    "nested call chain never replied: the in-flight gate charged a slot per level";
+const NESTED_DEPTH_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "nested_depth",
+    description = "dispatches itself one level deeper",
+    schema = {
+        type = "object",
+        properties = { depth = { type = "integer" } },
+        required = { "depth" },
+    },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        if input.depth == 0 then return "bottom" end
+        local out, err = maki.agent.call_tool(ctx, "nested_depth", { depth = input.depth - 1 })
+        if err then return { llm_output = err, is_error = true } end
+        return out
+    end,
+})
+"#;
+
+/// Every level stays parked on its child, so a slot per level wedges the gate
+/// for good once the chain is longer than the cap. A nested call rides its
+/// caller's slot instead, which leaves the depth up to the callers.
+#[test]
+fn nested_calls_run_deeper_than_the_inflight_cap() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("nested_depth_plugin", NESTED_DEPTH_PLUGIN)
+        .unwrap();
+
+    let (done_tx, done_rx) = flume::bounded(1);
+    let worker_reg = Arc::clone(&reg);
+    std::thread::spawn(move || {
+        let out = exec_tool_in(
+            &worker_reg,
+            NESTED_DEPTH_TOOL,
+            json!({ "depth": MAX_INFLIGHT_TOOLS + 1 }),
+            Some(Arc::clone(&worker_reg)),
+        );
+        let _ = done_tx.send(out);
+    });
+
+    let out = poll_until(NESTED_DEPTH_WEDGED, || done_rx.try_recv().ok());
+
+    assert_eq!(out, Ok(NESTED_DEPTH_BOTTOM.to_owned()));
+    drop(host);
 }
 
 #[test]
@@ -5691,57 +6185,312 @@ fn session_picker_requested_autocmd_does_not_wedge_host() {
 /// `RunCommand`, and a direct `open()` call would never route through it.
 #[test]
 fn session_picker_requested_routes_through_sessions_command() {
-    const PICKER_TITLE: &str = " Sessions ";
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
-    let ui_rx = guard.host().ui_action_rx();
-    let (saw_run_command_tx, saw_run_command_rx) = flume::bounded(1);
-    let (saw_open_win_tx, saw_open_win_rx) = flume::bounded(1);
-    std::thread::spawn(move || {
-        while let Ok(action) = ui_rx.recv() {
-            match action {
-                maki_lua::UiAction::Session { reply_tx, .. } => {
-                    let _ = reply_tx.send(Ok(json!([])));
-                }
-                maki_lua::UiAction::OpenWin { config, .. } => {
-                    let _ = saw_open_win_tx.send(config.title);
-                }
-                maki_lua::UiAction::RunCommand {
-                    cmdline,
-                    depth,
-                    reply_tx,
-                } => {
-                    let _ = saw_run_command_tx.send(cmdline.clone());
-                    // Play the UI's role in command dispatch so `open()` runs
-                    // end to end as a deadline-free command coroutine.
-                    let _ = handle.run_command_for_test(
-                        Arc::from("sessions"),
-                        Arc::from("/sessions"),
-                        String::new(),
-                        depth,
-                    );
-                    let _ = reply_tx.send(Ok(()));
-                }
+    let actions = guard.host().ui_action_rx();
+    handle.fire_autocmd("SessionPickerRequested", json!({}));
+    let UiAction::RunCommand {
+        cmdline,
+        depth,
+        reply_tx,
+    } = next_picker_action(&actions)
+    else {
+        panic!("SessionPickerRequested did not route through RunCommand");
+    };
+    assert_eq!(cmdline, PICKER_COMMAND);
+    let registry = guard.host().command_registry();
+    let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
+    let resolved = registry.resolve_input_for(&target, &cmdline).unwrap();
+    let outcome = smol::block_on(registry.dispatch_command_with_depth(
+        &target,
+        resolved.command,
+        resolved.arguments,
+        cmdline.as_str().into(),
+        usize::from(depth),
+    ));
+    reply_tx.send(Ok(())).unwrap();
+    assert!(matches!(outcome, CommandOutcome::Completed));
+    let picker = SessionsPicker::load(&actions);
+    picker.wait_for_unfiltered_rows();
+    picker.close("esc");
+}
+
+fn dispatch_sessions_command(host: &PluginHost, input: &str) {
+    let registry = host.command_registry();
+    let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(FakeCommandHost));
+    let outcome = smol::block_on(registry.dispatch_input(&target, input.into()));
+    assert!(matches!(
+        outcome,
+        InputDispatch::Dispatched(CommandOutcome::Completed)
+    ));
+}
+
+fn next_picker_action(actions: &flume::Receiver<UiAction>) -> UiAction {
+    actions
+        .recv_timeout(HOST_REPLY_TIMEOUT)
+        .expect(PICKER_ACTION_TIMEOUT)
+}
+
+fn reply_picker_sessions(actions: &flume::Receiver<UiAction>, expected: SessionRequest) {
+    let UiAction::Session { req, reply_tx } = next_picker_action(actions) else {
+        panic!("expected a sessions picker storage request");
+    };
+    let rows = match (expected, req) {
+        (SessionRequest::Live, SessionRequest::Live) => json!([{
+            "id": "00000000-0000-4000-8000-000000000001",
+            "title": PICKER_OTHER_TITLE,
+            "status": "idle",
+            "focused": true,
+            "open_elsewhere": false,
+            "updated_at": 1_700_000_000,
+            "message_count": 2,
+        }]),
+        (SessionRequest::List, SessionRequest::List) => json!([{
+            "id": "00000000-0000-4000-8000-000000000002",
+            "title": PICKER_MATCH_TITLE,
+            "status": "idle",
+            "focused": false,
+            "open_elsewhere": false,
+            "updated_at": 1_700_000_001,
+            "message_count": 4,
+        }]),
+        _ => panic!("unexpected sessions picker storage request"),
+    };
+    reply_tx.send(Ok(rows)).unwrap();
+}
+
+struct SessionsPicker {
+    buf: Arc<SharedBuf>,
+    event_tx: flume::Sender<WinEvent>,
+    cmd_rx: flume::Receiver<WinCommand>,
+}
+
+impl SessionsPicker {
+    fn load(actions: &flume::Receiver<UiAction>) -> Self {
+        let UiAction::OpenWin {
+            buf,
+            config,
+            focus,
+            event_tx,
+            cmd_rx,
+        } = next_picker_action(actions)
+        else {
+            panic!("sessions command did not open a window");
+        };
+        assert_eq!(config.title, PICKER_TITLE);
+        assert!(focus);
+        let picker = Self {
+            buf,
+            event_tx,
+            cmd_rx,
+        };
+        reply_picker_sessions(actions, SessionRequest::Live);
+        picker.wait_for_render(|text| text.contains(PICKER_LOADING_HINT));
+        reply_picker_sessions(actions, SessionRequest::List);
+        reply_picker_sessions(actions, SessionRequest::Live);
+        picker
+    }
+
+    fn wait_for_render(&self, predicate: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + HOST_REPLY_TIMEOUT;
+        loop {
+            let command = self
+                .cmd_rx
+                .recv_deadline(deadline)
+                .expect(PICKER_RENDER_TIMEOUT);
+            match command {
+                WinCommand::SetCursor(_) if predicate(&self.buf.take().text()) => return,
+                WinCommand::Close => panic!("sessions picker closed before rendering"),
                 _ => {}
             }
         }
+    }
+
+    fn wait_for_unfiltered_rows(&self) {
+        self.wait_for_render(|text| {
+            text.lines()
+                .next()
+                .is_some_and(|line| line.trim() == PICKER_FILTER_PREFIX)
+                && text.contains(PICKER_MATCH_TITLE)
+                && text.contains(PICKER_OTHER_TITLE)
+                && !text.contains(PICKER_LOADING_HINT)
+        });
+    }
+
+    fn key(&self, key: &str) {
+        self.event_tx
+            .send(WinEvent::Key { key: key.into() })
+            .unwrap();
+    }
+
+    fn close(&self, key: &str) {
+        self.key(key);
+        let deadline = Instant::now() + HOST_REPLY_TIMEOUT;
+        loop {
+            if matches!(
+                self.cmd_rx
+                    .recv_deadline(deadline)
+                    .expect(PICKER_CLOSE_TIMEOUT),
+                WinCommand::Close
+            ) {
+                return;
+            }
+        }
+    }
+}
+
+#[test_case::test_case("/sessions", "esc"; "omitted_query_escape")]
+#[test_case::test_case("/sessions", "ctrl+c"; "omitted_query_control_c")]
+#[test_case::test_case("/sessions \"\"", "esc"; "empty_query_escape")]
+#[test_case::test_case("/sessions \"\"", "ctrl+c"; "empty_query_control_c")]
+fn sessions_command_initializes_closes_and_reopens(input: &str, close_key: &str) {
+    let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
+    let actions = guard.host().ui_action_rx();
+    dispatch_sessions_command(guard.host(), input);
+    let first = SessionsPicker::load(&actions);
+    first.wait_for_unfiltered_rows();
+    first.close(close_key);
+    dispatch_sessions_command(guard.host(), input);
+    let second = SessionsPicker::load(&actions);
+    assert!(!Arc::ptr_eq(&first.buf, &second.buf));
+    second.wait_for_unfiltered_rows();
+    second.close(close_key);
+}
+
+#[test_case::test_case(PICKER_QUERY)]
+fn sessions_command_query_filters_and_escape_clears(query: &str) {
+    let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
+    let actions = guard.host().ui_action_rx();
+    dispatch_sessions_command(guard.host(), &format!("{PICKER_COMMAND} \"{query}\""));
+    let picker = SessionsPicker::load(&actions);
+    let filter = format!("{PICKER_FILTER_PREFIX} {query}");
+    picker.wait_for_render(|text| {
+        text.lines()
+            .next()
+            .is_some_and(|line| line.trim() == filter)
+            && text.contains(PICKER_MATCH_TITLE)
+            && !text.contains(PICKER_OTHER_TITLE)
+            && !text.contains(PICKER_LOADING_HINT)
     });
+    picker.key("esc");
+    picker.wait_for_unfiltered_rows();
+    picker.close("esc");
+}
 
-    let guard = host_roundtrip_bounded(guard, |host| {
-        host.load_source("fire", "maki.api.exec_autocmds('SessionPickerRequested')")
-    });
+#[test_case::test_case("esc")]
+#[test_case::test_case("ctrl+c")]
+fn sessions_keybind_initializes_and_closes(close_key: &str) {
+    let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
+    let actions = guard.host().ui_action_rx();
+    let keymaps = guard.host().keymap_reader().load();
+    let entry = keymaps
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.key == KeyCode::Char('p')
+                && entry.modifiers == KeyModifiers::CONTROL
+                && entry.plugin.as_ref() == "sessions"
+        })
+        .expect("bundled sessions Ctrl+P keybind is missing");
+    assert!(handle.run_keybind_callback(entry.id));
+    let picker = SessionsPicker::load(&actions);
+    picker.wait_for_unfiltered_rows();
+    picker.close(close_key);
+}
 
-    let cmdline = saw_run_command_rx
-        .recv_timeout(HOST_REPLY_TIMEOUT)
-        .expect("SessionPickerRequested never ran the /sessions command");
-    assert_eq!(cmdline, "/sessions");
+const SESSION_OPTION_PLUGIN_ID: &str = "session_option_e2e.choice";
+const SESSION_OPTION_VALIDATOR_REJECTION: &str = "c is not allowed";
+const SESSION_OPTION_PLUGIN: &str = r#"
+maki.api.register_session_option({
+    id = "session_option_e2e.choice",
+    name = "Choice",
+    description = "e2e choice",
+    category = "mode",
+    values = {
+        { value = "a", name = "A" },
+        { value = "b", name = "B" },
+        { value = "c", name = "C" },
+    },
+    initial_value = "a",
+    validate = function(value)
+        if value == "c" then return false, "c is not allowed" end
+        return true
+    end,
+})
 
-    let title = saw_open_win_rx
-        .recv_timeout(HOST_REPLY_TIMEOUT)
-        .expect("the /sessions command never opened the picker");
-    assert_eq!(title, PICKER_TITLE);
+maki.api.register_tool({
+    name = "set_choice",
+    description = "sets the plugin-owned session option",
+    schema = {
+        type = "object",
+        properties = {
+            session = { type = "string" },
+            value = { type = "string" },
+        },
+        required = { "session", "value" },
+    },
+    handler = function(input, ctx)
+        local ok, err = maki.session.set_option(
+            "session_option_e2e.choice",
+            input.value,
+            { session = input.session })
+        if not ok then
+            return "error: " .. tostring(err)
+        end
+        return "ok"
+    end,
+})
+"#;
 
-    // The host stays responsive while the picker is parked open.
-    let _guard = host_roundtrip_bounded(guard, |host| {
-        host.load_source("probe", "local still_alive = true")
-    });
+const SESSION_OPTION_SET_OK: &str = "ok";
+
+fn plugin_option_state(
+    session: &maki_agent::session_coordinator::SessionCoordinatorHandle,
+) -> (String, u64) {
+    let snapshot = session.read().options();
+    let state = snapshot
+        .options
+        .iter()
+        .find(|option| option.definition.id.as_ref() == SESSION_OPTION_PLUGIN_ID)
+        .expect("plugin-owned option missing from session snapshot");
+    (state.current_value.to_string(), snapshot.version)
+}
+
+/// Covers the Lua-facing set path end to end: a plugin loaded through the
+/// real host registers a plugin-owned option (including its validator), and a
+/// tool handler mutates a live session through `maki.session.set_option`.
+#[test]
+fn session_set_option_applies_plugin_owned_option_on_live_session() {
+    let (reg, host) = builtins_host();
+    let session = test_session(&host);
+    host.load_source("session_option_e2e", SESSION_OPTION_PLUGIN)
+        .unwrap();
+    let session_id = session.read().session_id().to_string();
+
+    let (value, _) = plugin_option_state(&session);
+    assert_eq!(value, "a");
+
+    let out = exec_tool(
+        &reg,
+        "set_choice",
+        json!({ "session": session_id, "value": "b" }),
+    )
+    .unwrap();
+    assert_eq!(out, SESSION_OPTION_SET_OK);
+    let (value, version) = plugin_option_state(&session);
+    assert_eq!(value, "b");
+    let set_version = version;
+
+    let out = exec_tool(
+        &reg,
+        "set_choice",
+        json!({ "session": session_id, "value": "c" }),
+    )
+    .unwrap();
+    assert!(
+        out.contains(SESSION_OPTION_VALIDATOR_REJECTION),
+        "expected validator rejection, got: {out}"
+    );
+    let (value, version) = plugin_option_state(&session);
+    assert_eq!(value, "b");
+    assert_eq!(version, set_version);
 }

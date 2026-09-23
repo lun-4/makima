@@ -19,15 +19,15 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use maki_storage::paths::incremental_canonicalize;
+use maki_storage::paths::canonical_key;
 
-use super::{DEADLINE_EXCEEDED, Deadline, resolve_path};
+use super::{DEADLINE_EXCEEDED, Deadline, resolve_path_from};
 use crate::cancel::CancelToken;
 
 pub const SAME_PATH_MUTATION_IN_PROGRESS: &str = "same-path mutation is already in progress";
@@ -70,13 +70,9 @@ impl FileWriteLocks {
     /// paths, existing components are walked through symlinks, and a
     /// missing tail falls back to lexical normalization. The result is only
     /// a synchronization key and is never used for filesystem access.
-    pub(crate) fn lock_key(path: &str) -> Result<PathBuf, String> {
-        let resolved = resolve_path(path)?;
-        let canonical =
-            incremental_canonicalize(std::path::Path::new(&resolved)).unwrap_or_else(|| {
-                maki_storage::paths::canonicalize_clean(std::path::Path::new(&resolved))
-            });
-        Ok(canonical)
+    pub(crate) fn lock_key(path: &str, cwd: &Path) -> Result<PathBuf, String> {
+        let resolved = resolve_path_from(path, cwd)?;
+        Ok(canonical_key(Path::new(&resolved)))
     }
 
     fn entry(&self, key: PathBuf) -> Arc<KeyEntry> {
@@ -210,7 +206,7 @@ mod tests {
     use super::*;
 
     fn key(path: &str) -> PathBuf {
-        FileWriteLocks::lock_key(path).expect("key resolves")
+        FileWriteLocks::lock_key(path, &std::env::current_dir().unwrap()).expect("key resolves")
     }
 
     #[test]

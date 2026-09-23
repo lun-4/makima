@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
@@ -162,8 +162,26 @@ pub(crate) struct CommandEntry {
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
+pub(crate) type PendingCommandMap = Arc<Mutex<HashMap<Arc<str>, CommandEntry>>>;
 pub(crate) type RetiredCommandHandlerMap = Vec<(Arc<str>, HashMap<Arc<str>, CommandEntry>)>;
 pub(crate) type CommandGenerationMap = HashMap<(Arc<str>, Arc<str>), u64>;
+
+pub(crate) fn remove_command_entry(lua: &Lua, entry: CommandEntry) {
+    let _ = lua.remove_registry_value(entry.handler);
+    for completion in entry.argument_completions.into_iter().flatten() {
+        for key in [
+            Some(completion.completion),
+            completion.on_highlight,
+            completion.on_accept,
+            completion.on_cancel,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = lua.remove_registry_value(key);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dimension {
@@ -327,6 +345,9 @@ pub struct FloatConfig {
     pub order: u16,
     pub visible: bool,
     pub needs_input: bool,
+    /// Opt in to corner stacking: the UI offsets this window past the other
+    /// stacked windows sharing its anchor. Open time only, so no patch field.
+    pub stack: bool,
 }
 
 impl Default for FloatConfig {
@@ -349,6 +370,7 @@ impl Default for FloatConfig {
             order: 50,
             visible: true,
             needs_input: false,
+            stack: false,
         }
     }
 }
@@ -428,6 +450,7 @@ pub enum SessionRequest {
     Live,
     Current,
     Usage,
+    Read { id: Option<String> },
     New { prompt: Option<String>, focus: bool },
     Prompt { id: Option<String>, text: String },
     Focus { id: String },
@@ -550,6 +573,7 @@ pub enum UiAction {
         reply_tx: flume::Sender<crate::api::util::picker::PickerResult>,
     },
     Flash(String),
+    SetWindowTitle(String),
     OpenEditor {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,

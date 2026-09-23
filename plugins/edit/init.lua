@@ -3,6 +3,7 @@ local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
+local preserve_line_endings = require("edit_helpers").preserve_line_endings
 
 local SNIPPET_MAX_CHARS = 32
 local FALLBACK_VIEW_LINES = 10
@@ -192,7 +193,11 @@ local function diff_restore(blocks_from)
 end
 
 local function apply_edit(path, ctx, transform)
-  path = maki.fs.abspath(path)
+  local resolved, resolve_err = ctx:resolve_path(path)
+  if not resolved then
+    return nil, resolve_err
+  end
+  path = resolved
 
   local ok, err = ctx:check_before_edit(path)
   if not ok then
@@ -204,7 +209,7 @@ local function apply_edit(path, ctx, transform)
     return nil, "read error: " .. tostring(read_err)
   end
 
-  local after, transform_err = transform(before)
+  local after, transform_err = preserve_line_endings(before, transform)
   if transform_err then
     return nil, transform_err
   end
@@ -235,7 +240,7 @@ end
 
 local opts = maki.api.register_options({
   multiedit = { default = true, desc = "Provide the `multiedit` tool." },
-  edit_lines = { default = false, desc = "Provide the opt-in `edit_lines` tool." },
+  edit_lines = { default = true, desc = "Provide the `edit_lines` tool." },
   insert_lines = { default = false, desc = "Provide the opt-in `insert_lines` tool." },
 })
 
@@ -249,6 +254,7 @@ maki.api.register_tool({
   name = "edit",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_DESCRIPTION,
@@ -300,6 +306,7 @@ register_tool_if(opts.multiedit, {
   name = "multiedit",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   start_annotation = "edits",
   audiences = { "main", "general_sub", "interpreter" },
@@ -386,6 +393,7 @@ register_tool_if(opts.edit_lines, {
   name = "edit_lines",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_LINES_DESCRIPTION,
@@ -440,6 +448,7 @@ register_tool_if(opts.insert_lines, {
   name = "insert_lines",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = INSERT_LINES_DESCRIPTION,

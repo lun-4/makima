@@ -179,6 +179,37 @@ impl ThinkingConfig {
             _ => self,
         }
     }
+
+    /// Caps this config at `parent`. A subagent's thinking request is written
+    /// by the model, not the user, so it may go down but never above what the
+    /// parent session runs with. A parent of `Adaptive` set no ceiling at all,
+    /// so the child gets whatever it asked for; but against a parent that did
+    /// name a level or a count, a child's `Adaptive` is "let the model decide"
+    /// with no upper bound, which sits above any concrete ceiling, so the
+    /// parent's config wins. Concrete sides compare as token budgets, the only
+    /// unit an effort level and an explicit count share; the winner keeps its
+    /// original form either way.
+    pub fn clamp_to(self, parent: Self) -> Self {
+        if matches!(parent, Self::Off) || matches!(self, Self::Off) {
+            return Self::Off;
+        }
+        if matches!(parent, Self::Adaptive) {
+            return self;
+        }
+        if matches!(self, Self::Adaptive) {
+            return parent;
+        }
+        match (parent.budget(None), self.budget(None)) {
+            (Some(ceiling), Some(asked)) => {
+                if asked <= ceiling {
+                    self
+                } else {
+                    parent
+                }
+            }
+            _ => self,
+        }
+    }
 }
 
 impl fmt::Display for ThinkingConfig {
@@ -217,6 +248,15 @@ impl From<StoredThinking> for ThinkingConfig {
             StoredThinking::Effort { level } => Self::Effort(level),
             StoredThinking::Budget { tokens } => Self::Budget(tokens),
         }
+    }
+}
+
+/// One place decides what silence means, so a session that never set a level, a
+/// config without `always_thinking` and a frontend with no toggle all read it
+/// the same way: off.
+impl From<Option<StoredThinking>> for ThinkingConfig {
+    fn from(s: Option<StoredThinking>) -> Self {
+        s.map_or(Self::Off, Self::from)
     }
 }
 
@@ -409,6 +449,91 @@ mod tests {
         assert_eq!(
             ThinkingConfig::Budget(20_000).snap(&[Effort::Low, Effort::High], Some(32_768)),
             ThinkingConfig::Effort(Effort::High)
+        );
+    }
+
+    #[test]
+    fn thinking_clamp_to_parent() {
+        use Effort::*;
+        const SMALL_BUDGET: u32 = 2048;
+        const LARGE_BUDGET: u32 = 16_384;
+
+        assert_eq!(
+            ThinkingConfig::Off.clamp_to(ThinkingConfig::Effort(Max)),
+            ThinkingConfig::Off
+        );
+        assert_eq!(
+            ThinkingConfig::Effort(Max).clamp_to(ThinkingConfig::Off),
+            ThinkingConfig::Off
+        );
+        assert_eq!(
+            ThinkingConfig::Adaptive.clamp_to(ThinkingConfig::Off),
+            ThinkingConfig::Off
+        );
+        assert_eq!(
+            ThinkingConfig::Adaptive.clamp_to(ThinkingConfig::Effort(Max)),
+            ThinkingConfig::Effort(Max)
+        );
+        assert_eq!(
+            ThinkingConfig::Adaptive.clamp_to(ThinkingConfig::Adaptive),
+            ThinkingConfig::Adaptive
+        );
+        assert_eq!(
+            ThinkingConfig::Effort(Minimal).clamp_to(ThinkingConfig::Adaptive),
+            ThinkingConfig::Effort(Minimal)
+        );
+        assert_eq!(
+            ThinkingConfig::Effort(Max).clamp_to(ThinkingConfig::Adaptive),
+            ThinkingConfig::Effort(Max)
+        );
+        assert_eq!(
+            ThinkingConfig::Budget(SMALL_BUDGET).clamp_to(ThinkingConfig::Adaptive),
+            ThinkingConfig::Budget(SMALL_BUDGET)
+        );
+        assert_eq!(
+            ThinkingConfig::Effort(Low).clamp_to(ThinkingConfig::Effort(Max)),
+            ThinkingConfig::Effort(Low)
+        );
+        assert_eq!(
+            ThinkingConfig::Effort(Max).clamp_to(ThinkingConfig::Effort(Low)),
+            ThinkingConfig::Effort(Low)
+        );
+        assert_eq!(
+            ThinkingConfig::Budget(SMALL_BUDGET).clamp_to(ThinkingConfig::Budget(LARGE_BUDGET)),
+            ThinkingConfig::Budget(SMALL_BUDGET)
+        );
+        assert_eq!(
+            ThinkingConfig::Budget(LARGE_BUDGET).clamp_to(ThinkingConfig::Budget(SMALL_BUDGET)),
+            ThinkingConfig::Budget(SMALL_BUDGET)
+        );
+        assert_eq!(
+            ThinkingConfig::Effort(Minimal).clamp_to(ThinkingConfig::Budget(LARGE_BUDGET)),
+            ThinkingConfig::Effort(Minimal)
+        );
+        assert_eq!(
+            ThinkingConfig::Effort(Max).clamp_to(ThinkingConfig::Budget(SMALL_BUDGET)),
+            ThinkingConfig::Budget(SMALL_BUDGET)
+        );
+        assert_eq!(
+            ThinkingConfig::Budget(SMALL_BUDGET).clamp_to(ThinkingConfig::Effort(High)),
+            ThinkingConfig::Budget(SMALL_BUDGET)
+        );
+        assert_eq!(
+            ThinkingConfig::Budget(LARGE_BUDGET).clamp_to(ThinkingConfig::Effort(Minimal)),
+            ThinkingConfig::Effort(Minimal)
+        );
+    }
+
+    #[test]
+    fn optional_stored_thinking_into_config_none() {
+        assert_eq!(ThinkingConfig::from(None), ThinkingConfig::Off);
+    }
+
+    #[test]
+    fn optional_stored_thinking_into_config_some() {
+        assert_eq!(
+            ThinkingConfig::from(Some(StoredThinking::Adaptive)),
+            ThinkingConfig::Adaptive
         );
     }
 }

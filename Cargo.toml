@@ -43,6 +43,7 @@ flume = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
+maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
@@ -69,7 +70,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.11-makima"
+version = "0.5.5-makima"
 edition = "2024"
 authors = ["Luna <luna@l4.pm", "Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -99,6 +100,7 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["osc52"] }
 fs2 = "0.4"
+fs4 = "1"
 color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
 termini = "1"
 thiserror = "2"
@@ -131,6 +133,7 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 keyring = "4"
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }
@@ -182,6 +185,7 @@ tree-sitter-starlark = "1.3"
 tree-sitter-swift = "0.7"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"
+tree-sitter-vlang = "0.1"
 tree-sitter-zig = "1.1"
 tree-sitter-dart = "0.2.0"
 tree-sitter-yaml = "0.7.2"
@@ -196,7 +200,7 @@ get-size2 = "=0.10.1"
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"
-agent-client-protocol-schema = { version = "0.13", features = ["unstable_elicitation"] }
+agent-client-protocol-schema = { version = "0.13", features = ["unstable_boolean_config", "unstable_elicitation"] }
 
 wait-timeout = "0.2"
 inventory = "0.3"
@@ -215,3 +219,16 @@ debug = false
 # grammars. Those static archives held the bulk of the bytes.
 [profile.dev.build-override]
 debug = false
+# crossterm 0.29.0 has no VT input on Windows, so bracketed paste never decodes and a
+# multiline paste submits at the first newline (#336). Pinned to the head of
+# crossterm-rs/crossterm#1030, which lives in refs/pull/1030/head on the upstream repo.
+# Remove once the PR ships in a crossterm release.
+#
+# syntect 5.3.0 spins forever on a JavaScript line like `x /*`: two rules match
+# empty at the same byte and `set` each other back, which is neither the push nor
+# the pop its loop guard watches, so one such line pins a core at 100% for good.
+# Pinned to a v5.3.0 backport of trishume/syntect#706, remove once that ships.
+[patch.crates-io]
+crossterm = { git = "https://github.com/crossterm-rs/crossterm", rev = "3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" }
+syntect = { git = "https://github.com/tontinton/syntect", rev = "01df275f6f25da670e5ba5b7128cb89d03795119" }
+ratatui-image = { path = "patches/ratatui-image" }

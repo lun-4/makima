@@ -20,6 +20,8 @@ use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use super::mistral::Mistral;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::openrouter::OpenRouter;
+use super::regolo::Regolo;
+use super::requesty::Requesty;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
 use super::zai::Zai;
@@ -126,7 +128,9 @@ fn compat_kind(kind: ProviderKind) -> Option<ProviderKind> {
         | ProviderKind::Zai
         | ProviderKind::DeepSeek
         | ProviderKind::OpenRouter
+        | ProviderKind::Requesty
         | ProviderKind::Synthetic
+        | ProviderKind::Regolo
         | ProviderKind::TensorX => Some(kind),
         _ => None,
     }
@@ -171,13 +175,16 @@ fn default_path_prefix(kind: Option<ProviderKind>) -> &'static str {
     match kind {
         Some(ProviderKind::Anthropic | ProviderKind::Zai) => "",
         Some(ProviderKind::Google) => GEMINI_PATH_PREFIX,
+        Some(ProviderKind::Vertex) => DEFAULT_PATH_PREFIX,
         Some(
             ProviderKind::Ollama
             | ProviderKind::LlamaCpp
             | ProviderKind::Mistral
             | ProviderKind::DeepSeek
             | ProviderKind::OpenRouter
+            | ProviderKind::Requesty
             | ProviderKind::Synthetic
+            | ProviderKind::Regolo
             | ProviderKind::TensorX
             | ProviderKind::OpenAi
             | ProviderKind::Copilot
@@ -236,6 +243,12 @@ fn build_routed_provider(
         ProviderKind::OpenRouter => {
             Box::new(OpenRouter::with_auth(auth, timeouts).with_system_prefix(system_prefix))
         }
+        ProviderKind::Requesty => {
+            Box::new(Requesty::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+        }
+        ProviderKind::Regolo => {
+            Box::new(Regolo::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+        }
         ProviderKind::Synthetic => {
             Box::new(Synthetic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
         }
@@ -273,10 +286,9 @@ pub struct Aperture {
 impl Aperture {
     pub fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
         let base_url = resolve_base_url()?;
-        let auth = Arc::new(Mutex::new(ResolvedAuth {
-            base_url: Some(base_url),
-            headers: Vec::new(),
-        }));
+        let auth = Arc::new(Mutex::new(
+            ResolvedAuth::new(CONFIG.slug, Vec::new())?.with_base_url(Some(base_url)),
+        ));
         Ok(Self::with_auth_and_overrides(
             auth,
             timeouts,
@@ -566,10 +578,10 @@ mod tests {
     }
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
-        Arc::new(Mutex::new(ResolvedAuth {
-            base_url: Some("https://aperture.example.com".into()),
-            headers: Vec::new(),
-        }))
+        Arc::new(Mutex::new(ResolvedAuth::for_test(
+            Some("https://aperture.example.com".into()),
+            Vec::new(),
+        )))
     }
 
     #[test_case(Some(ProviderKind::Ollama), Some("https://aperture.example.com/v1") ; "ollama_appends_v1")]
@@ -599,10 +611,10 @@ mod tests {
 
     #[test]
     fn routed_auth_handles_host_with_trailing_slash() {
-        let auth = Arc::new(Mutex::new(ResolvedAuth {
-            base_url: Some("https://aperture.example.com/".into()),
-            headers: Vec::new(),
-        }));
+        let auth = Arc::new(Mutex::new(ResolvedAuth::for_test(
+            Some("https://aperture.example.com/".into()),
+            Vec::new(),
+        )));
         let routed = routed_auth(&auth, DEFAULT_PATH_PREFIX);
         assert_eq!(
             routed.lock().unwrap().base_url.as_deref(),
@@ -803,10 +815,10 @@ mod tests {
 
     #[test]
     fn adjust_model_inherits_routed_provider_thinking_support() {
-        let auth = Arc::new(Mutex::new(ResolvedAuth {
-            base_url: Some("https://example.com".into()),
-            headers: Vec::new(),
-        }));
+        let auth = Arc::new(Mutex::new(ResolvedAuth::for_test(
+            Some("https://example.com".into()),
+            Vec::new(),
+        )));
         let aperture =
             Aperture::with_auth_and_overrides(auth, Timeouts::default(), Overrides::new());
         let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();

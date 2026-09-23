@@ -47,16 +47,25 @@ The rules:
   `false` to revoke it. An empty file grants everything.
 - Invalid TOML: everything denied, with a warning in the log.
 "#;
-    let keys = Permission::ALL.map(Permission::manifest_key);
+    let keys: Vec<&'static str> = Permission::ALL.iter().map(|p| p.manifest_key()).collect();
     let anchor = if anchored {
         format!(" {{#{PERMISSIONS_ANCHOR}}}")
     } else {
         String::new()
     };
+    let names = keys
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table_keys = keys
+        .iter()
+        .map(|k| format!("{k} = true\n"))
+        .collect::<String>();
     TEMPLATE
         .replace("{ANCHOR}", &anchor)
-        .replace("{NAMES}", &keys.map(|k| format!("`{k}`")).join(", "))
-        .replace("{KEYS}", &keys.map(|k| format!("{k} = true\n")).concat())
+        .replace("{NAMES}", &names)
+        .replace("{KEYS}", &table_keys)
 }
 
 const GUIDE: &str = r#"# Writing makima plugins
@@ -132,9 +141,11 @@ settings in a local table, or export a `setup(opts)` function `init.lua` calls.
 runs, an edited plugin is still the old one.
 
 To debug, add `maki.log.info|warn|error(...)` calls. They write to `maki.log`
-in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/makima/`). When
-a backtrace comes out useless, start makima with `--no-jit`: plugins then run on
-the interpreter, with full debug info.
+in the dir `maki.env.logs_dir()` returns (Linux: `~/.local/logs/makima/`). The
+log keeps `info` and above. Set `MAKI_LOG=debug` to also keep `maki.log.debug`,
+or `MAKI_LOG=maki_lua=trace` to narrow it to one target. When a backtrace comes
+out useless, start makima with `--no-jit`: plugins then run on the interpreter,
+with full debug info.
 
 {AGENT_NOTES}## Conventions
 

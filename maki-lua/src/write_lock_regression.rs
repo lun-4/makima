@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use maki_agent::agent::tool_dispatch::{self, Emit};
-use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::agent::tool_dispatch;
+use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
 use maki_agent::{AgentMode, ToolDoneEvent};
 use maki_config::PluginsConfig;
 use serde_json::{Map, Value, json};
@@ -60,13 +60,11 @@ fn shared_ctx(registry: &Arc<ToolRegistry>) -> ToolContext {
 
 fn dispatch(ctx: &ToolContext, id: &str, name: &str, input: Value) -> ToolDoneEvent {
     smol::block_on(tool_dispatch::run(
-        &ctx.registry,
-        None,
         id.into(),
         name,
         &input,
         ctx,
-        Emit::Silent,
+        CallOrigin::Nested,
     ))
 }
 
@@ -583,18 +581,7 @@ fn dispatch_async(
 ) -> impl std::future::Future<Output = ToolDoneEvent> {
     let ctx = ctx.clone();
     let input = input.clone();
-    async move {
-        tool_dispatch::run(
-            &ctx.registry,
-            None,
-            id.into(),
-            name,
-            &input,
-            &ctx,
-            Emit::Silent,
-        )
-        .await
-    }
+    async move { tool_dispatch::run(id.into(), name, &input, &ctx, CallOrigin::Nested).await }
 }
 
 /// Records the order of backend operations and can park the first `read`
@@ -997,21 +984,35 @@ fn memory_computed_mutable_path_locks_the_real_note() {
     let (registry, _host) = boot_with_backend(&["memory"], fs as _, HashMap::new());
     let entry = registry.get("memory").expect("memory tool registered");
 
-    let write = entry
-        .tool
-        .parse(&json!({"command": "write", "path": "notes.md", "content": "x"}))
-        .expect("parse");
-    let target = write
-        .mutable_path()
-        .map(|p| p.to_path_buf())
+    let parse_write = || {
+        entry
+            .tool
+            .parse(&json!({"command": "write", "path": "notes.md", "content": "x"}))
+            .expect("parse")
+    };
+    let mut first_ctx = shared_ctx(&registry);
+    first_ctx.cwd = PathBuf::from("/projects/first");
+    let first_target = parse_write()
+        .mutable_path(&first_ctx)
+        .expect("memory write declares a mutable path");
+    let mut second_ctx = first_ctx.clone();
+    second_ctx.cwd = PathBuf::from("/projects/second");
+    let second_target = parse_write()
+        .mutable_path(&second_ctx)
         .expect("memory write declares a mutable path");
     assert!(
-        target.is_absolute(),
-        "lock key must be absolute: {target:?}"
+        first_target.is_absolute(),
+        "lock key must be absolute: {first_target:?}"
     );
     assert!(
-        target.to_string_lossy().ends_with("memories/notes.md"),
-        "lock key must be the note's real location: {target:?}"
+        first_target
+            .to_string_lossy()
+            .ends_with("memories/notes.md"),
+        "lock key must be the note's real location: {first_target:?}"
+    );
+    assert_ne!(
+        first_target, second_target,
+        "lock key must use the invocation session cwd"
     );
 
     let read = entry
@@ -1019,7 +1020,7 @@ fn memory_computed_mutable_path_locks_the_real_note() {
         .parse(&json!({"command": "read", "path": "notes.md"}))
         .expect("parse");
     assert!(
-        read.mutable_path().is_none(),
+        read.mutable_path(&first_ctx).is_none(),
         "memory read must not participate in write serialization"
     );
 }

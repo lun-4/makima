@@ -50,7 +50,10 @@ pub enum ActorWork {
     Turn(TurnAdmission),
     Root(RootWork),
     Control(ControlWork),
-    Compact { run_id: u64 },
+    Compact {
+        run_id: u64,
+        instructions: Option<String>,
+    },
 }
 
 /// The mutable half of an actor, shared with every clone of the handle.
@@ -203,13 +206,7 @@ pub(super) fn cancelled_outcome(
     turn_id: TurnId,
     reason: TurnCancellationReason,
 ) -> TurnOutcome {
-    TurnOutcome::Cancelled {
-        agent_id,
-        turn_id,
-        usage: TokenUsage::default(),
-        num_turns: 0,
-        reason,
-    }
+    TurnOutcome::cancelled(agent_id, turn_id, TokenUsage::default(), 0, reason)
 }
 
 /// Canonical correlation for root/compact run work. The TUI addresses runs
@@ -441,7 +438,11 @@ impl AgentActorHandle {
         self.push_checked(ActorWork::Control(control))
     }
 
-    pub fn push_compact(&self, run_id: u64) -> Result<(), ActorError> {
+    pub fn push_compact(
+        &self,
+        run_id: u64,
+        instructions: Option<String>,
+    ) -> Result<(), ActorError> {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(match state.lifecycle {
@@ -457,7 +458,10 @@ impl AgentActorHandle {
         {
             return Ok(());
         }
-        self.inner.queue.push(ActorWork::Compact { run_id });
+        self.inner.queue.push(ActorWork::Compact {
+            run_id,
+            instructions,
+        });
         Ok(())
     }
 
@@ -648,7 +652,7 @@ impl AgentActorHandle {
             let active = state.active.take();
             match state.status {
                 ActorStatus::Running(turn_id) => operation(turn_id),
-                ActorStatus::Idle => unreachable!("active cancellation requires a running turn"),
+                ActorStatus::Idle => {}
             }
             active
         } else {

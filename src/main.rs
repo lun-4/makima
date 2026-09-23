@@ -1,6 +1,7 @@
 mod cli;
 mod cmd;
 mod print;
+mod project_trust;
 mod sdk_mode;
 mod setup;
 mod update;
@@ -47,28 +48,25 @@ mod command_attachments {
     pub(crate) fn agent_input(
         turn: AgentTurn,
         mode: AgentMode,
-        fast: bool,
-        workflow: bool,
+        defaults: maki_config::SessionDefaults,
     ) -> Result<AgentInput> {
-        Ok(AgentInput {
-            message: turn.content.text.to_string(),
+        let mut input = AgentInput::from_defaults(
+            turn.content.text.to_string(),
             mode,
-            images: into_images(&turn.content.attachments)?,
-            preamble: Vec::new(),
-            thinking: Default::default(),
-            fast,
-            workflow,
-            prompt: turn.prompt.map(|prompt| {
-                Box::new(McpPromptRef {
-                    qualified_name: prompt.qualified_name.to_string(),
-                    arguments: prompt
-                        .arguments
-                        .iter()
-                        .map(|(key, value)| (key.to_string(), value.to_string()))
-                        .collect(),
-                })
-            }),
-        })
+            into_images(&turn.content.attachments)?,
+            defaults,
+        );
+        input.prompt = turn.prompt.map(|prompt| {
+            Box::new(McpPromptRef {
+                qualified_name: prompt.qualified_name.to_string(),
+                arguments: prompt
+                    .arguments
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            })
+        });
+        Ok(input)
     }
 }
 
@@ -77,6 +75,10 @@ use clap::Parser;
 use cli::Cli;
 
 fn main() {
+    // First, before anything can ask for a path: until this runs the state,
+    // config, cache and log directories resolve to nothing, which is what
+    // keeps a test binary out of the directories a real run reads and writes.
+    maki_storage::paths::init().expect("storage paths must be initialized exactly once");
     color_eyre::install().ok();
     if let Err(e) = cmd::dispatch(Cli::parse()) {
         print_error(&e);

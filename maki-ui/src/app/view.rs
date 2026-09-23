@@ -1,4 +1,4 @@
-use maki_providers::ThinkingConfigExt;
+use maki_providers::{RequestOptions, ThinkingConfigExt};
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
@@ -65,7 +65,8 @@ impl App {
         self.render_defer_hint(frame, layout.defer_hint_area);
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
-        let _ = self.validate_middle_scroll();
+        let dirty = self.validate_middle_scroll();
+        self.pending_dirty |= dirty;
         self.apply_selection(frame, render_chat);
         if let Some(state) = &self.middle_scroll
             && layout.msg_area.contains(state.origin)
@@ -244,19 +245,23 @@ impl App {
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
         let accent = self.effective_mode_color();
         self.chats[render_chat].set_accent(accent);
-        let _ = self.validate_middle_scroll();
+        let dirty = self.validate_middle_scroll();
+        self.pending_dirty |= dirty;
         if self.middle_scroll.is_some()
             && self
                 .zones
                 .find(SelectionZone::Messages)
                 .is_none_or(|zone| zone.area != layout.msg_area)
         {
-            let _ = self.cancel_middle_scroll();
+            let dirty = self.cancel_middle_scroll();
+            self.pending_dirty |= dirty;
         }
+        let images_visible = !self.any_overlay_open();
         self.chats[render_chat].view(
             frame,
             layout.msg_area,
             self.selection_state.is_some() || self.middle_scroll.is_some(),
+            images_visible,
         );
     }
 
@@ -440,14 +445,30 @@ impl App {
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let (mode_label, mode_style) = self.mode_label();
+        // A subagent chat names its own model. The main chat shows the model the
+        // run is on, and marks a change the run has not reached yet.
+        let (model_id, model_switch_queued) = match chat.model_id.as_deref() {
+            Some(model_id) => (model_id, false),
+            None => {
+                let session_model = self.state.session.model.as_str();
+                match self.run_model.as_deref() {
+                    Some(running) if self.status == Status::Streaming => {
+                        (running, running != session_model)
+                    }
+                    _ => (session_model, false),
+                }
+            }
+        };
+        let opts = chat.opts.unwrap_or(RequestOptions {
+            thinking: self.state.thinking,
+            fast: self.state.fast,
+        });
         let ctx = StatusBarContext {
             status: self.status_for_chat(render_chat),
             mode_label,
             mode_style,
-            model_id: chat
-                .model_id
-                .as_deref()
-                .unwrap_or(&self.state.session.model),
+            model_id,
+            model_switch_queued,
             stats: UsageStats {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,
@@ -457,9 +478,11 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             retry_info: self.retry_info.as_ref(),
-            thinking_label: self.state.thinking.status_label(),
-            fast: self.state.fast,
+            thinking_label: opts.thinking.status_label(),
+            fast: opts.fast,
             workflow: self.state.workflow,
+            yolo: self.permissions.is_yolo(),
+            restricted: self.trust_question.is_some(),
             restoring: self.restoring.load(Ordering::Relaxed),
             status_content: self.status_content.get(),
             suppress_status_content: self.suppress_status_content.load(Ordering::Acquire),

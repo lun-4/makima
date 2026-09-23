@@ -107,7 +107,7 @@ end
 
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
-  if config and config.no_rtk then
+  if config and not config.rtk then
     return nil
   end
 
@@ -195,43 +195,61 @@ local function is_complex(node)
   return false
 end
 
-local LEAF_COMMAND_TYPES = {
-  command = true,
-  redirected_statement = true,
-  negated_command = true,
-  subshell = true,
-  compound_statement = true,
-  if_statement = true,
-  while_statement = true,
-  for_statement = true,
-  case_statement = true,
-  function_definition = true,
-  c_style_for_statement = true,
+local REDIRECT_TYPES = {
+  file_redirect = true,
+  heredoc_redirect = true,
+  herestring_redirect = true,
 }
 
+-- Nodes we walk through instead of turning into a scope. `redirected_statement`
+-- has to be one of them: tree-sitter hangs a trailing `2>&1` off the entire
+-- `cd x && cargo test` chain rather than off `cargo test`, so treating it as a
+-- leaf turns the whole chain into a single scope starting with `cd `, and a
+-- `cd *` allow rule then quietly covers whatever runs after the `&&`.
+local WALK_THROUGH_TYPES = {
+  program = true,
+  list = true,
+  pipeline = true,
+  redirected_statement = true,
+}
+
+local function node_text(node, source)
+  return maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+end
+
+-- Anything we don't walk through becomes one scope, its own text. That covers
+-- plain commands and the block forms (`if`, `while`, subshells) we deliberately
+-- keep whole, plus any node type we never thought of, which is what we want:
+-- an unknown node has to end up in front of the user, not get dropped.
 local function collect_commands(node, source)
-  local out = {}
-  local kind = node:type()
-  if kind == "program" or kind == "list" then
-    for child in node:iter_children() do
-      local nested = collect_commands(child, source)
-      for _, cmd in ipairs(nested) do
-        out[#out + 1] = cmd
-      end
-    end
-  elseif kind == "pipeline" then
-    for child in node:iter_children() do
-      if child:named() then
-        local text = maki.treesitter.get_node_text(child, source):match("^%s*(.-)%s*$")
-        if text ~= "" then
-          out[#out + 1] = text
+  if not WALK_THROUGH_TYPES[node:type()] then
+    local text = node_text(node, source)
+    return text ~= "" and { text } or {}
+  end
+
+  local out, redirects = {}, {}
+  for child in node:iter_children() do
+    local kind = child:type()
+    if child:named() and kind ~= "comment" then
+      if REDIRECT_TYPES[kind] then
+        redirects[#redirects + 1] = node_text(child, source)
+      else
+        for _, cmd in ipairs(collect_commands(child, source)) do
+          out[#out + 1] = cmd
         end
       end
     end
-  elseif LEAF_COMMAND_TYPES[kind] then
-    local text = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
-    if text ~= "" then
-      out[#out + 1] = text
+  end
+
+  -- The redirect belongs to the last command of the chain, the one bash would
+  -- actually apply it to. A bodiless `> log` has no such command and still
+  -- truncates the file, so it becomes a scope of its own instead of vanishing.
+  if #redirects > 0 then
+    local text = table.concat(redirects, " ")
+    if #out > 0 then
+      out[#out] = out[#out] .. " " .. text
+    else
+      out[1] = text
     end
   end
   return out
@@ -275,15 +293,52 @@ local opts = maki.api.register_options(output_limits.extend({
   },
 }))
 
-bh.set_auto_mode(opts.auto_mode)
+local auto_mode = maki.api.register_session_option({
+  id = "bash.auto_mode",
+  name = "Bash auto mode",
+  description = "Classify every bash command before executing it",
+  category = "mode",
+  values = {
+    { value = "enabled", name = "Enabled" },
+    { value = "disabled", name = "Disabled" },
+  },
+  initial_value = opts.auto_mode and "enabled" or "disabled",
+  persistent = true,
+})
+
+-- Sessionless contexts (`maki index`, an embedding host with no coordinator)
+-- have no per-session value to read. They still run bash, so fall back to the
+-- configured default rather than refusing to execute.
+local function auto_mode_enabled(session_id)
+  local target = session_id and { session = session_id } or nil
+  local value, err = auto_mode:get(target)
+  if not value then
+    if session_id then
+      return nil, err
+    end
+    return opts.auto_mode and true or false, nil
+  end
+  return value == "enabled", nil
+end
 
 maki.api.register_command({
   name = "/automode",
   description = "Toggle bash auto mode (classifier gates every bash command)",
   tui_only = false,
   handler = function()
-    bh.set_auto_mode(not bh.auto_mode_on)
-    maki.ui.flash("auto mode: " .. (bh.auto_mode_on and "on" or "off"))
+    local enabled, err = auto_mode_enabled()
+    if enabled == nil then
+      maki.ui.flash(err)
+      return
+    end
+    local value = enabled and "disabled" or "enabled"
+    local ok
+    ok, err = auto_mode:set(value)
+    if not ok then
+      maki.ui.flash(err)
+      return
+    end
+    maki.ui.flash("auto mode: " .. (value == "enabled" and "on" or "off"))
   end,
 })
 
@@ -313,6 +368,7 @@ maki.api.register_tool({
   name = "bash",
   kind = "execute",
   description = description,
+  permission = "run",
   schema = {
     type = "object",
     properties = {
@@ -322,8 +378,15 @@ maki.api.register_tool({
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
   },
-  permission_scopes = function(input)
-    if bh.auto_mode_on then
+  permission_scopes = function(input, ctx)
+    if not ctx or not ctx.session_id then
+      return command_scopes(input.command)
+    end
+    local enabled = auto_mode_enabled(ctx.session_id)
+    if enabled == nil then
+      return command_scopes(input.command)
+    end
+    if enabled then
       return nil
     end
     return command_scopes(input.command)
@@ -375,12 +438,26 @@ maki.api.register_tool({
     end
 
     local command, workdir = parse_cd_hint(input)
+    local resolved_workdir, workdir_err = ctx:resolve_path(workdir or ".")
+    if not resolved_workdir then
+      return { llm_output = workdir_err, is_error = true }
+    end
+    workdir = resolved_workdir
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
+    local session_id, session_err = ctx:session_id()
+    if session_err then
+      return { llm_output = session_err, is_error = true }
+    end
+    local enabled, option_err = auto_mode_enabled(session_id)
+    if enabled == nil then
+      return { llm_output = option_err, is_error = true }
+    end
+
     local auto_annotation
-    if bh.auto_mode_on then
-      local verdict, reason, err = bh.classify_verdict(command, workdir or maki.uv.cwd(), opts, ctx)
+    if enabled then
+      local verdict, reason, err = bh.classify_verdict(command, workdir, opts, ctx)
       if verdict == "approve" then
         auto_annotation = { { "auto-mode: allowed", "dim" } }
         -- fall through to the jobstart path unchanged

@@ -2,7 +2,7 @@ use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::providers::{
     anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
-    openai, openrouter, synthetic, tensorx, zai,
+    openai, openrouter, regolo, requesty, synthetic, tensorx, vertex, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +53,18 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models: google::models(),
+    pricing_schedule: None,
+};
+
+const VERTEX: ProviderManifest = ProviderManifest {
+    slug: "vertex",
+    display_name: "Google Vertex AI",
+    family: ModelFamily::Gemini,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(65_536),
+    fallback_context_window: 1_000_000,
+    models: vertex::models(),
     pricing_schedule: None,
 };
 
@@ -140,6 +152,30 @@ const OPENROUTER: ProviderManifest = ProviderManifest {
     pricing_schedule: None,
 };
 
+const REQUESTY: ProviderManifest = ProviderManifest {
+    slug: "requesty",
+    display_name: "Requesty",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(128_000),
+    fallback_context_window: 200_000,
+    models: requesty::models(),
+    pricing_schedule: None,
+};
+
+const REGOLO: ProviderManifest = ProviderManifest {
+    slug: "regolo",
+    display_name: "Regolo",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(120_000),
+    fallback_context_window: 120_000,
+    models: regolo::models(),
+    pricing_schedule: None,
+};
+
 const SYNTHETIC: ProviderManifest = ProviderManifest {
     slug: "synthetic",
     display_name: "Synthetic",
@@ -204,6 +240,7 @@ const BUILTINS: &[ProviderManifest] = &[
     ANTHROPIC,
     OPENAI,
     GOOGLE,
+    VERTEX,
     COPILOT,
     OLLAMA,
     LLAMA_CPP,
@@ -211,6 +248,8 @@ const BUILTINS: &[ProviderManifest] = &[
     ZAI,
     DEEPSEEK,
     OPENROUTER,
+    REQUESTY,
+    REGOLO,
     SYNTHETIC,
     TENSORX,
     OPENCODE,

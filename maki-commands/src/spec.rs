@@ -21,7 +21,8 @@ pub const COMPACT_COMMAND_NAME: &str = "/compact";
 pub enum TargetCapability {
     AgentTurns,
     ModelSelection,
-    SessionControl,
+    HistoryCompaction,
+    SessionReplacement,
     WorkingDirectory,
     PermissionToggles,
     ConfigToggles,
@@ -35,7 +36,18 @@ pub struct TargetCapabilities(u16);
 
 impl TargetCapabilities {
     pub const NONE: Self = Self(0);
-    pub const ALL: Self = Self((1 << 9) - 1);
+    pub const ALL: Self = Self::from_slice(&[
+        TargetCapability::AgentTurns,
+        TargetCapability::ModelSelection,
+        TargetCapability::HistoryCompaction,
+        TargetCapability::SessionReplacement,
+        TargetCapability::WorkingDirectory,
+        TargetCapability::PermissionToggles,
+        TargetCapability::ConfigToggles,
+        TargetCapability::InteractiveUi,
+        TargetCapability::ApplicationLifecycle,
+        TargetCapability::Reload,
+    ]);
 
     pub const fn from_capability(capability: TargetCapability) -> Self {
         Self(1 << capability as u8)
@@ -82,6 +94,7 @@ pub enum BuiltinId {
     Workflow,
     Exit,
     Reload,
+    Trust,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,7 +106,7 @@ pub enum CompletionKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuiltinOperation {
     OpenTasks,
-    Compact,
+    Compact(Option<String>),
     ResetSession,
     ToggleHelp,
     FocusQueue,
@@ -119,6 +132,7 @@ pub enum BuiltinOperation {
     ToggleWorkflow,
     Exit,
     Reload,
+    Trust,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +141,7 @@ pub enum HostContextRequest {
     ThemeNames,
     WorkingDirectory,
     FastModeSupported,
+    SessionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +149,7 @@ pub enum HostContextResponse {
     Values(Arc<[Arc<str>]>),
     WorkingDirectory(PathBuf),
     FastModeSupported(bool),
+    SessionId(Arc<str>),
     Unavailable,
 }
 
@@ -157,8 +173,10 @@ pub struct BuiltinDefinition {
 
 const INTERACTIVE: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::InteractiveUi);
-const SESSION: TargetCapabilities =
-    TargetCapabilities::from_capability(TargetCapability::SessionControl);
+const COMPACTION: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::HistoryCompaction);
+const SESSION_REPLACEMENT: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::SessionReplacement);
 const MODEL: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::ModelSelection);
 const CWD: TargetCapabilities =
@@ -246,10 +264,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         COMPACT_COMMAND_NAME,
         &[],
         "Summarize and compact conversation history",
-        typed & [],
-        NO_ARGUMENT_COMPLETIONS,
-        None,
-        SESSION,
+        raw false,
+        Some("<instructions>"),
+        COMPACTION,
     ),
     builtin!(
         New,
@@ -259,7 +276,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
-        SESSION,
+        SESSION_REPLACEMENT,
     ),
     builtin!(
         Help,
@@ -354,7 +371,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         Fast,
         "/fast",
         &[],
-        "Toggle Anthropic fast mode (Opus only)",
+        "Toggle fast mode (Anthropic Opus or Codex subscription models)",
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
@@ -385,6 +402,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         "/reload",
         &[],
         "Reload plugins and config",
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
+        None,
+        RELOAD,
+    ),
+    builtin!(
+        Trust,
+        "/trust",
+        &[],
+        "Trust this folder and load its shared project config",
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,

@@ -17,7 +17,9 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line};
+
+const API_KEY_HEADER: &str = "x-goog-api-key";
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
@@ -105,11 +107,11 @@ fn resolve_google_base_url() -> Option<String> {
     maki_config::providers::resolve_base_url("google", config.get("google"))
 }
 
-fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> ResolvedAuth {
-    ResolvedAuth {
-        base_url,
-        headers: vec![("x-goog-api-key".into(), key.to_string())],
-    }
+fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<ResolvedAuth, AgentError> {
+    Ok(
+        ResolvedAuth::new("google", vec![(API_KEY_HEADER.into(), key.to_string())])?
+            .with_base_url(base_url),
+    )
 }
 
 pub struct Google {
@@ -118,6 +120,7 @@ pub struct Google {
     key_pool: Option<KeyPool>,
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
+    /// Reused by key rotation / reload so they do not re-parse providers.toml.
     resolved_base_url: Option<String>,
 }
 
@@ -125,7 +128,7 @@ impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("google", ENV_VAR)?;
         let resolved_base_url = resolve_google_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone());
+        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
         Ok(Self {
             client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
@@ -194,26 +197,7 @@ impl Google {
         tools: &Value,
         thinking: ThinkingConfig,
     ) -> Value {
-        let mut body = json!({
-            "contents": convert_messages(messages),
-        });
-
-        if !system.is_empty() {
-            body["systemInstruction"] = json!({"parts": [{"text": system}]});
-        }
-
-        thinking.apply_google_thinking(&mut body, max_thinking(model));
-
-        if let Some(max_output) = model.max_output_tokens {
-            body["generationConfig"]["maxOutputTokens"] = json!(max_output);
-        }
-
-        let tool_decls = convert_tools(tools);
-        if !tool_defs_empty(&tool_decls) {
-            body["tools"] = json!([{"functionDeclarations": tool_decls}]);
-        }
-
-        body
+        build_body(model, messages, system, tools, thinking)
     }
 
     async fn do_stream(
@@ -296,21 +280,47 @@ impl Provider for Google {
         Box::pin(async {
             let pool = KeyPool::resolve("google", ENV_VAR)?;
             *self.auth.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone());
+                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            let base_url = self.resolved_base_url.clone();
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_auth(&self.auth, |key| {
-                    resolve_auth_from_key(key, base_url.clone())
-                })
-            }))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Raw(API_KEY_HEADER),
+        ))
     }
+}
+
+pub(crate) fn build_body(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: ThinkingConfig,
+) -> Value {
+    let mut body = json!({
+        "contents": convert_messages(messages),
+    });
+
+    if !system.is_empty() {
+        body["systemInstruction"] = json!({"parts": [{"text": system}]});
+    }
+
+    thinking.apply_google_thinking(&mut body, max_thinking(model));
+
+    if let Some(max_output) = model.max_output_tokens {
+        body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+    }
+
+    let tool_decls = convert_tools(tools);
+    if !tool_defs_empty(&tool_decls) {
+        body["tools"] = json!([{"functionDeclarations": tool_decls}]);
+    }
+
+    body
 }
 
 fn convert_messages(messages: &[Message]) -> Vec<Value> {
@@ -435,17 +445,28 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?;
             let description = t.get("description")?.as_str().unwrap_or("");
-            let parameters = t
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            Some(json!({
+            let mut decl = json!({
                 "name": name,
                 "description": description,
-                "parameters": strip_additional_properties(parameters),
-            }))
+            });
+            if let Some(parameters) = tool_parameters(t) {
+                decl["parameters"] = parameters;
+            }
+            Some(decl)
         })
         .collect()
+}
+
+/// Gemini turns down an object schema that lists no properties, while MiniMax
+/// turns down a bare `{}`, so no single payload pleases both. A tool that takes
+/// no arguments simply travels here without `parameters`.
+fn tool_parameters(tool: &Value) -> Option<Value> {
+    let schema = tool.get("input_schema")?;
+    let has_properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|props| !props.is_empty());
+    has_properties.then(|| strip_additional_properties(schema.clone()))
 }
 
 fn strip_additional_properties(value: Value) -> Value {
@@ -508,6 +529,8 @@ struct SseUsageMetadata {
     #[serde(default)]
     candidates_token_count: u32,
     #[serde(default)]
+    thoughts_token_count: u32,
+    #[serde(default)]
     cached_content_token_count: Option<u32>,
 }
 
@@ -530,6 +553,15 @@ struct ApiModelInfo {
     name: String,
     #[serde(default)]
     supported_generation_methods: Vec<String>,
+}
+
+fn apply_usage(usage: &mut TokenUsage, meta: SseUsageMetadata) {
+    let cached = meta.cached_content_token_count.unwrap_or_default();
+    usage.input = meta.prompt_token_count.saturating_sub(cached);
+    usage.output = meta
+        .candidates_token_count
+        .saturating_add(meta.thoughts_token_count);
+    usage.cache_read = cached;
 }
 
 /// Append `text` to the last block when it is already a `Text`, else push a new
@@ -569,7 +601,7 @@ fn push_or_extend_thinking(
     }
 }
 
-async fn parse_sse(
+pub(crate) async fn parse_sse(
     response: isahc::Response<isahc::AsyncBody>,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
@@ -580,6 +612,7 @@ async fn parse_sse(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
+    let mut thinking_open = false;
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
@@ -597,11 +630,7 @@ async fn parse_sse(
         };
 
         if let Some(meta) = chunk.usage_metadata {
-            usage.input = meta.prompt_token_count;
-            usage.output = meta.candidates_token_count;
-            if let Some(cached) = meta.cached_content_token_count {
-                usage.cache_read = cached;
-            }
+            apply_usage(&mut usage, meta);
         }
 
         let Some(candidates) = chunk.candidates else {
@@ -622,6 +651,10 @@ async fn parse_sse(
 
             for part in parts {
                 if let Some(func_call) = part.function_call {
+                    if thinking_open {
+                        event_tx.send_async(ProviderEvent::ThinkingBlockEnd).await?;
+                        thinking_open = false;
+                    }
                     let id = format!("call_{}_{}", func_call.name, MakiId::generate());
                     let input = func_call.args.unwrap_or_default();
                     let thought_signature = func_call.thought_signature.or(part.thought_signature);
@@ -644,10 +677,14 @@ async fn parse_sse(
                             event_tx
                                 .send_async(ProviderEvent::ThinkingDelta { text: text.clone() })
                                 .await?;
+                            thinking_open = true;
                         }
                         push_or_extend_thinking(&mut content_blocks, text, part.thought_signature);
                     } else if !text.is_empty() {
-                        // TODO: preserve part.thought_signature if ContentBlock::Text adds signature support.
+                        if thinking_open {
+                            event_tx.send_async(ProviderEvent::ThinkingBlockEnd).await?;
+                            thinking_open = false;
+                        }
                         event_tx
                             .send_async(ProviderEvent::TextDelta { text: text.clone() })
                             .await?;
@@ -656,6 +693,10 @@ async fn parse_sse(
                 }
             }
         }
+    }
+
+    if thinking_open {
+        event_tx.send_async(ProviderEvent::ThinkingBlockEnd).await?;
     }
 
     Ok(StreamResponse {
@@ -678,10 +719,10 @@ mod tests {
     const GEMINI_API_KEY: &str = "test-key";
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
-        Arc::new(Mutex::new(ResolvedAuth {
-            base_url: None,
-            headers: vec![("x-goog-api-key".into(), GEMINI_API_KEY.into())],
-        }))
+        Arc::new(Mutex::new(ResolvedAuth::for_test(
+            None,
+            vec![(API_KEY_HEADER.into(), GEMINI_API_KEY.into())],
+        )))
     }
 
     fn test_timeouts() -> super::super::Timeouts {
@@ -689,6 +730,7 @@ mod tests {
             connect: Duration::from_secs(5),
             low_speed: Duration::from_secs(30),
             stream: Duration::from_secs(300),
+            retry: crate::retry::RetryPolicy::default(),
         }
     }
 
@@ -699,10 +741,12 @@ mod tests {
             tier: ModelTier::Medium,
             family: ModelFamily::Gemini,
             supports_vision_override: Some(true),
+            supports_fast_override: None,
             supports_tool_examples_override: None,
             thinking_override: None,
             pricing: ModelPricing::default(),
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 1_048_576,
             thinking_fields: None,
         }
@@ -762,6 +806,27 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             4096
         );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+    }
+
+    #[test]
+    fn usage_includes_thinking_tokens() {
+        let mut usage = TokenUsage::default();
+        apply_usage(
+            &mut usage,
+            SseUsageMetadata {
+                prompt_token_count: 100,
+                candidates_token_count: 200,
+                thoughts_token_count: 300,
+                cached_content_token_count: Some(50),
+            },
+        );
+        assert_eq!(usage.input, 50);
+        assert_eq!(usage.output, 500);
+        assert_eq!(usage.cache_read, 50);
     }
 
     #[test_case("STOP", StopReason::EndTurn ; "stop")]
@@ -1151,8 +1216,17 @@ mod tests {
     fn parse_sse_thinking_part() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20}}\n\n";
         let response = mock_response(data);
-        let (tx, _rx) = flume::unbounded();
+        let (tx, rx) = flume::unbounded();
         let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let events = rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ProviderEvent::ThinkingDelta { text },
+                ProviderEvent::ThinkingBlockEnd,
+                ProviderEvent::TextDelta { text: answer },
+            ] if text == "thinking..." && answer == "answer"
+        ));
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::Thinking { thinking, signature } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
@@ -1205,7 +1279,7 @@ mod tests {
         let response = mock_response(data);
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
-        assert_eq!(result.usage.input, 100);
+        assert_eq!(result.usage.input, 50);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, 50);
     }

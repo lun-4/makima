@@ -1,12 +1,15 @@
+pub mod agent_autocmd;
 mod api;
 mod coalesced_latest;
 pub mod docs;
 pub mod docs_render;
 mod error;
+pub(crate) mod hook;
 pub mod language;
 mod loader;
 pub(crate) mod plugin_permissions;
 mod runtime;
+pub mod session_snapshot;
 mod splash;
 #[cfg(test)]
 mod write_lock_regression;
@@ -23,11 +26,11 @@ pub use api::util::command::{
 };
 pub use api::util::picker::{PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
-pub use error::PluginError;
-pub use loader::{EventHandle, PluginHost, TestCompletionBackend};
+pub use error::{PluginError, SessionOptionMutationError};
+pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, TestCompletionBackend};
 pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{CommandArgumentContext, CommandArgumentLifecycle};
-pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
+pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
 pub use splash::{
     SPLASH_PULL_TIMEOUT, SplashFrame, SplashPull, SplashRow, SplashStyle, VersionInfo,
 };
@@ -36,6 +39,7 @@ pub use api::completion::{
     ActiveAtToken, AtToken, AtTokenStatus, CompletionCtx, ItemSpec, active_at_token,
     at_is_token_start, is_trailing_at_token_punctuation, parse_at_tokens,
 };
+pub use api::net::set_allowed_private_hosts;
 
 #[cfg(feature = "test-support")]
 pub mod test_support {
@@ -45,6 +49,8 @@ pub mod test_support {
         StatusContentWriter,
     };
     use crate::{EventHandle, KeymapReader, PluginHost, TestCompletionBackend};
+
+    pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
 
     /// Stands in for the Lua thread publishing a plugin's status hints.
     pub struct HintWriterHandle(HintWriter);

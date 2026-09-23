@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "synthetic",
@@ -105,7 +105,10 @@ impl Synthetic {
         let pool = KeyPool::resolve("synthetic", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
+                "synthetic",
+                pool.current(),
+            )?)),
             key_pool: Some(pool),
             system_prefix: None,
         })
@@ -157,13 +160,12 @@ impl Provider for Synthetic {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -260,7 +262,11 @@ fn parse_quotas(response: &str) -> Result<ProviderUsage, AgentError> {
             message: EMPTY_USAGE_ERROR.into(),
         });
     }
-    Ok(ProviderUsage { plan: None, limits })
+    Ok(ProviderUsage {
+        plan: None,
+        limits,
+        by_model_today: Vec::new(),
+    })
 }
 
 #[cfg(test)]

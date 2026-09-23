@@ -13,44 +13,46 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 
 ## Built-in commands
 
-| Command | Description | Mode | Arguments | TUI-only |
-|---------|-------------|------|-----------|----------|
-| `/tasks` | Browse and search tasks | none |  | yes |
-| `/compact` | Summarize and compact conversation history | none |  | no |
-| `/new` | Start a new session | none |  | no |
-| `/clear` | Alias for `/new` | none |  | no |
-| `/help` | Show keybindings | none |  | yes |
-| `/queue` | Remove items from queue | none |  | yes |
-| `/model` | Switch model | typed | <model> | no |
-| `/theme` | Switch color theme | typed | <theme> | yes |
-| `/mcp` | Configure MCP servers | none |  | yes |
-| `/login` | Authenticate with an LLM provider | none |  | yes |
-| `/cd` | Change working directory. Quote paths containing spaces. | typed | [path] | no |
-| `/btw` | Ask a quick question (no tools, no history pollution) | raw (required) | <question> | no |
-| `/yolo` | Toggle YOLO mode (skip all permission prompts) | none |  | no |
-| `/fast` | Toggle Anthropic fast mode (Opus only) | none |  | no |
-| `/workflow` | Toggle workflow mode (task callable inside code_execution) | none |  | no |
-| `/exit` | Exit the application | none |  | yes |
-| `/reload` | Reload plugins and config | none |  | yes |
+| Command | Description | Mode | Arguments | Frontends |
+|---------|-------------|------|-----------|-----------|
+| `/tasks` | Browse and search tasks | none |  | TUI only |
+| `/compact` | Summarize and compact conversation history | raw (optional) | <instructions> | all |
+| `/new` | Start a new session | none |  | TUI only |
+| `/clear` | Alias for `/new` | none |  | TUI only |
+| `/help` | Show keybindings | none |  | TUI only |
+| `/queue` | Remove items from queue | none |  | TUI only |
+| `/model` | Switch model | typed | <model> | all |
+| `/theme` | Switch color theme | typed | <theme> | TUI only |
+| `/mcp` | Configure MCP servers | none |  | TUI only |
+| `/login` | Authenticate with an LLM provider | none |  | TUI only |
+| `/cd` | Change working directory. Quote paths containing spaces. | typed | [path] | all |
+| `/btw` | Ask a quick question (no tools, no history pollution) | raw (required) | <question> | all |
+| `/yolo` | Toggle YOLO mode (skip all permission prompts) | none |  | all |
+| `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) | none |  | all |
+| `/workflow` | Toggle workflow mode (task callable inside code_execution) | none |  | all |
+| `/exit` | Exit the application | none |  | TUI only |
+| `/reload` | Reload plugins and config | none |  | TUI only |
+| `/trust` | Trust this folder and load its shared project config | none |  | TUI only |
 
-The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`).
+The portable built-ins are `/compact`, `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. ACP hides `/new` and `/clear`. The ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference or reset model history. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`).
 
 ## Bundled plugin commands
 
 Bundled Lua plugins register these commands at startup. Plugin commands have higher collision priority than built-ins, so a bundled plugin can replace a built-in implementation for the targets it supports.
 
-| Command | Description | Mode | Arguments | TUI-only |
-|---------|-------------|------|-----------|----------|
-| `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | no |
-| `/build` | Switch to build mode (full tool access) | none |  | no |
-| `/memory` | View, edit, and delete memory files | none |  | yes |
-| `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | no |
-| `/rename` | Rename the current session | raw (required) |  | yes |
-| `/sessions` | Browse and switch sessions | typed | [query] | yes |
-| `/splash` | Preview and select a splash renderer | typed | [splash] | yes |
-| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | yes |
-| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | yes |
-| `/usage` | Show provider quota and focused-session token usage | none |  | yes |
+| Command | Description | Mode | Arguments | Frontends |
+|---------|-------------|------|-----------|-----------|
+| `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | all |
+| `/build` | Switch to build mode (full tool access) | none |  | all |
+| `/memory` | View, edit, and delete memory files | none |  | TUI only |
+| `/options` | Browse and change session options | none |  | TUI only |
+| `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | all |
+| `/rename` | Rename the current session | raw (required) |  | TUI only |
+| `/sessions` | Browse and switch sessions | typed | [query] | TUI only |
+| `/splash` | Preview and select a splash renderer | typed | [splash] | TUI only |
+| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | TUI only |
+| `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | TUI only |
+| `/usage` | Show provider quota and focused-session token usage | none |  | TUI only |
 
 ## Command arguments
 
@@ -73,7 +75,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`.
 - **`/thinking`**: bare opens the selector; an optional setting applies and persists the default. Completion lists the finite options supplied by the host. Positive numeric token budgets are accepted as arguments but are not suggested. Config: `always_thinking`.
-- **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
+- **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.

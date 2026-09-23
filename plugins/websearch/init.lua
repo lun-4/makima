@@ -1,18 +1,35 @@
-local EXA_MCP_ENDPOINT = "https://mcp.exa.ai/mcp"
 local REQUEST_TIMEOUT_SECS = 25
 local DEFAULT_NUM_RESULTS = 8
 
 local parse_sse_response = require("parse_sse")
+local providers = require("providers")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
 
 local opts = maki.api.register_options(output_limits.extend({
+  provider = {
+    default = "exa",
+    type = "string",
+    desc = 'Search backend: "exa" (default) or "youcom" (You.com MCP).',
+  },
   max_response_bytes = {
     default = 5 * 1024 * 1024,
     min = 1024,
     desc = "Stop reading a response after this many bytes.",
   },
 }))
+
+local provider = providers[opts.provider]
+if not provider then
+  error('websearch: unknown provider "' .. tostring(opts.provider) .. '" (expected "exa" or "youcom")')
+end
+
+-- An exported but blank variable is still truthy in lua, and a blank key
+-- means an empty auth header instead of the keyless path that would work.
+local function api_key()
+  local key = (maki.uv.os_getenv(provider.env) or ""):match("^%s*(.-)%s*$")
+  return key ~= "" and key or nil
+end
 
 local function web_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -22,7 +39,10 @@ end
 maki.api.register_tool({
   name = "websearch",
   kind = "fetch",
-  description = "Search the web for real-time information using Exa AI.\n\n"
+  permission = "net",
+  description = "Search the web for real-time information using "
+    .. provider.label
+    .. ".\n\n"
     .. "Today's date is "
     .. os.date("%Y-%m-%d")
     .. ".\n\n"
@@ -63,13 +83,8 @@ maki.api.register_tool({
       id = 1,
       method = "tools/call",
       params = {
-        name = "web_search_exa",
-        arguments = {
-          query = query,
-          numResults = num_results,
-          type = "auto",
-          livecrawl = "fallback",
-        },
+        name = provider.tool,
+        arguments = provider.arguments(query, num_results),
       },
     })
     if not payload then
@@ -78,16 +93,18 @@ maki.api.register_tool({
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
+    local key = api_key()
+
     local headers = {
       ["Content-Type"] = "application/json",
       ["Accept"] = "application/json, text/event-stream",
     }
-    local api_key = maki.uv.os_getenv("EXA_API_KEY")
-    if api_key then
-      headers["x-api-key"] = api_key
+    if key then
+      headers[provider.auth_header] = (provider.auth_prefix or "") .. key
     end
+    local endpoint = provider.endpoint .. ((not key and provider.keyless_suffix) or "")
 
-    local resp, err = maki.net.request(EXA_MCP_ENDPOINT, {
+    local resp, err = maki.net.request(endpoint, {
       method = "POST",
       body = payload,
       headers = headers,

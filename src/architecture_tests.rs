@@ -55,6 +55,91 @@ const FORBIDDEN_ACP_COMMANDS: &[&str] = &[
     "/sessions",
 ];
 
+/// Coordinator operations a running turn's lease defers, mirroring
+/// `defers_behind_lease` in the coordinator. One of these issued while a turn
+/// holds the lease waits for the turn to end, so awaiting it on the
+/// event-loop thread blocks every frame behind that turn.
+///
+/// `set_option` and `update_model_values` are deliberately absent: the lease
+/// serves them, so awaiting one does not wait for the turn.
+const LEASE_BOUND_COORDINATOR_OPS: &[&str] = &[
+    "acquire_lease",
+    "change_directory",
+    "close",
+    "replace_history",
+];
+
+/// Awaiting a lease-bound coordinator operation on the event-loop thread
+/// freezes every frame until the running turn ends, and deadlocks outright
+/// when that turn is itself waiting on the UI -- a permission prompt or a
+/// question is answered by the very loop that is blocked. The loop dispatches
+/// these through `dispatch_session_op` and applies the result when it lands.
+///
+/// This has been reintroduced twice, in call sites a reviewer would have to
+/// notice by eye, so it is enforced rather than remembered.
+#[test]
+fn the_ui_never_blocks_on_a_lease_bound_coordinator_operation() {
+    let mut offenders = Vec::new();
+    for path in rust_files(Path::new("maki-ui/src")).expect(SOURCE_SCAN_ERROR) {
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("failed to initialize Rust parser");
+        let tree = parser
+            .parse(&text, None)
+            .unwrap_or_else(|| panic!("failed to parse {}", path.display()));
+        let mut found = Vec::new();
+        blocking_coordinator_calls(tree.root_node(), text.as_bytes(), false, &mut found);
+        for op in found {
+            offenders.push(format!("{}: block_on(.. {op} ..)", path.display()));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the event loop must not await a coordinator operation; dispatch it \
+         off-thread instead:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// Collects lease-bound coordinator operations awaited inside a `block_on`.
+fn blocking_coordinator_calls(node: Node<'_>, text: &[u8], in_test: bool, out: &mut Vec<String>) {
+    let in_test = in_test || is_test_item(node, text);
+    if in_test {
+        return;
+    }
+    if node.kind() == "call_expression"
+        && let Some(function) = node.child_by_field_name("function")
+        && function
+            .utf8_text(text)
+            .is_ok_and(|name| name.rsplit("::").next() == Some("block_on"))
+        && let Some(arguments) = node.child_by_field_name("arguments")
+        && let Some(op) = awaited_coordinator_op(arguments, text)
+    {
+        out.push(op);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        blocking_coordinator_calls(child, text, in_test, out);
+    }
+}
+
+fn awaited_coordinator_op(node: Node<'_>, text: &[u8]) -> Option<String> {
+    if node.kind() == "call_expression"
+        && let Some(function) = node.child_by_field_name("function")
+        && let Ok(name) = function.utf8_text(text)
+        && let Some(method) = name.rsplit('.').next()
+        && LEASE_BOUND_COORDINATOR_OPS.contains(&method)
+    {
+        return Some(method.to_owned());
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find_map(|child| awaited_coordinator_op(child, text))
+}
+
 #[test]
 fn frontends_cannot_register_standard_commands() {
     for source in production_sources(FRONTEND_ROOTS).expect(SOURCE_SCAN_ERROR) {

@@ -53,8 +53,7 @@ const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_IMAGE_DATA: &str = "dGVzdA==";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
     "command failed: local commands cannot include non-text content";
-const FAST_UNSUPPORTED_COMMAND_ERROR: &str =
-    "command failed: Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const FAST_UNSUPPORTED_COMMAND_ERROR: &str = "command failed: Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -384,6 +383,7 @@ fn build_app_with_full(
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
+            maki_config::ProjectConfig::for_project(Path::new("/tmp")),
             Arc::default(),
         )),
         handle,
@@ -431,6 +431,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
+            maki_config::ProjectConfig::for_project(Path::new("/tmp")),
             Arc::default(),
         )),
         handle,
@@ -514,13 +515,13 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
 }
 
 fn done() -> AgentEvent {
-    AgentEvent::TurnOutcome(TurnOutcome::Completed {
-        agent_id: AgentId::generate(),
-        turn_id: TurnId::generate(),
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        reason: DoneReason::EndTurn,
-    })
+    AgentEvent::TurnOutcome(TurnOutcome::completed(
+        AgentId::generate(),
+        TurnId::generate(),
+        TokenUsage::default(),
+        1,
+        DoneReason::EndTurn,
+    ))
 }
 
 fn done_event() -> Msg {
@@ -574,6 +575,7 @@ fn subagent_info_for_agent(
         name: name.into(),
         prompt: None,
         model: None,
+        opts: None,
         answer_tx,
         input_tx,
         cancel: None,
@@ -891,7 +893,7 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
             text: "queued".into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         app.run_id,
     ));
@@ -915,7 +917,7 @@ fn queue_item_consumed_marks_agent_streaming() {
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
             text: "restored".into(),
-            image_count: 0,
+            images: Vec::new(),
         },
         app.run_id,
     ));
@@ -1151,7 +1153,7 @@ fn lifecycle_app() -> (
         UiConfig::default(),
     );
     app.input_box.set_input("/deploy a".into());
-    app.command_palette.sync("/deploy a");
+    let _ = app.command_palette.sync("/deploy a");
     settle_command_palette(&mut app);
     app.command_palette
         .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
@@ -1191,7 +1193,7 @@ fn argument_completion_retains_old_rows_while_request_pending() {
         UiConfig::default(),
     );
     app.input_box.set_input("/deploy a".into());
-    app.command_palette.sync("/deploy a");
+    let _ = app.command_palette.sync("/deploy a");
     app.command_palette.set_argument_completion(
         (8, 9),
         CommandArgumentItem {
@@ -1202,7 +1204,7 @@ fn argument_completion_retains_old_rows_while_request_pending() {
     );
 
     app.input_box.set_input("/deploy b".into());
-    app.command_palette.sync("/deploy b");
+    let _ = app.command_palette.sync("/deploy b");
     app.command_palette
         .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
     assert!(app.command_palette.completion_session_id().is_some());
@@ -1236,7 +1238,7 @@ fn unmatched_completion_items_keep_session_until_dismissal() {
         UiConfig::default(),
     );
     app.input_box.set_input("/deploy z".into());
-    app.command_palette.sync("/deploy z");
+    let _ = app.command_palette.sync("/deploy z");
     settle_command_palette(&mut app);
     app.command_palette
         .sync_arguments("/deploy z", 9, &app.state.mode.id_key());
@@ -1352,6 +1354,19 @@ fn reset_session_request_defers_autocmd_and_names_ended_session() {
         crate::components::SessionReplacementKind::Reset { ended_id }
     );
     assert_ne!(request.session.id, ended_id);
+}
+
+#[test]
+fn reset_session_carries_current_yolo() {
+    let mut app = test_app();
+    app.permissions.set_yolo(true);
+
+    let actions = app.reset_session();
+    let Action::ReplaceSession(request) = &actions[0] else {
+        panic!("expected replacement request");
+    };
+
+    assert_eq!(request.session.meta.yolo, Some(true));
 }
 
 #[test]
@@ -1498,7 +1513,7 @@ fn argument_completion_enter_fills_then_next_enter_executes() {
         UiConfig::default(),
     );
     app.input_box.set_input("/rename dråft tail".into());
-    app.command_palette.sync("/rename dråft tail");
+    let _ = app.command_palette.sync("/rename dråft tail");
     app.input_box.buffer.set_cursor(0, 11);
     app.command_palette.set_argument_completion(
         (8, 14),
@@ -1558,7 +1573,7 @@ fn scrolled_argument_completion_accepts_offscreen_candidate() {
         ui,
     );
     app.input_box.set_input("/de a".into());
-    app.command_palette.sync("/de a");
+    let _ = app.command_palette.sync("/de a");
     settle_command_palette(&mut app);
     app.command_palette.move_down();
     assert_eq!(
@@ -1633,7 +1648,7 @@ fn argument_completion_tab_preserves_command_for_next_request() {
         UiConfig::default(),
     );
     app.input_box.set_input("/de a".into());
-    app.command_palette.sync("/de a");
+    let _ = app.command_palette.sync("/de a");
     settle_command_palette(&mut app);
     app.command_palette.move_down();
     app.command_palette.set_argument_completions(
@@ -1710,7 +1725,7 @@ fn argument_completion_enter_on_exact_match_executes_immediately() {
         UiConfig::default(),
     );
     app.input_box.set_input("/rename final".into());
-    app.command_palette.sync("/rename final");
+    let _ = app.command_palette.sync("/rename final");
     app.command_palette.set_argument_completion(
         (8, 13),
         CommandArgumentItem {
@@ -2384,6 +2399,8 @@ fn restored_subagents_have_no_ago_and_are_finished() {
         tool_use_id: id.clone(),
         name: "old task".into(),
         model: None,
+        thinking: None,
+        fast: false,
     }]);
     app.state
         .session_mut()
@@ -2592,24 +2609,31 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
     );
 }
 
-#[test]
-fn compact_command_sets_streaming() {
+const COMPACT_GUIDANCE: &str = "keep the failing test names";
+const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
+
+#[test_case("/compact", None ; "no_guidance")]
+#[test_case(COMPACT_WITH_GUIDANCE, Some(COMPACT_GUIDANCE) ; "guidance_forwarded")]
+fn compact_command_sets_streaming(cmdline: &str, expected: Option<&str>) {
     let mut app = test_app();
-    let actions = app.execute_command(cmd("/compact"), 0);
-    assert!(matches!(&actions[0], Action::Compact));
+    let actions = app.execute_command(cmd(cmdline), 0);
+    assert!(
+        matches!(&actions[0], Action::Compact(instructions) if instructions.as_deref() == expected)
+    );
     assert_eq!(app.status, Status::Streaming);
 }
 
-#[test]
-fn compact_during_streaming_queues_item() {
+#[test_case("/compact" ; "bare")]
+#[test_case(COMPACT_WITH_GUIDANCE ; "guidance_shown_in_panel")]
+fn compact_during_streaming_queues_item(cmdline: &str) {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
 
-    let actions = app.execute_command(cmd("/compact"), 0);
+    let actions = app.execute_command(cmd(cmdline), 0);
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, "/compact");
+    assert_eq!(app.queue.panel_entries()[0].text, cmdline);
 }
 
 #[test]
@@ -3722,7 +3746,7 @@ fn scroll_preserves_dragging_and_updates_cursor() {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
-            app.active_chat().view(frame, area, false);
+            app.active_chat().view(frame, area, false, true);
         })
         .unwrap();
 
@@ -4287,6 +4311,19 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
 
     assert!(app.queue.is_empty());
     assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
+}
+
+#[test]
+fn loaded_session_restores_yolo() {
+    let mut app = test_app();
+    app.permissions.set_yolo(false);
+    let mut session = AppSession::new("test-model", "/tmp/test");
+    session.meta.yolo = Some(true);
+
+    let model = app.state.model.clone();
+    app.apply_loaded_session(session, &model);
+
+    assert!(app.permissions.is_yolo());
 }
 
 #[test]
@@ -5153,6 +5190,66 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
 
     assert_eq!(main_rx.try_recv().unwrap(), "");
     assert_eq!(app.pending_input, PendingInput::None);
+}
+
+/// Output that mutates a segment already on screen, rather than appending a
+/// new one, still has to be searchable. A `!` shell command does exactly this
+/// and never sets `Status::Streaming`, so the status is no guide to staleness.
+#[test]
+fn search_reaches_output_that_lands_in_an_existing_segment() {
+    const LATE_TEXT: &str = "zzarrived";
+
+    let mut app = test_app();
+    app.run_id = 1;
+    app.update(agent_msg(tool_start("tool-1", "bash")));
+    rendered(&mut app);
+    app.update(Msg::Key(kb::SEARCH.to_key_event()));
+
+    app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: "tool-1".into(),
+        tool: "bash".into(),
+        output: ToolOutput::Plain(LATE_TEXT.into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }))));
+    rendered(&mut app);
+    for c in LATE_TEXT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+
+    assert!(
+        app.search_modal.current_segment_index().is_some(),
+        "search must see output that landed in a segment opened before it"
+    );
+}
+
+/// The messages that close a turn out land after the status has already left
+/// `Streaming`, so both statuses have to reach a freshly appended segment.
+#[test_case(Status::Streaming ; "mid_turn")]
+#[test_case(Status::Idle      ; "after_the_turn_ended")]
+fn search_reaches_output_that_lands_while_the_modal_is_open(status: Status) {
+    // Nothing else in the transcript holds this string, so a hit can only come
+    // from a corpus rebuilt after the modal opened.
+    const LATE_TEXT: &str = "zzarrived";
+
+    let mut app = test_app();
+    app.status = status;
+    app.update(Msg::Key(kb::SEARCH.to_key_event()));
+
+    app.active_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        LATE_TEXT.into(),
+    ));
+    rendered(&mut app);
+    for c in LATE_TEXT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+
+    assert!(
+        app.search_modal.current_segment_index().is_some(),
+        "search must see the message that arrived after the modal opened"
+    );
 }
 
 #[test_case(42, false ; "restores_scroll_position")]
@@ -6161,7 +6258,7 @@ fn thinking_restored_from_session_meta() {
         &storage,
         &maki_config::ModelPolicy::default(),
     );
-    assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
+    assert_eq!(state.thinking, maki_domain::ThinkingConfig::Budget(4096));
 }
 
 fn set_opus_model(app: &mut App) {
@@ -6181,6 +6278,43 @@ fn fast_toggle_on_off_on_opus() {
     app.execute_command(cmd("/fast"), 0);
     assert!(!app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
+}
+
+fn pending_app() -> App {
+    let mut app = test_app();
+    app.state.model.supports_fast_override = Some(maki_providers::model::FastSupport::Pending);
+    app
+}
+
+#[test_case(false ; "kept")]
+#[test_case(true ; "cancelled")]
+fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
+    let mut app = pending_app();
+    app.set_fast(true).unwrap();
+    if cancel {
+        app.set_fast(false).unwrap();
+    }
+    assert!(!app.state.fast);
+    assert_eq!(app.state.pending_fast, !cancel);
+    assert_eq!(app.build_meta().fast, !cancel);
+
+    let mut model = app.state.model.clone();
+    model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+    app.update_model(&model);
+    assert_eq!(app.state.fast, !cancel);
+    assert!(!app.state.pending_fast);
+    assert_eq!(app.build_meta().fast, !cancel);
+}
+
+#[test]
+fn fast_command_flashes_pending_while_discovery_runs() {
+    let mut app = pending_app();
+    for expected in [FAST_PENDING_MSG, FAST_OFF_MSG] {
+        app.execute_command(cmd("/fast"), 0);
+        assert_eq!(app.status_bar.flash_text(), Some(expected));
+        assert!(!app.state.fast);
+    }
+    assert!(!app.state.pending_fast);
 }
 
 #[test]
@@ -6265,13 +6399,13 @@ fn stamped_child_tool_done_does_not_finish_the_child_turn() {
     assert_eq!(app.chats[1].in_progress_count(), 0);
 
     app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
-            agent_id: info.agent_id,
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        }),
+        event: AgentEvent::TurnOutcome(TurnOutcome::completed(
+            info.agent_id,
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        )),
         subagent: Some(info),
         run_id: 1,
     })));
@@ -6293,13 +6427,13 @@ fn outer_task_done_does_not_duplicate_stamped_child_completion() {
         run_id: 1,
     })));
     app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
-            agent_id: info.agent_id,
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        }),
+        event: AgentEvent::TurnOutcome(TurnOutcome::completed(
+            info.agent_id,
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        )),
         subagent: Some(info),
         run_id: 1,
     })));
@@ -6341,13 +6475,13 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
         run_id: 1,
     })));
 
-    app.update(envelope(TurnOutcome::Completed {
-        agent_id: AgentId::generate(),
-        turn_id: TurnId::generate(),
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        reason: DoneReason::EndTurn,
-    }));
+    app.update(envelope(TurnOutcome::completed(
+        AgentId::generate(),
+        TurnId::generate(),
+        TokenUsage::default(),
+        1,
+        DoneReason::EndTurn,
+    )));
     app.run_id = 2;
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
@@ -6379,18 +6513,18 @@ fn reusable_subagent_processes_distinct_turn_outcomes() {
         )],
         "old-run recovered history must queue a main-agent turn"
     );
-    app.update(envelope(TurnOutcome::Failed {
-        agent_id: AgentId::generate(),
-        turn_id: TurnId::generate(),
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        failure: TurnFailure {
+    app.update(envelope(TurnOutcome::failed(
+        AgentId::generate(),
+        TurnId::generate(),
+        TokenUsage::default(),
+        1,
+        TurnFailure {
             kind: TurnFailureKind::Provider,
             diagnostic: FAILURE_MESSAGE.into(),
             user_message: FAILURE_MESSAGE.into(),
             retryable: false,
         },
-    }));
+    )));
 
     assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
     assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
@@ -6460,13 +6594,13 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
         retryable: false,
     };
     app.update(subagent_msg_with_run_id(
-        AgentEvent::TurnOutcome(TurnOutcome::Failed {
-            agent_id: AgentId::generate(),
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
+        AgentEvent::TurnOutcome(TurnOutcome::failed(
+            AgentId::generate(),
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
             failure,
-        }),
+        )),
         TASK_ID,
         Some("worker"),
         1,
@@ -6492,18 +6626,18 @@ fn failed_subagent_delivery_obeys_ownership_policy(
     let mut info = subagent_info_full(TASK_ID, "worker", None, Some(input_tx));
     info.parent_is_root = parent_is_root;
     info.auto_deliver = auto_deliver;
-    let outcome = TurnOutcome::Failed {
-        agent_id: info.agent_id,
-        turn_id: TurnId::generate(),
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        failure: TurnFailure {
+    let outcome = TurnOutcome::failed(
+        info.agent_id,
+        TurnId::generate(),
+        TokenUsage::default(),
+        1,
+        TurnFailure {
             kind: TurnFailureKind::Provider,
             diagnostic: FAILURE_MESSAGE.into(),
             user_message: FAILURE_MESSAGE.into(),
             retryable: false,
         },
-    };
+    );
 
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TurnOutcome(outcome),
@@ -7428,7 +7562,7 @@ fn at_completion_insertion_synchronizes_argument_completion() {
         app.command_target.clone(),
     );
     app.input_box.set_input("/deploy @rev".into());
-    app.command_palette.sync("/deploy @rev");
+    let _ = app.command_palette.sync("/deploy @rev");
     settle_command_palette(&mut app);
     let value = app.input_box.buffer.value();
     app.sync_command_arguments(&value, app.input_box.buffer.cursor_byte_offset());
@@ -8109,7 +8243,7 @@ fn cd_completion_cursor_in_whitespace_before_path_does_not_panic() {
     let input = "/cd  ./alpha";
     app.input_box.set_input(input.into());
     app.input_box.buffer.set_cursor_byte_offset(4);
-    app.command_palette.sync(input);
+    let _ = app.command_palette.sync(input);
     app.sync_command_arguments(input, 4);
 
     assert!(app.typed_path_completion_context().is_some());
@@ -8126,7 +8260,7 @@ fn cd_completion_preserves_text_outside_path(prefix: &str, remainder: &str) {
     let input = format!("{partial}{remainder}");
     app.input_box.set_input(input.clone());
     app.input_box.buffer.set_cursor_byte_offset(partial.len());
-    app.command_palette.sync(&input);
+    let _ = app.command_palette.sync(&input);
     app.sync_command_arguments(&input, partial.len());
     app.sync_file_completion();
     converge_completion(&mut app);
@@ -8561,13 +8695,13 @@ fn submit_after_subagent_completion_routes_to_reusable_child() {
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
     let input_tx = app.subagent_channels[&agent_id].input_tx.clone();
     app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TurnOutcome(TurnOutcome::Completed {
+        event: AgentEvent::TurnOutcome(TurnOutcome::completed(
             agent_id,
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        }),
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        )),
         subagent: Some(subagent_info_for_agent(
             agent_id, TASK_ID, "research", None, input_tx,
         )),
@@ -8611,18 +8745,18 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
     assert_eq!(app.chats[chat_idx].last_message_text(), CANCELLED_TEXT);
 
     app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TurnOutcome(TurnOutcome::Failed {
+        event: AgentEvent::TurnOutcome(TurnOutcome::failed(
             agent_id,
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            failure: TurnFailure {
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            TurnFailure {
                 kind: TurnFailureKind::Provider,
                 diagnostic: LATE_FAILURE.into(),
                 user_message: LATE_FAILURE.into(),
                 retryable: false,
             },
-        }),
+        )),
         subagent: Some(info),
         run_id: 1,
     })));
@@ -10221,4 +10355,30 @@ fn defer_hint_pins_above_status_bar_until_restored() {
         !hint_row(&restored).contains("Undefer"),
         "hint clears once the demand is restored"
     );
+}
+
+#[test]
+fn plan_ready_fires_once_per_draft() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = StateDir::from_path(tmp.path().to_path_buf());
+    app.state.plan.allocate_path(&state_dir);
+    assert!(!app.state.plan.is_ready());
+
+    // First WriteDone marks plan ready
+    app.transition_plan(PlanTrigger::WriteDone);
+    assert!(app.state.plan.is_ready());
+
+    // Duplicate WriteDone while still ready does not transition again
+    app.transition_plan(PlanTrigger::WriteDone);
+    assert!(app.state.plan.is_ready());
+
+    // Interactive prompt marks plan drafting again
+    app.transition_plan(PlanTrigger::InteractivePrompt);
+    assert!(!app.state.plan.is_ready());
+
+    // Subsequent WriteDone marks plan ready for the new draft
+    app.transition_plan(PlanTrigger::WriteDone);
+    assert!(app.state.plan.is_ready());
 }

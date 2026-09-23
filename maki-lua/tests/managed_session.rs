@@ -356,13 +356,13 @@ impl ActorBackend for LuaToolBackend {
                     turn_id: context.turn_id.unwrap(),
                 };
             }
-            BackendResult::EnteredRun(TurnOutcome::Completed {
-                agent_id: context.agent_id,
-                turn_id: context.turn_id.unwrap(),
-                usage: Default::default(),
-                num_turns: 1,
-                reason: DoneReason::EndTurn,
-            })
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                Default::default(),
+                1,
+                DoneReason::EndTurn,
+            ))
         })
     }
 
@@ -379,6 +379,7 @@ impl ActorBackend for LuaToolBackend {
         &'a mut self,
         _: &'a mut History,
         _: TurnContext,
+        _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async { BackendResult::CompactDone })
     }
@@ -429,13 +430,13 @@ impl ActorBackend for NestedTaskBackend {
                     turn_id: context.turn_id.unwrap(),
                 };
             }
-            BackendResult::EnteredRun(TurnOutcome::Completed {
-                agent_id: context.agent_id,
-                turn_id: context.turn_id.unwrap(),
-                usage: Default::default(),
-                num_turns: 1,
-                reason: DoneReason::EndTurn,
-            })
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                Default::default(),
+                1,
+                DoneReason::EndTurn,
+            ))
         })
     }
 
@@ -452,6 +453,7 @@ impl ActorBackend for NestedTaskBackend {
         &'a mut self,
         _: &'a mut History,
         _: TurnContext,
+        _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async { BackendResult::CompactDone })
     }
@@ -486,13 +488,13 @@ impl ActorBackend for SpawnManagedChildBackend {
                 .admit_turn(input(), None, CORRELATION.into())
                 .unwrap();
             self.child.send((child, ticket)).unwrap();
-            BackendResult::EnteredRun(TurnOutcome::Completed {
-                agent_id: context.agent_id,
-                turn_id: context.turn_id.unwrap(),
-                usage: Default::default(),
-                num_turns: 1,
-                reason: DoneReason::EndTurn,
-            })
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                Default::default(),
+                1,
+                DoneReason::EndTurn,
+            ))
         })
     }
 
@@ -509,6 +511,7 @@ impl ActorBackend for SpawnManagedChildBackend {
         &'a mut self,
         _: &'a mut History,
         _: TurnContext,
+        _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async { BackendResult::CompactDone })
     }
@@ -606,6 +609,8 @@ fn input() -> AgentInput {
         fast: false,
         workflow: false,
         prompt: None,
+        cancel: None,
+        lease_committer: None,
     }
 }
 

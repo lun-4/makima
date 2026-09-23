@@ -8,12 +8,14 @@
 pub mod file_locks;
 mod file_tracker;
 pub mod grep;
+pub mod hook;
 pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
 pub use file_locks::FileWriteLocks;
 pub use file_tracker::FileReadTracker;
+pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
@@ -35,7 +37,7 @@ use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::{AgentConfig, AgentMode, CurrentManagedTurn, EventSender, SharedBuf};
+use crate::{AgentConfig, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
@@ -46,6 +48,7 @@ pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
     pub audience: ToolAudience,
     pub workflow: bool,
+    pub mcp: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +127,90 @@ pub fn is_tool_enabled(disabled_tools: &[String], name: &str) -> bool {
     !disabled_tools.iter().any(|s| s == name)
 }
 
+pub(crate) const TOOL_NAME_FIELD: &str = "name";
+
+/// The tool array one run sends to the model, paired with the filter that
+/// produced it. A run context carries the pair, never a loose array, so the
+/// names dispatch offers in-process (`tool_dispatch::callable`, and through it
+/// the `code_execution` sandbox) cannot drift from what the model was shown.
+#[derive(Debug, Clone)]
+pub struct RequestTools {
+    definitions: Value,
+    filter: Arc<ToolFilter>,
+}
+
+impl Default for RequestTools {
+    fn default() -> Self {
+        Self {
+            definitions: Value::Array(Vec::new()),
+            filter: Arc::default(),
+        }
+    }
+}
+
+impl RequestTools {
+    /// The one place a run's tool array is built. Host exclusions (a client
+    /// that cannot service `question`) go through here and nowhere else, so
+    /// the array and the filter always agree on them.
+    pub fn build(
+        registry: &ToolRegistry,
+        vars: &crate::template::Vars,
+        model: &Model,
+        config: &AgentConfig,
+        excluded: &[&str],
+        workflow: bool,
+        mcp: bool,
+    ) -> Self {
+        let filter = ToolFilter::from_config(config, model, excluded);
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow,
+            mcp,
+        };
+        Self {
+            definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),
+            filter: Arc::new(filter),
+        }
+    }
+
+    /// For an array the host built itself, like a Lua subagent publishing what
+    /// its caller picked. The filter is read back off that array, so the names
+    /// the model was shown and the names a script may reach are one set, and
+    /// the caller's `only`/`except` never has to be passed twice. MCP names are
+    /// never matched against this filter and stay reachable.
+    ///
+    /// An array nobody can read a name out of says nothing about intent, so it
+    /// falls back to the config's filter instead of an `Only` of nothing that
+    /// would leave the session unable to do anything. An array that is
+    /// genuinely empty is an answer, and is kept as one.
+    pub fn assembled(definitions: Value, config: &AgentConfig, model: &Model) -> Self {
+        let published: Option<Vec<String>> = definitions.as_array().and_then(|defs| {
+            let names: Vec<String> = defs
+                .iter()
+                .filter_map(|def| def[TOOL_NAME_FIELD].as_str().map(str::to_owned))
+                .collect();
+            (defs.is_empty() || !names.is_empty()).then_some(names)
+        });
+        let filter = published.map_or_else(
+            || ToolFilter::from_config(config, model, &[]),
+            ToolFilter::Only,
+        );
+        Self {
+            definitions,
+            filter: Arc::new(filter),
+        }
+    }
+
+    pub fn definitions(&self) -> &Value {
+        &self.definitions
+    }
+
+    pub fn filter(&self) -> &Arc<ToolFilter> {
+        &self.filter
+    }
+}
+
 pub const BASH_TOOL_NAME: &str = "bash";
 pub const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 pub const EDIT_TOOL_NAME: &str = "edit";
@@ -194,15 +281,56 @@ pub fn timeout_annotation(secs: u64) -> String {
     format!("{formatted} timeout")
 }
 
+/// Who made a tool call. A resumed session rebuilds its state from the `ToolUse`
+/// blocks in history, and those hold the model's own calls only, so a nested
+/// call must never change what the next request carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallOrigin {
+    /// Emitted by the model and recorded in history under its own id.
+    Model,
+    /// Made on the model's behalf and invisible to history: batch children,
+    /// `code_execution` scripts, Lua `call_tool`.
+    Nested,
+}
+
+impl CallOrigin {
+    pub fn is_model(self) -> bool {
+        matches!(self, Self::Model)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Nested => "nested",
+        }
+    }
+}
+
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
 pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
-pub type LocalTools = Arc<HashMap<String, LocalToolFn>>;
 
-pub fn local_tool<F>(f: F) -> LocalToolFn
+/// A tool the session's host supplies: an ACP client tool, a subagent's
+/// `structured_output`. Dispatch puts it ahead of the registry, so it carries
+/// its own audience: a host tool must not reach a sandbox by wearing the name
+/// of a registry tool that may.
+#[derive(Clone)]
+pub struct LocalTool {
+    pub handler: LocalToolFn,
+    pub audience: ToolAudience,
+}
+
+pub type LocalTools = Arc<HashMap<String, LocalTool>>;
+
+/// Coerces a closure into a [`LocalTool`]; the bound gives the boxed
+/// future a coercion target that `Arc::new` alone does not.
+pub fn local_tool<F>(audience: ToolAudience, f: F) -> LocalTool
 where
     F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
 {
-    Arc::new(f)
+    LocalTool {
+        handler: Arc::new(f),
+        audience,
+    }
 }
 
 /// How the `question` tool gathers user input. The interactive maki TUI
@@ -227,6 +355,7 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    pub cwd: PathBuf,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
@@ -234,6 +363,7 @@ pub struct ToolContext {
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
     pub config: AgentConfig,
+    pub tool_filter: Arc<ToolFilter>,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
@@ -242,6 +372,7 @@ pub struct ToolContext {
     pub modes: Arc<crate::ModeRegistry>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
+    pub ledger: Arc<RunLedger>,
     pub registry: Arc<ToolRegistry>,
     pub workflow: bool,
     pub audience: ToolAudience,
@@ -272,6 +403,17 @@ impl ToolContext {
     pub fn restrict_write_to(&self) -> Option<PathBuf> {
         self.modes.restrict_write_to(&self.mode)
     }
+
+    pub fn resolve_path(&self, path: &str) -> Result<String, String> {
+        resolve_path_from(path, &self.cwd)
+    }
+
+    pub fn resolve_search_path(&self, path: Option<&str>) -> Result<String, String> {
+        match path {
+            Some(path) => self.resolve_path(path),
+            None => Ok(self.cwd.to_string_lossy().into_owned()),
+        }
+    }
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -282,6 +424,11 @@ pub enum ToolLive {
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
+    let cwd = env::current_dir().map_err(|error| format!("cwd error: {error}"))?;
+    resolve_path_from(path, &cwd)
+}
+
+fn resolve_path_from(path: &str, cwd: &Path) -> Result<String, String> {
     let expanded = if let Some(rest) = path.strip_prefix("~/") {
         let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
         home.join(rest).to_string_lossy().into_owned()
@@ -293,7 +440,6 @@ pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
     };
 
     if Path::new(&expanded).is_relative() {
-        let cwd = env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
         Ok(cwd.join(&expanded).to_string_lossy().into_owned())
     } else {
         Ok(expanded)
@@ -487,6 +633,7 @@ pub fn interpreter_ctx(
         mode: mode.clone(),
         question_mode: QuestionMode::Headless,
         session_id: None,
+        cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
@@ -494,6 +641,7 @@ pub fn interpreter_ctx(
         mcp: None,
         deadline: Deadline::None,
         config: AgentConfig::default(),
+        tool_filter: Arc::default(),
         tool_output_lines: ToolOutputLines::default(),
         permissions,
         timeouts: maki_providers::Timeouts::default(),
@@ -502,6 +650,7 @@ pub fn interpreter_ctx(
         modes: Arc::new(crate::ModeRegistry::builtin()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
+        ledger: Arc::new(RunLedger::default()),
         registry,
         workflow: false,
         audience: ToolAudience::MAIN,
@@ -519,6 +668,8 @@ pub fn interpreter_ctx(
 pub fn cli_tool_ctx() -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let project_config = maki_config::ProjectConfig::discover(&cwd);
     interpreter_ctx(
         &AgentMode::Build,
         &event_tx,
@@ -529,7 +680,8 @@ pub fn cli_tool_ctx() -> ToolContext {
                 rules: vec![],
                 ..Default::default()
             },
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            cwd,
+            project_config,
             Arc::default(),
         )),
         Arc::new(FileReadTracker::new()),
@@ -547,6 +699,52 @@ pub mod test_support {
 
     pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
 
+    /// Registry and routing tests care about the name and audience only, never
+    /// about what the tool returns.
+    pub fn mock_tool(name: &str, audience: ToolAudience) -> Arc<dyn registry::Tool> {
+        Arc::new(MockTool {
+            name: name.to_owned(),
+            audience,
+        })
+    }
+
+    struct MockTool {
+        name: String,
+        audience: ToolAudience,
+    }
+
+    struct MockInvocation;
+
+    impl registry::ToolInvocation for MockInvocation {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
+        }
+    }
+
+    impl registry::Tool for MockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "mock tool".into()
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+        fn audience(&self) -> ToolAudience {
+            self.audience
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(MockInvocation))
+        }
+    }
+
     pub struct GuardedMock;
 
     struct GuardedInvocation;
@@ -555,7 +753,10 @@ pub mod test_support {
         fn start_header(&self) -> registry::HeaderFuture {
             registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
         }
-        fn permission_scopes(&self) -> registry::BoxFuture<'_, Option<registry::PermissionScopes>> {
+        fn permission_scopes(
+            &self,
+            _session_id: Option<&SessionRef>,
+        ) -> registry::BoxFuture<'_, Option<registry::PermissionScopes>> {
             Box::pin(std::future::ready(Some(
                 registry::PermissionScopes::single("guarded".into()),
             )))
@@ -593,6 +794,7 @@ pub mod test_support {
                 ..Default::default()
             },
             std::path::PathBuf::from("/tmp"),
+            maki_config::ProjectConfig::discover(Path::new("/tmp")),
             Arc::default(),
         ))
     });
@@ -621,6 +823,21 @@ pub mod test_support {
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
         ctx
+    }
+
+    pub fn stub_ctx_with_session(
+        mode: &AgentMode,
+        event_tx: Option<&EventSender>,
+        tool_use_id: Option<&str>,
+        session_id: maki_storage::id::MakiId,
+    ) -> ToolContext {
+        let mut ctx = stub_ctx_with(mode, event_tx, tool_use_id);
+        set_session(&mut ctx, session_id);
+        ctx
+    }
+
+    pub fn set_session(ctx: &mut ToolContext, session_id: maki_storage::id::MakiId) {
+        ctx.session_id = Some(SessionRef::from(session_id));
     }
 
     pub fn stub_ctx(mode: &AgentMode) -> ToolContext {
@@ -936,6 +1153,22 @@ mod tests {
 
         let no_partial = format!("{}sibling/file.txt", home.display());
         assert_eq!(relative_path(&no_partial), no_partial);
+    }
+
+    #[test]
+    fn tool_context_resolves_paths_against_session_cwd() {
+        let dir = TempDir::new().unwrap();
+        let mut ctx = test_support::stub_ctx(&AgentMode::Build);
+        ctx.cwd = dir.path().to_path_buf();
+
+        assert_eq!(
+            ctx.resolve_path("nested/file.txt").unwrap(),
+            dir.path().join("nested/file.txt").to_string_lossy()
+        );
+        assert_eq!(
+            ctx.resolve_search_path(None).unwrap(),
+            dir.path().to_string_lossy()
+        );
     }
 
     #[test]

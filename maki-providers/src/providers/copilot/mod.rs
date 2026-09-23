@@ -625,10 +625,11 @@ impl Copilot {
             tools,
             thinking,
         });
-        let resolved = super::ResolvedAuth {
-            base_url: Some(auth.endpoint.clone()),
-            headers: copilot_headers(&auth, Some("conversation-agent")),
-        };
+        let resolved = super::ResolvedAuth::new(
+            "copilot",
+            copilot_headers(&auth, Some("conversation-agent")),
+        )?
+        .with_base_url(Some(auth.endpoint.clone()));
         responses::do_stream(
             &self.client,
             model,

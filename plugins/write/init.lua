@@ -28,6 +28,7 @@ maki.api.register_tool({
   name = "write",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = DESCRIPTION,
@@ -73,7 +74,10 @@ maki.api.register_tool({
       return { llm_output = "error: content is required", is_error = true }
     end
 
-    local path = maki.fs.abspath(raw)
+    local path, path_err = ctx:resolve_path(raw)
+    if not path then
+      return { llm_output = "error: " .. tostring(path_err), is_error = true }
+    end
 
     local ok, err = ctx:check_before_edit(path)
     if not ok then

@@ -12,6 +12,7 @@ use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
+use crate::providers::KeyRotation;
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
@@ -28,8 +29,11 @@ use crate::providers::mistral::Mistral;
 use crate::providers::openai::OpenAi;
 use crate::providers::opencode::Opencode;
 use crate::providers::openrouter::OpenRouter;
+use crate::providers::regolo::Regolo;
+use crate::providers::requesty::Requesty;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
+use crate::providers::vertex::Vertex;
 use crate::providers::zai::Zai;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -40,6 +44,7 @@ pub enum ProviderKind {
     #[strum(serialize = "openai")]
     OpenAi,
     Google,
+    Vertex,
     Copilot,
     Ollama,
     LlamaCpp,
@@ -49,7 +54,9 @@ pub enum ProviderKind {
     DeepSeek,
     #[strum(serialize = "openrouter")]
     OpenRouter,
+    Requesty,
     Synthetic,
+    Regolo,
     #[strum(serialize = "tensorx")]
     TensorX,
     #[strum(serialize = "opencode")]
@@ -63,6 +70,7 @@ impl ProviderKind {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::Google => "Google",
+            Self::Vertex => "Google Vertex AI",
             Self::Copilot => "Copilot",
             Self::Ollama => "Ollama",
             Self::LlamaCpp => "LlamaCpp",
@@ -70,7 +78,9 @@ impl ProviderKind {
             Self::Zai => "Z.AI",
             Self::DeepSeek => "DeepSeek",
             Self::OpenRouter => "OpenRouter",
+            Self::Requesty => "Requesty",
             Self::Synthetic => "Synthetic",
+            Self::Regolo => "Regolo",
             Self::TensorX => "TensorX",
             Self::Opencode => "Opencode Zen",
             Self::Aperture => "Aperture",
@@ -82,6 +92,7 @@ impl ProviderKind {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Google => "GEMINI_API_KEY",
+            Self::Vertex => "",
             Self::Copilot => "GH_COPILOT_TOKEN",
             Self::Ollama => "OLLAMA_API_KEY",
             Self::LlamaCpp => "LLAMA_CPP_API_KEY",
@@ -89,7 +100,9 @@ impl ProviderKind {
             Self::Zai => "ZHIPU_API_KEY",
             Self::DeepSeek => "DEEPSEEK_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
+            Self::Requesty => "REQUESTY_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
+            Self::Regolo => "REGOLO_API_KEY",
             Self::TensorX => "TENSORX_API_KEY",
             Self::Opencode => "OPENCODE_API_KEY",
             Self::Aperture => "",
@@ -101,6 +114,7 @@ impl ProviderKind {
             Self::Anthropic => "https://api.anthropic.com/v1/messages",
             Self::OpenAi => "https://api.openai.com/v1",
             Self::Google => "https://generativelanguage.googleapis.com/v1beta",
+            Self::Vertex => "https://aiplatform.googleapis.com/v1",
             Self::Copilot => {
                 "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)"
             }
@@ -110,7 +124,9 @@ impl ProviderKind {
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::DeepSeek => "https://api.deepseek.com",
             Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::Requesty => "https://router.requesty.ai/v1",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
+            Self::Regolo => "https://api.regolo.ai/v1",
             Self::TensorX => "https://api.tensorx.ai/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
             Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
@@ -123,6 +139,9 @@ impl ProviderKind {
                 Some("Prompt caching, thinking mode (adaptive/budgeted), advanced tool use")
             }
             Self::Google => Some("Native Gemini API with thinking support"),
+            Self::Vertex => {
+                Some("Native Vertex AI Gemini API using Application Default Credentials")
+            }
             Self::Copilot => Some("Native Copilot Chat HTTP API with model endpoint discovery"),
             Self::Ollama => {
                 Some("Local or remote inference via OLLAMA_HOST, cloud fallback via OLLAMA_API_KEY")
@@ -138,6 +157,12 @@ impl ProviderKind {
             Self::OpenRouter => {
                 Some("300+ models from all providers, prompt caching, provider routing")
             }
+            Self::Requesty => Some(
+                "700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`",
+            ),
+            Self::Regolo => Some(
+                "EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API",
+            ),
             Self::Opencode => Some(
                 "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
             ),
@@ -152,7 +177,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => ModelFamily::Claude,
             Self::OpenAi => ModelFamily::Gpt,
-            Self::Google => ModelFamily::Gemini,
+            Self::Google | Self::Vertex => ModelFamily::Gemini,
             Self::Copilot => ModelFamily::Generic,
             Self::Ollama => ModelFamily::Generic,
             Self::LlamaCpp => ModelFamily::Generic,
@@ -160,7 +185,9 @@ impl ProviderKind {
             Self::Zai => ModelFamily::Glm,
             Self::DeepSeek => ModelFamily::Generic,
             Self::OpenRouter => ModelFamily::Generic,
+            Self::Requesty => ModelFamily::Generic,
             Self::Synthetic => ModelFamily::Synthetic,
+            Self::Regolo => ModelFamily::Generic,
             Self::TensorX => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
             Self::Aperture => ModelFamily::Generic,
@@ -176,7 +203,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => Some(128_000),
             Self::OpenAi => Some(100_000),
-            Self::Google => Some(65_536),
+            Self::Google | Self::Vertex => Some(65_536),
             Self::Copilot => Some(100_000),
             Self::Ollama => Some(16_384),
             Self::LlamaCpp => None,
@@ -184,7 +211,9 @@ impl ProviderKind {
             Self::Zai => Some(16_000),
             Self::DeepSeek => Some(384_000),
             Self::OpenRouter => Some(128_000),
+            Self::Requesty => Some(128_000),
             Self::Synthetic => Some(32_000),
+            Self::Regolo => Some(120_000),
             Self::TensorX => None,
             Self::Opencode => Some(128_000),
             Self::Aperture => Some(16_384),
@@ -195,7 +224,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => 200_000,
             Self::OpenAi => 200_000,
-            Self::Google => 1_000_000,
+            Self::Google | Self::Vertex => 1_000_000,
             Self::Copilot => 200_000,
             Self::Ollama => 128_000,
             Self::LlamaCpp => 128_000,
@@ -203,7 +232,9 @@ impl ProviderKind {
             Self::Zai => 128_000,
             Self::DeepSeek => 1_000_000,
             Self::OpenRouter => 200_000,
+            Self::Requesty => 200_000,
             Self::Synthetic => 128_000,
+            Self::Regolo => 120_000,
             Self::TensorX => 200_000,
             Self::Opencode => 256_000,
             Self::Aperture => 128_000,
@@ -221,6 +252,7 @@ impl ProviderKind {
             }
             Self::OpenAi => Ok(Box::new(OpenAi::new(timeouts)?)),
             Self::Google => Ok(Box::new(Google::new(timeouts)?)),
+            Self::Vertex => Ok(Box::new(Vertex::new(timeouts)?)),
             Self::Copilot => Ok(Box::new(Copilot::new(timeouts)?)),
             Self::Ollama => Ok(Box::new(LocalEndpoint::new(&OLLAMA, timeouts)?)),
             Self::LlamaCpp => Ok(Box::new(LocalEndpoint::new(&LLAMACPP, timeouts)?)),
@@ -228,7 +260,9 @@ impl ProviderKind {
             Self::Zai => Ok(Box::new(Zai::new(timeouts)?)),
             Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
             Self::OpenRouter => Ok(Box::new(OpenRouter::new(timeouts)?)),
+            Self::Requesty => Ok(Box::new(Requesty::new(timeouts)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
+            Self::Regolo => Ok(Box::new(Regolo::new(timeouts)?)),
             Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
@@ -267,8 +301,13 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async { Ok(false) })
+    /// The keys this provider rotates through, and where the current one lives.
+    /// `None` is one fixed credential that never changes. This is the only hook
+    /// for rotation: both the count and the swap come off it, so they can never
+    /// describe different pools, which is what a per-provider `rotate_key` let
+    /// happen before.
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        None
     }
 
     fn adjust_model(&self, _model: &mut Model) {}
@@ -602,6 +641,8 @@ mod tests {
 
     #[test]
     fn available_specs_apply_model_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        maki_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
         unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-model-policy") };
         let policy = policy(&["openai/*"], &["*/gpt-5.6-terra"]);
 
@@ -616,9 +657,9 @@ mod tests {
     #[test]
     fn provider_for_slug_unknown_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
-        crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
-            tmp.path().to_path_buf(),
-        ));
+        let _catalog = crate::providers::catalog::warm_empty_catalog_for_tests(
+            maki_storage::StateDir::from_path(tmp.path().to_path_buf()),
+        );
         let result = provider_for_slug("nonexistent-provider-xyz", Timeouts::default());
         match result {
             Err(e) => {

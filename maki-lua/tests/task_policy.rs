@@ -653,6 +653,7 @@ fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
         filter: &filter,
         audience: ToolAudience::GENERAL_SUB,
         workflow: false,
+        mcp: false,
     };
     for name in ["task_spawn", "task_get", "task_send", "task_despawn"] {
         assert!(
@@ -684,6 +685,7 @@ fn nested_spawn_contract_directs_managed_callers_to_blocking_task() {
         filter: &filter,
         audience: ToolAudience::GENERAL_SUB,
         workflow: false,
+        mcp: false,
     };
     let spawn_tool = reg.get("task_spawn").unwrap();
     let spawn_description = spawn_tool.tool.description(&description_ctx);

@@ -2681,8 +2681,12 @@ mod tests {
         menu.sync_query("");
         wait_for_matcher(
             &mut menu,
-            |menu| menu.session.as_ref().unwrap().file_matches.len() == 2,
-            "file matcher did not surface both files",
+            |menu| {
+                menu.session
+                    .as_ref()
+                    .is_some_and(|session| session.file_matches.len() == 2)
+            },
+            "both injected files must match before order is asserted",
         );
         let session = menu.session.as_ref().unwrap();
         let labels: Vec<_> = session

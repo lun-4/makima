@@ -8,7 +8,8 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 pub use maki_domain::{Effort, ThinkingConfig};
 use maki_domain::{FALLBACK_MAX_THINKING_BUDGET, MIN_THINKING_BUDGET};
@@ -19,6 +20,7 @@ use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
+use crate::image::{Fix, MAX_IMAGES, fix_for_wire};
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
@@ -64,10 +66,52 @@ impl<'de> Deserialize<'de> for ImageMediaType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone)]
 pub struct ImageSource {
     pub media_type: ImageMediaType,
     pub data: Arc<str>,
+    /// What [`adapt_images_for_model`] has to do with `data` before a provider
+    /// will take it, decided at most once. It describes the payload, so it
+    /// rides with it: every clone shares one verdict, and it dies with the
+    /// pixels instead of outliving them in a side table.
+    pub(crate) verdict: Arc<OnceLock<Fix>>,
+}
+
+/// The payload is the largest string a session holds, and a verdict can carry
+/// a second one, so neither belongs in a log line.
+impl fmt::Debug for ImageSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImageSource")
+            .field("media_type", &self.media_type)
+            .field("base64_len", &self.data.len())
+            .finish()
+    }
+}
+
+impl PartialEq for ImageSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.media_type == other.media_type
+            && (Arc::ptr_eq(&self.data, &other.data) || self.data == other.data)
+    }
+}
+
+impl Eq for ImageSource {}
+
+impl<'de> Deserialize<'de> for ImageSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            media_type: ImageMediaType,
+            data: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        // Base64 image payloads are the largest strings a session holds, and a
+        // load decodes each one once per record that carries it.
+        Ok(Self::new(
+            wire.media_type,
+            maki_storage::intern::shared_str(wire.data),
+        ))
+    }
 }
 
 impl Serialize for ImageSource {
@@ -83,7 +127,11 @@ impl Serialize for ImageSource {
 
 impl ImageSource {
     pub fn new(media_type: ImageMediaType, data: Arc<str>) -> Self {
-        Self { media_type, data }
+        Self {
+            media_type,
+            data,
+            verdict: Arc::default(),
+        }
     }
 
     pub fn to_data_url(&self) -> String {
@@ -93,35 +141,102 @@ impl ImageSource {
 
 pub const IMAGE_OMITTED_NOTE: &str =
     "[image omitted: the current model does not support image input]";
+/// A broken payload has to leave the request, or every turn after it fails.
+pub const IMAGE_UNUSABLE_NOTE: &str = "[image omitted: the image could not be decoded]";
+/// Past [`MAX_IMAGES`] the request itself is refused, so the oldest pixels
+/// make way rather than taking the whole session down.
+pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this conversation]";
+/// Stands in for the text of a message that carries only images, both in model
+/// context and in the transcript. One const so the two can never drift apart.
+pub const IMAGE_PLACEHOLDER: &str = "[image]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
 
-/// For models without vision, image blocks become a text note instead of a
-/// wire block the API would reject. History keeps the pixels, so switching
-/// back to a vision-capable model restores them.
-pub fn adapt_images_for_model<'a>(model: &Model, messages: &'a [Message]) -> Cow<'a, [Message]> {
-    let has_image = |m: &Message| {
-        m.content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Image { .. }))
-    };
-    if model.supports_vision() || !messages.iter().any(has_image) {
-        return Cow::Borrowed(messages);
-    }
-    let adapted = messages
+/// The last stop before the wire for every image in a request, whatever put
+/// it there. For models without vision, image blocks become a text note
+/// instead of a block the API would reject, and history keeps the pixels, so
+/// switching back to a vision-capable model restores them. For the rest,
+/// oversized payloads are rewritten to fit provider limits, because one image
+/// a provider refuses would otherwise fail every later request in the session
+/// too.
+pub async fn adapt_images_for_model<'a>(
+    model: &Model,
+    messages: &'a [Message],
+) -> Cow<'a, [Message]> {
+    // Newest first: the stale screenshots are the ones a long session can
+    // spare once the request runs out of room for them. Collected rather than
+    // walked lazily, since a borrow of `messages` held across the await below
+    // leaves callers unable to prove their own futures `Send`.
+    let images: Vec<(usize, usize, ImageSource)> = messages
         .iter()
-        .map(|m| {
-            let mut m = m.clone();
-            for block in &mut m.content {
-                if matches!(block, ContentBlock::Image { .. }) {
-                    *block = ContentBlock::Text {
-                        text: IMAGE_OMITTED_NOTE.into(),
-                    };
-                }
-            }
-            m
+        .enumerate()
+        .rev()
+        .flat_map(|(m, message)| {
+            message
+                .content
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(move |(b, block)| match block {
+                    ContentBlock::Image { source } => Some((m, b, source.clone())),
+                    _ => None,
+                })
         })
         .collect();
+    let note = |text: &str| ContentBlock::Text { text: text.into() };
+    let vision = model.supports_vision();
+    let mut edits: Vec<(usize, usize, ContentBlock)> = Vec::new();
+    // Counts survivors, not blocks, or an image nobody can read would cost a
+    // good one its place. Nothing past the cap is decoded at all.
+    let mut kept = 0;
+    for (m, b, source) in images {
+        if !vision {
+            edits.push((m, b, note(IMAGE_OMITTED_NOTE)));
+        } else if kept == MAX_IMAGES {
+            edits.push((m, b, note(IMAGE_EVICTED_NOTE)));
+        } else {
+            match fix_for_wire(&source).await {
+                Fix::Keep => kept += 1,
+                Fix::Replace(source) => {
+                    kept += 1;
+                    edits.push((m, b, ContentBlock::Image { source }));
+                }
+                Fix::Drop => edits.push((m, b, note(IMAGE_UNUSABLE_NOTE))),
+            }
+        }
+    }
+    if edits.is_empty() {
+        return Cow::Borrowed(messages);
+    }
+    // A settled image hands its cached verdict back, so once anything here
+    // needed repairing `edits` is non-empty on every later turn too. The owned
+    // slice a provider takes has to carry every message, so the untouched ones
+    // are still cloned, but only a message an edit lands on is rebuilt, and it
+    // is rebuilt out of the blocks it keeps rather than cloned whole and then
+    // written over. History keeps the originals on purpose: see above.
+    // The walk above ran newest-first, so reversing the edits lines them up
+    // with a single forward pass.
+    let mut edits = edits.into_iter().rev().peekable();
+    let mut adapted = Vec::with_capacity(messages.len());
+    for (m, message) in messages.iter().enumerate() {
+        if edits.peek().is_none_or(|&(edited, ..)| edited != m) {
+            adapted.push(message.clone());
+            continue;
+        }
+        let mut content = Vec::with_capacity(message.content.len());
+        for (b, block) in message.content.iter().enumerate() {
+            match edits.next_if(|&(edited, at, _)| (edited, at) == (m, b)) {
+                Some((.., replacement)) => content.push(replacement),
+                None => content.push(block.clone()),
+            }
+        }
+        adapted.push(Message {
+            role: message.role.clone(),
+            content,
+            display_text: message.display_text.clone(),
+            kind: message.kind,
+        });
+    }
     Cow::Owned(adapted)
 }
 
@@ -662,7 +777,8 @@ impl ThinkingConfigExt for ThinkingConfig {
                 body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
             }
             Budgeted::Tokens(n) => {
-                body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": n});
+                body["generationConfig"]["thinkingConfig"] =
+                    json!({"thinkingBudget": n, "includeThoughts": true});
             }
         }
     }
@@ -751,6 +867,26 @@ pub struct ProviderUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     pub limits: Vec<UsageLimit>,
+    /// Per-model breakdown of the current UTC day, when the provider exposes
+    /// one. The window is part of the contract: the modal labels these rows as
+    /// today's, so a provider reporting a month or a lifetime needs its own
+    /// field rather than this one. Sorted by the provider (typically spend
+    /// desc).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_model_today: Vec<ModelUsageRow>,
+}
+
+/// One row of a provider-reported per-model usage table. Money is kept as
+/// integer micro-dollars to keep `ProviderUsage` in `Eq` territory for tests;
+/// callers format at the UI layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsageRow {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    /// Spend in micro-dollars (1_000_000 = $1.00).
+    pub spend_microdollars: u64,
 }
 
 /// The kind of quota window a limit refers to, normalized across providers so
@@ -865,18 +1001,47 @@ mod tests {
         assert_eq!(ImageMediaType::from_mime(mime), expected);
     }
 
+    fn png_block(edge: usize) -> ContentBlock {
+        let data = crate::image::png_base64(edge as u32, edge as u32);
+        ContentBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from(data)),
+        }
+    }
+
+    fn unreadable_block() -> ContentBlock {
+        ContentBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
+        }
+    }
+
+    fn adapt(model: &Model, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+        let messages = vec![Message {
+            role: Role::User,
+            content,
+            ..Default::default()
+        }];
+        smol::block_on(adapt_images_for_model(model, &messages))[0]
+            .content
+            .clone()
+    }
+
+    fn image_count(blocks: &[ContentBlock]) -> usize {
+        blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .count()
+    }
+
     #[test]
-    fn adapt_images_borrows_when_model_has_vision_or_no_images() {
+    fn adapt_images_borrows_when_nothing_has_to_change() {
         let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
         let with_image = vec![Message {
             role: Role::User,
-            content: vec![ContentBlock::Image {
-                source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
-            }],
+            content: vec![png_block(32)],
             ..Default::default()
         }];
         assert!(matches!(
-            adapt_images_for_model(&model, &with_image),
+            smol::block_on(adapt_images_for_model(&model, &with_image)),
             Cow::Borrowed(_)
         ));
 
@@ -884,38 +1049,127 @@ mod tests {
         text_only_model.supports_vision_override = Some(false);
         let no_images = vec![Message::user("hi".into())];
         assert!(matches!(
-            adapt_images_for_model(&text_only_model, &no_images),
+            smol::block_on(adapt_images_for_model(&text_only_model, &no_images)),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn adapt_images_rebuilds_only_the_messages_that_change() {
+        const CAPTION: &str = "look";
+        const OVERSIZED: u32 = 2600;
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let fine = ImageSource::new(
+            ImageMediaType::Png,
+            Arc::from(crate::image::png_base64(32, 32)),
+        );
+        let carries = |content: Vec<ContentBlock>| Message {
+            role: Role::User,
+            content,
+            ..Default::default()
+        };
+        let history = vec![
+            Message::user(CAPTION.into()),
+            carries(vec![ContentBlock::Image {
+                source: fine.clone(),
+            }]),
+            carries(vec![
+                ContentBlock::Text {
+                    text: CAPTION.into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::new(
+                        ImageMediaType::Png,
+                        Arc::from(crate::image::png_base64(OVERSIZED, 30)),
+                    ),
+                },
+            ]),
+        ];
+
+        let adapted = smol::block_on(adapt_images_for_model(&model, &history));
+        assert!(matches!(adapted, Cow::Owned(_)), "the repair needs a copy");
+        assert_eq!(adapted[0].first_user_text(), Some(CAPTION));
+        let ContentBlock::Image { source } = &adapted[1].content[0] else {
+            panic!("an image nothing is wrong with must stay an image");
+        };
+        assert!(
+            Arc::ptr_eq(&source.data, &fine.data),
+            "an untouched image must not be re-encoded"
+        );
+        assert!(
+            matches!(&adapted[2].content[0], ContentBlock::Text { text } if text == CAPTION),
+            "the blocks beside a repaired one must survive"
+        );
+        let ContentBlock::Image { source } = &history[2].content[1] else {
+            panic!("history must keep its image block");
+        };
+        assert_eq!(
+            crate::image::dimensions(source),
+            (OVERSIZED, 30),
+            "only the copy going out is rewritten"
+        );
+    }
+
+    #[test]
+    fn adapt_images_shrinks_what_a_provider_would_refuse() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let oversized = ContentBlock::Image {
+            source: ImageSource::new(
+                ImageMediaType::Png,
+                Arc::from(crate::image::png_base64(2600, 30)),
+            ),
+        };
+        let text = ContentBlock::Text {
+            text: "look".into(),
+        };
+        let blocks = adapt(&model, vec![text, oversized]);
+        assert!(matches!(&blocks[0], ContentBlock::Text { .. }));
+        let ContentBlock::Image { source } = &blocks[1] else {
+            panic!("an image block must stay an image block");
+        };
+        let (width, height) = crate::image::dimensions(source);
+        assert!(
+            width.max(height) <= crate::image::MAX_EDGE,
+            "{width}x{height}"
+        );
+    }
+
+    #[test]
+    fn adapt_images_evicts_the_oldest_past_the_request_cap() {
+        const EXTRA: usize = 3;
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let blocks = adapt(&model, (1..=MAX_IMAGES + EXTRA).map(png_block).collect());
+        assert_eq!(image_count(&blocks), MAX_IMAGES);
+        assert!(
+            matches!(&blocks[EXTRA - 1], ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE),
+            "the oldest images are the ones that make way"
+        );
+        assert!(matches!(&blocks[EXTRA], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn adapt_images_drops_what_it_cannot_read_without_spending_the_cap() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let mut content = vec![png_block(1), unreadable_block()];
+        content.extend((2..=MAX_IMAGES).map(png_block));
+        let blocks = adapt(&model, content);
+        assert_eq!(image_count(&blocks), MAX_IMAGES);
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE));
     }
 
     #[test]
     fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
         model.supports_vision_override = Some(false);
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
-                ContentBlock::Image {
-                    source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
-                },
-            ],
-            ..Default::default()
-        }];
-        let adapted = adapt_images_for_model(&model, &messages);
-        assert_eq!(adapted[0].content.len(), 2);
-        assert!(matches!(
-            &adapted[0].content[0],
-            ContentBlock::ToolResult { .. }
-        ));
-        assert!(
-            matches!(&adapted[0].content[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE)
-        );
+        let tool_result = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "[image: pic.png 1KB]".into(),
+            is_error: false,
+        };
+        let blocks = adapt(&model, vec![tool_result, unreadable_block()]);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE));
     }
 
     #[test]
@@ -928,6 +1182,27 @@ mod tests {
         let deserialized: ImageSource = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.media_type, ImageMediaType::Png);
         assert_eq!(&*deserialized.data, "abc123");
+    }
+
+    /// The payloads a session repeats across records collapse to one
+    /// allocation, and only while a load is in flight.
+    #[test]
+    fn image_source_deserialize_shares_identical_payloads_within_a_load() {
+        const INTERNED_DATA: &str = "aW50ZXJuZWQtcGF5bG9hZA==";
+        const OTHER_DATA: &str = "b3RoZXItcGF5bG9hZA==";
+        let wire = |data: &str| json!({"media_type": "image/png", "data": data}).to_string();
+        let read = |data: &str| serde_json::from_str::<ImageSource>(&wire(data)).unwrap();
+
+        let (first, other) = {
+            let _scope = maki_storage::intern::Scope::enter();
+            let first = read(INTERNED_DATA);
+            assert!(Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
+            (first, read(OTHER_DATA))
+        };
+
+        assert!(!Arc::ptr_eq(&first.data, &other.data));
+        assert_eq!(&*first.data, INTERNED_DATA);
+        assert!(!Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
     }
 
     use Effort::{High, Low, Max, Minimal, XHigh};
@@ -1049,8 +1324,8 @@ mod tests {
 
     #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]
     #[test_case(ThinkingConfig::Adaptive,     json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
-    #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped")]
+    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096, "includeThoughts": true}}}) ; "budget")]
+    #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192, "includeThoughts": true}}}) ; "budget_clamped")]
     fn thinking_apply_google_thinking(config: ThinkingConfig, expected: Value) {
         let mut body = json!({});
         config.apply_google_thinking(&mut body, 8192);
@@ -1148,8 +1423,10 @@ mod tests {
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: Some(provider.family().supports_vision()),
+            supports_fast_override: None,
             pricing: crate::model::ModelPricing::default(),
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
         }

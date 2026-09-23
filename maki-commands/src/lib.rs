@@ -24,12 +24,13 @@ pub use completion::{
 pub use completion_providers::{CompletionKind, CompletionProviders};
 pub use dispatch::{
     AgentTurn, CommandAttachment, CommandBehavior, CommandContent, CommandError, CommandHost,
-    CommandInvocation, CommandOutcome, HostRequest, HostResponse, InputDispatch, PromptReference,
-    RegistrationError, ResolutionError, ResolvedCommand, ResolvedInput, SlashClass, classify_input,
+    CommandInvocation, CommandOutcome, FrontendFeedback, HostRequest, HostResponse, InputDispatch,
+    IsolatedTurn, PromptReference, RegistrationError, ResolutionError, ResolvedCommand,
+    ResolvedInput, SlashClass, classify_input,
 };
 pub use registry::{
     CommandRegistry, PreparedTarget, PresentedCommand, Producer, ProducerPrecedence,
-    RegistrySnapshot, RegistrySubscription, TargetHandle,
+    RegistrySnapshot, RegistrySubscription, TargetHandle, validate_registrations,
 };
 pub use spec::{
     BUILTIN_COMMANDS, BuiltinDefinition, BuiltinId, BuiltinOperation, COMPACT_COMMAND_NAME,

@@ -65,10 +65,6 @@ pub struct Cli {
     #[arg(long)]
     pub no_commands: bool,
 
-    /// Disable rtk command rewriting
-    #[arg(long)]
-    pub no_rtk: bool,
-
     /// Skip user `init.lua` files (global and project) but keep the Lua
     /// host and every builtin plugin running, so tools and the default
     /// keymap still load. Use this to recover from a broken `init.lua`
@@ -88,6 +84,12 @@ pub struct Cli {
     /// Gate every bash command through the auto-mode classifier
     #[arg(long)]
     pub automode: bool,
+
+    /// Load shared project `.makima` config for this run without asking and
+    /// without recording an answer. For containers and CI, where the state
+    /// directory is thrown away anyway. Only use it on a project you trust.
+    #[arg(long)]
+    pub trust: bool,
 
     /// Exit after the agent completes (for automation workflows)
     #[arg(long)]
@@ -209,7 +211,11 @@ pub enum Command {
         action: AuthAction,
     },
     /// List all available models
-    Models,
+    Models {
+        /// Refetch the models.dev catalog, ignoring its 24h cache
+        #[arg(long)]
+        refresh: bool,
+    },
     /// List stored sessions as JSON
     Sessions {
         #[arg(long)]
@@ -265,6 +271,30 @@ pub enum Command {
         #[command(subcommand)]
         action: MigrateAction,
     },
+    /// Manage projects that may load automatic shared project configuration
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TrustAction {
+    /// Trust a project to load automatic shared .makima configuration
+    Add {
+        /// Project to trust. Defaults to the current directory
+        path: Option<PathBuf>,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove a stored project trust decision
+    Remove {
+        /// Project to remove. Defaults to the current directory
+        path: Option<PathBuf>,
+    },
+    /// List stored project trust decisions
+    List,
 }
 
 #[derive(Subcommand)]

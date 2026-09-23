@@ -11,6 +11,10 @@ use maki_agent::types::{ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteE
 use maki_providers::{ContentBlock as MsgBlock, ImageMediaType, Message, Role as MsgRole};
 
 const MIN_FENCE_LEN: usize = 3;
+const WRITE_TOOL: &str = "write";
+/// One task pumps every session update, so reading a giant file to render a
+/// diff nobody can read would stall the whole stream.
+const MAX_DIFF_OLD_TEXT_BYTES: u64 = 256 * 1024;
 /// ACP has no block-boundary primitive, so consecutive thinking chunks are
 /// kept visually separate with a paragraph break.
 const THINKING_SEPARATOR: &str = "\n\n";
@@ -95,9 +99,92 @@ pub fn tool_pending(id: &str, name: &str) -> SessionUpdate {
     )
 }
 
+pub fn local_operation_pending(id: &str, title: &str) -> SessionUpdate {
+    SessionUpdate::ToolCall(
+        ToolCall::new(ToolCallId::from(id.to_string()), title.to_string())
+            .status(ToolCallStatus::Pending),
+    )
+}
+
+pub fn local_operation_started(id: &str) -> SessionUpdate {
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(id.to_string()),
+        ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+    ))
+}
+
+pub fn tool_execution_start(id: &str) -> SessionUpdate {
+    local_operation_started(id)
+}
+
+pub fn permission_request(
+    id: &str,
+    title: String,
+    tool: &str,
+    raw_input: Option<&serde_json::Value>,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> ToolCallUpdate {
+    let mut fields = ToolCallUpdateFields::new()
+        .title(title)
+        .status(ToolCallStatus::Pending);
+
+    if let Some(raw_input) = raw_input {
+        fields = fields.kind(tool_kind(tool)).raw_input(raw_input.clone());
+
+        let locations = tool_locations(tool, Some(raw_input), cwd, home);
+        if !locations.is_empty() {
+            fields = fields.locations(locations);
+        }
+
+        if let Some(diff) = write_diff(tool, raw_input, cwd, home) {
+            fields = fields.content(vec![ToolCallContent::Diff(diff)]);
+        }
+    }
+
+    ToolCallUpdate::new(ToolCallId::from(id.to_string()), fields)
+}
+
+fn write_diff(
+    tool: &str,
+    raw_input: &serde_json::Value,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Option<Diff> {
+    if tool != WRITE_TOOL {
+        return None;
+    }
+    let new_text = raw_input.get("content")?.as_str()?;
+    let path = resolve_path(input_path(raw_input)?, cwd, home)?;
+
+    let old_text = match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > MAX_DIFF_OLD_TEXT_BYTES || !meta.is_file() => return None,
+        Ok(_) => std::fs::read_to_string(&path).ok(),
+        Err(_) => None,
+    };
+    Some(Diff::new(path, new_text.to_string()).old_text(old_text))
+}
+
+pub fn local_operation_terminal(id: &str, error: Option<&str>) -> SessionUpdate {
+    let mut fields = ToolCallUpdateFields::new().status(if error.is_some() {
+        ToolCallStatus::Failed
+    } else {
+        ToolCallStatus::Completed
+    });
+    if let Some(error) = error {
+        fields = fields.content(vec![ToolCallContent::Content(Content::new(
+            ContentBlock::Text(TextContent::new(error.to_string())),
+        ))]);
+    }
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+        ToolCallId::from(id.to_string()),
+        fields,
+    ))
+}
+
 pub fn tool_start(event: &ToolStartEvent, cwd: &Path, home: Option<&Path>) -> SessionUpdate {
     let mut fields = ToolCallUpdateFields::new()
-        .status(ToolCallStatus::InProgress)
+        .status(ToolCallStatus::Pending)
         .title(event.summary.clone());
 
     if let Some(raw) = &event.raw_input {
@@ -282,7 +369,7 @@ pub fn tool_done(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Sess
 
 pub fn map_done_reason(reason: DoneReason) -> StopReason {
     match reason {
-        DoneReason::EndTurn => StopReason::EndTurn,
+        DoneReason::EndTurn | DoneReason::Compact => StopReason::EndTurn,
         DoneReason::MaxTokens => StopReason::MaxTokens,
         DoneReason::MaxTurns => StopReason::MaxTurnRequests,
     }
@@ -575,10 +662,10 @@ mod tests {
     fn replay_user_image_keeps_mime_type() {
         let msg = Message::user_with_images(
             String::new(),
-            vec![ImageSource {
-                media_type: ImageMediaType::Png,
-                data: std::sync::Arc::from("b64data"),
-            }],
+            vec![ImageSource::new(
+                ImageMediaType::Png,
+                std::sync::Arc::from("b64data"),
+            )],
         );
         let json = updates_json(&[msg]);
         assert_eq!(json.len(), 1);
@@ -816,6 +903,105 @@ mod tests {
         assert_eq!(json["used"], 60_000);
         assert_eq!(json["size"], 200_000);
         assert!(json.get("cost").is_none(), "{json}");
+    }
+
+    const EDIT_TOOL: &str = "edit";
+    const PERMISSION_ID: &str = "tu-perm";
+    const PERMISSION_TITLE: &str = "write: src/main.rs";
+    const REL_PATH: &str = "src/main.rs";
+    const ABS_PATH: &str = "/home/user/project/src/main.rs";
+    const OLD_TEXT: &str = "fn main() {}\n";
+    const NEW_TEXT: &str = "fn main() { run() }\n";
+
+    fn permission_json(
+        tool: &str,
+        raw_input: Option<&serde_json::Value>,
+        cwd: &Path,
+    ) -> serde_json::Value {
+        let update = permission_request(
+            PERMISSION_ID,
+            PERMISSION_TITLE.to_string(),
+            tool,
+            raw_input,
+            cwd,
+            Some(Path::new(HOME)),
+        );
+        serde_json::to_value(update).unwrap()
+    }
+
+    fn write_permission_json(dir: &Path) -> serde_json::Value {
+        permission_json(
+            WRITE_TOOL,
+            Some(&json!({"path": REL_PATH, "content": NEW_TEXT})),
+            dir,
+        )
+    }
+
+    #[test_case(WRITE_TOOL, json!({"path": REL_PATH, "content": NEW_TEXT}), true ; "write_input_gets_a_diff")]
+    #[test_case(EDIT_TOOL, json!({"path": REL_PATH, "old_string": "a", "new_string": "b"}), false ; "edit_input_has_no_diff")]
+    fn permission_update_carries_file_context(
+        tool: &str,
+        raw_input: serde_json::Value,
+        has_diff: bool,
+    ) {
+        let json = permission_json(tool, Some(&raw_input), Path::new(CWD));
+        assert_eq!(json["toolCallId"], PERMISSION_ID);
+        assert_eq!(json["title"], PERMISSION_TITLE);
+        assert_eq!(json["rawInput"], raw_input);
+        assert_eq!(json["locations"], json!([{"path": ABS_PATH}]));
+        assert_eq!(!json["content"].is_null(), has_diff, "{json}");
+        assert!(!json["kind"].is_null(), "{json}");
+    }
+
+    #[test_case(None, None ; "a_new_file_has_no_old_text")]
+    #[test_case(Some(OLD_TEXT.to_string()), Some(OLD_TEXT) ; "an_existing_file_diffs_against_disk")]
+    fn write_permission_diffs_against_the_file_on_disk(
+        on_disk: Option<String>,
+        expected_old: Option<&str>,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(REL_PATH);
+        if let Some(contents) = on_disk {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+        }
+
+        let json = write_permission_json(dir.path());
+        assert_eq!(json["content"][0]["type"], "diff");
+        assert_eq!(json["content"][0]["path"], path.to_str().unwrap());
+        assert_eq!(json["content"][0]["newText"], NEW_TEXT);
+        assert_eq!(json["content"][0]["oldText"], json!(expected_old));
+    }
+
+    #[test]
+    fn write_permission_skips_the_diff_for_an_oversized_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "x".repeat(MAX_DIFF_OLD_TEXT_BYTES as usize + 1)).unwrap();
+
+        let json = write_permission_json(dir.path());
+        assert!(json["content"].is_null(), "{json}");
+        assert_eq!(json["rawInput"]["content"], NEW_TEXT);
+    }
+
+    #[test]
+    fn write_permission_skips_the_diff_for_a_path_that_is_not_a_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(REL_PATH)).unwrap();
+
+        let json = write_permission_json(dir.path());
+        assert!(json["content"].is_null(), "{json}");
+    }
+
+    #[test]
+    fn permission_update_without_cached_input_is_title_only() {
+        let json = permission_json(WRITE_TOOL, None, Path::new(CWD));
+        assert_eq!(json["toolCallId"], PERMISSION_ID);
+        assert_eq!(json["title"], PERMISSION_TITLE);
+        for field in ["kind", "locations", "rawInput", "content"] {
+            assert!(json[field].is_null(), "{field} must stay unset: {json}");
+        }
     }
 
     #[test]

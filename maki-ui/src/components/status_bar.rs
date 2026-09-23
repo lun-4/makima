@@ -15,6 +15,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use tracing::info;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
@@ -22,6 +23,9 @@ use crate::repaint::{Cadence, Dirty};
 const TRUNCATE_PREFIX: &str = "..";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
+const RESTRICTED_LABEL: &str = " [restricted]";
+const YOLO_LABEL: &str = " [yolo]";
+const YOLO_DIM_FACTOR: f32 = 0.15;
 const SUBAGENT_LABEL_PREFIX: &str = "\u{21b3} ";
 
 /// Distinct footer badge for a focused subagent chat, contrasted with the
@@ -44,13 +48,22 @@ pub struct StatusBarContext<'a> {
     pub status: &'a Status,
     pub mode_label: Cow<'static, str>,
     pub mode_style: Style,
+    /// The model the visible turn is running on, or the session's model when
+    /// idle.
     pub model_id: &'a str,
+    /// Set when a model change has been adopted but the run has not reached
+    /// its next request yet. Showing the new name would claim a switch that
+    /// has not happened; showing only the old one would look like the change
+    /// was ignored.
+    pub model_switch_queued: bool,
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub retry_info: Option<&'a RetryInfo>,
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
+    pub yolo: bool,
+    pub restricted: bool,
     pub restoring: bool,
     pub status_content: Option<&'a StatusContentSnapshot>,
     pub suppress_status_content: bool,
@@ -78,7 +91,12 @@ impl StatusBar {
         }
     }
 
+    /// The single place a flash is set. Some failures surface nowhere else,
+    /// and a flash is gone within seconds, so mirror it to the log: tracing a
+    /// reported error afterwards should not depend on catching the status bar
+    /// before it clears.
     pub fn flash(&mut self, msg: String) {
+        info!(flash = %msg, "status flash");
         self.flash = Some((msg, Instant::now()));
     }
 
@@ -178,9 +196,17 @@ impl StatusBar {
 
         let mut right_spans = Vec::new();
 
+        let yolo_span = ctx.yolo.then(|| {
+            Span::styled(
+                YOLO_LABEL,
+                theme::dim_style(theme::current().error, YOLO_DIM_FACTOR),
+            )
+        });
+
         match ctx.status {
             Status::Error { message: e, .. } => {
                 left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
+                right_spans.extend(yolo_span);
             }
             _ => {
                 let pct = if ctx.stats.context_window > 0 {
@@ -203,6 +229,12 @@ impl StatusBar {
                 }
                 if ctx.workflow {
                     rest_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
+                }
+                if ctx.restricted {
+                    rest_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
+                }
+                if let Some(span) = yolo_span {
+                    rest_spans.push(span);
                 }
 
                 let context_text = format!(
@@ -231,7 +263,12 @@ impl StatusBar {
                 let left_width: usize = left_spans.iter().map(Span::width).sum();
                 let rest_width: usize = rest_spans.iter().map(Span::width).sum();
                 let available = (area.width as usize).saturating_sub(left_width + rest_width);
-                let model_min_width = 8.min(ctx.model_id.width());
+                let model_text = if ctx.model_switch_queued {
+                    Cow::Owned(format!("{} {MODEL_SWITCH_QUEUED}", ctx.model_id))
+                } else {
+                    Cow::Borrowed(ctx.model_id)
+                };
+                let model_min_width = 8.min(model_text.width());
                 let plugin_spans = if !ctx.suppress_status_content {
                     ctx.status_content
                         .map(|snapshot| {
@@ -245,7 +282,10 @@ impl StatusBar {
                     Vec::new()
                 };
                 let plugin_width: usize = plugin_spans.iter().map(Span::width).sum();
-                let model = truncate_tail(ctx.model_id, available.saturating_sub(plugin_width));
+                // `truncate_tail` keeps the tail, so a narrow bar collapses to
+                // the incoming model, which is the half worth keeping.
+                let model =
+                    truncate_tail(&model_text, available.saturating_sub(plugin_width)).into_owned();
 
                 right_spans.push(Span::styled(model, theme::current().status_dim));
                 right_spans.append(&mut rest_spans);
@@ -330,6 +370,10 @@ fn truncate_head(s: &str, max_width: usize) -> Cow<'_, str> {
         .unwrap_or(0);
     Cow::Owned(s[..end].to_owned())
 }
+
+/// Marks a model change adopted but not yet reached by the run, which picks
+/// one up at its next request rather than mid-flight.
+const MODEL_SWITCH_QUEUED: &str = "[switch queued]";
 
 pub(crate) fn truncate_tail(s: &str, max_width: usize) -> Cow<'_, str> {
     if s.width() <= max_width {
@@ -446,6 +490,14 @@ mod tests {
     const SIGMA: char = '\u{03a3}';
 
     fn render_context(status_content: Option<&StatusContentSnapshot>, width: u16) -> String {
+        render_context_with(status_content, width, false)
+    }
+
+    fn render_context_with(
+        status_content: Option<&StatusContentSnapshot>,
+        width: u16,
+        model_switch_queued: bool,
+    ) -> String {
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
@@ -455,6 +507,7 @@ mod tests {
             mode_label: Cow::Borrowed("build"),
             mode_style: Style::default(),
             model_id: MODEL_ID,
+            model_switch_queued,
             stats: UsageStats {
                 global_cost: None,
                 context_size: CONTEXT_SIZE,
@@ -467,6 +520,8 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            yolo: false,
+            restricted: false,
             restoring: false,
             status_content,
             suppress_status_content: false,
@@ -488,6 +543,24 @@ mod tests {
         let plugin = text.find("PLUGIN").unwrap();
         assert!(model < context && context < cost && cost < plugin, "{text}");
         assert!(text.trim_end().ends_with("PLUGIN"), "{text}");
+    }
+
+    /// A run picks a changed model up at its next request, so between the
+    /// change and that request the bar has to say the switch is pending: the
+    /// new name alone would claim a switch that has not happened, and the old
+    /// name alone looks like the change was ignored.
+    #[test]
+    fn status_bar_marks_a_queued_model_switch() {
+        let text = render_context_with(None, 120, true);
+        assert!(text.contains(MODEL_ID), "the running model stays: {text}");
+        assert!(text.contains(MODEL_SWITCH_QUEUED), "{text}");
+    }
+
+    #[test]
+    fn status_bar_without_a_queued_switch_shows_only_the_model() {
+        let text = render_context_with(None, 120, false);
+        assert!(text.contains(MODEL_ID), "{text}");
+        assert!(!text.contains(MODEL_SWITCH_QUEUED), "{text}");
     }
 
     #[test]
@@ -542,6 +615,7 @@ mod tests {
             mode_label: "build".into(),
             mode_style: Style::new(),
             model_id: MODEL_ID,
+            model_switch_queued: false,
             stats: UsageStats {
                 global_cost,
                 context_size: CONTEXT_SIZE,
@@ -554,12 +628,86 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            yolo: false,
+            restricted: false,
             restoring: false,
             status_content: None,
             suppress_status_content: false,
         };
         terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    /// A restricted folder says so for the whole session: the startup card is
+    /// long gone by the time the user wonders why their project config did
+    /// nothing.
+    #[test_case(true  => true  ; "a_restricted_folder_says_so")]
+    #[test_case(false => false ; "a_trusted_folder_stays_quiet")]
+    fn the_bar_advertises_restricted(restricted: bool) -> bool {
+        let bar = StatusBar::new(FLASH_TTL);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+        let ctx = StatusBarContext {
+            status: &Status::Idle,
+            mode_label: Cow::Borrowed("NORMAL"),
+            mode_style: Style::default(),
+            model_id: MODEL_ID,
+            model_switch_queued: false,
+            stats: UsageStats {
+                global_cost: None,
+                context_size: CONTEXT_SIZE,
+                cost: Some(CHAT_COST),
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                show_global: false,
+            },
+            auto_scroll: true,
+            retry_info: None,
+            thinking_label: None,
+            fast: false,
+            workflow: false,
+            yolo: false,
+            restricted,
+            restoring: false,
+            status_content: None,
+            suppress_status_content: false,
+        };
+        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+            .contains(RESTRICTED_LABEL.trim())
+    }
+
+    #[test_case(true  => true  ; "a_bypassed_session_says_so")]
+    #[test_case(false => false ; "a_prompting_session_stays_quiet")]
+    fn the_bar_advertises_yolo(yolo: bool) -> bool {
+        let bar = StatusBar::new(FLASH_TTL);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+        let ctx = StatusBarContext {
+            status: &Status::Idle,
+            mode_label: Cow::Borrowed("NORMAL"),
+            mode_style: Style::default(),
+            model_id: MODEL_ID,
+            model_switch_queued: false,
+            stats: UsageStats {
+                global_cost: None,
+                context_size: CONTEXT_SIZE,
+                cost: Some(CHAT_COST),
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                show_global: false,
+            },
+            auto_scroll: true,
+            retry_info: None,
+            thinking_label: None,
+            fast: false,
+            workflow: false,
+            yolo,
+            restricted: false,
+            restoring: false,
+            status_content: None,
+            suppress_status_content: false,
+        };
+        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer()).contains(YOLO_LABEL.trim())
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it
@@ -727,6 +875,7 @@ mod tests {
             mode_label: Cow::Borrowed("NORMAL"),
             mode_style: Style::default(),
             model_id: "model",
+            model_switch_queued: false,
             stats: UsageStats {
                 global_cost: None,
                 context_size: 0,
@@ -739,6 +888,8 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            yolo: false,
+            restricted: false,
             restoring: false,
             status_content: None,
             suppress_status_content: false,

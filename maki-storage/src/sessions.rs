@@ -8,7 +8,7 @@
 //! Legacy `.json` files are loaded transparently and converted to `.jsonl` on next save.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -17,8 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use tracing::{info, warn};
+use uuid::Uuid;
 
-use crate::id::{MakiId, MakiIdParseError};
+use crate::id::MakiId;
+use crate::paths::canonical_key;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -73,12 +75,8 @@ pub enum SessionError {
     VersionMismatch { found: u32, expected: u32 },
     #[error("session ID mismatch: log owns {log_id}, got {given_id}")]
     IdMismatch { log_id: MakiId, given_id: MakiId },
-    #[error("session log {path} has header id {raw_id:?} that is not a valid id: {source}")]
-    CorruptHeaderId {
-        path: String,
-        raw_id: String,
-        source: MakiIdParseError,
-    },
+    #[error("session log {path} has no valid header")]
+    MissingHeader { path: String },
     #[error("session log diverged ({reason}); rewrite required")]
     LogDiverged { reason: &'static str },
     #[error("session is open in another terminal; close it there first")]
@@ -159,6 +157,12 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
+    /// `None` when the user never set yolo for this session, which is what
+    /// makes `--yolo` a property of the invocation rather than of the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_options: BTreeMap<String, String>,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
@@ -167,6 +171,12 @@ pub struct SessionMeta {
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
     pub messages: Arc<Vec<M>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryIdentity {
+    epoch: u64,
+    len: usize,
 }
 
 impl<M> HistorySnapshot<M> {
@@ -302,6 +312,12 @@ pub struct StoredSubagent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Absent on subagents written before this was recorded, and the one flag
+    /// that says whether `fast` below is the subagent's or just a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<StoredThinking>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Deserialize)]
@@ -819,16 +835,6 @@ fn append_record<R: Serialize>(buf: &mut Vec<u8>, record: &R) -> Result<(), Sess
 
 /// Tag-only probe used to classify a line that failed the strict `LogRecord`
 /// parse: distinguishes a header with a bad id from a genuinely unknown record.
-#[derive(Deserialize)]
-#[serde(tag = "t", rename_all = "lowercase")]
-enum RawTag {
-    Header {
-        id: String,
-    },
-    #[serde(other)]
-    Other,
-}
-
 fn load_jsonl<M, U, T>(data: &[u8], display_path: &str) -> Result<Session<M, U, T>, SessionError>
 where
     M: DeserializeOwned,
@@ -850,8 +856,6 @@ where
     let mut subagents = Vec::new();
     let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
-    let mut got_header = false;
-
     for line in data.split(|&b| b == b'\n') {
         line_count += 1;
         if line.is_empty() {
@@ -860,16 +864,6 @@ where
         let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
             Err(e) => {
-                if !got_header
-                    && let Ok(RawTag::Header { id: raw_id }) = serde_json::from_slice(line)
-                    && let Err(source) = raw_id.parse::<MakiId>()
-                {
-                    return Err(SessionError::CorruptHeaderId {
-                        path: display_path.to_string(),
-                        raw_id,
-                        source,
-                    });
-                }
                 warn!(
                     path = display_path,
                     error = %e,
@@ -897,7 +891,6 @@ where
                 model = h_model;
                 cwd = h_cwd;
                 created_at = h_created;
-                got_header = true;
             }
             LogRecord::Msg { d } => messages.push(d),
             LogRecord::Out { id: out_id, d } => {
@@ -924,7 +917,9 @@ where
         }
     }
 
-    let id = id.ok_or(StorageError::NotFound(display_path.to_string()))?;
+    let id = id.ok_or_else(|| SessionError::MissingHeader {
+        path: display_path.to_string(),
+    })?;
 
     Ok(Session {
         version: SESSION_VERSION,
@@ -958,6 +953,38 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
         .ok()
         .and_then(|data| serde_json::from_slice(&data).ok())
         .unwrap_or_default()
+}
+
+/// The directories sessions were recorded in, most recently used first and at
+/// most `limit` of them.
+///
+/// The index is append only and the caller pays filesystem work per entry, so
+/// a limit is what keeps a long history off a startup path. Order comes from
+/// the session id, which is a UUIDv7 and carries the time it was made, so a
+/// history over the limit keeps the directories somebody still works in. A
+/// legacy v4 id has no time in it and sorts last.
+///
+/// Keys go through `canonical_key`, because the index holds whatever string a
+/// session was saved with while callers compare against canonicalized paths: a
+/// symlinked home would otherwise hide a folder's own history from it. A key
+/// that is not valid UTF-8 is dropped, because the callers store what they get
+/// back as text and a lossy path must never stand in for a real one.
+pub(crate) fn recorded_cwds(sessions_dir: &Path, limit: usize) -> Vec<String> {
+    let mut entries: Vec<(Option<(u64, u32)>, String)> = load_cwd_index(sessions_dir)
+        .into_iter()
+        .map(|(cwd, session_id)| (session_time(&session_id), cwd))
+        .collect();
+    entries.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    entries.truncate(limit);
+    entries
+        .into_iter()
+        .filter_map(|(_, cwd)| canonical_key(Path::new(&cwd)).to_str().map(str::to_owned))
+        .collect()
+}
+
+fn session_time(session_id: &str) -> Option<(u64, u32)> {
+    let id: MakiId = session_id.parse().ok()?;
+    Some(Uuid::from_bytes(*id.as_bytes()).get_timestamp()?.to_unix())
 }
 
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
@@ -1270,6 +1297,9 @@ where
     T: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
+    // Held across both formats: either one decodes the same image payload once
+    // per record that mentions it.
+    let _intern = crate::intern::Scope::enter();
     let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
         load_jsonl(&data, &path.display().to_string())?
     } else {
@@ -1324,6 +1354,20 @@ where
 
     pub fn messages(&self) -> &[M] {
         &self.messages
+    }
+
+    pub fn history_identity(&self) -> HistoryIdentity {
+        HistoryIdentity {
+            epoch: self.epoch,
+            len: self.messages.len(),
+        }
+    }
+
+    pub fn history_snapshot(&self) -> HistorySnapshot<M> {
+        HistorySnapshot {
+            epoch: self.epoch,
+            messages: Arc::clone(&self.messages),
+        }
     }
 
     pub fn take_messages(self) -> Vec<M> {
@@ -1382,7 +1426,11 @@ where
     }
 
     pub fn replace_messages(&mut self, messages: Vec<M>) {
-        self.messages = Arc::new(messages);
+        self.replace_shared_messages(Arc::new(messages));
+    }
+
+    pub fn replace_shared_messages(&mut self, messages: Arc<Vec<M>>) {
+        self.messages = messages;
         self.rewrite_messages();
     }
 
@@ -1396,7 +1444,7 @@ where
 
     /// Adopting a producer's snapshot inherits its run token, so the log's
     /// cursors survive exactly when the snapshot was an append.
-    fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
+    pub fn adopt_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
         self.touch();
@@ -1422,7 +1470,7 @@ where
         }
         let session = Arc::make_mut(this);
         if let Some(snapshot) = history {
-            session.set_history(snapshot);
+            session.adopt_history(snapshot);
             // The title comes from the messages, so it goes stale exactly when
             // they move.
             session.update_title_if_default();
@@ -1756,6 +1804,8 @@ mod tests {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
+                thinking: None,
+                fast: false,
             }
         }
 
@@ -2847,7 +2897,7 @@ mod tests {
     }
 
     #[test]
-    fn load_surfaces_corrupt_header_id() {
+    fn load_with_corrupt_header_id_reports_missing_header() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let id = MakiId::generate();
@@ -2864,7 +2914,7 @@ mod tests {
         fs::write(&path, corrupted).unwrap();
 
         let err = TestSession::load_from(id, dir).unwrap_err();
-        assert!(matches!(err, SessionError::CorruptHeaderId { .. }));
+        assert!(matches!(err, SessionError::MissingHeader { .. }));
     }
 
     #[test]
@@ -3004,7 +3054,11 @@ mod tests {
         write_legacy_jsonl(&path, &s);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         // The crash happened between the record's closing brace and the
-        // newline the writer emits after it.
+        // newline the writer emits after it. Written literally, because the
+        // scan matches MSG_PREFIX against the head of the line: a `json!`
+        // round-trip orders keys by whether serde_json has `preserve_order`,
+        // which is a workspace-wide feature this crate does not ask for, so
+        // building the record that way passes or fails with the build graph.
         file.write_all(br#"{"t":"msg","d":{"role":"user"}}"#)
             .unwrap();
         drop(file);
@@ -3015,6 +3069,24 @@ mod tests {
             TestSession::load_from(s.id, dir).unwrap().messages().len(),
             2
         );
+    }
+
+    #[test]
+    fn session_meta_default_yolo_is_none() {
+        let meta = SessionMeta::default();
+        assert!(meta.yolo.is_none());
+    }
+
+    #[test]
+    fn session_meta_yolo_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("test/model", "/tmp");
+        session.meta.yolo = Some(true);
+        session.save_to(dir).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.meta.yolo, Some(true));
     }
 
     #[test]
@@ -3212,7 +3284,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_header_line_only_returns_not_found() {
+    fn corrupt_header_line_only_reports_missing_header() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let id: MakiId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
@@ -3220,10 +3292,7 @@ mod tests {
         fs::write(&path, "NOT_A_HEADER\n").unwrap();
 
         let err = TestSession::load_from(id, dir).unwrap_err();
-        assert!(matches!(
-            err,
-            SessionError::Storage(StorageError::NotFound(_))
-        ));
+        assert!(matches!(err, SessionError::MissingHeader { .. }));
     }
 
     #[test]

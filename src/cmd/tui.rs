@@ -11,7 +11,8 @@ use crossterm::style::Stylize;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::{Config, load_env_files, load_permissions};
+use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
+use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
@@ -26,7 +27,14 @@ use crate::setup;
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const PICKER_NEEDS_TUI_ERR: &str = "continuing without a session ID opens the session picker, which needs the TUI; run `makima sessions --json` to list session IDs";
+
+/// A project `.env` is loaded exactly once, when a folder that was not trusted
+/// becomes trusted. Every other rebuild must leave the process env alone.
+fn should_load_project_env(was_trusted: bool, now_trusted: bool) -> bool {
+    !was_trusted && now_trusted
+}
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -40,11 +48,7 @@ struct Stack {
 
 impl Stack {
     fn timeouts(&self) -> maki_providers::Timeouts {
-        maki_providers::Timeouts {
-            connect: self.config.provider.connect_timeout,
-            low_speed: self.config.provider.low_speed_timeout,
-            stream: self.config.provider.stream_timeout,
-        }
+        maki_providers::Timeouts::from(&self.config.provider)
     }
 }
 
@@ -77,24 +81,29 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, cwd: &Path) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    command::discover_commands(&cwd)
+    command::discover_commands(cwd)
 }
 
-fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config> {
+fn load_config(
+    plugin_host: &PluginHost,
+    cli: &Cli,
+    project_config: &ProjectConfig,
+    warnings: &mut Vec<String>,
+) -> Result<Config> {
     let raw_config = plugin_host
-        .load_init_files_or_skip(cli.no_plugins, cwd)
+        .load_init_files_or_skip(cli.no_plugins, project_config, warnings)
         .context("load init.lua files")?;
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(cli.no_rtk)
+        .into_config()
         .context("invalid config")?;
-    config.permissions = load_permissions(cwd);
+    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    config.permissions = load_permissions(project_config);
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -141,9 +150,10 @@ fn build_stack(
     cli: &Cli,
     cwd: &Path,
     storage: &StateDir,
+    trust: &ProjectDecision,
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
 
     let command_registry = maki_commands::CommandRegistry::new();
     let mut plugin_host = PluginHost::with_command_registry(
@@ -156,7 +166,7 @@ fn build_stack(
     let (fallback_config, fallback_model) = fallback.unzip();
     let reloading = fallback_model.is_some();
     let config = config_or_fallback(
-        load_config(&plugin_host, cli, cwd),
+        load_config(&plugin_host, cli, &trust.project_config, &mut warnings),
         fallback_config,
         &mut warnings,
     )?;
@@ -170,7 +180,7 @@ fn build_stack(
         }
     }
 
-    let commands = discover_commands(cli.no_commands);
+    let commands = discover_commands(cli.no_commands, cwd);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
     let (model, needs_login) = match (model_result, fallback_model) {
@@ -196,6 +206,18 @@ fn build_stack(
         },
         warnings,
     ))
+}
+
+fn restored_session_model(
+    startup: &Model,
+    session: &AppSession,
+    explicit_model: bool,
+    model_policy: &ModelPolicy,
+) -> Model {
+    if explicit_model || !model_policy.allows(&session.model) {
+        return startup.clone();
+    }
+    Model::from_spec(&session.model).unwrap_or_else(|_| startup.clone())
 }
 
 fn resolve_session(
@@ -274,43 +296,87 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if cli.print && session_picker_requested(&cli) {
         bail!(PICKER_NEEDS_TUI_ERR);
     }
+    let explicit_model = cli.model.is_some();
+    let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
-    load_env_files(&cwd);
-    warn_stale_config_toml(&cwd);
+    let mode = if cli.trust {
+        TrustMode::Session
+    } else {
+        TrustMode::Consult
+    };
+    let mut trust = project::resolve(&storage, &cwd, mode);
+    load_env_files(&trust.project_config);
+    warn_stale_config_toml(&trust.project_config);
 
-    let (mut stack, _) = build_stack(&cli, &cwd, &storage, None)?;
+    let (mut stack, mut startup_warnings) = build_stack(&cli, &cwd, &storage, &trust, None)?;
+
+    let can_ask =
+        !cli.print && !cli.is_sdk_mode() && io::stdin().is_terminal() && io::stderr().is_terminal();
+    let mut notice = None;
+    let answer = trust.state.unanswered().and_then(|question| {
+        policy_grant(question, &stack.config.trust)
+            .map(|pattern| {
+                notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
+                TrustAnswer::Trust
+            })
+            .or_else(|| {
+                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
+            })
+    });
+    match answer {
+        Some(answer) => {
+            let was_trusted = trust.project_config.is_trusted();
+            trust = project::apply_answer(&storage, trust, answer);
+            if should_load_project_env(was_trusted, trust.project_config.is_trusted()) {
+                load_env_files(&trust.project_config);
+                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, &trust, None)?;
+                stack = new_stack;
+                startup_warnings = new_warnings;
+            } else {
+                startup_warnings.extend(trust.warning.clone());
+            }
+        }
+        None => startup_warnings.extend(trust.state.restricted_warning()),
+    }
 
     setup::init_logging(&stack.config.storage);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
+    if cli.is_sdk_mode() || cli.print {
+        for warning in &startup_warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+
     if cli.is_sdk_mode() {
-        let fast = stack.config.always_fast && stack.model.supports_fast();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
             model: stack.model,
+            explicit_model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
             timeouts,
             prompt_slots,
-            fast,
-            workflow: stack.config.always_workflow,
+            defaults: stack.config.session_defaults,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
+            project_config: trust.project_config.clone(),
             commands: stack.commands,
             command_registry: stack.plugin_host.command_registry(),
+            session_options: stack.plugin_host.event_handle().session_option_catalog(),
+            lua_handle: stack.plugin_host.event_handle().clone(),
         })
         .context("run sdk mode")?;
         return Ok(());
     }
     if cli.print {
-        let fast = stack.config.always_fast && stack.model.supports_fast();
         let timeouts = stack.timeouts();
         crate::print::run(
             &stack.model,
@@ -322,8 +388,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             stack.config.permissions,
             timeouts,
             stack.plugin_host.event_handle(),
-            fast,
-            stack.config.always_workflow,
+            stack.config.session_defaults,
             Arc::new(stack.config.provider.model_policy.clone()),
             cli.system_prompt,
             cli.append_system_prompt,
@@ -331,6 +396,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             &stack.commands,
             stack.plugin_host.command_registry(),
             stack.plugin_host.mode_registry(),
+            trust.project_config.clone(),
         )
         .context("run print mode")?;
         return Ok(());
@@ -347,40 +413,34 @@ pub fn run(mut cli: Cli) -> Result<()> {
         &storage,
     )?];
     let mut focused = 0;
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings = startup_warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let mut teardown = Teardown::default();
     let default_thinking: Option<StoredThinking> = maki_storage::sessions::read_prefs(&storage)
         .default_thinking
-        .or(stack.config.always_thinking);
+        .or(stack.config.session_defaults.thinking);
 
     loop {
         for session in &mut tabs {
             if session.messages().is_empty() {
-                session.meta.fast |= stack.config.always_fast;
-                session.meta.workflow |= stack.config.always_workflow;
-                if let Some(thinking) = default_thinking {
-                    session.meta.thinking = Some(thinking);
-                }
+                let mut defaults = stack.config.session_defaults;
+                defaults.thinking = default_thinking;
+                defaults.seed(&mut session.meta);
             }
         }
         let focused_tab = &tabs[focused];
-        let model = if focused_tab.messages().is_empty()
-            || !stack
-                .config
-                .provider
-                .model_policy
-                .allows(&focused_tab.model)
-        {
-            stack.model.clone()
-        } else {
-            Model::from_spec(&focused_tab.model).unwrap_or_else(|_| stack.model.clone())
-        };
+        let model = restored_session_model(
+            &stack.model,
+            focused_tab,
+            apply_explicit_model,
+            &stack.config.provider.model_policy,
+        );
 
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
                 model,
                 needs_login: stack.needs_login,
+                explicit_model: apply_explicit_model,
                 commands: std::mem::take(&mut stack.commands),
                 sessions: std::mem::take(&mut tabs),
                 focused,
@@ -392,6 +452,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),
                     cwd.clone(),
+                    trust.project_config.clone(),
                     stack.plugin_host.plugin_rules(),
                 )),
                 timeouts: stack.timeouts(),
@@ -406,6 +467,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 system_prompt_override: cli.system_prompt.clone(),
                 append_system_prompt: cli.append_system_prompt.clone(),
+                project_config: trust.project_config.clone(),
+                trust_question: trust.state.question().cloned(),
+                startup_notice: notice.take(),
             },
             initial_prompt.take(),
         )
@@ -438,18 +502,28 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 // The picker is a one-shot startup request; a later
                 // `/reload` must reopen a fresh tab instead of re-prompting.
                 session_picker = false;
+                apply_explicit_model = false;
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
+                let was_trusted = trust.project_config.is_trusted();
+                trust = project::resolve(&storage, &cwd, mode);
                 // Shut the old host down first so nothing can repopulate
                 // the registry after the clear: its senders disconnect, the
                 // watchdog aborts in-flight callbacks, and only this thread
-                // issues loads. The old VM then shares nothing with the new
-                // stack, so its slow join (up to 2s) can run on a
-                // background thread.
+                // issues loads.
                 stack.plugin_host.begin_shutdown();
                 ToolRegistry::global().clear_lua();
-                teardown.defer(move || drop(stack));
-                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, Some(last_good))?;
+                let load_env =
+                    should_load_project_env(was_trusted, trust.project_config.is_trusted());
+                if load_env {
+                    teardown.join();
+                    drop(stack);
+                    load_env_files(&trust.project_config);
+                } else {
+                    teardown.defer(move || drop(stack));
+                }
+                let (new_stack, new_warnings) =
+                    build_stack(&cli, &cwd, &storage, &trust, Some(last_good))?;
                 tabs = reloaded;
                 if tabs.is_empty() {
                     tabs.push(AppSession::new(&new_stack.model.spec(), &cwd_str));
@@ -467,10 +541,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 }
 
-fn warn_stale_config_toml(cwd: &std::path::Path) {
+fn warn_stale_config_toml(project_config: &ProjectConfig) {
     let stale_paths = [
         maki_config::global_config_dir().map(|d| d.join("config.toml")),
-        Some(cwd.join(".makima/config.toml")),
+        Some(project_config.config_root().join(".makima/config.toml")),
     ];
     for path in stale_paths.into_iter().flatten() {
         if path.is_file() {
@@ -491,6 +565,14 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
+
+    #[test_case(false, false, false ; "untrusted reload leaves the env alone")]
+    #[test_case(true, true, false ; "ordinary reload of a trusted folder does not reload the env")]
+    #[test_case(true, false, false ; "a revoked folder does not reload the env")]
+    #[test_case(false, true, true ; "a fresh grant loads the project env")]
+    fn project_env_loads_only_on_the_grant(was_trusted: bool, now_trusted: bool, expected: bool) {
+        assert_eq!(should_load_project_env(was_trusted, now_trusted), expected);
+    }
 
     /// `second_saw_first` requires both joins: `defer` joining the first
     /// closure before spawning the second, and `Drop` joining the second
@@ -529,9 +611,19 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        RawConfig::default()
-            .into_config(false)
-            .expect("default config")
+        RawConfig::default().into_config().expect("default config")
+    }
+
+    #[test_case(false, "anthropic/claude-opus-4-6"; "restores_persisted_model_without_explicit_flag")]
+    #[test_case(true, "openai/gpt-5"; "explicit_model_overrides_persisted_model")]
+    fn tui_restored_model_precedence(explicit_model: bool, expected: &str) {
+        let startup = Model::from_spec("openai/gpt-5").unwrap();
+        let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
+
+        let resolved =
+            restored_session_model(&startup, &session, explicit_model, &ModelPolicy::default());
+
+        assert_eq!(resolved.spec(), expected);
     }
 
     #[test]
@@ -555,13 +647,13 @@ mod tests {
     #[test]
     fn broken_config_with_fallback_uses_last_good_and_warns() {
         let mut last_good = test_config();
-        last_good.always_fast = true;
+        last_good.session_defaults.fast = true;
         let mut warnings = Vec::new();
 
         let config = config_or_fallback(Err(eyre!("boom")), Some(last_good), &mut warnings)
             .expect("fallback config");
 
-        assert!(config.always_fast);
+        assert!(config.session_defaults.fast);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].starts_with(CONFIG_FALLBACK_WARNING),
@@ -605,8 +697,13 @@ mod tests {
         let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
             .expect("live host boots under --no-plugins");
 
-        let config = load_config(&plugin_host, &cli, dir.path())
-            .expect("no-plugins must skip the broken init.lua and still load defaults");
+        let config = load_config(
+            &plugin_host,
+            &cli,
+            &ProjectConfig::for_project(dir.path()),
+            &mut Vec::new(),
+        )
+        .expect("no-plugins must skip the broken init.lua and still load defaults");
         assert!(
             !config.plugins.names.is_empty(),
             "default builtin plugins must still be enabled under --no-plugins"
@@ -754,7 +851,12 @@ mod tests {
         let mut plugin_host =
             PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
 
-        match load_config(&plugin_host, &cli, dir.path()) {
+        match load_config(
+            &plugin_host,
+            &cli,
+            &ProjectConfig::for_project(dir.path()),
+            &mut Vec::new(),
+        ) {
             Err(_) => {}
             Ok(_) => panic!("broken init.lua must error without --no-plugins"),
         }

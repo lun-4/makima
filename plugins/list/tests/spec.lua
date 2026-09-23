@@ -12,6 +12,9 @@ local PATH_REQUIRED_MSG = "error: path is required"
 
 local function mock_ctx(instructions)
   return {
+    resolve_path = function(_self, path)
+      return maki.fs.abspath(path), nil
+    end,
     is_instruction_file = function(_self, name)
       local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
       return set[name] or false

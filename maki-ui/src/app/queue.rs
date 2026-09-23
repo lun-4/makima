@@ -1,8 +1,8 @@
 //! Queue for messages typed while the agent is busy.
 
-use maki_agent::AgentInput;
+use maki_agent::{AgentInput, ImageSource};
 
-use super::{Action, App, Status, format_with_images};
+use super::{Action, App, Status};
 
 use crate::agent::shared_queue::{QueueItem, QueueSender};
 use crate::components::queue_panel::QueueEntry;
@@ -204,7 +204,7 @@ impl App {
             // the main agent. Surface the rejection via the caller's flash.
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         };
-        self.chats[self.active_chat].show_user_message(msg.text.clone());
+        self.chats[self.active_chat].show_user_message(msg.text.clone(), msg.images.clone());
         if input_tx.try_send(msg.text).is_err() {
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         }
@@ -246,12 +246,13 @@ impl App {
         }
     }
 
-    pub(super) fn queue_compact(&mut self) -> bool {
+    pub(super) fn queue_compact(&mut self, instructions: Option<String>) -> bool {
         let Some(ref shared) = self.queue.shared else {
             return false;
         };
         shared.push(QueueItem::Compact {
             run_id: self.run_id,
+            instructions,
         });
         true
     }
@@ -260,18 +261,16 @@ impl App {
     /// queue items start runs without `start_run`, so this is where the app
     /// learns the agent is busy. Immediate-dispatch items skip this event,
     /// so no dedup needed.
-    pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {
+    pub(super) fn on_queue_item_consumed(&mut self, text: String, images: Vec<ImageSource>) {
         self.status = Status::Streaming;
-        self.main_chat()
-            .show_user_message(format_with_images(text, image_count));
+        self.main_chat().show_user_message(text, images);
     }
 
     /// Immediate path: kick off the agent and draw the bubble in the same
     /// frame, so the user sees their message land where it will stay.
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
-        let display = format_with_images(&msg.text, msg.images.len());
         let input = self.build_agent_input(msg);
-        self.start_run(input, display)
+        self.start_run(input, msg.text.clone())
     }
 
     pub(crate) fn start_mailbox_run(
@@ -296,9 +295,13 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
+        // The turn runs on whatever the model is now; a change after this
+        // point lands on the next turn.
+        self.run_model = Some(self.state.session.model.clone());
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
-        if !display.is_empty() {
-            self.main_chat().show_user_message(display);
+        if !display.is_empty() || !input.images.is_empty() {
+            self.main_chat()
+                .show_user_message(display, input.images.clone());
         }
         vec![Action::SendMessage(Box::new(input))]
     }

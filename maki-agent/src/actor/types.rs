@@ -2,7 +2,7 @@
 
 use std::future::Future;
 
-use maki_providers::TokenUsage;
+use maki_providers::{ImageSource, TokenUsage};
 
 use crate::InterruptSource;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
@@ -21,10 +21,19 @@ impl ManagedTurnAdmission {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlierRoot {
+    pub run_id: u64,
+    pub displayed: bool,
+    pub text: String,
+    pub images: Vec<ImageSource>,
+    pub correlation: String,
+}
+
 /// What category of work the backend is asked to execute. Controls and
 /// compacts never produce a [`TurnOutcome`]; turns and started roots settle
 /// into one. A started root carries the neutral display metadata the host
-/// queued (`run_id`, displayed, text, image count) so the backend can emit
+/// queued (`run_id`, displayed, text, images) so the backend can emit
 /// `QueueItemConsumed` only for roots that were not yet drawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkKind {
@@ -33,7 +42,8 @@ pub enum WorkKind {
         run_id: u64,
         displayed: bool,
         text: String,
-        image_count: usize,
+        images: Vec<ImageSource>,
+        earlier: Vec<EarlierRoot>,
     },
     Control,
     Compact,
@@ -88,8 +98,30 @@ pub struct RootWork {
     pub run_id: u64,
     pub displayed: bool,
     pub text: String,
-    pub image_count: usize,
+    pub images: Vec<ImageSource>,
     pub correlation: String,
+    pub earlier: Vec<EarlierRoot>,
+}
+
+impl RootWork {
+    pub fn new(
+        input: crate::AgentInput,
+        run_id: u64,
+        displayed: bool,
+        text: String,
+        images: Vec<ImageSource>,
+        correlation: String,
+    ) -> Self {
+        Self {
+            input,
+            run_id,
+            displayed,
+            text,
+            images,
+            correlation,
+            earlier: Vec::new(),
+        }
+    }
 }
 
 /// A standalone control operation. Compact correlation only: the host's
@@ -177,5 +209,6 @@ pub trait ActorBackend: Send {
         &'a mut self,
         history: &'a mut crate::History,
         context: TurnContext,
+        instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>>;
 }

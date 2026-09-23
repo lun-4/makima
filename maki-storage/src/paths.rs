@@ -9,6 +9,7 @@ const APP_NAME: &str = "makima";
 
 static STRATEGY: OnceLock<Option<Paths>> = OnceLock::new();
 
+#[derive(Debug, PartialEq, Eq)]
 struct Paths {
     config: PathBuf,
     data: PathBuf,
@@ -126,6 +127,28 @@ pub fn incremental_canonicalize(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve a leading `~`. The one answer to what a tilde means, because a
+/// spelling one layer expands and another does not is two names for one file.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    match (path.strip_prefix("~"), home()) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The identity of a file, independent of how a path was spelled: relative or
+/// absolute, with `..` or not, through a symlink or not, under `~` or spelled
+/// out, existing or not yet.
+///
+/// Over-resolving is safe here; under-resolving is the bug, because two keys
+/// for one file mean two locks for one file, or a staleness check that looks
+/// up an entry nobody wrote.
+pub fn canonical_key(path: &Path) -> PathBuf {
+    let expanded = expand_tilde(path);
+    let abs = std::path::absolute(&expanded).unwrap_or(expanded);
+    incremental_canonicalize(&abs).unwrap_or_else(|| normalize_path(&abs))
+}
+
 /// Strip the `\\?\` prefix that Windows `canonicalize` adds, using the
 /// Rust `Prefix` enum for correct WTF-8 handling (no `.to_str()` lossy
 /// conversion).
@@ -175,38 +198,85 @@ fn state_logs(s: &impl BaseStrategy, fallback: &Path) -> (PathBuf, PathBuf) {
     (state, logs)
 }
 
+/// Choose the real user directories, once, for this process.
+///
+/// Until this runs, [`resolve`] yields nothing and every directory accessor
+/// reports the same error it reports on a machine with no home directory. That
+/// is deliberate: a test binary never calls this, so a test cannot reach the
+/// directories the person running it keeps their sessions and credentials in.
+///
+/// A scan of test bodies would not give the same guarantee, because tests
+/// reach these directories transitively -- a provider script cache three
+/// frames below a test that only asked to scan a directory. The lookup itself
+/// has to be unavailable.
+///
+/// Call it first thing in `main`, before anything can ask for a path: code
+/// that resolves earlier gets the uninitialized answer and degrades to an
+/// error instead of working.
+pub fn init() -> Result<(), PathsInitError> {
+    initialize(&STRATEGY, discover())
+}
+
+/// Put every directory under `root`, for a test that needs somewhere real to
+/// write and for any future flag that relocates the state directory.
+pub fn init_at(root: PathBuf) -> Result<(), PathsInitError> {
+    initialize(
+        &STRATEGY,
+        Some(Paths {
+            config: root.clone(),
+            data: root.clone(),
+            state: root.clone(),
+            logs: root.clone(),
+            cache: root.clone(),
+            xdg_config: root,
+        }),
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("storage paths were already initialized with a different strategy")]
+pub struct PathsInitError;
+
+fn initialize(lock: &OnceLock<Option<Paths>>, paths: Option<Paths>) -> Result<(), PathsInitError> {
+    match lock.set(paths) {
+        Ok(()) => Ok(()),
+        Err(paths) if lock.get().is_some_and(|initialized| *initialized == paths) => Ok(()),
+        Err(_) => Err(PathsInitError),
+    }
+}
+
+fn discover() -> Option<Paths> {
+    let s = etcetera::base_strategy::choose_base_strategy().ok()?;
+    let fallback_dir = etcetera::home_dir()
+        .ok()
+        .map(|h| h.join(FALLBACK_DIR))
+        .filter(|d| d.is_dir());
+    let xdg_config = s.config_dir().join(APP_NAME);
+    let (data, cache, config) = match &fallback_dir {
+        Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
+        None => (
+            s.data_dir().join(APP_NAME),
+            s.cache_dir().join(APP_NAME),
+            xdg_config.clone(),
+        ),
+    };
+    let (state, logs) = if fallback_dir.is_some() {
+        (data.clone(), data.clone())
+    } else {
+        state_logs(&s, &data)
+    };
+    Some(Paths {
+        config,
+        data,
+        state,
+        logs,
+        cache,
+        xdg_config,
+    })
+}
+
 fn resolve() -> Option<&'static Paths> {
-    STRATEGY
-        .get_or_init(|| {
-            let s = etcetera::choose_base_strategy().ok()?;
-            let fallback_dir = etcetera::home_dir()
-                .ok()
-                .map(|h| h.join(FALLBACK_DIR))
-                .filter(|d| d.is_dir());
-            let xdg_config = s.config_dir().join(APP_NAME);
-            let (data, cache, config) = match &fallback_dir {
-                Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
-                None => (
-                    s.data_dir().join(APP_NAME),
-                    s.cache_dir().join(APP_NAME),
-                    xdg_config.clone(),
-                ),
-            };
-            let (state, logs) = if fallback_dir.is_some() {
-                (data.clone(), data.clone())
-            } else {
-                state_logs(&s, &data)
-            };
-            Some(Paths {
-                config,
-                data,
-                state,
-                logs,
-                cache,
-                xdg_config,
-            })
-        })
-        .as_ref()
+    STRATEGY.get()?.as_ref()
 }
 
 fn err() -> std::io::Error {
@@ -279,24 +349,114 @@ pub fn legacy_home_dir() -> Option<PathBuf> {
         .filter(|d| d.is_dir())
 }
 
-/// Candidate config directories for `subdir` from `home` and `xdg_config`.
-/// Pure: no env reads, no process-home fallback. Production callers pass
-/// `config_dir().ok()` as `xdg_config` (which honors `XDG_CONFIG_HOME`, the
-/// `~/.makima` fallback, and the Windows `AppData\Roaming` strategy via
-/// `resolve()`); tests pass tempdirs.
-pub fn user_config_dirs(
-    home: Option<&Path>,
-    xdg_config: Option<&Path>,
-    subdir: &str,
-) -> Vec<PathBuf> {
-    let legacy = home.map(|h| h.join(FALLBACK_DIR).join(subdir));
-    let xdg = xdg_config.map(|d| d.join(subdir));
+/// Where to look for user config, best match first. Writes still go to
+/// `config_dir()`.
+///
+/// The two are not the same: `config_dir()` collapses to `~/.makima` the moment
+/// that directory exists, so anything that reads it alone goes blind to
+/// `~/.config/makima`, which is where the docs tell people to put their files.
+pub fn config_search_dirs() -> Vec<PathBuf> {
+    config_search_dirs_from(home().as_deref(), xdg_config_dir().ok().as_deref())
+}
+
+pub fn find_config_path(name: &str) -> Option<PathBuf> {
+    config_search_dirs()
+        .into_iter()
+        .map(|dir| dir.join(name))
+        .find(|path| path.exists())
+}
+
+/// Pure core of `config_search_dirs`: no env reads, no process-home fallback,
+/// so tests can hand it tempdirs.
+pub fn config_search_dirs_from(home: Option<&Path>, xdg_config: Option<&Path>) -> Vec<PathBuf> {
+    let legacy = home.map(|h| h.join(FALLBACK_DIR)).filter(|d| d.is_dir());
+    let xdg = xdg_config
+        .map(Path::to_path_buf)
+        .filter(|d| Some(d) != legacy.as_ref());
     [legacy, xdg].into_iter().flatten().collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
+
+    const KEYED_FILE: &str = "f.rs";
+    const SUBDIR: &str = "sub";
+
+    #[test_case(|_rel, abs| abs.join(KEYED_FILE); "absolute")]
+    #[test_case(|rel, _abs| rel.join(KEYED_FILE); "relative")]
+    #[test_case(|rel, _abs| rel.join(SUBDIR).join("..").join(KEYED_FILE); "parent_component")]
+    fn every_spelling_of_one_file_is_one_key(spell: fn(&Path, &Path) -> PathBuf) {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::TempDir::new_in(&cwd).unwrap();
+        let abs = dir.path();
+        let rel = PathBuf::from(abs.file_name().unwrap());
+        fs::create_dir(abs.join(SUBDIR)).unwrap();
+
+        let expected = canonical_key(&abs.join(KEYED_FILE));
+        assert_eq!(
+            canonical_key(&spell(&rel, abs)),
+            expected,
+            "before the file exists"
+        );
+
+        fs::write(abs.join(KEYED_FILE), "content").unwrap();
+        assert_eq!(
+            canonical_key(&spell(&rel, abs)),
+            expected,
+            "once the file exists"
+        );
+    }
+
+    #[test]
+    fn tilde_spelling_is_one_key() {
+        let home = home().expect("no home dir");
+        assert_eq!(
+            canonical_key(Path::new("~").join(KEYED_FILE).as_path()),
+            canonical_key(&home.join(KEYED_FILE))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_spelling_is_one_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join(SUBDIR);
+        let link = dir.path().join("link");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join(KEYED_FILE), "content").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            canonical_key(&link.join(KEYED_FILE)),
+            canonical_key(&real.join(KEYED_FILE))
+        );
+    }
+
+    fn test_paths(root: &Path) -> Option<Paths> {
+        Some(Paths {
+            config: root.to_path_buf(),
+            data: root.to_path_buf(),
+            state: root.to_path_buf(),
+            logs: root.to_path_buf(),
+            cache: root.to_path_buf(),
+            xdg_config: root.to_path_buf(),
+        })
+    }
+
+    #[test]
+    fn path_initialization_is_idempotent_but_rejects_conflicts() {
+        let lock = OnceLock::new();
+        let first = Path::new("/first");
+        let second = Path::new("/second");
+
+        assert!(initialize(&lock, test_paths(first)).is_ok());
+        assert!(initialize(&lock, test_paths(first)).is_ok());
+        assert!(initialize(&lock, test_paths(second)).is_err());
+        assert_eq!(lock.get(), Some(&test_paths(first)));
+    }
 
     #[test]
     fn normalize_path_resolves_parent() {
@@ -360,38 +520,55 @@ mod tests {
     }
 
     #[test]
-    fn user_config_dirs_returns_legacy_and_xdg() {
+    fn search_dirs_returns_legacy_and_xdg() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(FALLBACK_DIR);
+        let xdg = home.path().join(".config").join(APP_NAME);
+        fs::create_dir(&legacy).unwrap();
+
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&xdg));
+        assert_eq!(dirs, vec![legacy, xdg]);
+    }
+
+    #[test]
+    fn search_dirs_omits_legacy_when_it_does_not_exist() {
         let home = tempfile::tempdir().unwrap();
         let xdg = home.path().join(".config").join(APP_NAME);
 
-        let dirs = user_config_dirs(Some(home.path()), Some(&xdg), "AGENTS.md");
-        assert_eq!(
-            dirs,
-            vec![
-                home.path().join(FALLBACK_DIR).join("AGENTS.md"),
-                xdg.join("AGENTS.md"),
-            ]
-        );
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&xdg));
+        assert_eq!(dirs, vec![xdg]);
     }
 
     #[test]
-    fn user_config_dirs_omits_legacy_when_home_none() {
+    fn search_dirs_omits_legacy_when_home_none() {
         let xdg = tempfile::tempdir().unwrap();
 
-        let dirs = user_config_dirs(None, Some(xdg.path()), "AGENTS.md");
-        assert_eq!(dirs, vec![xdg.path().join("AGENTS.md")]);
+        let dirs = config_search_dirs_from(None, Some(xdg.path()));
+        assert_eq!(dirs, vec![xdg.path().to_path_buf()]);
     }
 
     #[test]
-    fn user_config_dirs_omits_xdg_when_xdg_none() {
+    fn search_dirs_omits_xdg_when_xdg_none() {
         let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(FALLBACK_DIR);
+        fs::create_dir(&legacy).unwrap();
 
-        let dirs = user_config_dirs(Some(home.path()), None, "AGENTS.md");
-        assert_eq!(dirs, vec![home.path().join(FALLBACK_DIR).join("AGENTS.md")]);
+        let dirs = config_search_dirs_from(Some(home.path()), None);
+        assert_eq!(dirs, vec![legacy]);
     }
 
     #[test]
-    fn user_config_dirs_neither_depends_on_process_env() {
+    fn search_dirs_does_not_repeat_the_same_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(FALLBACK_DIR);
+        fs::create_dir(&legacy).unwrap();
+
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&legacy));
+        assert_eq!(dirs, vec![legacy]);
+    }
+
+    #[test]
+    fn search_dirs_neither_depends_on_process_env() {
         let home_a = tempfile::tempdir().unwrap();
         let xdg_a = home_a.path().join(".config").join(APP_NAME);
 
@@ -401,7 +578,7 @@ mod tests {
         // SAFETY: tests run single-threaded within a process nextest invokes once.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", hostile.path()) };
 
-        let dirs = user_config_dirs(Some(home_a.path()), Some(&xdg_a), "AGENTS.md");
+        let dirs = config_search_dirs_from(Some(home_a.path()), Some(&xdg_a));
 
         // SAFETY: same single-threaded assumption as above.
         unsafe {

@@ -19,6 +19,11 @@ use maki_config::NotificationMethod;
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Makima needs attention";
 const BELL_SEQUENCE: &str = "\u{7}";
+/// XTPUSHTITLE saves whatever title the shell left on the window, so the
+/// matching XTPOPTITLE on exit or suspend hands it back and no plugin
+/// title outlives the session. Terminals without a title stack ignore both.
+const PUSH_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[22;2t";
+const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
 /// Raw mode is already on when the tmux query runs, so a wedged tmux server
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -76,11 +81,7 @@ impl TerminalNotifier {
     }
 
     pub(crate) fn notify(&self, message: &str) -> std::io::Result<()> {
-        let sequence = notification_sequence(self.notifier, self.mux, message);
-        let mut stdout = stdout().lock();
-        stdout
-            .write_all(sequence.as_bytes())
-            .and_then(|()| stdout.flush())
+        write_sequence(&notification_sequence(self.notifier, self.mux, message))
     }
 }
 
@@ -193,16 +194,41 @@ fn query_tmux_client() -> Option<TmuxClient> {
 /// A model response must not inject escape sequences into the terminal;
 /// `is_control` also covers DEL and the C1 range.
 fn sanitize_notification_message(message: &str) -> String {
-    let sanitized = message
-        .split(|c: char| c.is_whitespace() || c.is_control())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let sanitized = visible_text(message);
     if sanitized.is_empty() {
         FALLBACK_NOTIFICATION_MESSAGE.into()
     } else {
         sanitized
     }
+}
+
+/// Control bytes would terminate the OSC payload early or inject new
+/// sequences; whitespace runs collapse so spinner frames stay tidy.
+fn visible_text(text: &str) -> String {
+    text.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// OSC 2 sets the window title only; OSC 0 would stomp the icon name too.
+fn window_title_sequence(mux: TerminalMux, title: &str) -> String {
+    mux.wrap_for_mux(format!("\u{1b}]2;{}\u{7}", visible_text(title)))
+}
+
+pub(crate) fn set_window_title(title: &str) -> std::io::Result<()> {
+    write_sequence(&window_title_sequence(TerminalMux::detect(), title))
+}
+
+fn write_mux_sequence(sequence: &str) {
+    let _ = write_sequence(&TerminalMux::detect().wrap_for_mux(sequence.into()));
+}
+
+fn write_sequence(sequence: &str) -> std::io::Result<()> {
+    let mut stdout = stdout().lock();
+    stdout
+        .write_all(sequence.as_bytes())
+        .and_then(|()| stdout.flush())
 }
 
 fn notification_sequence(notifier: ResolvedNotifier, mux: TerminalMux, message: &str) -> String {
@@ -250,6 +276,8 @@ impl TerminalMux {
 impl TerminalGuard {
     pub(crate) fn init() -> Result<(Self, ratatui::DefaultTerminal)> {
         let terminal = ratatui::init();
+        write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
+        crate::terminal_image::init_graphics_detection();
         stdout().execute(EnableBracketedPaste)?;
         stdout().execute(EnableMouseCapture)?;
         enable_focus_change();
@@ -287,6 +315,7 @@ fn teardown() {
 }
 
 fn pop_terminal_modes() {
+    write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
     stdout().execute(crossterm::cursor::Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
     disable_focus_change();
@@ -295,6 +324,8 @@ fn pop_terminal_modes() {
 }
 
 fn resume(terminal: &mut ratatui::DefaultTerminal) {
+    write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
+    crate::terminal_image::invalidate();
     stdout().execute(EnterAlternateScreen).ok();
     stdout().execute(EnableBracketedPaste).ok();
     stdout().execute(EnableMouseCapture).ok();
@@ -570,6 +601,38 @@ mod tests {
     #[test_case("\0\t\u{7f}\u{85}\n\u{2003}", FALLBACK_NOTIFICATION_MESSAGE ; "all_control_input_falls_back")]
     fn sanitize_notification_message_cases(message: &str, expected: &str) {
         assert_eq!(sanitize_notification_message(message), expected);
+    }
+
+    #[test]
+    fn window_title_sequence_encodes_sanitized_title() {
+        const TITLE: &str = "◐ building";
+        const OSC2_SEQUENCE: &str = "\u{1b}]2;◐ building\u{7}";
+
+        assert_eq!(
+            window_title_sequence(TerminalMux::None, TITLE),
+            OSC2_SEQUENCE
+        );
+        // Control bytes are gone, so what remains cannot terminate the
+        // payload or start a new sequence.
+        assert_eq!(
+            window_title_sequence(TerminalMux::None, "\u{1b}\u{7}pwned\u{85}\ntitle"),
+            "\u{1b}]2;pwned title\u{7}"
+        );
+        assert_eq!(
+            window_title_sequence(TerminalMux::None, ""),
+            "\u{1b}]2;\u{7}"
+        );
+    }
+
+    #[test]
+    fn window_title_roundtrips_mux_passthrough() {
+        const TITLE: &str = "maki";
+        const OSC2_SEQUENCE: &str = "\u{1b}]2;maki\u{7}";
+
+        let tmux = window_title_sequence(TerminalMux::Tmux, TITLE);
+        let screen = window_title_sequence(TerminalMux::Screen, TITLE);
+        assert_eq!(parse_dcs_passthrough(&tmux, "\u{1b}Ptmux;"), OSC2_SEQUENCE);
+        assert_eq!(parse_dcs_passthrough(&screen, "\u{1b}P"), OSC2_SEQUENCE);
     }
 
     #[test]

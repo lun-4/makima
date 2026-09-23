@@ -128,6 +128,9 @@ local schema = {
     output_schema = {
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
     },
+    thinking = {
+      description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
+    },
   },
 }
 
@@ -273,6 +276,7 @@ local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
     name = input.description,
     semaphore = turn_semaphore,
     auto_deliver = auto_deliver,
+    thinking = input.thinking,
   }
 end
 
@@ -457,18 +461,23 @@ local function handler(input, ctx)
     return err
   end
 
+  -- Declared out here so the epilogue closes it on every path: left to the
+  -- garbage collector it keeps the subagent's event relay alive on an idle VM.
+  local sess
+
+  -- pcall so a raised error cannot leak the session.
   local ok, out = pcall(function()
-    local ok, sess, sess_err = pcall(function()
+    local ok_sess, s, sess_err = pcall(function()
       return maki.agent.session(ctx, ctx_opts(spec, input, semaphore, false))
     end)
-    if not ok then
-      error(sess_err, 0)
+    if not ok_sess then
+      error(s, 0)
     end
     if sess_err then
       error(sess_err, 0)
     end
+    sess = s
     if ctx:audience() == "general_sub" and not sess:_maki_managed() then
-      sess:close()
       return { llm_output = RECURSIVE_UNMANAGED_TASK_ERR, is_error = true }
     end
 
@@ -498,8 +507,6 @@ local function handler(input, ctx)
       result = result or {}
     end
 
-    sess:close()
-
     if prompt_err then
       -- A result alongside the error means the run was cut short after
       -- streaming some text, and half a transcript beats a bare error.
@@ -525,6 +532,9 @@ local function handler(input, ctx)
     }
   end)
 
+  if sess then
+    sess:close()
+  end
   if not ok then
     error(out, 0)
   end

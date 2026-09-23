@@ -140,12 +140,15 @@ maki.api.register_tool({
     return buf
   end,
 
-  handler = function(input, _ctx)
+  handler = function(input, ctx)
     local raw = input.path
     if not raw then
       return fail("error: path is required")
     end
-    local path = maki.fs.abspath(raw)
+    local path, path_err = ctx:resolve_path(raw)
+    if not path then
+      return fail("error: " .. tostring(path_err))
+    end
     local meta = maki.fs.metadata(path)
     if not meta then
       return fail("error: path not found: " .. path)

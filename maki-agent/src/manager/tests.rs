@@ -93,13 +93,13 @@ impl ActorBackend for ReportingCancellableBackend {
                 .send(context.managed_turn.clone().unwrap())
                 .unwrap();
             let reason = context.cancel_reason.cancelled().await;
-            BackendResult::EnteredRun(TurnOutcome::Cancelled {
-                agent_id: context.agent_id,
-                turn_id: context.turn_id.unwrap(),
-                usage: TokenUsage::default(),
-                num_turns: 0,
+            BackendResult::EnteredRun(TurnOutcome::cancelled(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                TokenUsage::default(),
+                0,
                 reason,
-            })
+            ))
         })
     }
 
@@ -116,6 +116,7 @@ impl ActorBackend for ReportingCancellableBackend {
         &'a mut self,
         _: &'a mut History,
         _: TurnContext,
+        _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async { BackendResult::CompactDone })
     }
@@ -132,13 +133,13 @@ impl ActorBackend for CancellableBackend {
         Box::pin(async move {
             self.entered.send(()).unwrap();
             let reason = context.cancel_reason.cancelled().await;
-            BackendResult::EnteredRun(TurnOutcome::Cancelled {
-                agent_id: context.agent_id,
-                turn_id: context.turn_id.unwrap(),
-                usage: TokenUsage::default(),
-                num_turns: 0,
+            BackendResult::EnteredRun(TurnOutcome::cancelled(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                TokenUsage::default(),
+                0,
                 reason,
-            })
+            ))
         })
     }
 
@@ -155,6 +156,7 @@ impl ActorBackend for CancellableBackend {
         &'a mut self,
         _: &'a mut History,
         _: TurnContext,
+        _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async { BackendResult::CompactDone })
     }
@@ -196,13 +198,13 @@ impl Future for SuspendDuringPollFuture {
         let Poll::Ready(reason) = cancelled.as_mut().poll(context) else {
             return Poll::Pending;
         };
-        Poll::Ready(BackendResult::EnteredRun(TurnOutcome::Cancelled {
-            agent_id: self.context.agent_id(),
-            turn_id: self.context.turn_id(),
-            usage: TokenUsage::default(),
-            num_turns: 0,
+        Poll::Ready(BackendResult::EnteredRun(TurnOutcome::cancelled(
+            self.context.agent_id(),
+            self.context.turn_id(),
+            TokenUsage::default(),
+            0,
             reason,
-        }))
+        )))
     }
 }
 
@@ -253,6 +255,7 @@ impl ActorBackend for SuspendDuringPollBackend {
         &'a mut self,
         _: &'a mut History,
         _: TurnContext,
+        _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async { BackendResult::CompactDone })
     }
@@ -273,13 +276,13 @@ impl ActorBackend for TestBackend {
             if let Some(gate) = &self.gate {
                 gate.enter().await;
             }
-            BackendResult::EnteredRun(TurnOutcome::Completed {
-                agent_id: context.agent_id,
-                turn_id: context.turn_id.unwrap(),
-                usage: TokenUsage::default(),
-                num_turns: 1,
-                reason: crate::DoneReason::EndTurn,
-            })
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                TokenUsage::default(),
+                1,
+                crate::DoneReason::EndTurn,
+            ))
         })
     }
 
@@ -296,6 +299,7 @@ impl ActorBackend for TestBackend {
         &'a mut self,
         _: &'a mut History,
         _: TurnContext,
+        _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async { BackendResult::CompactDone })
     }
@@ -311,6 +315,8 @@ fn input() -> AgentInput {
         fast: false,
         workflow: false,
         prompt: None,
+        cancel: None,
+        lease_committer: None,
     }
 }
 

@@ -14,7 +14,7 @@ use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
-use crate::runtime::{active_task_id, job_task_id, with_jobs};
+use crate::runtime::{active_task_id, job_task_id, loading_plugin_generation, with_jobs};
 
 const READER_BUF_SIZE: usize = 8 * 1024;
 
@@ -29,6 +29,7 @@ pub(crate) enum JobEvent {
 pub(crate) enum JobOwner {
     Task(u64),
     Plugin(Arc<str>),
+    PluginCandidate { plugin: Arc<str>, generation: u64 },
 }
 
 struct JobMeta {
@@ -51,6 +52,55 @@ struct CheckedOutReceiver {
     receiver: Option<flume::Receiver<JobEvent>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum JobCommand {
+    Shell(String),
+    Argv(Vec<String>),
+}
+
+impl JobCommand {
+    fn build(&self) -> Command {
+        match self {
+            Self::Shell(cmd) => shell_command(cmd),
+            Self::Argv(argv) => {
+                let mut command = Command::new(&argv[0]);
+                command.args(&argv[1..]);
+                command
+            }
+        }
+    }
+}
+
+impl From<&str> for JobCommand {
+    fn from(s: &str) -> Self {
+        Self::Shell(s.to_string())
+    }
+}
+
+impl From<String> for JobCommand {
+    fn from(s: String) -> Self {
+        Self::Shell(s)
+    }
+}
+
+impl From<&String> for JobCommand {
+    fn from(s: &String) -> Self {
+        Self::Shell(s.clone())
+    }
+}
+
+impl From<Vec<String>> for JobCommand {
+    fn from(argv: Vec<String>) -> Self {
+        Self::Argv(argv)
+    }
+}
+
+impl From<&JobCommand> for JobCommand {
+    fn from(cmd: &JobCommand) -> Self {
+        cmd.clone()
+    }
+}
+
 impl JobStore {
     pub fn new() -> Self {
         Self {
@@ -63,14 +113,15 @@ impl JobStore {
     pub fn start(
         &mut self,
         owner: JobOwner,
-        cmd: &str,
+        cmd: impl Into<JobCommand>,
         cwd: Option<String>,
         env: Option<HashMap<String, String>>,
         on_stdout: Option<RegistryKey>,
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
-        let mut command = shell_command(cmd);
+        let cmd = cmd.into();
+        let mut command = cmd.build();
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -210,11 +261,12 @@ impl JobStore {
 
     pub fn drain_plugin_events(&self, buf: &mut Vec<(u32, JobEvent)>) {
         buf.clear();
-        for (&id, job) in self
-            .jobs
-            .iter()
-            .filter(|(_, job)| matches!(job.owner, JobOwner::Plugin(_)))
-        {
+        for (&id, job) in self.jobs.iter().filter(|(_, job)| {
+            matches!(
+                job.owner,
+                JobOwner::Plugin(_) | JobOwner::PluginCandidate { .. }
+            )
+        }) {
             if let Some(ref rx) = job.event_rx {
                 while let Ok(event) = rx.try_recv() {
                     buf.push((id, event));
@@ -239,6 +291,27 @@ impl JobStore {
             .collect::<Vec<_>>();
         for id in ids {
             self.remove(lua, id, true);
+        }
+    }
+
+    pub fn abort_candidate(&mut self, lua: &Lua, plugin: &str, generation: u64) {
+        let owner = JobOwner::PluginCandidate {
+            plugin: Arc::from(plugin),
+            generation,
+        };
+        self.kill_owner(lua, &owner);
+    }
+
+    pub fn promote_candidate(&mut self, plugin: &str, generation: u64) {
+        for job in self.jobs.values_mut() {
+            if job.owner
+                == (JobOwner::PluginCandidate {
+                    plugin: Arc::from(plugin),
+                    generation,
+                })
+            {
+                job.owner = JobOwner::Plugin(Arc::from(plugin));
+            }
         }
     }
 
@@ -301,7 +374,11 @@ impl JobMeta {
     fn can_access(&self, task_id: Option<u64>, plugin: &str) -> bool {
         match &self.owner {
             JobOwner::Task(owner_id) => task_id == Some(*owner_id),
-            JobOwner::Plugin(owner_plugin) => owner_plugin.as_ref() == plugin,
+            JobOwner::Plugin(owner_plugin)
+            | JobOwner::PluginCandidate {
+                plugin: owner_plugin,
+                ..
+            } => owner_plugin.as_ref() == plugin,
         }
     }
 }
@@ -345,11 +422,27 @@ fn kill_job(meta: &mut JobMeta) {
     }
 }
 
+fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
+    match cmd {
+        Value::String(cmd) => Ok(JobCommand::Shell(cmd.to_str()?.to_string())),
+        Value::Table(argv) => {
+            let argv: Vec<String> = argv.sequence_values().collect::<LuaResult<_>>()?;
+            if argv.is_empty() {
+                return Err(mlua::Error::runtime("jobstart: empty argv"));
+            }
+            Ok(JobCommand::Argv(argv))
+        }
+        _ => Err(mlua::Error::runtime(
+            "jobstart: command must be string or table of strings",
+        )),
+    }
+}
+
 /// Run a shell command in the background. The command runs through
 /// `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
 /// that you can pass to `jobstop` or `jobwait` to control the process.
 ///
-/// @param cmd string Shell command to run.
+/// @param cmd string|string[] Shell command to run, or array of arguments.
 /// @param opts table? Optional settings:
 ///   `cwd` (string?) working directory (tilde is expanded).
 ///   `env` (table?) extra environment variables, `{ VAR = "value" }`.
@@ -367,12 +460,8 @@ fn kill_job(meta: &mut JobMeta) {
 ///   on_exit = function(_, code) print("exit: " .. code) end,
 /// })
 #[lua_fn(guard = Run)]
-fn jobstart(
-    lua: &Lua,
-    #[ctx] plugin: Arc<str>,
-    cmd: String,
-    opts: Option<Table>,
-) -> LuaResult<u32> {
+fn jobstart(lua: &Lua, #[ctx] plugin: Arc<str>, cmd: Value, opts: Option<Table>) -> LuaResult<u32> {
+    let cmd = parse_command(cmd)?;
     let owner_name: Option<String> = opts
         .as_ref()
         .map(|opts| opts.get("owner"))
@@ -382,7 +471,12 @@ fn jobstart(
         None | Some("task") => job_task_id(lua).map(JobOwner::Task).ok_or_else(|| {
             mlua::Error::runtime("jobstart: no active task; use owner = \"plugin\"")
         })?,
-        Some("plugin") => JobOwner::Plugin(Arc::clone(&plugin)),
+        Some("plugin") => loading_plugin_generation(lua, &plugin)
+            .map(|generation| JobOwner::PluginCandidate {
+                plugin: Arc::clone(&plugin),
+                generation,
+            })
+            .unwrap_or_else(|| JobOwner::Plugin(Arc::clone(&plugin))),
         Some(other) => {
             return Err(mlua::Error::runtime(format!(
                 "jobstart: unknown owner {other:?}; expected \"task\" or \"plugin\""

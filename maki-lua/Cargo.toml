@@ -32,6 +32,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 smol = { workspace = true }
 strum = { workspace = true }
 event-listener = { workspace = true }
@@ -75,6 +76,7 @@ tree-sitter-starlark = { workspace = true }
 tree-sitter-swift = { workspace = true }
 tree-sitter-toml-ng = { workspace = true }
 tree-sitter-typescript = { workspace = true }
+tree-sitter-vlang = { workspace = true }
 tree-sitter-zig = { workspace = true }
 tree-sitter-dart = { workspace = true }
 tree-sitter-yaml = { workspace = true }
@@ -88,6 +90,7 @@ tree-sitter-make = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+maki-config = { workspace = true, features = ["test-util"] }
 maki-lua = { path = ".", features = ["test-support"] }
 base64 = { workspace = true }
 criterion = { workspace = true }
