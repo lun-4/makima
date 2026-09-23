@@ -9650,13 +9650,69 @@ fn plan_form_renders_implementation_model() {
 }
 
 #[test]
+fn plan_form_reset_implementation_model_uses_current_model() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec!["zai/glm-5".into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    let _ = app.model_picker.refresh();
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.plan_form.implementation_model(), Some("zai/glm-5"));
+
+    for _ in 0..4 {
+        app.update(Msg::Key(key(KeyCode::Down)));
+    }
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty());
+    assert_eq!(app.plan_form.implementation_model(), None);
+    assert_eq!(app.state.model.spec(), "anthropic/test-model");
+
+    app.update(Msg::Key(key(KeyCode::Up)));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ImplementPlan {
+            clear_context: false,
+            model: None,
+        }]
+    ));
+}
+
+#[test_case(false ; "current_to_current")]
+#[test_case(true  ; "other_to_current")]
+fn plan_picker_selecting_current_model_clears_override(previous_override: bool) {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec!["anthropic/test-model".into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    let default_height = app.plan_form.height();
+    if previous_override {
+        app.plan_form
+            .set_implementation_model("zai/glm-5".into(), "anthropic/test-model");
+    }
+
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.plan_form.implementation_model(), None);
+    assert_eq!(app.state.model.spec(), "anthropic/test-model");
+    let rows = rendered_area(&mut app).join("\n");
+    assert!(rows.contains("Implementation model: anthropic/test-model"));
+    assert!(!rows.contains("Use current model"));
+    assert_eq!(app.plan_form.height(), default_height);
+}
+
+#[test]
 fn plan_form_model_selection_cancellation_preserves_choice() {
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec!["zai/glm-5".into()])));
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
     app.plan_form.on_plan_ready();
-    app.plan_form.set_implementation_model("zai/glm-5".into());
+    app.plan_form
+        .set_implementation_model("zai/glm-5".into(), "anthropic/test-model");
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     app.update(Msg::Key(key(KeyCode::Esc)));
     assert_eq!(app.plan_form.implementation_model(), Some("zai/glm-5"));

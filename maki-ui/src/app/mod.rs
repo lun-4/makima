@@ -1220,7 +1220,8 @@ impl App {
             ModelPickerAction::Select(spec) => {
                 if self.plan_picker_open {
                     self.plan_picker_open = false;
-                    self.plan_form.set_implementation_model(spec);
+                    self.plan_form
+                        .set_implementation_model(spec, &self.state.model.spec());
                     vec![]
                 } else {
                     vec![Action::ChangeModel(spec)]
@@ -3240,6 +3241,10 @@ impl App {
             PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
             PlanFormAction::Hide => {
                 self.plan_form.hide();
+                vec![]
+            }
+            PlanFormAction::UseCurrentModel => {
+                self.plan_form.use_current_model();
                 vec![]
             }
             PlanFormAction::OpenModelPicker => {
