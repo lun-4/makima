@@ -4,6 +4,7 @@
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::fmt;
 use std::ops::AddAssign;
 use std::str::FromStr;
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
+use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, dynamic};
 use crate::types::ThinkingFields;
 
@@ -54,7 +56,7 @@ pub struct ModelPricing {
 
 /// Metadata discovered at runtime from a provider's `/models` endpoint.
 /// All fields optional -- most providers only return an ID.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelInfo {
     pub id: String,
     pub context_window: Option<u32>,
@@ -119,13 +121,56 @@ pub enum ModelFamily {
     Synthetic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+/// Ordering is a cost guarantee (a subagent may never run on a pricier tier
+/// than its parent), so the strength is written down in [`ModelTier::strength`]
+/// instead of being inherited from declaration order, where inserting or moving
+/// a variant would silently redefine "stronger". `Ord` stays because the tier is
+/// also a `BTreeMap` key in `model_registry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     Weak,
     Medium,
     Strong,
     Compaction,
+}
+
+impl ModelTier {
+    /// `Compaction` is not a capability tier: it is a user-assigned slot for the
+    /// cheap model that rewrites history. It therefore ranks below every agent
+    /// tier, which makes it the tightest ceiling a parent can impose - a session
+    /// on a compaction model hands its children that same model rather than
+    /// letting them escalate to a capability tier.
+    const fn strength(self) -> u8 {
+        match self {
+            Self::Compaction => 0,
+            Self::Weak => 1,
+            Self::Medium => 2,
+            Self::Strong => 3,
+        }
+    }
+
+    /// The single named way to cap a requested tier, so no call site re-derives
+    /// the cost rule with an ad-hoc comparison.
+    pub fn capped_at(self, ceiling: Self) -> Self {
+        if self.strength() <= ceiling.strength() {
+            self
+        } else {
+            ceiling
+        }
+    }
+}
+
+impl Ord for ModelTier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.strength().cmp(&other.strength())
+    }
+}
+
+impl PartialOrd for ModelTier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl fmt::Display for ModelTier {
@@ -191,6 +236,75 @@ pub(crate) fn lookup_entry<'a>(
         .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
 }
 
+const SNAPSHOT_DATE_DIGITS: usize = 8;
+
+/// A provider pins a release by stamping a date on an id it already ships,
+/// either `claude-sonnet-4-5-20250929` or `gpt-5.4-2026-03-11`. Both are the
+/// same model as the row they extend, unlike a version bump such as
+/// `claude-opus-5-2`, and the digit count is what tells the two apart.
+fn is_snapshot_suffix(suffix: &str) -> bool {
+    let Some(date) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    date.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        && date.bytes().filter(u8::is_ascii_digit).count() == SNAPSHOT_DATE_DIGITS
+}
+
+/// Whether a curated row names *this* model rather than merely sharing a prefix
+/// with it. [`lookup_entry`] matches by prefix so dated snapshots resolve to
+/// their base row, which also means `glm-5` answers for `glm-5.4`, a model it
+/// has never been checked against.
+fn names_exactly(entry: &ModelEntry, model_id: &str) -> bool {
+    entry.prefixes.iter().any(|prefix| {
+        model_id
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest))
+    })
+}
+
+/// Everything that can describe one model, ranked by how sure it is to be about
+/// that model and not its neighbour.
+struct ModelSources<'a> {
+    /// The curated row [`lookup_entry`] reached, exact or not.
+    entry: Option<&'a ModelEntry>,
+    /// `entry` names this id. Such a row was checked against the provider's own
+    /// pricing page, so nothing outranks it but live discovery. A row reached
+    /// by prefix is still the right family and a usable guess at the rest, but
+    /// nobody ever checked it against the id we were handed.
+    exact: bool,
+    /// models.dev, which lists releases our tables have not caught up to. Read
+    /// only when already warm, so this is `None` on a cold start.
+    catalog: Option<CatalogMeta>,
+}
+
+impl<'a> ModelSources<'a> {
+    fn resolve(manifest: &'a ProviderManifest, model_id: &str) -> Self {
+        let entry = lookup_entry(manifest.models, model_id).ok();
+        let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
+        Self {
+            entry,
+            exact,
+            catalog: (!exact)
+                .then(|| catalog::model_meta_if_available(manifest.slug, model_id))
+                .flatten(),
+        }
+    }
+
+    /// Exact row, then the catalog, then the same row as a mere relative, so
+    /// the last rung only ever answers when the first was skipped.
+    fn pick<T>(
+        &self,
+        from_entry: impl Fn(&ModelEntry) -> Option<T>,
+        from_catalog: impl Fn(&CatalogMeta) -> Option<T>,
+    ) -> Option<T> {
+        self.entry
+            .filter(|_| self.exact)
+            .and_then(&from_entry)
+            .or_else(|| self.catalog.as_ref().and_then(from_catalog))
+            .or_else(|| self.entry.and_then(&from_entry))
+    }
+}
+
 impl ModelFamily {
     pub fn supports_tool_examples(self) -> bool {
         match self {
@@ -230,6 +344,13 @@ impl ThinkingSupport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastSupport {
+    Pending,
+    Supported,
+    Unsupported,
+}
+
 #[derive(Debug, Clone)]
 pub struct Model {
     pub id: String,
@@ -242,37 +363,53 @@ pub struct Model {
     /// back to discovery, then the provider manifest.
     pub thinking_override: Option<ThinkingSupport>,
     pub supports_vision_override: Option<bool>,
+    pub supports_fast_override: Option<FastSupport>,
     pub pricing: ModelPricing,
-    /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
+    /// What the model declares it can generate, `None` when unknown (see
+    /// [`ProviderKind::fallback_max_output`]). Stays the same across requests,
+    /// because [`Self::max_thinking_budget`] scales effort levels off it.
     pub max_output_tokens: Option<u32>,
+    /// What this one request may generate, when a caller trimmed the cap to a
+    /// turn budget. `None` leaves the declared cap standing.
+    pub turn_output_tokens: Option<u32>,
     pub context_window: u32,
     pub thinking_fields: Option<Box<ThinkingFields>>,
 }
 
 impl Model {
-    /// When no static entry matches (a freshly released model the table has not
-    /// caught up to yet), fall back to the provider defaults so it still resolves.
+    /// Rates and limits come from the most specific source that names this
+    /// model: live discovery, then [`ModelSources`], then provider defaults.
+    /// Family and tier are about which dialect a model speaks and what role it
+    /// plays, which a relative answers just as well, so they read the curated
+    /// row whether or not it was an exact match.
     fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
-        let static_entry = lookup_entry(manifest.models, model_id).ok();
+        let sources = ModelSources::resolve(manifest, model_id);
+        let entry = sources.entry;
         let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
         // custom slug reads positional tiers and metadata through its base.
         let discovered = model_registry::discovered(manifest.slug, model_id);
         let discovered = discovered.as_ref();
-        let tier = model_registry::tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
-        let family = static_entry.map_or(manifest.family, |entry| entry.family);
-        let pricing = discovered
-            .and_then(|info| info.pricing.clone())
-            .or_else(|| static_entry.map(|entry| entry.pricing.clone()))
+        let tier = model_registry::tier_for(&spec, manifest.slug, entry.map(|e| e.tier));
+        let family = entry.map_or(manifest.family, |entry| entry.family);
+        let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
+        let pricing = discovered_pricing
+            .cloned()
+            .or_else(|| {
+                sources.pick(
+                    |entry| Some(entry.pricing.clone()),
+                    |meta| meta.pricing.clone(),
+                )
+            })
             .unwrap_or_default();
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
-            .or_else(|| static_entry.and_then(|entry| entry.max_output_tokens))
+            .or_else(|| sources.pick(|entry| entry.max_output_tokens, |meta| meta.output))
             .or(manifest.fallback_max_output);
         let context_window = discovered
             .and_then(|info| info.context_window)
             .or_else(|| anthropic::shared::long_context_window(model_id))
-            .or_else(|| static_entry.map(|entry| entry.context_window))
+            .or_else(|| sources.pick(|entry| Some(entry.context_window), |meta| meta.context))
             .unwrap_or(manifest.fallback_context_window);
         Self {
             id: model_id.to_string(),
@@ -282,8 +419,10 @@ impl Model {
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: None,
+            supports_fast_override: None,
             pricing,
             max_output_tokens,
+            turn_output_tokens: None,
             context_window,
             thinking_fields: None,
         }
@@ -294,28 +433,21 @@ impl Model {
     /// builtin; metadata is read once from the models.dev catalog and cached on
     /// the `Model` so `supports_thinking`/`supports_vision` do not need a live
     /// catalog lookup.
-    fn from_catalog(
-        slug: &str,
-        model_id: &str,
-        meta: crate::providers::catalog::CatalogMetaView,
-    ) -> Self {
+    fn from_catalog(slug: &str, model_id: &str, meta: CatalogMeta) -> Self {
+        let (context_window, max_output_tokens) = (meta.context_window(), meta.max_output());
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             supports_tool_examples_override: None,
-            thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
-            supports_vision_override: Some(meta.supports_vision),
-            pricing: ModelPricing {
-                input: meta.input_price,
-                output: meta.output_price,
-                cache_write: meta.cache_write,
-                cache_read: meta.cache_read,
-                fast: None,
-            },
-            max_output_tokens: Some(meta.output),
-            context_window: meta.context,
+            thinking_override: ThinkingSupport::from_flags(meta.supports_thinking, false),
+            supports_vision_override: meta.supports_vision,
+            supports_fast_override: None,
+            pricing: meta.pricing.unwrap_or_default(),
+            max_output_tokens: Some(max_output_tokens),
+            turn_output_tokens: None,
+            context_window,
             thinking_fields: None,
         }
     }
@@ -331,6 +463,11 @@ impl Model {
         };
         model_registry::discovered(manifest.slug, &self.id)
             .and_then(|d| d.supports_thinking)
+            .or_else(|| {
+                ModelSources::resolve(manifest, &self.id)
+                    .catalog?
+                    .supports_thinking
+            })
             .unwrap_or(manifest.supports_thinking)
     }
 
@@ -338,19 +475,20 @@ impl Model {
         self.thinking_override == Some(ThinkingSupport::Required)
     }
 
+    /// Vision support, most specific first: per-model override, discovery,
+    /// [`ModelSources`], the family default.
     pub fn supports_vision(&self) -> bool {
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }
-        let manifest = ManifestRegistry::for_slug(&self.provider);
-        manifest
-            .and_then(|m| {
-                model_registry::discovered(m.slug, &self.id).and_then(|d| d.supports_vision)
-            })
+        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+            return self.family.supports_vision();
+        };
+        model_registry::discovered(manifest.slug, &self.id)
+            .and_then(|d| d.supports_vision)
             .or_else(|| {
-                manifest
-                    .and_then(|m| lookup_entry(m.models, &self.id).ok())
-                    .map(|e| e.vision)
+                ModelSources::resolve(manifest, &self.id)
+                    .pick(|entry| Some(entry.vision), |meta| meta.supports_vision)
             })
             .unwrap_or_else(|| self.family.supports_vision())
     }
@@ -358,6 +496,21 @@ impl Model {
     pub fn supports_tool_examples(&self) -> bool {
         self.supports_tool_examples_override
             .unwrap_or_else(|| self.family.supports_tool_examples())
+    }
+
+    /// The `max_tokens` this request should carry.
+    ///
+    /// The turn budget is clamped on read rather than where it is set, because
+    /// providers that resolve limits per request (catalog, opencode) rewrite
+    /// `max_output_tokens` on the way out, long after the budget was sized.
+    /// Doing it here means such a provider only has to report the cap it knows,
+    /// and cannot send a budget its endpoint never offered by forgetting to
+    /// re-apply the trim.
+    pub fn output_tokens(&self) -> Option<u32> {
+        [self.turn_output_tokens, self.max_output_tokens]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Half the output window, so the answer always has room after the
@@ -369,14 +522,44 @@ impl Model {
             .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
     }
 
-    /// A model supports fast mode exactly when it carries fast-tier pricing, so
-    /// capability and billing can never disagree. The provider gate keeps fast
-    /// mode to Anthropic-based providers, resolved through the base manifest so
-    /// oauth scripts keep it; Bedrock separately ignores `opts.fast` at request
-    /// time.
+    /// This model carrying one request's output budget, leaving the declared
+    /// cap to say what the model can do.
+    pub fn with_turn_output(&self, budget: u32) -> Self {
+        Self {
+            turn_output_tokens: Some(budget),
+            ..self.clone()
+        }
+    }
+
+    /// Ceiling for the thinking one *request* may ask for: half the
+    /// `max_tokens` it carries, so the answer always has room after the
+    /// thinking, and no dialect is handed a budget its own `max_tokens` refuses
+    /// (Anthropic 400s when the two meet).
+    pub fn thinking_ceiling(&self) -> Option<u32> {
+        self.output_tokens().map(|n| n / 2)
+    }
+
+    /// A provider that knows its own plan speaks through the override: a Codex
+    /// subscription bills a flat rate, so there is no fast per-token price to
+    /// read. Everyone else falls back to fast-tier pricing, so capability and
+    /// billing can never disagree. The provider gate keeps that path to
+    /// Anthropic-based providers, resolved through the base manifest so oauth
+    /// scripts keep it; Bedrock separately ignores `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
-        self.pricing.fast.is_some()
-            && ManifestRegistry::for_slug(&self.provider).is_some_and(|m| m.slug == FAST_PROVIDER)
+        match self.supports_fast_override {
+            Some(support) => support == FastSupport::Supported,
+            None => {
+                self.pricing.fast.is_some()
+                    && ManifestRegistry::for_slug(&self.provider)
+                        .is_some_and(|m| m.slug == FAST_PROVIDER)
+            }
+        }
+    }
+
+    /// Discovery has not answered yet, so the `false` from [`Self::supports_fast`]
+    /// is provisional. Frontends park the user's wish instead of rejecting it.
+    pub fn fast_pending(&self) -> bool {
+        self.supports_fast_override == Some(FastSupport::Pending)
     }
 
     pub fn spec(&self) -> String {
@@ -401,7 +584,7 @@ impl Model {
     /// what they paid: the rate back then is unknown, and the table price is
     /// the honest guess.
     pub fn list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
-        (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))
+        (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast && self.supports_fast()))
     }
 
     pub fn provider_display_name(&self) -> &'static str {
@@ -514,7 +697,7 @@ impl Model {
             return Ok(model);
         }
 
-        if let Some(meta) = crate::providers::catalog::model_meta_if_available(slug, model_id) {
+        if let Some(meta) = catalog::model_meta_if_available(slug, model_id) {
             return Ok(Self::from_catalog(slug, model_id, meta));
         }
 
@@ -688,6 +871,10 @@ mod tests {
     ];
 
     const EPSILON: f64 = 1e-10;
+
+    /// Declaration index of `Compaction`, which a derived `Ord` would read as
+    /// the strongest tier.
+    const COMPACTION_DECLARED_LAST: u8 = 3;
     /// The only builtin whose rates move with the wall clock.
     const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
     const DEEPSEEK_SPEC: &str = "deepseek/deepseek-v4-pro";
@@ -707,6 +894,48 @@ mod tests {
         cache_read: 44,
     };
     const RECORDED_COST: f64 = 0.25;
+
+    #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5"; "the id itself")]
+    #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5-20250929"; "anthropic snapshot")]
+    #[test_case(&["gpt-5.4"], "gpt-5.4-2026-03-11"; "openai snapshot")]
+    fn a_curated_row_names_its_own_dated_snapshots(
+        prefixes: &'static [&'static str],
+        model_id: &str,
+    ) {
+        assert!(names_exactly(&entry_named(prefixes), model_id));
+    }
+
+    /// Each of these is a different model that merely starts with the row's id.
+    /// Letting the row answer for them is how `glm-5.4` would bill at `glm-5`
+    /// rates forever, silently, rather than reading models.dev.
+    #[test_case(&["glm-5"], "glm-5.4"; "version bump")]
+    #[test_case(&["glm-5"], "glm-5-code"; "named variant")]
+    #[test_case(&["claude-opus-5"], "claude-opus-5-2"; "version bump behind a dash")]
+    #[test_case(&["deepseek-flash"], "deepseek-flash-preview"; "preview of a relative")]
+    fn a_curated_row_does_not_name_its_relatives(
+        prefixes: &'static [&'static str],
+        model_id: &str,
+    ) {
+        let entry = entry_named(prefixes);
+        assert!(!names_exactly(&entry, model_id));
+        assert!(
+            lookup_entry(std::slice::from_ref(&entry), model_id).is_ok(),
+            "still the right row for family and tier, just not for rates"
+        );
+    }
+
+    fn entry_named(prefixes: &'static [&'static str]) -> ModelEntry {
+        ModelEntry {
+            prefixes,
+            tier: ModelTier::Medium,
+            family: ModelFamily::Generic,
+            vision: false,
+            default: false,
+            pricing: ModelPricing::default(),
+            max_output_tokens: None,
+            context_window: 0,
+        }
+    }
 
     #[test_case(999, "999"         ; "under_thousand")]
     #[test_case(1_000, "1.0k"      ; "thousand")]
@@ -746,6 +975,31 @@ mod tests {
             std::mem::discriminant(&err),
             std::mem::discriminant(&expected)
         );
+    }
+
+    const SMALL_CAP: u32 = 8_192;
+    const TURN_BUDGET: u32 = 32_768;
+
+    /// Providers that resolve limits per request rewrite `max_output_tokens`
+    /// after the agent sized the turn, so a budget above the cap they report
+    /// must not survive to the wire.
+    #[test_case(Some(TURN_BUDGET), Some(SMALL_CAP), Some(SMALL_CAP) ; "a_lowered_cap_clamps_the_budget")]
+    #[test_case(Some(SMALL_CAP), Some(TURN_BUDGET), Some(SMALL_CAP) ; "a_trimmed_turn_is_what_the_request_carries")]
+    #[test_case(None, Some(SMALL_CAP), Some(SMALL_CAP) ; "an_untrimmed_turn_leaves_the_cap_standing")]
+    #[test_case(Some(TURN_BUDGET), None, Some(TURN_BUDGET) ; "an_undeclared_cap_keeps_the_budget")]
+    #[test_case(None, None, None ; "nothing_to_send")]
+    fn output_tokens_never_exceeds_the_declared_cap(
+        turn_output_tokens: Option<u32>,
+        max_output_tokens: Option<u32>,
+        expected: Option<u32>,
+    ) {
+        let model = Model {
+            turn_output_tokens,
+            max_output_tokens,
+            ..Model::from_spec("openai/gpt-5.6-sol").unwrap()
+        };
+
+        assert_eq!(model.output_tokens(), expected);
     }
 
     #[test]
@@ -946,6 +1200,50 @@ mod tests {
         }
     }
 
+    #[test_case(ModelTier::Strong, ModelTier::Weak, ModelTier::Weak ; "strong_child_capped_to_weak_parent")]
+    #[test_case(ModelTier::Weak, ModelTier::Strong, ModelTier::Weak ; "weak_child_stays_weak_under_strong_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Medium, ModelTier::Medium ; "equal_tiers_pass_through")]
+    #[test_case(ModelTier::Strong, ModelTier::Compaction, ModelTier::Compaction ; "strong_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Compaction, ModelTier::Compaction ; "medium_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Compaction, ModelTier::Strong, ModelTier::Compaction ; "compaction_child_is_not_escalated")]
+    fn capped_at_never_exceeds_ceiling(
+        requested: ModelTier,
+        ceiling: ModelTier,
+        expected: ModelTier,
+    ) {
+        assert_eq!(requested.capped_at(ceiling), expected);
+        assert!(requested.capped_at(ceiling) <= ceiling);
+    }
+
+    #[test]
+    fn every_tier_under_a_compaction_ceiling_stays_at_compaction() {
+        for &tier in &TIERS {
+            assert_eq!(tier.capped_at(ModelTier::Compaction), ModelTier::Compaction);
+        }
+    }
+
+    /// Fails if the variants get reordered (the hand-written strength table
+    /// would no longer be the thing that disagrees with declaration order) or if
+    /// the explicit `Ord` is ever replaced by a derive, which would rank
+    /// `Compaction` above `Strong` and turn the subagent cap into a no-op.
+    #[test]
+    fn tier_order_is_explicit_not_declaration_order() {
+        assert_eq!(ModelTier::Compaction as u8, COMPACTION_DECLARED_LAST);
+        assert!(ModelTier::Compaction < ModelTier::Weak);
+
+        let mut tiers = TIERS;
+        tiers.sort();
+        assert_eq!(
+            tiers,
+            [
+                ModelTier::Compaction,
+                ModelTier::Weak,
+                ModelTier::Medium,
+                ModelTier::Strong
+            ]
+        );
+    }
+
     #[test]
     fn tier_display_roundtrip() {
         for &tier in &TIERS {
@@ -1049,6 +1347,38 @@ mod tests {
         assert_eq!(model.supports_fast(), expected);
     }
 
+    #[test_case("google/gemini-2.5-pro", Some(FastSupport::Supported), true ; "override_enables_without_fast_pricing")]
+    #[test_case("anthropic/claude-opus-5", Some(FastSupport::Unsupported), false ; "override_disables_native_support")]
+    #[test_case("anthropic/claude-opus-5", None, true ; "no_override_falls_back_to_pricing")]
+    #[test_case("anthropic/claude-opus-5", Some(FastSupport::Pending), false ; "pending_disables_native_support")]
+    fn supports_fast_respects_override(
+        spec: &str,
+        fast_override: Option<FastSupport>,
+        expected: bool,
+    ) {
+        let mut model = Model::from_spec(spec).unwrap();
+        model.supports_fast_override = fast_override;
+        assert_eq!(model.supports_fast(), expected);
+    }
+
+    #[test_case("google/gemini-2.5-pro" ; "non_anthropic")]
+    #[test_case("anthropic/claude-sonnet-5" ; "anthropic")]
+    fn fast_override_without_fast_pricing_uses_standard_rates(spec: &str) {
+        let mut model = Model::from_spec(spec).unwrap();
+        model.supports_fast_override = Some(FastSupport::Supported);
+        assert!(model.supports_fast());
+        assert!(model.pricing.fast.is_none());
+        assert!(!model.pricing.is_zero());
+        assert_eq!(
+            model.list_cost(&COUNTERS, true),
+            Some(COUNTERS.cost(&model.pricing, false))
+        );
+    }
+
+    /// Without an override, fast mode is Anthropic-only, so a fast rate that
+    /// lands on anyone else is dead weight: nobody can turn it on, and an
+    /// `always_fast` carried in from config must not quietly reprice the
+    /// session with it.
     #[test]
     fn supports_fast_false_for_non_anthropic_even_with_fast_pricing() {
         let mut model = Model::from_base(

@@ -7,8 +7,8 @@ use base64::Engine;
 use image::{ImageBuffer, RgbaImage};
 use maki_agent::{ImageMediaType, ImageSource};
 
-const MAX_IMAGE_PIXELS: usize = 8_000_000;
-const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_PIXELS: usize = 8_000_000;
+pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 const IMAGE_EXTENSIONS: &[(&str, ImageMediaType)] = &[
     ("png", ImageMediaType::Png),

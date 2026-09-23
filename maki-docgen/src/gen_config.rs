@@ -4,10 +4,12 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, BellConfig, ConfigField, DEFAULT_AUTOCOMPLETE_HEIGHT, DEFAULT_MAX_LOG_FILES,
-    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig,
-    StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
+    DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig,
+    ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
+
+use crate::gen_folder_trust::POLICY_EXAMPLE;
 
 fn write_table_with_min(out: &mut String, fields: &[ConfigField]) {
     writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
@@ -210,6 +212,63 @@ fn write_bell_section(out: &mut String) {
     writeln!(out).unwrap();
 }
 
+fn write_net_section(out: &mut String) {
+    write_section(out, "[net]", NetConfig::FIELDS);
+    writeln!(
+        out,
+        "`maki.net` refuses private, loopback and metadata addresses, because \
+         the model picks the URLs. List a host here to let it through:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "\
+```lua
+maki.setup({{
+    net = {{
+        allowed_private_hosts = {{ \"localhost:8080\", \"nas.lan\", \"10.0.0.0/8\" }},
+    }},
+}})
+```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "An entry with no port covers every port. A name you list is allowed \
+         whatever it resolves to. A name you did not list stays blocked when \
+         DNS lands it on a private address, unless that address falls in a \
+         range you allowed, so keep ranges as small as the service needs. \
+         Every redirect hop is checked against the same list. \
+         [Permissions](/docs/permissions/#network-addresses) covers what the \
+         guard protects.\n"
+    )
+    .unwrap();
+}
+
+/// `paths` is a `Vec<String>`, which the `ConfigValue` table cannot describe,
+/// so this section is prose like `net.allowed_private_hosts`.
+fn write_trust_section(out: &mut String) {
+    writeln!(out, "### `trust`\n").unwrap();
+    writeln!(
+        out,
+        "Answers the folder trust question in advance. Read from the global \
+         `~/.config/makima/init.lua` only, since a project file that could set \
+         it would be trusting itself:\n"
+    )
+    .unwrap();
+    writeln!(out, "{POLICY_EXAMPLE}\n").unwrap();
+    writeln!(
+        out,
+        "`paths` is a list of globs matched against the project root, empty by \
+         default. `prompt` is a bool, `true` by default. Setting it to `false` \
+         drops the startup card and leaves the folder restricted unless a \
+         `paths` entry matches. \
+         [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax \
+         and which run modes apply the policy.\n"
+    )
+    .unwrap();
+}
+
 pub fn generate() -> String {
     let mut out = String::with_capacity(4096);
 
@@ -295,6 +354,8 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
+    write_net_section(&mut out);
+    write_trust_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(
@@ -302,6 +363,12 @@ All fields are optional. Typos in field names cause an error right away.
         "The `plugins` table turns plugins on or off and passes options to \
          them. All bundled plugins are on by default. Set \
          `enabled = false` to turn one off.\n\n\
+         A plugin that is off never loads, so its tool name is free for one \
+         of your own plugins to take. Permission rules are keyed by the tool \
+         name alone, and names such as `bash`, `write`, and `task` already \
+         have rules in maki. A plugin that takes one of them inherits those \
+         rules, together with any \"always allow\" you saved. Maki warns you \
+         at load when this happens.\n\n\
          Each plugin checks its own options at startup. A typo, a wrong \
          type, or an unknown plugin name gives you a clear error right \
          away.\n\n\

@@ -38,8 +38,13 @@ use maki_agent::session_options::{
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
-use maki_config::{ModelPolicy, UiConfig};
+use maki_config::project::TrustQuestion;
+use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
+use maki_lua::session_snapshot::{
+    MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
+    SessionSnapshot,
+};
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, ModelRequest, ProviderUsageAck,
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
@@ -138,6 +143,9 @@ pub struct EventLoopParams {
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
+    pub project_config: ProjectConfig,
+    pub trust_question: Option<TrustQuestion>,
+    pub startup_notice: Option<String>,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
 }
@@ -254,9 +262,9 @@ impl SessionStatus {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Working => "working",
-            Self::NeedsInput => "needs_input",
-            Self::Idle => "idle",
+            Self::Working => STATUS_WORKING,
+            Self::NeedsInput => STATUS_NEEDS_INPUT,
+            Self::Idle => STATUS_IDLE,
         }
     }
 }
@@ -313,13 +321,15 @@ fn terminal_input_proves_focus(_event: &Event) -> bool {
 
 fn route_terminal_lifecycle(app: &mut App, event: &Event) {
     if matches!(event, Event::FocusLost | Event::Resize(..)) {
-        let _ = app.cancel_middle_scroll();
+        let dirty = app.cancel_middle_scroll();
+        app.pending_dirty |= dirty;
     }
 }
 
 fn assign_session_focus(outgoing: &mut App, focused: &mut usize, next: usize) {
     if *focused != next {
-        let _ = outgoing.cancel_middle_scroll();
+        let dirty = outgoing.cancel_middle_scroll();
+        outgoing.pending_dirty |= dirty;
         *focused = next;
     }
 }
@@ -329,7 +339,8 @@ fn prepare_terminal_handoff<'a>(
     terminal_focused: &mut bool,
 ) {
     for app in apps {
-        let _ = app.cancel_middle_scroll();
+        let dirty = app.cancel_middle_scroll();
+        app.pending_dirty |= dirty;
     }
     *terminal_focused = false;
 }
@@ -340,7 +351,7 @@ fn tick_session(app: &mut App, focused: bool, now: Instant) -> (Dirty, Vec<Actio
     if focused {
         dirty |= app.tick_at(now);
     } else {
-        let _ = app.float_mgr.tick();
+        dirty |= app.float_mgr.tick();
         dirty |= app.tick_edge_scroll();
         dirty |= app.tick_error_expiry();
         dirty |= app.poll_image_paste();
@@ -503,9 +514,12 @@ fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
 fn project_committed_options_for_app(app: &mut App, snapshot: &SessionOptionsSnapshot) {
     for option in snapshot.options.iter() {
         match option.definition.id.as_ref() {
-            YOLO_OPTION_ID => app
-                .permissions
-                .set_yolo(option.current_value.as_ref() == ENABLED_VALUE),
+            YOLO_OPTION_ID => {
+                let enabled = option.current_value.as_ref() == ENABLED_VALUE;
+                if app.permissions.is_yolo() != enabled {
+                    app.permissions.set_yolo(enabled);
+                }
+            }
             FAST_OPTION_ID => app.state.fast = option.current_value.as_ref() == ENABLED_VALUE,
             WORKFLOW_OPTION_ID => {
                 app.state.workflow = option.current_value.as_ref() == ENABLED_VALUE
@@ -530,7 +544,7 @@ fn apply_options_to_session(session: &mut AppSession, snapshot: &SessionOptionsS
         let id = option.definition.id.as_ref();
         let enabled = option.current_value.as_ref() == ENABLED_VALUE;
         match id {
-            YOLO_OPTION_ID => session.meta.yolo = enabled,
+            YOLO_OPTION_ID => session.meta.yolo = Some(enabled),
             FAST_OPTION_ID => session.meta.fast = enabled,
             WORKFLOW_OPTION_ID => session.meta.workflow = enabled,
             THINKING_OPTION_ID => {
@@ -875,6 +889,7 @@ struct SpawnCtx {
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
     command_runtime: Arc<CommandRuntime>,
+    trust_question: Option<TrustQuestion>,
 }
 
 /// The slice of [`SpawnCtx`] that registering a coordinator needs. Split out
@@ -1013,7 +1028,7 @@ fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
     let definitions = builtin_option_definitions(
         Arc::from(model_spec.as_str()),
         available_models,
-        session.meta.yolo,
+        permissions.is_yolo(),
         session.meta.fast,
         session.meta.workflow,
         thinking,
@@ -1132,7 +1147,7 @@ impl SpawnCtx {
         current_id: MakiId,
         permissions: &PermissionManager,
     ) -> Result<PreparedSessionRuntime, String> {
-        session.meta.yolo = permissions.is_yolo();
+        session.meta.yolo = permissions.persisted_yolo();
         let provider = self.prepare_replacement_provider(&session)?;
         let seed_snapshot = session.id != current_id;
         self.prepare_runtime_with_provider_and_permissions(
@@ -1168,7 +1183,7 @@ impl SpawnCtx {
         provider: Option<PreparedProvider>,
     ) -> Result<PreparedSessionRuntime> {
         if !session_has_content(&session) {
-            session.meta.yolo = self.permissions.is_yolo();
+            session.meta.yolo = self.permissions.persisted_yolo();
         }
         self.prepare_runtime_with_provider_and_permissions(
             session,
@@ -1206,7 +1221,7 @@ impl SpawnCtx {
             self.model_slot.change_tx(),
         );
         let permissions = Arc::new(permissions.fork());
-        permissions.set_yolo(session.meta.yolo);
+        permissions.set_session_yolo(session.meta.yolo);
         permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
         let handles = AgentHandles::prepare(
             &model_slot,
@@ -1235,7 +1250,7 @@ impl SpawnCtx {
         )?;
         let seed_snapshot =
             seed_snapshot.then(|| (Arc::clone(&self.storage_writer), Arc::new(session.clone())));
-        let app = App::prepare(
+        let mut app = App::prepare(
             &model,
             session,
             self.storage.clone(),
@@ -1254,6 +1269,7 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
         );
+        app.app.trust_question = self.trust_question.clone();
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         Ok(PreparedSessionRuntime {
             app,
@@ -1417,6 +1433,7 @@ fn sync_session_models(sessions: &mut [SessionRuntime]) -> bool {
         let slot_model = rt.model_slot.load();
         if rt.app.state.session.model != slot_model.model.spec()
             || rt.app.state.model.context_window != slot_model.model.context_window
+            || rt.app.state.model.supports_fast_override != slot_model.model.supports_fast_override
         {
             let model = slot_model.model.clone();
             drop(slot_model);
@@ -1525,6 +1542,9 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             lua_event_handle,
             model_policy,
+            project_config,
+            trust_question,
+            startup_notice,
             system_prompt_override,
             append_system_prompt,
         } = params;
@@ -1552,7 +1572,7 @@ impl<'t> EventLoop<'t> {
 
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {
-            std::thread::spawn(crate::highlight::warmup);
+            maki_highlight::pool::spawn(crate::highlight::warmup);
             crate::update::spawn_check();
         });
 
@@ -1590,7 +1610,8 @@ impl<'t> EventLoop<'t> {
             theme_completion,
         );
         let command_runtime = Arc::new(command_runtime);
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+        let (mcp_handle, mcp_config_errors) =
+            smol::block_on(mcp::start(&cwd, project_config.clone()));
         let ctx = SpawnCtx {
             storage,
             sessions_dir: sessions_dir.clone(),
@@ -1614,6 +1635,7 @@ impl<'t> EventLoop<'t> {
                 append_text: append_system_prompt,
             },
             command_runtime,
+            trust_question,
         };
 
         let mut runtimes = Vec::with_capacity(sessions.len());
@@ -1656,6 +1678,9 @@ impl<'t> EventLoop<'t> {
         if !ctx.mcp_config_errors.is_empty() {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
             app.flash(msg);
+        }
+        if let Some(notice) = startup_notice {
+            app.flash(notice);
         }
         for w in startup_warnings {
             app.flash(w);
@@ -1827,9 +1852,10 @@ impl<'t> EventLoop<'t> {
                     // Sessions spawned before the fetch resolved copied the
                     // unrefined startup model; hand them the resolved one so
                     // context windows and capabilities are not left stale.
-                    for rt in &self.sessions {
+                    for rt in &mut self.sessions {
                         if rt.model_slot.load().model.spec() == requested_spec {
                             rt.model_slot.install(model.clone(), Arc::clone(&provider));
+                            rt.app.update_model(&model);
                         }
                     }
                 }
@@ -1956,7 +1982,7 @@ impl<'t> EventLoop<'t> {
                 maki_commands::CommandOutcome::Failed(error) => {
                     self.sessions[index].app.flash(error.to_string());
                 }
-                maki_commands::CommandOutcome::ManualCompaction
+                maki_commands::CommandOutcome::ManualCompaction(_)
                 | maki_commands::CommandOutcome::Completed => {}
             },
         }
@@ -2077,6 +2103,11 @@ impl<'t> EventLoop<'t> {
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
             }
+            UiAction::SetWindowTitle(title) => {
+                if let Err(error) = terminal::set_window_title(&title) {
+                    tracing::warn!(%error, "failed to set window title");
+                }
+            }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);
                 let _ = reply_tx.send(code);
@@ -2178,7 +2209,11 @@ impl<'t> EventLoop<'t> {
         let generations = self
             .sessions
             .iter_mut()
-            .map(|runtime| runtime.app.reconcile_status_content())
+            .map(|runtime| {
+                let (generation, d) = runtime.app.reconcile_status_content();
+                runtime.app.pending_dirty |= d;
+                generation
+            })
             .collect::<Vec<_>>();
         if generations
             .iter()
@@ -2521,6 +2556,13 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Current => {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
+            SessionRequest::Read { id } => {
+                let reply = match self.resolve_session_index(id.as_deref()) {
+                    Ok(idx) => Ok(self.session_snapshot_json(idx)),
+                    Err(e) => Err(e),
+                };
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::Usage => {
                 let app = &self.sessions[self.focused].app;
                 let reply = session_usage(
@@ -2720,6 +2762,45 @@ impl<'t> EventLoop<'t> {
 
     fn position(&self, id: MakiId) -> Option<usize> {
         self.sessions.iter().position(|rt| rt.id() == id)
+    }
+
+    /// No id means the focused session. A plugin holding the id of a tab that
+    /// has since closed gets `session not live` back, so it knows to stop.
+    fn resolve_session_index(&self, id: Option<&str>) -> Result<usize, String> {
+        let Some(id) = id else {
+            return Ok(self.focused);
+        };
+        let parsed = parse_session_id(id)?;
+        self.position(parsed).ok_or_else(|| NOT_LIVE_ERR.into())
+    }
+
+    /// The totals live on the session, so a plugin that reloads mid run keeps
+    /// the accounting it would lose by summing `TurnEnd` payloads itself.
+    fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
+        let rt = &self.sessions[idx];
+        let app = &rt.app;
+        let snapshot = SessionSnapshot {
+            id: rt.id().to_string(),
+            cwd: app.state.session.cwd.clone(),
+            title: Some(app.state.session.title.clone()),
+            model: app.state.model.spec(),
+            mode: if app.state.mode == crate::app::mode::Mode::Plan {
+                MODE_PLAN
+            } else {
+                MODE_BUILD
+            },
+            status: SessionStatus::of(app).as_str(),
+            focused: idx == self.focused,
+            updated_at: app.state.session.updated_at,
+            queue: Some(SessionQueueSnapshot {
+                count: app.queue.text_messages().len(),
+            }),
+            usage: app.state.token_usage,
+            context_size: app.state.context_size,
+            context_window: app.state.model.context_window,
+            cost: app.state.cost,
+        };
+        serde_json::to_value(snapshot).unwrap_or_default()
     }
 
     /// The single place that removes a runtime: keeps `focused` pointing at
@@ -3089,11 +3170,14 @@ impl<'t> EventLoop<'t> {
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
-            Action::Compact => {
+            Action::Compact(instructions) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Compact { run_id });
+                rt.handles.queue.push(QueueItem::Compact {
+                    run_id,
+                    instructions,
+                });
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
@@ -3420,6 +3504,7 @@ impl<'t> EventLoop<'t> {
                     }
                     let mut session = Arc::unwrap_or_clone(Arc::clone(&app.state.session));
                     apply_options_to_session(&mut session, &snapshot);
+                    session.meta.yolo = app.permissions.persisted_yolo();
                     app.state.session = Arc::new(session);
                     session_leases.push((app.state.session.id, lease));
                 }
@@ -3686,6 +3771,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             maki_config::PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(std::path::Path::new("/tmp")),
             Arc::default(),
         ));
         let mut app = crate::app::tests::test_app();
@@ -3950,7 +4036,7 @@ mod tests {
     }
 
     impl RuntimeHarness {
-        fn new() -> Self {
+        fn with_permissions_config(permissions_config: PermissionsConfig) -> Self {
             let temp_dir = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(temp_dir.path().to_path_buf());
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
@@ -3968,8 +4054,9 @@ mod tests {
             let (model_slot, _provider_change_rx) =
                 ProviderSlot::new(model, Arc::new(StubProvider));
             let permissions = Arc::new(PermissionManager::new(
-                PermissionsConfig::default(),
+                permissions_config,
                 temp_dir.path().to_path_buf(),
+                ProjectConfig::for_project(temp_dir.path()),
                 Arc::default(),
             ));
             let storage_writer =
@@ -3994,11 +4081,16 @@ mod tests {
                 model_policy: Arc::new(ModelPolicy::default()),
                 system_prompt: SystemPromptOverride::default(),
                 command_runtime,
+                trust_question: None,
             };
             Self {
                 _temp_dir: temp_dir,
                 ctx: Some(ctx),
             }
+        }
+
+        fn new() -> Self {
+            Self::with_permissions_config(PermissionsConfig::default())
         }
 
         fn ctx(&self) -> &SpawnCtx {
@@ -4193,7 +4285,7 @@ mod tests {
         let snapshot = runtime.coordinator.read().options();
         let mut reload = Arc::unwrap_or_clone(Arc::clone(&runtime.app.state.session));
         apply_options_to_session(&mut reload, &snapshot);
-        assert!(reload.meta.yolo);
+        assert_eq!(reload.meta.yolo, Some(true));
         assert!(reload.meta.workflow);
         release_runtime(runtime);
     }
@@ -4496,7 +4588,7 @@ mod tests {
         let harness = RuntimeHarness::new();
         harness.ctx().permissions.set_yolo(startup_yolo);
         let mut session = harness.session();
-        session.meta.yolo = persisted_yolo;
+        session.meta.yolo = Some(persisted_yolo);
         session.push_message(Message::user("resumed".into()));
 
         let runtime = harness.runtime(session);
@@ -4535,7 +4627,7 @@ mod tests {
             .unwrap();
 
         assert!(runtime.app.permissions.is_yolo());
-        assert!(runtime.app.state.session.meta.yolo);
+        assert_eq!(runtime.app.state.session.meta.yolo, Some(true));
         let options = runtime.coordinator.read().options();
         let yolo = options
             .options
@@ -4548,6 +4640,39 @@ mod tests {
             yolo.current_value.as_ref(),
             maki_agent::session_options::ENABLED_VALUE
         );
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn startup_yolo_seed_applies_without_marking_session() {
+        let harness = RuntimeHarness::with_permissions_config(PermissionsConfig {
+            yolo: true,
+            ..Default::default()
+        });
+
+        let mut runtime = harness
+            .prepare()
+            .activate(&harness.ctx().model_slot, None)
+            .unwrap();
+
+        assert!(runtime.app.permissions.is_yolo());
+        assert_eq!(runtime.app.state.session.meta.yolo, None);
+        let options = runtime.coordinator.read().options();
+        let yolo = options
+            .options
+            .iter()
+            .find(|option| {
+                option.definition.id.as_ref() == maki_agent::session_options::YOLO_OPTION_ID
+            })
+            .unwrap();
+        assert_eq!(
+            yolo.current_value.as_ref(),
+            maki_agent::session_options::ENABLED_VALUE
+        );
+
+        checkpoint_runtime(&mut runtime);
+        assert!(runtime.app.permissions.is_yolo());
+        assert_eq!(runtime.app.state.session.meta.yolo, None);
         release_runtime(runtime);
     }
 
@@ -5496,13 +5621,13 @@ mod tests {
     }
 
     fn done_event() -> AgentEvent {
-        AgentEvent::TurnOutcome(TurnOutcome::Completed {
-            agent_id: AgentId::generate(),
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        })
+        AgentEvent::TurnOutcome(TurnOutcome::completed(
+            AgentId::generate(),
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        ))
     }
 
     fn due_completion() -> RunNotificationState {

@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use maki_agent::agent::tool_dispatch::{self, Emit};
-use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::agent::tool_dispatch;
+use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
 use maki_agent::{AgentMode, ToolDoneEvent};
 use maki_config::PluginsConfig;
 use serde_json::{Map, Value, json};
@@ -60,13 +60,11 @@ fn shared_ctx(registry: &Arc<ToolRegistry>) -> ToolContext {
 
 fn dispatch(ctx: &ToolContext, id: &str, name: &str, input: Value) -> ToolDoneEvent {
     smol::block_on(tool_dispatch::run(
-        &ctx.registry,
-        None,
         id.into(),
         name,
         &input,
         ctx,
-        Emit::Silent,
+        CallOrigin::Nested,
     ))
 }
 
@@ -583,18 +581,7 @@ fn dispatch_async(
 ) -> impl std::future::Future<Output = ToolDoneEvent> {
     let ctx = ctx.clone();
     let input = input.clone();
-    async move {
-        tool_dispatch::run(
-            &ctx.registry,
-            None,
-            id.into(),
-            name,
-            &input,
-            &ctx,
-            Emit::Silent,
-        )
-        .await
-    }
+    async move { tool_dispatch::run(id.into(), name, &input, &ctx, CallOrigin::Nested).await }
 }
 
 /// Records the order of backend operations and can park the first `read`

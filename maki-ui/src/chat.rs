@@ -15,7 +15,7 @@ use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
-use maki_providers::{ContentBlock, Message, Role};
+use maki_providers::{ContentBlock, ImageSource, Message, Role};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -37,7 +37,7 @@ pub enum ChatEventResult {
     ControlComplete,
     QueueItemConsumed {
         text: String,
-        image_count: usize,
+        images: Vec<ImageSource>,
     },
     Error(String),
     PermissionRequest {
@@ -56,6 +56,9 @@ pub struct Chat {
     /// Compatibility identity retained for display and persistence.
     pub subagent_id: Option<String>,
     pub agent_id: Option<maki_agent::AgentId>,
+    /// A subagent's own settings; `None` on the main chat, which reads the
+    /// session's.
+    pub opts: Option<maki_providers::RequestOptions>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     finished: bool,
@@ -76,6 +79,7 @@ impl Chat {
             model_id: None,
             subagent_id: None,
             agent_id: None,
+            opts: None,
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle, theme_provider),
             finished: false,
@@ -130,24 +134,35 @@ impl Chat {
                         .push(DisplayMessage::plan(content, pp.display().to_string()));
                 }
             }
-            AgentEvent::TurnComplete(_) => {}
+            AgentEvent::TurnComplete(turn) => {
+                for block in turn.message.content {
+                    if let ContentBlock::Image { source } = block {
+                        self.messages_panel.flush();
+                        self.messages_panel.push(DisplayMessage::with_images(
+                            DisplayRole::Assistant,
+                            String::new(),
+                            vec![source],
+                        ));
+                    }
+                }
+            }
             AgentEvent::ToolResultsSubmitted { .. } => {
                 if let Some(usage) = self.pending_turn_usage.take() {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
-            AgentEvent::AutoCompacting => {
+            AgentEvent::AutoCompacting { .. } => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Assistant,
                     "Auto-compacting conversation...".into(),
                 ));
             }
-            AgentEvent::CompactionDone => {
+            AgentEvent::CompactionDone { .. } => {
                 self.messages_panel.flush();
             }
-            AgentEvent::QueueItemConsumed { text, image_count } => {
-                return ChatEventResult::QueueItemConsumed { text, image_count };
+            AgentEvent::QueueItemConsumed { text, images } => {
+                return ChatEventResult::QueueItemConsumed { text, images };
             }
             // The app tracks the running model to show a queued switch; the
             // chat panel has nothing to render for it.
@@ -202,7 +217,9 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::SubagentHistory { .. } | AgentEvent::SubagentClosed => {}
+            AgentEvent::SubagentHistory { .. }
+            | AgentEvent::SubagentClosed
+            | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
@@ -303,8 +320,15 @@ impl Chat {
         self.messages_panel.cadence()
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
-        self.messages_panel.view(frame, area, has_selection);
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        has_selection: bool,
+        images_visible: bool,
+    ) {
+        self.messages_panel
+            .view(frame, area, has_selection, images_visible);
     }
 
     pub fn scroll_top(&self) -> u16 {
@@ -315,7 +339,7 @@ impl Chat {
         self.messages_panel.segment_heights()
     }
 
-    pub fn segment_search_texts(&self) -> Vec<&str> {
+    pub fn segment_search_texts(&self) -> Vec<String> {
         self.messages_panel.segment_search_texts()
     }
 
@@ -421,9 +445,13 @@ impl Chat {
 
     /// Flush, push, and re-pin scroll in one shot to avoid
     /// the one-frame hop where the bubble briefly lands in the wrong row.
-    pub fn show_user_message(&mut self, text: impl Into<String>) {
+    pub fn show_user_message(&mut self, text: impl Into<String>, images: Vec<ImageSource>) {
         self.flush();
-        self.push_user_message(text);
+        self.messages_panel.push(DisplayMessage::with_images(
+            DisplayRole::User,
+            text.into(),
+            images,
+        ));
         self.enable_auto_scroll();
     }
 
@@ -442,6 +470,11 @@ impl Chat {
     #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages_panel.message_count()
+    }
+
+    #[cfg(test)]
+    pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
+        self.messages_panel.message_at(index)
     }
 
     #[cfg(test)]
@@ -493,8 +526,19 @@ pub fn history_to_display(
         }
         match msg.role {
             Role::User => {
-                if let Some(text) = msg.user_text() {
-                    display.push(DisplayMessage::new(DisplayRole::User, text.to_owned()));
+                // An empty `display_text` marks a message the transcript never
+                // shows, so its attachments must not sneak in either.
+                if msg.display_text.as_deref() == Some("") {
+                    continue;
+                }
+                let images = user_images(msg);
+                let text = msg.user_text();
+                if text.is_some() || !images.is_empty() {
+                    display.push(DisplayMessage::with_images(
+                        DisplayRole::User,
+                        text.unwrap_or_default().to_owned(),
+                        images,
+                    ));
                 }
             }
             Role::Assistant => {
@@ -502,6 +546,13 @@ pub fn history_to_display(
                     match block {
                         ContentBlock::Text { text } if !text.is_empty() => {
                             display.push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
+                        }
+                        ContentBlock::Image { source } => {
+                            display.push(DisplayMessage::with_images(
+                                DisplayRole::Assistant,
+                                String::new(),
+                                vec![source.clone()],
+                            ));
                         }
                         ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
                             display
@@ -571,6 +622,7 @@ pub fn history_to_display(
                                     name: static_name.into(),
                                 })),
                                 text,
+                                images: Vec::new(),
                                 tool_input: None,
                                 tool_raw_input: Some(Arc::new(input.clone())),
                                 tool_output,
@@ -661,6 +713,25 @@ fn build_loaded_tool(
     }
 }
 
+/// Images the user attached. A tool result also rides in a user message, and
+/// its images already render under the tool itself, so those stay out.
+fn user_images(msg: &Message) -> Vec<ImageSource> {
+    if msg
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    {
+        return Vec::new();
+    }
+    msg.content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image { source } => Some(source.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     let mut map = HashMap::new();
     for msg in messages {
@@ -684,10 +755,147 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::IMAGE_PLACEHOLDER;
     use crate::theme::InMemoryThemesProvider;
-    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
     use maki_config::UiConfig;
+    use maki_providers::ImageMediaType;
     use test_case::test_case;
+
+    const IMAGE_DATA: &str = "dGVzdA==";
+    const EXPECTED_QUEUE_DELIVERY: &str = "a consumed queue item must carry its images";
+    const USER_TEXT: &str = "look at this";
+    const TASK_ID: &str = "call_t1";
+    const REPLY_TEXT: &str = "i see it";
+
+    fn image() -> ImageSource {
+        ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
+    }
+
+    fn chat() -> Chat {
+        Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+            Arc::new(InMemoryThemesProvider::bundled()),
+        )
+    }
+
+    fn text_delta(chat: &mut Chat, text: &str) {
+        if !text.is_empty() {
+            chat.handle_event(
+                AgentEvent::TextDelta {
+                    text: text.to_string(),
+                },
+                None,
+            );
+        }
+    }
+
+    #[test_case(USER_TEXT, USER_TEXT ; "captioned")]
+    #[test_case("", IMAGE_PLACEHOLDER ; "image_only")]
+    fn history_delivers_images_without_synthetic_or_tool_attachments(text: &str, expected: &str) {
+        let mut hidden = Message::synthetic(USER_TEXT.into());
+        hidden.content.push(ContentBlock::Image { source: image() });
+        let mut observation = Message::observation(USER_TEXT.into());
+        observation
+            .content
+            .push(ContentBlock::Image { source: image() });
+        let tool_result = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: TASK_ID.into(),
+                    content: USER_TEXT.into(),
+                    is_error: false,
+                },
+                ContentBlock::Image { source: image() },
+            ],
+            ..Default::default()
+        };
+        let assistant = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Image { source: image() }],
+            ..Default::default()
+        };
+        let (display, _) = history_to_display(
+            &[
+                Message::user_with_images(text.into(), vec![image()]),
+                hidden,
+                observation,
+                tool_result,
+                assistant,
+            ],
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+        );
+        assert_eq!(display.len(), 2);
+        assert_eq!(display[0].role, DisplayRole::User);
+        assert_eq!(display[0].text, expected);
+        assert_eq!(display[1].role, DisplayRole::Assistant);
+        assert_eq!(display[1].text, IMAGE_PLACEHOLDER);
+        for message in display {
+            assert_eq!(message.images.len(), 1);
+            assert_eq!(&*message.images[0].data, IMAGE_DATA);
+        }
+    }
+
+    #[test]
+    fn queued_user_images_reach_display() {
+        let mut chat = chat();
+        let result = chat.handle_event(
+            AgentEvent::QueueItemConsumed {
+                text: String::new(),
+                images: vec![image()],
+            },
+            None,
+        );
+        let ChatEventResult::QueueItemConsumed { text, images } = result else {
+            panic!("{EXPECTED_QUEUE_DELIVERY}");
+        };
+        chat.show_user_message(text, images);
+        let message = chat.message_at(0).unwrap();
+        assert_eq!(message.role, DisplayRole::User);
+        assert_eq!(message.text, IMAGE_PLACEHOLDER);
+        assert_eq!(message.images.len(), 1);
+        assert_eq!(&*message.images[0].data, IMAGE_DATA);
+    }
+
+    #[test_case("" ; "image_only")]
+    #[test_case(REPLY_TEXT ; "streamed_text")]
+    fn turn_complete_delivers_images_without_replaying_text(text: &str) {
+        let mut chat = chat();
+        text_delta(&mut chat, text);
+        chat.handle_event(
+            AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Text { text: text.into() },
+                        ContentBlock::Image { source: image() },
+                    ],
+                    ..Default::default()
+                },
+                usage: Default::default(),
+                model: String::new(),
+                cost: None,
+                context_size: None,
+                context_window: 0,
+            })),
+            None,
+        );
+        let image_index = usize::from(!text.is_empty());
+        assert_eq!(chat.message_count(), image_index + 1);
+        if !text.is_empty() {
+            assert_eq!(chat.message_at(0).unwrap().text, text);
+            assert!(chat.message_at(0).unwrap().images.is_empty());
+        }
+        let message = chat.message_at(image_index).unwrap();
+        assert_eq!(message.role, DisplayRole::Assistant);
+        assert_eq!(message.text, IMAGE_PLACEHOLDER);
+        assert_eq!(message.images.len(), 1);
+        assert_eq!(&*message.images[0].data, IMAGE_DATA);
+    }
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
@@ -1164,7 +1372,13 @@ mod tests {
             Arc::new(InMemoryThemesProvider::bundled()),
         );
 
-        chat.handle_event(AgentEvent::AutoCompacting, None);
+        chat.handle_event(
+            AgentEvent::AutoCompacting {
+                context_size: 0,
+                context_window: 0,
+            },
+            None,
+        );
         assert_eq!(chat.message_count(), 1);
 
         chat.handle_event(
@@ -1182,7 +1396,14 @@ mod tests {
         assert!(!chat.streaming_text_is_empty());
         assert!(!chat.streaming_thinking_is_empty());
 
-        chat.handle_event(AgentEvent::CompactionDone, None);
+        chat.handle_event(
+            AgentEvent::CompactionDone {
+                context_size_before: 0,
+                context_size_after: 0,
+                context_window: 0,
+            },
+            None,
+        );
         assert!(chat.streaming_text_is_empty());
         assert!(chat.streaming_thinking_is_empty());
         assert_eq!(chat.message_count(), 3);

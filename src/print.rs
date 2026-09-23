@@ -28,8 +28,9 @@ use maki_commands::{
     CommandRegistry, HostRequest, HostResponse, InputDispatch, TargetCapabilities,
     TargetCapability,
 };
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::EventHandle;
+use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::id::{MakiId, SessionRef};
@@ -201,12 +202,12 @@ fn drive_print(
     };
     let input = match smol::block_on(registry.dispatch_input(target, content)) {
         InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
-            command_attachments::agent_input(
-                turn,
-                literal.mode.clone(),
-                literal.fast,
-                literal.workflow,
-            )?
+            let defaults = SessionDefaults {
+                fast: literal.fast,
+                workflow: literal.workflow,
+                thinking: Some(literal.thinking.into()),
+            };
+            command_attachments::agent_input(turn, literal.mode.clone(), defaults)?
         }
         InputDispatch::Dispatched(
             CommandOutcome::Completed | CommandOutcome::FrontendFeedback(_),
@@ -218,7 +219,7 @@ fn drive_print(
                 "isolated turns are unavailable in print mode"
             ));
         }
-        InputDispatch::Dispatched(CommandOutcome::ManualCompaction) => {
+        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(_)) => {
             return Err(color_eyre::eyre::eyre!(
                 "manual compaction is unavailable in print mode"
             ));
@@ -261,8 +262,7 @@ pub fn run(
     permissions_config: PermissionsConfig,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
-    fast: bool,
-    workflow: bool,
+    defaults: SessionDefaults,
     model_policy: Arc<ModelPolicy>,
     system_prompt_override: Option<String>,
     append_system_prompt: Option<String>,
@@ -270,6 +270,7 @@ pub fn run(
     commands: &[command::CustomCommand],
     command_registry: CommandRegistry,
     modes: Arc<ModeRegistry>,
+    project_config: ProjectConfig,
 ) -> Result<()> {
     let prompt = match prompt_arg {
         Some(p) => p,
@@ -281,18 +282,7 @@ pub fn run(
     };
 
     let images = load_images(&image_paths)?;
-    let literal = AgentInput {
-        message: prompt,
-        mode: AgentMode::Build,
-        images,
-        preamble: Vec::new(),
-        thinking: Default::default(),
-        fast,
-        workflow,
-        prompt: None,
-        cancel: None,
-        lease_committer: None,
-    };
+    let literal = AgentInput::from_defaults(prompt, AgentMode::Build, images, defaults);
     let _standard_commands =
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
     let target = command_registry.bind_target(print_capabilities(), Arc::new(PrintCommandHost));
@@ -302,8 +292,12 @@ pub fn run(
     let session_options = lua_handle.session_option_catalog();
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
-        let (handle, errors) =
-            maki_agent::mcp::start_with_commands(&cwd, command_registry.clone()).await;
+        let (handle, errors) = maki_agent::mcp::start_with_commands(
+            &cwd,
+            project_config.clone(),
+            command_registry.clone(),
+        )
+        .await;
         if let Some(handle) = &handle {
             handle.ready().await;
         }
@@ -329,6 +323,7 @@ pub fn run(
             system_prompt_override,
             append_system_prompt,
             plugin_rules: Arc::clone(&plugin_rules),
+            project_config,
             modes: Arc::clone(&modes),
             session_options: session_options.clone(),
         })
@@ -369,7 +364,30 @@ pub fn run(
         let mut cost = None;
         let mut stop_reason: Option<DoneReason> = None;
 
+        let snapshot = HeadlessSnapshot::default();
+        snapshot.install(
+            &lua_handle,
+            HeadlessMeta {
+                id: session_id.to_string(),
+                cwd: cwd.clone(),
+                model: model.spec(),
+            },
+            // `maki -p` always runs the agent in build mode
+            // (`headless::spawn` hardcodes `AgentMode::Build`).
+            || MODE_BUILD,
+        );
+
         while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
+            if matches!(envelope.event, AgentEvent::StreamClosed) {
+                break;
+            }
+            snapshot.observe(&envelope);
+            maki_lua::agent_autocmd::dispatch(
+                &lua_handle,
+                &session_id,
+                &envelope,
+                envelope.subagent.is_some(),
+            );
             let Envelope {
                 ref event,
                 ref subagent,
@@ -392,8 +410,8 @@ pub fn run(
                 | AgentEvent::QueueItemConsumed { .. }
                 | AgentEvent::ModelSwitched { .. }
                 | AgentEvent::QueueDrained
-                | AgentEvent::AutoCompacting
-                | AgentEvent::CompactionDone
+                | AgentEvent::AutoCompacting { .. }
+                | AgentEvent::CompactionDone { .. }
                 | AgentEvent::AuthRequired
                 | AgentEvent::PermissionRequest { .. }
                 | AgentEvent::Question { .. }
@@ -403,7 +421,8 @@ pub fn run(
                 | AgentEvent::ToolHeaderSnapshot { .. }
                 | AgentEvent::LiveToolBuf { .. }
                 | AgentEvent::Nudge
-                | AgentEvent::PromptProgress { .. } => {}
+                | AgentEvent::PromptProgress { .. }
+                | AgentEvent::StreamClosed => {}
                 AgentEvent::Retry {
                     attempt,
                     message,

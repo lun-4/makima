@@ -23,9 +23,7 @@ use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{
-    DescriptionContext, FileReadTracker, QuestionMode, ToolAudience, ToolFilter, ToolRegistry,
-};
+use maki_agent::tools::{FileReadTracker, QuestionMode, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
@@ -35,7 +33,6 @@ use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model};
 use maki_storage::id::SessionRef;
-use serde_json::Value;
 use tracing::{info, warn};
 
 use super::ProviderSlot;
@@ -86,7 +83,7 @@ pub(crate) struct TuiActorBackend {
     drain_tx: flume::Sender<u64>,
     vars: Vars,
     instructions: Instructions,
-    tools: Value,
+    tools: RequestTools,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -141,7 +138,7 @@ pub(super) fn new_backend(
         drain_tx,
         vars: Vars::default(),
         instructions: Instructions::default(),
-        tools: Value::Null,
+        tools: RequestTools::default(),
     }
 }
 
@@ -202,7 +199,7 @@ impl TuiActorBackend {
     async fn prepare_run(
         &mut self,
         input: &mut AgentInput,
-    ) -> Result<(String, Value, Arc<maki_agent::prompt::ResolvedSlots>), AgentError> {
+    ) -> Result<(String, RequestTools, Arc<maki_agent::prompt::ResolvedSlots>), AgentError> {
         let slot = self.model_slot.load();
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
@@ -340,17 +337,16 @@ impl TuiActorBackend {
                 tool_builder: Some({
                     let vars = self.vars.clone();
                     let config = self.config.clone();
+                    let has_mcp = self.mcp.is_some();
                     Arc::new(move |model: &Model, workflow: bool| {
-                        let filter = ToolFilter::from_config(&config, model, &[]);
-                        let ctx = DescriptionContext {
-                            filter: &filter,
-                            audience: ToolAudience::MAIN,
-                            workflow,
-                        };
-                        ToolRegistry::global().definitions(
+                        RequestTools::build(
+                            ToolRegistry::global(),
                             &vars,
-                            &ctx,
-                            model.supports_tool_examples(),
+                            model,
+                            &config,
+                            &[],
+                            workflow,
+                            has_mcp,
                         )
                     })
                 }),
@@ -364,6 +360,7 @@ impl TuiActorBackend {
                 prompt_slots,
                 modes: Arc::clone(&self.lua_handle.mode_registry()),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
+                ledger: Arc::new(maki_agent::RunLedger::default()),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 question_mode: QuestionMode::Tui,
@@ -400,15 +397,16 @@ impl TuiActorBackend {
 
     /// Base tools only. MCP definitions are injected per request by
     /// `Agent::request_tools`; baking them here would freeze the catalog.
-    fn build_tools(&self, model: &Model, workflow: bool) -> Value {
-        let examples = model.supports_tool_examples();
-        let filter = ToolFilter::from_config(&self.config, model, &[]);
-        let ctx = DescriptionContext {
-            filter: &filter,
-            audience: ToolAudience::MAIN,
+    fn build_tools(&self, model: &Model, workflow: bool) -> RequestTools {
+        RequestTools::build(
+            ToolRegistry::global(),
+            &self.vars,
+            model,
+            &self.config,
+            &[],
             workflow,
-        };
-        ToolRegistry::global().definitions(&self.vars, &ctx, examples)
+            self.mcp.is_some(),
+        )
     }
 
     async fn reload_instructions(&mut self) {
@@ -475,18 +473,31 @@ impl ActorBackend for TuiActorBackend {
                 // by `start_from_queue`, and folded roots never reach here (the
                 // active run consumes them through its interrupt source).
                 if let WorkKind::Root {
-                    displayed: false,
+                    displayed,
                     text,
-                    image_count,
+                    images,
+                    earlier,
                     ..
                 } = &work
                 {
-                    let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
-                        AgentEvent::QueueItemConsumed {
-                            text: text.clone(),
-                            image_count: *image_count,
-                        },
-                    );
+                    for item in earlier {
+                        if !item.displayed {
+                            let _ = EventSender::new(self.agent_tx.clone(), item.run_id).send(
+                                AgentEvent::QueueItemConsumed {
+                                    text: item.text.clone(),
+                                    images: item.images.clone(),
+                                },
+                            );
+                        }
+                    }
+                    if !displayed {
+                        let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
+                            AgentEvent::QueueItemConsumed {
+                                text: text.clone(),
+                                images: images.clone(),
+                            },
+                        );
+                    }
                 }
                 match self
                     .execute_agent(history, &context, input, turn_id, run_id)
@@ -521,7 +532,8 @@ impl ActorBackend for TuiActorBackend {
     fn run_compact<'a>(
         &'a mut self,
         history: &'a mut History,
-        _context: TurnContext,
+        context: TurnContext,
+        instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             // Idle compaction: the runner popped a `Compact` work item. Keep
@@ -556,8 +568,9 @@ impl ActorBackend for TuiActorBackend {
                 &model,
                 history,
                 &event_tx,
-                &maki_agent::cancel::CancelToken::none(),
+                &context.cancel,
                 &self.config,
+                instructions,
                 self.session_id.as_ref(),
             )
             .await;
@@ -675,6 +688,7 @@ mod tests {
             Arc::new(PermissionManager::new(
                 PermissionsConfig::default(),
                 PathBuf::from("/tmp"),
+                maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
                 Arc::default(),
             )),
             agent_tx,
@@ -755,7 +769,7 @@ mod tests {
             _model: &'a Model,
             _messages: &'a [Message],
             _system: &'a str,
-            _tools: &'a Value,
+            _tools: &'a serde_json::Value,
             _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
             _opts: maki_providers::RequestOptions,
             _session_id: Option<&'a SessionRef>,

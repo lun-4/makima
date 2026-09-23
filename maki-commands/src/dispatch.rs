@@ -323,7 +323,7 @@ pub enum CommandOutcome {
     Completed,
     AgentTurn(AgentTurn),
     IsolatedTurn(IsolatedTurn),
-    ManualCompaction,
+    ManualCompaction(Option<String>),
     FrontendFeedback(FrontendFeedback),
     Failed(CommandError),
 }
@@ -340,7 +340,7 @@ pub enum HostResponse {
     Completed,
     AgentTurn(AgentTurn),
     IsolatedTurn(IsolatedTurn),
-    ManualCompaction,
+    ManualCompaction(Option<String>),
     FrontendFeedback(FrontendFeedback),
 }
 

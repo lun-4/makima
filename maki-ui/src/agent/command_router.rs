@@ -98,13 +98,13 @@ mod tests {
                         .unwrap();
                 }
                 let reason = context.cancel_reason.cancelled().await;
-                BackendResult::EnteredRun(TurnOutcome::Cancelled {
-                    agent_id: context.agent_id,
-                    turn_id: context.turn_id.unwrap(),
-                    usage: TokenUsage::default(),
-                    num_turns: 0,
+                BackendResult::EnteredRun(TurnOutcome::cancelled(
+                    context.agent_id,
+                    context.turn_id.unwrap(),
+                    TokenUsage::default(),
+                    0,
                     reason,
-                })
+                ))
             })
         }
 
@@ -121,6 +121,7 @@ mod tests {
             &'a mut self,
             _: &'a mut History,
             _: TurnContext,
+            _: Option<&'a str>,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
             Box::pin(async { BackendResult::CompactDone })
         }
@@ -145,22 +146,22 @@ mod tests {
                     .unwrap();
                 if context.correlation == correlation(1) {
                     let reason = context.cancel_reason.cancelled().await;
-                    BackendResult::EnteredRun(TurnOutcome::Cancelled {
-                        agent_id: context.agent_id,
-                        turn_id: context.turn_id.unwrap(),
-                        usage: TokenUsage::default(),
-                        num_turns: 0,
+                    BackendResult::EnteredRun(TurnOutcome::cancelled(
+                        context.agent_id,
+                        context.turn_id.unwrap(),
+                        TokenUsage::default(),
+                        0,
                         reason,
-                    })
+                    ))
                 } else {
                     self.later_release.recv_async().await.unwrap();
-                    BackendResult::EnteredRun(TurnOutcome::Completed {
-                        agent_id: context.agent_id,
-                        turn_id: context.turn_id.unwrap(),
-                        usage: TokenUsage::default(),
-                        num_turns: 1,
-                        reason: DoneReason::EndTurn,
-                    })
+                    BackendResult::EnteredRun(TurnOutcome::completed(
+                        context.agent_id,
+                        context.turn_id.unwrap(),
+                        TokenUsage::default(),
+                        1,
+                        DoneReason::EndTurn,
+                    ))
                 }
             })
         }
@@ -178,6 +179,7 @@ mod tests {
             &'a mut self,
             _: &'a mut History,
             _: TurnContext,
+            _: Option<&'a str>,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
             Box::pin(async { BackendResult::CompactDone })
         }

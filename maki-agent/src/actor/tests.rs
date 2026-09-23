@@ -5,7 +5,11 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use maki_providers::{ContentBlock, Message, TokenUsage};
+use maki_providers::{ContentBlock, ImageMediaType, ImageSource, Message, TokenUsage};
+
+fn test_image() -> ImageSource {
+    ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
+}
 
 use super::queue::{ActorQueue, QueueProjection};
 use super::types::{
@@ -94,13 +98,13 @@ impl ScriptedBackend {
     }
 
     fn completed(context: &TurnContext, usage: TokenUsage) -> BackendResult {
-        BackendResult::EnteredRun(TurnOutcome::Completed {
-            agent_id: context.agent_id,
-            turn_id: context.turn_id.unwrap(),
+        BackendResult::EnteredRun(TurnOutcome::completed(
+            context.agent_id,
+            context.turn_id.unwrap(),
             usage,
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        })
+            1,
+            DoneReason::EndTurn,
+        ))
     }
 }
 
@@ -134,14 +138,15 @@ impl ActorBackend for ScriptedBackend {
                 run_id,
                 displayed,
                 text,
-                image_count,
+                images,
+                ..
             } = work
             {
                 self.state.root_metadata.lock().unwrap().push((
                     run_id,
                     displayed,
                     text,
-                    image_count,
+                    images.len(),
                 ));
             }
             self.state.entered.fetch_add(1, Ordering::SeqCst);
@@ -154,15 +159,13 @@ impl ActorBackend for ScriptedBackend {
             if let Some(gate) = &self.gate {
                 gate.wait().await;
             }
-            if let Some(ExtractedCommand::Interrupt(folded, _)) =
+            if let Some(ExtractedCommand::Interrupt(folded)) =
                 context.interrupt.as_ref().and_then(|source| source.poll())
             {
-                self.state
-                    .folds
-                    .lock()
-                    .unwrap()
-                    .push(folded.message.clone());
-                history.push(Message::user(folded.message));
+                for msg in folded {
+                    self.state.folds.lock().unwrap().push(msg.message.clone());
+                    history.push(Message::user(msg.message));
+                }
             }
 
             self.outcomes
@@ -194,6 +197,7 @@ impl ActorBackend for ScriptedBackend {
         &'a mut self,
         history: &'a mut crate::History,
         _context: TurnContext,
+        _instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             self.state.compacts.fetch_add(1, Ordering::SeqCst);
@@ -233,13 +237,13 @@ impl ActorBackend for CancellableBackend {
             history.push(Message::user(input.message));
             if self.block_first.fetch_add(1, Ordering::SeqCst) == 0 {
                 let reason = context.cancel_reason.cancelled().await;
-                return BackendResult::EnteredRun(TurnOutcome::Cancelled {
-                    agent_id: context.agent_id,
-                    turn_id: context.turn_id.unwrap(),
-                    usage: TokenUsage::default(),
-                    num_turns: 0,
+                return BackendResult::EnteredRun(TurnOutcome::cancelled(
+                    context.agent_id,
+                    context.turn_id.unwrap(),
+                    TokenUsage::default(),
+                    0,
                     reason,
-                });
+                ));
             }
             default_completed(&context)
         })
@@ -261,6 +265,7 @@ impl ActorBackend for CancellableBackend {
         &'a mut self,
         history: &'a mut crate::History,
         _context: TurnContext,
+        _instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             history.push(Message::user("compact".to_owned()));
@@ -444,14 +449,14 @@ fn cancel_all_is_reusable() {
         until(|| handle.snapshot().status != ActorStatus::Idle).await;
 
         handle
-            .rush(RootWork {
-                input: input("root"),
-                run_id: 1,
-                displayed: false,
-                text: "root".into(),
-                image_count: 0,
-                correlation: "r1".into(),
-            })
+            .rush(RootWork::new(
+                input("root"),
+                1,
+                false,
+                "root".into(),
+                Vec::new(),
+                "r1".into(),
+            ))
             .unwrap();
         let t2 = handle
             .admit_turn(input("queued"), None, "t2".into())
@@ -570,7 +575,7 @@ fn cancel_existing_catches_compact_between_pop_and_backend_entry() {
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let (popped, release) = handle.pause_after_next_pop();
-        handle.push_compact(1).unwrap();
+        handle.push_compact(1, None).unwrap();
 
         popped.recv_async().await.unwrap();
         handle.cancel_existing();
@@ -578,7 +583,7 @@ fn cancel_existing_catches_compact_between_pop_and_backend_entry() {
         until(|| handle.snapshot().queued == 0).await;
         assert_eq!(state.compacts.load(Ordering::SeqCst), 0);
 
-        handle.push_compact(2).unwrap();
+        handle.push_compact(2, None).unwrap();
         handle
             .push_control(ControlWork {
                 name: "fence".into(),
@@ -792,14 +797,14 @@ fn root_folds_into_active_turn_with_no_orphan() {
         // gate opens, so ordering is deterministic.
         until(|| state.entered.load(Ordering::SeqCst) > 0).await;
         handle
-            .rush(RootWork {
-                input: input("fold-me"),
-                run_id: 1,
-                displayed: false,
-                text: "fold-me".into(),
-                image_count: 0,
-                correlation: "r1".into(),
-            })
+            .rush(RootWork::new(
+                input("fold-me"),
+                1,
+                false,
+                "fold-me".into(),
+                Vec::new(),
+                "r1".into(),
+            ))
             .unwrap();
         gate.open();
         main.wait().await;
@@ -831,14 +836,14 @@ fn idle_root_start_preserves_metadata_to_backend() {
         // Queue the root while idle: the runner pops it and starts it as its
         // own turn, carrying the neutral display metadata.
         handle
-            .rush(RootWork {
-                input: input("deferred"),
-                run_id: 7,
-                displayed: false,
-                text: "deferred bubble".into(),
-                image_count: 3,
-                correlation: "r7".into(),
-            })
+            .rush(RootWork::new(
+                input("deferred"),
+                7,
+                false,
+                "deferred bubble".into(),
+                vec![test_image(), test_image(), test_image()],
+                "r7".into(),
+            ))
             .unwrap();
         // The runner starts the root (entered) and settles to Idle; both are
         // observed before asserting, so the backend's run completed.
@@ -857,7 +862,8 @@ fn idle_root_start_preserves_metadata_to_backend() {
                 run_id: 7,
                 displayed: false,
                 text: "deferred bubble".into(),
-                image_count: 3,
+                images: vec![test_image(), test_image(), test_image()],
+                earlier: Vec::new(),
             }
         );
         assert_eq!(runs[0].1, "deferred");
@@ -956,14 +962,17 @@ fn close_rejects_new_admissions() {
 #[test]
 fn queue_pop_interrupt_keeps_incompatible_entries() {
     let queue = ActorQueue::new();
-    queue.push(ActorWork::Compact { run_id: 1 });
+    queue.push(ActorWork::Compact {
+        run_id: 1,
+        instructions: None,
+    });
     queue.push(ActorWork::Control(ControlWork {
         name: "c".into(),
         correlation: "c".into(),
     }));
     assert!(matches!(
         queue.pop_interrupt(),
-        Some(ExtractedCommand::Compact(1))
+        Some(ExtractedCommand::Compact(None))
     ));
     // A control at the front is incompatible: poll must not consume it.
     assert!(queue.pop_interrupt().is_none());
@@ -978,14 +987,14 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         ticket: super::TurnTicket::new(crate::types::TurnId::generate(), Arc::new(())),
     };
     queue.push(ActorWork::Turn(admission));
-    queue.push(ActorWork::Root(RootWork {
-        input: input("r"),
-        run_id: 2,
-        displayed: false,
-        text: "r".into(),
-        image_count: 0,
-        correlation: "r2".into(),
-    }));
+    queue.push(ActorWork::Root(RootWork::new(
+        input("r"),
+        2,
+        false,
+        "r".into(),
+        Vec::new(),
+        "r2".into(),
+    )));
     assert!(queue.pop_interrupt().is_none());
     assert_eq!(
         queue.len(),
@@ -1000,7 +1009,10 @@ fn queue_drain_publication_is_ordered() {
     let published = Arc::new(Mutex::new(0));
     queue.publish_if_empty(|| *published.lock().unwrap() += 1);
     assert_eq!(*published.lock().unwrap(), 1, "empty queue publishes");
-    queue.push(ActorWork::Compact { run_id: 1 });
+    queue.push(ActorWork::Compact {
+        run_id: 1,
+        instructions: None,
+    });
     queue.publish_if_empty(|| *published.lock().unwrap() += 1);
     assert_eq!(
         *published.lock().unwrap(),
@@ -1102,14 +1114,14 @@ fn targeted_cancel_matching_queued_correlation_and_reuse() {
             .unwrap();
         // Queue root work sharing the "drop" correlation, behind the turns.
         handle
-            .rush(RootWork {
-                input: input("root-drop"),
-                run_id: 9,
-                displayed: false,
-                text: "root-drop".into(),
-                image_count: 0,
-                correlation: "drop".into(),
-            })
+            .rush(RootWork::new(
+                input("root-drop"),
+                9,
+                false,
+                "root-drop".into(),
+                Vec::new(),
+                "drop".into(),
+            ))
             .unwrap();
 
         handle.cancel_correlation("drop", TurnCancellationReason::User);
@@ -1190,14 +1202,14 @@ fn precancel_marks_match_and_do_not_poison() {
         assert_eq!(events.len(), 1, "precancelled admission delivered once");
         // Precancelled root is dropped without executing.
         handle
-            .rush(RootWork {
-                input: input("late-root"),
-                run_id: 5,
-                displayed: false,
-                text: "late-root".into(),
-                image_count: 0,
-                correlation: "run-5".into(),
-            })
+            .rush(RootWork::new(
+                input("late-root"),
+                5,
+                false,
+                "late-root".into(),
+                Vec::new(),
+                "run-5".into(),
+            ))
             .unwrap();
         assert_eq!(handle.snapshot().queued, 0);
         // The mark is retired: a later unrelated correlation runs fine.
@@ -1248,27 +1260,27 @@ fn remove_visible_at_skips_hidden_and_removes_deferred() {
         until(|| backend_reached(&handle)).await;
         // Hidden rows: an already-displayed root.
         handle
-            .rush(RootWork {
-                input: input("displayed-root"),
-                run_id: 1,
-                displayed: true,
-                text: "displayed-root".into(),
-                image_count: 0,
-                correlation: "h2".into(),
-            })
+            .rush(RootWork::new(
+                input("displayed-root"),
+                1,
+                true,
+                "displayed-root".into(),
+                Vec::new(),
+                "h2".into(),
+            ))
             .unwrap();
         // Visible rows: a deferred root and a compact.
         handle
-            .rush(RootWork {
-                input: input("deferred-root"),
-                run_id: 2,
-                displayed: false,
-                text: "deferred-root".into(),
-                image_count: 0,
-                correlation: "v1".into(),
-            })
+            .rush(RootWork::new(
+                input("deferred-root"),
+                2,
+                false,
+                "deferred-root".into(),
+                Vec::new(),
+                "v1".into(),
+            ))
             .unwrap();
-        handle.push_compact(3).unwrap();
+        handle.push_compact(3, None).unwrap();
 
         let queue = handle.snapshot().queue;
         assert_eq!(queue.len(), 3);
@@ -1352,8 +1364,8 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
         // Precancel r7 before any work with that correlation exists. Compact 7
         // queued afterwards is dropped; compact 8 is unrelated and runs.
         handle.cancel_correlation("r7", TurnCancellationReason::User);
-        handle.push_compact(7).unwrap();
-        handle.push_compact(8).unwrap();
+        handle.push_compact(7, None).unwrap();
+        handle.push_compact(8, None).unwrap();
         until(|| state.compacts.load(Ordering::SeqCst) >= 1).await;
         assert_eq!(
             state.compacts.load(Ordering::SeqCst),
@@ -1371,14 +1383,14 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
             .admit_turn(input("running"), None, "run-1".into())
             .unwrap();
         until(|| backend_reached(&handle)).await;
-        handle.push_compact(7).unwrap();
-        handle.push_compact(8).unwrap();
+        handle.push_compact(7, None).unwrap();
+        handle.push_compact(8, None).unwrap();
         assert_eq!(handle.snapshot().queued, 2);
 
         handle.cancel_correlation("r7", TurnCancellationReason::User);
         let queue = handle.snapshot().queue;
         assert_eq!(queue.len(), 1, "compact 7 removed, compact 8 survives");
-        assert!(matches!(queue[0], QueueProjection::Compact));
+        assert!(matches!(queue[0], QueueProjection::Compact(_)));
 
         gate.open();
         assert!(matches!(
@@ -1387,5 +1399,63 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
         ));
         handle.close();
         task.await;
+    });
+}
+
+#[test]
+fn cancel_active_compact_cancels_cleanly_without_panic() {
+    smol::block_on(async {
+        let (started_tx, started_rx) = flume::bounded(1);
+        struct BlockingCompactBackend {
+            state: Arc<ScriptedState>,
+            started_tx: flume::Sender<()>,
+        }
+        impl ActorBackend for BlockingCompactBackend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                context: TurnContext,
+                _input: crate::AgentInput,
+                _work: WorkKind,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async move { default_completed(&context) })
+            }
+            fn run_control<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                _context: TurnContext,
+                _control: &'a ControlWork,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+            fn run_compact<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                context: TurnContext,
+                _instructions: Option<&'a str>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    self.state.compacts.fetch_add(1, Ordering::SeqCst);
+                    let _ = self.started_tx.send(());
+                    context.cancel.cancelled().await;
+                    BackendResult::CompactDone
+                })
+            }
+        }
+        let state = Arc::new(ScriptedState::default());
+        let backend = BlockingCompactBackend {
+            state: Arc::clone(&state),
+            started_tx,
+        };
+        let (handle, task) = spawn(backend);
+        handle.push_compact(7, None).unwrap();
+        started_rx.recv_async().await.unwrap();
+        handle.cancel_correlation("r7", TurnCancellationReason::User);
+        handle.close();
+        task.await;
+        assert_eq!(state.compacts.load(Ordering::SeqCst), 1);
     });
 }

@@ -12,18 +12,18 @@ use futures::future::{Either, select};
 use maki_agent::actor::{
     ActorBackend, ActorLifecycle, ActorStatus, BackendResult, TurnContext, WorkKind,
 };
-use maki_agent::agent::tool_dispatch::{self, Emit};
+use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, PermissionScopes,
-    ToolAudience, ToolContext, ToolFilter, ToolLive,
+    CallOrigin, Deadline, DescriptionContext, FileReadTracker, LocalTool, LocalTools,
+    PermissionScopes, RequestTools, ToolAudience, ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
-    AgentRunParams, EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession,
+    AgentRunParams, EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, RunLedger,
     SubagentCancel, SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId, TurnOutcome,
 };
 use maki_config::ToolKey;
@@ -31,14 +31,17 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, Message, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost,
+    ContentBlock, Message, Model, ModelError, RequestOptions, Role, ThinkingConfig, TokenUsage,
+    add_cost,
 };
 use maki_storage::id::MakiId;
+use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
 
 use crate::api::r#async::LuaSemaphore;
+use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
@@ -96,9 +99,8 @@ struct AdapterResult {
 struct LuaActorState {
     params: OnceLock<AgentParams>,
     system: String,
-    tools: JsonValue,
-    thinking: ThinkingConfig,
-    fast: bool,
+    tools: RequestTools,
+    opts: RequestOptions,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
     child_cancel: CancelToken,
@@ -151,6 +153,7 @@ impl LuaActorState {
                         .model
                         .spec(),
                 ),
+                opts: Some(self.opts),
                 answer_tx: self.answer_tx.clone(),
                 input_tx: Some(self.input_tx.clone()),
                 cancel: Some(self.cancel.clone()),
@@ -299,16 +302,16 @@ impl ActorBackend for LuaActorBackend {
                     match cancel.race(semaphore.acquire_arc()).await {
                         Ok(permit) => Some(permit),
                         Err(_) => {
-                            let cancelled = TurnOutcome::Cancelled {
-                                agent_id: context.agent_id,
+                            let cancelled = TurnOutcome::cancelled(
+                                context.agent_id,
                                 turn_id,
-                                usage: TokenUsage::default(),
-                                num_turns: 0,
-                                reason: context
+                                TokenUsage::default(),
+                                0,
+                                context
                                     .cancel_reason
                                     .reason()
                                     .unwrap_or(TurnCancellationReason::User),
-                            };
+                            );
                             let text = latest_assistant_text(history);
                             state.relay_history(history);
                             state.present_result(
@@ -387,6 +390,7 @@ impl ActorBackend for LuaActorBackend {
         &'a mut self,
         _history: &'a mut History,
         _context: TurnContext,
+        _instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         // Lua sessions admit turns only; compacts are a TUI-run concern.
         Box::pin(async move {
@@ -415,7 +419,7 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     };
     let requested: ModelTier = tier_str.parse().map_err(|e: ModelError| e.to_string())?;
-    let effective = requested.min(ctx.model.tier);
+    let effective = requested.capped_at(ctx.model.tier);
     if effective == ctx.model.tier {
         return Ok(Model::clone(&ctx.model));
     }
@@ -607,6 +611,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     let except: Option<Vec<String>> = opts.get("except")?;
     let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
 
     let parsed = spec_str
         .as_deref()
@@ -633,12 +638,62 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         filter: &filter,
         audience,
         workflow,
+        mcp: mcp_enabled && agent.mcp.is_some(),
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
     let defs = ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
 
     Ok((Some(json_to_lua(&lua, &defs)?), None))
+}
+
+/// Every tool name this context can dispatch: registry tools, MCP tools
+/// (deferred ones included), host tools (ACP client tools, a subagent's
+/// `structured_output`) and `tool_search`. Reach for it when you expose tools
+/// inside a sandbox and need the names to bind. `maki.api.get_tools()` covers
+/// the registry alone and has no view of the session.
+///
+/// The list already accounts for this session's audience, the config's
+/// `disabled_tools` and the model's capabilities. Read `audiences` to layer
+/// your own policy on top. A sandbox wants `interpreter`.
+///
+/// Each name shows up once, described by the tool a call would really reach, so
+/// a host tool that shadows a registry name reports its own audience rather
+/// than the shadowed one's.
+///
+/// @param ctx LuaCtx Agent context.
+/// @return (table?, string?) Array of `{ name, alias?, source, audiences, schema? }`,
+///   or `(nil, err)` on failure. `source` is one of `"native"`, `"local"`,
+///   `"mcp"`. `alias` is a safe identifier to bind, set only when `name` is not
+///   one (say `srv__get-docs`). Dispatch `name` in every case. `schema` comes
+///   with registry tools only.
+/// @example
+/// local tools, err = maki.agent.callable_tools(ctx)
+/// if err then error(err) end
+/// for _, t in ipairs(tools) do
+///   print(t.source, t.alias or t.name)
+/// end
+#[lua_fn]
+async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<Table>> {
+    let agent = try_pair!(dispatch_ctx(&ctx, "callable_tools"));
+    let out = lua.create_table()?;
+    for (i, tool) in tool_dispatch::callable(&agent.to_tool_context())
+        .into_iter()
+        .enumerate()
+    {
+        let t = lua.create_table()?;
+        t.set("name", tool.name)?;
+        if let Some(alias) = tool.alias {
+            t.set("alias", alias)?;
+        }
+        t.set("source", tool.source)?;
+        t.set("audiences", audiences_to_lua(&lua, tool.audience)?)?;
+        if let Some(schema) = tool.schema {
+            t.set("schema", json_to_lua(&lua, &schema)?)?;
+        }
+        out.set(i + 1, t)?;
+    }
+    Ok((Some(out), None))
 }
 
 /// Run a tool by name and wait for the result. This is how you call built-in
@@ -940,7 +995,7 @@ async fn session(
     };
 
     let commit = Arc::new(Mutex::new(None));
-    let mut local_map: HashMap<String, LocalToolFn> = HashMap::new();
+    let mut local_map: HashMap<String, LocalTool> = HashMap::new();
     if let Some(tbl) = local_tools_tbl {
         let defs = tools_json.as_array_mut().expect("checked above");
         for pair in tbl.pairs::<String, Table>() {
@@ -961,11 +1016,13 @@ async fn session(
                 "description": description,
                 "input_schema": sanitized_schema,
             }));
+            let audience =
+                parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
             let weak = lua.weak();
             let commit = Arc::clone(&commit);
             local_map.insert(
                 name,
-                maki_agent::tools::local_tool(move |input, _ctx| {
+                maki_agent::tools::local_tool(audience, move |input, _ctx| {
                     let result = call_local_tool(&weak, &handler, &input, &commit, capture_input);
                     Box::pin(async move { result })
                 }),
@@ -973,24 +1030,30 @@ async fn session(
         }
     }
 
-    let thinking = match thinking_val {
-        Some(LuaValue::String(s)) => match s.to_str()?.parse::<ThinkingConfig>() {
-            Ok(config) => config,
-            Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
-        },
-        Some(LuaValue::Integer(n)) => match u32::try_from(n) {
-            Ok(tokens) if tokens > 0 => ThinkingConfig::Budget(tokens),
-            _ => return Ok(err_pair(format!("invalid thinking budget: {n}"))),
-        },
-        Some(LuaValue::Number(n)) if n >= 1.0 && n <= f64::from(u32::MAX) => {
-            ThinkingConfig::Budget(n as u32)
+    let requested_thinking = match thinking_val {
+        None => None,
+        Some(value) => {
+            let setting = match &value {
+                LuaValue::String(s) => s.to_str()?.to_owned(),
+                LuaValue::Integer(n) => n.to_string(),
+                LuaValue::Number(n) => n.to_string(),
+                other => {
+                    return Ok(err_pair(format!(
+                        "thinking must be string or number, got {}",
+                        other.type_name()
+                    )));
+                }
+            };
+            match StoredThinking::parse_setting(&setting) {
+                Ok(stored) => Some(ThinkingConfig::from(stored)),
+                Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
+            }
         }
-        Some(LuaValue::Number(n)) => {
-            return Ok(err_pair(format!("invalid thinking budget: {n}")));
-        }
-        Some(_) => return Err(mlua::Error::runtime("thinking must be string or number")),
-        None => agent_ctx.opts.thinking,
     };
+    let thinking = requested_thinking.map_or(agent_ctx.opts.thinking, |t| {
+        t.clamp_to(agent_ctx.opts.thinking)
+    });
+    let opts = RequestOptions { thinking, fast }.clamped(&model);
 
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let chip_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
@@ -1020,6 +1083,10 @@ async fn session(
     // UI input relay: tab submits from the parent dispatch into this session.
     // Each message is admitted to the actor as its own turn (no second FIFO;
     // the actor's queue is the FIFO).
+    // The array is the caller's, and the filter comes out of it, so whatever
+    // the caller left out is also a name this session cannot dispatch or bind
+    // inside its sandbox.
+    let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let build_params = |agent_id| AgentParams {
         settings_source: None,
@@ -1037,6 +1104,7 @@ async fn session(
         prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
         modes: Arc::clone(&agent_ctx.modes),
         subagent_cancels: Arc::new(CancelMap::new()),
+        ledger: RunLedger::child(&agent_ctx.ledger),
         registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
         audience,
         question_mode: agent_ctx.question_mode,
@@ -1056,9 +1124,8 @@ async fn session(
     let state = Arc::new(LuaActorState {
         params: OnceLock::new(),
         system: system.unwrap_or_default(),
-        tools: tools_json,
-        thinking,
-        fast,
+        tools,
+        opts,
         mcp: agent_ctx
             .mcp
             .as_ref()
@@ -1153,8 +1220,6 @@ async fn session(
 
     let agent_id = actor.agent_id();
     *cancel_actor.lock().unwrap() = Some(actor.clone());
-    let thinking = state.thinking;
-    let fast = state.fast;
 
     // `task_despawn` and global cancellation fire the shared child token.
     // Permanent closure aborts running turns and terminalizes queued turns;
@@ -1197,8 +1262,8 @@ async fn session(
                         mode: AgentMode::Build,
                         images: Vec::new(),
                         preamble: Vec::new(),
-                        thinking,
-                        fast,
+                        thinking: opts.thinking,
+                        fast: opts.fast,
                         workflow: false,
                         prompt: None,
                         cancel: None,
@@ -1244,7 +1309,7 @@ lua_table! {
     /// sess:close()
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, call_tool, permission_prompt, is_yolo, session,
+        resolve_model, system_prompt, tools, callable_tools, call_tool, permission_prompt, is_yolo, session,
         report_task_result,
     ]
 }
@@ -1288,15 +1353,7 @@ async fn dispatch_racing_live(
     rx: Option<flume::Receiver<ToolLive>>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
-    let run = tool_dispatch::run(
-        &tctx.registry,
-        tctx.mcp.as_ref(),
-        String::new(),
-        name,
-        input,
-        tctx,
-        Emit::Silent,
-    );
+    let run = tool_dispatch::run(String::new(), name, input, tctx, CallOrigin::Nested);
     let Some(rx) = rx else {
         return run.await;
     };
@@ -1457,8 +1514,8 @@ async fn prompt(
         mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
-        thinking: state.thinking,
-        fast: state.fast,
+        thinking: state.opts.thinking,
+        fast: state.opts.fast,
         workflow: false,
         prompt: None,
         cancel: None,
@@ -1604,8 +1661,8 @@ async fn send(
             mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
-            thinking: state.thinking,
-            fast: state.fast,
+            thinking: state.opts.thinking,
+            fast: state.opts.fast,
             workflow: false,
             prompt: None,
             cancel: None,
@@ -2048,6 +2105,7 @@ mod tests {
             prompt_slots: Arc::clone(&ctx.prompt_slots),
             modes: Arc::clone(&ctx.modes),
             subagent_cancels: Arc::new(CancelMap::new()),
+            ledger: Arc::new(RunLedger::default()),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience: DEFAULT_SESSION_AUDIENCE,
             question_mode: ctx.question_mode,
@@ -2062,9 +2120,11 @@ mod tests {
         let state = Arc::new(LuaActorState {
             params: OnceLock::from(params),
             system: String::new(),
-            tools: JsonValue::Array(vec![]),
-            thinking: ThinkingConfig::Off,
-            fast: false,
+            tools: RequestTools::default(),
+            opts: maki_providers::RequestOptions {
+                thinking: ThinkingConfig::Off,
+                fast: false,
+            },
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx, RUN_ID),
             child_cancel,
@@ -2131,8 +2191,8 @@ mod tests {
                     mode: AgentMode::Build,
                     images: Vec::new(),
                     preamble: Vec::new(),
-                    thinking: state.thinking,
-                    fast: state.fast,
+                    thinking: state.opts.thinking,
+                    fast: state.opts.fast,
                     workflow: false,
                     prompt: None,
                     cancel: None,
@@ -2157,8 +2217,8 @@ mod tests {
                         mode: AgentMode::Build,
                         images: Vec::new(),
                         preamble: Vec::new(),
-                        thinking: state.thinking,
-                        fast: state.fast,
+                        thinking: state.opts.thinking,
+                        fast: state.opts.fast,
                         workflow: false,
                         prompt: None,
                         cancel: None,
@@ -2308,8 +2368,8 @@ mod tests {
                             mode: AgentMode::Build,
                             images: Vec::new(),
                             preamble: Vec::new(),
-                            thinking: state.thinking,
-                            fast: state.fast,
+                            thinking: state.opts.thinking,
+                            fast: state.opts.fast,
                             workflow: false,
                             prompt: None,
                             cancel: None,
@@ -2409,13 +2469,13 @@ mod tests {
         assert!(matches!(outcome, TurnOutcome::Completed { .. }));
         assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Open));
 
-        let root_outcome = TurnOutcome::Completed {
-            agent_id: AgentId::generate(),
-            turn_id: TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        };
+        let root_outcome = TurnOutcome::completed(
+            AgentId::generate(),
+            TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        );
         turn_tx
             .send(Envelope {
                 event: AgentEvent::TextDelta {
@@ -2588,13 +2648,13 @@ mod tests {
         let lua = Lua::new();
         let agent_id = AgentId::generate();
         let turn_id = TurnId::generate();
-        let outcome = TurnOutcome::Cancelled {
+        let outcome = TurnOutcome::cancelled(
             agent_id,
             turn_id,
-            usage: TokenUsage::default(),
-            num_turns: 0,
-            reason: TurnCancellationReason::Closed,
-        };
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::Closed,
+        );
         let (result, error) =
             build_prompt_result(&lua, derive_result(&outcome), outcome.usage()).unwrap();
         assert!(result.is_none());
@@ -2655,19 +2715,20 @@ mod tests {
                 name: "research".into(),
                 prompt: None,
                 model: None,
+                opts: None,
                 answer_tx: None,
                 input_tx: None,
                 cancel: None,
             })
             .unwrap();
         let (live_tx, live_rx) = flume::unbounded();
-        let outcome = TurnOutcome::Completed {
-            agent_id: AgentId::generate(),
-            turn_id: TurnId::generate(),
-            usage: DONE_USAGE,
-            num_turns: 2,
-            reason: DoneReason::EndTurn,
-        };
+        let outcome = TurnOutcome::completed(
+            AgentId::generate(),
+            TurnId::generate(),
+            DONE_USAGE,
+            2,
+            DoneReason::EndTurn,
+        );
 
         for event in [
             turn(tokens(100, 20), 0.25),
@@ -2729,6 +2790,7 @@ mod tests {
                 name: "parent".into(),
                 prompt: None,
                 model: None,
+                opts: None,
                 answer_tx: None,
                 input_tx: None,
                 cancel: None,
@@ -2744,6 +2806,7 @@ mod tests {
             name: "grandchild".into(),
             prompt: None,
             model: None,
+            opts: None,
             answer_tx: None,
             input_tx: None,
             cancel: None,

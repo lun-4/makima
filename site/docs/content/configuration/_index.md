@@ -63,7 +63,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_automode` | bool | `false` | Start every session with bash auto mode (classify every bash command) |
-| `always_fast` | bool | `false` | Start every session with Anthropic fast mode (Opus only; ignored otherwise) |
+| `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
 | `always_workflow` | bool | `false` | Start every session with workflow mode (task callable inside code_execution) |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
 
@@ -73,6 +73,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-----|-------------|
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
+| `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support (Kitty graphics and tmux passthrough are detected automatically without manual multiplexer flags), falling back to an [image] line when off |
 | `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
@@ -146,6 +147,7 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `max_output_bytes` | usize | `51200` | 1024 | Max tool output size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
+| `max_turn_output` | u32 | `32768` | 1024 | Output tokens one turn asks for, raised where an effort level needs the room and capped by the model's own limit |
 | `max_concurrent_agent_turns` | usize | `8` | 1 | Max agent turns running concurrently |
 | `max_agent_depth` | usize | `4` | 1 | Max nesting depth for child agents |
 | `max_children_per_agent` | usize | `16` | 1 | Max child agents created by one agent |
@@ -154,6 +156,7 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
+| `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
 
 ### `provider`
 
@@ -165,6 +168,10 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `low_speed_timeout_secs` | u64 | `120` | 1 | Low speed timeout (seconds with less than 1 byte received) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
+| `retry_base_ms` | u64 | `2000` | 1 | Base delay between retries (milliseconds, grows per attempt) |
+| `retry_max_ms` | u64 | `60000` | 1 | Cap on the guessed retry backoff (milliseconds) |
+| `max_retries` | u32 | `5` | - | Max retries on a rate limit the server sent no Retry-After for, 0 to never retry them |
+| `max_timeout_retries` | u32 | `10` | - | Max retries on stream timeouts |
 
 ### `storage`
 
@@ -174,9 +181,44 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `max_log_files` | u32 | `10` | 1 | Max number of log files to keep |
 | `input_history_size` | usize | `100` | 10 | Number of input history entries to retain |
 
+### `net`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allowed_private_hosts` | string[] | `[]` | Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://` |
+
+`maki.net` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through:
+
+```lua
+maki.setup({
+    net = {
+        allowed_private_hosts = { "localhost:8080", "nas.lan", "10.0.0.0/8" },
+    },
+})
+```
+
+An entry with no port covers every port. A name you list is allowed whatever it resolves to. A name you did not list stays blocked when DNS lands it on a private address, unless that address falls in a range you allowed, so keep ranges as small as the service needs. Every redirect hop is checked against the same list. [Permissions](/docs/permissions/#network-addresses) covers what the guard protects.
+
+### `trust`
+
+Answers the folder trust question in advance. Read from the global `~/.config/makima/init.lua` only, since a project file that could set it would be trusting itself:
+
+```lua
+maki.setup({
+    trust = {
+        paths = { "~/src/me/*", "/workspace" },
+        prompt = false,
+    },
+})
+```
+
+`paths` is a list of globs matched against the project root, empty by default. `prompt` is a bool, `true` by default. Setting it to `false` drops the startup card and leaves the folder restricted unless a `paths` entry matches. [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax and which run modes apply the policy.
+
 ## Plugins
 
 The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
+
+A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
 
 Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
@@ -217,7 +259,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `edit_lines` | boolean | `false` | - | Provide the opt-in `edit_lines` tool. |
+| `edit_lines` | boolean | `true` | - | Provide the `edit_lines` tool. |
 | `insert_lines` | boolean | `false` | - | Provide the opt-in `insert_lines` tool. |
 | `multiedit` | boolean | `true` | - | Provide the `multiedit` tool. |
 
@@ -286,6 +328,7 @@ maki.setup({
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
+| `provider` | string | `"exa"` | - | Search backend: "exa" (default) or "youcom" (You.com MCP). |
 
 ## Validation
 

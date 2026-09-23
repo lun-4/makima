@@ -114,6 +114,8 @@ You can use OpenAI two ways.
 
 **ChatGPT subscription** — Use OpenAI Codex through your ChatGPT login instead. Run `makima auth login openai` or pick `OpenAI Codex (ChatGPT login)` in `/login`. Makima guides you through the OAuth device flow at [auth.openai.com/codex](https://auth.openai.com/codex) and stores your OAuth tokens, which take precedence over the API key.
 
+With ChatGPT OAuth (`makima auth login openai`) the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Makima update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Makima reports, so a brand new release can lag until that version is bumped.
+
 ### Google
 
 - **Env var**: `GEMINI_API_KEY`
@@ -222,12 +224,14 @@ Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministr
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
+| Weak | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
 | Weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
 | Weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
 | Weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
 | Medium | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
 | Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
 | Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
+| Strong | glm-5.3 | $1.40 / $4.40 | 1000K ctx / 131K out |
 | Strong | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
 | Strong | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
@@ -238,7 +242,7 @@ Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 - **Env var**: `DEEPSEEK_API_KEY`
 - **API**: `https://api.deepseek.com`
 - **Features**: Thinking mode toggle (on/off), open-weight models
-- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at 2x during 01:00-04:00, 06:00-10:00 UTC
+- **Peak pricing**: the prices below are off-peak; each turn is billed as it happens, at 2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
@@ -255,6 +259,14 @@ Defaults: deepseek-v4-flash (medium), deepseek-v4-pro (strong)
 
 OpenRouter aggregates models from many providers behind a single API key. Browse available models at [openrouter.ai/models](https://openrouter.ai/models). Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`).
 
+### Requesty
+
+- **Env var**: `REQUESTY_API_KEY`
+- **API**: `https://router.requesty.ai/v1`
+- **Features**: 700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`
+
+Requesty routes across 700+ models with one key, including managed routing policies (e.g. `requesty/claude-sonnet-4-5`) and the full `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
+
 ### Synthetic
 
 - **Env var**: `SYNTHETIC_API_KEY`
@@ -268,6 +280,20 @@ OpenRouter aggregates models from many providers behind a single API key. Browse
 | Strong | **hf:moonshotai/Kimi-K2.5** (default) | $0.45 / $3.40 | 200K ctx / 131K out |
 
 Defaults: hf:moonshotai/Kimi-K2.5 (strong), hf:deepseek-ai/DeepSeek-V3.2 (medium), hf:zai-org/GLM-4.7-Flash (weak)
+
+### Regolo
+
+- **Env var**: `REGOLO_API_KEY`
+- **API**: `https://api.regolo.ai/v1`
+- **Features**: EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API
+
+| Tier | Models | Pricing (in/out per 1M tokens) | Context |
+|------|--------|-------------------------------|---------|
+| Weak | **qwen3.5-9b** (default) | $0.07 / $0.35 | 80K ctx / 80K out |
+| Medium | **qwen3-coder-next** (default) | $0.50 / $2.00 | 120K ctx / 120K out |
+| Strong | **qwen3.5-122b** (default) | $1.00 / $4.20 | 120K ctx / 120K out |
+
+Defaults: qwen3.5-122b (strong), qwen3-coder-next (medium), qwen3.5-9b (weak)
 
 ### TensorX
 
@@ -322,6 +348,24 @@ zai/glm-4.7
 ```
 
 If the model name is unique across providers, the prefix can be omitted.
+
+### Models newer than your Maki version
+
+The tables above list the models Maki curates. Any other id a provider accepts works too: type it into `/model` or pass it to `--model`. The picker also lists what the provider's own model endpoint reports, so same-day releases are selectable there.
+
+For an id no table covers, rates, context window, vision and thinking support come from [models.dev](https://models.dev/), refreshed daily (`maki models --refresh` forces it). Maki reads each field on its own, so a row that lists a price but no context window still leaves the window to the sources below.
+
+Sources rank by how sure they are to describe the exact model you asked for:
+
+1. What the provider's own model endpoint reported this session.
+2. A curated row for that id, including its dated snapshots. `claude-sonnet-4-5-20250929` reads the `claude-sonnet-4-5` row.
+3. models.dev.
+4. A curated row for a close relative, reached by shared prefix. `glm-5.4` falls back to `glm-5` here, and takes its family and tier from it either way.
+5. The provider's defaults, with no cost estimate.
+
+A curated row is checked against the provider's own pricing page, so it wins for the id it names. For a relative it loses to models.dev, because a rate nobody checked against the id you typed is only a guess.
+
+New models start at the **medium** tier until you assign one in the picker.
 
 ## providers.toml
 
@@ -454,7 +498,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `tensorx`, `opencode`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `aperture`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

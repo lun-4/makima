@@ -3,11 +3,13 @@ use std::fmt::{self, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use flume::Sender;
+use flume::{Receiver, Sender};
 use maki_config::ToolKey;
-use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
+use maki_providers::{
+    AgentError, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, add_cost,
+};
 use maki_storage::id::{MakiId, MakiIdParseError};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -336,6 +338,25 @@ impl ToolOutput {
         }
     }
 
+    /// The text a [`HookStage::Output`] hook may read and rewrite, or `None`
+    /// when the output has none to lend. Only a plain-text shape with no
+    /// `state` qualifies: the other variants render from their own fields, and
+    /// a `state` sidecar is saved with the session and re-rendered on restore,
+    /// so text a hook redacted would come back verbatim after a restart.
+    ///
+    /// One accessor for both directions, so a getter and a setter can never
+    /// drift into letting a hook read text it cannot write back.
+    ///
+    /// [`HookStage::Output`]: crate::tools::HookStage::Output
+    pub fn filterable_text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) if t.state.is_none() => {
+                Some(&mut t.text)
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_empty_result(&self) -> bool {
         match self {
             Self::GrepResult { entries } => entries.is_empty(),
@@ -608,6 +629,9 @@ pub enum DoneReason {
     EndTurn,
     MaxTokens,
     MaxTurns,
+    /// A manual `/compact` ended the run, but no user turn ended with it, so
+    /// a goal loop should not treat this as a turn boundary.
+    Compact,
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -693,6 +717,14 @@ pub enum TurnOutcome {
         usage: TokenUsage,
         num_turns: u32,
         reason: DoneReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        list_cost: Option<f64>,
+        #[serde(default)]
+        context_size: u32,
+        #[serde(default)]
+        context_window: u32,
     },
     Failed {
         agent_id: AgentId,
@@ -700,6 +732,14 @@ pub enum TurnOutcome {
         usage: TokenUsage,
         num_turns: u32,
         failure: TurnFailure,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        list_cost: Option<f64>,
+        #[serde(default)]
+        context_size: u32,
+        #[serde(default)]
+        context_window: u32,
     },
     Cancelled {
         agent_id: AgentId,
@@ -707,10 +747,78 @@ pub enum TurnOutcome {
         usage: TokenUsage,
         num_turns: u32,
         reason: TurnCancellationReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        list_cost: Option<f64>,
+        #[serde(default)]
+        context_size: u32,
+        #[serde(default)]
+        context_window: u32,
     },
 }
 
 impl TurnOutcome {
+    pub fn completed(
+        agent_id: AgentId,
+        turn_id: TurnId,
+        usage: TokenUsage,
+        num_turns: u32,
+        reason: DoneReason,
+    ) -> Self {
+        Self::Completed {
+            agent_id,
+            turn_id,
+            usage,
+            num_turns,
+            reason,
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+        }
+    }
+
+    pub fn failed(
+        agent_id: AgentId,
+        turn_id: TurnId,
+        usage: TokenUsage,
+        num_turns: u32,
+        failure: TurnFailure,
+    ) -> Self {
+        Self::Failed {
+            agent_id,
+            turn_id,
+            usage,
+            num_turns,
+            failure,
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+        }
+    }
+
+    pub fn cancelled(
+        agent_id: AgentId,
+        turn_id: TurnId,
+        usage: TokenUsage,
+        num_turns: u32,
+        reason: TurnCancellationReason,
+    ) -> Self {
+        Self::Cancelled {
+            agent_id,
+            turn_id,
+            usage,
+            num_turns,
+            reason,
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+        }
+    }
+
     pub fn agent_id(&self) -> AgentId {
         match self {
             Self::Completed { agent_id, .. }
@@ -740,6 +848,38 @@ impl TurnOutcome {
             Self::Completed { num_turns, .. }
             | Self::Failed { num_turns, .. }
             | Self::Cancelled { num_turns, .. } => *num_turns,
+        }
+    }
+
+    pub fn cost(&self) -> Option<f64> {
+        match self {
+            Self::Completed { cost, .. }
+            | Self::Failed { cost, .. }
+            | Self::Cancelled { cost, .. } => *cost,
+        }
+    }
+
+    pub fn list_cost(&self) -> Option<f64> {
+        match self {
+            Self::Completed { list_cost, .. }
+            | Self::Failed { list_cost, .. }
+            | Self::Cancelled { list_cost, .. } => *list_cost,
+        }
+    }
+
+    pub fn context_size(&self) -> u32 {
+        match self {
+            Self::Completed { context_size, .. }
+            | Self::Failed { context_size, .. }
+            | Self::Cancelled { context_size, .. } => *context_size,
+        }
+    }
+
+    pub fn context_window(&self) -> u32 {
+        match self {
+            Self::Completed { context_window, .. }
+            | Self::Failed { context_window, .. }
+            | Self::Cancelled { context_window, .. } => *context_window,
         }
     }
 }
@@ -777,7 +917,7 @@ pub enum AgentEvent {
     },
     QueueItemConsumed {
         text: String,
-        image_count: usize,
+        images: Vec<ImageSource>,
     },
     QueueDrained,
     /// A run picked up a model that changed while it was in flight. Carries
@@ -788,8 +928,15 @@ pub enum AgentEvent {
     },
     /// The sole terminal event for an accepted agent turn.
     TurnOutcome(TurnOutcome),
-    AutoCompacting,
-    CompactionDone,
+    AutoCompacting {
+        context_size: u32,
+        context_window: u32,
+    },
+    CompactionDone {
+        context_size_before: u32,
+        context_size_after: u32,
+        context_window: u32,
+    },
     Retry {
         attempt: u32,
         message: String,
@@ -844,6 +991,10 @@ pub enum AgentEvent {
         total: u32,
         cache: u32,
     },
+    /// End of a session's event stream. Emitted only by
+    /// [`EventStreamGuard::drop`] and swallowed by [`SessionEvents::next`], so
+    /// a consumer sees `None` and never this variant.
+    StreamClosed,
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
@@ -1072,6 +1223,57 @@ pub struct TurnCompleteEvent {
     pub context_window: u32,
 }
 
+/// What one run spent, itself and everything it spawned.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunTotals {
+    pub usage: TokenUsage,
+    pub cost: Option<f64>,
+    pub list_cost: Option<f64>,
+}
+
+/// Spend accumulator for one run, chained to the run that spawned it.
+///
+/// A round is added where it was paid for and walks up the chain, so every
+/// ledger holds its own subtree: a subagent reports its own spend, and the
+/// turn that spawned it still gets billed for the whole fan-out. Several
+/// subagents run at once, hence the lock.
+#[derive(Debug, Default)]
+pub struct RunLedger {
+    totals: Mutex<RunTotals>,
+    parent: Option<Arc<RunLedger>>,
+}
+
+impl RunLedger {
+    pub fn child(parent: &Arc<Self>) -> Arc<Self> {
+        Arc::new(Self {
+            totals: Mutex::default(),
+            parent: Some(Arc::clone(parent)),
+        })
+    }
+
+    pub fn add(&self, usage: TokenUsage, cost: Option<f64>, list_cost: Option<f64>) {
+        {
+            let mut totals = self.locked();
+            totals.usage += usage;
+            add_cost(&mut totals.cost, cost);
+            add_cost(&mut totals.list_cost, list_cost);
+        }
+        if let Some(parent) = &self.parent {
+            parent.add(usage, cost, list_cost);
+        }
+    }
+
+    pub fn totals(&self) -> RunTotals {
+        *self.locked()
+    }
+
+    /// A poisoned lock only means another run panicked mid-update. The totals
+    /// are still sound, and dropping a session's accounting over it is worse.
+    fn locked(&self) -> MutexGuard<'_, RunTotals> {
+        self.totals.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[derive(Clone)]
 pub struct SubagentCancel(Arc<dyn Fn() + Send + Sync>);
 
@@ -1108,6 +1310,11 @@ pub struct SubagentInfo {
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// What the subagent actually runs with, already reconciled against its
+    /// model. `None` means unknown (a restore predating it), which reads as
+    /// the parent's settings.
+    #[serde(skip)]
+    pub opts: Option<maki_providers::RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
     /// Queue into the subagent's background driver (async sessions only).
@@ -1158,6 +1365,15 @@ impl EventSender {
     pub fn raw_tx(&self) -> &Sender<Envelope> {
         &self.tx
     }
+
+    /// Same stream, different run. Lets a session body stamp per-turn ids
+    /// without keeping the [`EventStreamGuard`] in scope.
+    pub fn with_run_id(&self, run_id: u64) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            run_id,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1169,10 +1385,107 @@ pub struct Envelope {
     pub run_id: u64,
 }
 
+/// The only way to create a session event stream.
+///
+/// Never key a loop off sender disconnect instead: Lua tool contexts retain
+/// [`EventSender`] clones until the VM garbage-collects them, which never
+/// happens on an idle VM.
+pub fn event_stream() -> (EventStreamGuard, SessionEvents) {
+    let (tx, rx) = flume::unbounded();
+    (EventStreamGuard { tx }, SessionEvents { rx, closed: false })
+}
+
+/// Dropping this ends the stream, and it is the only thing that does. Handing
+/// out [`EventSender`]s is free, none of them extend it.
+///
+/// Nothing here bounds *when* the drop happens, that is the owner's job. An
+/// owner that parks the guard in a struct (the Lua subagent session does) is
+/// promising that the struct dies on a path it controls, not on a garbage
+/// collector's schedule.
+#[derive(Debug)]
+pub struct EventStreamGuard {
+    tx: Sender<Envelope>,
+}
+
+impl EventStreamGuard {
+    pub fn tx(&self) -> &Sender<Envelope> {
+        &self.tx
+    }
+
+    pub fn sender(&self, run_id: u64) -> EventSender {
+        EventSender::new(self.tx.clone(), run_id)
+    }
+}
+
+impl Drop for EventStreamGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(Envelope {
+            event: AgentEvent::StreamClosed,
+            subagent: None,
+            run_id: 0,
+        });
+    }
+}
+
+/// The single reader of a session's stream. Not `Clone`: two readers would
+/// split the terminal item and one of them would wait forever.
+#[derive(Debug)]
+pub struct SessionEvents {
+    rx: Receiver<Envelope>,
+    /// Kept instead of dropping `rx`, so a retained [`EventSender`] still
+    /// reports success: the stream ends because the marker said so, never
+    /// because a sender happened to notice a dead channel.
+    closed: bool,
+}
+
+impl SessionEvents {
+    pub fn into_receiver(self) -> Receiver<Envelope> {
+        self.rx
+    }
+
+    /// `None` once the stream closed, forever after. The marker rides the same
+    /// FIFO as the events, so everything sent before the guard dropped is
+    /// delivered first and everything sent after it is lost. That is why a
+    /// session drops its guard only once the run returned and history landed.
+    ///
+    /// Cancel-safe: the only suspension point is flume's `recv_async`, which
+    /// leaves a queued envelope in the queue when dropped.
+    pub async fn next(&mut self) -> Option<Envelope> {
+        if self.closed {
+            return None;
+        }
+        match self.rx.recv_async().await {
+            Ok(envelope) if !matches!(envelope.event, AgentEvent::StreamClosed) => Some(envelope),
+            _ => {
+                self.closed = true;
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn test_session_events_guard_emits_stream_closed_on_drop() {
+        let (guard, mut events) = event_stream();
+        let sender = guard.sender(1);
+        sender.send(AgentEvent::Nudge).unwrap();
+        drop(guard);
+
+        smol::block_on(async {
+            let first = events.next().await;
+            assert!(first.is_some());
+            assert!(matches!(first.unwrap().event, AgentEvent::Nudge));
+
+            // StreamClosed causes next() to return None and close the stream.
+            let second = events.next().await;
+            assert!(second.is_none());
+        });
+    }
 
     #[test_case(ToolOutput::Plain("ok".into()),                      Some("1 lines")     ; "plain_short_annotates")]
     #[test_case(ToolOutput::Plain((0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into()), Some("20 lines") ; "plain_long_annotates")]
@@ -1184,6 +1497,28 @@ mod tests {
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: "ok".into() }, None ; "diff_no_annotation")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
+    }
+
+    const FILTERABLE_TEXT: &str = "body";
+
+    fn text_with_state() -> TextOutput {
+        TextOutput {
+            text: FILTERABLE_TEXT.into(),
+            instructions: None,
+            state: Some(serde_json::json!({ "text": FILTERABLE_TEXT })),
+        }
+    }
+
+    #[test_case(ToolOutput::Plain(FILTERABLE_TEXT.into()),   Some(FILTERABLE_TEXT) ; "plain_without_state_lends_text")]
+    #[test_case(ToolOutput::Plain(text_with_state()),        None                  ; "plain_with_state_withholds_text")]
+    #[test_case(ToolOutput::Markdown(text_with_state()),     None                  ; "markdown_with_state_withholds_text")]
+    #[test_case(ToolOutput::ReadDir(FILTERABLE_TEXT.into()), Some(FILTERABLE_TEXT) ; "read_dir_without_state_lends_text")]
+    #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: String::new(), summary: FILTERABLE_TEXT.into() }, None ; "diff_withholds_text")]
+    fn filterable_text_needs_text_to_be_the_sole_representation(
+        mut output: ToolOutput,
+        expected: Option<&str>,
+    ) {
+        assert_eq!(output.filterable_text_mut().map(|t| t.as_str()), expected);
     }
 
     #[test_case(None ; "no_stop_reason")]
@@ -1218,8 +1553,8 @@ mod tests {
         assert_id_roundtrip(TurnId::generate());
     }
 
-    #[test_case(AgentError::Api { status: 500, message: "down".into() }, TurnFailureKind::Provider ; "provider")]
-    #[test_case(AgentError::Api { status: 401, message: "bad key".into() }, TurnFailureKind::Authentication ; "authentication")]
+    #[test_case(AgentError::api(500, "down"), TurnFailureKind::Provider ; "provider")]
+    #[test_case(AgentError::api(401, "bad key"), TurnFailureKind::Authentication ; "authentication")]
     #[test_case(AgentError::Timeout { secs: 10 }, TurnFailureKind::Timeout ; "timeout")]
     #[test_case(AgentError::Tool { tool: "read".into(), message: "bad".into() }, TurnFailureKind::Tool ; "tool")]
     #[test_case(AgentError::Io(std::io::Error::other("disk")), TurnFailureKind::Transport ; "io")]
@@ -1762,5 +2097,144 @@ mod tests {
         let display = output.as_display_text();
         assert!(display.contains("fn main()"), "{EXCLUDES_MSG}");
         assert!(!display.contains("Instructions from:"), "{EXCLUDES_MSG}");
+    }
+
+    const STREAM_RUN_IDS: [u64; 3] = [1, 2, 3];
+    const STILL_PENDING: &str = "an empty stream must not resolve `next()`";
+    const NO_LATE_EVENTS: &str = "events queued after the marker must stay invisible";
+
+    fn drain(events: &mut SessionEvents) -> Vec<u64> {
+        smol::block_on(async {
+            let mut seen = Vec::new();
+            while let Some(envelope) = events.next().await {
+                seen.push(envelope.run_id);
+            }
+            seen
+        })
+    }
+
+    /// The ordering the whole design rests on: the marker rides the same FIFO
+    /// as the events, so nothing queued before it is lost. The first `next()`
+    /// is polled on an empty queue and then dropped, the way a `select!` arm
+    /// in the SDK pump does, and it must not swallow what lands afterwards.
+    #[test]
+    fn queued_events_arrive_in_order_before_the_close() {
+        use futures_lite::future::poll_once;
+        use std::pin::pin;
+
+        let (guard, mut events) = event_stream();
+        smol::block_on(async {
+            let mut pending = pin!(events.next());
+            assert!(
+                poll_once(pending.as_mut()).await.is_none(),
+                "{STILL_PENDING}"
+            );
+            for run_id in STREAM_RUN_IDS {
+                guard.sender(run_id).send(AgentEvent::Nudge).unwrap();
+            }
+        });
+        drop(guard);
+        assert_eq!(drain(&mut events), STREAM_RUN_IDS);
+    }
+
+    /// The marker is a point of no return, even for a reader that has not
+    /// polled yet. A Lua tool context parks a sender on an idle VM forever, so
+    /// its late send has to look fine to it and stay invisible to the reader.
+    #[test]
+    fn events_sent_after_the_close_are_never_observed() {
+        let (guard, mut events) = event_stream();
+        let retained = guard.sender(STREAM_RUN_IDS[0]);
+        retained.send(AgentEvent::Nudge).unwrap();
+        drop(guard);
+        retained.send(AgentEvent::Nudge).unwrap();
+        assert_eq!(drain(&mut events), [STREAM_RUN_IDS[0]], "{NO_LATE_EVENTS}");
+        assert!(smol::block_on(events.next()).is_none(), "{NO_LATE_EVENTS}");
+    }
+
+    /// A derived sender is just another clone: it stamps its own run id on the
+    /// same FIFO, and dropping it neither ends nor extends the stream.
+    #[test]
+    fn with_run_id_restamps_without_forking_the_stream() {
+        let (guard, mut events) = event_stream();
+        let original = guard.sender(STREAM_RUN_IDS[0]);
+        let derived = original.with_run_id(STREAM_RUN_IDS[1]);
+        derived.send(AgentEvent::Nudge).unwrap();
+        drop(derived);
+        original.send(AgentEvent::Nudge).unwrap();
+        drop(guard);
+        assert_eq!(
+            drain(&mut events),
+            [STREAM_RUN_IDS[1], STREAM_RUN_IDS[0]],
+            "{NO_LATE_EVENTS}"
+        );
+    }
+
+    /// A consumer that exits first (SDK stdout closed, ACP client gone) leaves
+    /// the guard sending the marker into a dead channel, often while unwinding.
+    #[test]
+    fn dropping_the_guard_after_the_reader_is_harmless() {
+        let (guard, events) = event_stream();
+        let retained = guard.sender(STREAM_RUN_IDS[0]);
+        drop(events);
+        drop(guard);
+        assert!(matches!(
+            retained.send(AgentEvent::Nudge),
+            Err(AgentError::Channel)
+        ));
+    }
+
+    const FIRST_COST: f64 = 0.5;
+    const SECOND_COST: f64 = 0.25;
+    const FIRST_INPUT: u32 = 10;
+    const SECOND_INPUT: u32 = 5;
+    const OWN_SUBTREE_MSG: &str = "a child ledger reports only what it spent itself";
+    const ROLLUP_MSG: &str = "a child's spend has to land in the parent's totals";
+
+    fn usage(input: u32) -> TokenUsage {
+        TokenUsage {
+            input,
+            ..Default::default()
+        }
+    }
+
+    #[test_case::test_case(Some(FIRST_COST), Some(SECOND_COST), Some(FIRST_COST + SECOND_COST) ; "priced_rounds_add_up")]
+    #[test_case::test_case(None, None, None ; "unpriced_rounds_stay_unpriced")]
+    fn ledger_folds_usage_and_cost_across_adds(
+        first: Option<f64>,
+        second: Option<f64>,
+        expected: Option<f64>,
+    ) {
+        let ledger = RunLedger::default();
+        ledger.add(usage(FIRST_INPUT), first, first);
+        ledger.add(usage(SECOND_INPUT), second, second);
+
+        let totals = ledger.totals();
+        assert_eq!(totals.usage.input, FIRST_INPUT + SECOND_INPUT);
+        assert_eq!(totals.cost, expected);
+        assert_eq!(totals.list_cost, expected);
+    }
+
+    #[test]
+    fn ledger_child_spend_rolls_up_into_parent() {
+        let parent = Arc::new(RunLedger::default());
+        parent.add(usage(FIRST_INPUT), Some(FIRST_COST), Some(FIRST_COST));
+        let child = RunLedger::child(&parent);
+        child.add(usage(SECOND_INPUT), Some(SECOND_COST), Some(SECOND_COST));
+
+        let own = child.totals();
+        assert_eq!(own.usage.input, SECOND_INPUT, "{OWN_SUBTREE_MSG}");
+        assert_eq!(own.cost, Some(SECOND_COST), "{OWN_SUBTREE_MSG}");
+
+        let rolled_up = parent.totals();
+        assert_eq!(
+            rolled_up.usage.input,
+            FIRST_INPUT + SECOND_INPUT,
+            "{ROLLUP_MSG}"
+        );
+        assert_eq!(
+            rolled_up.cost,
+            Some(FIRST_COST + SECOND_COST),
+            "{ROLLUP_MSG}"
+        );
     }
 }

@@ -1,8 +1,9 @@
 use std::env;
 
-use maki_config::{AgentConfig, CompactionBuffer};
+use maki_config::AgentConfig;
 use maki_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
+    ContentBlock, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role, StreamResponse,
+    TokenUsage,
 };
 use maki_storage::id::SessionRef;
 use tracing::info;
@@ -13,19 +14,45 @@ use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
-const IMAGE_PLACEHOLDER: &str = "[image]";
 
-fn normalize(text: &Option<String>) -> Option<&str> {
-    text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+const MAX_RESERVED_PERCENT: u32 = 50;
+
+fn percent_of(tokens: u32, percent: u32) -> u32 {
+    (u64::from(tokens) * u64::from(percent) / 100) as u32
+}
+
+fn normalize(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// Config instructions steer every compaction, `request` only the one the user
+/// asked for with `/compact <guidance>`, so both are kept and neither wins.
+fn summary_prompt(config: &AgentConfig, request: Option<&str>) -> String {
+    let extras = [
+        normalize(config.compaction_instructions.as_deref()),
+        normalize(request),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    if extras.is_empty() {
+        return crate::prompt::COMPACTION_USER.to_string();
+    }
+    format!(
+        "{}\n\nAdditional instructions:\n{extras}",
+        crate::prompt::COMPACTION_USER
+    )
 }
 
 pub(super) fn continue_message(config: &AgentConfig) -> String {
-    match normalize(&config.post_compaction_instructions) {
+    match normalize(config.post_compaction_instructions.as_deref()) {
         Some(extra) => format!("{CONTINUE_AFTER_COMPACT}\n\n{extra}"),
         None => CONTINUE_AFTER_COMPACT.to_string(),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_history(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
@@ -33,6 +60,7 @@ pub(super) async fn compact_history(
     event_tx: &EventSender,
     cancel: &CancelToken,
     config: &AgentConfig,
+    instructions: Option<&str>,
     session_id: Option<&SessionRef>,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
@@ -41,14 +69,7 @@ pub(super) async fn compact_history(
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
     strip_old_tool_results(&mut compaction_history);
-    let summary_prompt = match normalize(&config.compaction_instructions) {
-        Some(extra) => format!(
-            "{}\n\nAdditional instructions:\n{extra}",
-            crate::prompt::COMPACTION_USER
-        ),
-        None => crate::prompt::COMPACTION_USER.to_string(),
-    };
-    compaction_history.push(Message::user(summary_prompt));
+    compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
     let empty_tools = serde_json::json!([]);
     let max_attempts = 3;
@@ -65,6 +86,7 @@ pub(super) async fn compact_history(
             cancel,
             RequestOptions::default(),
             session_id,
+            maki_providers::retry::RetryPolicy::default(),
         )
         .await
         {
@@ -124,6 +146,7 @@ fn finish_compact(
     Ok(response.usage)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn compact(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
@@ -131,13 +154,21 @@ pub async fn compact(
     event_tx: &EventSender,
     cancel: &CancelToken,
     config: &AgentConfig,
+    instructions: Option<&str>,
     session_id: Option<&SessionRef>,
 ) -> Result<(), AgentError> {
     let usage = compact_history(
-        provider, model, history, event_tx, cancel, config, session_id,
+        provider,
+        model,
+        history,
+        event_tx,
+        cancel,
+        config,
+        instructions,
+        session_id,
     )
     .await?;
-    if let Some(post) = normalize(&config.post_compaction_instructions) {
+    if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
         history.push(Message::synthetic(post.to_string()));
     }
 
@@ -146,11 +177,35 @@ pub async fn compact(
     Ok(())
 }
 
-pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
-    let usable = model
-        .context_window
-        .saturating_sub(buffer.resolve(model.context_window));
-    usage.context_tokens() >= usable
+const MIN_OUTPUT_TOKENS: u32 = 4096;
+
+pub(super) fn min_output(model: &Model) -> u32 {
+    MIN_OUTPUT_TOKENS.min(model.max_output_tokens.unwrap_or(MIN_OUTPUT_TOKENS))
+}
+
+/// Reserving a whole [`AgentConfig::max_turn_output`] would guarantee more and
+/// cost more: on a small window that is half the context, and compacting that
+/// early hurts worse than the odd turn whose output budget gets trimmed.
+///
+/// Whatever the floor and the buffer work out to, [`MAX_RESERVED_PERCENT`] has
+/// the last word, because a reservation that eats the window leaves compaction
+/// nothing to compact into.
+pub(super) fn reserved(model: &Model, config: &AgentConfig) -> u32 {
+    config
+        .compaction_buffer
+        .resolve(model.context_window)
+        .max(min_output(model))
+        .min(percent_of(model.context_window, MAX_RESERVED_PERCENT))
+}
+
+/// What [`reserved`] leaves the transcript. Always a real number of tokens, so
+/// `>=` against it is a threshold a session can sit below.
+pub(super) fn usable(model: &Model, config: &AgentConfig) -> u32 {
+    model.context_window - reserved(model, config)
+}
+
+pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, config: &AgentConfig) -> bool {
+    usage.context_tokens() >= usable(model, config)
 }
 
 fn strip_images(messages: &mut [Message]) {
@@ -243,6 +298,7 @@ mod tests {
 
     use super::*;
     use crate::AgentConfig;
+    use maki_config::CompactionBuffer;
 
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
@@ -324,6 +380,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
                 Some(&session),
             )
             .await
@@ -363,6 +420,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -399,6 +457,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                None,
             )
             .await
             .expect_err("empty summary must fail");
@@ -409,17 +468,20 @@ mod tests {
         });
     }
 
-    #[test]
-    fn compact_applies_custom_instructions() {
-        smol::block_on(async {
-            const EXTRA: &str = "Record anything that belongs in plan.md";
-            const POST: &str = "Re-read plan.md and agent.md";
+    const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
+    const REQUEST_EXTRA: &str = "Keep the failing test names";
+    const POST: &str = "Re-read plan.md and agent.md";
 
+    /// `summary_prompt_merges_instructions` covers the merge, this one the
+    /// wiring around it.
+    #[test]
+    fn compact_sends_instructions_and_appends_post() {
+        smol::block_on(async {
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![Message::user("work".into())]);
             let (raw_tx, _rx) = flume::unbounded();
             let config = AgentConfig {
-                compaction_instructions: Some(EXTRA.into()),
+                compaction_instructions: Some(CONFIG_EXTRA.into()),
                 post_compaction_instructions: Some(POST.into()),
                 ..Default::default()
             };
@@ -431,17 +493,17 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 &config,
+                Some(REQUEST_EXTRA),
                 None,
             )
             .await
             .unwrap();
 
             let requests = provider.requests.lock().unwrap();
-            let summary_prompt = requests[0].last().unwrap();
             assert!(matches!(
-                &summary_prompt.content[0],
+                &requests[0].last().unwrap().content[0],
                 ContentBlock::Text { text }
-                    if text.starts_with(crate::prompt::COMPACTION_USER) && text.ends_with(EXTRA)
+                    if text.contains(CONFIG_EXTRA) && text.contains(REQUEST_EXTRA)
             ));
             assert!(matches!(
                 &history.as_slice().last().unwrap().content[0],
@@ -450,10 +512,31 @@ mod tests {
         });
     }
 
-    #[test_case(Some("  \n ".into()), None ; "whitespace_only_is_none")]
-    #[test_case(Some("  keep plan.md ".into()), Some("keep plan.md") ; "trimmed")]
-    fn normalize_instructions(raw: Option<String>, expected: Option<&str>) {
-        assert_eq!(normalize(&raw), expected);
+    #[test_case(None, None, false, false ; "no_instructions")]
+    #[test_case(Some(CONFIG_EXTRA), None, true, false ; "config_only")]
+    #[test_case(None, Some(REQUEST_EXTRA), false, true ; "request_only")]
+    #[test_case(Some(CONFIG_EXTRA), Some(REQUEST_EXTRA), true, true ; "both_kept")]
+    #[test_case(Some(CONFIG_EXTRA), Some("   "), true, false ; "blank_request_ignored")]
+    #[test_case(Some(" \n "), Some(REQUEST_EXTRA), false, true ; "blank_config_ignored")]
+    fn summary_prompt_merges_instructions(
+        config_extra: Option<&str>,
+        request: Option<&str>,
+        has_config: bool,
+        has_request: bool,
+    ) {
+        let config = AgentConfig {
+            compaction_instructions: config_extra.map(str::to_string),
+            ..Default::default()
+        };
+        let prompt = summary_prompt(&config, request);
+
+        assert!(prompt.starts_with(crate::prompt::COMPACTION_USER));
+        assert_eq!(
+            prompt.len() > crate::prompt::COMPACTION_USER.len(),
+            has_config || has_request
+        );
+        assert_eq!(prompt.contains(CONFIG_EXTRA), has_config);
+        assert_eq!(prompt.contains(REQUEST_EXTRA), has_request);
     }
 
     #[test]
@@ -491,6 +574,7 @@ mod tests {
                 &CancelToken::none(),
                 &AgentConfig::default(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -525,6 +609,9 @@ mod tests {
     #[test_case(262_144, 0,       0,       0,      262_144, true  ; "equal_context_and_max_output")]
     #[test_case(51_199,  0,       0,       0,      64_000,  false ; "small_window_below_scaled_threshold")]
     #[test_case(51_200,  0,       0,       0,      64_000,  true  ; "small_window_at_scaled_threshold")]
+    #[test_case(2_047,   0,       0,       0,      4_096,   false ; "llama_cpp_default_window_is_usable")]
+    #[test_case(2_048,   0,       0,       0,      4_096,   true  ; "llama_cpp_default_window_still_compacts")]
+    #[test_case(0,       0,       0,       0,      1_024,   false ; "an_empty_transcript_never_overflows")]
     fn overflow_detection(
         input: u32,
         cache_read: u32,
@@ -541,7 +628,7 @@ mod tests {
             cache_creation,
         };
         assert_eq!(
-            is_overflow(&usage, &model, AgentConfig::default().compaction_buffer),
+            is_overflow(&usage, &model, &AgentConfig::default()),
             expected
         );
     }
@@ -555,7 +642,11 @@ mod tests {
             input,
             ..Default::default()
         };
-        assert_eq!(is_overflow(&usage, &model, buffer), expected);
+        let config = AgentConfig {
+            compaction_buffer: buffer,
+            ..Default::default()
+        };
+        assert_eq!(is_overflow(&usage, &model, &config), expected);
     }
 
     #[test]
@@ -693,10 +784,7 @@ mod tests {
             const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
 
             let provider = MockProvider::new(vec![
-                Err(AgentError::Api {
-                    status: 413,
-                    message: "prompt is too long".into(),
-                }),
+                Err(AgentError::api(413, "prompt is too long")),
                 Ok(text_response(StopReason::EndTurn)),
             ]);
             let mut history = History::new(vec![
@@ -718,6 +806,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
                 None,
             )
             .await
@@ -761,6 +850,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
                 None,
             )
             .await

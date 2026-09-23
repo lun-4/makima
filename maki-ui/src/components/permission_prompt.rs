@@ -178,6 +178,15 @@ impl PermissionPrompt {
         }
     }
 
+    /// The ask the agent is parked on. Its answer has to name it, or the agent
+    /// refuses it as one meant for some other request.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Open { id, .. } => Some(id),
+            Self::Closed => None,
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<PermissionAnswer> {
         let Self::Open { state, buffer, .. } = self else {
             return None;

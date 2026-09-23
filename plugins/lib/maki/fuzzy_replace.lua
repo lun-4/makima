@@ -92,18 +92,51 @@ local function rebase(drift, indent)
 end
 
 -- The model can write `old_string` sloppily and `new_string` in the file's own
--- frame, and then there is nothing left to correct.
+-- frame, and then there is nothing left to correct. Two independent signs of
+-- that, either one enough: every column the replacement uses is already a file
+-- column, or the replacement's base column is the file's one rather than the
+-- model's. The second matters because a replacement that adds a nesting level
+-- uses a column neither side has seen, which defeats the first on its own and
+-- would push the whole block a level deeper.
+--
+-- The bases only tell the frames apart when they differ; when they agree the
+-- drift is a widening of the inner levels, which the column test still catches
+-- and reindent has to correct otherwise.
 local function written_in_file_frame(drift, replacement)
-  local file_columns = {}
-  for _, file_indent in pairs(drift) do
-    file_columns[file_indent] = true
+  local model_indents = {}
+  for model_indent in pairs(drift) do
+    model_indents[#model_indents + 1] = model_indent
   end
+  -- `pairs` walks the table in whatever order it likes, so two columns of equal
+  -- width, easy to hit once tabs and spaces mix, used to leave the hash order
+  -- deciding how the file gets reindented. Shallowest first, then by content so
+  -- a tie always falls the same way.
+  table.sort(model_indents, function(a, b)
+    if #a ~= #b then
+      return #a < #b
+    end
+    return a < b
+  end)
+
+  local file_columns = {}
+  for _, model_indent in ipairs(model_indents) do
+    file_columns[drift[model_indent]] = true
+  end
+  local model_base = model_indents[1]
+  local file_base = model_base and drift[model_base]
+
+  local every_column_known, replacement_base = true, nil
   for _, line in ipairs(split_lines(replacement)) do
-    if trim(line) ~= "" and not file_columns[indent_of(line)] then
-      return false
+    if trim(line) ~= "" then
+      local indent = indent_of(line)
+      every_column_known = every_column_known and file_columns[indent] ~= nil
+      if not replacement_base or #indent < #replacement_base then
+        replacement_base = indent
+      end
     end
   end
-  return true
+
+  return every_column_known or (replacement_base == file_base and file_base ~= model_base)
 end
 
 -- Corrects exactly what the match forgave in `old_string`, and nothing else.

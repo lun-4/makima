@@ -69,7 +69,7 @@ impl StreamingCache {
             return false;
         }
         let text = maki_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
-        let semantic = renderer.render(text.as_ref(), width, theme_gen);
+        let semantic = renderer.render(text.as_ref(), width);
         self.lines = paint_semantic(&semantic, prefix, text_style, prefix_style);
         self.key = Some(key);
         true
@@ -95,7 +95,7 @@ impl StreamingContent {
         Self {
             typewriter: Typewriter::with_speed(ms_per_char),
             cache: StreamingCache::default(),
-            renderer: Renderer::unwrapped(),
+            renderer: Renderer::streaming(),
             prefix,
             text_style,
             prefix_style,
@@ -109,12 +109,12 @@ impl StreamingContent {
     pub fn clear(&mut self) {
         self.typewriter.clear();
         self.cache.invalidate();
-        self.renderer = Renderer::unwrapped();
+        self.renderer = Renderer::streaming();
     }
 
     pub fn take_all(&mut self) -> String {
         self.cache.invalidate();
-        self.renderer = Renderer::unwrapped();
+        self.renderer = Renderer::streaming();
         self.typewriter.take_all()
     }
 
@@ -202,7 +202,7 @@ mod tests {
     }
 
     fn fresh_renderer() -> Renderer {
-        Renderer::unwrapped()
+        Renderer::streaming()
     }
 
     #[test_case(

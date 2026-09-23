@@ -61,7 +61,11 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::text_buffer::is_newline_key;
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+#[cfg(test)]
+pub(crate) use crossterm::event::KeyEventKind;
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
+};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
@@ -72,6 +76,7 @@ use maki_commands::{
     HostContextRequest, HostContextResponse, HostRequest, HostResponse, SlashClass, TargetHandle,
     classify_input,
 };
+use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
@@ -115,12 +120,15 @@ const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
 const FAST_UNSUPPORTED_MSG: &str = maki_agent::command::FAST_UNSUPPORTED;
 pub(crate) const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
+const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 const THEME_APPLIED_PREFIX: &str = "Theme";
+pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
+const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
@@ -388,8 +396,10 @@ pub struct App {
     /// Armed by a keyboard submit (main or subagent input) to release a manual
     /// Alt+M hold; consumed by the next promotion pass.
     pub(super) submit_released: bool,
+    pub(crate) pending_dirty: Dirty,
 
     pub(crate) storage: StateDir,
+    pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) theme_provider: Arc<dyn ThemesProvider>,
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
@@ -420,7 +430,7 @@ pub struct App {
 }
 
 pub(crate) struct PreparedApp {
-    app: App,
+    pub(crate) app: App,
     command_target: PreparedCommandTarget,
 }
 
@@ -543,6 +553,7 @@ impl App {
             pending_bell: false,
             submit_released: false,
             storage,
+            trust_question: None,
             theme_provider,
             available_models,
             shared_history: None,
@@ -567,6 +578,7 @@ impl App {
             subagent_channels: HashMap::new(),
             stamped_subagent_outcomes: HashSet::new(),
             delivered_subagent_histories: HashMap::new(),
+            pending_dirty: Dirty::NO,
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -676,10 +688,11 @@ impl App {
     }
 
     pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
-        if fast && !self.state.model.supports_fast() {
+        let model = &self.state.model;
+        if fast && !model.supports_fast() && !model.fast_pending() {
             return Err(FAST_UNSUPPORTED_MSG.into());
         }
-        self.state.fast = fast;
+        self.state.set_fast(fast);
         Ok(())
     }
 
@@ -762,16 +775,18 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
         match &msg {
-            Msg::Key(key) if key.kind == KeyEventKind::Release => return vec![],
+            Msg::Key(key) if key.kind == CrosstermKeyEventKind::Release => return vec![],
             Msg::Key(key) => {
                 let active = self.middle_scroll.is_some();
-                let _ = self.cancel_middle_scroll();
+                let dirty = self.cancel_middle_scroll();
+                self.pending_dirty |= dirty;
                 if active && key.code == KeyCode::Esc {
                     return vec![];
                 }
             }
             Msg::Paste(_) | Msg::Scroll { .. } => {
-                let _ = self.cancel_middle_scroll();
+                let dirty = self.cancel_middle_scroll();
+                self.pending_dirty |= dirty;
             }
             _ => {}
         }
@@ -804,7 +819,8 @@ impl App {
                 vec![]
             }
             Msg::Mouse(event) => {
-                self.handle_mouse(event);
+                let dirty = self.handle_mouse(event);
+                self.pending_dirty |= dirty;
                 vec![]
             }
             Msg::Scroll { column, row, delta } => {
@@ -815,8 +831,10 @@ impl App {
         };
         // A modal-closing key or an answered permission yields the next demand
         // immediately, rather than waiting for the next 100ms tick.
-        let _ = self.promote_deferred_if_ready();
-        let _ = self.validate_middle_scroll();
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
+        let dirty = self.validate_middle_scroll();
+        self.pending_dirty |= dirty;
         actions
     }
 
@@ -1020,7 +1038,9 @@ impl App {
         if self.permission_active() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
                 let agent_id = self.permission_prompt.agent_id();
-                let encoded = answer.encode();
+                let request_id = self.permission_prompt.request_id().unwrap_or_default();
+                let encoded =
+                    maki_agent::permissions::TaggedAnswer::new(request_id, answer).encode();
                 self.permission_prompt.close();
                 self.send_to_agent(agent_id, encoded);
             }
@@ -1064,12 +1084,7 @@ impl App {
 
         if self.search_modal.is_open() {
             match self.search_modal.handle_key(key) {
-                SearchAction::Consumed => {
-                    let chat = &mut self.chats[self.active_chat];
-                    let texts = chat.segment_search_texts();
-                    self.search_modal.update_matches(&texts);
-                    sync_search_highlight(&self.search_modal, chat);
-                }
+                SearchAction::Consumed => self.refresh_search_matches(),
                 SearchAction::Navigate => {
                     sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
                 }
@@ -1099,7 +1114,7 @@ impl App {
                     if let InputAction::PaletteSync(val) =
                         self.input_box.handle_paste_with_spaces(&path)
                     {
-                        self.command_palette.sync(&val);
+                        self.pending_dirty |= self.command_palette.sync(&val);
                         self.sync_command_arguments(
                             &val,
                             self.input_box.buffer.cursor_byte_offset(),
@@ -1429,7 +1444,7 @@ impl App {
                     });
             }
             CommandAction::AcceptArgument { text, cursor } => {
-                self.command_palette.sync(&text);
+                self.pending_dirty |= self.command_palette.sync(&text);
                 self.refresh_at_ref_labels(&text);
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
@@ -1437,7 +1452,7 @@ impl App {
                 return vec![];
             }
             CommandAction::Complete { text, cursor } => {
-                self.command_palette.sync(&text);
+                self.pending_dirty |= self.command_palette.sync(&text);
                 self.refresh_at_ref_labels(&text);
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
@@ -1475,7 +1490,7 @@ impl App {
                 self.handle_submit(sub)
             }
             InputAction::PaletteSync(val) => {
-                self.command_palette.sync(&val);
+                self.pending_dirty |= self.command_palette.sync(&val);
                 self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
                 self.sync_file_completion();
                 vec![]
@@ -1634,7 +1649,7 @@ impl App {
             .buffer
             .replace_range_on_current_line(start, end, &replacement);
         let value = self.input_box.buffer.value();
-        self.command_palette.sync(&value);
+        self.pending_dirty |= self.command_palette.sync(&value);
         self.sync_command_arguments(&value, self.input_box.buffer.cursor_byte_offset());
     }
 
@@ -1653,6 +1668,22 @@ impl App {
 
     fn quit(&mut self) -> Vec<Action> {
         self.quit_with(ExitRequest::Success)
+    }
+
+    /// `maki trust` lives outside the TUI, so without this a "not now" or a
+    /// `.makima/` created mid-session is unrecoverable without quitting.
+    fn trust_folder(&mut self) -> Vec<Action> {
+        let Some(question) = self.trust_question.clone() else {
+            self.flash(NOTHING_TO_TRUST_MSG.into());
+            return Vec::new();
+        };
+        if let Err(error) = project::grant(&self.storage, &question) {
+            self.flash(error);
+            return Vec::new();
+        }
+        let covered: Vec<String> = question.present.iter().map(GatedFile::to_string).collect();
+        self.flash(format!("{TRUSTED_PREFIX}{}", covered.join(", ")));
+        self.quit_with(ExitRequest::Reload)
     }
 
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
@@ -1691,7 +1722,7 @@ impl App {
             let id = self.shell.reserve_id();
             let sigil = if prefix.visible { "!" } else { "!!" };
             let display = format!("{sigil} {}", prefix.command);
-            self.main_chat().show_user_message(display);
+            self.main_chat().show_user_message(display, Vec::new());
             return vec![Action::ShellCommand {
                 id,
                 command: prefix.command,
@@ -1960,23 +1991,12 @@ impl App {
             return vec![];
         }
 
-        match &envelope.event {
-            AgentEvent::ToolStart(event) => self.fire_session_autocmd(
-                "ToolStart",
-                serde_json::json!({
-                    "tool_id": event.id,
-                    "tool": event.tool,
-                }),
-            ),
-            AgentEvent::ToolDone(event) => self.fire_session_autocmd(
-                "ToolDone",
-                serde_json::json!({
-                    "tool_id": event.id,
-                    "tool": event.tool,
-                }),
-            ),
-            _ => {}
-        }
+        maki_lua::agent_autocmd::dispatch(
+            &self.lua_event_handle,
+            &self.state.session.id,
+            &envelope,
+            envelope.subagent.is_some(),
+        );
 
         let subagent_id = envelope
             .subagent
@@ -2074,9 +2094,9 @@ impl App {
         };
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
 
-        if let ChatEventResult::QueueItemConsumed { text, image_count } = result {
+        if let ChatEventResult::QueueItemConsumed { text, images } = result {
             if chat_idx == 0 {
-                self.on_queue_item_consumed(&text, image_count);
+                self.on_queue_item_consumed(text, images);
             }
             return vec![];
         }
@@ -2125,7 +2145,6 @@ impl App {
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
                     self.retain_live_async_subagents();
                     self.status = Status::Idle;
-                    self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
                     }
@@ -2140,10 +2159,6 @@ impl App {
                     self.retain_live_async_subagents();
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.fire_session_autocmd(
-                        "TurnError",
-                        serde_json::json!({ "message": message }),
-                    );
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -2231,6 +2246,7 @@ impl App {
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
+        chat.opts = subagent.opts;
         chat.subagent_id = Some(id.clone());
         chat.agent_id = Some(subagent.agent_id);
         chat.set_started_at_now();
@@ -2328,7 +2344,7 @@ impl App {
                         self.present_frontend_feedback(feedback)
                     }
                     maki_commands::CommandOutcome::Failed(error) => self.flash(error.to_string()),
-                    maki_commands::CommandOutcome::ManualCompaction
+                    maki_commands::CommandOutcome::ManualCompaction(_)
                     | maki_commands::CommandOutcome::Completed => break,
                 },
             }
@@ -2364,8 +2380,14 @@ impl App {
                 }
             }
             FAST_OPTION_ID => {
-                self.state.fast = enabled;
-                if enabled { FAST_ON_MSG } else { FAST_OFF_MSG }
+                let _ = self.set_fast(enabled);
+                if self.state.pending_fast {
+                    FAST_PENDING_MSG
+                } else if self.state.fast {
+                    FAST_ON_MSG
+                } else {
+                    FAST_OFF_MSG
+                }
             }
             WORKFLOW_OPTION_ID => {
                 self.state.workflow = enabled;
@@ -2414,7 +2436,9 @@ impl App {
                         PathBuf::from(&self.state.session.cwd),
                     ),
                     HostContextRequest::FastModeSupported => {
-                        HostContextResponse::FastModeSupported(self.state.model.supports_fast())
+                        HostContextResponse::FastModeSupported(
+                            self.state.model.supports_fast() || self.state.model.fast_pending(),
+                        )
                     }
                     HostContextRequest::SessionId => {
                         HostContextResponse::SessionId(Arc::from(self.state.session.id.to_string()))
@@ -2429,9 +2453,9 @@ impl App {
                 self.open_tasks();
                 vec![]
             }
-            BuiltinOperation::Compact => {
+            BuiltinOperation::Compact(instructions) => {
                 if self.status == Status::Streaming {
-                    if !self.queue_compact() {
+                    if !self.queue_compact(instructions) {
                         return Err(CommandError::Producer(Arc::from(
                             "agent queue is unavailable",
                         )));
@@ -2439,7 +2463,7 @@ impl App {
                     vec![]
                 } else {
                     self.status = Status::Streaming;
-                    vec![Action::Compact]
+                    vec![Action::Compact(instructions)]
                 }
             }
             BuiltinOperation::ResetSession => self.reset_session(),
@@ -2507,7 +2531,7 @@ impl App {
             ),
             BuiltinOperation::ToggleFast => self.toggle_coordinator_option(
                 maki_agent::session_options::FAST_OPTION_ID,
-                self.state.fast,
+                self.state.fast_intent(),
             ),
             BuiltinOperation::ToggleWorkflow => self.toggle_coordinator_option(
                 maki_agent::session_options::WORKFLOW_OPTION_ID,
@@ -2515,6 +2539,7 @@ impl App {
             ),
             BuiltinOperation::Exit => self.quit(),
             BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
+            BuiltinOperation::Trust => self.trust_folder(),
         };
         Ok((HostResponse::Completed, actions))
     }
@@ -2717,7 +2742,8 @@ impl App {
             self.pending_input = PendingInput::None;
         }
         self.reconcile_active();
-        let _ = self.promote_deferred_if_ready();
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
     }
 
     pub(crate) fn permission_active(&self) -> bool {
@@ -2849,7 +2875,8 @@ impl App {
         // Arm the submit release so `promote_deferred_if_ready` treats the held
         // head as ready regardless of idle/modal timers.
         self.submit_released = true;
-        let _ = self.promote_deferred_if_ready();
+        let dirty = self.promote_deferred_if_ready();
+        self.pending_dirty |= dirty;
         true
     }
 
@@ -2923,6 +2950,17 @@ impl App {
         self.overlays().iter().any(|o| o.is_open())
     }
 
+    /// Derived fresh every time rather than snapshotted on open: output can
+    /// land behind the modal, and a `!` shell command streams into a segment
+    /// that already existed without ever setting [`Status::Streaming`]. The
+    /// copy is cheaper than the match pass that follows it over the same bytes.
+    fn refresh_search_matches(&mut self) {
+        let chat = &mut self.chats[self.active_chat];
+        self.search_modal
+            .update_matches(|| chat.segment_search_texts());
+        sync_search_highlight(&self.search_modal, chat);
+    }
+
     /// True when the agent is parked on user input. Drives the `needs_input`
     /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
@@ -2949,10 +2987,10 @@ impl App {
 
     /// Every poller that feeds the screen, in one place and never in `view`;
     /// see [`crate::repaint`] for why.
-    pub(crate) fn reconcile_status_content(&mut self) -> u64 {
+    pub(crate) fn reconcile_status_content(&mut self) -> (u64, Dirty) {
         let snapshot = self.status_content_reader.load_full();
-        let _ = self.status_content.poll(Arc::clone(&snapshot));
-        snapshot.generation
+        let dirty = self.status_content.poll(Arc::clone(&snapshot));
+        (snapshot.generation, dirty)
     }
 
     pub fn tick(&mut self) -> Dirty {
@@ -2961,7 +2999,8 @@ impl App {
 
     pub(crate) fn tick_at(&mut self, now: Instant) -> Dirty {
         // `|` never short-circuits: every poller must run on every tick.
-        let mut dirty = self.float_mgr.tick()
+        let mut dirty = std::mem::take(&mut self.pending_dirty)
+            | self.float_mgr.tick()
             | self.lua_picker.tick()
             | self.tick_edge_scroll()
             | self.tick_error_expiry()
@@ -3142,10 +3181,7 @@ impl App {
         }
         if self.search_modal.is_open() {
             self.search_modal.handle_paste(text);
-            let chat = &mut self.chats[self.active_chat];
-            let texts = chat.segment_search_texts();
-            self.search_modal.update_matches(&texts);
-            sync_search_highlight(&self.search_modal, chat);
+            self.refresh_search_matches();
             return;
         }
         macro_rules! try_picker {
@@ -3167,7 +3203,7 @@ impl App {
             return;
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
-            self.command_palette.sync(&val);
+            self.pending_dirty |= self.command_palette.sync(&val);
             self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
             self.sync_file_completion();
         }
@@ -3256,14 +3292,5 @@ fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
     let idx = modal.current_segment_index();
     if let Some(i) = idx {
         chat.scroll_to_segment(i);
-    }
-    chat.set_highlight_segment(idx);
-}
-
-fn format_with_images(text: &str, image_count: usize) -> String {
-    match image_count {
-        0 => text.to_string(),
-        1 => format!("{text} [1 image]"),
-        n => format!("{text} [{n} images]"),
     }
 }

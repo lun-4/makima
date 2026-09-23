@@ -1,6 +1,7 @@
 mod cli;
 mod cmd;
 mod print;
+mod project_trust;
 mod sdk_mode;
 mod setup;
 mod update;
@@ -47,30 +48,25 @@ mod command_attachments {
     pub(crate) fn agent_input(
         turn: AgentTurn,
         mode: AgentMode,
-        fast: bool,
-        workflow: bool,
+        defaults: maki_config::SessionDefaults,
     ) -> Result<AgentInput> {
-        Ok(AgentInput {
-            message: turn.content.text.to_string(),
+        let mut input = AgentInput::from_defaults(
+            turn.content.text.to_string(),
             mode,
-            images: into_images(&turn.content.attachments)?,
-            preamble: Vec::new(),
-            thinking: Default::default(),
-            fast,
-            workflow,
-            prompt: turn.prompt.map(|prompt| {
-                Box::new(McpPromptRef {
-                    qualified_name: prompt.qualified_name.to_string(),
-                    arguments: prompt
-                        .arguments
-                        .iter()
-                        .map(|(key, value)| (key.to_string(), value.to_string()))
-                        .collect(),
-                })
-            }),
-            cancel: None,
-            lease_committer: None,
-        })
+            into_images(&turn.content.attachments)?,
+            defaults,
+        );
+        input.prompt = turn.prompt.map(|prompt| {
+            Box::new(McpPromptRef {
+                qualified_name: prompt.qualified_name.to_string(),
+                arguments: prompt
+                    .arguments
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            })
+        });
+        Ok(input)
     }
 }
 

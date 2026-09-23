@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Makima ships with 26 built-in tools in this reference (24 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Makima ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -71,7 +71,7 @@ Prefer this over edit when making multiple changes to the same file.
 | `edits` | array | yes | Array of edit operations to apply sequentially |
 | `path` | string | yes | Absolute path to the file |
 
-### `edit_lines` <span class="badge badge-optin">opt-in</span> {#edit_lines}
+### `edit_lines` {#edit_lines}
 
 Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
 
@@ -142,11 +142,11 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 ### `code_execution` {#code_execution}
 
-Execute Python code in a sandboxed interpreter with tools as callable functions.
+Execute Python in a sandbox where every tool is an async function.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency. |
+| `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. |
 | `timeout` | integer | no | 30 | Script execution timeout in seconds |
 
 ### `plan_submit` {#plan_submit}
@@ -181,6 +181,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default), "general" (can modify files), or "plan_reviewer" (read-only plan audit, plan mode only) |
+| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
 
 ### `task_spawn` {#task_spawn}
 
@@ -193,6 +194,7 @@ Start a background subagent and return its task_id immediately. Each task's mess
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default), "general" (can modify files), or "plan_reviewer" (read-only plan audit, plan mode only) |
+| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
 
 ### `task_get` {#task_get}
 

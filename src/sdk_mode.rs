@@ -7,7 +7,7 @@
 //! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than makima's base58
 //! `MakiId` canonical form.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::command::{CustomCommand, StandardCommands, StandardCompletions};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
+use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use maki_agent::{
@@ -33,7 +33,8 @@ use maki_commands::{
     CommandOutcome, CommandRegistry, HostRequest, HostResponse, InputDispatch, TargetCapabilities,
     TargetCapability, TargetHandle,
 };
-use maki_config::ModelPolicy;
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
@@ -510,22 +511,23 @@ pub struct SdkParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
-    pub fast: bool,
-    pub workflow: bool,
+    pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
+    pub project_config: ProjectConfig,
     pub commands: Vec<CustomCommand>,
     pub command_registry: CommandRegistry,
     /// Plugin-registered session options, so a tool's options resolve here the
     /// same way they do in the TUI.
     pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
+    pub lua_handle: maki_lua::EventHandle,
 }
 
 struct Shared {
     model: Model,
     permission_mode: PermissionMode,
     turn_start: Instant,
-    pending: HashSet<String>,
+    pending: HashMap<String, String>,
     turn_active: bool,
     active_cancel: Option<CancelTrigger>,
 }
@@ -691,13 +693,14 @@ pub fn run(params: SdkParams) -> Result<()> {
         permissions_config,
         timeouts,
         prompt_slots,
-        fast,
-        workflow,
+        mut defaults,
         model_policy,
         plugin_rules,
+        project_config,
         commands,
         command_registry,
         session_options,
+        lua_handle,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -731,13 +734,15 @@ pub fn run(params: SdkParams) -> Result<()> {
     let fast = if restored_state {
         restored.meta.fast && model.supports_fast()
     } else {
-        fast && model.supports_fast()
+        defaults.fast && model.supports_fast()
     };
     let workflow = if restored_state {
         restored.meta.workflow
     } else {
-        workflow
+        defaults.workflow
     };
+    defaults.fast = fast;
+    defaults.workflow = workflow;
     let thinking = restored
         .meta
         .thinking
@@ -755,7 +760,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         .into();
     let sdk_commands = SdkCommands::new(command_registry, &commands, model_specs)?;
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
-        let (handle, errors) = mcp::start_with_commands(&cwd, sdk_commands.registry.clone()).await;
+        let (handle, errors) =
+            mcp::start_with_commands(&cwd, project_config.clone(), sdk_commands.registry.clone())
+                .await;
         if let Some(handle) = &handle {
             handle.ready().await;
         }
@@ -782,10 +789,11 @@ pub fn run(params: SdkParams) -> Result<()> {
         yolo,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
-        workflow,
+        defaults,
         modes: Arc::new(maki_agent::ModeRegistry::builtin()),
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
+        project_config,
         local_tools: Default::default(),
     });
     let definitions = maki_agent::session_coordinator::builtin_option_definitions(
@@ -931,10 +939,26 @@ pub fn run(params: SdkParams) -> Result<()> {
         model: startup_model.clone(),
         permission_mode,
         turn_start: Instant::now(),
-        pending: HashSet::new(),
+        pending: HashMap::new(),
         turn_active: false,
         active_cancel: None,
     }));
+
+    let snapshot = HeadlessSnapshot::default();
+    let shared_for_mode = Arc::clone(&shared);
+    snapshot.install(
+        &lua_handle,
+        HeadlessMeta {
+            id: handle.session_id.to_string(),
+            cwd: working_dir.clone(),
+            model: startup_model.spec(),
+        },
+        // `set_permission_mode` can flip this mid-run, so read it per call.
+        move || match shared_for_mode.lock().unwrap().permission_mode {
+            PermissionMode::Plan => MODE_PLAN,
+            _ => MODE_BUILD,
+        },
+    );
 
     let pump = EventPump {
         writer: writer.clone(),
@@ -947,6 +971,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         cost: None,
         request_counter: 0,
         terminal_run_id: None,
+        lua_handle: lua_handle.clone(),
+        session_id: handle.session_id.to_string(),
+        snapshot,
     }
     .spawn(handle.event_rx.clone());
     let command_driver = spawn_command_driver(CommandDriverParams {
@@ -999,8 +1026,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                             let input = command_attachments::agent_input(
                                 turn,
                                 mode.agent_mode(&cwd),
-                                fast,
-                                workflow,
+                                defaults,
                             )?;
                             let input = match prepare_sdk_turn(&shared, input) {
                                 Ok(input) => input,
@@ -1036,7 +1062,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 "isolated turns are unavailable in SDK mode".into(),
                             )?
                         }
-                        InputDispatch::Dispatched(CommandOutcome::ManualCompaction) => {
+                        InputDispatch::Dispatched(CommandOutcome::ManualCompaction(_)) => {
                             emit_command_result(
                                 &writer,
                                 &shared,
@@ -1048,18 +1074,12 @@ pub fn run(params: SdkParams) -> Result<()> {
                             emit_command_result(&writer, &shared, true, error.to_string())?
                         }
                         InputDispatch::LiteralInput(content) => {
-                            let input = AgentInput {
-                                message: content.text.to_string(),
-                                mode: mode.agent_mode(&cwd),
-                                images: command_attachments::into_images(&content.attachments)?,
-                                preamble: Vec::new(),
-                                thinking,
-                                fast,
-                                workflow,
-                                prompt: None,
-                                cancel: None,
-                                lease_committer: None,
-                            };
+                            let input = AgentInput::from_defaults(
+                                content.text.to_string(),
+                                mode.agent_mode(&cwd),
+                                command_attachments::into_images(&content.attachments)?,
+                                defaults,
+                            );
                             let input = match prepare_sdk_turn(&shared, input) {
                                 Ok(input) => input,
                                 Err(error) => {
@@ -1102,11 +1122,11 @@ pub fn run(params: SdkParams) -> Result<()> {
                     };
                     let data = cr.response;
                     if let Some(req_id) = data.get("request_id").and_then(Value::as_str)
-                        && shared.lock().unwrap().pending.remove(req_id)
+                        && let Some(ask_id) = shared.lock().unwrap().pending.remove(req_id)
                     {
-                        let _ = handle
-                            .answer_tx
-                            .send(decode_permission_response(&data).encode());
+                        let _ = handle.answer_tx.send(
+                            TaggedAnswer::new(ask_id, decode_permission_response(&data)).encode(),
+                        );
                     }
                 }
                 InboundMessageType::ControlCancelRequest => {
@@ -1116,8 +1136,10 @@ pub fn run(params: SdkParams) -> Result<()> {
                     ) else {
                         continue;
                     };
-                    if shared.lock().unwrap().pending.remove(&ccr.request_id) {
-                        let _ = handle.answer_tx.send(PermissionAnswer::Deny.encode());
+                    if let Some(ask_id) = shared.lock().unwrap().pending.remove(&ccr.request_id) {
+                        let _ = handle
+                            .answer_tx
+                            .send(TaggedAnswer::new(ask_id, PermissionAnswer::Deny).encode());
                     }
                 }
                 InboundMessageType::Unknown(message_type) => {
@@ -1279,16 +1301,20 @@ fn apply_permission_option(
 
 fn restored_permission_mode(
     restored: bool,
-    persisted_yolo: bool,
+    persisted_yolo: Option<bool>,
     startup: PermissionMode,
     explicit: bool,
 ) -> PermissionMode {
     if !restored || explicit {
         startup
-    } else if persisted_yolo {
-        PermissionMode::BypassPermissions
-    } else if startup == PermissionMode::BypassPermissions {
-        PermissionMode::Default
+    } else if let Some(yolo) = persisted_yolo {
+        if yolo {
+            PermissionMode::BypassPermissions
+        } else if startup == PermissionMode::BypassPermissions {
+            PermissionMode::Default
+        } else {
+            startup
+        }
     } else {
         startup
     }
@@ -1706,12 +1732,27 @@ struct EventPump {
     cost: Option<f64>,
     request_counter: u64,
     terminal_run_id: Option<u64>,
+    lua_handle: maki_lua::EventHandle,
+    session_id: String,
+    snapshot: HeadlessSnapshot,
 }
 
 impl EventPump {
     fn spawn(mut self, event_rx: Receiver<Envelope>) -> smol::Task<()> {
         smol::spawn(async move {
             while let Ok(envelope) = event_rx.recv_async().await {
+                if matches!(envelope.event, AgentEvent::StreamClosed) {
+                    break;
+                }
+                // Folded in first, so a plugin handling `TurnEnd` finds the
+                // finished totals when it calls `maki.session.read()`.
+                self.snapshot.observe(&envelope);
+                maki_lua::agent_autocmd::dispatch(
+                    &self.lua_handle,
+                    &self.session_id,
+                    &envelope,
+                    envelope.subagent.is_some(),
+                );
                 if let Err(e) = self.handle(envelope) {
                     warn!(error = %e, "sdk event pump stopped");
                     break;
@@ -1818,8 +1859,8 @@ impl EventPump {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::ModelSwitched { .. }
             | AgentEvent::QueueDrained
-            | AgentEvent::AutoCompacting
-            | AgentEvent::CompactionDone
+            | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::SubagentClosed
@@ -1878,7 +1919,9 @@ impl EventPump {
             AgentEvent::PermissionRequest { id, tool, .. } => {
                 if self.shared.lock().unwrap().permission_mode == PermissionMode::BypassPermissions
                 {
-                    let _ = self.answer_tx.send(PermissionAnswer::AllowSession.encode());
+                    let _ = self
+                        .answer_tx
+                        .send(TaggedAnswer::new(id, PermissionAnswer::AllowSession).encode());
                     return Ok(());
                 }
 
@@ -1890,7 +1933,11 @@ impl EventPump {
 
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
-                self.shared.lock().unwrap().pending.insert(req_id.clone());
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .insert(req_id.clone(), id.clone());
 
                 self.writer
                     .emit(WireInner::ControlRequest(ControlRequestPayload {
@@ -1935,7 +1982,7 @@ impl EventPump {
                     } => self.emit_turn_result(true, result, *num_turns, *usage)?,
                 }
             }
-            AgentEvent::ControlComplete { .. } => {}
+            AgentEvent::ControlComplete { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::ControlError { .. } if envelope.subagent.is_some() => {}
             AgentEvent::ControlError { message } => {
                 let mut shared = self.shared.lock().unwrap();
@@ -2222,7 +2269,7 @@ mod tests {
             model: Model::from_spec(STARTUP_MODEL).unwrap(),
             permission_mode: PermissionMode::Default,
             turn_start: Instant::now(),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             turn_active: false,
             active_cancel: None,
         });
@@ -2311,7 +2358,7 @@ mod tests {
             model: Model::from_spec(STARTUP_MODEL).unwrap(),
             permission_mode: PermissionMode::Default,
             turn_start: Instant::now(),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             turn_active: false,
             active_cancel: None,
         }));
@@ -2399,6 +2446,7 @@ mod tests {
         let permissions = maki_agent::permissions::PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/project"),
+            ProjectConfig::for_project(std::path::Path::new("/project")),
             Arc::default(),
         );
         permissions.set_yolo(true);
@@ -2406,7 +2454,7 @@ mod tests {
             model: Model::from_spec(STARTUP_MODEL).unwrap(),
             permission_mode: PermissionMode::BypassPermissions,
             turn_start: Instant::now(),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             turn_active: false,
             active_cancel: None,
         });
@@ -2449,13 +2497,14 @@ mod tests {
         let permissions = maki_agent::permissions::PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/project"),
+            ProjectConfig::for_project(std::path::Path::new("/project")),
             Arc::default(),
         );
         let shared = Mutex::new(Shared {
             model: Model::from_spec(STARTUP_MODEL).unwrap(),
             permission_mode: PermissionMode::Plan,
             turn_start: Instant::now(),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             turn_active: false,
             active_cancel: None,
         });
@@ -2478,17 +2527,17 @@ mod tests {
         assert_eq!(shared.lock().unwrap().permission_mode, PermissionMode::Plan);
     }
 
-    #[test_case(true, true, PermissionMode::Default, false, PermissionMode::BypassPermissions ; "bare_resume_restores_enabled")]
-    #[test_case(true, false, PermissionMode::BypassPermissions, false, PermissionMode::Default ; "bare_resume_restores_disabled")]
-    #[test_case(false, false, PermissionMode::BypassPermissions, false, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
-    #[test_case(true, false, PermissionMode::Plan, false, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
-    #[test_case(true, true, PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_resumed_yolo")]
-    #[test_case(true, true, PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_resumed_yolo")]
-    #[test_case(true, true, PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_forked_yolo")]
-    #[test_case(true, true, PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_forked_yolo")]
+    #[test_case(true, Some(true), PermissionMode::Default, false, PermissionMode::BypassPermissions ; "bare_resume_restores_enabled")]
+    #[test_case(true, Some(false), PermissionMode::BypassPermissions, false, PermissionMode::Default ; "bare_resume_restores_disabled")]
+    #[test_case(false, None, PermissionMode::BypassPermissions, false, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
+    #[test_case(true, Some(false), PermissionMode::Plan, false, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
+    #[test_case(true, Some(true), PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_resumed_yolo")]
+    #[test_case(true, Some(true), PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_resumed_yolo")]
+    #[test_case(true, Some(true), PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_forked_yolo")]
+    #[test_case(true, Some(true), PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_forked_yolo")]
     fn sdk_yolo_restore_precedence(
         restored: bool,
-        persisted: bool,
+        persisted: Option<bool>,
         startup: PermissionMode,
         explicit: bool,
         expected: PermissionMode,
@@ -2530,7 +2579,9 @@ mod tests {
         else {
             panic!("attachment-aware command did not return an agent turn");
         };
-        let input = command_attachments::agent_input(turn, AgentMode::Build, false, false).unwrap();
+        let input =
+            command_attachments::agent_input(turn, AgentMode::Build, SessionDefaults::default())
+                .unwrap();
         assert_eq!(input.message, "inspected");
         assert_eq!(input.images.len(), 1);
         assert_eq!(
@@ -2885,7 +2936,7 @@ mod tests {
             model: Model::from_spec(STARTUP_MODEL).unwrap(),
             permission_mode: PermissionMode::Default,
             turn_start: Instant::now(),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             turn_active: false,
             active_cancel: None,
         }));
@@ -2917,13 +2968,18 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
+            lua_handle: maki_lua::EventHandle::disconnected_for_test(),
+            session_id: "test".into(),
+            snapshot: HeadlessSnapshot::default(),
         };
-        let outcome = || TurnOutcome::Completed {
-            agent_id: maki_agent::AgentId::generate(),
-            turn_id: maki_agent::TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: maki_agent::DoneReason::EndTurn,
+        let outcome = || {
+            TurnOutcome::completed(
+                maki_agent::AgentId::generate(),
+                maki_agent::TurnId::generate(),
+                TokenUsage::default(),
+                1,
+                maki_agent::DoneReason::EndTurn,
+            )
         };
         pump.handle(Envelope {
             event: AgentEvent::TurnOutcome(outcome()),
@@ -2936,6 +2992,7 @@ mod tests {
                 name: "research".into(),
                 prompt: None,
                 model: None,
+                opts: None,
                 answer_tx: None,
                 input_tx: None,
                 cancel: None,
@@ -2979,7 +3036,7 @@ mod tests {
                 model: Model::from_spec(STARTUP_MODEL).unwrap(),
                 permission_mode: PermissionMode::Default,
                 turn_start: Instant::now(),
-                pending: HashSet::new(),
+                pending: HashMap::new(),
                 turn_active: false,
                 active_cancel: None,
             })),
@@ -2991,14 +3048,17 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
+            lua_handle: maki_lua::EventHandle::disconnected_for_test(),
+            session_id: "test".into(),
+            snapshot: HeadlessSnapshot::default(),
         };
-        let outcome = TurnOutcome::Completed {
-            agent_id: maki_agent::AgentId::generate(),
-            turn_id: maki_agent::TurnId::generate(),
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            reason: maki_agent::DoneReason::EndTurn,
-        };
+        let outcome = TurnOutcome::completed(
+            maki_agent::AgentId::generate(),
+            maki_agent::TurnId::generate(),
+            TokenUsage::default(),
+            1,
+            maki_agent::DoneReason::EndTurn,
+        );
 
         pump.handle(Envelope {
             event: AgentEvent::TurnOutcome(outcome),
@@ -3172,7 +3232,7 @@ mod tests {
             "provider": {"allowed_models": [startup.spec()]}
         }))
         .unwrap();
-        let policy = raw.into_config(false).unwrap().provider.model_policy;
+        let policy = raw.into_config().unwrap().provider.model_policy;
 
         assert!(
             resolve_set_model(

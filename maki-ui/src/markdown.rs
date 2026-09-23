@@ -239,7 +239,7 @@ pub fn text_to_lines(
         }
         None => text,
     };
-    let semantic = render::Renderer::unwrapped().render(text, width, 0);
+    let semantic = render::Renderer::unwrapped().render(text, width);
     paint_semantic(&semantic, prefix, text_style, prefix_style)
 }
 

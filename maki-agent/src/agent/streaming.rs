@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use maki_providers::provider::Provider;
-use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
+use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{ContentBlock, Message, Model, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
@@ -95,11 +97,16 @@ pub(crate) async fn stream_with_retry(
     cancel: &CancelToken,
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
+    retry_policy: RetryPolicy,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
-    let messages = maki_providers::adapt_images_for_model(model, messages);
+    let messages = maki_providers::adapt_images_for_model(model, messages).await;
     let messages = &*messages;
-    let mut retry = RetryState::new();
+    let mut retry = RetryState::new(
+        retry_policy,
+        provider.keys().map_or(1, |keys| keys.key_count()),
+    );
+    let mut attempt = 0;
     loop {
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
@@ -122,21 +129,26 @@ pub(crate) async fn stream_with_retry(
                 return Ok(r);
             }
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
-            Err(e) if e.is_retryable() => {
-                if e.should_rotate_key()
-                    && let Ok(true) = provider.rotate_key().await
-                {
-                    warn!("rotated API key after error: {e}");
-                }
-                let (attempt, delay) = retry.next_delay();
-                if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
+            Err(e) => {
+                attempt += 1;
+                let rotated = e.should_rotate_key()
+                    && retry.book_rotation()
+                    && provider.keys().is_some_and(|keys| keys.rotate());
+                let (message, delay) = if rotated {
+                    (e.retry_message(), Duration::ZERO)
+                } else if let Some(kind) = e.retry_kind() {
+                    let Some(delay) = retry.next_delay(kind, e.retry_after()) else {
+                        return Err(e.into());
+                    };
+                    (e.retry_message(), delay)
+                } else {
                     return Err(e.into());
-                }
+                };
                 let delay_ms = delay.as_millis() as u64;
-                warn!(attempt, delay_ms, error = %e, "retryable, will retry");
+                warn!(attempt, delay_ms, rotated, error = %e, "retryable, will retry");
                 event_tx.send(AgentEvent::Retry {
                     attempt,
-                    message: e.retry_message(),
+                    message,
                     delay_ms,
                 })?;
                 futures_lite::future::race(
@@ -152,7 +164,6 @@ pub(crate) async fn stream_with_retry(
                     });
                 }
             }
-            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -161,6 +172,7 @@ pub(crate) async fn stream_with_retry(
 mod tests {
     use maki_providers::Role;
     use serde_json::json;
+    use test_case::test_case;
 
     use super::*;
 
@@ -203,6 +215,144 @@ mod tests {
             assert!(matches!(&events[0], AgentEvent::ThinkingDelta { text } if text == "a"));
             assert!(matches!(&events[1], AgentEvent::ThinkingBlockEnd));
             assert!(matches!(&events[2], AgentEvent::ThinkingDelta { text } if text == "b"));
+        });
+    }
+
+    const POOL_KEYS: [&str; 3] = ["sk-first", "sk-second", "sk-third"];
+    const FULL_POOL: usize = POOL_KEYS.len();
+    const SINGLE_KEY: usize = 1;
+    const RATE_LIMITED: u16 = 429;
+    const UNAUTHORIZED: u16 = 401;
+    const FORBIDDEN: u16 = 403;
+    const REJECTED_BODY: &str = "this key is done";
+
+    fn no_budget() -> RetryPolicy {
+        RetryPolicy {
+            max_retries: 0,
+            max_timeout_retries: 0,
+            ..RetryPolicy::default()
+        }
+    }
+
+    struct PooledServer {
+        pool: maki_providers::KeyPool,
+        auth: std::sync::Mutex<maki_providers::ResolvedAuth>,
+        status: u16,
+        relents_for: Option<&'static str>,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PooledServer {
+        fn new(keys: usize, status: u16, relents_for: Option<&'static str>) -> Self {
+            let pool = maki_providers::KeyPool::from_keys(
+                POOL_KEYS[..keys].iter().map(|k| (*k).into()).collect(),
+            );
+            let auth = maki_providers::ResolvedAuth::bearer("test", pool.current()).unwrap();
+            Self {
+                pool,
+                auth: std::sync::Mutex::new(auth),
+                status,
+                relents_for,
+                seen: std::sync::Mutex::default(),
+            }
+        }
+
+        fn keys_seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Provider for PooledServer {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let key = self.pool.current().to_owned();
+                let relents = self.relents_for == Some(key.as_str());
+                self.seen.lock().unwrap().push(key);
+                if !relents {
+                    return Err(AgentError::api(self.status, REJECTED_BODY));
+                }
+                Ok(StreamResponse {
+                    message: Message::user("ok".into()),
+                    usage: maki_providers::TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { unimplemented!() })
+        }
+
+        fn keys(&self) -> Option<maki_providers::KeyRotation<'_>> {
+            Some(maki_providers::KeyRotation::new(
+                &self.pool,
+                &self.auth,
+                maki_providers::KeyHeader::Bearer,
+            ))
+        }
+    }
+
+    async fn send_pooled(server: &PooledServer) -> Result<StreamResponse, StreamError> {
+        let (tx, _rx) = flume::unbounded();
+        let model = Model::from_spec("ollama/qwen3").unwrap();
+        stream_with_retry(
+            server,
+            &model,
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            &EventSender::new(tx, 0),
+            &CancelToken::none(),
+            RequestOptions::default(),
+            None,
+            no_budget(),
+        )
+        .await
+    }
+
+    #[test]
+    fn a_fresh_key_is_tried_without_spending_the_retry_budget() {
+        smol::block_on(async {
+            let server = PooledServer::new(FULL_POOL, RATE_LIMITED, Some(POOL_KEYS[FULL_POOL - 1]));
+
+            send_pooled(&server)
+                .await
+                .expect("the last key in the pool answers");
+
+            assert_eq!(
+                server.keys_seen(),
+                POOL_KEYS,
+                "the walk tries each key once, in the pool's order"
+            );
+        });
+    }
+
+    #[test_case(RATE_LIMITED, FULL_POOL  ; "a_rate_limit_walks_the_whole_pool")]
+    #[test_case(UNAUTHORIZED, FULL_POOL  ; "unauthorized_walks_the_whole_pool")]
+    #[test_case(FORBIDDEN, FULL_POOL     ; "forbidden_walks_the_whole_pool")]
+    #[test_case(UNAUTHORIZED, SINGLE_KEY ; "a_lone_key_is_tried_once")]
+    fn a_spent_pool_is_walked_once_and_then_gives_up(status: u16, keys: usize) {
+        smol::block_on(async {
+            let server = PooledServer::new(keys, status, None);
+
+            let result = send_pooled(&server).await;
+
+            assert!(result.is_err(), "no key in the pool is accepted");
+            assert_eq!(server.keys_seen().len(), keys, "and no key is tried twice");
         });
     }
 }

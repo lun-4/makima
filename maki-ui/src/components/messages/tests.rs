@@ -269,7 +269,7 @@ fn render_sel(
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            panel.view(f, f.area(), has_selection);
+            panel.view(f, f.area(), has_selection, true);
         })
         .unwrap();
     terminal
@@ -733,14 +733,13 @@ fn selection_freezes_viewport_during_auto_scroll() {
 }
 
 fn seg_search(panel: &MessagesPanel, tool_id: &str) -> String {
-    panel
+    let idx = panel
         .cache
         .segments()
         .iter()
-        .find(|s| s.tool_id.as_deref() == Some(tool_id))
-        .unwrap()
-        .search_text
-        .clone()
+        .position(|s| s.tool_id.as_deref() == Some(tool_id))
+        .unwrap();
+    panel.segment_search_texts()[idx].clone()
 }
 
 #[test]
@@ -841,7 +840,7 @@ fn wrapped_line_count_cases(input: &[&str], width: u16, expected: u16) {
         .iter()
         .map(|s| Line::from(Span::raw(s.to_string())))
         .collect();
-    assert_eq!(wrapped_line_count(&lines, width), expected);
+    assert_eq!(crate::wrap::total_rows(&lines, width), expected);
 }
 
 #[test]
@@ -2214,7 +2213,7 @@ fn stream_reset_clears_thinking_expand_state() {
 #[test]
 fn stale_height_keeps_the_old_width_but_drawn_height_does_not() {
     let long_line = Line::from("x".repeat(80));
-    let mut seg = Segment::with_lines(vec![long_line.clone()], "test".into(), None);
+    let mut seg = Segment::with_lines(vec![long_line.clone()], None);
 
     let h_wide = seg.height(80);
     assert_eq!(h_wide, 1, "80 chars at width 80 fits on one line");
@@ -2466,6 +2465,57 @@ fn big_widen_keeps_no_stale_segment_in_the_viewport() {
         panel.cache.segments().iter().any(|s| s.stale),
         "off-viewport segments must stay stale so the test exercises convergence"
     );
+}
+
+/// `scroll_top` sits inside the anchor segment, so a downward window measured
+/// from that segment's start can be consumed entirely by rows above the first
+/// visible one, leaving the screen full of segments still wrapped at the old
+/// width.
+#[test]
+fn resize_low_in_a_tall_segment_leaves_no_stale_segment_in_the_viewport() {
+    const VIEWPORT_HEIGHT: u16 = 10;
+    const TALL_LINES: usize = 100;
+
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    let tall = (0..TALL_LINES)
+        .map(|i| format!("line {i:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, tall));
+    for i in 0..8 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("tail {i} {}", "x".repeat(60)),
+        ));
+    }
+    render(&mut panel, 80, VIEWPORT_HEIGHT);
+
+    // Five rows from the bottom of the tall first segment: the rest of the
+    // viewport is filled by the segments after it.
+    panel.set_scroll_top(TALL_LINES as u16 - 5);
+    render(&mut panel, 80, VIEWPORT_HEIGHT);
+    assert!(
+        !panel.auto_scroll(),
+        "the test must start anchored deep inside the tall segment"
+    );
+
+    render(&mut panel, 40, VIEWPORT_HEIGHT);
+
+    let top = panel.scroll_top() as u32;
+    let mut offset: u32 = 0;
+    for seg in panel.cache.segments() {
+        let h = seg.height(39) as u32;
+        let in_view = offset < top + VIEWPORT_HEIGHT as u32 && offset + h > top;
+        assert!(
+            !(in_view && seg.stale),
+            "a stale segment overlaps the viewport after resizing low in a tall segment"
+        );
+        offset += h;
+    }
 }
 
 #[test]

@@ -1,5 +1,6 @@
 mod gen_commands;
 mod gen_config;
+mod gen_folder_trust;
 mod gen_keybindings;
 mod gen_lua_api;
 mod gen_plugins;
@@ -18,7 +19,7 @@ const CONTENT_DIR: &str = "site/docs/content";
 
 type Page = (&'static str, fn() -> Result<String>);
 
-const PAGES: [Page; 7] = [
+const PAGES: [Page; 8] = [
     ("tools", || Ok(gen_tools::generate())),
     ("plugins", || Ok(gen_plugins::generate())),
     ("providers", || Ok(gen_providers::generate())),
@@ -26,6 +27,7 @@ const PAGES: [Page; 7] = [
     ("lua-api", || Ok(gen_lua_api::generate())),
     ("keybindings", || Ok(gen_keybindings::generate())),
     ("commands", gen_commands::generate),
+    ("folder-trust", || Ok(gen_folder_trust::generate())),
 ];
 
 fn page_path(section: &str) -> PathBuf {

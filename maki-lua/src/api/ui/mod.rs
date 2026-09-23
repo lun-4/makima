@@ -15,6 +15,7 @@ use crate::api::util::command::{
     StatusContent, StatusContentEntries, StatusContentWriter, TitlePos, UiAction, WinCommand,
     WinEvent, ui_send,
 };
+use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::api::util::picker::{PickerCallbackEntry, PickerCallbacks, PickerResult};
 use crate::docs::{FnDoc, ParamDoc};
@@ -134,16 +135,27 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 
 /// Creates a new buffer for building UI content. The first buffer you
 /// create in a task becomes the "live" buffer, streamed to the UI while
-/// your tool runs. Create more buffers for secondary content like
-/// floating windows.
+/// your tool runs. Pass `{ scratch = true }` to opt out: a toast or an
+/// interactive prompt raised from inside a tool needs its own window
+/// without stealing the live stream.
 ///
+/// @param opts table? Optional. `scratch` (boolean, default false): never claim the live pane.
 /// @return (Buf) Buffer handle.
 /// @example
 /// local buf = maki.ui.buf()
 /// buf:line("hello world")
+/// local toast = maki.ui.buf({ scratch = true })
+/// toast:line("copied!")
 #[lua_fn]
-fn buf(lua: &Lua) -> LuaResult<buf::BufHandle> {
-    Ok(with_task_bufs(lua, |store| store.create_live()))
+fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
+    let scratch = opts.and_then(|t| opt_bool(&t, "scratch")).unwrap_or(false);
+    Ok(with_task_bufs(lua, |store| {
+        if scratch {
+            store.create()
+        } else {
+            store.create_live()
+        }
+    }))
 }
 
 /// Formats a Unix timestamp as local time using the configured clock.
@@ -211,17 +223,19 @@ fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) -> LuaResult<Table> {
     let independent = opts
         .as_ref()
-        .and_then(|t| t.get::<bool>("independent").ok())
+        .and_then(|t| opt_bool(t, "independent"))
         .unwrap_or(false);
     let prefix = opts
         .and_then(|t| t.get::<String>("prefix").ok())
         .unwrap_or_default();
     let segments = smol::unblock(move || {
-        if independent {
-            maki_highlight::highlight_lines_independent(&lang, &code)
-        } else {
-            maki_highlight::highlight_code(&lang, &code, &prefix)
-        }
+        maki_highlight::pool::run(move || {
+            if independent {
+                maki_highlight::highlight_lines_independent(&lang, &code)
+            } else {
+                maki_highlight::highlight_code(&lang, &code, &prefix)
+            }
+        })
     })
     .await;
     segments_to_lua_lines(&lua, &segments)
@@ -243,7 +257,10 @@ async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) ->
 /// end
 #[lua_fn]
 async fn markdown(lua: Lua, text: String, width: u16) -> LuaResult<Table> {
-    let lines = smol::unblock(move || maki_markdown::render::render(&text, width)).await;
+    let lines = smol::unblock(move || {
+        maki_highlight::pool::run(move || maki_markdown::render::render(&text, width))
+    })
+    .await;
     markdown_lines_to_lua(&lua, &lines)
 }
 
@@ -329,6 +346,30 @@ fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> 
 #[lua_fn]
 fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResult<()> {
     let _ = tx.try_send(UiAction::Flash(msg));
+    Ok(())
+}
+
+/// Sets the terminal emulator's window title. Pass an empty string to
+/// clear it.
+///
+/// The title passes through tmux, GNU screen, and zellij untouched, and
+/// control characters are stripped, so model text cannot inject escape
+/// sequences into the terminal. On exit maki hands the title back to the
+/// shell, on terminals that support the title stack.
+///
+/// @param title string New window title, e.g. `"● 3/5 tests"`.
+/// @return
+/// @example
+/// maki.ui.set_window_title("maki: " .. session_name)
+/// -- Give the title back to the shell:
+/// maki.ui.set_window_title("")
+#[lua_fn]
+fn set_window_title(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    title: String,
+) -> LuaResult<()> {
+    let _ = tx.try_send(UiAction::SetWindowTitle(title));
     Ok(())
 }
 
@@ -528,15 +569,11 @@ fn open_win(
 ) -> LuaResult<WinHandle> {
     let buf_handle = buf.borrow::<buf::BufHandle>()?;
     let title: String = opts.get("title").unwrap_or_default();
-    let cursor_line: bool = opts.get("cursor_line").unwrap_or(false);
+    let cursor_line = opt_bool(&opts, "cursor_line").unwrap_or(false);
     let footer = parse_footer(&opts)?;
     let reserved_bottom: usize = opts.get("reserved_bottom").unwrap_or(0);
     let reserved_top: usize = opts.get("reserved_top").unwrap_or(0);
-    let focus: bool = opts
-        .get::<Option<bool>>("focus")
-        .ok()
-        .flatten()
-        .unwrap_or(true);
+    let focus = opt_bool(&opts, "focus").unwrap_or(true);
     let zindex: u16 = opts.get("zindex").unwrap_or(50);
 
     let width = parse_dimension(&opts, "width", Dimension::Percent(60));
@@ -548,8 +585,9 @@ fn open_win(
     let title_pos = parse_title_pos(&opts);
     let split = parse_split(&opts);
     let order: u16 = opts.get("order").unwrap_or(50);
-    let visible: bool = opts.get("visible").unwrap_or(true);
-    let needs_input: bool = opts.get("needs_input").unwrap_or(false);
+    let visible = opt_bool(&opts, "visible").unwrap_or(true);
+    let needs_input = opt_bool(&opts, "needs_input").unwrap_or(false);
+    let stack = opt_bool(&opts, "stack").unwrap_or(false);
 
     let config = FloatConfig {
         width,
@@ -569,6 +607,7 @@ fn open_win(
         order,
         visible,
         needs_input,
+        stack,
     };
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -647,7 +686,7 @@ lua_table! {
         buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,
-        manual set_status_content, manual set_status_hint,
+        manual set_status_content, manual set_status_hint, manual set_window_title,
     ]
 }
 
@@ -662,6 +701,7 @@ pub(crate) fn create_ui_table(
 
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
+        set_window_title__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         open_list_picker__register(&t, lua, tx.clone())?;

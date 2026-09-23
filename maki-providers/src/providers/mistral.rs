@@ -9,8 +9,8 @@ use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, Thin
 use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
+use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "mistral",
@@ -180,7 +180,7 @@ impl Mistral {
         let pool = KeyPool::resolve("mistral", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer("mistral", pool.current())?)),
             key_pool: Some(pool),
             system_prefix: None,
         })
@@ -236,7 +236,7 @@ impl Provider for Mistral {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
             self.compat
-                .fetch_and_parse_models(&auth, |m| {
+                .fetch_and_parse_models(&auth, MODELS_PATH, |m| {
                     // Filter: only completion_chat capable models
                     let has_completion_chat = m
                         .get("capabilities")
@@ -279,13 +279,12 @@ impl Provider for Mistral {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 
     fn adjust_model(&self, model: &mut Model) {

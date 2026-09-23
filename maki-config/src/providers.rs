@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -187,6 +187,25 @@ pub struct ProviderDef {
     pub location: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
+    /// Extra HTTP headers sent with every request to this provider. Values
+    /// expand `${VAR}` from the environment, so gateway credentials (e.g.
+    /// Cloudflare Access service tokens in front of a private endpoint) never
+    /// land in the config file:
+    ///
+    /// ```toml
+    /// [anthropic]
+    /// base_url = "https://gw.internal/anthropic"
+    /// [anthropic.headers]
+    /// CF-Access-Client-Id = "${CF_ACCESS_CLIENT_ID}"
+    /// CF-Access-Client-Secret = "${CF_ACCESS_CLIENT_SECRET}"
+    /// ```
+    ///
+    /// A same-name header (case-insensitive) replaces the built-in auth
+    /// header instead of appending, and keeps winning across key rotations.
+    /// An unset or empty variable fails the whole provider so callers see the
+    /// missing name instead of a silent 401.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// Opencode-only: when `Some(false)`, free catalog models are hidden
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,26 +229,39 @@ impl ProvidersConfig {
     /// in tier or pricing surfaces immediately instead of silently dropping
     /// every provider and starting maki with an empty registry.
     pub fn load() -> Self {
+        Self::read().unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(BAD_CONFIG_EXIT_CODE);
+        })
+    }
+
+    /// Same read, but a typo only costs the answer. For callers past startup,
+    /// where taking the process down mid-session is never the right trade.
+    pub fn load_or_default() -> Self {
+        Self::read().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "ignoring providers.toml");
+            Self::default()
+        })
+    }
+
+    fn read() -> Result<Self, String> {
         let path = providers_file_path();
         if !path.exists() {
-            return Self::default();
+            return Ok(Self::default());
         }
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read providers.toml");
-                return Self::default();
+                return Ok(Self::default());
             }
         };
         match toml::from_str::<ProvidersConfig>(&content) {
             Ok(config) => {
                 debug!(path = %path.display(), "loaded providers config");
-                config
+                Ok(config)
             }
-            Err(e) => {
-                eprintln!("error: invalid {}: {e}", path.display());
-                process::exit(BAD_CONFIG_EXIT_CODE);
-            }
+            Err(e) => Err(format!("invalid {}: {e}", path.display())),
         }
     }
 
@@ -408,6 +440,22 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn provider_def_parses_custom_headers() {
+        let def: ProviderDef = toml::from_str(
+            "base_url = \"https://gw.example.com/v1\"\n[headers]\n\"CF-Access-Client-Id\" = \"${CF_ID}\"\n\"CF-Access-Client-Secret\" = \"${CF_SECRET}\"\n",
+        )
+        .unwrap();
+        assert_eq!(def.headers.len(), 2);
+        assert_eq!(def.headers["CF-Access-Client-Id"], "${CF_ID}");
+    }
+
+    #[test]
+    fn provider_def_without_headers_is_empty() {
+        let def: ProviderDef = toml::from_str("base_url = \"https://x\"\n").unwrap();
+        assert!(def.headers.is_empty());
+    }
 
     #[test]
     fn provider_def_roundtrip() {

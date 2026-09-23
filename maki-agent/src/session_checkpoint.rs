@@ -198,7 +198,7 @@ fn checkpoint_meta(current: &SessionMeta, checkpoint: &SessionCheckpoint) -> Ses
         let id = option.definition.id.as_ref();
         let enabled = option.current_value.as_ref() == ENABLED_VALUE;
         match id {
-            YOLO_OPTION_ID => meta.yolo = enabled,
+            YOLO_OPTION_ID => meta.yolo = Some(enabled),
             FAST_OPTION_ID => meta.fast = enabled,
             WORKFLOW_OPTION_ID => meta.workflow = enabled,
             // Thinking predates session options and keeps its own field, so
@@ -469,7 +469,7 @@ mod tests {
                 .unwrap();
 
             let loaded: StoredSession = StoredSession::load(id, &dir).unwrap();
-            assert!(loaded.meta.yolo);
+            assert_eq!(loaded.meta.yolo, Some(true));
             assert!(loaded.meta.fast);
             assert!(loaded.meta.workflow);
             assert_eq!(

@@ -10,7 +10,11 @@ use crate::provider::{BoxFuture, Provider};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, deepseek};
+
+/// TensorX namespaces resold models by vendor, so DeepSeek ids arrive as
+/// `deepseek/deepseek-flash`.
+const DEEPSEEK_VENDOR_PREFIX: &str = "deepseek/";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: "tensorx",
@@ -55,7 +59,7 @@ impl TensorX {
         let pool = KeyPool::resolve("tensorx", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer("tensorx", pool.current())?)),
             key_pool: Some(pool),
             system_prefix: None,
         })
@@ -106,10 +110,15 @@ impl Provider for TensorX {
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::TENSORX, model);
             }
-            // Fallback for deepseek models that use chat_template_kwargs
+            // DeepSeek takes the toggle through the chat template and TensorX
+            // advertises neither knob for it. Sharing DeepSeek's own predicate
+            // means a rename upstream cannot quietly turn thinking off here.
             else if !has_thinking
                 && opts.thinking.is_enabled()
-                && model.id.starts_with("deepseek/deepseek-v4")
+                && model
+                    .id
+                    .strip_prefix(DEEPSEEK_VENDOR_PREFIX)
+                    .is_some_and(deepseek::uses_v4_thinking_protocol)
             {
                 body["chat_template_kwargs"] = json!({"thinking": true});
             }
@@ -219,12 +228,11 @@ impl Provider for TensorX {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 }

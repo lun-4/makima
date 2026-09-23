@@ -74,7 +74,8 @@ fn wait_capture(provider: &CannedProvider) -> ThinkingConfig {
 fn thinking_effort_reaches_the_model(thinking: Value, expected: ThinkingConfig) {
     let (reg, _host) = load_thinking_host();
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("ok")]));
-    let (ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
+    let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
+    ctx.opts.thinking = ThinkingConfig::Effort(Effort::High);
 
     exec_tool(
         &reg,
@@ -96,6 +97,7 @@ fn thinking_clamped_to_off_for_non_supporting_model() {
     let (reg, _host) = load_thinking_host();
     let provider = Arc::new(CannedProvider::new(vec![canned_reply("ok")]));
     let (mut ctx, _rx, _trigger) = ctx_with_provider(Arc::clone(&provider));
+    ctx.opts.thinking = ThinkingConfig::Effort(Effort::High);
     let non_thinking = Arc::new(Model::from_spec("copilot/gpt-5-mini").unwrap());
     assert!(
         !non_thinking.supports_thinking(),

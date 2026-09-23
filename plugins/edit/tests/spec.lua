@@ -59,6 +59,37 @@ case("reindent_leaves_a_correct_new_string_alone", function()
   eq(result, "def f():\n    a = 1\n    return a\n\n\ndef g():\n    return 2\n")
 end)
 
+-- A replacement that adds a nesting level uses a column the file has never
+-- shown, so the "every column is a file column" test cannot recognise the
+-- frame on its own and the whole block used to sink a level.
+case("reindent_leaves_a_file_frame_new_string_that_adds_a_level_alone", function()
+  local content = "def f():\n    if x:\n        a()\n    return 1\n"
+  local new = "    if x:\n        if y:\n            a()"
+  local result = fr.replace(content, "if x:\na()", new, false)
+  eq(result, "def f():\n    if x:\n        if y:\n            a()\n    return 1\n")
+end)
+
+case("reindent_still_rebases_a_model_frame_new_string_that_adds_a_level", function()
+  local content = "def f():\n    if x:\n        a()\n    return 1\n"
+  local new = "if x:\n    if y:\n        a()"
+  local result = fr.replace(content, "if x:\na()", new, false)
+  eq(result, "def f():\n    if x:\n        if y:\n            a()\n    return 1\n")
+end)
+
+-- Bases agree here, so only the columns tell the frames apart: the file's own
+-- widths are already in `new_string`, nothing to correct.
+case("reindent_leaves_a_file_frame_new_string_alone_when_only_widths_drifted", function()
+  local content = "if x:\n    a()\n"
+  local result = fr.replace(content, "if x:\n  a()", "if x:\n    a()\n    b()", false)
+  eq(result, "if x:\n    a()\n    b()\n")
+end)
+
+case("reindent_widens_inner_levels_when_the_base_column_is_shared", function()
+  local content = "if x:\n    a()\n"
+  local result = fr.replace(content, "if x:\n  a()", "if x:\n  a()\n  b()", false)
+  eq(result, "if x:\n    a()\n    b()\n")
+end)
+
 case("reindent_leaves_a_line_that_exits_the_block_alone", function()
   local content = "def f():\n    a = 1\n    return a\n"
   local new = "  a = 1\n  return a\n\n\ndef g():\n  return 2"
@@ -264,6 +295,18 @@ case("exact_match_wins_over_fuzzy", function()
   eq(result, R .. "\nlet  x = 1;")
 end)
 
+-- Two model columns of the same width map to different file columns here, so
+-- the base is a real tie. Without a stable order the same edit can reindent one
+-- way on one run and another way on the next, hence the repeat.
+case("reindent_base_is_deterministic_when_indent_widths_tie", function()
+  local content = "if x:\n    a()\n        b()\n"
+  local old = "\ta()\n b()"
+  local new = "    a()\n      c()"
+  for _ = 1, 8 do
+    eq(fr.replace(content, old, new, false), "if x:\n    a()\n      c()\n")
+  end
+end)
+
 case("cjk_exact_match", function()
   local content = "// こんにちは世界\n// hello"
   local result = fr.replace(content, "// こんにちは世界", R, false)
@@ -273,6 +316,19 @@ end)
 
 local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
+local preserve_line_endings = require("edit_helpers").preserve_line_endings
+
+local function edit_lines(content, start_line, end_line, new_string)
+  return preserve_line_endings(content, function(lf)
+    return replace_lines(lf, start_line, end_line, new_string)
+  end)
+end
+
+local function fuzzy_edit(content, old, new)
+  return preserve_line_endings(content, function(lf)
+    return fr.replace(lf, old, new, false)
+  end)
+end
 
 case("replace_lines_range_replace_and_delete", function()
   local content = "aaa\nbbb\nccc\nddd\neee\n"
@@ -331,6 +387,33 @@ case("insert_after_mode", function()
   has(e1, "out of range")
   local _, e2 = insert_after(content, 4, "x")
   has(e2, "out of range")
+end)
+
+case("edit_lines_keeps_crlf_line_endings", function()
+  local content = "aaa\r\nbbb\r\nccc\r\n"
+  eq(edit_lines(content, 2, 2, "XXX\nYYY"), "aaa\r\nXXX\r\nYYY\r\nccc\r\n")
+  eq(edit_lines(content, 2, 3, ""), "aaa\r\n")
+  eq(edit_lines(content, 1, nil, "TOP"), "TOP\r\naaa\r\nbbb\r\nccc\r\n")
+end)
+
+case("edit_lines_keeps_lf_line_endings", function()
+  eq(edit_lines("aaa\nbbb\nccc\n", 2, 2, "XXX"), "aaa\nXXX\nccc\n")
+end)
+
+case("edit_lines_keeps_a_missing_trailing_newline", function()
+  eq(edit_lines("aaa\r\nbbb", 1, 1, "XXX"), "XXX\r\nbbb")
+  eq(edit_lines("aaa\nbbb", 1, 1, "XXX"), "XXX\nbbb")
+end)
+
+case("fuzzy_edit_keeps_crlf_line_endings", function()
+  local content = "fn f() {\r\n    a();\r\n}\r\n"
+  eq(fuzzy_edit(content, "    a();", "    b();\n    c();"), "fn f() {\r\n    b();\r\n    c();\r\n}\r\n")
+end)
+
+case("line_endings_follow_the_majority_when_mixed", function()
+  eq(edit_lines("a\r\nb\r\nc\r\nd\n", 1, 1, "X"), "X\r\nb\r\nc\r\nd\r\n")
+  eq(edit_lines("a\r\nb\nc\nd\n", 1, 1, "X"), "X\nb\nc\nd\n")
+  eq(edit_lines("a\r\nb\n", 1, 1, "X"), "X\nb\n")
 end)
 
 th.report()

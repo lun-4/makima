@@ -18,6 +18,10 @@ Rules come from four layers, combined for resolution:
 
 Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
 
+A [`tool.<name>.input` hook](/docs/hooks/) runs before any of this. Rules are
+resolved against the call as the hook left it, so what the prompt shows you is
+what runs.
+
 ## Check Flow
 
 For every tool call, each scope resolves like this:
@@ -234,6 +238,12 @@ Brace groups `{ ... }` and control flow (`if`, `for`, …) are segmented when po
 ## Plugin Permissions
 
 Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/lua-api/#plugin-permissions) documents the manifest and lists every permission.
+
+## Network Addresses
+
+`webfetch`, `websearch` and every plugin that calls `maki.net` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
+
+To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
 ## Session Persistence
 

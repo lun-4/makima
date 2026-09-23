@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use maki_storage::paths::canonical_key;
 use tracing::warn;
 
 const STALE_READ_MSG: &str = "file changed since last read";
@@ -12,10 +13,6 @@ pub struct FileReadTracker(Mutex<HashMap<PathBuf, SystemTime>>);
 
 fn get_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 impl Default for FileReadTracker {
@@ -34,10 +31,10 @@ impl FileReadTracker {
     }
 
     pub fn record_read(&self, path: &Path) {
-        let normalized = normalize_path(path);
-        match get_mtime(&normalized) {
+        let key = canonical_key(path);
+        match get_mtime(&key) {
             Some(mtime) => {
-                self.0.lock().unwrap().insert(normalized, mtime);
+                self.0.lock().unwrap().insert(key, mtime);
             }
             None => warn!(
                 path = %path.display(),
@@ -47,13 +44,13 @@ impl FileReadTracker {
     }
 
     pub fn check_before_edit(&self, path: &Path) -> Result<(), String> {
-        let normalized = normalize_path(path);
+        let key = canonical_key(path);
         let mut guard = self.0.lock().unwrap();
-        let Some(&recorded) = guard.get(&normalized) else {
+        let Some(&recorded) = guard.get(&key) else {
             return Ok(());
         };
-        let Some(current) = get_mtime(&normalized) else {
-            guard.remove(&normalized);
+        let Some(current) = get_mtime(&key) else {
+            guard.remove(&key);
             return Ok(());
         };
         if recorded != current {

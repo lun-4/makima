@@ -20,8 +20,8 @@ use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    AgentError, Message, Model, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions,
-    StreamResponse,
+    AgentError, KeyRotation, Message, Model, ModelInfo, ProviderEvent, ProviderUsage,
+    RequestOptions, StreamResponse,
 };
 use maki_storage::id::SessionRef;
 use tracing::{info, warn};
@@ -121,14 +121,8 @@ impl Provider for TrackedProvider {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            let rotated = self.inner.rotate_key().await?;
-            if rotated {
-                self.bump_auth_generation();
-            }
-            Ok(rotated)
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        self.inner.keys()
     }
 
     fn adjust_model(&self, model: &mut Model) {
@@ -717,7 +711,6 @@ mod tests {
 
     struct AuthProvider {
         reload_ok: bool,
-        rotate: bool,
     }
 
     impl Provider for AuthProvider {
@@ -753,19 +746,12 @@ mod tests {
                 }
             })
         }
-
-        fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-            Box::pin(async move { Ok(self.rotate) })
-        }
     }
 
-    fn auth_slot(
-        reload_ok: bool,
-        rotate: bool,
-    ) -> (Arc<ProviderSlot>, flume::Receiver<ProviderChange>) {
+    fn auth_slot(reload_ok: bool) -> (Arc<ProviderSlot>, flume::Receiver<ProviderChange>) {
         ProviderSlot::new(
             crate::components::test_model(),
-            Arc::new(AuthProvider { reload_ok, rotate }),
+            Arc::new(AuthProvider { reload_ok }),
         )
     }
 
@@ -781,6 +767,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(
@@ -868,7 +855,7 @@ mod tests {
     /// invariants rather than absolute numbers.
     #[test]
     fn provider_install_increments_instance_and_resets_auth_generation() {
-        let (slot, change_rx) = auth_slot(true, false);
+        let (slot, change_rx) = auth_slot(true);
         let before = slot.load().provider.identity();
         assert_eq!(before.auth, ProviderAuthGeneration(0));
 
@@ -879,10 +866,7 @@ mod tests {
 
         let identity = slot.install(
             crate::components::test_model(),
-            Arc::new(AuthProvider {
-                reload_ok: true,
-                rotate: false,
-            }),
+            Arc::new(AuthProvider { reload_ok: true }),
         );
 
         assert!(
@@ -903,7 +887,7 @@ mod tests {
 
     #[test]
     fn successful_auth_operations_bump_before_notification() {
-        let (slot, change_rx) = auth_slot(true, true);
+        let (slot, change_rx) = auth_slot(true);
         let provider = Arc::clone(&slot.load().provider);
 
         smol::block_on(provider.reload_auth()).expect("reload succeeds");
@@ -919,28 +903,15 @@ mod tests {
             ProviderChange::Auth(provider.identity())
         );
         assert_eq!(provider.identity().auth, ProviderAuthGeneration(2));
-
-        assert!(smol::block_on(provider.rotate_key()).expect("rotation succeeds"));
-        assert_eq!(
-            change_rx.recv().expect("rotation notification"),
-            ProviderChange::Auth(provider.identity())
-        );
-        assert_eq!(provider.identity().auth, ProviderAuthGeneration(3));
     }
 
     #[test]
-    fn failed_reload_and_false_rotation_do_not_bump_auth_generation() {
-        let (failed_slot, failed_rx) = auth_slot(false, false);
+    fn failed_reload_does_not_bump_auth_generation() {
+        let (failed_slot, failed_rx) = auth_slot(false);
         let failed = Arc::clone(&failed_slot.load().provider);
         assert!(smol::block_on(failed.reload_auth()).is_err());
         assert_eq!(failed.identity().auth, ProviderAuthGeneration(0));
         assert!(failed_rx.is_empty());
-
-        let (slot, change_rx) = auth_slot(true, false);
-        let provider = Arc::clone(&slot.load().provider);
-        assert!(!smol::block_on(provider.rotate_key()).expect("rotation succeeds"));
-        assert_eq!(provider.identity().auth, ProviderAuthGeneration(0));
-        assert!(change_rx.is_empty());
     }
 
     /// Senders captured before any respawn (Lua restore replies, clicks) must
@@ -1050,6 +1021,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
             Arc::default(),
         ));
         let mut app = crate::app::tests::test_app();
@@ -1105,6 +1077,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
             Arc::default(),
         ));
         let first = maki_storage::id::MakiId::generate();
@@ -1139,13 +1112,10 @@ mod tests {
     /// it, or the status line and usage panel go stale with no way to notice.
     #[test]
     fn session_slot_reports_into_the_shared_change_channel() {
-        let (loop_slot, change_rx) = auth_slot(true, false);
+        let (loop_slot, change_rx) = auth_slot(true);
         let session_slot = ProviderSlot::with_change_tx(
             crate::components::test_model(),
-            Arc::new(AuthProvider {
-                reload_ok: true,
-                rotate: false,
-            }),
+            Arc::new(AuthProvider { reload_ok: true }),
             loop_slot.change_tx(),
         );
         assert!(
@@ -1170,10 +1140,7 @@ mod tests {
 
         let installed = session_slot.install(
             crate::components::test_model(),
-            Arc::new(AuthProvider {
-                reload_ok: true,
-                rotate: false,
-            }),
+            Arc::new(AuthProvider { reload_ok: true }),
         );
         assert_eq!(
             change_rx

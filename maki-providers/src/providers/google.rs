@@ -17,7 +17,9 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line};
+
+const API_KEY_HEADER: &str = "x-goog-api-key";
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
@@ -105,11 +107,11 @@ fn resolve_google_base_url() -> Option<String> {
     maki_config::providers::resolve_base_url("google", config.get("google"))
 }
 
-fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> ResolvedAuth {
-    ResolvedAuth {
-        base_url,
-        headers: vec![("x-goog-api-key".into(), key.to_string())],
-    }
+fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<ResolvedAuth, AgentError> {
+    Ok(
+        ResolvedAuth::new("google", vec![(API_KEY_HEADER.into(), key.to_string())])?
+            .with_base_url(base_url),
+    )
 }
 
 pub struct Google {
@@ -118,6 +120,7 @@ pub struct Google {
     key_pool: Option<KeyPool>,
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
+    /// Reused by key rotation / reload so they do not re-parse providers.toml.
     resolved_base_url: Option<String>,
 }
 
@@ -125,7 +128,7 @@ impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("google", ENV_VAR)?;
         let resolved_base_url = resolve_google_base_url();
-        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone());
+        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
         Ok(Self {
             client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
@@ -277,20 +280,17 @@ impl Provider for Google {
         Box::pin(async {
             let pool = KeyPool::resolve("google", ENV_VAR)?;
             *self.auth.lock().unwrap() =
-                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone());
+                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            let base_url = self.resolved_base_url.clone();
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_auth(&self.auth, |key| {
-                    resolve_auth_from_key(key, base_url.clone())
-                })
-            }))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Raw(API_KEY_HEADER),
+        ))
     }
 }
 
@@ -445,17 +445,28 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?;
             let description = t.get("description")?.as_str().unwrap_or("");
-            let parameters = t
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            Some(json!({
+            let mut decl = json!({
                 "name": name,
                 "description": description,
-                "parameters": strip_additional_properties(parameters),
-            }))
+            });
+            if let Some(parameters) = tool_parameters(t) {
+                decl["parameters"] = parameters;
+            }
+            Some(decl)
         })
         .collect()
+}
+
+/// Gemini turns down an object schema that lists no properties, while MiniMax
+/// turns down a bare `{}`, so no single payload pleases both. A tool that takes
+/// no arguments simply travels here without `parameters`.
+fn tool_parameters(tool: &Value) -> Option<Value> {
+    let schema = tool.get("input_schema")?;
+    let has_properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|props| !props.is_empty());
+    has_properties.then(|| strip_additional_properties(schema.clone()))
 }
 
 fn strip_additional_properties(value: Value) -> Value {
@@ -708,10 +719,10 @@ mod tests {
     const GEMINI_API_KEY: &str = "test-key";
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
-        Arc::new(Mutex::new(ResolvedAuth {
-            base_url: None,
-            headers: vec![("x-goog-api-key".into(), GEMINI_API_KEY.into())],
-        }))
+        Arc::new(Mutex::new(ResolvedAuth::for_test(
+            None,
+            vec![(API_KEY_HEADER.into(), GEMINI_API_KEY.into())],
+        )))
     }
 
     fn test_timeouts() -> super::super::Timeouts {
@@ -719,6 +730,7 @@ mod tests {
             connect: Duration::from_secs(5),
             low_speed: Duration::from_secs(30),
             stream: Duration::from_secs(300),
+            retry: crate::retry::RetryPolicy::default(),
         }
     }
 
@@ -729,10 +741,12 @@ mod tests {
             tier: ModelTier::Medium,
             family: ModelFamily::Gemini,
             supports_vision_override: Some(true),
+            supports_fast_override: None,
             supports_tool_examples_override: None,
             thinking_override: None,
             pricing: ModelPricing::default(),
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 1_048_576,
             thinking_fields: None,
         }

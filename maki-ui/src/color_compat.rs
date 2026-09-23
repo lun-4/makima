@@ -52,6 +52,9 @@ pub(crate) fn downgrade_if_needed(buf: &mut Buffer) {
         return;
     }
     for cell in &mut buf.content {
+        if cell.symbol().contains('\u{10EEEE}') {
+            continue;
+        }
         cell.fg = downgrade(cell.fg);
         cell.bg = downgrade(cell.bg);
         cell.underline_color = downgrade(cell.underline_color);
@@ -62,10 +65,16 @@ fn detect() -> bool {
     let (supported, source) = match truecolor_from_env(|var| std::env::var(var).ok()) {
         Some(v) => (v, "env"),
         None if terminfo_advertises() => (true, "terminfo"),
+        None if is_kitty_graphics() => (true, "kitty_graphics"),
         None => (probe::terminal_supports_rgb(), "probe"),
     };
     tracing::info!(supported, source, "truecolor detection");
     supported
+}
+
+fn is_kitty_graphics() -> bool {
+    crate::terminal_image::detected_graphics()
+        .is_some_and(|g| g.protocol == ratatui_image::picker::ProtocolType::Kitty)
 }
 
 /// `Some` is a definite answer; `None` means the env does not say, so the
@@ -286,5 +295,11 @@ mod tests {
     #[test_case(b"\x1b[?65;1;9", false; "partial_da1")]
     fn da1(buf: &[u8], expected: bool) {
         assert_eq!(da1_answered(buf), expected);
+    }
+
+    #[test]
+    fn test_kitty_placeholder_symbol_detected() {
+        let sym = "\u{10EEEE}\u{0305}\u{0305}";
+        assert!(sym.contains('\u{10EEEE}'));
     }
 }

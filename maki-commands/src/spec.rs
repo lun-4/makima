@@ -94,6 +94,7 @@ pub enum BuiltinId {
     Workflow,
     Exit,
     Reload,
+    Trust,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,7 +106,7 @@ pub enum CompletionKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuiltinOperation {
     OpenTasks,
-    Compact,
+    Compact(Option<String>),
     ResetSession,
     ToggleHelp,
     FocusQueue,
@@ -131,6 +132,7 @@ pub enum BuiltinOperation {
     ToggleWorkflow,
     Exit,
     Reload,
+    Trust,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,9 +264,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         COMPACT_COMMAND_NAME,
         &[],
         "Summarize and compact conversation history",
-        typed & [],
-        NO_ARGUMENT_COMPLETIONS,
-        None,
+        raw false,
+        Some("<instructions>"),
         COMPACTION,
     ),
     builtin!(
@@ -370,7 +371,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         Fast,
         "/fast",
         &[],
-        "Toggle Anthropic fast mode (Opus only)",
+        "Toggle fast mode (Anthropic Opus or Codex subscription models)",
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,
@@ -401,6 +402,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         "/reload",
         &[],
         "Reload plugins and config",
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
+        None,
+        RELOAD,
+    ),
+    builtin!(
+        Trust,
+        "/trust",
+        &[],
+        "Trust this folder and load its shared project config",
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,

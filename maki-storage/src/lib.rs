@@ -6,6 +6,8 @@ pub mod auth;
 pub mod checkpoint;
 pub mod id;
 pub mod input_history;
+pub mod intern;
+pub mod lock;
 pub mod log;
 pub mod model;
 pub mod paths;
@@ -13,6 +15,7 @@ pub mod plans;
 pub mod session_lock;
 pub mod sessions;
 pub mod theme;
+pub mod trusted_folders;
 pub mod version;
 
 use std::fs;
@@ -32,7 +35,7 @@ use paths::state_dir;
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir(PathBuf);
 
 impl StateDir {

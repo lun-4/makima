@@ -54,7 +54,7 @@ pub async fn run_isolated_turn(
         format!("{BTW_REMINDER}\n\n{question}"),
         images,
     ));
-    let messages = maki_providers::adapt_images_for_model(&model, &history);
+    let messages = maki_providers::adapt_images_for_model(&model, &history).await;
     let tools = Value::Array(Vec::new());
     let (provider_tx, provider_rx) = flume::unbounded();
     let forwarder = smol::spawn({

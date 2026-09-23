@@ -13,6 +13,7 @@ use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
 
 use crate::AppSession;
+use maki_providers::RequestOptions;
 
 #[cfg(test)]
 use super::PendingInput;
@@ -120,7 +121,7 @@ impl App {
     /// a new `SessionMeta` field forces a decision here. Every frame calls it,
     /// so it stays cheap: an idle UI has an empty draft, queue and rule list,
     /// and an empty `Vec` does not allocate.
-    fn build_meta(&self) -> SessionMeta {
+    pub(super) fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
         let draft = self.input_box.buffer.value();
         SessionMeta {
@@ -136,9 +137,9 @@ impl App {
                 self.recoverable_queue.clone()
             },
             thinking: Some(state.thinking.into()),
-            fast: state.fast,
+            fast: state.fast_intent(),
             workflow: state.workflow,
-            yolo: self.permissions.is_yolo(),
+            yolo: self.permissions.persisted_yolo(),
             session_options: Default::default(),
         }
     }
@@ -157,6 +158,8 @@ impl App {
                     tool_use_id: tool_id.clone(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
+                    thinking: chat.opts.map(|o| o.thinking.into()),
+                    fast: chat.opts.is_some_and(|o| o.fast),
                 }
             })
             .collect();
@@ -237,6 +240,10 @@ impl App {
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
+            chat.opts = sa.thinking.map(|thinking| RequestOptions {
+                thinking: thinking.into(),
+                fast: sa.fast,
+            });
             if let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) {
                 let (display, items) = history_to_display(
                     messages,
@@ -277,6 +284,8 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
+        self.permissions
+            .set_session_yolo(self.state.session.meta.yolo);
         self.restore_display();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
@@ -291,9 +300,9 @@ impl App {
         session.meta.mode = Some(self.state.mode.clone().into());
         session.meta.session_rules = self.state.session.meta.session_rules.clone();
         session.meta.thinking = Some(self.state.thinking.into());
-        session.meta.fast = self.state.fast;
+        session.meta.fast = self.state.fast_intent();
         session.meta.workflow = self.state.workflow;
-        session.meta.yolo = self.permissions.is_yolo();
+        session.meta.yolo = self.permissions.persisted_yolo();
         vec![Action::ReplaceSession(Box::new(
             SessionReplacementRequest {
                 session,
@@ -340,7 +349,7 @@ impl App {
     pub(crate) fn apply_loaded_session(&mut self, session: AppSession, fallback_model: &Model) {
         self.checkpoint_now();
         self.rotate_command_target();
-        self.permissions.set_yolo(session.meta.yolo);
+        self.permissions.set_session_yolo(session.meta.yolo);
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.state =

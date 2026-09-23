@@ -8,6 +8,7 @@ use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
+use maki_config::project::{self, ProjectConfig, TrustMode};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, VERTEX_LOGIN_INSTRUCTIONS, all_builtins, builtin_provider,
     resolve_api_key_env, resolve_base_url, resolve_default_model, resolve_display_name,
@@ -541,13 +542,23 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
+pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    load_env_files(&trust.project_config);
 
     let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
-    let config = load_effective_config(&host, no_plugins, &cwd)?;
+    let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
+    let config = load_effective_config(&host, no_plugins, &trust.project_config, &mut warnings)?;
+
+    let mut refresh_failure = None;
+    if refresh {
+        match maki_providers::refresh_catalog() {
+            Ok(()) => eprintln!("models.dev catalog has been refreshed"),
+            Err(e) => refresh_failure = Some(e),
+        }
+    }
 
     smol::block_on(fetch_all_models(
         &config.provider.model_policy,
@@ -561,15 +572,27 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
         },
         None,
     ));
+
+    if let Some(e) = refresh_failure {
+        bail!("catalog refresh failed, keeping existing cache: {e}");
+    }
     Ok(())
 }
 
-fn load_effective_config(host: &PluginHost, no_plugins: bool, cwd: &Path) -> Result<Config> {
-    host.load_init_files_or_skip(no_plugins, cwd)
+fn load_effective_config(
+    host: &PluginHost,
+    no_plugins: bool,
+    project_config: &ProjectConfig,
+    warnings: &mut Vec<String>,
+) -> Result<Config> {
+    let config = host
+        .load_init_files_or_skip(no_plugins, project_config, warnings)
         .context("load init.lua files")?
         .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")
+        .into_config()
+        .context("invalid config")?;
+    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    Ok(config)
 }
 
 pub fn sessions(storage: &StateDir, json: bool) -> Result<()> {
@@ -581,22 +604,25 @@ pub fn sessions(storage: &StateDir, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
+pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    load_env_files(&trust.project_config);
 
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
 
+    let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let raw_config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
+        .load_init_files_or_skip(no_plugins, &trust.project_config, &mut warnings)
         .context("load init.lua files")?;
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config()
         .context("invalid config")?;
-    config.permissions = load_permissions(&cwd);
+    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    config.permissions = load_permissions(&trust.project_config);
 
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
@@ -622,10 +648,11 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
+pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
     smol::block_on(async {
         let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let (config, _) = mcp_config::load_config(&cwd);
+        let trust = project::resolve(storage, &cwd, trust_mode);
+        let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
         let raw = config
             .mcp
             .get(server)
@@ -666,6 +693,7 @@ pub fn prompt(
     names: bool,
     no_plugins: bool,
     no_jit: bool,
+    trust_mode: TrustMode,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
@@ -678,19 +706,22 @@ pub fn prompt(
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    load_env_files(&trust.project_config);
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
     let mut host =
         PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
+    let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let raw_config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
+        .load_init_files_or_skip(no_plugins, &trust.project_config, &mut warnings)
         .context("load init.lua files")?;
     let config = raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config()
         .context("invalid config")?;
+    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
@@ -699,6 +730,7 @@ pub fn prompt(
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         let defs = reg.definitions(&vars, &ctx, true);
         if names {

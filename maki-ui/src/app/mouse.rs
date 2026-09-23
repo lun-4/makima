@@ -114,11 +114,12 @@ impl App {
         dirty | Dirty::from(before != after)
     }
 
-    pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
+    pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Dirty {
+        let mut dirty = Dirty::NO;
         match event.kind {
             MouseEventKind::Down(MouseButton::Middle) => {
                 if self.middle_scroll.is_some() {
-                    let _ = self.cancel_middle_scroll();
+                    dirty |= self.cancel_middle_scroll();
                 } else if !self.middle_scroll_obstructed()
                     && self.selection_state.is_none()
                     && let Some(zone) = self.zone_at(event.row, event.column)
@@ -135,23 +136,24 @@ impl App {
                         last_update: Instant::now(),
                         fractional_lines: 0.0,
                     });
+                    dirty |= Dirty::YES;
                 }
-                return;
+                return dirty;
             }
             MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Middle) => {
                 let now = Instant::now();
-                let _ = self.tick_middle_scroll_at(now);
+                dirty |= self.tick_middle_scroll_at(now);
                 if let Some(state) = self.middle_scroll.as_mut() {
                     state.move_to(event.row, now);
                 }
-                return;
+                return dirty;
             }
             MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
             | MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => {
-                let _ = self.cancel_middle_scroll();
+                dirty |= self.cancel_middle_scroll();
             }
             _ => {}
         }
@@ -159,7 +161,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
-                        return;
+                        return dirty;
                     }
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
@@ -208,6 +210,7 @@ impl App {
             }
             _ => {}
         }
+        dirty
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {

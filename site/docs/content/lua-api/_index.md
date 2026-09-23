@@ -205,6 +205,115 @@ if v.update_available then
 end
 ```
 
+---
+
+### `maki.defer_fn()` {#maki-defer_fn}
+
+```lua
+maki.defer_fn({callback}, {ms})
+```
+
+Run {callback} after {ms} milliseconds, on the Lua thread and outside
+any task scope. The timer does not hang off the caller's cancel token
+or the 60 second `async.run` deadline, so the callback still fires
+once the tool call that scheduled it is over. That is what a toast
+needs to dismiss itself, and the difference from `maki.async.sleep`.
+
+You get back a handle. Its `:stop()` cancels a callback that has not
+fired yet, which is how you debounce: schedule, then stop and
+reschedule on every new event. An error raised by the callback is
+logged and dropped, since nobody is waiting for a result.
+
+**Parameters:**
+
+- `{callback}` (`function`) Called with no arguments.
+- `{ms}` (`integer`) Delay in milliseconds. Zero fires on the next tick.
+
+**Returns:** (`maki.Timer`) Handle with `:stop()` to cancel before it fires.
+
+**Example:**
+
+```lua
+-- A toast that dismisses itself 4 seconds later:
+local buf = maki.ui.buf({ scratch = true })
+buf:line("copied!")
+local win = maki.ui.open_win(buf, { split = "right", width = 20, height = 3 })
+maki.defer_fn(function() win:close() end, 4000)
+
+-- Repaint only after the user has stopped typing for half a second:
+local pending
+local function repaint_soon()
+  if pending then
+    pending:stop()
+  end
+  pending = maki.defer_fn(repaint, 500)
+end
+```
+
+---
+
+### `maki.notify()` {#maki-notify}
+
+```lua
+maki.notify({msg}, {level?}, {opts?})
+```
+
+Show a one line notice. By default it goes to `maki.ui.flash`, with
+`{opts.title}` in front of the message when you pass one. A run with
+no UI, such as `maki -p` or the sdk, logs the notice instead of
+dropping it.
+
+There is one handler for the whole process. Once a plugin calls
+`maki.set_notify_handler`, notices from every plugin go through it.
+That is how a UI plugin turns flashes into stacked toasts without
+any of the callers knowing about it.
+
+{level} reaches the handler untouched, and the default ignores it.
+
+**Parameters:**
+
+- `{msg}` (`string`) Notice text.
+- `{level?}` (`string?`) Optional. Severity name such as "info", "warn" or "error".
+- `{opts?}` (`table?`) Optional. `title` (string) labels the notice. Free form otherwise.
+
+**Example:**
+
+```lua
+maki.notify("saved!")
+maki.notify("build failed", "error", { title = "make" })
+```
+
+---
+
+### `maki.set_notify_handler()` {#maki-set_notify_handler}
+
+```lua
+maki.set_notify_handler({handler})
+```
+
+Install the handler that every `maki.notify` call in the process goes
+through, in place of the default flash. Pass `nil` to put the default
+back.
+
+The handler runs on the Lua thread, so keep it short and hand real
+work to `maki.async.run`. If it raises an error, the error is logged
+and the notice falls back to `maki.ui.flash`, so the user still sees
+it. Unloading the plugin that installed the handler also restores the
+default.
+
+**Parameters:**
+
+- `{handler}` (`function|nil`) Handler `function(msg, level?, opts?)`, or nil.
+
+**Example:**
+
+```lua
+local Toast = require("maki.toast")
+maki.set_notify_handler(function(msg, level, opts)
+  Toast.show(msg, { title = opts and opts.title, level = level })
+end)
+```
+
 
 ## maki.api {#maki-api}
 
@@ -831,7 +940,15 @@ Create a named extension point owned by your plugin. You provide a
 `set_slot`. The returned callable runs the full chain: outermost
 layer first, then inward, ending at {default}.
 
-Throws if another plugin already owns a slot with the same {name}.
+Throws if another plugin already owns a slot with the same {name}, or
+if {name} starts with `"tool."`, which the host fires itself.
+
+The chain is async: the default and every layer may park (`maki.fs.*`,
+`maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
+returned callable. Call it from a tool handler, a command, or an
+autocmd, rather than from a `header` or `restore` function, which
+cannot wait. The chain runs in your task, so cancelling the caller
+cancels the layers it is waiting on.
 
 **Parameters:**
 
@@ -865,6 +982,21 @@ Calling `prev` more than once throws.
 You can call this before the owner runs `declare_slot`. The layer
 is queued and attached when the slot is declared.
 
+A layer may park, and one that throws is skipped: the chain continues
+as if it had returned `prev(...)` untouched, so a broken layer never
+takes the seam down with it.
+
+Layers wrap in registration order, so the last one registered runs
+first and sees the value before the others do.
+
+Maki fires two slots per tool itself: `tool.<name>.input` before
+permissions look at the call, and `tool.<name>.output` on the text it
+produced. Both take `function(prev, value, ctx)` and answer with a
+table to replace the value, nothing to leave it alone, or
+`nil, reason` to stop the call. Wrapping one costs the capability the
+tool declares, and a tool declaring none costs every permission. See
+[Hooks](/docs/hooks/).
+
 **Parameters:**
 
 - `{name}` (`string`) Slot name to wrap.
@@ -889,15 +1021,7 @@ maki.api.get_slots()
 List all known slots and their current state. Useful for debugging
 which plugins own or wrap each slot.
 
-**Returns:** (`table`) Map of slot name to `{ owner, declared, fillers }`.
-
-**Example:**
-
-```lua
-for name, info in pairs(maki.api.get_slots()) do
-  print(name, info.owner, info.declared)
-end
-```
+**Returns:** table<string, { owner: string?, has_default: boolean, layers: { plugin: string }[] }>
 
 ---
 
@@ -1150,6 +1274,48 @@ local defs, err = maki.agent.tools(ctx, {
 })
 if err then error(err) end
 print(#defs .. " tools available")
+```
+
+---
+
+### `maki.agent.callable_tools()` {#maki-agent-callable_tools}
+
+```lua
+maki.agent.callable_tools({ctx})
+```
+
+Every tool name this context can dispatch: registry tools, MCP tools
+(deferred ones included), host tools (ACP client tools, a subagent's
+`structured_output`) and `tool_search`. Reach for it when you expose tools
+inside a sandbox and need the names to bind. `maki.api.get_tools()` covers
+the registry alone and has no view of the session.
+
+The list already accounts for this session's audience, the config's
+`disabled_tools` and the model's capabilities. Read `audiences` to layer
+your own policy on top. A sandbox wants `interpreter`.
+
+Each name shows up once, described by the tool a call would really reach, so
+a host tool that shadows a registry name reports its own audience rather
+than the shadowed one's.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** (`table?`, `string?`) Array of `{ name, alias?, source, audiences, schema? }`,
+  or `(nil, err)` on failure. `source` is one of `"native"`, `"local"`,
+  `"mcp"`. `alias` is a safe identifier to bind, set only when `name` is not
+  one (say `srv__get-docs`). Dispatch `name` in every case. `schema` comes
+  with registry tools only.
+
+**Example:**
+
+```lua
+local tools, err = maki.agent.callable_tools(ctx)
+if err then error(err) end
+for _, t in ipairs(tools) do
+  print(t.source, t.alias or t.name)
+end
 ```
 
 ---
@@ -1895,7 +2061,7 @@ Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
-- `{cmd}` (`string`) Shell command to run.
+- `{cmd}` (`string|string[]`) Shell command to run, or array of arguments.
 - `{opts?}` (`table?`) Optional settings:
   - `cwd` (`string?`) working directory (tilde is expanded).
   - `env` (`table?`) extra environment variables, `{ VAR = "value" }`.
@@ -3362,8 +3528,9 @@ maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 
 HTTP client for fetching web content. All traffic goes over HTTPS
 (plain HTTP is upgraded). Private and metadata IP addresses are
-blocked to prevent SSRF. Failed requests (5xx) are retried
-automatically.
+blocked to prevent SSRF, including after a redirect. Hosts listed in
+the `net.allowed_private_hosts` config option are exempt.
+Failed requests (5xx) are retried automatically.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -3380,7 +3547,8 @@ maki.net.request({url}, {opts?})
 
 Make an HTTP request and return the response body. Plain `http://`
 URLs are automatically upgraded to `https://`. Requests to private
-or metadata IP addresses are blocked for safety.
+or metadata IP addresses are blocked for safety, unless the host is
+listed in `net.allowed_private_hosts`.
 
 {opts} fields:
   `method` (string) HTTP verb (default `"GET"`).
@@ -3526,6 +3694,53 @@ descending, then model spec ascending.
 
 ```lua
 local usage, err = maki.session.usage()
+```
+
+---
+
+### `maki.session.read()` {#maki-session-read}
+
+```lua
+maki.session.read({opts?})
+```
+
+One-call snapshot of a session: queue, usage, context, cost, mode, and
+status. Reads the focused session, or the one you name in `session` when
+you act on a background tab.
+
+The returned table:
+```lua
+{
+  id, cwd, model, mode = "build" | "plan",
+  status = "idle" | "working" | "needs_input",
+  focused, updated_at,
+  usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
+  context_size, context_window,
+  cost,
+  queue = { count }, -- nil under headless drivers
+  title,             -- nil under headless drivers
+}
+```
+
+`usage` and `cost` include subagent spend. `context_size` is the main
+session's own, since a subagent runs its own window. There is no
+`list_cost` here because `cost` is re-settled from stored usage when a
+session resumes and list price is not stored, so per-turn list price
+lives on the `TurnEnd` autocmd instead.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` (string?) Session id; defaults to focused.
+
+**Returns:** (`table|nil`, `string|nil`) Snapshot table, or nil and an error.
+
+**Example:**
+
+```lua
+local s = maki.session.read()
+if s.context_size > s.context_window * 0.8 then
+  maki.ui.notify("context is nearly full")
+end
 ```
 
 ---
@@ -5248,13 +5463,18 @@ local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 
 ### `maki.ui.buf()` {#maki-ui-buf}
 
 ```lua
-maki.ui.buf()
+maki.ui.buf({opts?})
 ```
 
 Creates a new buffer for building UI content. The first buffer you
 create in a task becomes the "live" buffer, streamed to the UI while
-your tool runs. Create more buffers for secondary content like
-floating windows.
+your tool runs. Pass `{ scratch = true }` to opt out: a toast or an
+interactive prompt raised from inside a tool needs its own window
+without stealing the live stream.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional. `scratch` (boolean, default false): never claim the live pane.
 
 **Returns:** ([`Buf`](#maki-ui-Buf)) Buffer handle.
 
@@ -5263,6 +5483,8 @@ floating windows.
 ```lua
 local buf = maki.ui.buf()
 buf:line("hello world")
+local toast = maki.ui.buf({ scratch = true })
+toast:line("copied!")
 ```
 
 ---
@@ -5674,6 +5896,34 @@ Shows key hints in the status bar for your plugin. Each hint is a {key, label} p
 maki.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
 -- later, clear them:
 maki.ui.set_status_hint(nil)
+```
+
+---
+
+### `maki.ui.set_window_title()` {#maki-ui-set_window_title}
+
+```lua
+maki.ui.set_window_title({title})
+```
+
+Sets the terminal emulator's window title. Pass an empty string to
+clear it.
+
+The title passes through tmux, GNU screen, and zellij untouched, and
+control characters are stripped, so model text cannot inject escape
+sequences into the terminal. On exit maki hands the title back to the
+shell, on terminals that support the title stack.
+
+**Parameters:**
+
+- `{title}` (`string`) New window title, e.g. `"● 3/5 tests"`.
+
+**Example:**
+
+```lua
+maki.ui.set_window_title("maki: " .. session_name)
+-- Give the title back to the shell:
+maki.ui.set_window_title("")
 ```
 
 
@@ -6294,6 +6544,30 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 function M.replace(content, old_string, new_string, replace_all)
 ```
 
+### `require("maki.list_picker")`
+
+```lua
+-- Draws the filter query and its blank spacer into {lines}, pins that height on
+-- {win} and returns it, which is also the first scrollable line. Drawing and
+-- pinning belong together: a query that wraps, or one pasted with a newline,
+-- makes the header taller than a picker would guess, and a reserved_top guessed
+-- elsewhere then mis-scrolls the list.
+function ListPicker.render_header(win, lines, input, prefix, inner)
+
+-- Open a fuzzy-filter picker in a floating window and block until the user
+-- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
+-- title, footer, cursor (initial index), submit_keys (extra submit keys
+-- besides enter), action_keys (keys that close the picker and report
+-- themselves, like { "R" } for a refresh binding. Use uppercase keys, since
+-- lowercase ones keep feeding the filter). Returns
+-- { type = "choice"|"delete", index }, { type = "key", key, index? } or
+-- { type = "close" }.
+function ListPicker.open(items, opts)
+ListPicker.split_words = split_words
+ListPicker.matches = matches
+ListPicker.highlight_spans = highlight_spans
+```
+
 ### `require("maki.output_limits")`
 
 ```lua
@@ -6486,6 +6760,19 @@ function TextInput:handle_key(key)
 -- Wrap lines to {width} with {prefix} before the first row. Returns
 -- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
 function TextInput:render(prefix, prefix_width, width)
+```
+
+### `require("maki.toast")`
+
+```lua
+-- Corner toast notifications built on floating windows. `maki.ui.flash` gives
+-- you one line in the status area. A toast stays up long enough to read, can
+-- carry a title, and stacks under the toasts already on screen.
+
+-- Show {text} as a toast, up to 5 lines of it. {opts}: title (string),
+-- timeout_secs (integer, default 4). Returns right away and the toast
+-- dismisses itself when the time is up.
+function Toast.show(text, opts)
 ```
 
 ### `require("maki.tool_view")`

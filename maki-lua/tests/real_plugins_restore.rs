@@ -16,7 +16,8 @@ use maki_agent::session_coordinator::{
 use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolRegistry};
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
-    DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey, ToolOutputLines,
+    DefaultEffect, Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
+    ToolOutputLines,
 };
 use maki_lua::PluginHost;
 use maki_providers::{Model, StreamResponse};
@@ -644,6 +645,7 @@ fn prompt_permissions() -> Arc<PermissionManager> {
             ..PermissionsConfig::default()
         },
         PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
         Arc::default(),
     ))
 }
@@ -660,6 +662,7 @@ fn yolo_permissions() -> Arc<PermissionManager> {
             ..PermissionsConfig::default()
         },
         PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
         Arc::default(),
     ))
 }
@@ -689,7 +692,12 @@ fn exec_verdict_prompt(
     if let Some(answer) = answer {
         let (answer_tx, answer_rx) = flume::unbounded::<String>();
         ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
-        answer_tx.send(answer.to_owned()).unwrap();
+        let answer_parsed = maki_agent::permissions::PermissionAnswer::decode(answer)
+            .expect("valid permission answer");
+        let tagged =
+            maki_agent::permissions::TaggedAnswer::new("classifier_tool_use_id", answer_parsed)
+                .encode();
+        answer_tx.send(tagged).unwrap();
     }
     ctx.tool_output_lines = view_lines();
     let inv = reg
@@ -1077,6 +1085,7 @@ fn auto_mode_deny_allow_rule_skips_prompt() {
             ..PermissionsConfig::default()
         },
         PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
         Arc::default(),
     ));
     let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
@@ -1119,6 +1128,7 @@ fn auto_mode_deny_cd_hint_prompts_on_raw_input_scopes() {
             ..PermissionsConfig::default()
         },
         PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
         Arc::default(),
     ));
     let result = exec_verdict_prompt(
@@ -1159,6 +1169,7 @@ fn auto_mode_deny_cd_hint_prompts_on_raw_input_scopes() {
             ..PermissionsConfig::default()
         },
         PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
         Arc::default(),
     ));
     let result = exec_verdict_prompt(
