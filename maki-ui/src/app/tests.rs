@@ -5335,6 +5335,54 @@ fn paste_routing(setup: fn(&mut App), expected_input: &str) {
     assert_eq!(app.input_box.buffer.value(), expected_input);
 }
 
+#[test]
+fn model_picker_paste_filters_before_image_detection() {
+    let (mut app, models) = app_with_model_slot();
+    let dir = TempDir::new().unwrap();
+    let image_path = dir.path().join("plan.png");
+    std::fs::write(&image_path, b"image").unwrap();
+    let filter = image_path.to_str().unwrap();
+    assert!(crate::image::try_parse_image_path(filter).is_some());
+    models.store(Some(Arc::new(vec![format!("anthropic/{filter}")])));
+    app.model_picker.open(&app.state.model.spec());
+    app.update(Msg::Paste(filter.into()));
+    assert_eq!(app.input_box.buffer.value(), "");
+    assert!(app.image_paste_rx.is_empty());
+    assert!(matches!(
+        app.model_picker.handle_key(key(KeyCode::Enter)),
+        ModelPickerAction::Select(spec) if spec == format!("anthropic/{filter}")
+    ));
+}
+
+#[test_case(false ; "help")]
+#[test_case(true ; "btw")]
+fn top_overlay_takes_keys_and_paste_before_model_picker(btw: bool) {
+    let (mut app, models) = app_with_model_slot();
+    let dir = TempDir::new().unwrap();
+    let image_path = dir.path().join("plan.png");
+    std::fs::write(&image_path, b"image").unwrap();
+    let filter = image_path.to_str().unwrap();
+    models.store(Some(Arc::new(vec![format!("anthropic/{filter}")])));
+    app.model_picker.open(&app.state.model.spec());
+    app.model_picker.handle_paste("unmatched-filter");
+    if btw {
+        let (_tx, rx) = flume::bounded(1);
+        app.btw_modal.open("question", rx);
+    } else {
+        app.help_modal.toggle();
+    }
+    app.update(Msg::Paste(filter.into()));
+    assert!(app.image_paste_rx.is_empty());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(app.model_picker.is_open());
+    assert!(!app.btw_modal.is_open());
+    assert!(!app.help_modal.is_open());
+    assert!(!matches!(
+        app.model_picker.handle_key(key(KeyCode::Enter)),
+        ModelPickerAction::Select(spec) if spec == format!("anthropic/{filter}")
+    ));
+}
+
 #[test_case(PlanState::None,                                       true  ; "no_plan")]
 #[test_case(PlanState::Drafting(PathBuf::from("/tmp/plan.md")),     false ; "plan_drafting")]
 #[test_case(PlanState::Ready(PathBuf::from("/tmp/plan.md")),       false ; "plan_ready")]
@@ -5949,6 +5997,113 @@ fn implement_plan_applies_model_then_implements(clear_context: bool) {
                 .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
         );
     }
+}
+
+fn approvable_plan_app() -> (TempDir, App) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("plan.md");
+    std::fs::write(&path, "original").unwrap();
+    let mut app = plan_app();
+    app.state.plan = PlanState::Ready(path);
+    (dir, app)
+}
+
+#[test]
+fn delayed_plan_approval_ignores_duplicate_and_allows_retry_after_failure() {
+    let (_dir, mut app) = approvable_plan_app();
+    app.plan_form
+        .set_implementation_model(MODEL_SPEC_GLM4.into(), &app.state.model.spec());
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Down)));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(actions.as_slice(), [Action::ImplementPlan { .. }]));
+    let (id, _) = app.begin_plan_approval().unwrap();
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert!(app.begin_plan_approval().is_none());
+    assert!(app.finish_plan_approval(id));
+    assert!(app.begin_plan_approval().is_some());
+}
+
+#[test_case(false ; "dismissed")]
+#[test_case(true ; "revised")]
+fn delayed_plan_approval_rejects_stale_completion(revised: bool) {
+    let (_dir, mut app) = approvable_plan_app();
+    let (old, active) = app.begin_plan_approval().unwrap();
+    if revised {
+        std::fs::write(app.state.plan.path().unwrap(), "revised").unwrap();
+    } else {
+        dismiss_plan_esc(&mut app);
+        assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+    }
+    assert!(!app.finish_plan_approval(old));
+    assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.state.plan.is_ready());
+    if revised {
+        let (next, _) = app.begin_plan_approval().unwrap();
+        assert!(!app.finish_plan_approval(old));
+        assert!(app.finish_plan_approval(next));
+    }
+}
+
+#[test]
+fn plan_approval_rejects_revision_reverted_to_same_content() {
+    let (_dir, mut app) = approvable_plan_app();
+    let (id, active) = app.begin_plan_approval().unwrap();
+    app.transition_plan(PlanTrigger::InteractivePrompt);
+    assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+    app.transition_plan(PlanTrigger::WriteDone);
+    assert!(!app.finish_plan_approval(id));
+    assert!(app.begin_plan_approval().is_some());
+}
+
+#[test]
+fn plan_approval_rejects_dismiss_then_reopen() {
+    let (_dir, mut app) = approvable_plan_app();
+    let (id, _) = app.begin_plan_approval().unwrap();
+    dismiss_plan_esc(&mut app);
+    app.update(Msg::Key(kb::PLAN_TOGGLE.to_key_event()));
+    assert!(app.plan_form.is_visible());
+    assert!(!app.finish_plan_approval(id));
+    assert!(app.begin_plan_approval().is_some());
+}
+
+#[test]
+fn plan_approval_without_override_implements_immediately() {
+    let (_dir, mut app) = approvable_plan_app();
+    let (id, _) = app.begin_plan_approval().unwrap();
+    assert!(app.finish_plan_approval(id));
+    let actions = app.implement_plan(false);
+    assert_eq!(app.state.mode, Mode::Build);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::SendMessage(_)))
+    );
+    assert!(!app.finish_plan_approval(id));
+}
+
+#[test]
+fn newer_normal_model_request_invalidates_plan_approval() {
+    let (_dir, mut app) = approvable_plan_app();
+    let (approval_id, active) = app.begin_plan_approval().unwrap();
+    app.invalidate_plan_approval();
+    assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!app.finish_plan_approval(approval_id));
+    assert!(app.begin_plan_approval().is_some());
+}
+
+#[test]
+fn delayed_plan_approval_rejects_changed_plan_body() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("plan.md");
+    std::fs::write(&path, "original").unwrap();
+    let mut app = plan_app();
+    app.state.plan = PlanState::Ready(path.clone());
+    let (id, _) = app.begin_plan_approval().unwrap();
+    std::fs::write(path, "revised").unwrap();
+    assert!(!app.finish_plan_approval(id));
+    assert!(app.begin_plan_approval().is_some());
 }
 
 #[test]

@@ -117,6 +117,7 @@ impl App {
         if self.state.mode != Mode::Plan {
             return;
         }
+        self.invalidate_plan_approval();
         match trigger {
             PlanTrigger::WriteDone => {
                 if self.state.plan.is_ready() {
@@ -157,6 +158,7 @@ impl App {
 
     /// Applies a mode switch, guarding plan-mode invariants (plan path).
     pub(crate) fn set_mode_id(&mut self, id: String) {
+        self.invalidate_plan_approval();
         self.file_completion.close();
         match id.as_str() {
             "build" => {
