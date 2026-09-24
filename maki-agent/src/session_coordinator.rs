@@ -3,7 +3,7 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -74,6 +74,10 @@ pub enum SessionCoordinatorError {
     Checkpoint(#[from] CheckpointError),
     #[error("model runtime transition failed: {0}")]
     ModelAdoption(Arc<str>),
+    #[error("conditional model adoption expired")]
+    ModelAdoptionExpired,
+    #[error("conditional model adoption expired and rollback failed: {0}")]
+    ConditionalModelRollback(Arc<str>),
     #[error(
         "model checkpoint failed and runtime rollback also failed; runtime state was adopted: {0}"
     )]
@@ -94,6 +98,13 @@ pub struct SessionCheckpoint {
     pub model: Arc<str>,
     pub cwd: PathBuf,
     pub options: SessionOptionsSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelAdoptionReceipt {
+    pub previous: Arc<str>,
+    pub adopted: Arc<str>,
+    pub model_revision: u64,
 }
 
 #[derive(Clone)]
@@ -194,6 +205,7 @@ struct CoordinatorState {
     cwd: PathBuf,
     checkpoint_revision: u64,
     history_revision: u64,
+    model_revision: u64,
 }
 
 pub struct SessionCoordinatorParams {
@@ -243,6 +255,15 @@ enum Operation {
         fast: Option<bool>,
         thinking: Option<ThinkingConfig>,
         reply: flume::Sender<Result<SessionOptionsSnapshot, SessionCoordinatorError>>,
+    },
+    SetModelIfActive {
+        spec: Arc<str>,
+        active: Arc<AtomicBool>,
+        reply: flume::Sender<Result<ModelAdoptionReceipt, SessionCoordinatorError>>,
+    },
+    RestoreModelIfVersion {
+        receipt: ModelAdoptionReceipt,
+        reply: flume::Sender<Result<bool, SessionCoordinatorError>>,
     },
     ReplaceHistory {
         history: Arc<Vec<Message>>,
@@ -597,6 +618,43 @@ impl SessionCoordinatorHandle {
             .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?
     }
 
+    pub async fn set_model_if_active(
+        &self,
+        spec: Arc<str>,
+        active: Arc<AtomicBool>,
+    ) -> Result<ModelAdoptionReceipt, SessionCoordinatorError> {
+        self.ensure_live()?;
+        let (reply, response) = flume::bounded(1);
+        self.tx
+            .send_async(Operation::SetModelIfActive {
+                spec,
+                active,
+                reply,
+            })
+            .await
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
+        response
+            .recv_async()
+            .await
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?
+    }
+
+    pub async fn rollback_model_if_version(
+        &self,
+        receipt: ModelAdoptionReceipt,
+    ) -> Result<bool, SessionCoordinatorError> {
+        self.ensure_live()?;
+        let (reply, response) = flume::bounded(1);
+        self.tx
+            .send_async(Operation::RestoreModelIfVersion { receipt, reply })
+            .await
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
+        response
+            .recv_async()
+            .await
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?
+    }
+
     pub async fn replace_history(
         &self,
         history: Vec<Message>,
@@ -718,6 +776,7 @@ impl PreparedSessionCoordinator {
                 cwd,
                 checkpoint_revision: 0,
                 history_revision: 0,
+                model_revision: 0,
             })),
         };
         let (tx, rx) = flume::unbounded();
@@ -926,6 +985,10 @@ impl SessionReadHandle {
         Arc::clone(&lock(&self.state).model)
     }
 
+    pub fn model_revision(&self) -> u64 {
+        lock(&self.state).model_revision
+    }
+
     pub fn cwd(&self) -> PathBuf {
         lock(&self.state).cwd.clone()
     }
@@ -977,6 +1040,12 @@ fn reject_operation(operation: Operation, session_id: MakiId) {
             let _ = reply.send(Err(error()));
         }
         Operation::SetModel { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Operation::SetModelIfActive { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        Operation::RestoreModelIfVersion { reply, .. } => {
             let _ = reply.send(Err(error()));
         }
         Operation::ReplaceHistory { reply, .. } => {
@@ -1048,6 +1117,81 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
                 thinking,
             )
             .await;
+            let _ = reply.send(result);
+        }
+        Operation::SetModelIfActive {
+            spec,
+            active,
+            reply,
+        } => {
+            let result = async {
+                if !active.load(Ordering::Acquire) {
+                    return Err(SessionCoordinatorError::ModelAdoptionExpired);
+                }
+                let previous = ctx.read.model();
+                let result = set_model(
+                    &ctx.read,
+                    &ctx.model_policy,
+                    &*ctx.model_adopter,
+                    &*ctx.checkpoint,
+                    Some(Arc::clone(&spec)),
+                    None,
+                    None,
+                )
+                .await;
+                if !active.load(Ordering::Acquire) {
+                    if previous != ctx.read.model() {
+                        set_model(
+                            &ctx.read,
+                            &ctx.model_policy,
+                            &*ctx.model_adopter,
+                            &*ctx.checkpoint,
+                            Some(previous),
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|error| {
+                            SessionCoordinatorError::ConditionalModelRollback(Arc::from(
+                                error.to_string(),
+                            ))
+                        })?;
+                    }
+                    return Err(SessionCoordinatorError::ModelAdoptionExpired);
+                }
+                result.map(|_| ModelAdoptionReceipt {
+                    previous,
+                    adopted: spec,
+                    model_revision: ctx.read.model_revision(),
+                })
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        Operation::RestoreModelIfVersion { receipt, reply } => {
+            let result = if ctx.read.model_revision() != receipt.model_revision
+                || ctx.read.model() != receipt.adopted
+            {
+                Ok(false)
+            } else if receipt.previous == receipt.adopted {
+                lock(&ctx.read.state).model_revision += 1;
+                Ok(true)
+            } else {
+                set_model(
+                    &ctx.read,
+                    &ctx.model_policy,
+                    &*ctx.model_adopter,
+                    &*ctx.checkpoint,
+                    Some(receipt.previous),
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| true)
+                .map_err(|error| {
+                    SessionCoordinatorError::ConditionalModelRollback(Arc::from(error.to_string()))
+                })
+            };
             let _ = reply.send(result);
         }
         Operation::ReplaceHistory { history, reply } => {
@@ -1704,6 +1848,7 @@ async fn set_model(
     thinking: Option<ThinkingConfig>,
 ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
     let previous_spec = read.model();
+    let selects_model = spec.is_some();
     let target_spec = spec.as_deref().unwrap_or(&previous_spec);
     if !model_policy.allows(target_spec) {
         return Err(SessionOptionError::PolicyRejected(Arc::from(target_spec)).into());
@@ -1738,6 +1883,9 @@ async fn set_model(
         thinking_value.as_ref(),
     )?
     else {
+        if selects_model {
+            lock(&read.state).model_revision += 1;
+        }
         return Ok(read.options.snapshot());
     };
     let options = SessionOptions::candidate_snapshot(&candidate);
@@ -1757,7 +1905,10 @@ async fn set_model(
                 SessionCoordinatorError::ModelRollback(Arc::from(rollback_error.to_string()))
             })?;
             if let Err(rollback_error) = model_adopter.adopt(previous_model).await {
-                lock(&read.state).model = Arc::from(target_spec);
+                let mut state = lock(&read.state);
+                state.model = Arc::from(target_spec);
+                state.model_revision += 1;
+                drop(state);
                 read.options.commit(candidate)?;
                 return Err(SessionCoordinatorError::ModelRollback(Arc::from(format!(
                     "{error}; rollback: {rollback_error}; live runtime remains on {target_spec}"
@@ -1768,7 +1919,12 @@ async fn set_model(
     }
     lock(&read.state).model = Arc::from(target_spec);
     match read.options.commit(candidate) {
-        Ok(snapshot) => Ok(snapshot),
+        Ok(snapshot) => {
+            if selects_model {
+                lock(&read.state).model_revision += 1;
+            }
+            Ok(snapshot)
+        }
         Err(error) => {
             lock(&read.state).model = previous_spec;
             Err(error.into())
@@ -3171,6 +3327,373 @@ mod tests {
                 .unwrap();
 
             assert_eq!(thinking_value(&after).as_ref(), "off");
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn conditional_model_expired_before_adoption_does_not_change_model() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let adopted = Arc::new(Mutex::new(Vec::new()));
+            let mut params = params(id, writer(false));
+            params.model_adopter = Arc::new({
+                let adopted = Arc::clone(&adopted);
+                move |model: Model| {
+                    lock(&adopted).push(model.spec());
+                    Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let active = Arc::new(AtomicBool::new(false));
+            assert_eq!(
+                coordinator
+                    .set_model_if_active(Arc::from("ollama/llama3"), active)
+                    .await,
+                Err(SessionCoordinatorError::ModelAdoptionExpired)
+            );
+            assert_eq!(coordinator.read().model().as_ref(), "test/model");
+            assert!(lock(&adopted).is_empty());
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn conditional_model_expired_after_adoption_rolls_back_before_newer_model() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let active = Arc::new(AtomicBool::new(true));
+            let adopted = Arc::new(Mutex::new(Vec::new()));
+            let (adoption_started, adoption_seen) = flume::bounded(1);
+            let (release_adoption, adoption_release) = flume::bounded(1);
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [Arc::from("ollama/llama3")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let adopted = Arc::clone(&adopted);
+                move |model: Model| {
+                    let spec = model.spec();
+                    let adoption_started = adoption_started.clone();
+                    let adoption_release = adoption_release.clone();
+                    let adopted = Arc::clone(&adopted);
+                    Box::pin(async move {
+                        if spec == "anthropic/claude-opus-4-8" {
+                            adoption_started.send_async(()).await.unwrap();
+                            adoption_release.recv_async().await.unwrap();
+                        }
+                        lock(&adopted).push(spec);
+                        Ok(())
+                    }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let (reply, expired) = flume::bounded(1);
+            coordinator
+                .tx
+                .send(Operation::SetModelIfActive {
+                    spec: Arc::from("anthropic/claude-opus-4-8"),
+                    active: Arc::clone(&active),
+                    reply,
+                })
+                .unwrap();
+            adoption_seen.recv_async().await.unwrap();
+            active.store(false, Ordering::Release);
+            let (newer_reply, newer_response) = flume::bounded(1);
+            coordinator
+                .tx
+                .send(Operation::SetModel {
+                    spec: Some(Arc::from("openai/gpt-5")),
+                    fast: None,
+                    thinking: None,
+                    reply: newer_reply,
+                })
+                .unwrap();
+            release_adoption.send_async(()).await.unwrap();
+            assert_eq!(
+                expired.recv_async().await.unwrap(),
+                Err(SessionCoordinatorError::ModelAdoptionExpired)
+            );
+            newer_response.recv_async().await.unwrap().unwrap();
+            assert_eq!(coordinator.read().model().as_ref(), "openai/gpt-5");
+            assert_eq!(
+                lock(&adopted).as_slice(),
+                ["anthropic/claude-opus-4-8", "ollama/llama3", "openai/gpt-5"]
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn conditional_model_expired_during_failed_checkpoint_restores_runtime() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let active = Arc::new(AtomicBool::new(true));
+            let adopted = Arc::new(Mutex::new(Vec::new()));
+            let mut params = params(id, writer(true));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [Arc::from("ollama/llama3")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let active = Arc::clone(&active);
+                let adopted = Arc::clone(&adopted);
+                move |model: Model| {
+                    let spec = model.spec();
+                    lock(&adopted).push(spec.clone());
+                    if spec == "anthropic/claude-opus-4-8" {
+                        active.store(false, Ordering::Release);
+                    }
+                    Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let before = coordinator.read().options();
+            assert_eq!(
+                coordinator
+                    .set_model_if_active(Arc::from("anthropic/claude-opus-4-8"), active)
+                    .await,
+                Err(SessionCoordinatorError::ModelAdoptionExpired)
+            );
+            assert_eq!(coordinator.read().model().as_ref(), "ollama/llama3");
+            assert_eq!(coordinator.read().options(), before);
+            assert_eq!(
+                lock(&adopted).as_slice(),
+                ["anthropic/claude-opus-4-8", "ollama/llama3"]
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn rollback_model_if_version_skips_newer_change() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let adopted = Arc::new(Mutex::new(Vec::new()));
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [Arc::from("ollama/llama3")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let adopted = Arc::clone(&adopted);
+                move |model: Model| {
+                    lock(&adopted).push(model.spec());
+                    Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let receipt = coordinator
+                .set_model_if_active(
+                    Arc::from("anthropic/claude-opus-4-8"),
+                    Arc::new(AtomicBool::new(true)),
+                )
+                .await
+                .unwrap();
+            assert!(
+                coordinator
+                    .rollback_model_if_version(receipt.clone())
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(coordinator.read().model().as_ref(), "ollama/llama3");
+            assert!(
+                !coordinator
+                    .rollback_model_if_version(receipt.clone())
+                    .await
+                    .unwrap()
+            );
+            let newer = coordinator
+                .set_model(Some(Arc::from("openai/gpt-5")), None, None)
+                .await
+                .unwrap();
+            assert!(
+                !coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(coordinator.read().options(), newer);
+            assert_eq!(coordinator.read().model().as_ref(), "openai/gpt-5");
+            assert_eq!(lock(&adopted).len(), 3);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn rollback_model_if_version_ignores_unrelated_option_change() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [Arc::from("ollama/llama3")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let receipt = coordinator
+                .set_model_if_active(
+                    Arc::from("anthropic/claude-opus-4-8"),
+                    Arc::new(AtomicBool::new(true)),
+                )
+                .await
+                .unwrap();
+            let (enabled, changed) = coordinator
+                .toggle_boolean_option(YOLO_OPTION_ID)
+                .await
+                .unwrap();
+            assert!(enabled);
+            assert!(
+                coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(coordinator.read().model().as_ref(), "ollama/llama3");
+            assert!(coordinator.read().options().version > changed.version);
+            assert_eq!(
+                current_option_value(&coordinator.read(), YOLO_OPTION_ID).as_deref(),
+                Some(ENABLED_VALUE)
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn rollback_model_if_version_skips_newer_selection_of_same_spec() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let adopted = Arc::new(Mutex::new(Vec::new()));
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [Arc::from("ollama/llama3")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let adopted = Arc::clone(&adopted);
+                move |model: Model| {
+                    lock(&adopted).push(model.spec());
+                    Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let receipt = coordinator
+                .set_model_if_active(
+                    Arc::from("anthropic/claude-opus-4-8"),
+                    Arc::new(AtomicBool::new(true)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.previous.as_ref(), "ollama/llama3");
+            assert_eq!(receipt.adopted.as_ref(), "anthropic/claude-opus-4-8");
+            let newer = coordinator
+                .set_model(Some(Arc::clone(&receipt.adopted)), None, None)
+                .await
+                .unwrap();
+            assert!(
+                !coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
+            );
+            assert_eq!(coordinator.read().options(), newer);
+            let receipt = coordinator
+                .set_model_if_active(
+                    Arc::from("anthropic/claude-opus-4-8"),
+                    Arc::new(AtomicBool::new(true)),
+                )
+                .await
+                .unwrap();
+            coordinator
+                .set_option(MODEL_OPTION_ID, "anthropic/claude-opus-4-8")
+                .await
+                .unwrap();
+            assert!(
+                !coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
+            );
+            assert_eq!(lock(&adopted).len(), 1);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn conditional_model_rollback_failure_is_explicit() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let active = Arc::new(AtomicBool::new(true));
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [Arc::from("ollama/llama3")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let active = Arc::clone(&active);
+                move |model: Model| {
+                    let spec = model.spec();
+                    if spec == "anthropic/claude-opus-4-8" {
+                        active.store(false, Ordering::Release);
+                    }
+                    Box::pin(async move {
+                        if spec == "ollama/llama3" {
+                            Err(Arc::from("rollback refused"))
+                        } else {
+                            Ok(())
+                        }
+                    }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            assert!(matches!(
+                coordinator
+                    .set_model_if_active(Arc::from("anthropic/claude-opus-4-8"), active)
+                    .await,
+                Err(SessionCoordinatorError::ConditionalModelRollback(_))
+            ));
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
+            );
             coordinator.close().await.unwrap();
         });
     }
