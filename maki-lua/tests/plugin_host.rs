@@ -4906,6 +4906,43 @@ maki.api.register_tool({{
     (reg, host)
 }
 
+#[test]
+fn start_hook_respects_restrictive_turn_policy() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "restricted_start",
+        &format!(
+            r#"maki.api.register_tool({{
+                name = "restricted_start",
+                description = "test",
+                schema = {MINIMAL_SCHEMA},
+                start = function(_, ctx)
+                    local ok, err = maki.fs.write("/not-the-plan", "bad")
+                    local buf = maki.ui.buf()
+                    buf:set_lines({{ tostring(ok) .. "|" .. tostring(err) }})
+                    ctx:live_buf(buf)
+                end,
+                handler = function() return "handled" end,
+            }})"#,
+        ),
+    )
+    .unwrap();
+
+    let rx = run_start_in_mode(
+        &reg,
+        "restricted_start",
+        serde_json::json!({}),
+        &maki_agent::AgentMode::Plan("plan.md".into()),
+    );
+    let buf = recv_live_buf(&rx, START_TOOL_USE_ID).expect("start preview");
+    let lines = buf.read();
+    assert_eq!(
+        lines[0].spans[0].text,
+        "nil|plan mode prohibits this mutation"
+    );
+}
+
 /// `start` is awaited to completion, so the returned receiver already holds
 /// everything the hook emitted.
 fn run_start(
@@ -4913,10 +4950,19 @@ fn run_start(
     name: &str,
     input: serde_json::Value,
 ) -> flume::Receiver<maki_agent::Envelope> {
+    run_start_in_mode(reg, name, input, &maki_agent::AgentMode::Build)
+}
+
+fn run_start_in_mode(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    mode: &maki_agent::AgentMode,
+) -> flume::Receiver<maki_agent::Envelope> {
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let ctx = maki_agent::tools::test_support::stub_ctx_with(
-        &maki_agent::AgentMode::Build,
+        mode,
         Some(&event_tx),
         Some(START_TOOL_USE_ID),
     );

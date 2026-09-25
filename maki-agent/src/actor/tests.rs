@@ -1251,6 +1251,7 @@ fn overlapping_reservations_commit_fifo_and_cancel_wakes_waiter() {
             .admit_turn(input("cancelled"), None, "cancelled".into())
             .unwrap();
         handle.cancel_existing();
+        assert_eq!(pending.wait().await, Err(ActorError::PolicyCancelled));
         assert!(matches!(
             cancelled.wait().await,
             TurnOutcome::Cancelled { .. }

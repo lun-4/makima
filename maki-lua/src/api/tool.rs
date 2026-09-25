@@ -420,6 +420,7 @@ impl ToolInvocation for LuaToolInvocation {
             return Box::pin(std::future::ready(()));
         };
         let (reply_tx, reply_rx) = flume::bounded::<()>(1);
+        let plan_write_path = ctx.restrict_write_to().map(Arc::from);
         let req = Request::StartTool {
             plugin: Arc::clone(&self.plugin),
             tool: Arc::clone(&self.tool),
@@ -429,6 +430,7 @@ impl ToolInvocation for LuaToolInvocation {
                 tool_use_id: id.clone(),
             },
             ctx: Box::new(LuaCtx::start(ctx)),
+            plan_write_path,
             reply: reply_tx,
             nested: crate::runtime::under_inflight_slot(),
         };
