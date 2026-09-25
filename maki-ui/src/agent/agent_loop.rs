@@ -271,6 +271,15 @@ impl TuiActorBackend {
                 });
             }
             let messages = if let Some(resolved) = &resolved {
+                if !binding.is_some_and(|binding| mcp.prompt_is_current(binding)) {
+                    return Err(AgentError::Tool {
+                        tool: "mcp_prompt".into(),
+                        message: format!(
+                            "MCP prompt is no longer available: {}",
+                            prompt_ref.qualified_name
+                        ),
+                    });
+                }
                 resolved.mcp_messages.clone().unwrap_or_default()
             } else {
                 match binding {
@@ -523,18 +532,23 @@ impl ActorBackend for TuiActorBackend {
             let pinned = binding.clone();
             let slot_request = lua_handle.request_prompt_slots();
             smol::spawn(async move {
-                let slots = Arc::new(slot_request.recv_async().await.unwrap_or_default());
-                let messages = match (mcp_prompt, pinned, prompt_mcp) {
-                    (Some(prompt), Some(binding), Some(mcp)) => mcp
-                        .get_bound_prompt(&binding, &prompt.arguments)
-                        .await
-                        .map(|messages| Some(messages.into_iter().map(prompt_message).collect()))
-                        .map_err(|e| e.to_string()),
-                    (Some(prompt), _, _) => {
-                        Err(format!("unknown MCP prompt: {}", prompt.qualified_name))
+                let slots = async { Arc::new(slot_request.recv_async().await.unwrap_or_default()) };
+                let messages = async {
+                    match (mcp_prompt, pinned, prompt_mcp) {
+                        (Some(prompt), Some(binding), Some(mcp)) => mcp
+                            .get_bound_prompt(&binding, &prompt.arguments)
+                            .await
+                            .map(|messages| {
+                                Some(messages.into_iter().map(prompt_message).collect())
+                            })
+                            .map_err(|e| e.to_string()),
+                        (Some(prompt), _, _) => {
+                            Err(format!("unknown MCP prompt: {}", prompt.qualified_name))
+                        }
+                        (None, _, _) => Ok(None),
                     }
-                    (None, _, _) => Ok(None),
                 };
+                let (messages, slots) = futures_lite::future::zip(messages, slots).await;
                 let _ =
                     tx.send(
                         messages.map(|mcp_messages| maki_agent::agent::ResolvedPromptInputs {

@@ -1057,12 +1057,7 @@ impl EventHandle {
     }
 
     pub fn collect_prompt_slots(&self) -> ResolvedSlots {
-        if self.shutdown.load(Ordering::Acquire) {
-            return ResolvedSlots::default();
-        }
-        let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv().unwrap_or_default()
+        self.request_prompt_slots().recv().unwrap_or_default()
     }
 
     /// Gather `@`-completion candidates from every registered source, for the
