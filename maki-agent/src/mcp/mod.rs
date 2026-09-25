@@ -820,8 +820,17 @@ impl McpHandle {
         binding: &McpPromptBinding,
         arguments: &HashMap<String, String>,
     ) -> Result<Vec<protocol::PromptMessage>, McpError> {
-        let current = self.published.load();
-        let valid = current
+        if !self.prompt_is_current(binding) {
+            return Err(McpError::UnknownPrompt {
+                name: binding.qualified_name.clone(),
+            });
+        }
+        transport::get_prompt(binding.transport.as_ref(), &binding.raw_name, arguments).await
+    }
+
+    pub fn prompt_is_current(&self, binding: &McpPromptBinding) -> bool {
+        self.published
+            .load()
             .index
             .prompts
             .get(&binding.qualified_name)
@@ -829,13 +838,7 @@ impl McpHandle {
                 Arc::ptr_eq(&prompt.identity, &binding.identity)
                     && Arc::ptr_eq(&prompt.transport, &binding.transport)
                     && prompt.raw_name == binding.raw_name
-            });
-        if !valid {
-            return Err(McpError::UnknownPrompt {
-                name: binding.qualified_name.clone(),
-            });
-        }
-        transport::get_prompt(binding.transport.as_ref(), &binding.raw_name, arguments).await
+            })
     }
 
     pub async fn get_prompt(
@@ -1767,6 +1770,7 @@ mod tests {
             },
         );
         session.handle.published.store(Arc::new(replacement));
+        assert!(!session.prompt_is_current(&binding));
         let result = smol::block_on(session.get_bound_prompt(&binding, &HashMap::new()));
         assert!(matches!(result, Err(McpError::UnknownPrompt { .. })));
     }

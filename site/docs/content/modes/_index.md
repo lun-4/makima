@@ -23,9 +23,9 @@ Tab toggles between them (build is the default).
 Switching to plan mode allocates a plan file under `plans/`. Bundled read,
 glob, and grep tools remain available. Bundled write and edit tools can change
 only the designated plan file; the host opens its parent without following
-symlinks and replaces the file through that directory handle. The parent must
-already exist. On platforms without this anchored write path, writes fail
-closed. Other Lua tools, shell commands, MCP execution, and deferred MCP
+symlinks and replaces the file through that directory handle. Missing plan
+file parent directories are created before the anchored write. On platforms
+without this anchored write path, writes fail closed. Other Lua tools, shell commands, MCP execution, and deferred MCP
 search are denied even with YOLO on.
 
 Model changes apply to later admitted turns. Active turns keep their selected
