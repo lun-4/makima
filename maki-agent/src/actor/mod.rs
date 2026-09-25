@@ -606,13 +606,35 @@ impl AgentActorHandle {
                 .inner
                 .managed_admission
                 .as_ref()
-                .is_some_and(|admission| admission.ceiling.is_some())
-                && input.mode != crate::AgentMode::Build
+                .and_then(|admission| admission.mode_ceiling.as_ref())
+                .is_some_and(|ceiling| &input.mode != ceiling)
             {
                 return Err(ActorError::PolicyCeiling);
             }
             let turn_id = TurnId::generate();
             let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
+            let snapshot = self
+                .inner
+                .admission_preparation
+                .as_ref()
+                .map(|prepare| prepare(&input));
+            if let Some(reason) = state.cancelled_correlations.get(&correlation).copied() {
+                let admission = TurnAdmission {
+                    turn_id,
+                    admission: snapshot,
+                    input: Some(input),
+                    event_sender,
+                    correlation,
+                    root: false,
+                    generation: state.policy_generation,
+                    policy: state.policy.clone(),
+                    ticket: ticket.clone(),
+                };
+                let outcome = cancelled_outcome(self.inner.agent_id, turn_id, reason);
+                drop(state);
+                finalize_turn(&self.inner, turn_id, outcome, Some(&admission), true);
+                return Ok(ticket);
+            }
             self.inner
                 .tickets
                 .lock()
@@ -622,11 +644,7 @@ impl AgentActorHandle {
                 .deferred_admissions
                 .push_back(DeferredAdmission::Turn {
                     after,
-                    admission: self
-                        .inner
-                        .admission_preparation
-                        .as_ref()
-                        .map(|prepare| prepare(&input)),
+                    admission: snapshot,
                     input,
                     event_sender,
                     correlation,
@@ -648,8 +666,8 @@ impl AgentActorHandle {
             .inner
             .managed_admission
             .as_ref()
-            .is_some_and(|admission| admission.ceiling.is_some())
-            && input.mode != crate::AgentMode::Build
+            .and_then(|admission| admission.mode_ceiling.as_ref())
+            .is_some_and(|ceiling| &input.mode != ceiling)
         {
             return Err(ActorError::PolicyCeiling);
         }

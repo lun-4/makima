@@ -901,6 +901,10 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool}': {e}"), true);
         }
     };
+    if ctx.resolve_turn_route(&tool).is_none() {
+        return done(format!("{UNAVAILABLE_TOOL_PREFIX}: {tool}"), true);
+    }
+
     let perm_scope = truncate_line(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
 
@@ -920,9 +924,6 @@ async fn execute_mcp_tool(
         return done(e.to_string(), true);
     }
 
-    if ctx.resolve_turn_route(&tool).is_none() {
-        return done(format!("{UNAVAILABLE_TOOL_PREFIX}: {tool}"), true);
-    }
     if origin.is_model() {
         let _ = ctx
             .event_tx

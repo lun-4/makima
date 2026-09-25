@@ -613,6 +613,52 @@ fn child_ceiling_rejects_policy_and_mode_expansion() {
 }
 
 #[test]
+fn restrictive_parent_delegates_without_broadening_child_mode() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::bounded(1);
+        let gate = Gate::new();
+        let root = manager
+            .create_root_with_config(
+                Some(config("anthropic/claude-sonnet-4-20250514", false)),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate)))),
+            )
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let plan_mode = AgentMode::Plan("plan.md".into());
+        let mut plan_input = input();
+        plan_input.mode = plan_mode.clone();
+        actor.admit_turn(plan_input, None, "root".into()).unwrap();
+        let current = rx.recv_async().await.unwrap();
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let child_actor = child.actor().unwrap();
+        let mut plan_input = input();
+        plan_input.mode = plan_mode;
+        assert!(
+            child_actor
+                .admit_turn(plan_input, None, "plan-child".into())
+                .is_ok()
+        );
+        assert!(
+            child_actor
+                .admit_turn(input(), None, "build-child".into())
+                .is_err()
+        );
+        gate.release(1);
+        manager.shutdown(std::time::Duration::from_secs(1)).await;
+    });
+}
+
+#[test]
 fn zero_agent_limits_are_rejected() {
     for limits in [
         AgentLimits {
