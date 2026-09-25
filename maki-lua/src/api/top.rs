@@ -53,6 +53,11 @@ pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>
 /// end
 #[lua_fn]
 fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> LuaResult<Timer> {
+    if crate::runtime::restrictive_effects(lua) {
+        return Err(mlua::Error::runtime(
+            "plan mode prohibits deferred callbacks",
+        ));
+    }
     let queue = lua
         .app_data_ref::<DeferQueue>()
         .ok_or_else(|| mlua::Error::runtime("defer queue not initialized"))?;

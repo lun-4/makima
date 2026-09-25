@@ -294,7 +294,7 @@ async fn new(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
-    if crate::api::fs::plan_write_path(&lua).is_some() {
+    if crate::runtime::restrictive_effects(&lua) {
         return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
     }
     let (prompt, focus) = match opts {
@@ -322,6 +322,9 @@ async fn prompt(
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let id = match opts {
         Some(opts) => opts.get("session")?,
         None => None,

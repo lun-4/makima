@@ -754,6 +754,13 @@ async fn call_tool(
     input: LuaValue,
     opts: Option<Table>,
 ) -> LuaResult<(Option<String>, Option<String>, LuaValue)> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok((
+            None,
+            Some("plan mode prohibits indirect tool dispatch".into()),
+            LuaValue::Nil,
+        ));
+    }
     let input_json = lua_to_json(&lua, &input)?;
     let agent = match dispatch_ctx(&ctx, "call_tool") {
         Ok(a) => a,
@@ -947,7 +954,7 @@ async fn session(
     opts: Table,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
-    if crate::api::fs::plan_write_path(&lua).is_some() {
+    if crate::runtime::restrictive_effects(&lua) {
         return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
     }
     let managed_turn = match (
@@ -1505,6 +1512,9 @@ async fn prompt(
     message: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok(err_pair("plan mode prohibits session prompts"));
+    }
     let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
     let (managed_child, fallback_cancel) = match &this.control {
@@ -1674,10 +1684,13 @@ fn actor_is_busy(status: ActorStatus, queued: usize) -> bool {
 /// @return (boolean?, string?) `true` on success, or `(nil, err)` if the session is closed.
 #[lua_fn]
 async fn send(
-    _lua: Lua,
+    lua: Lua,
     this: mlua::UserDataRef<LuaSession>,
     message: String,
 ) -> LuaResult<Pair<bool>> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok(err_pair("plan mode prohibits session sends"));
+    }
     let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
     drop(this);

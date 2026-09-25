@@ -226,7 +226,7 @@ fn set(
     if !seconds.is_finite() || seconds <= 0.0 || seconds >= MAX_LUA_SECONDS {
         return Err(mlua::Error::runtime(ERR_SECONDS_RANGE));
     }
-    if crate::api::fs::plan_write_path(lua).is_some() {
+    if crate::runtime::restrictive_effects(lua) {
         return Err(mlua::Error::runtime(crate::api::fs::PLAN_MUTATION_DENIED));
     }
     let key = lua.create_registry_value(callback.clone())?;
@@ -336,6 +336,7 @@ mod tests {
         let (lua, _) = setup();
         let mut cell = crate::runtime::TaskCell::new(CancelToken::none(), None, None);
         cell.plan_write_path = Some(Arc::from(std::path::PathBuf::from("/tmp/plan.md")));
+        cell.restrict_effects = true;
         lua.set_app_data(cell.into_handle());
         let err = lua
             .load("timer_tbl.set(1, function() end)")

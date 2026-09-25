@@ -393,7 +393,12 @@ fn set_window_title(
 ///   maki.ui.action("file_picker")
 /// end)
 #[lua_fn]
-fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaResult<Pair<bool>> {
+fn action(lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaResult<Pair<bool>> {
+    if crate::runtime::restrictive_effects(lua) {
+        return Ok(crate::api::util::pair::err_pair(
+            "plan mode prohibits UI actions",
+        ));
+    }
     let builtin = try_pair!(name.parse::<BuiltinAction>().map_err(|_| format!(
         "unknown action '{name}' (valid: {})",
         BuiltinAction::VARIANTS.join(", ")
@@ -414,11 +419,10 @@ fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaRe
 ///   maki.ui.flash("File saved")
 /// end
 #[lua_fn]
-async fn open_editor(
-    _lua: Lua,
-    #[ctx] tx: flume::Sender<UiAction>,
-    path: String,
-) -> LuaResult<i32> {
+async fn open_editor(lua: Lua, #[ctx] tx: flume::Sender<UiAction>, path: String) -> LuaResult<i32> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok(-1);
+    }
     let (reply_tx, reply_rx) = flume::bounded::<i32>(1);
     if tx
         .try_send(UiAction::OpenEditor {
@@ -460,6 +464,11 @@ async fn open_list_picker(
     items: mlua::Value,
     opts: Option<Table>,
 ) -> LuaResult<Table> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Err(mlua::Error::runtime(
+            "plan mode prohibits interactive pickers",
+        ));
+    }
     let (items_table, specs) = crate::api::util::picker::decode_picker_items(&items)?;
     let config = crate::api::util::picker::decode_picker_opts(opts.as_ref())?;
     let (on_change, on_timeout) = crate::api::util::picker::decode_picker_callbacks(opts.as_ref());
@@ -562,11 +571,14 @@ async fn open_list_picker(
 /// })
 #[lua_fn]
 fn open_win(
-    _lua: &Lua,
+    lua: &Lua,
     #[ctx] tx: flume::Sender<UiAction>,
     buf: mlua::AnyUserData,
     opts: Table,
 ) -> LuaResult<WinHandle> {
+    if crate::runtime::restrictive_effects(lua) {
+        return Err(mlua::Error::runtime("plan mode prohibits opening windows"));
+    }
     let buf_handle = buf.borrow::<buf::BufHandle>()?;
     let title: String = opts.get("title").unwrap_or_default();
     let cursor_line = opt_bool(&opts, "cursor_line").unwrap_or(false);
