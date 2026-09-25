@@ -3855,6 +3855,58 @@ mod tests {
     const OBSERVATION: &str = "failed";
 
     #[test]
+    fn ui_queue_and_mode_model_projection() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let initial = actor.effective_config().unwrap();
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            dispatch_option_toggle(
+                runtime.coordinator.clone(),
+                Arc::clone(&runtime.model_slot),
+                runtime.setter_sequence.clone(),
+                (manager, root),
+                (runtime.id(), WORKFLOW_OPTION_ID),
+                &internal_tx,
+            );
+            runtime.handles.queue.push(QueueItem::Message {
+                text: "after barrier".into(),
+                image_count: 0,
+                input: maki_agent::AgentInput {
+                    message: "after barrier".into(),
+                    mode: Default::default(),
+                    images: Vec::new(),
+                    preamble: Vec::new(),
+                    thinking: Default::default(),
+                    fast: false,
+                    workflow: false,
+                    prompt: None,
+                    cancel: None,
+                    lease_committer: None,
+                },
+                run_id: 1,
+                displayed: false,
+            });
+            assert_eq!(runtime.handles.queue.text_messages(), vec!["after barrier"]);
+            drop(lease);
+            let InternalEvent::SessionOp { result, .. } = internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected option completion");
+            };
+            result.unwrap();
+            actor.wait_policy_updates().await.unwrap();
+            let selected = actor.effective_config().unwrap();
+            assert!(!initial.workflow);
+            assert!(selected.workflow);
+            assert_eq!(selected.model.id, runtime.model_slot.load().model.id);
+            assert_eq!(runtime.app.state.session.model, selected.model.spec());
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
     fn reserved_option_change_precedes_root_admission() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));
