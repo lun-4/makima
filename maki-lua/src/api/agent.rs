@@ -269,6 +269,28 @@ impl Drop for LuaActorBackend {
 }
 
 impl ActorBackend for LuaActorBackend {
+    fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
+        let state = Arc::clone(&self.state);
+        Some(Arc::new(move |input| {
+            let params = state
+                .params
+                .get()
+                .expect("session parameters initialized before admission");
+            let mode_def = match &input.mode {
+                AgentMode::Custom(id) => params.modes.get(id).map(Arc::new),
+                _ => Some(Arc::new(params.modes.current(&input.mode))),
+            };
+            maki_agent::agent::TurnAdmissionSnapshot {
+                mode_def,
+                bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
+                    &params.registry,
+                    &state.local_tools,
+                    state.mcp.as_ref(),
+                )),
+            }
+        }))
+    }
+
     fn run_turn<'a>(
         &'a mut self,
         history: &'a mut History,
@@ -348,7 +370,8 @@ impl ActorBackend for LuaActorBackend {
             .with_cancel(context.cancel.clone())
             .with_cancel_reason_source(context.cancel_reason.clone())
             .with_mcp(state.mcp.clone())
-            .with_local_tools(Arc::clone(&state.local_tools));
+            .with_local_tools(Arc::clone(&state.local_tools))
+            .with_admission(context.admission.clone());
             let outcome = agent.run(turn_id, input).await;
             drop(agent);
             drop(permit);
@@ -924,6 +947,9 @@ async fn session(
     opts: Table,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
+    if crate::api::fs::plan_write_path(&lua).is_some() {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let managed_turn = match (
         &agent_ctx.managed_turn,
         crate::runtime::current_managed_turn(&lua),
@@ -2205,6 +2231,64 @@ mod tests {
     }
 
     #[test]
+    fn send_returns_during_policy_update() {
+        smol::block_on(async {
+            const MESSAGE: &str = "queued";
+            const REPLY: &str = "accepted";
+            let provider: Arc<dyn Provider> =
+                Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
+            let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
+            let reservation = actor.reserve_policy_update().unwrap();
+            let lua = Lua::new();
+            let userdata = lua.create_userdata(sess).unwrap();
+            assert_eq!(
+                send(lua.clone(), userdata.borrow().unwrap(), MESSAGE.into())
+                    .await
+                    .unwrap(),
+                (Some(true), None)
+            );
+            drop(reservation);
+            while actor.snapshot().latest.is_none() {
+                smol::future::yield_now().await;
+            }
+            assert!(matches!(
+                actor.snapshot().latest,
+                Some(TurnOutcome::Completed { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn prompt_survives_policy_update() {
+        smol::block_on(async {
+            const MESSAGE: &str = "queued prompt";
+            const REPLY: &str = "accepted";
+            let provider: Arc<dyn Provider> =
+                Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
+            let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
+            let reservation = actor.reserve_policy_update().unwrap();
+            let lua = Lua::new();
+            let userdata = lua.create_userdata(sess).unwrap();
+            let scope = crate::runtime::TaskScope::detached(&lua);
+            let mut pending = Box::pin(scope.scope_future(prompt(
+                lua.clone(),
+                userdata.borrow().unwrap(),
+                MESSAGE.into(),
+                None,
+            )));
+            assert!(
+                futures_lite::future::poll_once(&mut pending)
+                    .await
+                    .is_none()
+            );
+            drop(reservation);
+            let (result, error) = pending.await.unwrap();
+            assert_eq!(error, None);
+            assert_eq!(result.unwrap().get::<String>("text").unwrap(), REPLY);
+        });
+    }
+
+    #[test]
     fn close_rejects_new_admission_and_closes_actor() {
         let (actor, state, _sess, _rx) = canned_state(None);
         actor.close();
@@ -2572,6 +2656,51 @@ mod tests {
         assert!(actor_is_busy(ActorStatus::Running(TurnId::generate()), 0));
         assert!(actor_is_busy(ActorStatus::Idle, 1));
         assert!(!actor_is_busy(ActorStatus::Idle, 0));
+    }
+
+    #[test]
+    fn lua_backend_prepares_mode_at_admission() {
+        let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![]));
+        let (actor, state, session, _events) = session_with_provider(provider, None, None);
+        let modes = &state.params.get().unwrap().modes;
+        modes
+            .define(maki_agent::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("before".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let backend = LuaActorBackend::new(Arc::clone(&state));
+        let prepare = backend.admission_preparation().unwrap();
+        let input = AgentInput::from_defaults(
+            "queued".into(),
+            AgentMode::Build,
+            Vec::new(),
+            Default::default(),
+        );
+        let admitted = prepare(&input);
+        modes
+            .define(maki_agent::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("after".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            admitted.mode_def.as_ref().unwrap().system_prompt.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            prepare(&input)
+                .mode_def
+                .as_ref()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("after")
+        );
+        drop(session);
+        actor.shutdown();
     }
 
     #[test]

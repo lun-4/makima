@@ -172,6 +172,8 @@ pub(crate) fn due_tasks(lua: &Lua) -> Vec<PendingAsyncTask> {
                     live_ctx: None,
                     owner: None,
                     managed_turn: None,
+                    plan_write_path: None,
+                    restrict_effects: false,
                     command_depth: 0,
                     command_invocation: None,
                     timer_id: Some(timer_id),
@@ -223,6 +225,9 @@ fn set(
 ) -> LuaResult<u64> {
     if !seconds.is_finite() || seconds <= 0.0 || seconds >= MAX_LUA_SECONDS {
         return Err(mlua::Error::runtime(ERR_SECONDS_RANGE));
+    }
+    if crate::api::fs::plan_write_path(lua).is_some() {
+        return Err(mlua::Error::runtime(crate::api::fs::PLAN_MUTATION_DENIED));
     }
     let key = lua.create_registry_value(callback.clone())?;
     let interval = Duration::from_secs_f64(seconds);
@@ -324,6 +329,23 @@ mod tests {
             err.to_string().contains(ERR_SECONDS_RANGE),
             "expected error containing {ERR_SECONDS_RANGE:?}, got: {err}"
         );
+    }
+
+    #[test]
+    fn restricted_turn_cannot_schedule_unrestricted_timer() {
+        let (lua, _) = setup();
+        let mut cell = crate::runtime::TaskCell::new(CancelToken::none(), None, None);
+        cell.plan_write_path = Some(Arc::from(std::path::PathBuf::from("/tmp/plan.md")));
+        lua.set_app_data(cell.into_handle());
+        let err = lua
+            .load("timer_tbl.set(1, function() end)")
+            .eval::<u64>()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(crate::api::fs::PLAN_MUTATION_DENIED)
+        );
+        assert!(lua.app_data_ref::<TimerStore>().unwrap().entries.is_empty());
     }
 
     #[test]

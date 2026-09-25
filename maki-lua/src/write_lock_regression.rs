@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use maki_agent::agent::tool_dispatch;
-use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
+use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry, TurnToolBindings};
 use maki_agent::{AgentMode, ToolDoneEvent};
 use maki_config::PluginsConfig;
 use serde_json::{Map, Value, json};
@@ -55,6 +55,11 @@ fn boot(fs: Arc<InMemoryFs>, plugins: &[&str]) -> (Arc<ToolRegistry>, crate::Plu
 fn shared_ctx(registry: &Arc<ToolRegistry>) -> ToolContext {
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
     ctx.registry = Arc::clone(registry);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
     ctx
 }
 

@@ -13,7 +13,8 @@ use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext, truncate_line,
+    CallOrigin, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext, TurnToolRoute,
+    truncate_line,
 };
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{FILE_WRITE_TOOLS, ToolKey};
@@ -85,6 +86,13 @@ pub async fn run(
 ) -> ToolDoneEvent {
     let resolved = resolve(ctx, name);
     let name = resolved.name;
+    if matches!(resolved.route, Route::Unknown) {
+        return run_inner(resolved, id, input, ctx, origin).await;
+    }
+    if let Err(reason) = authorize_mode(&resolved, input, ctx) {
+        warn!(tool = %name, reason = %reason, "tool blocked by mode");
+        return mode_denied(id, name, reason);
+    }
     let hook = Hook::of(ctx, &resolved, origin);
 
     let verdict = match &hook {
@@ -110,6 +118,9 @@ pub async fn run(
         }
     };
 
+    if let Err(reason) = authorize_mode(&resolved, &input, ctx) {
+        return mode_denied(id, name, reason);
+    }
     let mut done = run_inner(resolved, id, &input, ctx, origin).await;
     if let Some(hook) = &hook {
         hook.filter_output(&mut done).await;
@@ -307,6 +318,89 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     Resolved { name, route }
 }
 
+const MODE_DENIED: &str = "tool not allowed in restricted mode";
+
+fn mode_denied(id: String, name: &str, reason: String) -> ToolDoneEvent {
+    ToolDoneEvent {
+        id,
+        tool: Arc::from(name),
+        output: ToolOutput::Plain(reason.into()),
+        is_error: true,
+        annotation: None,
+        written_path: None,
+    }
+}
+
+fn binding_matches(resolved: &Resolved<'_>, ctx: &ToolContext) -> bool {
+    let Some(pinned) = ctx.turn_bindings.get(resolved.name) else {
+        return false;
+    };
+    let same_route = match (pinned, &resolved.route) {
+        (TurnToolRoute::Local(expected), Route::Local(current)) => {
+            Arc::ptr_eq(&expected.handler, &current.handler)
+                && expected.audience == current.audience
+        }
+        (TurnToolRoute::Native(expected), Route::Native(current)) => {
+            Arc::ptr_eq(&expected.tool, &current.tool)
+        }
+        (TurnToolRoute::Mcp(expected), Route::Mcp(mcp, qualified)) => {
+            expected.qualified_name().as_ref() == qualified.as_ref()
+                && mcp.binding_is_current(expected)
+        }
+        (TurnToolRoute::ToolSearch, Route::ToolSearch(_)) => true,
+        _ => false,
+    };
+    same_route && ctx.resolve_turn_route(resolved.name).is_some()
+}
+
+fn mode_offers(ctx: &ToolContext) -> bool {
+    if ctx.restrict_write_to().is_none() {
+        return true;
+    }
+    // Lua registrations do not expose a host-verified bundled handler identity.
+    // Names, kinds, permissions, and plugin owners are supplied by plugins.
+    false
+}
+
+pub(crate) fn authorize_advertised(ctx: &ToolContext, name: &str) -> bool {
+    let resolved = resolve(ctx, name);
+    let Some(mode) = ctx.mode_def.as_ref() else {
+        return false;
+    };
+    if mode
+        .tools
+        .as_ref()
+        .is_some_and(|names| !names.iter().any(|allowed| allowed == resolved.name))
+    {
+        return false;
+    }
+    let available = match &resolved.route {
+        Route::Native(entry) => {
+            entry.tool.audience().contains(ctx.audience) && ctx.tool_filter.matches(resolved.name)
+        }
+        Route::Local(local) => local.audience.contains(ctx.audience),
+        Route::Mcp(..) | Route::ToolSearch(_) => true,
+        Route::Unknown => false,
+    };
+    available && binding_matches(&resolved, ctx) && mode_offers(ctx)
+}
+
+fn authorize_mode(
+    resolved: &Resolved<'_>,
+    _input: &Value,
+    ctx: &ToolContext,
+) -> Result<(), String> {
+    let name = resolved.name;
+    if !authorize_advertised(ctx, name) {
+        return Err(if ctx.restrict_write_to().is_some() && !mode_offers(ctx) {
+            format!("{MODE_DENIED}: {name}")
+        } else {
+            format!("{UNAVAILABLE_TOOL_PREFIX}: {name}")
+        });
+    }
+    Ok(())
+}
+
 /// One callable name, as [`resolve`] would route it.
 pub struct Callable {
     /// The name to dispatch. Always what `resolve` was asked, never an alias.
@@ -336,7 +430,6 @@ pub struct Callable {
 ///
 /// Recompute per call: MCP republishes its index whenever a server comes or goes.
 pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
-    let filter = &ctx.tool_filter;
     let mut out: Vec<Callable> = Vec::new();
     let mut claimed: HashSet<String> = HashSet::new();
     // A name belongs to the first source dispatch would reach, claimed before
@@ -357,13 +450,13 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
     let mut local: Vec<(&String, &LocalTool)> = ctx.local_tools.iter().collect();
     local.sort_by(|a, b| a.0.cmp(b.0));
     for (name, tool) in local {
-        if claim(name, tool.audience) {
+        if claim(name, tool.audience) && authorize_advertised(ctx, name) {
             out.push(entry_of(name, SOURCE_LOCAL, tool.audience, None));
         }
     }
     for entry in ctx.registry.iter().iter() {
         let audience = entry.tool.audience();
-        if !claim(entry.name(), audience) || !filter.matches(entry.name()) {
+        if !claim(entry.name(), audience) || !authorize_advertised(ctx, entry.name()) {
             continue;
         }
         out.push(entry_of(
@@ -380,7 +473,7 @@ pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
         for name in names {
             // MCP has no audience system: a server is reachable or it is not,
             // and a session holding one already offers its tools to the model.
-            if claim(&name, ToolAudience::all()) {
+            if claim(&name, ToolAudience::all()) && authorize_advertised(ctx, &name) {
                 out.push(entry_of(&name, SOURCE_MCP, ToolAudience::all(), None));
             }
         }
@@ -499,19 +592,12 @@ async fn run_native_tool(
 
     if let Some(target) = invocation.mutable_path(ctx) {
         let restrict = ctx.restrict_write_to();
-        let is_plan_target = restrict.as_deref().is_some_and(|pp| target == pp);
-        if !is_plan_target {
-            if restrict.is_some() {
-                warn!(
-                    tool = %name,
-                    target = %target.display(),
-                    "blocked write in restricted mode"
-                );
-                return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
-            }
-            if let Some(reason) = ctx.permissions.boundary_block_reason(&target) {
-                return done_error(reason);
-            }
+        if restrict.is_some() {
+            warn!(tool = %name, target = %target.display(), "blocked write in restricted mode");
+            return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+        }
+        if let Some(reason) = ctx.permissions.boundary_block_reason(&target) {
+            return done_error(reason);
         }
     }
 
@@ -532,10 +618,16 @@ async fn run_native_tool(
 
     invocation.start(ctx).await;
 
+    if !binding_matches(&resolve(ctx, name), ctx) {
+        return done_error(format!("{UNAVAILABLE_TOOL_PREFIX}: {name}"));
+    }
     if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
         return done_error(e);
     }
 
+    if !binding_matches(&resolve(ctx, name), ctx) {
+        return done_error(format!("{UNAVAILABLE_TOOL_PREFIX}: {name}"));
+    }
     let locked = match invocation.mutable_path(ctx) {
         Some(target) => {
             let key = match crate::tools::file_locks::FileWriteLocks::lock_key(
@@ -579,6 +671,9 @@ async fn run_native_tool(
             .send(AgentEvent::ToolExecutionStart { id: id.clone() });
     }
 
+    if !binding_matches(&resolve(ctx, name), ctx) {
+        return done_error(format!("{UNAVAILABLE_TOOL_PREFIX}: {name}"));
+    }
     let result = match locked {
         Some((exec_ctx, guard, key)) => {
             let result = invocation.execute(&exec_ctx).await;
@@ -659,7 +754,7 @@ fn run_tool_search(
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
     let query = input["query"].as_str().unwrap_or_default();
     emit_raw_start(ctx, origin, &id, &tool_id, query.to_owned(), input);
-    let (output, is_error) = match mcp.search_tools(query, origin) {
+    let (output, is_error) = match ctx.turn_bindings.search_mcp_tools(mcp, query, origin) {
         Ok(out) => (out, false),
         Err(e) => (e, true),
     };
@@ -797,6 +892,9 @@ async fn execute_mcp_tool(
         return done(e.to_string(), true);
     }
 
+    if ctx.resolve_turn_route(&tool).is_none() {
+        return done(format!("{UNAVAILABLE_TOOL_PREFIX}: {tool}"), true);
+    }
     if origin.is_model() {
         let _ = ctx
             .event_tx
@@ -805,8 +903,11 @@ async fn execute_mcp_tool(
 
     // A permitted call counts as loading the tool, so its definition joins the
     // next request; a denied one must not load anything.
+    let Some(TurnToolRoute::Mcp(binding)) = ctx.resolve_turn_route(&tool) else {
+        return done(format!("{UNAVAILABLE_TOOL_PREFIX}: {tool}"), true);
+    };
     mcp.mark_loaded(&tool, origin);
-    match mcp.call_tool(&tool, input).await {
+    match mcp.call_bound_tool(binding, input).await {
         Ok(text) => done(text, false),
         Err(e) => done(e.to_string(), true),
     }
@@ -986,19 +1087,23 @@ mod tests {
                 Box::pin(async move { result })
             }),
         )]));
+        pin(&mut ctx);
         ctx
     }
 
     async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> ToolDoneEvent {
-        run(TEST_ID.into(), name, input, ctx, CallOrigin::Model).await
+        dispatch_rebound(ctx, name, input).await
     }
 
     async fn dispatch_nested(ctx: &ToolContext, name: &str, input: &Value) -> ToolDoneEvent {
-        run(TEST_ID.into(), name, input, ctx, CallOrigin::Nested).await
+        let mut ctx = ctx.clone();
+        pin(&mut ctx);
+        run(TEST_ID.into(), name, input, &ctx, CallOrigin::Nested).await
     }
 
     fn with_mcp(mut ctx: ToolContext, mcp: &McpSession) -> ToolContext {
         ctx.mcp = Some(mcp.clone());
+        pin(&mut ctx);
         ctx
     }
 
@@ -1010,6 +1115,24 @@ mod tests {
 
     fn mcp_ctx(mcp: &McpSession) -> ToolContext {
         with_mcp(stub_ctx(&AgentMode::Build), mcp)
+    }
+
+    fn pin(ctx: &mut ToolContext) {
+        ctx.turn_bindings = Arc::new(crate::tools::TurnToolBindings::capture(
+            &ctx.registry,
+            &ctx.local_tools,
+            ctx.mcp.as_ref(),
+        ));
+    }
+
+    async fn dispatch_pinned(ctx: &ToolContext, name: &str, input: &Value) -> ToolDoneEvent {
+        run(TEST_ID.into(), name, input, ctx, CallOrigin::Model).await
+    }
+
+    async fn dispatch_rebound(ctx: &ToolContext, name: &str, input: &Value) -> ToolDoneEvent {
+        let mut ctx = ctx.clone();
+        pin(&mut ctx);
+        dispatch_pinned(&ctx, name, input).await
     }
 
     fn registered(tool: Arc<dyn Tool>) -> Arc<ToolRegistry> {
@@ -1132,6 +1255,9 @@ mod tests {
         }
         fn schema(&self) -> Value {
             serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
+        }
+        fn tool_kind(&self) -> Option<&str> {
+            Some("edit")
         }
         fn required_permission(&self) -> Option<Permission> {
             self.0
@@ -1277,6 +1403,7 @@ mod tests {
     ) -> (ToolContext, RecordingHook) {
         ctx.registry = registered(Arc::new(HookMock(permission)));
         ctx.registry.set_hook(hook.clone());
+        pin(&mut ctx);
         (ctx, hook)
     }
 
@@ -1565,19 +1692,22 @@ mod tests {
         }
     }
 
-    /// The write gate reads its target off the rewritten input, so a hook
-    /// cannot point a plan-mode write anywhere but the plan file. The
-    /// untouched call is the control, otherwise the gate could be refusing for
-    /// some unrelated reason.
-    #[test_case(RecordingHook::answering(rewrite_the_target), crate::tools::PLAN_WRITE_RESTRICTED.to_owned() ; "rewritten_away_from_the_plan_file")]
-    #[test_case(RecordingHook::default(),                     ran(PLAN_PATH)                                 ; "left_on_the_plan_file")]
-    fn a_rewritten_write_target_is_still_plan_gated(hook: RecordingHook, expected: String) {
+    #[test]
+    fn restricted_write_never_reaches_input_hooks_even_for_plan_path() {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
-            let (ctx, _hook) = hooked_with(stub_ctx(&plan), None, hook);
+            let (ctx, hook) = hooked_with(
+                stub_ctx(&plan),
+                None,
+                RecordingHook::answering(rewrite_the_target),
+            );
             let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
-
-            assert_eq!(done.output.as_text(), expected);
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{MODE_DENIED}: {HOOK_TOOL_NAME}")
+            );
+            assert!(hook.seen.lock().unwrap().is_empty());
         });
     }
 
@@ -1682,6 +1812,53 @@ mod tests {
                 tool_names(&tools).contains(&PROBE_WIRE),
                 "searched tool must join the next request"
             );
+        });
+    }
+
+    #[test]
+    fn stale_mcp_catalog_rejects_tool_search() {
+        smol::block_on(async {
+            let original = stub_mcp(&[PROBE_QUALIFIED]);
+            let replacement = stub_mcp(&[PROBE_QUALIFIED]);
+            let mut ctx = mcp_ctx(&original);
+            ctx.mcp = Some(replacement);
+            let done = run_tool_search(
+                ctx.mcp.as_ref().unwrap(),
+                TEST_ID.into(),
+                &serde_json::json!({"query": "probe"}),
+                &ctx,
+                CallOrigin::Model,
+            );
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                "MCP tool catalog changed during this turn"
+            );
+        });
+    }
+
+    #[test]
+    fn plan_mode_denies_tool_search_before_hooks_and_loading() {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let ctx = with_mcp(stub_ctx(&plan), &mcp);
+            let (ctx, hook) = hooked_with(ctx, None, RecordingHook::default());
+            let done = dispatch(
+                &ctx,
+                TOOL_SEARCH_TOOL_NAME,
+                &serde_json::json!({"query": "probe"}),
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{MODE_DENIED}: {TOOL_SEARCH_TOOL_NAME}")
+            );
+            assert!(hook.seen.lock().unwrap().is_empty());
+            let mut tools = serde_json::json!([]);
+            mcp.extend_tools(&mut tools);
+            assert!(!tool_names(&tools).contains(&PROBE_WIRE));
         });
     }
 
@@ -1818,6 +1995,223 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pinned_native_replacement_is_not_dispatchable() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE]);
+            pin(&mut ctx);
+            ctx.registry = registry_with(&[PROBE_WIRE]);
+            assert!(!authorize_advertised(&ctx, PROBE_WIRE));
+            let done = dispatch_pinned(&ctx, PROBE_WIRE, &json!({})).await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {PROBE_WIRE}")
+            );
+        });
+    }
+
+    #[test]
+    fn stale_binding_denied_before_hooks_and_permission_prompt() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                PathBuf::from(TEST_ROOT),
+                maki_config::ProjectConfig::discover(Path::new(TEST_ROOT)),
+                Arc::default(),
+            ));
+            let (mut ctx, hook) = hooked_with(ctx, Some(Permission::Run), RecordingHook::default());
+            ctx.registry = registered(Arc::new(HookMock(Some(Permission::Run))));
+            let done = dispatch_pinned(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {HOOK_TOOL_NAME}")
+            );
+            assert!(hook.seen().is_empty());
+        });
+    }
+
+    #[test]
+    fn pinned_route_rejects_local_shadowing() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE]);
+            pin(&mut ctx);
+            ctx.local_tools = Arc::new(HashMap::from([(
+                PROBE_WIRE.into(),
+                local_tool(ToolAudience::all(), |_, _| {
+                    Box::pin(async { Ok("shadow".into()) })
+                }),
+            )]));
+            assert!(!authorize_advertised(&ctx, PROBE_WIRE));
+            assert!(dispatch_pinned(&ctx, PROBE_WIRE, &json!({})).await.is_error);
+        });
+    }
+
+    #[test]
+    fn unpinned_native_name_is_not_dispatchable() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE]);
+            assert!(dispatch_pinned(&ctx, PROBE_WIRE, &json!({})).await.is_error);
+        });
+    }
+
+    #[test]
+    fn plan_callable_excludes_unknown_effect_and_shell() {
+        let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+        let mut ctx = with_mcp(stub_ctx(&plan), &stub_mcp(&[PROBE_QUALIFIED]));
+        ctx.registry = registered(Arc::new(HookMock(Some(Permission::Run))));
+        assert!(callable_names(&ctx).is_empty());
+        assert!(!authorize_advertised(&ctx, TOOL_SEARCH_TOOL_NAME));
+    }
+
+    struct SpoofedReadInvocation(Arc<AtomicBool>);
+
+    impl ToolInvocation for SpoofedReadInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain("read probe".into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            self.0.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(ToolOutput::Plain("ran".into())).into() })
+        }
+    }
+
+    struct SpoofedReadTool {
+        name: &'static str,
+        kind: &'static str,
+        executed: Arc<AtomicBool>,
+    }
+
+    impl Tool for SpoofedReadTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "read probe".into()
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn tool_kind(&self) -> Option<&str> {
+            Some(self.kind)
+        }
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(SpoofedReadInvocation(Arc::clone(&self.executed))))
+        }
+    }
+
+    #[test_case("read", "read" ; "read")]
+    #[test_case("glob", "search" ; "glob")]
+    #[test_case("grep", "search" ; "grep")]
+    fn restricted_mode_denies_spoofed_lua_read_or_search(name: &'static str, kind: &'static str) {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Plan(PathBuf::from(PLAN_PATH)));
+            let registry = ToolRegistry::new();
+            let executed = Arc::new(AtomicBool::new(false));
+            registry
+                .register(
+                    Arc::new(SpoofedReadTool {
+                        name,
+                        kind,
+                        executed: Arc::clone(&executed),
+                    }),
+                    ToolSource::Lua {
+                        plugin: name.into(),
+                    },
+                )
+                .unwrap();
+            ctx.registry = Arc::new(registry);
+            pin(&mut ctx);
+            assert!(callable_names(&ctx).is_empty());
+            let done = dispatch_pinned(&ctx, name, &json!({})).await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), format!("{MODE_DENIED}: {name}"));
+            assert!(!executed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn plan_denies_unknown_effect_even_if_pinned_in_mode_toolset() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Plan(PathBuf::from(PLAN_PATH)));
+            ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
+            let mut mode = ctx.mode_def.as_ref().unwrap().as_ref().clone();
+            mode.tools = Some(vec![OTHER_WIRE.into()]);
+            ctx.mode_def = Some(Arc::new(mode));
+            pin(&mut ctx);
+            assert!(callable_names(&ctx).is_empty());
+            let done = dispatch_pinned(&ctx, OTHER_WIRE, &json!({})).await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{MODE_DENIED}: {OTHER_WIRE}")
+            );
+        });
+    }
+
+    #[test]
+    fn mode_toolset_blocks_dispatch_and_catalog() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
+            let mut pinned = (*ctx.mode_def.as_ref().unwrap()).as_ref().clone();
+            pinned.tools = Some(vec![OTHER_WIRE.into()]);
+            ctx.mode_def = Some(Arc::new(pinned));
+            pin(&mut ctx);
+            assert!(!authorize_advertised(&ctx, PROBE_WIRE));
+            assert!(authorize_advertised(&ctx, OTHER_WIRE));
+            assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
+            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {PROBE_WIRE}")
+            );
+        });
+    }
+
+    #[test]
+    fn dispatch_uses_pinned_mode_toolset_after_registry_changes() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
+            let mut pinned = (*ctx.mode_def.as_ref().unwrap()).as_ref().clone();
+            pinned.tools = Some(vec![OTHER_WIRE.into()]);
+            ctx.mode_def = Some(Arc::new(pinned));
+            pin(&mut ctx);
+            ctx.modes
+                .define(crate::ModeDefSpec {
+                    name: "build".into(),
+                    tools: Some(vec![PROBE_WIRE.into()]),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
+            assert!(dispatch(&ctx, PROBE_WIRE, &json!({})).await.is_error);
+            assert!(!dispatch(&ctx, OTHER_WIRE, &json!({})).await.is_error);
+        });
+    }
+
+    #[test]
+    fn missing_pinned_mode_def_denies_dispatch() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE]);
+            ctx.mode_def = None;
+            assert!(callable_names(&ctx).is_empty());
+            let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {PROBE_WIRE}")
+            );
+        });
+    }
+
     /// A shadowed name appears once, described by whatever `resolve` picks:
     /// listing it under the loser's audience is how a script gets handed a tool
     /// its own audience was denied.
@@ -1826,6 +2220,7 @@ mod tests {
         let mcp = stub_mcp(&[PROBE_QUALIFIED]);
         let mut ctx = with_mcp(local_ctx(PROBE_WIRE, |_| Ok(String::new())), &mcp);
         ctx.registry = registry_with(&[PROBE_WIRE]);
+        pin(&mut ctx);
 
         let probe = |ctx: &ToolContext| {
             let all = callable(ctx);
@@ -1837,6 +2232,7 @@ mod tests {
         assert_eq!(probe(&ctx).source, SOURCE_LOCAL);
 
         ctx.local_tools = Arc::default();
+        pin(&mut ctx);
         let native = probe(&ctx);
         assert_eq!(native.source, SOURCE_NATIVE);
         assert!(native.schema.is_some(), "registry tools carry their schema");
@@ -1861,9 +2257,24 @@ mod tests {
             false,
         );
         ctx.tool_filter = Arc::clone(tools.filter());
+        pin(&mut ctx);
 
         assert_eq!(tool_names(tools.definitions()), [OTHER_WIRE]);
         assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
+    }
+
+    #[test]
+    fn disabled_native_call_is_blocked_before_hooks() {
+        smol::block_on(async {
+            let (mut ctx, hook) = hooked_ctx(build_ctx());
+            ctx.tool_filter = Arc::new(crate::tools::ToolFilter::Only(vec![]));
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {HOOK_TOOL_NAME}")
+            );
+            assert!(hook.seen.lock().unwrap().is_empty());
+        });
     }
 
     /// A host that trims the array it publishes (a Lua caller passing `except`)
@@ -1879,6 +2290,7 @@ mod tests {
             &ctx.model,
         );
         ctx.tool_filter = Arc::clone(tools.filter());
+        pin(&mut ctx);
 
         assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
     }
@@ -1904,6 +2316,7 @@ mod tests {
                 Box::pin(async { Ok(String::new()) })
             }),
         )]));
+        pin(&mut ctx);
         assert_eq!(callable_names(&ctx), [CLIENT_NAME]);
 
         ctx.audience = ToolAudience::GENERAL_SUB;
@@ -1952,10 +2365,57 @@ mod tests {
         });
     }
 
-    /// Plan mode puts MCP behind the user, it does not block it outright. An
-    /// allow rule is the user's answer already, so the call goes through.
     #[test]
-    fn mcp_tool_allowed_by_rule_in_plan_mode() {
+    fn restricted_mode_blocks_unknown_effect_before_hooks() {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let (ctx, hook) = hooked_with(stub_ctx(&plan), None, RecordingHook::default());
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+            assert_eq!(
+                done.output.as_text(),
+                format!("{MODE_DENIED}: {HOOK_TOOL_NAME}")
+            );
+            assert!(hook.seen.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn plan_mode_blocks_write_even_with_yolo() {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let (ctx, hook) = hooked_with(stub_ctx(&plan), None, RecordingHook::default());
+            ctx.permissions.set_yolo(true);
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{MODE_DENIED}: {HOOK_TOOL_NAME}")
+            );
+            assert!(hook.seen.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn plan_mode_blocks_shell_before_hooks_even_with_allow_rule() {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let (ctx, hook) = hooked_with(
+                ruled_ctx(&plan, ToolKey::native(HOOK_TOOL_NAME), Effect::Allow),
+                Some(Permission::Run),
+                RecordingHook::default(),
+            );
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{MODE_DENIED}: {HOOK_TOOL_NAME}")
+            );
+            assert!(hook.seen.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn mcp_tool_denied_even_with_allow_rule_in_plan_mode() {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let ctx = with_mcp(
@@ -1967,28 +2427,22 @@ mod tests {
                 &stub_mcp(&[PROBE_QUALIFIED]),
             );
             let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
-            // The stub transport fails every call, so a successful run surfaces
-            // its error: the proof the call was neither plan-blocked nor
-            // permission-denied and actually reached MCP.
-            assert_eq!(done.tool.as_ref(), PROBE_QUALIFIED, "must route to MCP");
-            let text = done.output.as_text();
-            assert!(
-                !text.starts_with(PERMISSION_DENIED_PREFIX)
-                    && text != crate::tools::PLAN_WRITE_RESTRICTED,
-                "plan mode must not block or deny the call, got: {text}"
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{MODE_DENIED}: {PROBE_WIRE}")
             );
             let mut tools = serde_json::json!([]);
             ctx.mcp.as_ref().unwrap().extend_tools(&mut tools);
             assert!(
-                tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
-                "a permitted plan-mode call must load the definition"
+                !tool_names(&tools).contains(&&PROBE_WIRE.to_owned()[..]),
+                "a restricted call must not load the definition"
             );
         });
     }
 
-    /// An MCP server can write without announcing it, so a plan-mode session
-    /// asks first even where everything else is approved automatically. The
-    /// stub has no channel to ask on, hence the denial below.
+    /// An MCP server can write without announcing it, so a restricted mode
+    /// rejects it even if ordinary permissions would allow it.
     #[test]
     fn mcp_tool_in_plan_mode_is_never_auto_approved() {
         smol::block_on(async {
@@ -1997,7 +2451,7 @@ mod tests {
             let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
             assert!(done.is_error);
             let text = done.output.as_text();
-            assert!(text.starts_with(PERMISSION_DENIED_PREFIX), "got: {text}");
+            assert_eq!(text, format!("{MODE_DENIED}: {PROBE_WIRE}"));
             let mut tools = serde_json::json!([]);
             ctx.mcp.as_ref().unwrap().extend_tools(&mut tools);
             assert!(
@@ -2022,7 +2476,7 @@ mod tests {
             let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
             assert!(done.is_error, "plan mode must not bypass deny rules");
             assert!(
-                done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
+                done.output.as_text() == format!("{MODE_DENIED}: {PROBE_WIRE}"),
                 "got: {}",
                 done.output.as_text()
             );
@@ -2261,6 +2715,7 @@ mod tests {
         path: String,
     ) -> ToolDoneEvent {
         ctx.registry = registry;
+        pin(&mut ctx);
         run(
             id,
             &name,
@@ -2871,6 +3326,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            pin(&mut ctx);
 
             let done = run(
                 "outer".into(),

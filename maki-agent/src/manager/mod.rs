@@ -39,6 +39,11 @@ static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 type RunnerTask = smol::Task<()>;
 
+struct CommitPolicy {
+    config: Option<crate::RunSettings>,
+    ceiling: Option<crate::RunSettings>,
+}
+
 struct Node {
     parent_id: Option<AgentId>,
     root_id: AgentId,
@@ -205,6 +210,20 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
+        self.create_root_with_config(None, initial_messages, shared_messages, factory)
+    }
+
+    pub fn create_root_with_config<F, E>(
+        &self,
+        config: Option<crate::actor::EffectiveAgentConfig>,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        factory: F,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
         let agent_id = AgentId::generate();
         let reservation = {
             let mut graph = self.lock_graph();
@@ -252,6 +271,10 @@ impl AgentManagerHandle {
             initial_messages,
             shared_messages,
             backend,
+            CommitPolicy {
+                config,
+                ceiling: None,
+            },
         )
     }
 
@@ -280,10 +303,24 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
+        self.validate_manager(current)?;
+        self.validate_active(current)?;
         let parent_id = current.agent_id();
+        if current.mode != Some(crate::AgentMode::Build) {
+            return Err(ManagerError::Policy("delegation requires a build-mode parent snapshot; restrictive tool and effect ceilings are unavailable".into()));
+        }
+        let inherited_config = current.policy_snapshot().ok_or_else(|| {
+            ManagerError::Policy("child delegation requires a parent policy snapshot".into())
+        })?;
+        let inherited_config = Some(crate::RunSettings {
+            provider: Arc::clone(&inherited_config.provider),
+            model: inherited_config.model.clone(),
+            fast: inherited_config.fast,
+            workflow: inherited_config.workflow,
+            thinking: inherited_config.thinking,
+        });
         let child_id = AgentId::generate();
         let reservation = {
-            self.validate_manager(current)?;
             let mut graph = self.lock_graph();
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
@@ -384,6 +421,10 @@ impl AgentManagerHandle {
             initial_messages,
             shared_messages,
             backend,
+            CommitPolicy {
+                config: inherited_config.clone(),
+                ceiling: inherited_config,
+            },
         )
     }
 
@@ -591,14 +632,17 @@ impl AgentManagerHandle {
         initial_messages: Vec<Message>,
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
+        policy: CommitPolicy,
     ) -> Result<AgentRef, ManagerError> {
-        let admission = ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id);
+        let admission =
+            ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id, policy.ceiling);
         let (actor, task) = AgentActorHandle::spawn_managed(
             agent_id,
             initial_messages,
             shared_messages,
             backend,
             admission,
+            policy.config,
         );
         let manager = Arc::downgrade(&self.0);
         let task = smol::spawn(async move {
@@ -754,6 +798,23 @@ impl AgentManagerHandle {
         node.actor
             .clone()
             .ok_or(ManagerError::NonLiveAgent(agent_id))
+    }
+
+    pub fn effective_config(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<Arc<crate::actor::EffectiveAgentConfig>>, ManagerError> {
+        Ok(self.actor(agent_id)?.effective_config())
+    }
+
+    pub fn update_policy(
+        &self,
+        agent_id: AgentId,
+        policy: crate::RunSettings,
+    ) -> Result<u64, ManagerError> {
+        self.actor(agent_id)?
+            .update_policy(policy)
+            .map_err(|error| ManagerError::Policy(error.to_string()))
     }
 
     pub fn node(&self, agent_id: AgentId) -> Result<AgentNodeSnapshot, ManagerError> {
@@ -1446,17 +1507,16 @@ pub(crate) struct ManagedTurnGuard {
 
 impl Drop for ManagedTurnGuard {
     fn drop(&mut self) {
-        self.lease.close();
-        let Some(manager) = self.manager.upgrade() else {
-            return;
-        };
-        let mut graph = manager
-            .graph
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if graph.active_turns.get(&(self.agent_id, self.turn_id)) == Some(&self.nonce) {
-            graph.active_turns.remove(&(self.agent_id, self.turn_id));
+        if let Some(manager) = self.manager.upgrade() {
+            let mut graph = manager
+                .graph
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if graph.active_turns.get(&(self.agent_id, self.turn_id)) == Some(&self.nonce) {
+                graph.active_turns.remove(&(self.agent_id, self.turn_id));
+            }
         }
+        self.lease.close();
     }
 }
 
@@ -1565,8 +1625,8 @@ impl Future for ManagedExecutionFuture<'_> {
 
 impl Drop for ManagedExecutionFuture<'_> {
     fn drop(&mut self) {
-        self.lease.close();
         self.guard.take();
+        self.lease.close();
     }
 }
 
@@ -1643,6 +1703,8 @@ pub(crate) async fn enter_managed_turn(
         lease: TurnPermitLease {
             inner: Arc::clone(&lease),
         },
+        policy: None,
+        mode: None,
     };
     Ok((
         ManagedTurnGuard {

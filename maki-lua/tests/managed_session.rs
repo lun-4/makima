@@ -7,7 +7,7 @@ use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
 use maki_agent::{
     ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMetadata,
     AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, GraphLifecycle, History,
-    ToolOutput, TurnContext, TurnOutcome, TurnTicket, WorkKind,
+    RunSettings, ToolOutput, TurnContext, TurnOutcome, TurnTicket, WorkKind,
 };
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
@@ -340,6 +340,14 @@ impl ActorBackend for LuaToolBackend {
         _: WorkKind,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
+            assert!(context.policy.is_some());
+            assert!(
+                context
+                    .managed_turn
+                    .as_ref()
+                    .and_then(|turn| turn.policy_snapshot())
+                    .is_some()
+            );
             self.context.managed_turn = context.managed_turn;
             let invocation = self
                 .registry
@@ -403,6 +411,14 @@ impl ActorBackend for NestedTaskBackend {
         _: WorkKind,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
+            assert!(context.policy.is_some());
+            assert!(
+                context
+                    .managed_turn
+                    .as_ref()
+                    .and_then(|turn| turn.policy_snapshot())
+                    .is_some()
+            );
             self.context.managed_turn = context.managed_turn;
             self.context.audience = ToolAudience::GENERAL_SUB;
             let invocation = self
@@ -517,6 +533,16 @@ impl ActorBackend for SpawnManagedChildBackend {
     }
 }
 
+fn parent_policy(context: &ToolContext) -> RunSettings {
+    RunSettings {
+        provider: Arc::clone(&context.provider),
+        model: (*context.model).clone(),
+        fast: false,
+        workflow: context.workflow,
+        thinking: Default::default(),
+    }
+}
+
 fn task_input() -> Value {
     json!({
         "description": "nested-child",
@@ -538,18 +564,17 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
 
 async fn spawn_managed_parent(
     manager: &AgentManagerHandle,
+    policy: RunSettings,
     child_backend: Box<dyn ActorBackend>,
 ) -> (AgentRef, TurnTicket) {
     let (child_tx, child_rx) = flume::bounded(1);
     let root = manager
-        .create_root(
-            Vec::new(),
-            None,
-            Box::new(SpawnManagedChildBackend {
+        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(SpawnManagedChildBackend {
                 child_backend: Some(child_backend),
                 child: child_tx,
-            }),
-        )
+            }) as Box<dyn ActorBackend>)
+        })
         .unwrap();
     let root_ticket = root
         .actor()
@@ -629,6 +654,7 @@ fn managed_nested_blocking_task_completes_before_parent_turn_ends_at_capacity_on
         let (release_tx, release_rx) = flume::bounded(1);
         let (parent, parent_ticket) = spawn_managed_parent(
             &manager,
+            parent_policy(&context),
             Box::new(NestedTaskBackend {
                 registry,
                 context,
@@ -692,6 +718,7 @@ fn closing_managed_subtree_closes_retained_nested_session_adapter() {
         let (release_tx, release_rx) = flume::bounded(1);
         let (parent, _parent_ticket) = spawn_managed_parent(
             &manager,
+            parent_policy(&context),
             Box::new(NestedTaskBackend {
                 registry: Arc::clone(&registry),
                 context: context.clone(),
@@ -774,6 +801,7 @@ fn managed_nested_task_spawn_rejects_before_creating_child() {
         let (release_tx, release_rx) = flume::bounded(1);
         let (_parent, parent_ticket) = spawn_managed_parent(
             &manager,
+            parent_policy(&context),
             Box::new(NestedTaskBackend {
                 registry,
                 context,
@@ -826,6 +854,7 @@ fn managed_join_worker_prompts_existing_child_at_capacity_one() {
         let (release_tx, release_rx) = flume::bounded(1);
         let (parent, parent_ticket) = spawn_managed_parent(
             &manager,
+            parent_policy(&context),
             Box::new(NestedTaskBackend {
                 registry,
                 context,
@@ -884,16 +913,14 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
         .unwrap();
         let (first_tx, first_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
-                Vec::new(),
-                None,
-                Box::new(LuaToolBackend {
+            .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(LuaToolBackend {
                     registry: Arc::clone(&registry),
                     context: context.clone(),
                     completed: first_tx,
                     tool_name: RETAIN_ASYNC_TOOL_NAME,
-                }),
-            )
+                }) as Box<dyn ActorBackend>)
+            })
             .unwrap();
         let first_ticket = root
             .actor()
@@ -998,15 +1025,18 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
+            .create_root_with_config(
+                Some(parent_policy(&unmanaged_context)),
                 Vec::new(),
                 None,
-                Box::new(LuaToolBackend {
-                    registry,
-                    context: unmanaged_context,
-                    completed: completed_tx,
-                    tool_name: REJECT_FOREIGN_CTX_TOOL_NAME,
-                }),
+                |_| {
+                    Ok::<_, String>(Box::new(LuaToolBackend {
+                        registry,
+                        context: unmanaged_context,
+                        completed: completed_tx,
+                        tool_name: REJECT_FOREIGN_CTX_TOOL_NAME,
+                    }) as Box<dyn ActorBackend>)
+                },
             )
             .unwrap();
         let before = manager.node(root.id()).unwrap();
@@ -1051,16 +1081,14 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
-                Vec::new(),
-                None,
-                Box::new(LuaToolBackend {
+            .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(LuaToolBackend {
                     registry,
                     context,
                     completed: completed_tx,
                     tool_name: TOOL_NAME,
-                }),
-            )
+                }) as Box<dyn ActorBackend>)
+            })
             .unwrap();
         let ticket = root
             .actor()
@@ -1119,16 +1147,14 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
-                Vec::new(),
-                None,
-                Box::new(LuaToolBackend {
+            .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(LuaToolBackend {
                     registry,
                     context,
                     completed: completed_tx,
                     tool_name: SILENT_TOOL_NAME,
-                }),
-            )
+                }) as Box<dyn ActorBackend>)
+            })
             .unwrap();
         let ticket = root
             .actor()
@@ -1176,16 +1202,14 @@ fn retained_managed_prompt_timeout_outside_invocation_closes_graph_node() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
-                Vec::new(),
-                None,
-                Box::new(LuaToolBackend {
+            .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(LuaToolBackend {
                     registry: Arc::clone(&registry),
                     context: context.clone(),
                     completed: completed_tx,
                     tool_name: RETAIN_TOOL_NAME,
-                }),
-            )
+                }) as Box<dyn ActorBackend>)
+            })
             .unwrap();
         let ticket = root
             .actor()
@@ -1246,16 +1270,14 @@ fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
         .unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
-                Vec::new(),
-                None,
-                Box::new(LuaToolBackend {
+            .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(LuaToolBackend {
                     registry,
                     context: context.clone(),
                     completed: completed_tx,
                     tool_name: TIMEOUT_TOOL_NAME,
-                }),
-            )
+                }) as Box<dyn ActorBackend>)
+            })
             .unwrap();
         context.managed_turn = None;
         let ticket = root

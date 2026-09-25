@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use event_listener::Event;
-use maki_providers::TokenUsage;
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{Model, ProviderEvent, RequestOptions, StreamResponse, TokenUsage};
+use maki_storage::id::SessionRef;
+use serde_json::Value;
 
 use super::{AgentLimits, AgentManagerHandle, AgentMetadata, GraphLifecycle, ManagerError};
 use crate::{
@@ -305,6 +308,39 @@ impl ActorBackend for TestBackend {
     }
 }
 
+struct ConfigTestProvider;
+
+impl Provider for ConfigTestProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [maki_providers::Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
+        Box::pin(async { unreachable!() })
+    }
+
+    fn list_models(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+fn config(model: &str, fast: bool) -> crate::actor::EffectiveAgentConfig {
+    crate::actor::EffectiveAgentConfig {
+        provider: Arc::new(ConfigTestProvider),
+        model: Model::from_spec(model).unwrap(),
+        fast,
+        workflow: false,
+        thinking: Default::default(),
+    }
+}
+
 fn input() -> AgentInput {
     AgentInput {
         message: "test".into(),
@@ -332,10 +368,11 @@ fn active_root(
     let (tx, rx) = flume::bounded(1);
     let gate = Gate::new();
     let root = manager
-        .create_root(
+        .create_root_with_config(
+            Some(config("anthropic/claude-sonnet-4-20250514", false)),
             Vec::new(),
             None,
-            TestBackend::reporting(tx, Some(Arc::clone(&gate))),
+            |_| Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate)))),
         )
         .unwrap();
     root.actor()
@@ -344,6 +381,153 @@ fn active_root(
         .unwrap();
     let current = smol::block_on(rx.recv_async()).unwrap();
     (manager, root, current, gate)
+}
+
+#[test]
+fn actor_owned_config_inherits_and_isolates_nodes() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::bounded(1);
+        let gate = Gate::new();
+        let initial = config("anthropic/claude-sonnet-4-20250514", false);
+        let root = manager
+            .create_root_with_config(Some(initial.clone()), Vec::new(), None, |_| {
+                Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
+            })
+            .unwrap();
+        root.actor()
+            .unwrap()
+            .admit_turn(input(), None, "root".into())
+            .unwrap();
+        let current = rx.recv_async().await.unwrap();
+        let captured = current.policy_snapshot().unwrap();
+        assert_eq!(captured.model.id, initial.model.id);
+        assert!(Arc::ptr_eq(&captured.provider, &initial.provider));
+        root.update_policy(config("anthropic/claude-sonnet-4-20250514", true))
+            .unwrap();
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let inherited = child.effective_config().unwrap().unwrap();
+        assert_eq!(inherited.model.id, initial.model.id);
+        assert!(Arc::ptr_eq(&inherited.provider, &initial.provider));
+        assert!(!inherited.fast);
+        assert!(root.effective_config().unwrap().unwrap().fast);
+        assert!(!child.effective_config().unwrap().unwrap().fast);
+        assert!(matches!(
+            manager.update_policy(
+                child.id(),
+                config("anthropic/claude-sonnet-4-20250514", true)
+            ),
+            Err(ManagerError::Policy(_))
+        ));
+        assert!(!child.effective_config().unwrap().unwrap().fast);
+        gate.release(1);
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn child_spawn_without_parent_policy_fails_closed() {
+    let (manager, root, current, gate) = {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::bounded(1);
+        let gate = Gate::new();
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                TestBackend::reporting(tx, Some(Arc::clone(&gate))),
+            )
+            .unwrap();
+        root.actor()
+            .unwrap()
+            .admit_turn(input(), None, "root".into())
+            .unwrap();
+        let current = smol::block_on(rx.recv_async()).unwrap();
+        (manager, root, current, gate)
+    };
+    assert!(matches!(
+        manager.spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed()
+        ),
+        Err(ManagerError::Policy(_))
+    ));
+    assert!(root.snapshot().unwrap().children.is_empty());
+    gate.release(1);
+    smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+}
+
+#[test]
+fn child_ceiling_rejects_policy_and_mode_expansion() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::bounded(1);
+        let gate = Gate::new();
+        let initial = config("anthropic/claude-sonnet-4-20250514", false);
+        let root = manager
+            .create_root_with_config(Some(initial.clone()), Vec::new(), None, |_| {
+                Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
+            })
+            .unwrap();
+        root.actor()
+            .unwrap()
+            .admit_turn(input(), None, "root".into())
+            .unwrap();
+        let current = rx.recv_async().await.unwrap();
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let actor = child.actor().unwrap();
+        let mut broader = initial.clone();
+        broader.model = Model::from_spec("anthropic/claude-opus-4-20250514").unwrap();
+        assert!(matches!(
+            child.update_policy(broader),
+            Err(ManagerError::Policy(_))
+        ));
+        let mut broader = initial.clone();
+        broader.workflow = true;
+        assert!(matches!(
+            child.update_policy(broader),
+            Err(ManagerError::Policy(_))
+        ));
+        let mut broader = initial.clone();
+        broader.fast = true;
+        assert!(matches!(
+            child.update_policy(broader),
+            Err(ManagerError::Policy(_))
+        ));
+        let mut broader = initial.clone();
+        broader.provider = Arc::new(ConfigTestProvider);
+        assert!(matches!(
+            child.update_policy(broader),
+            Err(ManagerError::Policy(_))
+        ));
+        let mut plan_input = input();
+        plan_input.mode = AgentMode::Plan("plan.md".into());
+        assert!(actor.admit_turn(plan_input, None, "plan".into()).is_err());
+        assert_eq!(
+            child.effective_config().unwrap().unwrap().model.id,
+            initial.model.id
+        );
+        gate.release(1);
+        manager.shutdown(std::time::Duration::from_secs(1)).await;
+    });
 }
 
 #[test]
@@ -1335,22 +1519,30 @@ fn root_snapshot_does_not_block_atomic_correlation_cancel_cut() {
         cancel_done_tx.send(()).unwrap();
     });
 
-    cut_entered_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
-    assert!(matches!(
-        manager.spawn_child(
+    let cut_entered = cut_entered_rx.recv_timeout(COMPLETION_TIMEOUT);
+    let spawn = if cut_entered.is_ok() {
+        Some(manager.spawn_child(
             &current,
             AgentMetadata::default(),
             Vec::new(),
             None,
             TestBackend::boxed(),
-        ),
+        ))
+    } else {
+        None
+    };
+    cut_release_tx.send(()).unwrap();
+    snapshot_release.send(()).unwrap();
+    let cancel_done = cancel_done_rx.recv_timeout(COMPLETION_TIMEOUT);
+    let snapshot_done = snapshot_done_rx.recv_timeout(COMPLETION_TIMEOUT);
+    cut_entered.unwrap();
+    cancel_done.unwrap();
+    snapshot_done.unwrap();
+    assert!(matches!(
+        spawn.unwrap(),
         Err(ManagerError::InactiveTurn { agent_id, turn_id })
             if agent_id == root.id() && turn_id == current.turn_id()
     ));
-    cut_release_tx.send(()).unwrap();
-    cancel_done_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
-    snapshot_release.send(()).unwrap();
-    snapshot_done_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
 
     cancel.join().unwrap();
     let snapshot = snapshot.join().unwrap().unwrap();
@@ -1370,10 +1562,16 @@ fn turn_descendant_cut_rejects_post_cut_spawn_and_preserves_later_turn() {
         let (current_tx, current_rx) = flume::unbounded();
         let root_gate = Gate::new();
         let root = manager
-            .create_root(
+            .create_root_with_config(
+                Some(config("anthropic/claude-sonnet-4-20250514", false)),
                 Vec::new(),
                 None,
-                TestBackend::reporting(current_tx, Some(Arc::clone(&root_gate))),
+                |_| {
+                    Ok::<_, String>(TestBackend::reporting(
+                        current_tx,
+                        Some(Arc::clone(&root_gate)),
+                    ))
+                },
             )
             .unwrap();
         let root_actor = root.actor().unwrap();
@@ -1788,10 +1986,16 @@ fn parent_waiting_for_child_yields_permit() {
         let root_gate = Gate::new();
         let (root_tx, root_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
+            .create_root_with_config(
+                Some(config("anthropic/claude-sonnet-4-20250514", false)),
                 Vec::new(),
                 None,
-                TestBackend::reporting(root_tx, Some(Arc::clone(&root_gate))),
+                |_| {
+                    Ok::<_, String>(TestBackend::reporting(
+                        root_tx,
+                        Some(Arc::clone(&root_gate)),
+                    ))
+                },
             )
             .unwrap();
         root.actor()
@@ -1911,12 +2115,15 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
         let manager = AgentManagerHandle::new(limits).unwrap();
         let (current_tx, current_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
+            .create_root_with_config(
+                Some(config("anthropic/claude-sonnet-4-20250514", false)),
                 Vec::new(),
                 None,
-                Box::new(ReportingCancellableBackend {
-                    current: current_tx,
-                }),
+                |_| {
+                    Ok::<_, String>(Box::new(ReportingCancellableBackend {
+                        current: current_tx,
+                    }) as Box<dyn ActorBackend>)
+                },
             )
             .unwrap();
         let root_ticket = root
@@ -2084,10 +2291,16 @@ fn two_child_waits_share_one_parent_suspension() {
         let root_gate = Gate::new();
         let (root_tx, root_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
+            .create_root_with_config(
+                Some(config("anthropic/claude-sonnet-4-20250514", false)),
                 Vec::new(),
                 None,
-                TestBackend::reporting(root_tx, Some(Arc::clone(&root_gate))),
+                |_| {
+                    Ok::<_, String>(TestBackend::reporting(
+                        root_tx,
+                        Some(Arc::clone(&root_gate)),
+                    ))
+                },
             )
             .unwrap();
         root.actor()
@@ -2236,10 +2449,11 @@ fn active_turns_never_exceed_manager_limit() {
         let gate = Gate::new();
         let (root_tx, root_rx) = flume::bounded(1);
         let root = manager
-            .create_root(
+            .create_root_with_config(
+                Some(config("anthropic/claude-sonnet-4-20250514", false)),
                 Vec::new(),
                 None,
-                TestBackend::reporting(root_tx, Some(Arc::clone(&gate))),
+                |_| Ok::<_, String>(TestBackend::reporting(root_tx, Some(Arc::clone(&gate)))),
             )
             .unwrap();
         root.actor()

@@ -65,7 +65,12 @@ mod tests {
         AgentMetadata, AgentMode, BackendResult, ControlWork, DoneReason, EventSender,
         GraphLifecycle, History, ManagerError, TurnContext, TurnOutcome, WorkKind,
     };
-    use maki_providers::TokenUsage;
+    use maki_providers::{
+        AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+        TokenUsage,
+        provider::{BoxFuture, Provider},
+    };
+    use maki_storage::id::SessionRef;
 
     use super::*;
 
@@ -185,6 +190,37 @@ mod tests {
         }
     }
 
+    struct StubProvider;
+
+    impl Provider for StubProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn policy() -> maki_agent::RunSettings {
+        maki_agent::RunSettings {
+            provider: Arc::new(StubProvider),
+            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+            fast: false,
+            workflow: false,
+            thinking: Default::default(),
+        }
+    }
+
     fn input() -> AgentInput {
         AgentInput {
             message: "test".into(),
@@ -207,20 +243,19 @@ mod tests {
             let (current_tx, current_rx) = flume::bounded(2);
             let (later_release_tx, later_release_rx) = flume::bounded(1);
             let root = manager
-                .create_root(
-                    Vec::new(),
-                    None,
-                    Box::new(CancelThenCompleteBackend {
+                .create_root_with_config(Some(policy()), Vec::new(), None, |_| {
+                    Ok::<_, String>(Box::new(CancelThenCompleteBackend {
                         currents: current_tx,
                         later_release: later_release_rx,
-                    }),
-                )
+                    }) as Box<dyn ActorBackend>)
+                })
                 .unwrap();
             let root_actor = root.actor().unwrap();
             let root_ticket = root_actor
                 .admit_turn(input(), None, correlation(1))
                 .unwrap();
             let current = current_rx.recv_async().await.unwrap();
+            assert!(current.policy_snapshot().is_some());
 
             let (event_tx, event_rx) = flume::unbounded();
             let (entered_tx, entered_rx) = flume::bounded(1);
@@ -313,19 +348,18 @@ mod tests {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let (current_tx, current_rx) = flume::bounded(1);
             let root = manager
-                .create_root(
-                    Vec::new(),
-                    None,
-                    Box::new(CancellableBackend {
+                .create_root_with_config(Some(policy()), Vec::new(), None, |_| {
+                    Ok::<_, String>(Box::new(CancellableBackend {
                         current: Some(current_tx),
                         entered: None,
                         event_tx: None,
-                    }),
-                )
+                    }) as Box<dyn ActorBackend>)
+                })
                 .unwrap();
             let root_actor = root.actor().unwrap();
             let root_ticket = root_actor.admit_turn(input(), None, "root".into()).unwrap();
             let current = current_rx.recv_async().await.unwrap();
+            assert!(current.policy_snapshot().is_some());
 
             let (entered_tx, entered_rx) = flume::bounded(1);
             let child = manager

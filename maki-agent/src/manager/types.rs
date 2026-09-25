@@ -85,6 +85,16 @@ impl AgentRef {
         self.manager.node(self.agent_id)
     }
 
+    pub fn effective_config(
+        &self,
+    ) -> Result<Option<Arc<crate::actor::EffectiveAgentConfig>>, super::ManagerError> {
+        self.manager.effective_config(self.agent_id)
+    }
+
+    pub fn update_policy(&self, policy: crate::RunSettings) -> Result<u64, super::ManagerError> {
+        self.manager.update_policy(self.agent_id, policy)
+    }
+
     pub fn cancel(&self) -> Result<(), super::ManagerError> {
         self.manager.cancel_agent(self.agent_id)
     }
@@ -104,6 +114,8 @@ pub struct ShutdownReport {
 pub struct CurrentManagedTurn {
     pub(crate) token: ManagedTurnToken,
     pub(crate) lease: TurnPermitLease,
+    pub(crate) policy: Option<Arc<crate::RunSettings>>,
+    pub(crate) mode: Option<crate::AgentMode>,
 }
 
 impl CurrentManagedTurn {
@@ -113,6 +125,10 @@ impl CurrentManagedTurn {
 
     pub fn turn_id(&self) -> TurnId {
         self.token.turn_id
+    }
+
+    pub fn policy_snapshot(&self) -> Option<&Arc<crate::RunSettings>> {
+        self.policy.as_ref()
     }
 
     pub fn node_snapshot(&self) -> Result<AgentNodeSnapshot, super::ManagerError> {

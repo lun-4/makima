@@ -17,11 +17,21 @@ modes do, and how a Lua plugin defines a new mode or overrides a built-in one.
 Tab toggles between them (build is the default).
 
 - **build `[BUILD]`** - the default. Full toolset, no restrictions.
-- **plan `[PLAN]`** - analyse and plan. Writes are locked to a single plan
-  file, and the model gets a directive telling it never to touch anything else.
+- **plan `[PLAN]`** - analyse and plan. The mode names one plan file as its
+  intended write target, and the model gets a directive not to change other files.
 
-Switching to plan mode allocates a plan file under `plans/`. The `write` and
-`edit` tools only allow edits to that file while in plan mode.
+Switching to plan mode allocates a plan file under `plans/`. Native and Lua
+plugin filesystem writes, including writes to that file, are currently denied
+until plan-file writes can be made race-safe. Shell commands, MCP execution,
+deferred MCP search, and Lua-registered tools (including bundled read and
+search tools) are denied even with YOLO on until the host can verify their
+effects.
+
+Model changes apply to later admitted turns. Active turns keep their selected
+model through continuations. Queued roots do not fold across a model-policy
+barrier; a queued interrupt cannot change the active turn's mode. Mode
+selection still comes from the submitted input rather than a unified
+per-agent mode configuration.
 
 ## What a mode is
 
@@ -30,8 +40,9 @@ Under the hood a mode is a definition in a shared registry:
 - **name** (`"build"`, `"plan"`, or a custom id) and a **label** for the badge.
 - **system_prompt** - a snippet appended to the system prompt, like the plan
   directive. `{plan_path}` and the other prompt variables are filled in.
-- **restrict_write_to** (optional) - when set, every non-matching write is
-  blocked, exactly like the plan-file-only rule.
+- **restrict_write_to** (optional) - names the intended write target. Until
+  race-safe scoped writes are available, the host blocks filesystem writes in
+  this mode, including writes to the named file.
 - **tools** (optional) - when set, the model sees *only* this exact toolset for
   that mode. When absent, the mode inherits the default (build) set. This is how
   a tool like `plan_submit` exists only while you are in plan mode.

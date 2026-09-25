@@ -11,7 +11,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
     ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
-    ToolSource, timeout_annotation,
+    ToolSource, TurnToolBindings, timeout_annotation,
 };
 use maki_agent::{AgentMode, SharedBuf, ToolOutput};
 use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
@@ -228,6 +228,11 @@ fn exec_output_in(
     if let Some(r) = registry_override {
         ctx.registry = r;
     }
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
     smol::block_on(async { inv.execute(&ctx).await }).output
 }
 
@@ -5491,6 +5496,11 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
 
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
     let out = smol::block_on(maki_agent::tools::interpreter_bridge::dispatch(
         &ctx,
         "img_probe",

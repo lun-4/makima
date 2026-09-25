@@ -332,6 +332,11 @@ impl ToolRegistry {
         self.tools.load().iter().any(|t| t.name() == name)
     }
 
+    pub fn is_current(&self, entry: &RegisteredTool) -> bool {
+        self.get(entry.name())
+            .is_some_and(|current| Arc::ptr_eq(&current.tool, &entry.tool))
+    }
+
     pub fn register(&self, tool: Arc<dyn Tool>, source: ToolSource) -> Result<(), RegistryError> {
         let name = tool.name().to_owned();
         let mut conflict = None;
@@ -647,6 +652,21 @@ mod tests {
         ToolSource::Lua {
             plugin: plugin.into(),
         }
+    }
+
+    #[test_case(false ; "removed")]
+    #[test_case(true ; "replaced")]
+    fn pinned_registry_entry_does_not_rebind(replace: bool) {
+        let reg = ToolRegistry::new();
+        let name = "pinned";
+        reg.register(mock(name), lua_source("original")).unwrap();
+        let pinned = reg.get(name).unwrap();
+        assert!(reg.is_current(&pinned));
+        reg.clear_plugin("original");
+        if replace {
+            reg.register(mock(name), lua_source("replacement")).unwrap();
+        }
+        assert!(!reg.is_current(&pinned));
     }
 
     #[test]

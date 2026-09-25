@@ -3,21 +3,34 @@
 use std::future::Future;
 
 use maki_providers::{ImageSource, TokenUsage};
+use std::sync::Arc;
 
-use crate::InterruptSource;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::manager::{CurrentManagedTurn, ManagerInner};
 use crate::types::{AgentId, TurnId, TurnOutcome};
+use crate::{InterruptSource, RunSettings};
 
 #[derive(Clone)]
 pub(crate) struct ManagedTurnAdmission {
     pub(crate) manager: std::sync::Weak<ManagerInner>,
     pub(crate) agent_id: AgentId,
+    pub(crate) ceiling: Option<RunSettings>,
 }
 
+/// The actor's immutable per-admission settings shape.
+pub type EffectiveAgentConfig = RunSettings;
+
 impl ManagedTurnAdmission {
-    pub(crate) fn new(manager: std::sync::Weak<ManagerInner>, agent_id: AgentId) -> Self {
-        Self { manager, agent_id }
+    pub(crate) fn new(
+        manager: std::sync::Weak<ManagerInner>,
+        agent_id: AgentId,
+        ceiling: Option<RunSettings>,
+    ) -> Self {
+        Self {
+            manager,
+            agent_id,
+            ceiling,
+        }
     }
 }
 
@@ -63,10 +76,13 @@ pub struct TurnContext {
     pub cancel_reason: ReasonedCancelToken,
     /// Adapter-local correlation (the sink's run id or the control's key).
     pub correlation: String,
+    pub generation: u64,
+    pub policy: Option<Arc<EffectiveAgentConfig>>,
     /// Extracts root/compact work out of the actor's queue while the run is
     /// active, so it can fold them instead of waiting for the turn to end.
     pub interrupt: Option<std::sync::Arc<dyn InterruptSource>>,
     pub managed_turn: Option<CurrentManagedTurn>,
+    pub admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
 
 /// The terminal result of one backend execution. `EnteredRun` is the only
@@ -101,6 +117,9 @@ pub struct RootWork {
     pub images: Vec<ImageSource>,
     pub correlation: String,
     pub earlier: Vec<EarlierRoot>,
+    pub generation: u64,
+    pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
+    pub(crate) admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
 
 impl RootWork {
@@ -120,6 +139,9 @@ impl RootWork {
             images,
             correlation,
             earlier: Vec::new(),
+            generation: 0,
+            policy: None,
+            admission: None,
         }
     }
 }
@@ -144,7 +166,10 @@ pub struct TurnAdmission {
     /// A root-started turn that is cancelled before entering produces no
     /// retained outcome and no terminal delivery.
     pub(crate) root: bool,
+    pub(crate) generation: u64,
+    pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     pub(crate) ticket: super::TurnTicket,
+    pub(crate) admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
 
 /// The actor's lifecycle. `Closed` and `Shutdown` are terminal and reject
@@ -182,7 +207,14 @@ pub struct ActorSnapshot {
 /// The adapter owns its mutable configuration and executes work against the
 /// actor's shared history. Object-safe: every execution method returns a
 /// boxed future, so the TUI and Lua can share one `Box<dyn ActorBackend>`.
+pub type AdmissionPreparation =
+    Arc<dyn Fn(&crate::AgentInput) -> crate::agent::TurnAdmissionSnapshot + Send + Sync>;
+
 pub trait ActorBackend: Send {
+    fn admission_preparation(&self) -> Option<AdmissionPreparation> {
+        None
+    }
+
     /// Executes one accepted turn or a started root. `turn_id` is `Some`;
     /// `work` distinguishes `Turn` from `Root`. Returns `EnteredRun` with
     /// the authoritative outcome, or `SetupFailed` for a turn that never

@@ -9,7 +9,8 @@ use maki_agent::AgentMode;
 use maki_agent::mcp::test_support::stub_session;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
-    DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, local_tool,
+    DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, TurnToolBindings,
+    local_tool,
 };
 use maki_lua::PluginHost;
 
@@ -180,6 +181,11 @@ fn shaped_ctx(reg: &Arc<ToolRegistry>, shape: impl FnOnce(&mut ToolContext)) -> 
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.registry = Arc::clone(reg);
     shape(&mut ctx);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
     ctx
 }
 

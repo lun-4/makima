@@ -35,13 +35,13 @@ allow rule matches? ── yes ──►  runs
     │ no
 YOLO active?        ── yes ──►  runs
     │ no
-plan file write?    ── yes ──►  runs
-    │ no
     ▼
 default: prompt / allow / deny
 ```
 
-Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO. In plan mode, native and Lua plugin filesystem writes, including writes to the plan file, are blocked before permission checks until those writes can be made race-safe. Shell commands and MCP tools, including deferred tool search, are also blocked before permission checks, even if an allow rule or YOLO would approve them. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+
+Restrictive modes deny Lua-registered tools, including bundled read and search tools, because the host cannot verify their effects from registration metadata. They also reject other tools with unknown effects before asking for permission. Approval and YOLO do not override these limits. Already admitted turns retain their selected model settings; changes apply to later admissions.
 
 ## Builtin Defaults
 
