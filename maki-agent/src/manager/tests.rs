@@ -434,6 +434,88 @@ fn actor_owned_config_inherits_and_isolates_nodes() {
 }
 
 #[test]
+fn agent_config_isolation_and_failed_switch() {
+    smol::block_on(async {
+        let first = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let second = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::unbounded();
+        let gate = Gate::new();
+        let initial = config("anthropic/claude-sonnet-4-20250514", false);
+        let other = config("anthropic/claude-opus-4-20250514", true);
+        let first_root = first
+            .create_root_with_config(Some(initial.clone()), Vec::new(), None, |_| {
+                Ok::<_, String>(TestBackend::reporting(tx.clone(), Some(Arc::clone(&gate))))
+            })
+            .unwrap();
+        let second_root = second
+            .create_root_with_config(Some(other.clone()), Vec::new(), None, |_| {
+                Ok::<_, String>(TestBackend::reporting(tx.clone(), None))
+            })
+            .unwrap();
+        let first_actor = first_root.actor().unwrap();
+        let second_actor = second_root.actor().unwrap();
+        let first_ticket = first_actor
+            .admit_turn(input(), None, "first".into())
+            .unwrap();
+        let first_turn = rx.recv_async().await.unwrap();
+        let child = first_turn
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let second_ticket = second_actor
+            .admit_turn(input(), None, "second".into())
+            .unwrap();
+        let second_turn = rx.recv_async().await.unwrap();
+        assert!(Arc::ptr_eq(
+            &first_turn.policy_snapshot().unwrap().provider,
+            &initial.provider
+        ));
+        assert!(Arc::ptr_eq(
+            &second_turn.policy_snapshot().unwrap().provider,
+            &other.provider
+        ));
+        assert_eq!(
+            first_turn.policy_snapshot().unwrap().model.id,
+            initial.model.id
+        );
+        assert_eq!(
+            second_turn.policy_snapshot().unwrap().model.id,
+            other.model.id
+        );
+        assert!(!first_turn.policy_snapshot().unwrap().fast);
+        assert!(second_turn.policy_snapshot().unwrap().fast);
+        assert!(!child.effective_config().unwrap().unwrap().fast);
+        assert!(matches!(
+            first.update_policy(child.id(), other.clone()),
+            Err(ManagerError::Policy(_))
+        ));
+        assert!(Arc::ptr_eq(
+            &first_root.effective_config().unwrap().unwrap().provider,
+            &initial.provider
+        ));
+        assert!(Arc::ptr_eq(
+            &second_root.effective_config().unwrap().unwrap().provider,
+            &other.provider
+        ));
+        gate.release(1);
+        first_actor
+            .wait_outcome(first_ticket.turn_id())
+            .await
+            .unwrap();
+        second_actor
+            .wait_outcome(second_ticket.turn_id())
+            .await
+            .unwrap();
+        first.shutdown(std::time::Duration::from_secs(1)).await;
+        second.shutdown(std::time::Duration::from_secs(1)).await;
+    });
+}
+
+#[test]
 fn child_spawn_without_parent_policy_fails_closed() {
     let (manager, root, current, gate) = {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();

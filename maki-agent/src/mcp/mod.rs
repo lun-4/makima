@@ -259,6 +259,14 @@ struct PromptRef {
 }
 
 #[derive(Clone)]
+pub struct McpPromptBinding {
+    qualified_name: String,
+    raw_name: String,
+    transport: Arc<dyn McpTransport>,
+    identity: Arc<()>,
+}
+
+#[derive(Clone)]
 pub struct McpPromptInfo {
     pub display_name: String,
     pub qualified_name: String,
@@ -796,21 +804,51 @@ impl McpHandle {
         transport::call_tool(transport.as_ref(), &raw_name, args).await
     }
 
+    pub fn prompt_binding(&self, qualified_name: &str) -> Option<McpPromptBinding> {
+        let state = self.published.load();
+        let prompt = state.index.prompts.get(qualified_name)?;
+        Some(McpPromptBinding {
+            qualified_name: qualified_name.to_owned(),
+            raw_name: prompt.raw_name.clone(),
+            transport: Arc::clone(&prompt.transport),
+            identity: Arc::clone(&prompt.identity),
+        })
+    }
+
+    pub async fn get_bound_prompt(
+        &self,
+        binding: &McpPromptBinding,
+        arguments: &HashMap<String, String>,
+    ) -> Result<Vec<protocol::PromptMessage>, McpError> {
+        let current = self.published.load();
+        let valid = current
+            .index
+            .prompts
+            .get(&binding.qualified_name)
+            .is_some_and(|prompt| {
+                Arc::ptr_eq(&prompt.identity, &binding.identity)
+                    && Arc::ptr_eq(&prompt.transport, &binding.transport)
+                    && prompt.raw_name == binding.raw_name
+            });
+        if !valid {
+            return Err(McpError::UnknownPrompt {
+                name: binding.qualified_name.clone(),
+            });
+        }
+        transport::get_prompt(binding.transport.as_ref(), &binding.raw_name, arguments).await
+    }
+
     pub async fn get_prompt(
         &self,
         qualified_name: &str,
         arguments: &HashMap<String, String>,
     ) -> Result<Vec<protocol::PromptMessage>, McpError> {
-        let (raw_name, transport) = {
-            let state = self.published.load();
-            let Some(p) = state.index.prompts.get(qualified_name) else {
-                return Err(McpError::UnknownPrompt {
-                    name: qualified_name.into(),
-                });
-            };
-            (p.raw_name.clone(), Arc::clone(&p.transport))
-        };
-        transport::get_prompt(transport.as_ref(), &raw_name, arguments).await
+        let binding =
+            self.prompt_binding(qualified_name)
+                .ok_or_else(|| McpError::UnknownPrompt {
+                    name: qualified_name.to_owned(),
+                })?;
+        self.get_bound_prompt(&binding, arguments).await
     }
 
     pub async fn shutdown(&self) {
@@ -1704,6 +1742,34 @@ mod tests {
     use test_case::test_case;
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+    #[test]
+    fn prompt_binding_rejects_replacement_before_transport_call() {
+        let session = test_support::stub_session(&[]);
+        let identity = Arc::new(());
+        let transport: Arc<dyn McpTransport> = FakeTransport::new();
+        let prompt = || PromptRef {
+            raw_name: "example".into(),
+            transport: Arc::clone(&transport),
+            identity: Arc::clone(&identity),
+        };
+        let mut first = McpPublishedState::default();
+        first.index.prompts.insert("stub.example".into(), prompt());
+        session.handle.published.store(Arc::new(first));
+        let binding = session.prompt_binding("stub.example").unwrap();
+        let mut replacement = McpPublishedState::default();
+        replacement.index.prompts.insert(
+            "stub.example".into(),
+            PromptRef {
+                raw_name: "example".into(),
+                transport,
+                identity: Arc::new(()),
+            },
+        );
+        session.handle.published.store(Arc::new(replacement));
+        let result = smol::block_on(session.get_bound_prompt(&binding, &HashMap::new()));
+        assert!(matches!(result, Err(McpError::UnknownPrompt { .. })));
+    }
 
     #[test_case(false ; "removed")]
     #[test_case(true ; "replaced")]

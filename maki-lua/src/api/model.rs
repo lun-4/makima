@@ -2,11 +2,13 @@
 //! read their own model without a UI.
 
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::{Model, RequestOptions};
 use mlua::{Error as LuaError, Lua, Result as LuaResult, UserDataRef, Value};
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair};
+use crate::runtime::{TaskHandle, lock_cell};
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
 
@@ -41,18 +43,53 @@ async fn get(
         let Some(agent) = ctx.agent() else {
             return Ok(err_pair(ctx.cap_err("maki.model.get")));
         };
-        let model = &agent.model;
-        let result = lua.create_table()?;
-        result.set("spec", model.spec())?;
-        result.set("id", model.id.as_str())?;
-        result.set("provider", model.provider.to_string())?;
-        result.set("thinking", agent.opts.thinking.to_string())?;
-        result.set("fast", agent.opts.fast)?;
-        result.set("supports_thinking", model.supports_thinking())?;
-        result.set("supports_fast", model.supports_fast())?;
-        return Ok((Some(Value::Table(result)), None));
+        return model_value(&lua, &agent.model, &agent.opts);
+    }
+    if tx.is_none() {
+        if let Some(handle) = lua.app_data_ref::<TaskHandle>()
+            && let Some(policy) = lock_cell(&handle)
+                .managed_turn
+                .as_ref()
+                .and_then(|turn| turn.policy_snapshot().cloned())
+        {
+            return model_value(
+                &lua,
+                &policy.model,
+                &RequestOptions {
+                    thinking: policy.thinking,
+                    fast: policy.fast,
+                },
+            );
+        }
+        if let Some(slot) = lua.app_data_ref::<crate::api::session::SessionSnapshotSlot>() {
+            let snapshot = match (slot.0)(None) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Ok(err_pair(error)),
+            };
+            let Some(spec) = snapshot.get("model").and_then(serde_json::Value::as_str) else {
+                return Ok(err_pair("session model is unavailable"));
+            };
+            let model = match Model::from_spec(spec) {
+                Ok(model) => model,
+                Err(error) => return Ok(err_pair(error.to_string())),
+            };
+            let opts = RequestOptions::default();
+            return model_value(&lua, &model, &opts);
+        }
     }
     roundtrip(lua, tx, ModelRequest::Get).await
+}
+
+fn model_value(lua: &Lua, model: &Model, opts: &RequestOptions) -> LuaResult<Pair<Value>> {
+    let result = lua.create_table()?;
+    result.set("spec", model.spec())?;
+    result.set("id", model.id.as_str())?;
+    result.set("provider", model.provider.to_string())?;
+    result.set("thinking", opts.thinking.to_string())?;
+    result.set("fast", opts.fast)?;
+    result.set("supports_thinking", model.supports_thinking())?;
+    result.set("supports_fast", model.supports_fast())?;
+    Ok((Some(Value::Table(result)), None))
 }
 
 /// Lists the model specs you can switch to: what the providers you are logged
@@ -215,6 +252,20 @@ mod tests {
             eval(&lua, "return model.get()"),
             (Json::Null, Some(NO_UI_ERR.to_owned()))
         );
+    }
+
+    #[test]
+    fn headless_single_session_model_fallback() {
+        let lua = lua_with_model(None);
+        lua.set_app_data(crate::api::session::SessionSnapshotSlot(Box::new(|id| {
+            assert!(id.is_none());
+            Ok(json!({ "model": SPEC }))
+        })));
+        let model = Model::from_spec(SPEC).unwrap();
+        let (actual, error) = eval(&lua, "return model.get()");
+        assert_eq!(error, None);
+        assert_eq!(actual["spec"], model.spec());
+        assert_eq!(actual["provider"], model.provider.to_string());
     }
 
     /// Every way of not getting an answer lands in the error slot, instead of

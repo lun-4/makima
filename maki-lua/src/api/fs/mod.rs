@@ -869,6 +869,45 @@ mod tests {
         assert!(!outside.path().join("plan.md").exists());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restrictive_plan_write_creates_only_safe_parents() {
+        let tmp = TempDir::new().unwrap();
+        let plan = tmp.path().join("new/nested/plan.md");
+        let lua = Lua::new();
+        let mut cell =
+            crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
+        cell.restrict_effects = true;
+        cell.plan_write_path = Some(std::sync::Arc::from(plan.clone()));
+        lua.set_app_data(cell.into_handle());
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let mkdir: mlua::Function = table.get("mkdir").unwrap();
+        let (ok, err): (Option<bool>, Option<String>) =
+            smol::block_on(mkdir.call_async(plan.parent().unwrap().to_string_lossy().as_ref()))
+                .unwrap();
+        assert_eq!((ok, err.as_deref()), (None, Some(PLAN_MUTATION_DENIED)));
+        assert!(!plan.parent().unwrap().exists());
+
+        let write: mlua::Function = table.get("atomic_write").unwrap();
+        let (ok, err): (Option<bool>, Option<String>) =
+            smol::block_on(write.call_async((plan.to_string_lossy().as_ref(), FIRST_CONTENT)))
+                .unwrap();
+        assert_eq!((ok, err), (Some(true), None));
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), FIRST_CONTENT);
+
+        let outside = TempDir::new().unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let linked_plan = linked.join("new/plan.md");
+        crate::runtime::lock_cell(&lua.app_data_ref::<TaskHandle>().unwrap()).plan_write_path =
+            Some(std::sync::Arc::from(linked_plan.clone()));
+        let (ok, _): (Option<bool>, Option<String>) =
+            smol::block_on(write.call_async((linked_plan.to_string_lossy().as_ref(), "no")))
+                .unwrap();
+        assert_eq!(ok, None);
+        assert!(!outside.path().join("new").exists());
+    }
+
     #[test]
     fn read_file_ok() {
         let tmp = TempDir::new().unwrap();
