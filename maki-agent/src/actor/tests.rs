@@ -1145,11 +1145,15 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         correlation: "c".into(),
     }));
     assert!(matches!(
-        queue.pop_interrupt(0),
+        queue.pop_interrupt(0, &crate::batch_key(&input("t"))),
         Some(ExtractedCommand::Compact(None))
     ));
     // A control at the front is incompatible: poll must not consume it.
-    assert!(queue.pop_interrupt(0).is_none());
+    assert!(
+        queue
+            .pop_interrupt(0, &crate::batch_key(&input("t")))
+            .is_none()
+    );
     assert_eq!(queue.len(), 1);
     // A turn at the front shields a root behind it.
     let admission = TurnAdmission {
@@ -1172,7 +1176,11 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         Vec::new(),
         "r2".into(),
     )));
-    assert!(queue.pop_interrupt(0).is_none());
+    assert!(
+        queue
+            .pop_interrupt(0, &crate::batch_key(&input("t")))
+            .is_none()
+    );
     assert_eq!(
         queue.len(),
         3,

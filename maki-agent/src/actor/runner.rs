@@ -289,6 +289,7 @@ impl Runner {
                     Arc::clone(&self.inner),
                     popped_generation,
                     admission.generation,
+                    admission.input.as_ref().and_then(crate::batch_key),
                 )) as Arc<dyn InterruptSource>),
                 managed_turn: managed_turn.clone(),
                 admission: admission.admission.clone(),
