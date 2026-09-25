@@ -15,6 +15,7 @@ pub(crate) struct ManagedTurnAdmission {
     pub(crate) manager: std::sync::Weak<ManagerInner>,
     pub(crate) agent_id: AgentId,
     pub(crate) ceiling: Option<RunSettings>,
+    pub(crate) mode_ceiling: Option<crate::AgentMode>,
 }
 
 /// The actor's immutable per-admission settings shape.
@@ -25,11 +26,13 @@ impl ManagedTurnAdmission {
         manager: std::sync::Weak<ManagerInner>,
         agent_id: AgentId,
         ceiling: Option<RunSettings>,
+        mode_ceiling: Option<crate::AgentMode>,
     ) -> Self {
         Self {
             manager,
             agent_id,
             ceiling,
+            mode_ceiling,
         }
     }
 }

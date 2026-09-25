@@ -1562,6 +1562,25 @@ fn targeted_cancel_settles_deferred_turn_before_policy_commit() {
 }
 
 #[test]
+fn precancelled_deferred_turn_is_cancelled_after_policy_commit() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let reservation = handle.reserve_policy_update().unwrap();
+        handle.cancel_correlation("deferred", TurnCancellationReason::User);
+        let ticket = handle
+            .admit_turn(input("cancelled"), None, "deferred".into())
+            .unwrap();
+        reservation.resolve(Ok(policy(true))).unwrap();
+        assert!(matches!(ticket.wait().await, TurnOutcome::Cancelled { .. }));
+        assert!(observed.policies.lock().unwrap().is_empty());
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn dropped_reservation_releases_async_admission() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();

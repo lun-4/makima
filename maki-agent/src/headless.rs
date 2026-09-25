@@ -710,9 +710,8 @@ pub struct InteractiveHandle {
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
     pub control_tx: flume::Sender<InteractiveControl>,
-    /// Install a model here to change it. Adoption is a store, so it lands on
-    /// the run's next request rather than waiting for the turn to end, and it
-    /// never blocks a caller behind a running turn.
+    /// Install a model here to change it. A running turn keeps its admitted
+    /// model. The new model applies when the next turn wakes.
     pub model: crate::SharedModel,
     pub session_id: SessionRef,
     pub mailbox: SessionMailbox,
@@ -971,7 +970,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     mut input,
                     settings,
                     prepared,
-                    admission,
+                    mut admission,
                 } = queued;
                 let turn_id = TurnId::generate();
                 let lease_committer = input.lease_committer.clone();
@@ -995,6 +994,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 // is racing cancel: a slow server must not pin the whole session.
                 if let Some(mcp) = &mcp {
                     let _ = cancel.race(mcp.ready()).await;
+                    admission.bindings = Arc::new(crate::tools::TurnToolBindings::capture(
+                        ToolRegistry::global(),
+                        &params.local_tools,
+                        Some(mcp),
+                    ));
                 }
 
                 let (turn_event_tx, turn_event_rx) = flume::unbounded::<Envelope>();

@@ -42,6 +42,7 @@ type RunnerTask = smol::Task<()>;
 struct CommitPolicy {
     config: Option<crate::RunSettings>,
     ceiling: Option<crate::RunSettings>,
+    mode_ceiling: Option<crate::AgentMode>,
 }
 
 struct Node {
@@ -274,6 +275,7 @@ impl AgentManagerHandle {
             CommitPolicy {
                 config,
                 ceiling: None,
+                mode_ceiling: None,
             },
         )
     }
@@ -306,9 +308,9 @@ impl AgentManagerHandle {
         self.validate_manager(current)?;
         self.validate_active(current)?;
         let parent_id = current.agent_id();
-        if current.mode != Some(crate::AgentMode::Build) {
-            return Err(ManagerError::Policy("delegation requires a build-mode parent snapshot; restrictive tool and effect ceilings are unavailable".into()));
-        }
+        let parent_mode = current.mode.clone().ok_or_else(|| {
+            ManagerError::Policy("child delegation requires a parent mode snapshot".into())
+        })?;
         let inherited_config = current.policy_snapshot().ok_or_else(|| {
             ManagerError::Policy("child delegation requires a parent policy snapshot".into())
         })?;
@@ -424,6 +426,7 @@ impl AgentManagerHandle {
             CommitPolicy {
                 config: inherited_config.clone(),
                 ceiling: inherited_config,
+                mode_ceiling: Some(parent_mode),
             },
         )
     }
@@ -634,8 +637,12 @@ impl AgentManagerHandle {
         backend: Box<dyn ActorBackend>,
         policy: CommitPolicy,
     ) -> Result<AgentRef, ManagerError> {
-        let admission =
-            ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id, policy.ceiling);
+        let admission = ManagedTurnAdmission::new(
+            Arc::downgrade(&self.0),
+            agent_id,
+            policy.ceiling,
+            policy.mode_ceiling,
+        );
         let (actor, task) = AgentActorHandle::spawn_managed(
             agent_id,
             initial_messages,

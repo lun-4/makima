@@ -101,6 +101,7 @@ struct LuaActorState {
     system: String,
     tools: RequestTools,
     opts: RequestOptions,
+    mode: AgentMode,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
     child_cancel: CancelToken,
@@ -955,6 +956,8 @@ async fn session(
     opts: Table,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
+    let parent_mode = agent_ctx.mode.clone();
+    let restrictive_parent = agent_ctx.restrict_write_to().is_some();
     if crate::runtime::restrictive_effects(&lua) {
         return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
     }
@@ -989,7 +992,7 @@ async fn session(
     let fast: bool = opts
         .get::<Option<bool>>("fast")?
         .unwrap_or(agent_ctx.opts.fast);
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !restrictive_parent;
     let silent: bool = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
     let auto_deliver: bool = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
     let parent_agent_id = managed_turn.as_ref().map(|current| current.agent_id());
@@ -1120,6 +1123,29 @@ async fn session(
     // The array is the caller's, and the filter comes out of it, so whatever
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
+    let initial_tools = RequestTools::assembled(tools_json.clone(), &agent_ctx.config, &model);
+    let child_mode = if restrictive_parent {
+        let mut child_ctx = agent_ctx.to_tool_context();
+        child_ctx.audience = audience;
+        child_ctx.tool_filter = Arc::clone(initial_tools.filter());
+        let mut allowed: std::collections::HashSet<_> = tool_dispatch::callable(&child_ctx)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        allowed.extend(local_map.keys().cloned());
+        tools_json
+            .as_array_mut()
+            .expect("request tools are an array")
+            .retain(|definition| {
+                definition
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|name| allowed.contains(name))
+            });
+        parent_mode
+    } else {
+        AgentMode::Build
+    };
     let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let build_params = |agent_id| AgentParams {
@@ -1160,6 +1186,7 @@ async fn session(
         system: system.unwrap_or_default(),
         tools,
         opts,
+        mode: child_mode,
         mcp: agent_ctx
             .mcp
             .as_ref()
@@ -1288,12 +1315,13 @@ async fn session(
     // Tab submits go through the actor's admission, exactly like `send`.
     {
         let actor = actor.clone();
+        let mode = state.mode.clone();
         smol::spawn(async move {
             while let Ok(message) = ui_input_rx.recv_async().await {
                 let _ = actor.admit_turn(
                     AgentInput {
                         message,
-                        mode: AgentMode::Build,
+                        mode: mode.clone(),
                         images: Vec::new(),
                         preamble: Vec::new(),
                         thinking: opts.thinking,
@@ -1548,7 +1576,7 @@ async fn prompt(
     drop(this);
     let input = AgentInput {
         message,
-        mode: AgentMode::Build,
+        mode: state.mode.clone(),
         images: Vec::new(),
         preamble: Vec::new(),
         thinking: state.opts.thinking,
@@ -1698,7 +1726,7 @@ async fn send(
     match actor.admit_turn(
         AgentInput {
             message,
-            mode: AgentMode::Build,
+            mode: state.mode.clone(),
             images: Vec::new(),
             preamble: Vec::new(),
             thinking: state.opts.thinking,
@@ -2165,6 +2193,7 @@ mod tests {
                 thinking: ThinkingConfig::Off,
                 fast: false,
             },
+            mode: AgentMode::Build,
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx, RUN_ID),
             child_cancel,
