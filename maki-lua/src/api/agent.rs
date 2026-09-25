@@ -102,6 +102,7 @@ struct LuaActorState {
     tools: RequestTools,
     opts: RequestOptions,
     mode: AgentMode,
+    mode_def: Option<Arc<maki_agent::ModeDef>>,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
     child_cancel: CancelToken,
@@ -277,9 +278,13 @@ impl ActorBackend for LuaActorBackend {
                 .params
                 .get()
                 .expect("session parameters initialized before admission");
-            let mode_def = match &input.mode {
-                AgentMode::Custom(id) => params.modes.get(id).map(Arc::new),
-                _ => Some(Arc::new(params.modes.current(&input.mode))),
+            let mode_def = if input.mode == state.mode {
+                state.mode_def.clone().or_else(|| match &input.mode {
+                    AgentMode::Custom(id) => params.modes.get(id).map(Arc::new),
+                    _ => Some(Arc::new(params.modes.current(&input.mode))),
+                })
+            } else {
+                None
             };
             maki_agent::agent::TurnAdmissionSnapshot {
                 mode_def,
@@ -1187,6 +1192,9 @@ async fn session(
         tools,
         opts,
         mode: child_mode,
+        mode_def: restrictive_parent
+            .then(|| agent_ctx.mode_def.clone())
+            .flatten(),
         mcp: agent_ctx
             .mcp
             .as_ref()
@@ -2194,6 +2202,7 @@ mod tests {
                 fast: false,
             },
             mode: AgentMode::Build,
+            mode_def: None,
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx, RUN_ID),
             child_cancel,

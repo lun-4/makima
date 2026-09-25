@@ -104,6 +104,7 @@ pub(crate) struct ActorState {
 struct PendingPolicy {
     id: u64,
     result: Option<Result<RunSettings, ActorError>>,
+    completion: Arc<Mutex<Option<Result<(), ActorError>>>>,
 }
 
 enum DeferredAdmission {
@@ -143,6 +144,7 @@ impl DeferredAdmission {
 pub struct PolicyUpdateTicket {
     inner: Arc<ActorInner>,
     id: u64,
+    completion: Arc<Mutex<Option<Result<(), ActorError>>>>,
 }
 
 impl ActorInner {
@@ -194,22 +196,32 @@ impl PolicyUpdateTicket {
         self.resolve(Err(ActorError::PolicyCancelled))
     }
 
-    fn is_pending(&self) -> Result<bool, ActorError> {
+    fn pending_result(&self) -> Result<Option<Result<(), ActorError>>, ActorError> {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        Ok(state
+        if state
             .pending_policy
             .iter()
-            .any(|pending| pending.id == self.id))
+            .any(|pending| pending.id == self.id)
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.completion
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or(Ok(())),
+        ))
     }
 
     pub async fn wait(&self) -> Result<(), ActorError> {
         loop {
             let listener = self.inner.policy_changed.listen();
-            if !self.is_pending()? {
-                return Ok(());
+            if let Some(result) = self.pending_result()? {
+                return result;
             }
             listener.await;
         }
@@ -269,7 +281,10 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
         .is_some_and(|pending| pending.result.is_some())
     {
         let pending = state.pending_policy.pop_front().unwrap();
-        if let Ok(policy) = pending.result.unwrap() {
+        let result = pending.result.unwrap();
+        *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
+        if let Ok(policy) = result {
             state.policy_generation = state.policy_generation.wrapping_add(1);
             state.policy = Some(Arc::new(policy));
             inner.queue.push(ActorWork::PolicyBarrier {
@@ -824,12 +839,16 @@ impl AgentActorHandle {
         }
         state.next_policy_id = state.next_policy_id.wrapping_add(1);
         let id = state.next_policy_id;
-        state
-            .pending_policy
-            .push_back(PendingPolicy { id, result: None });
+        let completion = Arc::new(Mutex::new(None));
+        state.pending_policy.push_back(PendingPolicy {
+            id,
+            result: None,
+            completion: Arc::clone(&completion),
+        });
         Ok(PolicyUpdateTicket {
             inner: Arc::clone(&self.inner),
             id,
+            completion,
         })
     }
 
@@ -1063,9 +1082,11 @@ impl AgentActorHandle {
     pub fn cancel_existing(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
-        state.pending_policy.clear();
+        for pending in &mut state.pending_policy {
+            pending.result = Some(Err(ActorError::PolicyCancelled));
+        }
+        flush_policy_updates(&self.inner, &mut state);
         let deferred = state.deferred_admissions.drain(..).collect::<Vec<_>>();
-        self.inner.policy_changed.notify(usize::MAX);
         let active = state.active.take();
         let drained = self.inner.queue.drain_all();
         drop(state);

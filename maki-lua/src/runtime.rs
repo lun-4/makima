@@ -333,6 +333,7 @@ pub enum Request {
         input: Value,
         live: LiveCtx,
         ctx: Box<LuaCtx>,
+        plan_write_path: Option<Arc<std::path::Path>>,
         reply: flume::Sender<()>,
         /// See [`Request::CallTool::nested`].
         nested: bool,
@@ -1968,6 +1969,11 @@ struct ToolKeys {
     permission_scopes: Option<RegistryKey>,
     mutable_path: Option<RegistryKey>,
     describe: Option<RegistryKey>,
+}
+
+struct StartRestrictions {
+    plan_write_path: Option<Arc<std::path::Path>>,
+    restrict_effects: bool,
 }
 
 struct PluginOwner {
@@ -4322,11 +4328,11 @@ async fn run_tool_start(
     input: Value,
     live: LiveCtx,
     ctx: Box<LuaCtx>,
+    restrictions: StartRestrictions,
 ) {
     let mut cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
-    cell.restrict_effects = ctx
-        .agent()
-        .is_some_and(|agent| agent.restrict_write_to().is_some());
+    cell.plan_write_path = restrictions.plan_write_path;
+    cell.restrict_effects = restrictions.restrict_effects;
     let scope = TaskScope::new(lua, cell);
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
@@ -5195,16 +5201,18 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             input,
                             live,
                             ctx,
+                            plan_write_path,
                             reply,
                             nested,
                         } => {
-                            let func = {
+                            let (func, bundled_read_only) = {
                                 let plugins = rt.plugins.borrow();
-                                plugins
-                                    .get(&*plugin)
+                                let owner = plugins.get(&*plugin);
+                                let func = owner
                                     .and_then(|p| p.tools.get(&*tool))
                                     .and_then(|tk| tk.start.as_ref())
-                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok())
+                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok());
+                                (func, owner.is_some_and(|owner| owner.bundled_read_only))
                             };
                             let Some(func) = func else {
                                 let _ = reply.send(());
@@ -5217,8 +5225,24 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     true => None,
                                     false => Some(g.acquire().await),
                                 };
-                                covered(slot, run_tool_start(&lua, func, &tool, input, live, ctx))
-                                    .await;
+                                let restrictions = StartRestrictions {
+                                    restrict_effects: plan_write_path.is_some()
+                                        && !bundled_read_only,
+                                    plan_write_path,
+                                };
+                                covered(
+                                    slot,
+                                    run_tool_start(
+                                        &lua,
+                                        func,
+                                        &tool,
+                                        input,
+                                        live,
+                                        ctx,
+                                        restrictions,
+                                    ),
+                                )
+                                .await;
                                 let _ = reply.send(());
                             })
                             .detach();
