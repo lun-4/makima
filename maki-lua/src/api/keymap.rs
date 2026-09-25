@@ -365,6 +365,9 @@ fn set(
     rhs: mlua::Function,
     opts: Option<Table>,
 ) -> LuaResult<()> {
+    if crate::runtime::restrictive_effects(lua) {
+        return Err(mlua::Error::runtime("plan mode prohibits keymap changes"));
+    }
     if mode != "n" {
         return Err(mlua::Error::runtime(format!(
             "unsupported keymap mode: {mode}"
@@ -411,6 +414,9 @@ fn del(
     mode: String,
     lhs: String,
 ) -> LuaResult<()> {
+    if crate::runtime::restrictive_effects(lua) {
+        return Err(mlua::Error::runtime("plan mode prohibits keymap changes"));
+    }
     let _ = mode;
     let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
     let old = if loading(lua, &plugin) {

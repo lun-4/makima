@@ -20,12 +20,13 @@ Tab toggles between them (build is the default).
 - **plan `[PLAN]`** - analyse and plan. The mode names one plan file as its
   intended write target, and the model gets a directive not to change other files.
 
-Switching to plan mode allocates a plan file under `plans/`. Native and Lua
-plugin filesystem writes, including writes to that file, are currently denied
-until plan-file writes can be made race-safe. Shell commands, MCP execution,
-deferred MCP search, and Lua-registered tools (including bundled read and
-search tools) are denied even with YOLO on until the host can verify their
-effects.
+Switching to plan mode allocates a plan file under `plans/`. Bundled read,
+glob, and grep tools remain available. Bundled write and edit tools can change
+only the designated plan file; the host opens its parent without following
+symlinks and replaces the file through that directory handle. The parent must
+already exist. On platforms without this anchored write path, writes fail
+closed. Other Lua tools, shell commands, MCP execution, and deferred MCP
+search are denied even with YOLO on.
 
 Model changes apply to later admitted turns. Active turns keep their selected
 model through continuations. Queued roots do not fold across a model-policy

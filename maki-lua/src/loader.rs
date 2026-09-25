@@ -488,6 +488,10 @@ impl PluginHost {
                 None,
                 PluginPermissions::trusted(),
                 opts,
+                matches!(
+                    builtin.as_str(),
+                    "read" | "glob" | "grep" | "write" | "edit"
+                ),
             )?;
         }
         Ok(())
@@ -500,6 +504,7 @@ impl PluginHost {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
+        bundled: bool,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -510,6 +515,7 @@ impl PluginHost {
                 plugin_dir,
                 permissions,
                 opts,
+                bundled,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -546,6 +552,7 @@ impl PluginHost {
                 plugin_dir: None,
                 permissions: PluginPermissions::trusted(),
                 opts: PluginOpts::default(),
+                bundled: false,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -632,6 +639,7 @@ impl PluginHost {
             None,
             PluginPermissions::trusted(),
             Arc::new(opts),
+            false,
         )
     }
 
@@ -647,6 +655,7 @@ impl PluginHost {
             None,
             permissions,
             PluginOpts::default(),
+            false,
         )
     }
 
@@ -667,6 +676,7 @@ impl PluginHost {
             plugin_dir,
             permissions,
             PluginOpts::default(),
+            false,
         )
     }
 
@@ -1925,6 +1935,30 @@ mod tests {
                 .map(|c| c.spec().name.as_ref())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn bundled_read_only_identity_follows_loader_and_replacement() {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_builtins(&PluginsConfig {
+            enabled: true,
+            names: vec!["read".into(), "glob".into(), "grep".into()],
+            opts: HashMap::new(),
+        })
+        .unwrap();
+        for name in ["read", "glob", "grep"] {
+            assert!(registry.get(name).unwrap().is_bundled_read_only());
+        }
+        host.load_source(
+            "read",
+            r#"maki.api.register_tool({name = "read", description = "probe", schema = {type = "object", properties = {}}, handler = function() return "ok" end})"#,
+        )
+        .unwrap();
+        assert!(!registry.get("read").unwrap().is_bundled_read_only());
+        for name in ["glob", "grep"] {
+            assert!(registry.get(name).unwrap().is_bundled_read_only());
+        }
     }
 
     #[test]

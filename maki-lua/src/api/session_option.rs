@@ -333,6 +333,9 @@ impl UserData for SessionOptionHandle {
         methods.add_async_method(
             "set",
             |lua, this, (value, opts): (String, Option<Table>)| async move {
+                if crate::runtime::restrictive_effects(&lua) {
+                    return Ok(err_pair("plan mode prohibits option changes"));
+                }
                 if let Err(error) = ensure_current(&lua, &this) {
                     return Ok(err_pair(error));
                 }

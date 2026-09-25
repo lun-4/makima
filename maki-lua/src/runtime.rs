@@ -200,11 +200,13 @@ pub enum Request {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
+        bundled: bool,
         reply: flume::Sender<LoadResult>,
     },
     CallTool {
         plugin: Arc<str>,
         tool: Arc<str>,
+        generation: u64,
         input: Value,
         ctx: Box<LuaCtx>,
         deadline: Option<Instant>,
@@ -1958,6 +1960,7 @@ async fn drain_barrier(
 }
 
 struct ToolKeys {
+    generation: u64,
     handler: RegistryKey,
     header: Option<RegistryKey>,
     restore: Option<RegistryKey>,
@@ -3164,14 +3167,14 @@ impl LuaRuntime {
 
     async fn load_source(
         &mut self,
-        identity: (Arc<str>, &str),
+        identity: (Arc<str>, &str, bool),
         source: &str,
         plugin_dir: Option<PathBuf>,
         permissions: &PluginPermissions,
         opts: PluginOpts,
         config_store: Option<&ConfigStore>,
     ) -> LoadResult {
-        let (name, source_name) = identity;
+        let (name, source_name, bundled) = identity;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: source_name.to_owned(),
             source: e,
@@ -3305,6 +3308,7 @@ impl LuaRuntime {
                     kind: t.kind.clone(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
+                    generation,
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
                     permission_scope_kind: t
@@ -3320,8 +3324,14 @@ impl LuaRuntime {
                 });
                 (
                     tool,
-                    ToolSource::Lua {
-                        plugin: Arc::clone(&name),
+                    if bundled {
+                        ToolSource::Bundled {
+                            plugin: Arc::clone(&name),
+                        }
+                    } else {
+                        ToolSource::Lua {
+                            plugin: Arc::clone(&name),
+                        }
                     },
                 )
             })
@@ -3558,6 +3568,7 @@ impl LuaRuntime {
                 (
                     t.name,
                     ToolKeys {
+                        generation,
                         handler: t.handler_key,
                         header: t.header_key,
                         restore: t.restore_key,
@@ -3774,7 +3785,7 @@ impl LuaRuntime {
             })
             .unwrap_or_else(PluginPermissions::trusted);
         self.load_source(
-            (owner, source_name),
+            (owner, source_name, false),
             source,
             plugin_dir,
             &perms,
@@ -4325,6 +4336,7 @@ async fn run_tool_call(
     lua: Lua,
     plugin: Arc<str>,
     tool: Arc<str>,
+    generation: u64,
     input: Value,
     mut ctx: Box<LuaCtx>,
     deadline: Option<Instant>,
@@ -4342,6 +4354,9 @@ async fn run_tool_call(
         let Some(tool_keys) = owner.tools.get(&*tool) else {
             return ToolCallReply::err(format!("tool not found: {tool}"));
         };
+        if tool_keys.generation != generation {
+            return ToolCallReply::err(format!("tool binding changed: {tool}"));
+        }
         match lua.registry_value(&tool_keys.handler) {
             Ok(f) => f,
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -4765,12 +4780,13 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             plugin_dir,
                             permissions,
                             opts,
+                            bundled,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             let res = rt
                                 .load_source(
-                                    (Arc::clone(&name), &name),
+                                    (Arc::clone(&name), &name, bundled),
                                     &source,
                                     plugin_dir,
                                     &permissions,
@@ -4783,6 +4799,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::CallTool {
                             plugin,
                             tool,
+                            generation,
                             input,
                             ctx,
                             deadline,
@@ -4815,6 +4832,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         lua.clone(),
                                         plugin,
                                         tool,
+                                        generation,
                                         input,
                                         ctx,
                                         deadline,

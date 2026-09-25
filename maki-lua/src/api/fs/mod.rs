@@ -139,21 +139,53 @@ pub(crate) fn plan_write_path(lua: &Lua) -> Option<std::sync::Arc<Path>> {
 }
 
 fn mutation_allowed(lua: &Lua, target: &Path, write: bool) -> Result<(), &'static str> {
-    if crate::runtime::restrictive_effects(lua) {
+    if crate::runtime::restrictive_effects(lua) && plan_write_path(lua).is_none() {
         return Err(PLAN_MUTATION_DENIED);
     }
     let Some(plan) = plan_write_path(lua) else {
         return Ok(());
     };
-    #[cfg(feature = "test-support")]
-    if write
-        && target == plan.as_ref()
-        && backend(lua).as_ref().type_id() == std::any::TypeId::of::<InMemoryFs>()
-    {
+    if write && normalize_target(target) == normalize_target(&plan) {
         return Ok(());
     }
-    let _ = (target, write, plan);
     Err(PLAN_MUTATION_DENIED)
+}
+
+fn normalize_target(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+async fn write_plan(lua: &Lua, path: PathBuf, content: Vec<u8>) -> std::io::Result<()> {
+    if backend(lua).as_ref().type_id() == std::any::TypeId::of::<RealFs>() {
+        #[cfg(target_os = "linux")]
+        return smol::unblock(move || {
+            real::anchored_plan_write(&normalize_target(&path), &content)
+        })
+        .await;
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            PLAN_MUTATION_DENIED,
+        ));
+    }
+    #[cfg(feature = "test-support")]
+    if backend(lua).as_ref().type_id() == std::any::TypeId::of::<InMemoryFs>() {
+        return backend(lua).atomic_write(path, content).await;
+    }
+    Err(std::io::Error::new(
+        ErrorKind::PermissionDenied,
+        PLAN_MUTATION_DENIED,
+    ))
 }
 
 fn path_to_string(p: &Path) -> LuaResult<String> {
@@ -489,8 +521,11 @@ async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>>
     if let Err(err) = mutation_allowed(&lua, &abs, true) {
         return Ok(err_pair(err));
     }
-    let fs = backend(&lua);
-    let result = fs.write(abs, content.into_bytes()).await;
+    let result = if plan_write_path(&lua).is_some() {
+        write_plan(&lua, abs, content.into_bytes()).await
+    } else {
+        backend(&lua).write(abs, content.into_bytes()).await
+    };
     Ok(pair(result.map(|()| true)))
 }
 
@@ -510,8 +545,11 @@ async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair
     if let Err(err) = mutation_allowed(&lua, &abs, true) {
         return Ok(err_pair(err));
     }
-    let fs = backend(&lua);
-    let result = fs.atomic_write(abs, content.into_bytes()).await;
+    let result = if plan_write_path(&lua).is_some() {
+        write_plan(&lua, abs, content.into_bytes()).await
+    } else {
+        backend(&lua).atomic_write(abs, content.into_bytes()).await
+    };
     Ok(pair(result.map(|()| true)))
 }
 
@@ -786,34 +824,49 @@ mod tests {
         assert!(fs.files().is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn plan_guard_denies_real_fs_even_for_plan_path() {
+    fn plan_guard_writes_only_anchored_real_plan_file() {
         let tmp = TempDir::new().unwrap();
         let plan = tmp.path().join("plan.md");
+        let other = tmp.path().join("other.md");
         let lua = Lua::new();
         let mut cell =
             crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
         cell.plan_write_path = Some(std::sync::Arc::from(plan.clone()));
         lua.set_app_data(cell.into_handle());
-        assert_eq!(
-            mutation_allowed(&lua, &plan, true),
-            Err(PLAN_MUTATION_DENIED)
-        );
         let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
-        lua.globals().set("fs", table).unwrap();
         for operation in ["write", "atomic_write"] {
-            let func: mlua::Function = lua
-                .globals()
-                .get::<Table>("fs")
-                .unwrap()
-                .get(operation)
-                .unwrap();
+            let func: mlua::Function = table.get(operation).unwrap();
             let (ok, err): (Option<bool>, Option<String>) =
-                smol::block_on(func.call_async((plan.to_string_lossy().as_ref(), "no"))).unwrap();
+                smol::block_on(func.call_async((plan.to_string_lossy().as_ref(), operation)))
+                    .unwrap();
+            assert_eq!((ok, err), (Some(true), None));
+            assert_eq!(std::fs::read_to_string(&plan).unwrap(), operation);
+            let (ok, err): (Option<bool>, Option<String>) =
+                smol::block_on(func.call_async((other.to_string_lossy().as_ref(), "no"))).unwrap();
             assert_eq!(ok, None);
             assert_eq!(err.as_deref(), Some(PLAN_MUTATION_DENIED));
         }
-        assert!(!plan.exists());
+        std::fs::remove_file(&plan).unwrap();
+        std::os::unix::fs::symlink(&other, &plan).unwrap();
+        let func: mlua::Function = table.get("atomic_write").unwrap();
+        let (ok, _): (Option<bool>, Option<String>) =
+            smol::block_on(func.call_async((plan.to_string_lossy().as_ref(), "no"))).unwrap();
+        assert_eq!(ok, None);
+        assert!(!other.exists());
+
+        let outside = TempDir::new().unwrap();
+        let linked_parent = tmp.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), &linked_parent).unwrap();
+        let linked_plan = linked_parent.join("plan.md");
+        crate::runtime::lock_cell(&lua.app_data_ref::<TaskHandle>().unwrap()).plan_write_path =
+            Some(std::sync::Arc::from(linked_plan.clone()));
+        let (ok, _): (Option<bool>, Option<String>) =
+            smol::block_on(func.call_async((linked_plan.to_string_lossy().as_ref(), "no")))
+                .unwrap();
+        assert_eq!(ok, None);
+        assert!(!outside.path().join("plan.md").exists());
     }
 
     #[test]

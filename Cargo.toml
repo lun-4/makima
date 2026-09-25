@@ -136,7 +136,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm"] }
 flume = { version = "0.11", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
-rustix = { version = "1", default-features = false, features = ["process"] }
+rustix = { version = "1", default-features = false, features = ["process", "fs"] }
 humantime = "2"
 toml = "0.8"
 toml_edit = "0.22"

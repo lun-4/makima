@@ -197,6 +197,11 @@ fn create_autocmd(
     event: Value,
     opts: Table,
 ) -> LuaResult<u64> {
+    if crate::runtime::restrictive_effects(lua) {
+        return Err(mlua::Error::runtime(
+            "plan mode prohibits autocmd registration",
+        ));
+    }
     let events = parse_string_or_seq(event, "event")?;
     let callback: Function = opts.get("callback")?;
     let once: bool = opts.get("once").unwrap_or(false);
@@ -253,6 +258,9 @@ fn del_autocmd(
     #[ctx] plugin: Arc<str>,
     id: u64,
 ) -> LuaResult<()> {
+    if crate::runtime::restrictive_effects(lua) {
+        return Err(mlua::Error::runtime("plan mode prohibits autocmd removal"));
+    }
     if crate::runtime::loading_plugin_is(lua, &plugin) {
         pending
             .lock()
@@ -285,6 +293,9 @@ fn exec_autocmds(
     event: Value,
     opts: Option<Table>,
 ) -> LuaResult<()> {
+    if crate::runtime::restrictive_effects(lua) {
+        return Err(mlua::Error::runtime("plan mode prohibits autocmd dispatch"));
+    }
     let events = parse_string_or_seq(event, "event")?;
     let (pattern, data) = match opts {
         Some(opts) => {
