@@ -1232,6 +1232,7 @@ impl AgentActorHandle {
             Arc::clone(&self.inner),
             generation,
             policy_generation,
+            None,
         ))
     }
 

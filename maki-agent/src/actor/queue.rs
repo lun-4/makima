@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::types::EarlierRoot;
 use super::{ActorInner, ActorWork, RootWork, TurnAdmission};
-use crate::ExtractedCommand;
 use crate::types::TurnId;
+use crate::{BatchKey, ExtractedCommand};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -269,10 +269,16 @@ impl ActorQueue {
     /// fold into the active turn as `Interrupt`; compacts become `Compact`.
     /// Turns and controls are never popped here, so interrupt polling cannot
     /// discard incompatible FIFO entries.
-    pub(crate) fn pop_interrupt(&self, generation: u64) -> Option<ExtractedCommand> {
+    pub(crate) fn pop_interrupt(
+        &self,
+        generation: u64,
+        batch_key: &Option<BatchKey>,
+    ) -> Option<ExtractedCommand> {
         let mut items = lock(&self.items);
         match items.front() {
-            Some(ActorWork::Root(root)) if root.generation == generation => {}
+            Some(ActorWork::Root(root))
+                if root.generation == generation && &crate::batch_key(&root.input) == batch_key => {
+            }
             Some(ActorWork::Compact { .. }) => {}
             _ => return None,
         }
@@ -317,6 +323,7 @@ pub struct InterruptQueue {
     inner: Arc<ActorInner>,
     cancellation_generation: u64,
     policy_generation: u64,
+    batch_key: Option<BatchKey>,
 }
 
 impl InterruptQueue {
@@ -324,11 +331,13 @@ impl InterruptQueue {
         inner: Arc<ActorInner>,
         cancellation_generation: u64,
         policy_generation: u64,
+        batch_key: Option<BatchKey>,
     ) -> Self {
         Self {
             inner,
             cancellation_generation,
             policy_generation,
+            batch_key,
         }
     }
 }
@@ -337,7 +346,11 @@ impl crate::InterruptSource for InterruptQueue {
     fn poll(&self) -> Option<ExtractedCommand> {
         let state = lock(&self.inner.state);
         (state.cancellation_generation == self.cancellation_generation)
-            .then(|| self.inner.queue.pop_interrupt(self.policy_generation))
+            .then(|| {
+                self.inner
+                    .queue
+                    .pop_interrupt(self.policy_generation, &self.batch_key)
+            })
             .flatten()
     }
 }
@@ -433,18 +446,41 @@ mod tests {
         queue.push(ActorWork::Root(old));
         queue.push(ActorWork::Root(new));
 
-        assert!(queue.pop_interrupt(2).is_none());
+        assert!(
+            queue
+                .pop_interrupt(2, &crate::batch_key(&test_input("old")))
+                .is_none()
+        );
         assert_eq!(queue.len(), 2);
-        let Some(ExtractedCommand::Interrupt(inputs)) = queue.pop_interrupt(1) else {
+        let Some(ExtractedCommand::Interrupt(inputs)) =
+            queue.pop_interrupt(1, &crate::batch_key(&test_input("old")))
+        else {
             panic!("expected interrupt");
         };
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].message, "old");
-        let Some(ExtractedCommand::Interrupt(inputs)) = queue.pop_interrupt(2) else {
+        let Some(ExtractedCommand::Interrupt(inputs)) =
+            queue.pop_interrupt(2, &crate::batch_key(&test_input("old")))
+        else {
             panic!("expected next interrupt");
         };
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].message, "new");
+    }
+
+    #[test]
+    fn interrupt_rejects_same_generation_different_mode() {
+        let queue = ActorQueue::new();
+        let mut plan = test_root("plan", 1, Vec::new());
+        plan.input.mode = AgentMode::Plan("plan.md".into());
+        queue.push(ActorWork::Root(plan));
+
+        assert!(
+            queue
+                .pop_interrupt(0, &crate::batch_key(&test_input("build")))
+                .is_none()
+        );
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]
@@ -456,12 +492,18 @@ mod tests {
         next.generation = 1;
         queue.push(ActorWork::Root(next));
 
-        let Some(ExtractedCommand::Interrupt(inputs)) = queue.pop_interrupt(0) else {
+        let Some(ExtractedCommand::Interrupt(inputs)) =
+            queue.pop_interrupt(0, &crate::batch_key(&test_input("old")))
+        else {
             panic!("expected first interrupt");
         };
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].message, "old");
-        assert!(queue.pop_interrupt(0).is_none());
+        assert!(
+            queue
+                .pop_interrupt(0, &crate::batch_key(&test_input("old")))
+                .is_none()
+        );
         assert!(matches!(
             queue.pop(),
             Some(ActorWork::PolicyBarrier { generation: 1 })
