@@ -1141,13 +1141,19 @@ impl EventHandle {
         rx.recv().unwrap_or_else(|_| Ok(text.to_string()))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
-        if self.shutdown.load(Ordering::Acquire) {
-            return ResolvedSlots::default();
-        }
+    pub fn request_prompt_slots(&self) -> flume::Receiver<ResolvedSlots> {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv_async().await.unwrap_or_default()
+        if !self.shutdown.load(Ordering::Acquire) {
+            let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        }
+        rx
+    }
+
+    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+        self.request_prompt_slots()
+            .recv_async()
+            .await
+            .unwrap_or_default()
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {

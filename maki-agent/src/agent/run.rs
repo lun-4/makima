@@ -102,6 +102,13 @@ pub struct TurnPromptInputs {
     pub cwd: PathBuf,
     pub instructions: super::instructions::Instructions,
     pub mcp_prompt: Option<crate::mcp::McpPromptBinding>,
+    pub resolved: Option<flume::Receiver<Result<ResolvedPromptInputs, String>>>,
+}
+
+#[derive(Clone)]
+pub struct ResolvedPromptInputs {
+    pub slots: Arc<crate::prompt::ResolvedSlots>,
+    pub mcp_messages: Option<Vec<Message>>,
 }
 
 /// The settings captured at the start of a run.

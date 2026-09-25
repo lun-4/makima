@@ -233,6 +233,26 @@ impl TuiActorBackend {
             }
         }
         self.tools = self.build_tools(model, input.workflow);
+        let resolved = if let Some(receiver) = admission
+            .and_then(|snapshot| snapshot.prompt_inputs.as_ref())
+            .and_then(|prompt| prompt.resolved.as_ref())
+        {
+            Some(
+                receiver
+                    .recv_async()
+                    .await
+                    .map_err(|e| AgentError::Tool {
+                        tool: "prompt_inputs".into(),
+                        message: e.to_string(),
+                    })?
+                    .map_err(|message| AgentError::Tool {
+                        tool: "prompt_inputs".into(),
+                        message,
+                    })?,
+            )
+        } else {
+            None
+        };
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -250,32 +270,32 @@ impl TuiActorBackend {
                     message: format!("unknown MCP prompt: {}", prompt_ref.qualified_name),
                 });
             }
-            let messages = match binding {
-                Some(binding) => mcp.get_bound_prompt(binding, &prompt_ref.arguments).await,
-                None => {
-                    mcp.get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
-                        .await
+            let messages = if let Some(resolved) = &resolved {
+                resolved.mcp_messages.clone().unwrap_or_default()
+            } else {
+                match binding {
+                    Some(binding) => mcp.get_bound_prompt(binding, &prompt_ref.arguments).await,
+                    None => {
+                        mcp.get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
+                            .await
+                    }
                 }
-            }
-            .map_err(|e| AgentError::Tool {
-                tool: "mcp_prompt".into(),
-                message: e.to_string(),
-            })?;
-            for pm in messages {
-                let text = pm.content.text.unwrap_or_default();
-                let msg = match pm.role {
-                    PromptRole::Assistant => Message {
-                        role: maki_providers::Role::Assistant,
-                        content: vec![maki_providers::ContentBlock::Text { text }],
-                        ..Default::default()
-                    },
-                    PromptRole::User => Message::user(text),
-                };
-                input.preamble.push(msg);
-            }
+                .map_err(|e| AgentError::Tool {
+                    tool: "mcp_prompt".into(),
+                    message: e.to_string(),
+                })?
+                .into_iter()
+                .map(prompt_message)
+                .collect()
+            };
+            input.preamble.extend(messages);
         }
 
-        let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
+        let prompt_slots = if let Some(resolved) = resolved {
+            resolved.slots
+        } else {
+            Arc::new(self.lua_handle.collect_prompt_slots_async().await)
+        };
         let system = self.build_system_with(&input.mode, &prompt_slots, admission);
         self.publish_btw_system(&prompt_slots);
         self.tools = self.build_tools(model, input.workflow);
@@ -283,7 +303,7 @@ impl TuiActorBackend {
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
-        Ok((system, tools, Arc::new(prompt_slots)))
+        Ok((system, tools, prompt_slots))
     }
 
     /// Resolves this session's coordinator lease for a run. `Ok(None)` when
@@ -466,12 +486,25 @@ impl TuiActorBackend {
     }
 }
 
+fn prompt_message(pm: maki_agent::mcp::protocol::PromptMessage) -> Message {
+    let text = pm.content.text.unwrap_or_default();
+    match pm.role {
+        PromptRole::Assistant => Message {
+            role: maki_providers::Role::Assistant,
+            content: vec![maki_providers::ContentBlock::Text { text }],
+            ..Default::default()
+        },
+        PromptRole::User => Message::user(text),
+    }
+}
+
 impl ActorBackend for TuiActorBackend {
     fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
         let modes = self.lua_handle.mode_registry();
         let registry = Arc::clone(ToolRegistry::global_arc());
         let mcp = self.mcp.clone();
         let cwd = Arc::clone(&self.cwd);
+        let lua_handle = self.lua_handle.clone();
         Some(Arc::new(move |input| {
             let cwd = (**cwd.load()).clone();
             let instructions = maki_agent::agent::load_instructions(&cwd.to_string_lossy());
@@ -479,15 +512,45 @@ impl ActorBackend for TuiActorBackend {
                 maki_agent::AgentMode::Custom(id) => modes.get(id).map(Arc::new),
                 _ => Some(Arc::new(modes.current(&input.mode))),
             };
+            let binding = input
+                .prompt
+                .as_ref()
+                .and_then(|prompt| mcp.as_ref()?.prompt_binding(&prompt.qualified_name));
+            let (tx, rx) = flume::bounded(1);
+            let lua_handle = lua_handle.clone();
+            let mcp_prompt = input.prompt.clone();
+            let prompt_mcp = mcp.clone();
+            let pinned = binding.clone();
+            let slot_request = lua_handle.request_prompt_slots();
+            smol::spawn(async move {
+                let slots = Arc::new(slot_request.recv_async().await.unwrap_or_default());
+                let messages = match (mcp_prompt, pinned, prompt_mcp) {
+                    (Some(prompt), Some(binding), Some(mcp)) => mcp
+                        .get_bound_prompt(&binding, &prompt.arguments)
+                        .await
+                        .map(|messages| Some(messages.into_iter().map(prompt_message).collect()))
+                        .map_err(|e| e.to_string()),
+                    (Some(prompt), _, _) => {
+                        Err(format!("unknown MCP prompt: {}", prompt.qualified_name))
+                    }
+                    (None, _, _) => Ok(None),
+                };
+                let _ =
+                    tx.send(
+                        messages.map(|mcp_messages| maki_agent::agent::ResolvedPromptInputs {
+                            slots,
+                            mcp_messages,
+                        }),
+                    );
+            })
+            .detach();
             maki_agent::agent::TurnAdmissionSnapshot {
                 mode_def,
                 prompt_inputs: Some(Arc::new(maki_agent::agent::TurnPromptInputs {
                     cwd,
                     instructions,
-                    mcp_prompt: input
-                        .prompt
-                        .as_ref()
-                        .and_then(|prompt| mcp.as_ref()?.prompt_binding(&prompt.qualified_name)),
+                    mcp_prompt: binding,
+                    resolved: Some(rx),
                 })),
                 bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
                     &registry,
@@ -781,11 +844,28 @@ mod tests {
         let mut snapshot = backend.admission_preparation().unwrap()(&input);
         let prompt = Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap());
         prompt.instructions.text = "admitted instructions".into();
+        let (tx, rx) = flume::bounded(1);
+        prompt.resolved = Some(rx);
+        let mut slots = maki_agent::prompt::ResolvedSlots::default();
+        slots.insert(
+            maki_agent::prompt::PromptId::System,
+            maki_agent::prompt::Slot::Identity,
+            maki_agent::prompt::SlotEntry {
+                plugin: "admission".into(),
+                content: "admitted identity".into(),
+            },
+        );
+        tx.send(Ok(maki_agent::agent::ResolvedPromptInputs {
+            slots: Arc::new(slots),
+            mcp_messages: None,
+        }))
+        .unwrap();
         cwd.store(Arc::new(PathBuf::from("/tmp/changed")));
         let model = crate::components::test_model();
         let (system, _, _) =
             smol::block_on(backend.prepare_run(&mut input, &model, Some(&snapshot))).unwrap();
         assert!(system.contains("admitted instructions"));
+        assert!(system.contains("admitted identity"));
         assert!(!system.contains("/tmp/changed"));
         assert_eq!(backend.vars.apply("{cwd}"), "/tmp/admitted");
     }
