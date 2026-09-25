@@ -58,20 +58,30 @@ pub fn build_system_prompt(
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
 ) -> String {
+    build_system_prompt_with_def(vars, &modes.current(mode), mode, instructions, slots)
+}
+
+pub fn build_system_prompt_with_def(
+    vars: &Vars,
+    def: &crate::ModeDef,
+    mode: &AgentMode,
+    instructions: &str,
+    slots: &crate::prompt::ResolvedSlots,
+) -> String {
     let env = vars.apply(
         "\n\nEnvironment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}",
     );
     let instructions = format!("{env}{instructions}");
     let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
 
-    let def = modes.current(mode);
-    if let Some(snippet) = def.system_prompt {
+    if let Some(snippet) = &def.system_prompt {
         let plan_path = mode
             .plan_path()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let vars = vars.clone().with_custom("{plan_path}", plan_path);
-        out.push_str(&vars.apply(&snippet));
+        let snippet = vars.apply(snippet);
+        out.push_str(&snippet);
     }
 
     out

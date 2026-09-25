@@ -1,11 +1,12 @@
-//! `maki.model`. The event loop owns the model slot and the per-session
-//! request options, so every call has to round-trip to it.
+//! `maki.model`. UI calls read the focused session; explicit tool contexts
+//! read their own model without a UI.
 
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Error as LuaError, Lua, Result as LuaResult, Value};
+use mlua::{Error as LuaError, Lua, Result as LuaResult, UserDataRef, Value};
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
-use crate::api::util::pair::Pair;
+use crate::api::util::ctx::LuaCtx;
+use crate::api::util::pair::{Pair, err_pair};
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
 
@@ -21,17 +22,36 @@ async fn roundtrip(
     .await
 }
 
-/// Reads the focused session's model, thinking level, and fast mode.
-/// `thinking` comes back in the spelling `set` accepts, so a table from here
-/// can go straight back in.
+/// Reads the model for an explicit tool context, or the focused session when
+/// a UI is attached. `thinking` uses the spelling `set` accepts.
 ///
+/// @param ctx userdata|nil Optional tool handler context.
 /// @return (table|nil, string|nil) `{spec, id, provider, thinking, fast,
 ///   supports_thinking, supports_fast}`, or nil and an error.
 /// @example
-/// local m = maki.model.get()
+/// local m = maki.model.get(ctx)
 /// if m.spec ~= "anthropic/claude-opus-4-6" then ... end
 #[lua_fn]
-async fn get(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn get(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    ctx: Option<UserDataRef<LuaCtx>>,
+) -> LuaResult<Pair<Value>> {
+    if let Some(ctx) = ctx {
+        let Some(agent) = ctx.agent() else {
+            return Ok(err_pair(ctx.cap_err("maki.model.get")));
+        };
+        let model = &agent.model;
+        let result = lua.create_table()?;
+        result.set("spec", model.spec())?;
+        result.set("id", model.id.as_str())?;
+        result.set("provider", model.provider.to_string())?;
+        result.set("thinking", agent.opts.thinking.to_string())?;
+        result.set("fast", agent.opts.fast)?;
+        result.set("supports_thinking", model.supports_thinking())?;
+        result.set("supports_fast", model.supports_fast())?;
+        return Ok((Some(Value::Table(result)), None));
+    }
     roundtrip(lua, tx, ModelRequest::Get).await
 }
 
@@ -89,10 +109,8 @@ async fn set(
 }
 
 lua_table! {
-    /// The model behind the focused session. Good for a keybind that flips
-    /// between your two go-to models, or lifts thinking for one hard question.
-    /// Without an interactive UI every function returns
-    /// `nil, "no interactive UI attached"`.
+    /// Read a tool context's model without a UI, or the focused session's
+    /// model for a keybind. `available` and `set` require an interactive UI.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
     DOCS [get(tx), available(tx), set(tx)]
 }
@@ -102,6 +120,8 @@ mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UI_DROPPED_ERR, UiReply};
     use crate::api::util::convert::lua_to_json;
+    use maki_agent::{AgentMode, tools::test_support::stub_ctx};
+    use maki_providers::ThinkingConfig;
     use serde_json::{Value as Json, json};
     use test_case::test_case;
 
@@ -170,6 +190,28 @@ mod tests {
     #[test_case("local m = model.get() return model.set(m)", json!({ "spec": SPEC, "thinking": THINKING, "fast": true }) ; "set_fed_by_get")]
     fn requests_cross_the_channel_and_answer_with_the_new_state(script: &str, expected: Json) {
         assert_eq!(eval(&stub_ui(echo), script), (expected, None));
+    }
+
+    #[test]
+    fn test_lua_model_get_without_ui() {
+        let lua = lua_with_model(None);
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.opts.thinking = ThinkingConfig::Off;
+        ctx.opts.fast = false;
+        let model = &ctx.model;
+        let expected = json!({
+            "spec": model.spec(), "id": model.id, "provider": model.provider.to_string(),
+            "thinking": ctx.opts.thinking.to_string(), "fast": ctx.opts.fast,
+            "supports_thinking": model.supports_thinking(), "supports_fast": model.supports_fast(),
+        });
+        lua.globals()
+            .set("ctx", lua.create_userdata(LuaCtx::handler(&ctx)).unwrap())
+            .unwrap();
+        assert_eq!(eval(&lua, "return model.get(ctx)"), (expected, None));
+        assert_eq!(
+            eval(&lua, "return model.get()"),
+            (Json::Null, Some(NO_UI_ERR.to_owned()))
+        );
     }
 
     /// Every way of not getting an answer lands in the error slot, instead of

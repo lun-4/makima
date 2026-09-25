@@ -461,6 +461,9 @@ fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
 /// })
 #[lua_fn(guard = Run)]
 fn jobstart(lua: &Lua, #[ctx] plugin: Arc<str>, cmd: Value, opts: Option<Table>) -> LuaResult<u32> {
+    if crate::runtime::restrictive_effects(lua) || crate::api::fs::plan_write_path(lua).is_some() {
+        return Err(mlua::Error::runtime(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let cmd = parse_command(cmd)?;
     let owner_name: Option<String> = opts
         .as_ref()

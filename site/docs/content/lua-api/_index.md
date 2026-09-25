@@ -106,7 +106,7 @@ The rules:
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
 | [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override, list, and switch agent modes. |
-| [`maki.model`](#maki-model) | The model behind the focused session. |
+| [`maki.model`](#maki-model) | Read a tool context's model without a UI, or the focused session's |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
@@ -3444,22 +3444,23 @@ maki.api.mode.reset("plan")
 
 ## maki.model {#maki-model}
 
-The model behind the focused session. Good for a keybind that flips
-between your two go-to models, or lifts thinking for one hard question.
-Without an interactive UI every function returns
-`nil, "no interactive UI attached"`.
+Read a tool context's model without a UI, or the focused session's
+model for a keybind. `available` and `set` require an interactive UI.
 
 ---
 
 ### `maki.model.get()` {#maki-model-get}
 
 ```lua
-maki.model.get()
+maki.model.get({ctx?})
 ```
 
-Reads the focused session's model, thinking level, and fast mode.
-`thinking` comes back in the spelling `set` accepts, so a table from here
-can go straight back in.
+Reads the model for an explicit tool context, or the focused session when
+a UI is attached. `thinking` uses the spelling `set` accepts.
+
+**Parameters:**
+
+- `{ctx?}` (`userdata|nil`) Optional tool handler context.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking, fast,
   supports_thinking, supports_fast}`, or nil and an error.
@@ -3467,7 +3468,7 @@ can go straight back in.
 **Example:**
 
 ```lua
-local m = maki.model.get()
+local m = maki.model.get(ctx)
 if m.spec ~= "anthropic/claude-opus-4-6" then ... end
 ```
 

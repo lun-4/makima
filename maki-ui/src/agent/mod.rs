@@ -391,7 +391,6 @@ impl AgentHandles {
         self.mailbox = Some(mailbox);
     }
 
-    #[cfg(test)]
     pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, maki_agent::AgentId) {
         (self.manager.clone(), self.root_id)
     }
@@ -582,8 +581,18 @@ fn spawn_agent_internal(
         max_live_agents: config.max_live_agents,
     };
     let manager = AgentManagerHandle::new(limits).expect("validated agent limits");
+    let selected = model_slot.load();
+    let initial_settings = maki_agent::RunSettings {
+        provider: Arc::clone(&selected.provider) as Arc<dyn Provider>,
+        model: selected.model.clone(),
+        fast: false,
+        workflow: false,
+        thinking: Default::default(),
+    };
+    drop(selected);
     let root = manager
-        .create_root_with(
+        .create_root_with_config(
+            Some(initial_settings),
             initial_history.clone(),
             Some(Arc::clone(&shared_history)),
             |agent_id| {

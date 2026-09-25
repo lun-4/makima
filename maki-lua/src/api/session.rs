@@ -294,6 +294,9 @@ async fn new(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
+    if crate::api::fs::plan_write_path(&lua).is_some() {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let (prompt, focus) = match opts {
         Some(opts) => (opts.get("prompt")?, opts.get("focus").unwrap_or(false)),
         None => (None, false),

@@ -11,11 +11,11 @@ pub use history::{
     History, HistorySnapshot, SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls,
 };
 pub use instructions::{
-    Instructions, LoadedInstructions, build_system_prompt, find_subdirectory_instructions,
-    is_instruction_file, load_instruction_text, load_instructions,
+    Instructions, LoadedInstructions, build_system_prompt, build_system_prompt_with_def,
+    find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
 };
 pub use run::{
     Agent, AgentParams, AgentRunParams, ModelSource, RunSettings, RunSettingsSource,
-    SessionRunSettings, SharedModel, ToolBuilder, estimate_message_tokens,
+    SessionRunSettings, SharedModel, ToolBuilder, TurnAdmissionSnapshot, estimate_message_tokens,
     resolve_compaction_model,
 };
