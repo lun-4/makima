@@ -210,6 +210,9 @@ pub struct ActorSnapshot {
 /// The adapter owns its mutable configuration and executes work against the
 /// actor's shared history. Object-safe: every execution method returns a
 /// boxed future, so the TUI and Lua can share one `Box<dyn ActorBackend>`.
+/// Captures the external state pinned to an admission. The actor always calls
+/// this before taking its state lock, so implementations may perform blocking
+/// work but must tolerate the actor closing before the prepared snapshot commits.
 pub type AdmissionPreparation =
     Arc<dyn Fn(&crate::AgentInput) -> crate::agent::TurnAdmissionSnapshot + Send + Sync>;
 

@@ -42,7 +42,7 @@ use tracing::info;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken, ReasonedCancelTrigger};
 use crate::types::{AgentEvent, AgentId, EventSender, TurnCancellationReason, TurnId, TurnOutcome};
-use crate::{AgentInput, CancelTrigger, History, InterruptSource, RunSettings, SharedMessages};
+use crate::{AgentInput, CancelTrigger, History, RunSettings, SharedMessages};
 
 /// One unit of work the scheduler consumes. Variants map onto behavior: a
 /// `Turn` always settles into exactly one [`TurnOutcome`], `Root` becomes a
@@ -58,6 +58,8 @@ pub enum ActorWork {
     Compact {
         run_id: u64,
         instructions: Option<String>,
+        generation: u64,
+        policy: Option<Arc<EffectiveAgentConfig>>,
     },
 }
 
@@ -602,16 +604,26 @@ impl AgentActorHandle {
         (retired_rx, release_tx)
     }
 
-    /// Admits one turn. The [`TurnId`] and ticket are allocated immediately
-    /// and the turn is queued strictly behind every already admitted turn.
-    /// Admission and close linearize under one lock, so a concurrent
-    /// `close()`/`shutdown()` cannot admit a turn after the queue drains.
+    /// Admits one turn. Preparation runs before the actor state lock; the
+    /// admission and close decision then linearize under that lock, so a
+    /// concurrent `close()`/`shutdown()` cannot admit after the queue drains.
     pub fn admit_turn(
         &self,
         input: AgentInput,
         event_sender: Option<EventSender>,
         correlation: String,
     ) -> Result<TurnTicket, ActorError> {
+        {
+            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.lifecycle != ActorLifecycle::Open {
+                return Err(lifecycle_error(state.lifecycle));
+            }
+        }
+        let snapshot = self
+            .inner
+            .admission_preparation
+            .as_ref()
+            .map(|prepare| prepare(&input));
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -628,11 +640,6 @@ impl AgentActorHandle {
             }
             let turn_id = TurnId::generate();
             let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
-            let snapshot = self
-                .inner
-                .admission_preparation
-                .as_ref()
-                .map(|prepare| prepare(&input));
             if let Some(reason) = state.cancelled_correlations.get(&correlation).copied() {
                 let admission = TurnAdmission {
                     turn_id,
@@ -667,13 +674,14 @@ impl AgentActorHandle {
                 });
             return Ok(ticket);
         }
-        self.admit_turn_locked(state, input, event_sender, correlation)
+        self.admit_turn_locked(state, input, snapshot, event_sender, correlation)
     }
 
     fn admit_turn_locked(
         &self,
         state: std::sync::MutexGuard<'_, ActorState>,
         input: AgentInput,
+        snapshot: Option<crate::agent::TurnAdmissionSnapshot>,
         event_sender: Option<EventSender>,
         correlation: String,
     ) -> Result<TurnTicket, ActorError> {
@@ -695,11 +703,7 @@ impl AgentActorHandle {
             let reason = *reason;
             let admission = TurnAdmission {
                 turn_id,
-                admission: self
-                    .inner
-                    .admission_preparation
-                    .as_ref()
-                    .map(|prepare| prepare(&input)),
+                admission: snapshot,
                 input: Some(input),
                 event_sender,
                 correlation: correlation.clone(),
@@ -733,11 +737,7 @@ impl AgentActorHandle {
             .insert(turn_id, ticket.clone());
         self.inner.queue.push(ActorWork::Turn(TurnAdmission {
             turn_id,
-            admission: self
-                .inner
-                .admission_preparation
-                .as_ref()
-                .map(|prepare| prepare(&input)),
+            admission: snapshot,
             input: Some(input),
             event_sender,
             correlation: correlation.clone(),
@@ -759,7 +759,18 @@ impl AgentActorHandle {
     /// when it starts it, and an active run folds it instead. A root whose
     /// correlation was precancelled is dropped. The mark stays until a
     /// matching run is consumed by the runner.
-    pub fn rush(&self, root: RootWork) -> Result<(), ActorError> {
+    pub fn rush(&self, mut root: RootWork) -> Result<(), ActorError> {
+        {
+            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.lifecycle != ActorLifecycle::Open {
+                return Err(lifecycle_error(state.lifecycle));
+            }
+        }
+        root.admission = self
+            .inner
+            .admission_preparation
+            .as_ref()
+            .map(|prepare| prepare(&root.input));
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -774,12 +785,6 @@ impl AgentActorHandle {
             {
                 return Err(ActorError::PolicyCeiling);
             }
-            let mut root = root;
-            root.admission = self
-                .inner
-                .admission_preparation
-                .as_ref()
-                .map(|prepare| prepare(&root.input));
             state
                 .deferred_admissions
                 .push_back(DeferredAdmission::Root { after, root });
@@ -804,11 +809,6 @@ impl AgentActorHandle {
         let mut root = root;
         root.generation = state.policy_generation;
         root.policy = state.policy.clone();
-        root.admission = self
-            .inner
-            .admission_preparation
-            .as_ref()
-            .map(|prepare| prepare(&root.input));
         self.inner.queue.push(ActorWork::Root(root));
         Ok(())
     }
@@ -932,6 +932,8 @@ impl AgentActorHandle {
         self.inner.queue.push(ActorWork::Compact {
             run_id,
             instructions,
+            generation: state.policy_generation,
+            policy: state.policy.clone(),
         });
         Ok(())
     }
@@ -1259,20 +1261,6 @@ impl AgentActorHandle {
             ?reason,
             "correlation cancelled"
         );
-    }
-
-    /// A scheduler view of the queue, usable as the running agent's
-    /// [`InterruptSource`].
-    pub fn interrupt_source(&self) -> Arc<dyn InterruptSource> {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let generation = state.cancellation_generation;
-        let policy_generation = state.policy_generation;
-        Arc::new(queue::InterruptQueue::new(
-            Arc::clone(&self.inner),
-            generation,
-            policy_generation,
-            None,
-        ))
     }
 
     /// Runs the drain publication only when the queue is empty, under the

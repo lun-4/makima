@@ -1722,6 +1722,26 @@ mod tests {
     }
 
     #[test]
+    fn rewritten_build_target_is_boundary_checked() {
+        smol::block_on(async {
+            let ctx = stub_ctx_with_permissions(
+                &AgentMode::Build,
+                Arc::new(PermissionManager::new(
+                    PermissionsConfig::default(),
+                    PathBuf::from(TEST_ROOT),
+                    maki_config::ProjectConfig::discover(Path::new(TEST_ROOT)),
+                    Arc::default(),
+                )),
+            );
+            let (ctx, hook) = hooked_with(ctx, None, RecordingHook::answering(rewrite_the_target));
+            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
+            assert!(done.is_error);
+            assert!(done.output.as_text().contains(HOOK_ESCAPED_PATH));
+            assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
+        });
+    }
+
+    #[test]
     fn restricted_write_never_reaches_input_hooks_even_for_plan_path() {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
@@ -1840,6 +1860,22 @@ mod tests {
             assert!(
                 tool_names(&tools).contains(&PROBE_WIRE),
                 "searched tool must join the next request"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_mcp_binding_is_not_dispatchable() {
+        smol::block_on(async {
+            let original = stub_mcp(&[PROBE_QUALIFIED]);
+            let replacement = stub_mcp(&[PROBE_QUALIFIED]);
+            let mut ctx = mcp_ctx(&original);
+            ctx.mcp = Some(replacement);
+            let done = dispatch_pinned(&ctx, PROBE_WIRE, &json!({})).await;
+            assert!(done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                format!("{UNAVAILABLE_TOOL_PREFIX}: {PROBE_WIRE}")
             );
         });
     }
