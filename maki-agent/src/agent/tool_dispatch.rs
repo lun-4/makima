@@ -2163,10 +2163,14 @@ mod tests {
         });
     }
 
-    #[test_case("read" ; "read")]
-    #[test_case("glob" ; "glob")]
-    #[test_case("grep" ; "grep")]
-    fn restricted_mode_offers_host_verified_bundled_tool(name: &'static str) {
+    #[test_case("read", "read" ; "read")]
+    #[test_case("glob", "glob" ; "glob")]
+    #[test_case("grep", "grep" ; "grep")]
+    #[test_case("webfetch", "webfetch" ; "webfetch")]
+    #[test_case("question", "question" ; "question")]
+    #[test_case("plan_submit", "plan_submit_tool" ; "plan_submit")]
+    #[test_case("task", "task" ; "task")]
+    fn restricted_mode_offers_host_verified_bundled_tool(name: &'static str, plugin: &'static str) {
         smol::block_on(async {
             let mut ctx = stub_ctx(&AgentMode::Plan(PathBuf::from(PLAN_PATH)));
             let registry = ToolRegistry::new();
@@ -2179,7 +2183,7 @@ mod tests {
                         executed: Arc::clone(&executed),
                     }),
                     ToolSource::Bundled {
-                        plugin: name.into(),
+                        plugin: plugin.into(),
                     },
                 )
                 .unwrap();

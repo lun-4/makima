@@ -592,8 +592,8 @@ pub fn interactive_directory_adopter(
 
 struct QueuedInput {
     input: AgentInput,
-    settings: Option<crate::RunSettings>,
-    prepared: Option<(String, RequestTools, agent::Instructions)>,
+    settings: crate::RunSettings,
+    prepared: (String, RequestTools, agent::Instructions),
     admission: agent::TurnAdmissionSnapshot,
 }
 
@@ -630,49 +630,50 @@ impl InteractiveInputSender {
             model: Arc::new(self.model.clone()),
             session_id: self.session_id,
         });
+        let Some(settings) = settings else {
+            return Err(flume::SendError(Box::new(input)));
+        };
         self.send_with_settings(input, settings)
     }
 
     fn send_with_settings(
         &self,
         mut input: AgentInput,
-        settings: Option<crate::RunSettings>,
+        settings: crate::RunSettings,
     ) -> Result<(), flume::SendError<Box<AgentInput>>> {
-        let prepared = settings.as_ref().map(|settings| {
-            input.fast = settings.fast;
-            input.workflow = settings.workflow;
-            input.thinking = settings.thinking;
-            let cwd = self
-                .cwd
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
-            let vars = template::env_vars_for(&cwd);
-            let instructions = agent::load_instructions(&cwd.to_string_lossy());
-            let tools = RequestTools::build(
-                ToolRegistry::global(),
+        input.fast = settings.fast;
+        input.workflow = settings.workflow;
+        input.thinking = settings.thinking;
+        let cwd = self
+            .cwd
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let vars = template::env_vars_for(&cwd);
+        let instructions = agent::load_instructions(&cwd.to_string_lossy());
+        let tools = RequestTools::build(
+            ToolRegistry::global(),
+            &vars,
+            &settings.model,
+            &self.config,
+            &self.excluded_tools,
+            input.workflow,
+            self.mcp_handle.is_some(),
+        );
+        let mut system = self.system_prompt_override.clone().unwrap_or_else(|| {
+            agent::build_system_prompt(
                 &vars,
-                &settings.model,
-                &self.config,
-                &self.excluded_tools,
-                input.workflow,
-                self.mcp_handle.is_some(),
-            );
-            let mut system = self.system_prompt_override.clone().unwrap_or_else(|| {
-                agent::build_system_prompt(
-                    &vars,
-                    &self.modes,
-                    &input.mode,
-                    &instructions.text,
-                    &self.prompt_slots,
-                )
-            });
-            if let Some(append) = &self.append_system_prompt {
-                system.push('\n');
-                system.push_str(append);
-            }
-            (system, tools, instructions)
+                &self.modes,
+                &input.mode,
+                &instructions.text,
+                &self.prompt_slots,
+            )
         });
+        if let Some(append) = &self.append_system_prompt {
+            system.push('\n');
+            system.push_str(append);
+        }
+        let prepared = (system, tools, instructions);
         let mode_def = match &input.mode {
             AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
             _ => Some(Arc::new(self.modes.current(&input.mode))),
@@ -1042,41 +1043,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 }
 
-                if let Some(settings) = settings {
-                    provider = settings.provider;
-                    model = settings.model;
-                    input.fast = settings.fast;
-                    input.workflow = settings.workflow;
-                    input.thinking = settings.thinking;
-                }
+                provider = settings.provider;
+                model = settings.model;
+                input.fast = settings.fast;
+                input.workflow = settings.workflow;
+                input.thinking = settings.thinking;
 
-                let (system, tools, turn_instructions) = prepared.unwrap_or_else(|| {
-                    let vars = template::env_vars_for(&working_dir);
-                    let instructions = agent::load_instructions(&working_dir.to_string_lossy());
-                    let tools = RequestTools::build(
-                        ToolRegistry::global(),
-                        &vars,
-                        &model,
-                        &params.config,
-                        &params.excluded_tools,
-                        input.workflow,
-                        mcp.is_some(),
-                    );
-                    let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
-                        agent::build_system_prompt(
-                            &vars,
-                            &modes,
-                            &input.mode,
-                            &instructions.text,
-                            &params.prompt_slots,
-                        )
-                    });
-                    if let Some(append) = &params.append_system_prompt {
-                        system.push('\n');
-                        system.push_str(append);
-                    }
-                    (system, tools, instructions)
-                });
+                let (system, tools, turn_instructions) = prepared;
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
@@ -1746,6 +1719,8 @@ mod tests {
             mcp_handle: None,
             local_tools: Arc::new(Default::default()),
         };
+        assert!(sender.send(test_params().input).is_err());
+        assert!(rx.is_empty());
         sender
             .modes
             .define(crate::ModeDefSpec {
@@ -1760,13 +1735,13 @@ mod tests {
         sender
             .send_with_settings(
                 test_params().input,
-                Some(crate::RunSettings {
+                crate::RunSettings {
                     provider: Arc::clone(&first_provider),
                     model: first_model,
                     fast: true,
                     workflow: true,
                     thinking: Default::default(),
-                }),
+                },
             )
             .unwrap();
         *cwd.lock().unwrap() = PathBuf::from("/other");
@@ -1781,28 +1756,22 @@ mod tests {
         sender
             .send_with_settings(
                 test_params().input,
-                Some(crate::RunSettings {
+                crate::RunSettings {
                     provider: Arc::new(TestProvider),
                     model: later_model,
                     fast: false,
                     workflow: false,
                     thinking: Default::default(),
-                }),
+                },
             )
             .unwrap();
 
         let first = rx.recv().unwrap();
         let second = rx.recv().unwrap();
-        assert!(Arc::ptr_eq(
-            &first.settings.as_ref().unwrap().provider,
-            &first_provider
-        ));
+        assert!(Arc::ptr_eq(&first.settings.provider, &first_provider));
         assert!(first.input.fast && first.input.workflow);
         assert!(!second.input.fast && !second.input.workflow);
-        assert_ne!(
-            first.settings.as_ref().unwrap().model.spec(),
-            second.settings.as_ref().unwrap().model.spec()
-        );
+        assert_ne!(first.settings.model.spec(), second.settings.model.spec());
         assert_eq!(
             first.admission.mode_def.unwrap().system_prompt.as_deref(),
             Some("before")
@@ -1811,8 +1780,8 @@ mod tests {
             second.admission.mode_def.unwrap().system_prompt.as_deref(),
             Some("after")
         );
-        assert_eq!(first.prepared.unwrap().0, "admitted system");
-        assert_eq!(second.prepared.unwrap().0, "admitted system");
+        assert_eq!(first.prepared.0, "admitted system");
+        assert_eq!(second.prepared.0, "admitted system");
     }
 
     #[test]

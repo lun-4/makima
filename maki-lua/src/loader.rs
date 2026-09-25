@@ -490,7 +490,15 @@ impl PluginHost {
                 opts,
                 matches!(
                     builtin.as_str(),
-                    "read" | "glob" | "grep" | "write" | "edit"
+                    "read"
+                        | "glob"
+                        | "grep"
+                        | "webfetch"
+                        | "question"
+                        | "write"
+                        | "edit"
+                        | "plan_submit_tool"
+                        | "task"
                 ),
             )?;
         }
@@ -1942,13 +1950,30 @@ mod tests {
     fn bundled_read_only_identity_follows_loader_and_replacement() {
         let registry = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        let names = [
+            "read",
+            "glob",
+            "grep",
+            "webfetch",
+            "question",
+            "plan_submit_tool",
+            "task",
+        ];
         host.load_builtins(&PluginsConfig {
             enabled: true,
-            names: vec!["read".into(), "glob".into(), "grep".into()],
+            names: names.iter().map(|name| (*name).into()).collect(),
             opts: HashMap::new(),
         })
         .unwrap();
-        for name in ["read", "glob", "grep"] {
+        for name in [
+            "read",
+            "glob",
+            "grep",
+            "webfetch",
+            "question",
+            "plan_submit",
+            "task",
+        ] {
             assert!(registry.get(name).unwrap().is_bundled_read_only());
         }
         host.load_source(
@@ -1957,7 +1982,14 @@ mod tests {
         )
         .unwrap();
         assert!(!registry.get("read").unwrap().is_bundled_read_only());
-        for name in ["glob", "grep"] {
+        for name in [
+            "glob",
+            "grep",
+            "webfetch",
+            "question",
+            "plan_submit",
+            "task",
+        ] {
             assert!(registry.get(name).unwrap().is_bundled_read_only());
         }
     }
