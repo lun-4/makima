@@ -263,7 +263,11 @@ pub struct RegisteredTool {
 
 impl RegisteredTool {
     pub fn is_bundled_read_only(&self) -> bool {
-        self.is_bundled() && matches!(self.name(), "read" | "glob" | "grep")
+        self.is_bundled()
+            && matches!(
+                self.name(),
+                "read" | "glob" | "grep" | "webfetch" | "question" | "plan_submit" | "task"
+            )
     }
 
     pub fn is_bundled_mutation(&self) -> bool {
@@ -275,10 +279,11 @@ impl RegisteredTool {
     }
 
     fn is_bundled(&self) -> bool {
-        matches!(&self.source, ToolSource::Bundled { plugin } if matches!(plugin.as_ref(), "read" | "glob" | "grep" | "write" | "edit")
-            && (plugin.as_ref() == self.name()
+        matches!(&self.source, ToolSource::Bundled { plugin }
+            if plugin.as_ref() == self.name()
                 || plugin.as_ref() == "edit"
-                    && matches!(self.name(), "multiedit" | "edit_lines" | "insert_lines")))
+                    && matches!(self.name(), "multiedit" | "edit_lines" | "insert_lines")
+                || plugin.as_ref() == "plan_submit_tool" && self.name() == "plan_submit")
     }
 
     pub fn name(&self) -> &str {

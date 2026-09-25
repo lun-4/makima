@@ -395,6 +395,62 @@ fn exec_with_ctx(
         })
 }
 
+#[test_case::test_case(
+    r#"local ok, err = maki.fs.write("/not-the-plan", "bad")
+        return tostring(ok) .. "|" .. tostring(err)"#,
+    "nil|plan mode prohibits this mutation"
+    ; "direct_fs_write"
+)]
+#[test_case::test_case(
+    r#"maki.async.run(function()
+            local ok, err = maki.fs.write("/not-the-plan", "bad")
+            ctx:finish(tostring(ok) .. "|" .. tostring(err))
+        end)"#,
+    "nil|plan mode prohibits this mutation"
+    ; "async_fs_write"
+)]
+#[test_case::test_case(
+    r#"local ok, err = pcall(maki.fn.jobstart, "true")
+        return tostring(ok) .. "|" .. tostring(err)"#,
+    "false|runtime error: plan mode prohibits this mutation"
+    ; "jobstart"
+)]
+fn lua_host_effects_respect_turn_policy(handler: &str, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "restrictive_effect_probe",
+        &format!(
+            r#"maki.api.register_tool({{
+                name = "restrictive_effect_probe",
+                description = "probes restrictive effects",
+                schema = {MINIMAL_SCHEMA},
+                handler = function(_, ctx)
+                    {handler}
+                end,
+            }})"#,
+        ),
+    )
+    .unwrap();
+    let mut ctx =
+        maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Plan("plan.md".into()));
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+
+    let output = exec_with_ctx(
+        &reg,
+        "restrictive_effect_probe",
+        serde_json::json!({}),
+        &ctx,
+    )
+    .expect("probe output");
+    assert!(output.contains(expected), "got: {output}");
+}
+
 /// The point of the whole thing: a handler learns who called it without
 /// asking `maki.session.current()`, which answers with whoever is focused.
 #[test]

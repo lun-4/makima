@@ -1972,9 +1972,8 @@ struct ToolKeys {
 
 struct PluginOwner {
     tools: HashMap<Arc<str>, ToolKeys>,
-    /// What this load granted the plugin. Kept past the load so a slot layer
-    /// can be weighed against the authority of each call it filters.
     permissions: PluginPermissions,
+    bundled_read_only: bool,
 }
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, PluginOwner>>>;
@@ -3596,6 +3595,17 @@ impl LuaRuntime {
             PluginOwner {
                 tools: keys,
                 permissions: permissions.clone(),
+                bundled_read_only: bundled
+                    && matches!(
+                        source_name,
+                        "read"
+                            | "glob"
+                            | "grep"
+                            | "webfetch"
+                            | "question"
+                            | "plan_submit_tool"
+                            | "task"
+                    ),
             },
         );
 
@@ -4346,7 +4356,7 @@ async fn run_tool_call(
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
-    let handler: Function = {
+    let (handler, bundled_read_only): (Function, bool) = {
         let plugins_ref = plugins.borrow();
         let Some(owner) = plugins_ref.get(&*plugin) else {
             return ToolCallReply::err(format!("plugin not loaded: {plugin}"));
@@ -4354,11 +4364,12 @@ async fn run_tool_call(
         let Some(tool_keys) = owner.tools.get(&*tool) else {
             return ToolCallReply::err(format!("tool not found: {tool}"));
         };
+        let bundled_read_only = owner.bundled_read_only;
         if tool_keys.generation != generation {
             return ToolCallReply::err(format!("tool binding changed: {tool}"));
         }
         match lua.registry_value(&tool_keys.handler) {
-            Ok(f) => f,
+            Ok(handler) => (handler, bundled_read_only),
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
         }
     };
@@ -4392,7 +4403,7 @@ async fn run_tool_call(
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
     cell.managed_turn = managed_turn;
-    cell.restrict_effects = plan_write_path.is_some();
+    cell.restrict_effects = plan_write_path.is_some() && !bundled_read_only;
     cell.plan_write_path = plan_write_path;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
