@@ -1403,6 +1403,57 @@ fn unpolled_admission_future_reserves_between_setters() {
 }
 
 #[test]
+fn root_batch_and_interrupt_respect_policy_generation() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.update_policy(policy(false)).unwrap();
+        let active = handle
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        until(|| observed.entered.load(Ordering::SeqCst) == 1).await;
+        for (run_id, message) in [(1, "old"), (2, "old too")] {
+            handle
+                .rush(RootWork::new(
+                    input(message),
+                    run_id,
+                    false,
+                    message.into(),
+                    Vec::new(),
+                    message.into(),
+                ))
+                .unwrap();
+        }
+        let reservation = handle.reserve_policy_update().unwrap();
+        reservation.resolve(Ok(policy(true))).unwrap();
+        handle
+            .rush(RootWork::new(
+                input("new"),
+                3,
+                false,
+                "new".into(),
+                Vec::new(),
+                "new".into(),
+            ))
+            .unwrap();
+        gate.open();
+        active.wait().await;
+        until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
+        assert_eq!(
+            observed.folds.lock().unwrap().as_slice(),
+            &["old", "old too"]
+        );
+        assert_eq!(observed.policies.lock().unwrap()[0].2, 1);
+        assert_eq!(observed.policies.lock().unwrap()[1].2, 2);
+        assert_eq!(observed.root_metadata.lock().unwrap()[0].2, "new");
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn deferred_roots_keep_setter_order() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
