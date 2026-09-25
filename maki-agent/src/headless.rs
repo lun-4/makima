@@ -683,6 +683,7 @@ impl InteractiveInputSender {
             .map(|handle| McpSession::new(handle, &[]));
         let admission = agent::TurnAdmissionSnapshot {
             mode_def,
+            prompt_inputs: None,
             bindings: Arc::new(crate::tools::TurnToolBindings::capture(
                 ToolRegistry::global(),
                 &self.local_tools,

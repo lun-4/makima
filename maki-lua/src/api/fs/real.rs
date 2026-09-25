@@ -18,7 +18,7 @@ pub struct RealFs;
 
 #[cfg(target_os = "linux")]
 pub(super) fn anchored_plan_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, open, openat, renameat, unlinkat};
+    use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, open, openat, renameat, unlinkat};
     use std::io::Write;
 
     let parent = path
@@ -31,12 +31,19 @@ pub(super) fn anchored_plan_write(path: &Path, content: &[u8]) -> std::io::Resul
     let mut directory = root;
     for component in parent.components() {
         if let std::path::Component::Normal(part) = component {
-            directory = openat(
-                &directory,
-                part,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )?;
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+            directory = match openat(&directory, part, flags, Mode::empty()) {
+                Ok(next) => next,
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    match mkdirat(&directory, part, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                    openat(&directory, part, flags, Mode::empty())?
+                }
+                Err(err) => return Err(err.into()),
+            };
         }
     }
     match openat(

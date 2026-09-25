@@ -38,7 +38,7 @@ impl LoadedInstructions {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Instructions {
     pub text: String,
     pub loaded: LoadedInstructions,

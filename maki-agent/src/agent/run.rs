@@ -94,6 +94,14 @@ pub type ToolBuilder = Arc<dyn Fn(&Model, bool) -> RequestTools + Send + Sync>;
 pub struct TurnAdmissionSnapshot {
     pub mode_def: Option<Arc<crate::ModeDef>>,
     pub bindings: Arc<TurnToolBindings>,
+    pub prompt_inputs: Option<Arc<TurnPromptInputs>>,
+}
+
+#[derive(Clone)]
+pub struct TurnPromptInputs {
+    pub cwd: PathBuf,
+    pub instructions: super::instructions::Instructions,
+    pub mcp_prompt: Option<crate::mcp::McpPromptBinding>,
 }
 
 /// The settings captured at the start of a run.

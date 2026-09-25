@@ -282,6 +282,7 @@ impl ActorBackend for LuaActorBackend {
             };
             maki_agent::agent::TurnAdmissionSnapshot {
                 mode_def,
+                prompt_inputs: None,
                 bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
                     &params.registry,
                     &state.local_tools,

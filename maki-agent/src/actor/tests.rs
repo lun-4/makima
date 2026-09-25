@@ -440,6 +440,7 @@ fn queued_turn_keeps_admitted_mode_and_tool_binding() {
             let registry = Arc::clone(&registry);
             move |input| crate::agent::TurnAdmissionSnapshot {
                 mode_def: Some(Arc::new(modes.current(&input.mode))),
+                prompt_inputs: None,
                 bindings: Arc::new(crate::tools::TurnToolBindings::capture(
                     &registry,
                     &crate::tools::LocalTools::default(),

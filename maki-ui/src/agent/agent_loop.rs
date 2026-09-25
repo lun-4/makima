@@ -222,10 +222,15 @@ impl TuiActorBackend {
         model: &Model,
         admission: Option<&maki_agent::agent::TurnAdmissionSnapshot>,
     ) -> Result<(String, RequestTools, Arc<maki_agent::prompt::ResolvedSlots>), AgentError> {
-        let old_cwd = self.vars.apply("{cwd}").into_owned();
-        self.vars = template::env_vars_for(&self.cwd.load());
-        if *self.vars.apply("{cwd}") != old_cwd {
-            self.reload_instructions().await;
+        if let Some(prompt) = admission.and_then(|snapshot| snapshot.prompt_inputs.as_ref()) {
+            self.vars = template::env_vars_for(&prompt.cwd);
+            self.instructions = prompt.instructions.clone();
+        } else {
+            let old_cwd = self.vars.apply("{cwd}").into_owned();
+            self.vars = template::env_vars_for(&self.cwd.load());
+            if *self.vars.apply("{cwd}") != old_cwd {
+                self.reload_instructions().await;
+            }
         }
         self.tools = self.build_tools(model, input.workflow);
 
@@ -236,13 +241,26 @@ impl TuiActorBackend {
                     message: "MCP not available".into(),
                 });
             };
-            let messages = mcp
-                .get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
-                .await
-                .map_err(|e| AgentError::Tool {
+            let binding = admission
+                .and_then(|snapshot| snapshot.prompt_inputs.as_ref())
+                .and_then(|prompt| prompt.mcp_prompt.as_ref());
+            if binding.is_none() && admission.is_some() {
+                return Err(AgentError::Tool {
                     tool: "mcp_prompt".into(),
-                    message: e.to_string(),
-                })?;
+                    message: format!("unknown MCP prompt: {}", prompt_ref.qualified_name),
+                });
+            }
+            let messages = match binding {
+                Some(binding) => mcp.get_bound_prompt(binding, &prompt_ref.arguments).await,
+                None => {
+                    mcp.get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
+                        .await
+                }
+            }
+            .map_err(|e| AgentError::Tool {
+                tool: "mcp_prompt".into(),
+                message: e.to_string(),
+            })?;
             for pm in messages {
                 let text = pm.content.text.unwrap_or_default();
                 let msg = match pm.role {
@@ -453,13 +471,24 @@ impl ActorBackend for TuiActorBackend {
         let modes = self.lua_handle.mode_registry();
         let registry = Arc::clone(ToolRegistry::global_arc());
         let mcp = self.mcp.clone();
+        let cwd = Arc::clone(&self.cwd);
         Some(Arc::new(move |input| {
+            let cwd = (**cwd.load()).clone();
+            let instructions = maki_agent::agent::load_instructions(&cwd.to_string_lossy());
             let mode_def = match &input.mode {
                 maki_agent::AgentMode::Custom(id) => modes.get(id).map(Arc::new),
                 _ => Some(Arc::new(modes.current(&input.mode))),
             };
             maki_agent::agent::TurnAdmissionSnapshot {
                 mode_def,
+                prompt_inputs: Some(Arc::new(maki_agent::agent::TurnPromptInputs {
+                    cwd,
+                    instructions,
+                    mcp_prompt: input
+                        .prompt
+                        .as_ref()
+                        .and_then(|prompt| mcp.as_ref()?.prompt_binding(&prompt.qualified_name)),
+                })),
                 bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
                     &registry,
                     &Default::default(),
@@ -704,6 +733,62 @@ mod tests {
 
     use super::*;
     use crate::agent::ProviderSlot;
+
+    #[test]
+    fn admitted_prompt_inputs_survive_cwd_change() {
+        let (model_slot, _change_rx) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let (agent_tx, _agent_rx) = flume::unbounded();
+        let (_answer_tx, answer_rx) = flume::unbounded();
+        let (drain_tx, _drain_rx) = flume::unbounded();
+        let (_init_trigger, init_cancel) = CancelToken::new();
+        let cwd = Arc::new(ArcSwap::from_pointee(PathBuf::from("/tmp/admitted")));
+        let mut backend = new_backend(
+            AgentId::generate(),
+            model_slot,
+            Arc::clone(&cwd),
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            Arc::new(ArcSwap::from_pointee(String::new())),
+            None,
+            &[],
+            Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                PathBuf::from("/tmp"),
+                maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
+                Arc::default(),
+            )),
+            agent_tx,
+            answer_rx,
+            None,
+            None,
+            maki_providers::Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            Arc::new(CancelMap::new()),
+            Arc::new(ModelPolicy::default()),
+            SystemPromptOverride::default(),
+            Arc::new(maki_agent::tools::FileWriteLocks::new()),
+            init_cancel,
+            drain_tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let mut input = AgentInput::from_defaults(
+            "hello".into(),
+            AgentMode::Build,
+            Vec::new(),
+            maki_config::SessionDefaults::default(),
+        );
+        let mut snapshot = backend.admission_preparation().unwrap()(&input);
+        let prompt = Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap());
+        prompt.instructions.text = "admitted instructions".into();
+        cwd.store(Arc::new(PathBuf::from("/tmp/changed")));
+        let model = crate::components::test_model();
+        let (system, _, _) =
+            smol::block_on(backend.prepare_run(&mut input, &model, Some(&snapshot))).unwrap();
+        assert!(system.contains("admitted instructions"));
+        assert!(!system.contains("/tmp/changed"));
+        assert_eq!(backend.vars.apply("{cwd}"), "/tmp/admitted");
+    }
 
     /// Drives one turn through a backend whose setup cannot succeed, and
     /// returns everything the run emitted.
