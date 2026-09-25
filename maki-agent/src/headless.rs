@@ -594,6 +594,7 @@ struct QueuedInput {
     input: AgentInput,
     settings: Option<crate::RunSettings>,
     prepared: Option<(String, RequestTools, agent::Instructions)>,
+    admission: agent::TurnAdmissionSnapshot,
 }
 
 #[derive(Clone)]
@@ -609,7 +610,8 @@ pub struct InteractiveInputSender {
     prompt_slots: Arc<ResolvedSlots>,
     system_prompt_override: Option<String>,
     append_system_prompt: Option<String>,
-    has_mcp: bool,
+    mcp_handle: Option<McpHandle>,
+    local_tools: LocalTools,
 }
 
 impl InteractiveInputSender {
@@ -654,7 +656,7 @@ impl InteractiveInputSender {
                 &self.config,
                 &self.excluded_tools,
                 input.workflow,
-                self.has_mcp,
+                self.mcp_handle.is_some(),
             );
             let mut system = self.system_prompt_override.clone().unwrap_or_else(|| {
                 agent::build_system_prompt(
@@ -671,11 +673,28 @@ impl InteractiveInputSender {
             }
             (system, tools, instructions)
         });
+        let mode_def = match &input.mode {
+            AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
+            _ => Some(Arc::new(self.modes.current(&input.mode))),
+        };
+        let mcp = self
+            .mcp_handle
+            .clone()
+            .map(|handle| McpSession::new(handle, &[]));
+        let admission = agent::TurnAdmissionSnapshot {
+            mode_def,
+            bindings: Arc::new(crate::tools::TurnToolBindings::capture(
+                ToolRegistry::global(),
+                &self.local_tools,
+                mcp.as_ref(),
+            )),
+        };
         self.tx
             .send(QueuedInput {
                 input,
                 settings,
                 prepared,
+                admission,
             })
             .map_err(|error| flume::SendError(Box::new(error.0.input)))
     }
@@ -753,7 +772,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         prompt_slots: Arc::clone(&params.prompt_slots),
         system_prompt_override: params.system_prompt_override.clone(),
         append_system_prompt: params.append_system_prompt.clone(),
-        has_mcp: params.mcp_handle.is_some(),
+        mcp_handle: params.mcp_handle.clone(),
+        local_tools: Arc::clone(&params.local_tools),
     };
     let mut permissions_config = params.permissions_config.clone();
     permissions_config.yolo |= params.yolo;
@@ -949,6 +969,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     mut input,
                     settings,
                     prepared,
+                    admission,
                 } = queued;
                 let turn_id = TurnId::generate();
                 let lease_committer = input.lease_committer.clone();
@@ -1094,7 +1115,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
                 .with_local_tools(Arc::clone(&params.local_tools))
-                .with_mcp(mcp.clone());
+                .with_mcp(mcp.clone())
+                .with_admission(Some(admission));
 
                 let outcome = agent.run(turn_id, input).await;
                 drop(agent);
@@ -1720,8 +1742,17 @@ mod tests {
             prompt_slots: Arc::new(params.prompt_slots),
             system_prompt_override: Some("admitted system".into()),
             append_system_prompt: None,
-            has_mcp: false,
+            mcp_handle: None,
+            local_tools: Arc::new(Default::default()),
         };
+        sender
+            .modes
+            .define(crate::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("before".into()),
+                ..Default::default()
+            })
+            .unwrap();
         let first_provider: Arc<dyn Provider> = Arc::new(TestProvider);
         let first_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let later_model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
@@ -1738,6 +1769,14 @@ mod tests {
             )
             .unwrap();
         *cwd.lock().unwrap() = PathBuf::from("/other");
+        sender
+            .modes
+            .define(crate::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("after".into()),
+                ..Default::default()
+            })
+            .unwrap();
         sender
             .send_with_settings(
                 test_params().input,
@@ -1762,6 +1801,14 @@ mod tests {
         assert_ne!(
             first.settings.as_ref().unwrap().model.spec(),
             second.settings.as_ref().unwrap().model.spec()
+        );
+        assert_eq!(
+            first.admission.mode_def.unwrap().system_prompt.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            second.admission.mode_def.unwrap().system_prompt.as_deref(),
+            Some("after")
         );
         assert_eq!(first.prepared.unwrap().0, "admitted system");
         assert_eq!(second.prepared.unwrap().0, "admitted system");
