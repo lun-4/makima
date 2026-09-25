@@ -10,6 +10,12 @@ pub enum ActorError {
     Closed,
     #[error("the actor is shutting down")]
     Shutdown,
+    #[error("policy update is pending; use async admission")]
+    PolicyPending,
+    #[error("policy update was cancelled")]
+    PolicyCancelled,
+    #[error("child policy exceeds its inherited authority ceiling")]
+    PolicyCeiling,
     #[error("no such turn: {0}")]
     UnknownTurn(TurnId),
 }

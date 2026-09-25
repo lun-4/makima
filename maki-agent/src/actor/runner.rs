@@ -70,7 +70,6 @@ pub(super) struct Runner {
     queue: Arc<ActorQueue>,
     notify: flume::Receiver<()>,
     wake: Arc<WakeFlag>,
-    interrupt: Arc<dyn InterruptSource>,
 }
 
 impl Runner {
@@ -82,8 +81,6 @@ impl Runner {
     ) -> Self {
         let queue = Arc::clone(&inner.queue);
         let notify = queue.take_notify_rx();
-        let interrupt: Arc<dyn InterruptSource> =
-            Arc::new(InterruptQueue::new(Arc::clone(&inner.queue)));
         Self {
             inner,
             history,
@@ -91,7 +88,6 @@ impl Runner {
             queue,
             notify,
             wake,
-            interrupt,
         }
     }
 
@@ -160,13 +156,22 @@ impl Runner {
                     .await
             }
             ActorWork::Root(root) => self.run_root(root, cancellation_generation).await,
+            ActorWork::PolicyBarrier { .. } => {}
             ActorWork::Control(control) => self.run_control(control, cancellation_generation).await,
             ActorWork::Compact {
                 run_id,
                 instructions,
+                generation,
+                policy,
             } => {
-                self.run_compact(run_id, instructions.as_deref(), cancellation_generation)
-                    .await
+                self.run_compact(
+                    run_id,
+                    instructions.as_deref(),
+                    generation,
+                    policy,
+                    cancellation_generation,
+                )
+                .await
             }
         }
     }
@@ -261,7 +266,11 @@ impl Runner {
             )
             .await
             {
-                Ok((guard, current)) => (Some(guard), Some(current)),
+                Ok((guard, mut current)) => {
+                    current.policy = admission.policy.clone();
+                    current.mode = admission.input.as_ref().map(|input| input.mode.clone());
+                    (Some(guard), Some(current))
+                }
                 Err(reason) => {
                     if admission.root {
                         self.settle_turn(&admission, None, false);
@@ -282,8 +291,16 @@ impl Runner {
                 cancel: plain,
                 cancel_reason: reasoned.clone(),
                 correlation: admission.correlation.clone(),
-                interrupt: Some(Arc::clone(&self.interrupt)),
+                generation: admission.generation,
+                policy: admission.policy.clone(),
+                interrupt: Some(Arc::new(InterruptQueue::new(
+                    Arc::clone(&self.inner),
+                    popped_generation,
+                    admission.generation,
+                    admission.input.as_ref().and_then(crate::batch_key),
+                )) as Arc<dyn InterruptSource>),
                 managed_turn: managed_turn.clone(),
+                admission: admission.admission.clone(),
             },
             admission.input.take().expect("turn input taken once"),
             work,
@@ -343,6 +360,9 @@ impl Runner {
             event_sender: None,
             correlation: root.correlation,
             root: true,
+            generation: root.generation,
+            policy: root.policy,
+            admission: root.admission,
             ticket: super::tickets::TurnTicket::new_anonymous(Arc::clone(&self.inner.identity)),
         };
         self.run_turn(
@@ -391,8 +411,11 @@ impl Runner {
                     cancel: plain,
                     cancel_reason: reasoned,
                     correlation: control.correlation.clone(),
+                    generation: 0,
+                    policy: None,
                     interrupt: None,
                     managed_turn: None,
+                    admission: None,
                 },
                 &control,
             )
@@ -414,6 +437,8 @@ impl Runner {
         &mut self,
         run_id: u64,
         instructions: Option<&str>,
+        policy_generation: u64,
+        policy: Option<Arc<super::EffectiveAgentConfig>>,
         popped_generation: u64,
     ) {
         // Consumed: retire any precancel mark for this run_id's canonical
@@ -443,8 +468,11 @@ impl Runner {
                     cancel: plain,
                     cancel_reason: reasoned,
                     correlation: correlation.clone(),
+                    generation: policy_generation,
+                    policy,
                     interrupt: None,
                     managed_turn: None,
+                    admission: None,
                 },
                 instructions,
             )

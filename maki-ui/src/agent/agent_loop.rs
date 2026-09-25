@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use maki_agent::ModelSource;
 use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
@@ -26,8 +25,8 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{FileReadTracker, QuestionMode, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
-    SessionMailbox, ToolOutputLines, TurnId, TurnOutcome,
+    CancelToken, Envelope, EventSender, History, Instructions, McpCommand, ModelSource, PromptRole,
+    RunSettingsSource, SessionMailbox, ToolOutputLines, TurnId, TurnOutcome,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -148,16 +147,37 @@ impl TuiActorBackend {
         &self,
         mode: &maki_agent::AgentMode,
         prompt_slots: &maki_agent::prompt::ResolvedSlots,
+        admission: Option<&maki_agent::agent::TurnAdmissionSnapshot>,
     ) -> String {
-        let mut system = self.system_prompt.override_text.clone().unwrap_or_else(|| {
-            maki_agent::agent::build_system_prompt(
-                &self.vars,
-                &self.lua_handle.mode_registry(),
-                mode,
-                &self.instructions.text,
-                prompt_slots,
-            )
-        });
+        let mut system =
+            self.system_prompt
+                .override_text
+                .clone()
+                .unwrap_or_else(|| match admission {
+                    Some(snapshot) => match &snapshot.mode_def {
+                        Some(def) => maki_agent::agent::build_system_prompt_with_def(
+                            &self.vars,
+                            def,
+                            mode,
+                            &self.instructions.text,
+                            prompt_slots,
+                        ),
+                        None => maki_agent::agent::build_system_prompt_with_def(
+                            &self.vars,
+                            &maki_agent::ModeDef::default_for(maki_agent::ModeId::Build),
+                            mode,
+                            &self.instructions.text,
+                            prompt_slots,
+                        ),
+                    },
+                    None => maki_agent::agent::build_system_prompt(
+                        &self.vars,
+                        &self.lua_handle.mode_registry(),
+                        mode,
+                        &self.instructions.text,
+                        prompt_slots,
+                    ),
+                });
         if let Some(append) = &self.system_prompt.append_text {
             system.push('\n');
             system.push_str(append);
@@ -199,15 +219,40 @@ impl TuiActorBackend {
     async fn prepare_run(
         &mut self,
         input: &mut AgentInput,
+        model: &Model,
+        admission: Option<&maki_agent::agent::TurnAdmissionSnapshot>,
     ) -> Result<(String, RequestTools, Arc<maki_agent::prompt::ResolvedSlots>), AgentError> {
-        let slot = self.model_slot.load();
-
-        let old_cwd = self.vars.apply("{cwd}").into_owned();
-        self.vars = template::env_vars_for(&self.cwd.load());
-        if *self.vars.apply("{cwd}") != old_cwd {
-            self.reload_instructions().await;
+        if let Some(prompt) = admission.and_then(|snapshot| snapshot.prompt_inputs.as_ref()) {
+            self.vars = template::env_vars_for(&prompt.cwd);
+            self.instructions = prompt.instructions.clone();
+        } else {
+            let old_cwd = self.vars.apply("{cwd}").into_owned();
+            self.vars = template::env_vars_for(&self.cwd.load());
+            if *self.vars.apply("{cwd}") != old_cwd {
+                self.reload_instructions().await;
+            }
         }
-        self.tools = self.build_tools(&slot.model, input.workflow);
+        self.tools = self.build_tools(model, input.workflow);
+        let resolved = if let Some(receiver) = admission
+            .and_then(|snapshot| snapshot.prompt_inputs.as_ref())
+            .and_then(|prompt| prompt.resolved.as_ref())
+        {
+            Some(
+                receiver
+                    .recv_async()
+                    .await
+                    .map_err(|e| AgentError::Tool {
+                        tool: "prompt_inputs".into(),
+                        message: e.to_string(),
+                    })?
+                    .map_err(|message| AgentError::Tool {
+                        tool: "prompt_inputs".into(),
+                        message,
+                    })?,
+            )
+        } else {
+            None
+        };
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -216,36 +261,58 @@ impl TuiActorBackend {
                     message: "MCP not available".into(),
                 });
             };
-            let messages = mcp
-                .get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
-                .await
+            let binding = admission
+                .and_then(|snapshot| snapshot.prompt_inputs.as_ref())
+                .and_then(|prompt| prompt.mcp_prompt.as_ref());
+            if binding.is_none() && admission.is_some() {
+                return Err(AgentError::Tool {
+                    tool: "mcp_prompt".into(),
+                    message: format!("unknown MCP prompt: {}", prompt_ref.qualified_name),
+                });
+            }
+            let messages = if let Some(resolved) = &resolved {
+                if !binding.is_some_and(|binding| mcp.prompt_is_current(binding)) {
+                    return Err(AgentError::Tool {
+                        tool: "mcp_prompt".into(),
+                        message: format!(
+                            "MCP prompt is no longer available: {}",
+                            prompt_ref.qualified_name
+                        ),
+                    });
+                }
+                resolved.mcp_messages.clone().unwrap_or_default()
+            } else {
+                match binding {
+                    Some(binding) => mcp.get_bound_prompt(binding, &prompt_ref.arguments).await,
+                    None => {
+                        mcp.get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
+                            .await
+                    }
+                }
                 .map_err(|e| AgentError::Tool {
                     tool: "mcp_prompt".into(),
                     message: e.to_string(),
-                })?;
-            for pm in messages {
-                let text = pm.content.text.unwrap_or_default();
-                let msg = match pm.role {
-                    PromptRole::Assistant => Message {
-                        role: maki_providers::Role::Assistant,
-                        content: vec![maki_providers::ContentBlock::Text { text }],
-                        ..Default::default()
-                    },
-                    PromptRole::User => Message::user(text),
-                };
-                input.preamble.push(msg);
-            }
+                })?
+                .into_iter()
+                .map(prompt_message)
+                .collect()
+            };
+            input.preamble.extend(messages);
         }
 
-        let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
-        let system = self.build_system_with(&input.mode, &prompt_slots);
+        let prompt_slots = if let Some(resolved) = resolved {
+            resolved.slots
+        } else {
+            Arc::new(self.lua_handle.collect_prompt_slots_async().await)
+        };
+        let system = self.build_system_with(&input.mode, &prompt_slots, admission);
         self.publish_btw_system(&prompt_slots);
-        self.tools = self.build_tools(&slot.model, input.workflow);
+        self.tools = self.build_tools(model, input.workflow);
         let tools = self.tools.clone();
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
-        Ok((system, tools, Arc::new(prompt_slots)))
+        Ok((system, tools, prompt_slots))
     }
 
     /// Resolves this session's coordinator lease for a run. `Ok(None)` when
@@ -308,7 +375,33 @@ impl TuiActorBackend {
                 return None;
             }
         };
-        let (system, tools, prompt_slots) = match self.prepare_run(&mut input).await {
+        let slot = self.model_slot.load();
+        let mut provider =
+            Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>;
+        let mut model = slot.model.clone();
+        let fallback = if context.policy.is_none() {
+            self.session_id.as_ref().and_then(|session| {
+                maki_agent::SessionRunSettings {
+                    model: Arc::clone(&self.model_slot) as Arc<dyn ModelSource>,
+                    session_id: session.id(),
+                }
+                .current()
+            })
+        } else {
+            None
+        };
+        if let Some(settings) = context.policy.as_deref().or(fallback.as_ref()) {
+            provider = Arc::clone(&settings.provider);
+            model = settings.model.clone();
+            input.fast = settings.fast;
+            input.workflow = settings.workflow;
+            input.thinking = settings.thinking;
+        }
+        drop(slot);
+        let (system, tools, prompt_slots) = match self
+            .prepare_run(&mut input, &model, context.admission.as_ref())
+            .await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.report_setup_failure(run_id, turn_id, "agent turn setup failed", &error);
@@ -316,40 +409,13 @@ impl TuiActorBackend {
             }
         };
         self.run_id.store(run_id, Ordering::Relaxed);
-        let slot = self.model_slot.load();
         let mut agent = Agent::new(
             AgentParams {
                 agent_id: self.agent_id,
-                provider: Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>,
-                model: slot.model.clone(),
-                // The session's slot for the model, the coordinator for the
-                // options, so a change while this run is in flight is picked
-                // up at its next request.
-                settings_source: self.session_id.as_ref().map(|session| {
-                    Arc::new(maki_agent::SessionRunSettings {
-                        model: Arc::clone(&self.model_slot) as Arc<dyn ModelSource>,
-                        session_id: session.id(),
-                    }) as Arc<dyn maki_agent::RunSettingsSource>
-                }),
-                // The schema is built here, so a run that can be reconfigured
-                // needs the means to rebuild it. `vars` is snapshotted: a cwd
-                // change defers behind the lease, so it cannot move mid-run.
-                tool_builder: Some({
-                    let vars = self.vars.clone();
-                    let config = self.config.clone();
-                    let has_mcp = self.mcp.is_some();
-                    Arc::new(move |model: &Model, workflow: bool| {
-                        RequestTools::build(
-                            ToolRegistry::global(),
-                            &vars,
-                            model,
-                            &config,
-                            &[],
-                            workflow,
-                            has_mcp,
-                        )
-                    })
-                }),
+                provider,
+                model,
+                settings_source: None,
+                tool_builder: None,
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
@@ -380,7 +446,8 @@ impl TuiActorBackend {
         .with_interrupt_source(context.interrupt.clone().unwrap_or_else(noop_interrupt))
         .with_cancel(context.cancel.clone())
         .with_cancel_reason_source(context.cancel_reason.clone())
-        .with_mcp(self.mcp.clone());
+        .with_mcp(self.mcp.clone())
+        .with_admission(context.admission.clone());
 
         let outcome = agent.run(turn_id, input).await;
         drop(agent);
@@ -417,7 +484,7 @@ impl TuiActorBackend {
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints
     /// would only confuse the model. Everything else matches the live prompt.
     fn publish_btw_system(&mut self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
-        let system = self.build_system_with(&maki_agent::AgentMode::Build, prompt_slots);
+        let system = self.build_system_with(&maki_agent::AgentMode::Build, prompt_slots, None);
         self.btw_system.store(Arc::new(system));
     }
 
@@ -428,7 +495,86 @@ impl TuiActorBackend {
     }
 }
 
+fn prompt_message(pm: maki_agent::mcp::protocol::PromptMessage) -> Message {
+    let text = pm.content.text.unwrap_or_default();
+    match pm.role {
+        PromptRole::Assistant => Message {
+            role: maki_providers::Role::Assistant,
+            content: vec![maki_providers::ContentBlock::Text { text }],
+            ..Default::default()
+        },
+        PromptRole::User => Message::user(text),
+    }
+}
+
 impl ActorBackend for TuiActorBackend {
+    fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
+        let modes = self.lua_handle.mode_registry();
+        let registry = Arc::clone(ToolRegistry::global_arc());
+        let mcp = self.mcp.clone();
+        let cwd = Arc::clone(&self.cwd);
+        let lua_handle = self.lua_handle.clone();
+        Some(Arc::new(move |input| {
+            let cwd = (**cwd.load()).clone();
+            let instructions = maki_agent::agent::load_instructions(&cwd.to_string_lossy());
+            let mode_def = match &input.mode {
+                maki_agent::AgentMode::Custom(id) => modes.get(id).map(Arc::new),
+                _ => Some(Arc::new(modes.current(&input.mode))),
+            };
+            let binding = input
+                .prompt
+                .as_ref()
+                .and_then(|prompt| mcp.as_ref()?.prompt_binding(&prompt.qualified_name));
+            let (tx, rx) = flume::bounded(1);
+            let lua_handle = lua_handle.clone();
+            let mcp_prompt = input.prompt.clone();
+            let prompt_mcp = mcp.clone();
+            let pinned = binding.clone();
+            let slot_request = lua_handle.request_prompt_slots();
+            smol::spawn(async move {
+                let slots = async { Arc::new(slot_request.recv_async().await.unwrap_or_default()) };
+                let messages = async {
+                    match (mcp_prompt, pinned, prompt_mcp) {
+                        (Some(prompt), Some(binding), Some(mcp)) => mcp
+                            .get_bound_prompt(&binding, &prompt.arguments)
+                            .await
+                            .map(|messages| {
+                                Some(messages.into_iter().map(prompt_message).collect())
+                            })
+                            .map_err(|e| e.to_string()),
+                        (Some(prompt), _, _) => {
+                            Err(format!("unknown MCP prompt: {}", prompt.qualified_name))
+                        }
+                        (None, _, _) => Ok(None),
+                    }
+                };
+                let (messages, slots) = futures_lite::future::zip(messages, slots).await;
+                let _ =
+                    tx.send(
+                        messages.map(|mcp_messages| maki_agent::agent::ResolvedPromptInputs {
+                            slots,
+                            mcp_messages,
+                        }),
+                    );
+            })
+            .detach();
+            maki_agent::agent::TurnAdmissionSnapshot {
+                mode_def,
+                prompt_inputs: Some(Arc::new(maki_agent::agent::TurnPromptInputs {
+                    cwd,
+                    instructions,
+                    mcp_prompt: binding,
+                    resolved: Some(rx),
+                })),
+                bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
+                    &registry,
+                    &Default::default(),
+                    mcp.as_ref(),
+                )),
+            }
+        }))
+    }
+
     fn run_turn<'a>(
         &'a mut self,
         history: &'a mut History,
@@ -665,6 +811,79 @@ mod tests {
     use super::*;
     use crate::agent::ProviderSlot;
 
+    #[test]
+    fn admitted_prompt_inputs_survive_cwd_change() {
+        let (model_slot, _change_rx) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let (agent_tx, _agent_rx) = flume::unbounded();
+        let (_answer_tx, answer_rx) = flume::unbounded();
+        let (drain_tx, _drain_rx) = flume::unbounded();
+        let (_init_trigger, init_cancel) = CancelToken::new();
+        let cwd = Arc::new(ArcSwap::from_pointee(PathBuf::from("/tmp/admitted")));
+        let mut backend = new_backend(
+            AgentId::generate(),
+            model_slot,
+            Arc::clone(&cwd),
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            Arc::new(ArcSwap::from_pointee(String::new())),
+            None,
+            &[],
+            Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                PathBuf::from("/tmp"),
+                maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
+                Arc::default(),
+            )),
+            agent_tx,
+            answer_rx,
+            None,
+            None,
+            maki_providers::Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            Arc::new(CancelMap::new()),
+            Arc::new(ModelPolicy::default()),
+            SystemPromptOverride::default(),
+            Arc::new(maki_agent::tools::FileWriteLocks::new()),
+            init_cancel,
+            drain_tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let mut input = AgentInput::from_defaults(
+            "hello".into(),
+            AgentMode::Build,
+            Vec::new(),
+            maki_config::SessionDefaults::default(),
+        );
+        let mut snapshot = backend.admission_preparation().unwrap()(&input);
+        let prompt = Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap());
+        prompt.instructions.text = "admitted instructions".into();
+        let (tx, rx) = flume::bounded(1);
+        prompt.resolved = Some(rx);
+        let mut slots = maki_agent::prompt::ResolvedSlots::default();
+        slots.insert(
+            maki_agent::prompt::PromptId::System,
+            maki_agent::prompt::Slot::Identity,
+            maki_agent::prompt::SlotEntry {
+                plugin: "admission".into(),
+                content: "admitted identity".into(),
+            },
+        );
+        tx.send(Ok(maki_agent::agent::ResolvedPromptInputs {
+            slots: Arc::new(slots),
+            mcp_messages: None,
+        }))
+        .unwrap();
+        cwd.store(Arc::new(PathBuf::from("/tmp/changed")));
+        let model = crate::components::test_model();
+        let (system, _, _) =
+            smol::block_on(backend.prepare_run(&mut input, &model, Some(&snapshot))).unwrap();
+        assert!(system.contains("admitted instructions"));
+        assert!(system.contains("admitted identity"));
+        assert!(!system.contains("/tmp/changed"));
+        assert_eq!(backend.vars.apply("{cwd}"), "/tmp/admitted");
+    }
+
     /// Drives one turn through a backend whose setup cannot succeed, and
     /// returns everything the run emitted.
     fn run_failing_turn() -> (Option<TurnOutcome>, Vec<Envelope>) {
@@ -728,6 +947,9 @@ mod tests {
             cancel: CancelToken::none(),
             cancel_reason: ReasonedCancelToken::none(),
             correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
+            generation: 0,
+            policy: None,
+            admission: None,
             interrupt: None,
             managed_turn: None,
         };

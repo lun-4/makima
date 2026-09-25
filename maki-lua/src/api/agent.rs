@@ -101,6 +101,8 @@ struct LuaActorState {
     system: String,
     tools: RequestTools,
     opts: RequestOptions,
+    mode: AgentMode,
+    mode_def: Option<Arc<maki_agent::ModeDef>>,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
     child_cancel: CancelToken,
@@ -269,6 +271,33 @@ impl Drop for LuaActorBackend {
 }
 
 impl ActorBackend for LuaActorBackend {
+    fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
+        let state = Arc::clone(&self.state);
+        Some(Arc::new(move |input| {
+            let params = state
+                .params
+                .get()
+                .expect("session parameters initialized before admission");
+            let mode_def = if input.mode == state.mode {
+                state.mode_def.clone().or_else(|| match &input.mode {
+                    AgentMode::Custom(id) => params.modes.get(id).map(Arc::new),
+                    _ => Some(Arc::new(params.modes.current(&input.mode))),
+                })
+            } else {
+                None
+            };
+            maki_agent::agent::TurnAdmissionSnapshot {
+                mode_def,
+                prompt_inputs: None,
+                bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
+                    &params.registry,
+                    &state.local_tools,
+                    state.mcp.as_ref(),
+                )),
+            }
+        }))
+    }
+
     fn run_turn<'a>(
         &'a mut self,
         history: &'a mut History,
@@ -348,7 +377,8 @@ impl ActorBackend for LuaActorBackend {
             .with_cancel(context.cancel.clone())
             .with_cancel_reason_source(context.cancel_reason.clone())
             .with_mcp(state.mcp.clone())
-            .with_local_tools(Arc::clone(&state.local_tools));
+            .with_local_tools(Arc::clone(&state.local_tools))
+            .with_admission(context.admission.clone());
             let outcome = agent.run(turn_id, input).await;
             drop(agent);
             drop(permit);
@@ -731,6 +761,13 @@ async fn call_tool(
     input: LuaValue,
     opts: Option<Table>,
 ) -> LuaResult<(Option<String>, Option<String>, LuaValue)> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok((
+            None,
+            Some("plan mode prohibits indirect tool dispatch".into()),
+            LuaValue::Nil,
+        ));
+    }
     let input_json = lua_to_json(&lua, &input)?;
     let agent = match dispatch_ctx(&ctx, "call_tool") {
         Ok(a) => a,
@@ -924,6 +961,11 @@ async fn session(
     opts: Table,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
+    let parent_mode = agent_ctx.mode.clone();
+    let restrictive_parent = agent_ctx.restrict_write_to().is_some();
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let managed_turn = match (
         &agent_ctx.managed_turn,
         crate::runtime::current_managed_turn(&lua),
@@ -955,7 +997,7 @@ async fn session(
     let fast: bool = opts
         .get::<Option<bool>>("fast")?
         .unwrap_or(agent_ctx.opts.fast);
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !restrictive_parent;
     let silent: bool = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
     let auto_deliver: bool = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
     let parent_agent_id = managed_turn.as_ref().map(|current| current.agent_id());
@@ -1086,6 +1128,29 @@ async fn session(
     // The array is the caller's, and the filter comes out of it, so whatever
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
+    let initial_tools = RequestTools::assembled(tools_json.clone(), &agent_ctx.config, &model);
+    let child_mode = if restrictive_parent {
+        let mut child_ctx = agent_ctx.to_tool_context();
+        child_ctx.audience = audience;
+        child_ctx.tool_filter = Arc::clone(initial_tools.filter());
+        let mut allowed: std::collections::HashSet<_> = tool_dispatch::callable(&child_ctx)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        allowed.extend(local_map.keys().cloned());
+        tools_json
+            .as_array_mut()
+            .expect("request tools are an array")
+            .retain(|definition| {
+                definition
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|name| allowed.contains(name))
+            });
+        parent_mode
+    } else {
+        AgentMode::Build
+    };
     let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let build_params = |agent_id| AgentParams {
@@ -1126,6 +1191,10 @@ async fn session(
         system: system.unwrap_or_default(),
         tools,
         opts,
+        mode: child_mode,
+        mode_def: restrictive_parent
+            .then(|| agent_ctx.mode_def.clone())
+            .flatten(),
         mcp: agent_ctx
             .mcp
             .as_ref()
@@ -1254,12 +1323,13 @@ async fn session(
     // Tab submits go through the actor's admission, exactly like `send`.
     {
         let actor = actor.clone();
+        let mode = state.mode.clone();
         smol::spawn(async move {
             while let Ok(message) = ui_input_rx.recv_async().await {
                 let _ = actor.admit_turn(
                     AgentInput {
                         message,
-                        mode: AgentMode::Build,
+                        mode: mode.clone(),
                         images: Vec::new(),
                         preamble: Vec::new(),
                         thinking: opts.thinking,
@@ -1479,6 +1549,9 @@ async fn prompt(
     message: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok(err_pair("plan mode prohibits session prompts"));
+    }
     let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
     let (managed_child, fallback_cancel) = match &this.control {
@@ -1511,7 +1584,7 @@ async fn prompt(
     drop(this);
     let input = AgentInput {
         message,
-        mode: AgentMode::Build,
+        mode: state.mode.clone(),
         images: Vec::new(),
         preamble: Vec::new(),
         thinking: state.opts.thinking,
@@ -1648,17 +1721,20 @@ fn actor_is_busy(status: ActorStatus, queued: usize) -> bool {
 /// @return (boolean?, string?) `true` on success, or `(nil, err)` if the session is closed.
 #[lua_fn]
 async fn send(
-    _lua: Lua,
+    lua: Lua,
     this: mlua::UserDataRef<LuaSession>,
     message: String,
 ) -> LuaResult<Pair<bool>> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok(err_pair("plan mode prohibits session sends"));
+    }
     let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
     drop(this);
     match actor.admit_turn(
         AgentInput {
             message,
-            mode: AgentMode::Build,
+            mode: state.mode.clone(),
             images: Vec::new(),
             preamble: Vec::new(),
             thinking: state.opts.thinking,
@@ -2125,6 +2201,8 @@ mod tests {
                 thinking: ThinkingConfig::Off,
                 fast: false,
             },
+            mode: AgentMode::Build,
+            mode_def: None,
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx, RUN_ID),
             child_cancel,
@@ -2202,6 +2280,64 @@ mod tests {
                 String::new(),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn send_returns_during_policy_update() {
+        smol::block_on(async {
+            const MESSAGE: &str = "queued";
+            const REPLY: &str = "accepted";
+            let provider: Arc<dyn Provider> =
+                Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
+            let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
+            let reservation = actor.reserve_policy_update().unwrap();
+            let lua = Lua::new();
+            let userdata = lua.create_userdata(sess).unwrap();
+            assert_eq!(
+                send(lua.clone(), userdata.borrow().unwrap(), MESSAGE.into())
+                    .await
+                    .unwrap(),
+                (Some(true), None)
+            );
+            drop(reservation);
+            while actor.snapshot().latest.is_none() {
+                smol::future::yield_now().await;
+            }
+            assert!(matches!(
+                actor.snapshot().latest,
+                Some(TurnOutcome::Completed { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn prompt_survives_policy_update() {
+        smol::block_on(async {
+            const MESSAGE: &str = "queued prompt";
+            const REPLY: &str = "accepted";
+            let provider: Arc<dyn Provider> =
+                Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
+            let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
+            let reservation = actor.reserve_policy_update().unwrap();
+            let lua = Lua::new();
+            let userdata = lua.create_userdata(sess).unwrap();
+            let scope = crate::runtime::TaskScope::detached(&lua);
+            let mut pending = Box::pin(scope.scope_future(prompt(
+                lua.clone(),
+                userdata.borrow().unwrap(),
+                MESSAGE.into(),
+                None,
+            )));
+            assert!(
+                futures_lite::future::poll_once(&mut pending)
+                    .await
+                    .is_none()
+            );
+            drop(reservation);
+            let (result, error) = pending.await.unwrap();
+            assert_eq!(error, None);
+            assert_eq!(result.unwrap().get::<String>("text").unwrap(), REPLY);
+        });
     }
 
     #[test]
@@ -2572,6 +2708,51 @@ mod tests {
         assert!(actor_is_busy(ActorStatus::Running(TurnId::generate()), 0));
         assert!(actor_is_busy(ActorStatus::Idle, 1));
         assert!(!actor_is_busy(ActorStatus::Idle, 0));
+    }
+
+    #[test]
+    fn lua_backend_prepares_mode_at_admission() {
+        let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![]));
+        let (actor, state, session, _events) = session_with_provider(provider, None, None);
+        let modes = &state.params.get().unwrap().modes;
+        modes
+            .define(maki_agent::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("before".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let backend = LuaActorBackend::new(Arc::clone(&state));
+        let prepare = backend.admission_preparation().unwrap();
+        let input = AgentInput::from_defaults(
+            "queued".into(),
+            AgentMode::Build,
+            Vec::new(),
+            Default::default(),
+        );
+        let admitted = prepare(&input);
+        modes
+            .define(maki_agent::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("after".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            admitted.mode_def.as_ref().unwrap().system_prompt.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            prepare(&input)
+                .mode_def
+                .as_ref()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("after")
+        );
+        drop(session);
+        actor.shutdown();
     }
 
     #[test]

@@ -11,7 +11,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
     ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
-    ToolSource, timeout_annotation,
+    ToolSource, TurnToolBindings, timeout_annotation,
 };
 use maki_agent::{AgentMode, SharedBuf, ToolOutput};
 use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
@@ -228,6 +228,11 @@ fn exec_output_in(
     if let Some(r) = registry_override {
         ctx.registry = r;
     }
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
     smol::block_on(async { inv.execute(&ctx).await }).output
 }
 
@@ -388,6 +393,62 @@ fn exec_with_ctx(
             maki_agent::ToolOutput::Plain(s) => s.text,
             other => panic!("unexpected output: {other:?}"),
         })
+}
+
+#[test_case::test_case(
+    r#"local ok, err = maki.fs.write("/not-the-plan", "bad")
+        return tostring(ok) .. "|" .. tostring(err)"#,
+    "nil|plan mode prohibits this mutation"
+    ; "direct_fs_write"
+)]
+#[test_case::test_case(
+    r#"maki.async.run(function()
+            local ok, err = maki.fs.write("/not-the-plan", "bad")
+            ctx:finish(tostring(ok) .. "|" .. tostring(err))
+        end)"#,
+    "nil|plan mode prohibits this mutation"
+    ; "async_fs_write"
+)]
+#[test_case::test_case(
+    r#"local ok, err = pcall(maki.fn.jobstart, "true")
+        return tostring(ok) .. "|" .. tostring(err)"#,
+    "false|runtime error: plan mode prohibits this mutation"
+    ; "jobstart"
+)]
+fn lua_host_effects_respect_turn_policy(handler: &str, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "restrictive_effect_probe",
+        &format!(
+            r#"maki.api.register_tool({{
+                name = "restrictive_effect_probe",
+                description = "probes restrictive effects",
+                schema = {MINIMAL_SCHEMA},
+                handler = function(_, ctx)
+                    {handler}
+                end,
+            }})"#,
+        ),
+    )
+    .unwrap();
+    let mut ctx =
+        maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Plan("plan.md".into()));
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+
+    let output = exec_with_ctx(
+        &reg,
+        "restrictive_effect_probe",
+        serde_json::json!({}),
+        &ctx,
+    )
+    .expect("probe output");
+    assert!(output.contains(expected), "got: {output}");
 }
 
 /// The point of the whole thing: a handler learns who called it without
@@ -4845,6 +4906,43 @@ maki.api.register_tool({{
     (reg, host)
 }
 
+#[test]
+fn start_hook_respects_restrictive_turn_policy() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "restricted_start",
+        &format!(
+            r#"maki.api.register_tool({{
+                name = "restricted_start",
+                description = "test",
+                schema = {MINIMAL_SCHEMA},
+                start = function(_, ctx)
+                    local ok, err = maki.fs.write("/not-the-plan", "bad")
+                    local buf = maki.ui.buf()
+                    buf:set_lines({{ tostring(ok) .. "|" .. tostring(err) }})
+                    ctx:live_buf(buf)
+                end,
+                handler = function() return "handled" end,
+            }})"#,
+        ),
+    )
+    .unwrap();
+
+    let rx = run_start_in_mode(
+        &reg,
+        "restricted_start",
+        serde_json::json!({}),
+        &maki_agent::AgentMode::Plan("plan.md".into()),
+    );
+    let buf = recv_live_buf(&rx, START_TOOL_USE_ID).expect("start preview");
+    let lines = buf.read();
+    assert_eq!(
+        lines[0].spans[0].text,
+        "nil|plan mode prohibits this mutation"
+    );
+}
+
 /// `start` is awaited to completion, so the returned receiver already holds
 /// everything the hook emitted.
 fn run_start(
@@ -4852,10 +4950,19 @@ fn run_start(
     name: &str,
     input: serde_json::Value,
 ) -> flume::Receiver<maki_agent::Envelope> {
+    run_start_in_mode(reg, name, input, &maki_agent::AgentMode::Build)
+}
+
+fn run_start_in_mode(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    mode: &maki_agent::AgentMode,
+) -> flume::Receiver<maki_agent::Envelope> {
     let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let ctx = maki_agent::tools::test_support::stub_ctx_with(
-        &maki_agent::AgentMode::Build,
+        mode,
         Some(&event_tx),
         Some(START_TOOL_USE_ID),
     );
@@ -5491,6 +5598,11 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
 
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
     let out = smol::block_on(maki_agent::tools::interpreter_bridge::dispatch(
         &ctx,
         "img_probe",

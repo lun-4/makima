@@ -5,7 +5,13 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use maki_providers::{ContentBlock, ImageMediaType, ImageSource, Message, TokenUsage};
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    ContentBlock, ImageMediaType, ImageSource, Message, Model, ProviderEvent, RequestOptions,
+    StreamResponse, TokenUsage,
+};
+use maki_storage::id::SessionRef;
+use serde_json::Value;
 
 fn test_image() -> ImageSource {
     ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
@@ -16,8 +22,47 @@ use super::types::{
     ActorLifecycle, ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind,
 };
 use super::{ActorBackend, ActorError, ActorWork, AgentActorHandle, TurnAdmission};
+use crate::tools::DescriptionContext;
+use crate::tools::{
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience, ToolInvocation,
+    ToolSource,
+};
 use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnOutcome};
 use crate::{AgentEvent, AgentInput, AgentMode, ExtractedCommand, SharedMessages};
+use std::borrow::Cow;
+
+struct PolicyTestProvider;
+
+impl Provider for PolicyTestProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
+        Box::pin(async { unreachable!() })
+    }
+
+    fn list_models(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+fn policy(fast: bool) -> crate::RunSettings {
+    crate::RunSettings {
+        provider: Arc::new(PolicyTestProvider),
+        model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+        fast,
+        workflow: false,
+        thinking: Default::default(),
+    }
+}
 
 /// Shared observations the scripted backend records for the test to assert.
 #[derive(Default)]
@@ -27,7 +72,10 @@ struct ScriptedState {
     folds: Mutex<Vec<String>>,
     controls: Mutex<Vec<String>>,
     compacts: AtomicU32,
+    compact_policies: Mutex<Vec<(Option<bool>, u64)>>,
     entered: AtomicU32,
+    policies: Mutex<Vec<(String, Option<bool>, u64)>>,
+    admissions: Mutex<Vec<(String, Option<String>, bool)>>,
 }
 
 /// Scripted backend with an optional gate and a scripted outcome sequence.
@@ -38,6 +86,7 @@ struct ScriptedBackend {
     state: Arc<ScriptedState>,
     gate: Option<Arc<Gate>>,
     outcomes: Mutex<Vec<BackendResult>>,
+    preparation: Option<super::AdmissionPreparation>,
 }
 
 struct Gate {
@@ -78,6 +127,7 @@ impl ScriptedBackend {
             state: Arc::new(ScriptedState::default()),
             gate: None,
             outcomes: Mutex::new(Vec::new()),
+            preparation: None,
         }
     }
 
@@ -121,6 +171,10 @@ fn default_completed(context: &TurnContext) -> BackendResult {
 }
 
 impl ActorBackend for ScriptedBackend {
+    fn admission_preparation(&self) -> Option<super::AdmissionPreparation> {
+        self.preparation.clone()
+    }
+
     fn run_turn<'a>(
         &'a mut self,
         history: &'a mut crate::History,
@@ -149,6 +203,23 @@ impl ActorBackend for ScriptedBackend {
                     images.len(),
                 ));
             }
+            self.state.policies.lock().unwrap().push((
+                input.message.clone(),
+                context.policy.as_ref().map(|policy| policy.fast),
+                context.generation,
+            ));
+            self.state.admissions.lock().unwrap().push((
+                input.message.clone(),
+                context
+                    .admission
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.mode_def.as_ref())
+                    .and_then(|def| def.system_prompt.clone()),
+                context
+                    .admission
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.bindings.get("queued_tool").is_some()),
+            ));
             self.state.entered.fetch_add(1, Ordering::SeqCst);
             history.push(Message::user(input.message));
 
@@ -196,11 +267,15 @@ impl ActorBackend for ScriptedBackend {
     fn run_compact<'a>(
         &'a mut self,
         history: &'a mut crate::History,
-        _context: TurnContext,
+        context: TurnContext,
         _instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             self.state.compacts.fetch_add(1, Ordering::SeqCst);
+            self.state.compact_policies.lock().unwrap().push((
+                context.policy.as_ref().map(|policy| policy.fast),
+                context.generation,
+            ));
             history.push(Message::user("compact".to_owned()));
             BackendResult::CompactDone
         })
@@ -289,6 +364,43 @@ fn input(message: &str) -> AgentInput {
     }
 }
 
+struct QueuedTool;
+struct QueuedInvocation;
+
+impl ToolInvocation for QueuedInvocation {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain("queued".into()))
+    }
+
+    fn execute<'a>(self: Box<Self>, _ctx: &'a crate::tools::ToolContext) -> ExecFuture<'a> {
+        Box::pin(async {
+            crate::tools::ToolExecResult {
+                output: Ok(crate::ToolOutput::Plain("queued".into())),
+                annotation: None,
+                written_path: None,
+            }
+        })
+    }
+}
+
+impl Tool for QueuedTool {
+    fn name(&self) -> &str {
+        "queued_tool"
+    }
+    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+        "queued".into()
+    }
+    fn schema(&self) -> Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn audience(&self) -> ToolAudience {
+        ToolAudience::MAIN
+    }
+    fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(QueuedInvocation))
+    }
+}
+
 fn spawn(backend: impl ActorBackend + 'static) -> (AgentActorHandle, smol::Task<()>) {
     AgentActorHandle::spawn(AgentId::generate(), Vec::new(), None, Box::new(backend))
 }
@@ -303,6 +415,98 @@ async fn until(cond: impl Fn() -> bool) {
         smol::future::yield_now().await;
     }
     panic!("condition never became true");
+}
+
+#[test]
+fn admission_preparation_does_not_hold_actor_state_lock() {
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let mut backend = ScriptedBackend::new();
+    backend.preparation = Some(Arc::new(move |_| {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        crate::agent::TurnAdmissionSnapshot {
+            mode_def: None,
+            prompt_inputs: None,
+            bindings: Arc::default(),
+        }
+    }));
+    let (handle, task) = spawn(backend);
+    let actor = handle.clone();
+    let admission =
+        std::thread::spawn(move || actor.admit_turn(input("work"), None, "work".into()));
+    entered_rx.recv().unwrap();
+    handle.close();
+    release_tx.send(()).unwrap();
+    assert!(matches!(admission.join().unwrap(), Err(ActorError::Closed)));
+    smol::block_on(task);
+}
+
+#[test]
+fn queued_turn_keeps_admitted_mode_and_tool_binding() {
+    smol::block_on(async {
+        let modes = Arc::new(crate::modes::ModeRegistry::builtin());
+        let registry = Arc::new(crate::tools::ToolRegistry::new());
+        modes
+            .define(crate::modes::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("before".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        registry
+            .register(
+                Arc::new(QueuedTool),
+                ToolSource::Lua {
+                    plugin: "queued".into(),
+                },
+            )
+            .unwrap();
+        let gate = Gate::new();
+        let mut backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let observations = Arc::clone(&backend.state);
+        backend.preparation = Some(Arc::new({
+            let modes = Arc::clone(&modes);
+            let registry = Arc::clone(&registry);
+            move |input| crate::agent::TurnAdmissionSnapshot {
+                mode_def: Some(Arc::new(modes.current(&input.mode))),
+                prompt_inputs: None,
+                bindings: Arc::new(crate::tools::TurnToolBindings::capture(
+                    &registry,
+                    &crate::tools::LocalTools::default(),
+                    None,
+                )),
+            }
+        }));
+        let (handle, task) = spawn(backend);
+        let first = handle
+            .admit_turn(input("first"), None, "first".into())
+            .unwrap();
+        until(|| observations.entered.load(Ordering::SeqCst) == 1).await;
+        let second = handle
+            .admit_turn(input("second"), None, "second".into())
+            .unwrap();
+        modes
+            .define(crate::modes::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("after".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        registry.clear_plugin("queued");
+        gate.open();
+        assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
+        assert!(matches!(second.wait().await, TurnOutcome::Completed { .. }));
+        assert_eq!(
+            observations.admissions.lock().unwrap().as_slice(),
+            &[
+                ("first".into(), Some("before".into()), true),
+                ("second".into(), Some("before".into()), true),
+            ]
+        );
+        handle.shutdown();
+        task.await;
+    });
 }
 
 #[test]
@@ -564,6 +768,31 @@ fn cancel_existing_catches_control_between_pop_and_backend_entry() {
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.controls.lock().unwrap().as_slice(), ["surviving"]);
         handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn compact_keeps_admitted_policy() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.update_policy(policy(false)).unwrap();
+        handle.push_compact(1, None).unwrap();
+        handle.update_policy(policy(true)).unwrap();
+        handle
+            .push_control(ControlWork {
+                name: "fence".into(),
+                correlation: "fence".into(),
+            })
+            .unwrap();
+        until(|| state.controls.lock().unwrap().len() == 1).await;
+        assert_eq!(
+            state.compact_policies.lock().unwrap().as_slice(),
+            &[(Some(false), 1)]
+        );
+        handle.shutdown();
         task.await;
     });
 }
@@ -965,17 +1194,23 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
     queue.push(ActorWork::Compact {
         run_id: 1,
         instructions: None,
+        generation: 0,
+        policy: None,
     });
     queue.push(ActorWork::Control(ControlWork {
         name: "c".into(),
         correlation: "c".into(),
     }));
     assert!(matches!(
-        queue.pop_interrupt(),
+        queue.pop_interrupt(0, &crate::batch_key(&input("t"))),
         Some(ExtractedCommand::Compact(None))
     ));
     // A control at the front is incompatible: poll must not consume it.
-    assert!(queue.pop_interrupt().is_none());
+    assert!(
+        queue
+            .pop_interrupt(0, &crate::batch_key(&input("t")))
+            .is_none()
+    );
     assert_eq!(queue.len(), 1);
     // A turn at the front shields a root behind it.
     let admission = TurnAdmission {
@@ -984,6 +1219,9 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         event_sender: None,
         correlation: "t".into(),
         root: false,
+        generation: 0,
+        policy: None,
+        admission: None,
         ticket: super::TurnTicket::new(crate::types::TurnId::generate(), Arc::new(())),
     };
     queue.push(ActorWork::Turn(admission));
@@ -995,12 +1233,493 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         Vec::new(),
         "r2".into(),
     )));
-    assert!(queue.pop_interrupt().is_none());
+    assert!(
+        queue
+            .pop_interrupt(0, &crate::batch_key(&input("t")))
+            .is_none()
+    );
     assert_eq!(
         queue.len(),
         3,
         "incompatible FIFO entries must not be discarded"
     );
+}
+
+#[test]
+fn reserved_policy_orders_admissions_and_failed_updates() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.update_policy(policy(false)).unwrap();
+        let a = handle.admit_turn(input("a"), None, "a".into()).unwrap();
+        until(|| backend_reached(&handle)).await;
+        let reservation = handle.reserve_policy_update().unwrap();
+        let next = handle.clone();
+        let b = next.admit_turn(input("b"), None, "b".into()).unwrap();
+        assert!(handle.policy_snapshot().is_some_and(|p| !p.fast));
+        reservation.resolve(Ok(policy(true))).unwrap();
+        gate.open();
+        a.wait().await;
+        b.wait().await;
+        assert_eq!(
+            *state.policies.lock().unwrap(),
+            vec![("a".into(), Some(false), 1), ("b".into(), Some(true), 2)]
+        );
+
+        let failed = handle.reserve_policy_update().unwrap();
+        assert_eq!(
+            failed.resolve(Err(ActorError::PolicyCancelled)),
+            Err(ActorError::PolicyCancelled)
+        );
+        let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
+        c.wait().await;
+        assert_eq!(
+            state.policies.lock().unwrap()[2],
+            ("c".into(), Some(true), 2)
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn overlapping_reservations_commit_fifo_and_cancel_wakes_waiter() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let first = handle.reserve_policy_update().unwrap();
+        let second = handle.reserve_policy_update().unwrap();
+        second.resolve(Ok(policy(true))).unwrap();
+        assert!(handle.policy_snapshot().is_none());
+        let after = handle
+            .admit_turn(input("after"), None, "after".into())
+            .unwrap();
+        first.resolve(Ok(policy(false))).unwrap();
+        after.wait().await;
+        assert_eq!(
+            state.policies.lock().unwrap()[0],
+            ("after".into(), Some(true), 2)
+        );
+        let pending = handle.reserve_policy_update().unwrap();
+        let cancelled = handle
+            .admit_turn(input("cancelled"), None, "cancelled".into())
+            .unwrap();
+        handle.cancel_existing();
+        assert_eq!(pending.wait().await, Err(ActorError::PolicyCancelled));
+        assert!(matches!(
+            cancelled.wait().await,
+            TurnOutcome::Cancelled { .. }
+        ));
+        let after_cancel = handle
+            .admit_turn(input("cancelled"), None, "cancelled".into())
+            .unwrap();
+        assert_eq!(after_cancel.wait().await.agent_id(), handle.agent_id());
+        assert_eq!(
+            pending.resolve(Ok(policy(false))),
+            Err(ActorError::PolicyCancelled)
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn admissions_between_setters_keep_their_fifo_policy() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.update_policy(policy(false)).unwrap();
+        let first = handle.reserve_policy_update().unwrap();
+        let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
+        let second = handle.reserve_policy_update().unwrap();
+        let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
+        second.resolve(Ok(policy(false))).unwrap();
+        assert!(b.peek().is_none());
+        first.resolve(Ok(policy(true))).unwrap();
+        b.wait().await;
+        c.wait().await;
+        assert_eq!(
+            *observed.policies.lock().unwrap(),
+            vec![("b".into(), Some(true), 2), ("c".into(), Some(false), 3)]
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn first_setter_releases_b_while_second_still_blocks_c() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let first = handle.reserve_policy_update().unwrap();
+        let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
+        let second = handle.reserve_policy_update().unwrap();
+        let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
+        first.resolve(Ok(policy(true))).unwrap();
+        b.wait().await;
+        assert!(c.peek().is_none());
+        assert_eq!(
+            *observed.policies.lock().unwrap(),
+            vec![("b".into(), Some(true), 1)]
+        );
+        second.resolve(Ok(policy(false))).unwrap();
+        c.wait().await;
+        assert_eq!(
+            *observed.policies.lock().unwrap(),
+            vec![("b".into(), Some(true), 1), ("c".into(), Some(false), 2)]
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn deferred_work_projects_and_removes_without_orphan_tickets() {
+    smol::block_on(async {
+        let (handle, task) = spawn(ScriptedBackend::new());
+        let reservation = handle.reserve_policy_update().unwrap();
+        let removed = handle
+            .admit_turn(input("removed"), None, "removed".into())
+            .unwrap();
+        let cleared = handle
+            .admit_turn(input("cleared"), None, "cleared".into())
+            .unwrap();
+        handle
+            .rush(RootWork::new(
+                input("root"),
+                1,
+                false,
+                "root".into(),
+                Vec::new(),
+                "root".into(),
+            ))
+            .unwrap();
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.queued, snapshot.queue.len());
+        assert!(
+            snapshot
+                .queue
+                .contains(&QueueProjection::Turn("removed".into()))
+        );
+        assert!(snapshot.queue.contains(&QueueProjection::Message {
+            text: "root".into(),
+            image_count: 0,
+            displayed: false,
+        }));
+        let index = snapshot
+            .queue
+            .iter()
+            .position(|work| *work == QueueProjection::Turn("removed".into()))
+            .unwrap();
+        assert_eq!(
+            handle.remove_at(index),
+            Some(QueueProjection::Turn("removed".into()))
+        );
+        assert!(matches!(
+            removed.wait().await,
+            TurnOutcome::Cancelled { .. }
+        ));
+        assert_eq!(
+            handle.remove_visible_at(0),
+            Some(QueueProjection::Message {
+                text: "root".into(),
+                image_count: 0,
+                displayed: false,
+            })
+        );
+        assert_eq!(handle.clear(), 1);
+        assert!(matches!(
+            cleared.wait().await,
+            TurnOutcome::Cancelled { .. }
+        ));
+        assert!(handle.inner.tickets.lock().unwrap().is_empty());
+        drop(reservation);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn unpolled_admission_future_reserves_between_setters() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let first = handle.reserve_policy_update().unwrap();
+        let b = handle.admit_turn_after_policy(input("b"), None, "b".into());
+        let second = handle.reserve_policy_update().unwrap();
+        let c = handle.admit_turn_after_policy(input("c"), None, "c".into());
+        second.resolve(Ok(policy(false))).unwrap();
+        first.resolve(Ok(policy(true))).unwrap();
+        b.await.unwrap().wait().await;
+        c.await.unwrap().wait().await;
+        assert_eq!(
+            *observed.policies.lock().unwrap(),
+            vec![("b".into(), Some(true), 1), ("c".into(), Some(false), 2)]
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn root_batch_and_interrupt_respect_policy_generation() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.update_policy(policy(false)).unwrap();
+        let active = handle
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        until(|| observed.entered.load(Ordering::SeqCst) == 1).await;
+        for (run_id, message) in [(1, "old"), (2, "old too")] {
+            handle
+                .rush(RootWork::new(
+                    input(message),
+                    run_id,
+                    false,
+                    message.into(),
+                    Vec::new(),
+                    message.into(),
+                ))
+                .unwrap();
+        }
+        let reservation = handle.reserve_policy_update().unwrap();
+        reservation.resolve(Ok(policy(true))).unwrap();
+        handle
+            .rush(RootWork::new(
+                input("new"),
+                3,
+                false,
+                "new".into(),
+                Vec::new(),
+                "new".into(),
+            ))
+            .unwrap();
+        gate.open();
+        active.wait().await;
+        until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
+        assert_eq!(
+            observed.folds.lock().unwrap().as_slice(),
+            &["old", "old too"]
+        );
+        assert_eq!(observed.policies.lock().unwrap()[0].2, 1);
+        assert_eq!(observed.policies.lock().unwrap()[1].2, 2);
+        assert_eq!(observed.root_metadata.lock().unwrap()[0].2, "new");
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn deferred_roots_keep_setter_order() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let first = handle.reserve_policy_update().unwrap();
+        handle
+            .rush(RootWork::new(
+                input("b"),
+                1,
+                false,
+                "b".into(),
+                Vec::new(),
+                "b".into(),
+            ))
+            .unwrap();
+        let second = handle.reserve_policy_update().unwrap();
+        handle
+            .rush(RootWork::new(
+                input("c"),
+                2,
+                false,
+                "c".into(),
+                Vec::new(),
+                "c".into(),
+            ))
+            .unwrap();
+        second.resolve(Ok(policy(false))).unwrap();
+        first.resolve(Ok(policy(true))).unwrap();
+        until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
+        assert_eq!(
+            *observed.policies.lock().unwrap(),
+            vec![("b".into(), Some(true), 1), ("c".into(), Some(false), 2)]
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn unpolled_root_future_reserves_between_setters() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let first = handle.reserve_policy_update().unwrap();
+        let b = handle.rush_after_policy(RootWork::new(
+            input("b"),
+            1,
+            false,
+            "b".into(),
+            Vec::new(),
+            "b".into(),
+        ));
+        let second = handle.reserve_policy_update().unwrap();
+        let c = handle.rush_after_policy(RootWork::new(
+            input("c"),
+            2,
+            false,
+            "c".into(),
+            Vec::new(),
+            "c".into(),
+        ));
+        second.resolve(Ok(policy(false))).unwrap();
+        first.resolve(Ok(policy(true))).unwrap();
+        b.await.unwrap();
+        c.await.unwrap();
+        until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
+        assert_eq!(
+            *observed.policies.lock().unwrap(),
+            vec![("b".into(), Some(true), 1), ("c".into(), Some(false), 2)]
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn targeted_cancel_settles_deferred_turn_before_policy_commit() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let reservation = handle.reserve_policy_update().unwrap();
+        let cancelled = handle
+            .admit_turn(input("cancelled"), None, "cancelled".into())
+            .unwrap();
+        handle.cancel_turn(cancelled.turn_id()).unwrap();
+        assert!(matches!(
+            cancelled.wait().await,
+            TurnOutcome::Cancelled { .. }
+        ));
+        reservation.resolve(Ok(policy(true))).unwrap();
+        assert!(observed.policies.lock().unwrap().is_empty());
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn precancelled_deferred_turn_is_cancelled_after_policy_commit() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let reservation = handle.reserve_policy_update().unwrap();
+        handle.cancel_correlation("deferred", TurnCancellationReason::User);
+        let ticket = handle
+            .admit_turn(input("cancelled"), None, "deferred".into())
+            .unwrap();
+        reservation.resolve(Ok(policy(true))).unwrap();
+        assert!(matches!(ticket.wait().await, TurnOutcome::Cancelled { .. }));
+        assert!(observed.policies.lock().unwrap().is_empty());
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn dropped_reservation_releases_async_admission() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.update_policy(policy(false)).unwrap();
+        let reservation = handle.reserve_policy_update().unwrap();
+        let ticket = handle
+            .admit_turn(input("after"), None, "after".into())
+            .unwrap();
+        assert!(ticket.peek().is_none());
+        drop(reservation);
+        ticket.wait().await;
+        assert_eq!(
+            observed.policies.lock().unwrap()[0],
+            ("after".into(), Some(false), 1)
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn close_wakes_policy_waiter() {
+    smol::block_on(async {
+        let (handle, task) = spawn(ScriptedBackend::new());
+        let reservation = handle.reserve_policy_update().unwrap();
+        let ticket = handle
+            .admit_turn(input("after"), None, "after".into())
+            .unwrap();
+        handle.close();
+        let outcome = ticket.wait().await;
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::Closed,
+                ..
+            }
+        ));
+        assert_eq!(handle.outcome(ticket.turn_id()), Some(outcome));
+        drop(reservation);
+        assert!(handle.inner.state.lock().unwrap().pending_policy.is_empty());
+        assert!(handle.policy_snapshot().is_none());
+        assert!(matches!(
+            handle.admit_turn(input("after close"), None, "after close".into()),
+            Err(ActorError::Closed)
+        ));
+        task.await;
+    });
+}
+
+#[test]
+fn cancelled_running_turn_does_not_fold_next_generation() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let running = handle
+            .admit_turn(input("running"), None, "running".into())
+            .unwrap();
+        until(|| backend_reached(&handle)).await;
+        handle.cancel_existing();
+        handle
+            .rush(RootWork::new(
+                input("new"),
+                2,
+                false,
+                "new".into(),
+                Vec::new(),
+                "new".into(),
+            ))
+            .unwrap();
+        gate.open();
+        running.wait().await;
+        until(|| state.entered.load(Ordering::SeqCst) == 2).await;
+        assert!(state.folds.lock().unwrap().is_empty());
+        assert_eq!(state.runs.lock().unwrap().len(), 2);
+        handle.close();
+        task.await;
+    });
 }
 
 #[test]
@@ -1012,6 +1731,8 @@ fn queue_drain_publication_is_ordered() {
     queue.push(ActorWork::Compact {
         run_id: 1,
         instructions: None,
+        generation: 0,
+        policy: None,
     });
     queue.publish_if_empty(|| *published.lock().unwrap() += 1);
     assert_eq!(
@@ -1314,6 +2035,7 @@ fn remove_at_raw_index_terminalizes_real_turn() {
             .admit_turn(input("running"), None, "r1".into())
             .unwrap();
         until(|| backend_reached(&handle)).await;
+        handle.update_policy(policy(false)).unwrap();
         let t2 = handle
             .admit_turn(input("queued"), None, "r2".into())
             .unwrap();
@@ -1321,9 +2043,10 @@ fn remove_at_raw_index_terminalizes_real_turn() {
             .admit_turn(input("queued2"), None, "r3".into())
             .unwrap();
 
-        // The queue is [running is out of queue; queued, queued2]; raw index 0
-        // is t2. Removing it terminalizes the real turn exactly once.
-        let removed = handle.remove_at(0).unwrap();
+        // The queue is [policy barrier, queued, queued2]. The barrier cannot
+        // be removed, so raw index 1 remains t2.
+        assert_eq!(handle.remove_at(0), None);
+        let removed = handle.remove_at(1).unwrap();
         assert!(matches!(removed, QueueProjection::Turn(_)));
         assert!(matches!(
             t2.wait().await,
@@ -1332,7 +2055,13 @@ fn remove_at_raw_index_terminalizes_real_turn() {
                 ..
             }
         ));
-        assert_eq!(handle.snapshot().queued, 1);
+        assert_eq!(
+            handle.snapshot().queue,
+            vec![
+                QueueProjection::PolicyBarrier,
+                QueueProjection::Turn("r3".into())
+            ]
+        );
         gate.open();
         t1.wait().await;
         t3.wait().await;

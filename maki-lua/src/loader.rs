@@ -488,6 +488,18 @@ impl PluginHost {
                 None,
                 PluginPermissions::trusted(),
                 opts,
+                matches!(
+                    builtin.as_str(),
+                    "read"
+                        | "glob"
+                        | "grep"
+                        | "webfetch"
+                        | "question"
+                        | "write"
+                        | "edit"
+                        | "plan_submit_tool"
+                        | "task"
+                ),
             )?;
         }
         Ok(())
@@ -500,6 +512,7 @@ impl PluginHost {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
+        bundled: bool,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -510,6 +523,7 @@ impl PluginHost {
                 plugin_dir,
                 permissions,
                 opts,
+                bundled,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -546,6 +560,7 @@ impl PluginHost {
                 plugin_dir: None,
                 permissions: PluginPermissions::trusted(),
                 opts: PluginOpts::default(),
+                bundled: false,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -632,6 +647,7 @@ impl PluginHost {
             None,
             PluginPermissions::trusted(),
             Arc::new(opts),
+            false,
         )
     }
 
@@ -647,6 +663,7 @@ impl PluginHost {
             None,
             permissions,
             PluginOpts::default(),
+            false,
         )
     }
 
@@ -667,6 +684,7 @@ impl PluginHost {
             plugin_dir,
             permissions,
             PluginOpts::default(),
+            false,
         )
     }
 
@@ -1047,12 +1065,7 @@ impl EventHandle {
     }
 
     pub fn collect_prompt_slots(&self) -> ResolvedSlots {
-        if self.shutdown.load(Ordering::Acquire) {
-            return ResolvedSlots::default();
-        }
-        let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv().unwrap_or_default()
+        self.request_prompt_slots().recv().unwrap_or_default()
     }
 
     /// Gather `@`-completion candidates from every registered source, for the
@@ -1131,13 +1144,19 @@ impl EventHandle {
         rx.recv().unwrap_or_else(|_| Ok(text.to_string()))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
-        if self.shutdown.load(Ordering::Acquire) {
-            return ResolvedSlots::default();
-        }
+    pub fn request_prompt_slots(&self) -> flume::Receiver<ResolvedSlots> {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv_async().await.unwrap_or_default()
+        if !self.shutdown.load(Ordering::Acquire) {
+            let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        }
+        rx
+    }
+
+    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+        self.request_prompt_slots()
+            .recv_async()
+            .await
+            .unwrap_or_default()
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
@@ -1925,6 +1944,54 @@ mod tests {
                 .map(|c| c.spec().name.as_ref())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn bundled_read_only_identity_follows_loader_and_replacement() {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        let names = [
+            "read",
+            "glob",
+            "grep",
+            "webfetch",
+            "question",
+            "plan_submit_tool",
+            "task",
+        ];
+        host.load_builtins(&PluginsConfig {
+            enabled: true,
+            names: names.iter().map(|name| (*name).into()).collect(),
+            opts: HashMap::new(),
+        })
+        .unwrap();
+        for name in [
+            "read",
+            "glob",
+            "grep",
+            "webfetch",
+            "question",
+            "plan_submit",
+            "task",
+        ] {
+            assert!(registry.get(name).unwrap().is_bundled_read_only());
+        }
+        host.load_source(
+            "read",
+            r#"maki.api.register_tool({name = "read", description = "probe", schema = {type = "object", properties = {}}, handler = function() return "ok" end})"#,
+        )
+        .unwrap();
+        assert!(!registry.get("read").unwrap().is_bundled_read_only());
+        for name in [
+            "glob",
+            "grep",
+            "webfetch",
+            "question",
+            "plan_submit",
+            "task",
+        ] {
+            assert!(registry.get(name).unwrap().is_bundled_read_only());
+        }
     }
 
     #[test]

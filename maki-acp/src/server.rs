@@ -2514,11 +2514,33 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let (input_tx, input_rx) = flume::unbounded();
         let session_id = MakiId::generate();
+        let input_handle = headless::spawn_interactive(InteractiveParams {
+            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+            config: Default::default(),
+            permissions_config: Default::default(),
+            timeouts: Default::default(),
+            prompt_slots: Arc::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: PathBuf::from("/project"),
+            session_id: Some(SessionRef::from(session_id)),
+            modes: Arc::default(),
+            initial_history: Vec::new(),
+            yolo: false,
+            system_prompt_override: Some(String::new()),
+            append_system_prompt: None,
+            defaults: Default::default(),
+            model_policy: Arc::default(),
+            question_mode: QuestionMode::Headless,
+            plugin_rules: Arc::default(),
+            project_config: ProjectConfig::for_project(Path::new("/project")),
+            local_tools: Default::default(),
+        });
         let handle = InteractiveHandle {
             model: Default::default(),
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
-            input_tx,
+            input_tx: input_handle.input_tx.with_input_mirror(input_tx),
             answer_tx: answer_tx.clone(),
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
@@ -2688,7 +2710,18 @@ mod tests {
             .unwrap_err();
 
             assert!(!error.is_empty());
-            assert!(input_tx.is_disconnected(), "session task was not cancelled");
+            assert!(
+                input_tx
+                    .send(agent_input(
+                        String::new(),
+                        Vec::new(),
+                        AgentMode::Build,
+                        SessionDefaults::default(),
+                        None,
+                    ))
+                    .is_err(),
+                "session task was not cancelled"
+            );
             assert!(srv.session.is_none());
         });
     }

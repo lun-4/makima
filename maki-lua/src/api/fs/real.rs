@@ -16,6 +16,83 @@ use super::{
 /// gitignore, permissions, real mtimes.
 pub struct RealFs;
 
+#[cfg(target_os = "linux")]
+pub(super) fn anchored_plan_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, open, openat, renameat, unlinkat};
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| IoError::from(ErrorKind::InvalidInput))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| IoError::from(ErrorKind::InvalidInput))?;
+    let root = open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
+    let mut directory = root;
+    for component in parent.components() {
+        if let std::path::Component::Normal(part) = component {
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+            directory = match openat(&directory, part, flags, Mode::empty()) {
+                Ok(next) => next,
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    match mkdirat(&directory, part, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                    openat(&directory, part, flags, Mode::empty())?
+                }
+                Err(err) => return Err(err.into()),
+            };
+        }
+    }
+    match openat(
+        &directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            if !std::fs::File::from(file).metadata()?.is_file() {
+                return Err(IoError::from(ErrorKind::InvalidInput));
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let mut temp_name = None;
+    let mut file = None;
+    for attempt in 0..16u64 {
+        let candidate = format!(".maki-plan-{}-{attempt}", std::process::id());
+        match openat(
+            &directory,
+            candidate.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(created) => {
+                temp_name = Some(candidate);
+                file = Some(std::fs::File::from(created));
+                break;
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let temp_name = temp_name.ok_or_else(|| IoError::from(ErrorKind::AlreadyExists))?;
+    let result = (|| {
+        let mut file = file.ok_or_else(|| IoError::from(ErrorKind::AlreadyExists))?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        renameat(&directory, temp_name.as_str(), &directory, name)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = unlinkat(&directory, temp_name.as_str(), AtFlags::empty());
+    }
+    result
+}
+
 impl FsBackend for RealFs {
     fn read(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<String>> {
         Box::pin(async move { smol::unblock(move || std::fs::read_to_string(&path)).await })

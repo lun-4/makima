@@ -198,6 +198,34 @@ fn unknown_subagent_type_rejects_submit() {
 }
 
 #[test]
+fn admitted_slot_request_precedes_plugin_replacement() {
+    const FIRST: &str = "first admitted slot";
+    const SECOND: &str = "replacement slot";
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let source = |content| {
+        format!(
+            "maki.api.register_prompt_hint({{ slot = 'after_instructions', content = '{content}' }})"
+        )
+    };
+    host.load_source("pinned_slots", &source(FIRST)).unwrap();
+    let handle = host.event_handle();
+    let admitted = handle.request_prompt_slots();
+    host.load_source("pinned_slots", &source(SECOND)).unwrap();
+    let slots = admitted.recv().unwrap();
+    let contents: Vec<_> = slots
+        .get(PromptId::System, Slot::AfterInstructions)
+        .iter()
+        .map(|entry| entry.content.as_str())
+        .collect();
+    assert_eq!(contents, [FIRST]);
+    let latest = handle.collect_prompt_slots();
+    assert_eq!(
+        latest.get(PromptId::System, Slot::AfterInstructions)[0].content,
+        SECOND
+    );
+}
+
+#[test]
 fn plugins_teach_agent_their_intent_tokens() {
     let (_host, eh) = host_with_real_plugins();
     let slots = eh.collect_prompt_slots();

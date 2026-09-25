@@ -12,7 +12,7 @@ use mlua::{Lua, Result as LuaResult, Table};
 use smol::{Timer, unblock};
 use url::Url;
 
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 use crate::plugin_permissions::PluginPermissions;
 
@@ -231,6 +231,9 @@ struct ResponseData {
 /// end
 #[lua_fn(guard = Net)]
 async fn request(lua: Lua, url: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
+    if crate::runtime::restrictive_effects(&lua) {
+        return Ok(err_pair("plan mode prohibits network requests"));
+    }
     let params = try_pair!(extract_request_params(&url, opts.as_ref()).await);
     let resp = try_pair!(do_request(params).await);
     let tbl = lua.create_table()?;
@@ -1042,6 +1045,21 @@ mod tests {
             .unwrap();
         assert!(is_nil);
         assert!(has_err);
+    }
+
+    #[test]
+    fn restrictive_task_denies_network_before_request() {
+        const DENIED: &str = "plan mode prohibits network requests";
+        let lua = Lua::new();
+        let cell =
+            crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
+        let handle = cell.into_handle();
+        crate::runtime::lock_cell(&handle).restrict_effects = true;
+        lua.set_app_data(handle);
+        let (response, error) =
+            smol::block_on(request(lua, "https://example.com".into(), None)).unwrap();
+        assert!(response.is_none());
+        assert_eq!(error.as_deref(), Some(DENIED));
     }
 
     #[test]

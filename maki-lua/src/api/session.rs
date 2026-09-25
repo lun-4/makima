@@ -29,6 +29,10 @@ pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
 
+fn mutation_denied(lua: &Lua) -> bool {
+    crate::runtime::restrictive_effects(lua) || crate::api::fs::plan_write_path(lua).is_some()
+}
+
 async fn roundtrip(
     lua: Lua,
     tx: Option<flume::Sender<UiAction>>,
@@ -208,6 +212,9 @@ async fn focus(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
+    if mutation_denied(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
 }
 
@@ -224,6 +231,9 @@ async fn delete(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
+    if mutation_denied(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     roundtrip(lua, tx, SessionRequest::Delete { id }).await
 }
 
@@ -294,6 +304,9 @@ async fn new(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
+    if mutation_denied(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let (prompt, focus) = match opts {
         Some(opts) => (opts.get("prompt")?, opts.get("focus").unwrap_or(false)),
         None => (None, false),
@@ -319,6 +332,9 @@ async fn prompt(
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
+    if mutation_denied(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let id = match opts {
         Some(opts) => opts.get("session")?,
         None => None,
@@ -337,7 +353,10 @@ async fn prompt(
 /// @example
 /// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 #[lua_fn]
-fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+fn notify(lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+    if mutation_denied(lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     if text.trim().is_empty() {
         return Ok(err_pair(BLANK_NOTIFY_ERR));
     }
@@ -397,6 +416,9 @@ async fn set_option(
     value: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<bool>> {
+    if mutation_denied(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     if let Err(error) = ensure_validation_not_in_progress(&lua) {
         return Ok(err_pair(error));
     }
@@ -435,6 +457,9 @@ async fn set_title(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Table,
 ) -> LuaResult<Pair<Value>> {
+    if mutation_denied(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let req = SessionRequest::SetTitle {
         id: opts.get("id")?,
         title: opts.get("title")?,
@@ -469,6 +494,9 @@ async fn set_thinking(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Table,
 ) -> LuaResult<Pair<Value>> {
+    if mutation_denied(&lua) {
+        return Ok(err_pair(crate::api::fs::PLAN_MUTATION_DENIED));
+    }
     let req = SessionRequest::SetThinking {
         set_default: opts.get("set_default").unwrap_or(false),
         thinking: opts.get("mode")?,
@@ -510,6 +538,13 @@ mod tests {
         let t = create_session_table(&lua, tx).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
+    }
+
+    fn restrict(lua: &Lua) {
+        let mut cell =
+            crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
+        cell.plan_write_path = Some(Arc::from(PathBuf::from("/plan.md")));
+        lua.set_app_data(cell.into_handle());
     }
 
     fn live_mailbox(id: MakiId) -> (SessionMailbox, SessionCoordinatorHandle) {
@@ -724,6 +759,39 @@ mod tests {
 
         assert!(value.is_nil());
         assert_eq!(error, Some(format!("session not live: {id}")));
+    }
+
+    #[test]
+    fn restrictive_context_rejects_session_mutations() {
+        let lua = lua_with_session(None);
+        restrict(&lua);
+        lua.globals()
+            .set("session_id", MakiId::generate().to_string())
+            .unwrap();
+        smol::block_on(
+            lua.load(format!(
+                r#"
+                local denied = {denied:?}
+                local mutations = {{
+                    function() return session.focus(session_id) end,
+                    function() return session.delete(session_id) end,
+                    function() return session.new() end,
+                    function() return session.prompt("work") end,
+                    function() return session.notify("wake", {{ session = session_id, wake = true }}) end,
+                    function() return session.set_option("fast", "enabled") end,
+                    function() return session.set_title({{ id = session_id, title = "changed" }}) end,
+                    function() return session.set_thinking({{ mode = "medium" }}) end,
+                }}
+                for _, mutate in ipairs(mutations) do
+                    local value, err = mutate()
+                    assert(value == nil and err == denied, tostring(value) .. "|" .. tostring(err))
+                end
+                "#,
+                denied = crate::api::fs::PLAN_MUTATION_DENIED,
+            ))
+            .exec_async(),
+        )
+        .unwrap();
     }
 
     #[test]

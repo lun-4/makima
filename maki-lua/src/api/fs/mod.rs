@@ -22,6 +22,7 @@ use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
+use crate::runtime::{TaskHandle, lock_cell};
 
 #[cfg(feature = "test-support")]
 pub use in_memory::InMemoryFs;
@@ -63,7 +64,7 @@ pub(crate) type BoxFuture<'a, T> =
 /// All methods return a boxed future so the trait stays object-safe; a
 /// backend that performs blocking I/O hops to a thread pool itself
 /// (`RealFs` uses `smol::unblock`).
-pub trait FsBackend: Send + Sync {
+pub trait FsBackend: Send + Sync + std::any::Any {
     fn read(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<String>>;
     fn read_bytes(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<Vec<u8>>>;
     fn stat(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<FsMeta>>;
@@ -128,6 +129,63 @@ fn make_absolute(path: &str) -> LuaResult<PathBuf> {
             .map(|cwd| cwd.join(&p))
             .map_err(|e| mlua::Error::runtime(format!("cannot resolve cwd: {e}")))
     }
+}
+
+pub(crate) const PLAN_MUTATION_DENIED: &str = "plan mode prohibits this mutation";
+
+pub(crate) fn plan_write_path(lua: &Lua) -> Option<std::sync::Arc<Path>> {
+    lua.app_data_ref::<TaskHandle>()
+        .and_then(|handle| lock_cell(&handle).plan_write_path.clone())
+}
+
+fn mutation_allowed(lua: &Lua, target: &Path, write: bool) -> Result<(), &'static str> {
+    if crate::runtime::restrictive_effects(lua) && plan_write_path(lua).is_none() {
+        return Err(PLAN_MUTATION_DENIED);
+    }
+    let Some(plan) = plan_write_path(lua) else {
+        return Ok(());
+    };
+    if write && normalize_target(target) == normalize_target(&plan) {
+        return Ok(());
+    }
+    Err(PLAN_MUTATION_DENIED)
+}
+
+fn normalize_target(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+async fn write_plan(lua: &Lua, path: PathBuf, content: Vec<u8>) -> std::io::Result<()> {
+    if backend(lua).as_ref().type_id() == std::any::TypeId::of::<RealFs>() {
+        #[cfg(target_os = "linux")]
+        return smol::unblock(move || {
+            real::anchored_plan_write(&normalize_target(&path), &content)
+        })
+        .await;
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            PLAN_MUTATION_DENIED,
+        ));
+    }
+    #[cfg(feature = "test-support")]
+    if backend(lua).as_ref().type_id() == std::any::TypeId::of::<InMemoryFs>() {
+        return backend(lua).atomic_write(path, content).await;
+    }
+    Err(std::io::Error::new(
+        ErrorKind::PermissionDenied,
+        PLAN_MUTATION_DENIED,
+    ))
 }
 
 fn path_to_string(p: &Path) -> LuaResult<String> {
@@ -460,8 +518,14 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 #[lua_fn(guard = FsWrite)]
 async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
-    let fs = backend(&lua);
-    let result = fs.write(abs, content.into_bytes()).await;
+    if let Err(err) = mutation_allowed(&lua, &abs, true) {
+        return Ok(err_pair(err));
+    }
+    let result = if plan_write_path(&lua).is_some() {
+        write_plan(&lua, abs, content.into_bytes()).await
+    } else {
+        backend(&lua).write(abs, content.into_bytes()).await
+    };
     Ok(pair(result.map(|()| true)))
 }
 
@@ -478,8 +542,14 @@ async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>>
 #[lua_fn(guard = FsWrite)]
 async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
-    let fs = backend(&lua);
-    let result = fs.atomic_write(abs, content.into_bytes()).await;
+    if let Err(err) = mutation_allowed(&lua, &abs, true) {
+        return Ok(err_pair(err));
+    }
+    let result = if plan_write_path(&lua).is_some() {
+        write_plan(&lua, abs, content.into_bytes()).await
+    } else {
+        backend(&lua).atomic_write(abs, content.into_bytes()).await
+    };
     Ok(pair(result.map(|()| true)))
 }
 
@@ -498,6 +568,9 @@ async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair
 #[lua_fn(guard = FsWrite)]
 async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
+    if let Err(err) = mutation_allowed(&lua, &abs, false) {
+        return Ok(err_pair(err));
+    }
     let recursive = opts
         .as_ref()
         .and_then(|t| opt_bool(t, "recursive"))
@@ -522,6 +595,9 @@ async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>
 #[lua_fn(guard = FsWrite)]
 async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
+    if let Err(err) = mutation_allowed(&lua, &abs, false) {
+        return Ok(err_pair(err));
+    }
     let parents = opts
         .as_ref()
         .and_then(|t| opt_bool(t, "parents"))
@@ -686,6 +762,151 @@ mod tests {
     const FIRST_CONTENT: &str = "first";
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
+
+    #[test]
+    fn plan_guard_restricts_actual_mutations_and_allows_plan_write() {
+        let plan = PathBuf::from("/plan.md");
+        let other = PathBuf::from("/other.md");
+        let lua = Lua::new();
+        let fs = std::sync::Arc::new(InMemoryFs::new());
+        lua.set_app_data(FsBackendHandle(fs.clone()));
+        let mut cell =
+            crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
+        cell.plan_write_path = Some(std::sync::Arc::from(plan.clone()));
+        lua.set_app_data(cell.into_handle());
+
+        assert_eq!(mutation_allowed(&lua, &plan, true), Ok(()));
+        assert_eq!(
+            mutation_allowed(&lua, &other, true),
+            Err(PLAN_MUTATION_DENIED)
+        );
+        assert_eq!(
+            mutation_allowed(&lua, &plan, false),
+            Err(PLAN_MUTATION_DENIED)
+        );
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        lua.globals().set("fs", table).unwrap();
+        let script = format!(
+            "local ok, err = fs.write({other:?}, 'no'); assert(ok == nil and err == {denied:?}); local good, fail = fs.atomic_write({plan:?}, 'yes'); assert(good == true and fail == nil); local removed, why = fs.rm({plan:?}); assert(removed == nil and why == {denied:?})",
+            other = other.to_string_lossy(),
+            plan = plan.to_string_lossy(),
+            denied = PLAN_MUTATION_DENIED,
+        );
+        smol::block_on(lua.load(script).exec_async()).unwrap();
+        assert!(fs.files().iter().all(|(path, _)| path != &other));
+        assert_eq!(fs.files(), vec![(plan, b"yes".to_vec())]);
+    }
+
+    #[test]
+    fn restrictive_guard_denies_every_mutation_on_in_memory_backend() {
+        let lua = Lua::new();
+        let fs = std::sync::Arc::new(InMemoryFs::new());
+        lua.set_app_data(FsBackendHandle(fs.clone()));
+        let mut cell =
+            crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
+        cell.restrict_effects = true;
+        lua.set_app_data(cell.into_handle());
+        let path = Path::new("/plan.md");
+        assert_eq!(
+            mutation_allowed(&lua, path, true),
+            Err(PLAN_MUTATION_DENIED)
+        );
+        assert_eq!(
+            mutation_allowed(&lua, path, false),
+            Err(PLAN_MUTATION_DENIED)
+        );
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        lua.globals().set("fs", table).unwrap();
+        smol::block_on(lua.load(format!(
+            "for _, name in ipairs({{'write', 'atomic_write'}}) do local ok, err = fs[name]('/plan.md', 'content'); assert(ok == nil and err == {denied:?}) end; for _, name in ipairs({{'rm', 'mkdir'}}) do local ok, err = fs[name]('/plan.md'); assert(ok == nil and err == {denied:?}) end",
+            denied = PLAN_MUTATION_DENIED,
+        )).exec_async()).unwrap();
+        assert!(fs.files().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plan_guard_writes_only_anchored_real_plan_file() {
+        let tmp = TempDir::new().unwrap();
+        let plan = tmp.path().join("plan.md");
+        let other = tmp.path().join("other.md");
+        let lua = Lua::new();
+        let mut cell =
+            crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
+        cell.plan_write_path = Some(std::sync::Arc::from(plan.clone()));
+        lua.set_app_data(cell.into_handle());
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        for operation in ["write", "atomic_write"] {
+            let func: mlua::Function = table.get(operation).unwrap();
+            let (ok, err): (Option<bool>, Option<String>) =
+                smol::block_on(func.call_async((plan.to_string_lossy().as_ref(), operation)))
+                    .unwrap();
+            assert_eq!((ok, err), (Some(true), None));
+            assert_eq!(std::fs::read_to_string(&plan).unwrap(), operation);
+            let (ok, err): (Option<bool>, Option<String>) =
+                smol::block_on(func.call_async((other.to_string_lossy().as_ref(), "no"))).unwrap();
+            assert_eq!(ok, None);
+            assert_eq!(err.as_deref(), Some(PLAN_MUTATION_DENIED));
+        }
+        std::fs::remove_file(&plan).unwrap();
+        std::os::unix::fs::symlink(&other, &plan).unwrap();
+        let func: mlua::Function = table.get("atomic_write").unwrap();
+        let (ok, _): (Option<bool>, Option<String>) =
+            smol::block_on(func.call_async((plan.to_string_lossy().as_ref(), "no"))).unwrap();
+        assert_eq!(ok, None);
+        assert!(!other.exists());
+
+        let outside = TempDir::new().unwrap();
+        let linked_parent = tmp.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), &linked_parent).unwrap();
+        let linked_plan = linked_parent.join("plan.md");
+        crate::runtime::lock_cell(&lua.app_data_ref::<TaskHandle>().unwrap()).plan_write_path =
+            Some(std::sync::Arc::from(linked_plan.clone()));
+        let (ok, _): (Option<bool>, Option<String>) =
+            smol::block_on(func.call_async((linked_plan.to_string_lossy().as_ref(), "no")))
+                .unwrap();
+        assert_eq!(ok, None);
+        assert!(!outside.path().join("plan.md").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restrictive_plan_write_creates_only_safe_parents() {
+        let tmp = TempDir::new().unwrap();
+        let plan = tmp.path().join("new/nested/plan.md");
+        let lua = Lua::new();
+        let mut cell =
+            crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
+        cell.restrict_effects = true;
+        cell.plan_write_path = Some(std::sync::Arc::from(plan.clone()));
+        lua.set_app_data(cell.into_handle());
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let mkdir: mlua::Function = table.get("mkdir").unwrap();
+        let (ok, err): (Option<bool>, Option<String>) =
+            smol::block_on(mkdir.call_async(plan.parent().unwrap().to_string_lossy().as_ref()))
+                .unwrap();
+        assert_eq!((ok, err.as_deref()), (None, Some(PLAN_MUTATION_DENIED)));
+        assert!(!plan.parent().unwrap().exists());
+
+        let write: mlua::Function = table.get("atomic_write").unwrap();
+        let (ok, err): (Option<bool>, Option<String>) =
+            smol::block_on(write.call_async((plan.to_string_lossy().as_ref(), FIRST_CONTENT)))
+                .unwrap();
+        assert_eq!((ok, err), (Some(true), None));
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), FIRST_CONTENT);
+
+        let outside = TempDir::new().unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let linked_plan = linked.join("new/plan.md");
+        crate::runtime::lock_cell(&lua.app_data_ref::<TaskHandle>().unwrap()).plan_write_path =
+            Some(std::sync::Arc::from(linked_plan.clone()));
+        let (ok, _): (Option<bool>, Option<String>) =
+            smol::block_on(write.call_async((linked_plan.to_string_lossy().as_ref(), "no")))
+                .unwrap();
+        assert_eq!(ok, None);
+        assert!(!outside.path().join("new").exists());
+    }
 
     #[test]
     fn read_file_ok() {

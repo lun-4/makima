@@ -35,7 +35,9 @@ use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpSession;
+use crate::mcp::{
+    McpPublishedBinding, McpSession, McpToolBinding, TOOL_SEARCH_TOOL_NAME, wire_tool_name,
+};
 use crate::permissions::PermissionManager;
 use crate::{AgentConfig, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
@@ -321,6 +323,102 @@ pub struct LocalTool {
 
 pub type LocalTools = Arc<HashMap<String, LocalTool>>;
 
+#[derive(Clone)]
+pub enum TurnToolRoute {
+    Local(LocalTool),
+    Native(RegisteredTool),
+    Mcp(McpToolBinding),
+    ToolSearch,
+}
+
+#[derive(Clone, Default)]
+pub struct TurnToolBindings {
+    routes: HashMap<String, TurnToolRoute>,
+    mcp_published: Option<McpPublishedBinding>,
+}
+
+impl TurnToolBindings {
+    pub fn capture(
+        registry: &ToolRegistry,
+        local_tools: &LocalTools,
+        mcp: Option<&McpSession>,
+    ) -> Self {
+        let mut routes = HashMap::new();
+        let mcp_published = mcp.map(McpSession::published_binding);
+        if let Some((mcp, published)) = mcp.zip(mcp_published.as_ref()) {
+            routes.insert(TOOL_SEARCH_TOOL_NAME.to_owned(), TurnToolRoute::ToolSearch);
+            for binding in mcp.tool_bindings(published) {
+                let qualified = binding.qualified_name().to_string();
+                routes.insert(
+                    wire_tool_name(&qualified),
+                    TurnToolRoute::Mcp(binding.clone()),
+                );
+                routes.insert(qualified, TurnToolRoute::Mcp(binding));
+            }
+        }
+        for entry in registry.iter().iter() {
+            routes.insert(
+                entry.name().to_owned(),
+                TurnToolRoute::Native(entry.clone()),
+            );
+        }
+        for (name, tool) in local_tools.iter() {
+            routes.insert(name.clone(), TurnToolRoute::Local(tool.clone()));
+        }
+        Self {
+            routes,
+            mcp_published,
+        }
+    }
+
+    pub fn extend_mcp_tools(&self, mcp: &McpSession, tools: &mut Value) {
+        if let Some(binding) = &self.mcp_published {
+            mcp.extend_bound_tools(binding, tools);
+        }
+    }
+
+    pub fn search_mcp_tools(
+        &self,
+        mcp: &McpSession,
+        query: &str,
+        origin: CallOrigin,
+    ) -> Result<String, String> {
+        let binding = self
+            .mcp_published
+            .as_ref()
+            .ok_or("MCP unavailable this turn")?;
+        mcp.search_bound_tools(binding, query, origin)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&TurnToolRoute> {
+        self.routes
+            .get(name.strip_prefix("functions.").unwrap_or(name))
+    }
+
+    pub fn is_current(
+        &self,
+        name: &str,
+        registry: &ToolRegistry,
+        local_tools: &LocalTools,
+        mcp: Option<&McpSession>,
+    ) -> bool {
+        let name = name.strip_prefix("functions.").unwrap_or(name);
+        match self.routes.get(name) {
+            Some(TurnToolRoute::Native(entry)) => registry.is_current(entry),
+            Some(TurnToolRoute::Local(tool)) => local_tools
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(&current.handler, &tool.handler)),
+            Some(TurnToolRoute::Mcp(binding)) => {
+                mcp.is_some_and(|mcp| mcp.binding_is_current(binding))
+            }
+            Some(TurnToolRoute::ToolSearch) => mcp
+                .zip(self.mcp_published.as_ref())
+                .is_some_and(|(mcp, binding)| mcp.published_is_current(binding)),
+            None => false,
+        }
+    }
+}
+
 /// Coerces a closure into a [`LocalTool`]; the bound gives the boxed
 /// future a coercion target that `Arc::new` alone does not.
 pub fn local_tool<F>(audience: ToolAudience, f: F) -> LocalTool
@@ -350,6 +448,7 @@ pub struct ToolContext {
     pub model: Arc<Model>,
     pub event_tx: EventSender,
     pub mode: AgentMode,
+    pub mode_def: Option<Arc<crate::ModeDef>>,
     pub question_mode: QuestionMode,
     /// The session this run belongs to. A subagent inherits its parent's,
     /// so a tool can always tell which conversation it is serving. `None`
@@ -377,6 +476,7 @@ pub struct ToolContext {
     pub workflow: bool,
     pub audience: ToolAudience,
     pub local_tools: LocalTools,
+    pub turn_bindings: Arc<TurnToolBindings>,
     /// Streams a dispatched child's live bufs and annotations back to the
     /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
     /// Never inherited: `to_tool_context` clears it, and each caller sets
@@ -398,10 +498,26 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    /// Write-restriction for the active mode (plan path or a custom def's
-    /// `restrict_write_to`). `None` means writes are unrestricted by mode.
+    pub fn resolve_turn_route(&self, name: &str) -> Option<&TurnToolRoute> {
+        self.turn_bindings.get(name).filter(|_| {
+            self.turn_bindings.is_current(
+                name,
+                &self.registry,
+                &self.local_tools,
+                self.mcp.as_ref(),
+            )
+        })
+    }
+
+    /// Write-restriction pinned for this turn; the dynamic plan path wins.
     pub fn restrict_write_to(&self) -> Option<PathBuf> {
-        self.modes.restrict_write_to(&self.mode)
+        match &self.mode {
+            AgentMode::Plan(path) => Some(path.clone()),
+            AgentMode::Build | AgentMode::Custom(_) => self
+                .mode_def
+                .as_ref()
+                .and_then(|def| def.restrict_write_to.clone()),
+        }
     }
 
     pub fn resolve_path(&self, path: &str) -> Result<String, String> {
@@ -626,11 +742,16 @@ pub fn interpreter_ctx(
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
     static MODEL: LazyLock<Arc<Model>> =
         LazyLock::new(|| Arc::new(Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()));
+    let modes = Arc::new(crate::ModeRegistry::builtin());
     ToolContext {
         provider: Arc::clone(&PROVIDER),
         model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),
         mode: mode.clone(),
+        mode_def: match mode {
+            AgentMode::Custom(id) => modes.get(id).map(Arc::new),
+            _ => Some(Arc::new(modes.current(mode))),
+        },
         question_mode: QuestionMode::Headless,
         session_id: None,
         cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -647,10 +768,15 @@ pub fn interpreter_ctx(
         timeouts: maki_providers::Timeouts::default(),
         file_tracker,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
-        modes: Arc::new(crate::ModeRegistry::builtin()),
+        modes,
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
         ledger: Arc::new(RunLedger::default()),
+        turn_bindings: Arc::new(TurnToolBindings::capture(
+            &registry,
+            &LocalTools::default(),
+            None,
+        )),
         registry,
         workflow: false,
         audience: ToolAudience::MAIN,
@@ -875,6 +1001,45 @@ mod tests {
     use super::*;
 
     const LINE_LIMIT: usize = 500;
+    const PINNED_TOOL: &str = "pinned";
+
+    #[test_case(false ; "removed")]
+    #[test_case(true ; "replaced")]
+    fn local_binding_does_not_rebind(replace: bool) {
+        let registry = ToolRegistry::new();
+        let original = local_tool(ToolAudience::MAIN, |_, _| {
+            Box::pin(async { Ok(String::new()) })
+        });
+        let mut entries = HashMap::from([(PINNED_TOOL.to_owned(), original)]);
+        let locals = Arc::new(entries.clone());
+        let bindings = TurnToolBindings::capture(&registry, &locals, None);
+        assert!(bindings.is_current(PINNED_TOOL, &registry, &locals, None));
+        entries.remove(PINNED_TOOL);
+        if replace {
+            entries.insert(
+                PINNED_TOOL.to_owned(),
+                local_tool(ToolAudience::MAIN, |_, _| {
+                    Box::pin(async { Ok(String::new()) })
+                }),
+            );
+        }
+        assert!(!bindings.is_current(PINNED_TOOL, &registry, &Arc::new(entries), None));
+    }
+
+    #[test_case("pinned" ; "bare")]
+    #[test_case("functions.pinned" ; "provider_prefix")]
+    fn local_binding_canonical_name(name: &str) {
+        let registry = ToolRegistry::new();
+        let locals = Arc::new(HashMap::from([(
+            PINNED_TOOL.to_owned(),
+            local_tool(ToolAudience::MAIN, |_, _| {
+                Box::pin(async { Ok(String::new()) })
+            }),
+        )]));
+        let bindings = TurnToolBindings::capture(&registry, &locals, None);
+        assert!(matches!(bindings.get(name), Some(TurnToolRoute::Local(_))));
+        assert!(bindings.is_current(name, &registry, &locals, None));
+    }
 
     #[test_case(true  ; "vision_model_keeps_view_image")]
     #[test_case(false ; "text_only_model_loses_view_image")]

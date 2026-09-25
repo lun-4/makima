@@ -35,13 +35,13 @@ allow rule matches? ── yes ──►  runs
     │ no
 YOLO active?        ── yes ──►  runs
     │ no
-plan file write?    ── yes ──►  runs
-    │ no
     ▼
 default: prompt / allow / deny
 ```
 
-Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO. In plan mode, the host admits the bundled `read`, `glob`, `grep`, `webfetch`, `question`, `plan_submit`, and `task` tools when the mode names them. Bundled write and edit tools can only target the designated plan file. Lua filesystem writes use an anchored directory handle on Linux. They fail closed on other platforms. Shell commands and MCP tools, including deferred tool search, are blocked before permission checks, even if an allow rule or YOLO would approve them. `default` resolves per-tool first, then global. The built-in default is `"prompt"`.
+
+Restrictive modes deny other Lua-registered tools because registration metadata cannot prove their effects. A third-party tool does not gain bundled authority by using a bundled tool name. Restrictive modes also reject unknown-effect tools before asking for permission. Approval and YOLO do not override these limits. Work initiated by an admitted tool inherits the turn restriction, including `maki.async.run` children. Timers and deferred callbacks scheduled outside an admitted turn run as detached plugin work. They do not inherit authority or restrictions from a turn that happens to be active when they fire. Already admitted turns retain their selected model settings and queued prompt inputs. Changes apply to later admissions. If a pinned MCP prompt disappears before execution, setup fails rather than using a replacement.
 
 ## Builtin Defaults
 
