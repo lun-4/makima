@@ -1407,6 +1407,8 @@ enum InternalEvent {
 enum SessionOpKind {
     /// `/model` from a keybinding or command: apply the adopted model.
     ModelChanged { spec: String },
+    /// OAuth refresh rebuilt the focused model's provider without changing its spec.
+    ProviderRefreshed,
     /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
     OptionToggled {
         id: &'static str,
@@ -3331,6 +3333,7 @@ impl<'t> EventLoop<'t> {
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
         let reservation = match kind {
             SessionOpKind::ModelChanged { .. }
+            | SessionOpKind::ProviderRefreshed
             | SessionOpKind::ThinkingSet { .. }
             | SessionOpKind::ModelSet { .. } => manager
                 .actor(root)
@@ -3416,6 +3419,11 @@ impl<'t> EventLoop<'t> {
                 Ok(()) => self.apply_model_change(idx, &spec),
                 Err(error) => self.sessions[idx].app.flash(error),
             },
+            SessionOpKind::ProviderRefreshed => {
+                if let Err(error) = result {
+                    self.sessions[idx].app.flash(error);
+                }
+            }
             SessionOpKind::OptionToggled { id, committed } => match result {
                 Ok(()) => {
                     if let Some(enabled) = committed
@@ -3570,13 +3578,17 @@ impl<'t> EventLoop<'t> {
     }
 
     fn refresh_provider(&mut self, slug: String) {
+        let idx = self.focused;
         let slot = Arc::clone(self.focused_model_slot());
         let mut model = slot.load().model.clone();
         if model.provider.to_string() == slug {
             if let Ok(provider) =
                 maki_providers::provider::from_model(&mut model, self.ctx.timeouts)
             {
-                slot.install(model, Arc::from(provider));
+                self.dispatch_session_op(idx, SessionOpKind::ProviderRefreshed, async move {
+                    slot.install(model, Arc::from(provider));
+                    Ok(())
+                });
             }
         } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
             self.change_model(self.focused, builtin.default_model);

@@ -161,9 +161,17 @@ impl Runner {
             ActorWork::Compact {
                 run_id,
                 instructions,
+                generation,
+                policy,
             } => {
-                self.run_compact(run_id, instructions.as_deref(), cancellation_generation)
-                    .await
+                self.run_compact(
+                    run_id,
+                    instructions.as_deref(),
+                    generation,
+                    policy,
+                    cancellation_generation,
+                )
+                .await
             }
         }
     }
@@ -429,6 +437,8 @@ impl Runner {
         &mut self,
         run_id: u64,
         instructions: Option<&str>,
+        policy_generation: u64,
+        policy: Option<Arc<super::EffectiveAgentConfig>>,
         popped_generation: u64,
     ) {
         // Consumed: retire any precancel mark for this run_id's canonical
@@ -458,8 +468,8 @@ impl Runner {
                     cancel: plain,
                     cancel_reason: reasoned,
                     correlation: correlation.clone(),
-                    generation: 0,
-                    policy: None,
+                    generation: policy_generation,
+                    policy,
                     interrupt: None,
                     managed_turn: None,
                     admission: None,

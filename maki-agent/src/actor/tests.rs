@@ -72,6 +72,7 @@ struct ScriptedState {
     folds: Mutex<Vec<String>>,
     controls: Mutex<Vec<String>>,
     compacts: AtomicU32,
+    compact_policies: Mutex<Vec<(Option<bool>, u64)>>,
     entered: AtomicU32,
     policies: Mutex<Vec<(String, Option<bool>, u64)>>,
     admissions: Mutex<Vec<(String, Option<String>, bool)>>,
@@ -266,11 +267,15 @@ impl ActorBackend for ScriptedBackend {
     fn run_compact<'a>(
         &'a mut self,
         history: &'a mut crate::History,
-        _context: TurnContext,
+        context: TurnContext,
         _instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             self.state.compacts.fetch_add(1, Ordering::SeqCst);
+            self.state.compact_policies.lock().unwrap().push((
+                context.policy.as_ref().map(|policy| policy.fast),
+                context.generation,
+            ));
             history.push(Message::user("compact".to_owned()));
             BackendResult::CompactDone
         })
@@ -410,6 +415,31 @@ async fn until(cond: impl Fn() -> bool) {
         smol::future::yield_now().await;
     }
     panic!("condition never became true");
+}
+
+#[test]
+fn admission_preparation_does_not_hold_actor_state_lock() {
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let mut backend = ScriptedBackend::new();
+    backend.preparation = Some(Arc::new(move |_| {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        crate::agent::TurnAdmissionSnapshot {
+            mode_def: None,
+            prompt_inputs: None,
+            bindings: Arc::default(),
+        }
+    }));
+    let (handle, task) = spawn(backend);
+    let actor = handle.clone();
+    let admission =
+        std::thread::spawn(move || actor.admit_turn(input("work"), None, "work".into()));
+    entered_rx.recv().unwrap();
+    handle.close();
+    release_tx.send(()).unwrap();
+    assert!(matches!(admission.join().unwrap(), Err(ActorError::Closed)));
+    smol::block_on(task);
 }
 
 #[test]
@@ -738,6 +768,31 @@ fn cancel_existing_catches_control_between_pop_and_backend_entry() {
         until(|| !state.controls.lock().unwrap().is_empty()).await;
         assert_eq!(state.controls.lock().unwrap().as_slice(), ["surviving"]);
         handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn compact_keeps_admitted_policy() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.update_policy(policy(false)).unwrap();
+        handle.push_compact(1, None).unwrap();
+        handle.update_policy(policy(true)).unwrap();
+        handle
+            .push_control(ControlWork {
+                name: "fence".into(),
+                correlation: "fence".into(),
+            })
+            .unwrap();
+        until(|| state.controls.lock().unwrap().len() == 1).await;
+        assert_eq!(
+            state.compact_policies.lock().unwrap().as_slice(),
+            &[(Some(false), 1)]
+        );
+        handle.shutdown();
         task.await;
     });
 }
@@ -1139,6 +1194,8 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
     queue.push(ActorWork::Compact {
         run_id: 1,
         instructions: None,
+        generation: 0,
+        policy: None,
     });
     queue.push(ActorWork::Control(ControlWork {
         name: "c".into(),
@@ -1674,6 +1731,8 @@ fn queue_drain_publication_is_ordered() {
     queue.push(ActorWork::Compact {
         run_id: 1,
         instructions: None,
+        generation: 0,
+        policy: None,
     });
     queue.publish_if_empty(|| *published.lock().unwrap() += 1);
     assert_eq!(

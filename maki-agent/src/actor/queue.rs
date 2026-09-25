@@ -583,6 +583,8 @@ mod tests {
         queue.push(ActorWork::Compact {
             run_id: 2,
             instructions: None,
+            generation: 0,
+            policy: None,
         });
         queue.push(ActorWork::Root(test_root("second", 3, Vec::new())));
 
