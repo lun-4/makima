@@ -15,7 +15,7 @@ pub use instructions::{
     find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
 };
 pub use run::{
-    Agent, AgentParams, AgentRunParams, ModelSource, RunSettings, RunSettingsSource,
-    SessionRunSettings, SharedModel, ToolBuilder, TurnAdmissionSnapshot, TurnPromptInputs,
-    estimate_message_tokens, resolve_compaction_model,
+    Agent, AgentParams, AgentRunParams, ModelSource, ResolvedPromptInputs, RunSettings,
+    RunSettingsSource, SessionRunSettings, SharedModel, ToolBuilder, TurnAdmissionSnapshot,
+    TurnPromptInputs, estimate_message_tokens, resolve_compaction_model,
 };
