@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_agent::actor::{ActorError, AgentActorHandle, QueueProjection, RootWork};
+use maki_agent::actor::{ActorError, AgentActorHandle, QueueProjection, QueuedUiWork, RootWork};
 use maki_agent::{AgentInput, ImageSource};
 use maki_commands::COMPACT_COMMAND_NAME;
 use tracing::warn;
@@ -125,16 +125,65 @@ pub(crate) fn correlation(run_id: u64) -> String {
 impl QueueSender {
     pub(crate) fn set_gated(&self, gated: bool) {
         let mut gate = lock(&self.gate);
-        gate.gated = gated;
-        if !gated {
+        if gated {
+            match &self.backend {
+                QueueBackend::Actor(actor) => actor.set_queue_paused(true),
+                #[cfg(test)]
+                QueueBackend::Test(_) => {}
+            }
+            gate.gated = true;
+        } else {
             while let Some(entry) = gate.held.pop_front() {
                 self.push_to_backend(entry);
+            }
+            gate.gated = false;
+            match &self.backend {
+                QueueBackend::Actor(actor) => actor.set_queue_paused(false),
+                #[cfg(test)]
+                QueueBackend::Test(_) => {}
             }
         }
     }
 
     pub(crate) fn clear_held(&self) {
         lock(&self.gate).held.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_held(&self) -> VecDeque<QueueItem> {
+        std::mem::take(&mut lock(&self.gate).held)
+    }
+
+    /// Call only after the replacement runtime has been installed. Actor work
+    /// predates gate-held work and must be transferred first.
+    pub(crate) fn take_pending_work(&self) -> VecDeque<QueueItem> {
+        let mut gate = lock(&self.gate);
+        let mut pending = match &self.backend {
+            QueueBackend::Actor(actor) => actor
+                .take_paused_ui_work()
+                .into_iter()
+                .map(|work| match work {
+                    QueuedUiWork::Root(root) => QueueItem::Message {
+                        image_count: root.input.images.len(),
+                        text: root.text,
+                        input: root.input,
+                        run_id: root.run_id,
+                        displayed: root.displayed,
+                    },
+                    QueuedUiWork::Compact {
+                        run_id,
+                        instructions,
+                    } => QueueItem::Compact {
+                        run_id,
+                        instructions,
+                    },
+                })
+                .collect::<VecDeque<_>>(),
+            #[cfg(test)]
+            QueueBackend::Test(items) => std::mem::take(&mut *lock(items)),
+        };
+        pending.append(&mut gate.held);
+        pending
     }
 
     pub(crate) fn push(&self, entry: QueueItem) {
@@ -439,6 +488,145 @@ mod tests {
                 QueueProjection::Compact(Some("last".into())),
             ]
         );
+    }
+
+    #[test]
+    fn take_pending_work_keeps_backend_before_held() {
+        let tx = queue();
+        tx.push(msg(false));
+        tx.push(QueueItem::Compact {
+            run_id: 1,
+            instructions: Some("earlier".into()),
+        });
+        tx.set_gated(true);
+        tx.push(QueueItem::Compact {
+            run_id: 2,
+            instructions: Some("held".into()),
+        });
+        let pending = tx.take_pending_work();
+        assert_eq!(pending.len(), 3);
+        assert!(tx.is_empty());
+        let mut pending = pending.into_iter();
+        assert!(matches!(pending.next(), Some(QueueItem::Message { .. })));
+        assert!(matches!(
+            pending.next(),
+            Some(QueueItem::Compact { run_id: 1, .. })
+        ));
+        assert!(matches!(
+            pending.next(),
+            Some(QueueItem::Compact { run_id: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn actor_pending_work_rebuilds_original_input_before_held() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
+        use maki_agent::{AgentId, History};
+        use maki_providers::{ImageMediaType, Message};
+
+        struct Backend;
+
+        impl ActorBackend for Backend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: AgentInput,
+                _: WorkKind,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+
+            fn run_control<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: &'a ControlWork,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+
+            fn run_compact<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: Option<&'a str>,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::CompactDone })
+            }
+        }
+
+        const EARLIER: &str = "earlier root";
+        const HELD: &str = "held root";
+        const DETAILS: &str = "preserve details";
+        let (actor, task) = AgentActorHandle::spawn(
+            AgentId::generate(),
+            Vec::<Message>::new(),
+            None,
+            Box::new(Backend),
+        );
+        let tx = actor_queue(Arc::new(actor), Arc::new(AtomicU64::new(0)));
+        tx.set_gated(true);
+        let image = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
+        let QueueItem::Message { mut input, .. } = msg(false) else {
+            unreachable!();
+        };
+        input.message = EARLIER.into();
+        input.images = vec![image.clone()];
+        let QueueBackend::Actor(actor) = &tx.backend else {
+            unreachable!();
+        };
+        actor
+            .rush(RootWork::new(
+                input,
+                1,
+                false,
+                EARLIER.into(),
+                vec![image.clone()],
+                correlation(1),
+            ))
+            .unwrap();
+        actor.push_compact(2, Some(DETAILS.into())).unwrap();
+        let QueueItem::Message { mut input, .. } = msg(false) else {
+            unreachable!();
+        };
+        input.message = HELD.into();
+        tx.push(QueueItem::Message {
+            text: HELD.into(),
+            input,
+            image_count: 0,
+            run_id: 3,
+            displayed: false,
+        });
+
+        let pending = tx.take_pending_work();
+        assert!(tx.is_empty());
+        let mut pending = pending.into_iter();
+        let Some(QueueItem::Message {
+            text,
+            input,
+            run_id,
+            ..
+        }) = pending.next()
+        else {
+            panic!("expected earlier root");
+        };
+        assert_eq!(text, EARLIER);
+        assert_eq!(input.message, EARLIER);
+        assert_eq!(input.images, [image]);
+        assert_eq!(run_id, 1);
+        assert!(
+            matches!(pending.next(), Some(QueueItem::Compact { run_id: 2, instructions: Some(details) }) if details == DETAILS)
+        );
+        assert!(
+            matches!(pending.next(), Some(QueueItem::Message { text, run_id: 3, .. }) if text == HELD)
+        );
+        assert!(pending.next().is_none());
+        actor.close();
+        smol::block_on(task);
     }
 
     #[test]

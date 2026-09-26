@@ -788,6 +788,22 @@ fn ensure_replacement_lock_available(
     }
 }
 
+fn transfer_held_queue(app: &mut App, held: Vec<QueueItem>) {
+    for item in held {
+        match item {
+            QueueItem::Message { text, input, .. } => {
+                app.queue_and_notify(QueuedMessage {
+                    text,
+                    images: input.images,
+                });
+            }
+            QueueItem::Compact { instructions, .. } => {
+                app.queue_compact(instructions);
+            }
+        }
+    }
+}
+
 fn replace_session_runtime(
     current: &mut SessionRuntime,
     prepared: PreparedSessionRuntime,
@@ -3097,14 +3113,16 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].id(),
             self.sessions[idx].app.permissions.as_ref(),
         )?;
-        self.replace_prepared_runtime(idx, prepared)
+        let held = self.replace_prepared_runtime(idx, prepared)?;
+        transfer_held_queue(&mut self.sessions[idx].app, held);
+        Ok(())
     }
 
     fn replace_prepared_runtime(
         &mut self,
         idx: usize,
         prepared: PreparedSessionRuntime,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<QueueItem>, String> {
         if self.sessions[idx].pending_plan_transitions != 0 {
             return Err(PENDING_MODEL_REPLACEMENT_ERR.into());
         }
@@ -3132,6 +3150,7 @@ impl<'t> EventLoop<'t> {
             ..
         } = old;
         let retired_id = app.state.session.id;
+        let held = handles.queue.take_pending_work();
         let replaced_session = retired_id != self.sessions[idx].id();
         if let Err(error) = release_lock_state(session_lock) {
             warn!(%error, "old session lock release failed");
@@ -3146,7 +3165,7 @@ impl<'t> EventLoop<'t> {
             })
             .detach();
         }
-        Ok(())
+        Ok(held.into_iter().collect())
     }
 
     fn prepare_replacement(
@@ -3184,7 +3203,7 @@ impl<'t> EventLoop<'t> {
             post_commit,
         } = pending;
         match self.replace_prepared_runtime(idx, prepared) {
-            Ok(()) => {
+            Ok(held) => {
                 if let SessionReplacementKind::Reset { ended_id } = kind {
                     self.sessions[idx].app.lua_event_handle.fire_autocmd(
                         "SessionReset",
@@ -3197,6 +3216,7 @@ impl<'t> EventLoop<'t> {
                         .apply_replacement_post_commit(post_commit);
                     self.dispatch(idx, actions);
                 }
+                transfer_held_queue(&mut self.sessions[idx].app, held);
             }
             Err(error) => self.sessions[idx].app.flash(error),
         }
@@ -4245,7 +4265,9 @@ mod tests {
     use super::*;
     use crate::selection::SelectionZone;
     use crossterm::event::KeyModifiers;
-    use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
+    use maki_agent::{
+        AgentId, DoneReason, ImageMediaType, ImageSource, SessionMailbox, TurnId, TurnOutcome,
+    };
     use maki_config::PermissionsConfig;
     use maki_providers::{TokenUsage, model::FastSupport};
     use ratatui::{Terminal, TerminalOptions, Viewport, backend::TestBackend, layout::Rect};
@@ -6186,6 +6208,115 @@ mod tests {
     }
 
     #[test]
+    fn clear_plan_replacement_transfers_queued_work_after_implementation() {
+        const EARLIER: &str = "queued before approval";
+        const FIRST: &str = "first queued prompt";
+        const SECOND: &str = "second queued prompt";
+        const COMPACT: &str = "keep details";
+
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        runtime.app.state.mode = crate::app::mode::Mode::Plan;
+        runtime.app.state.plan = crate::app::mode::PlanState::Ready(PathBuf::from("test-plan.md"));
+        runtime.app.plan_form.on_plan_ready();
+        let (manager, root) = runtime.handles.manager_and_root();
+        manager.actor(root).unwrap().set_queue_paused(true);
+        runtime.app.queue_and_notify(QueuedMessage {
+            text: EARLIER.into(),
+            images: Vec::new(),
+        });
+        runtime.handles.queue.set_gated(true);
+        let image = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
+        runtime.app.queue_and_notify(QueuedMessage {
+            text: FIRST.into(),
+            images: vec![image.clone()],
+        });
+        runtime.app.queue_compact(Some(COMPACT.into()));
+        runtime.app.queue_and_notify(QueuedMessage {
+            text: SECOND.into(),
+            images: Vec::new(),
+        });
+        let old_queue = runtime.handles.queue.clone();
+        let mut actions = runtime.app.implement_plan(true);
+        let Action::ReplaceSession(request) = actions.pop().unwrap() else {
+            panic!("expected replacement request");
+        };
+        let request = *request;
+        let prepared = harness
+            .ctx()
+            .prepare_replacement_runtime(
+                request.session,
+                runtime.id(),
+                runtime.app.permissions.as_ref(),
+            )
+            .unwrap();
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+        let held = old.handles.queue.take_pending_work();
+        assert_eq!(held.len(), 4);
+        assert!(old_queue.take_pending_work().is_empty());
+        release_runtime(old);
+        let mut actions = runtime
+            .app
+            .apply_replacement_post_commit(request.post_commit.unwrap());
+        let Action::SendMessage(input) = actions.pop().unwrap() else {
+            panic!("expected implementation prompt");
+        };
+        assert!(actions.is_empty());
+        assert!(input.message.starts_with("Implement the plan"));
+        runtime.handles.queue.set_gated(true);
+        runtime.handles.queue.push(QueueItem::Message {
+            text: input.message.clone(),
+            image_count: 0,
+            input: *input,
+            run_id: runtime.app.run_id,
+            displayed: true,
+        });
+        transfer_held_queue(&mut runtime.app, held.into_iter().collect());
+        let transferred = runtime.handles.queue.take_held();
+        assert_eq!(transferred.len(), 5);
+        let mut items = transferred.into_iter();
+        assert!(matches!(
+            items.next(),
+            Some(QueueItem::Message {
+                displayed: true,
+                ..
+            })
+        ));
+        assert!(
+            matches!(items.next(), Some(QueueItem::Message { text, displayed: false, .. }) if text == EARLIER)
+        );
+        let Some(QueueItem::Message {
+            text,
+            input,
+            run_id,
+            displayed: false,
+            ..
+        }) = items.next()
+        else {
+            panic!("expected first queued message");
+        };
+        assert_eq!(text, FIRST);
+        assert_eq!(input.images, [image]);
+        assert_eq!(input.message, FIRST);
+        assert_eq!(input.mode, maki_agent::AgentMode::Build);
+        assert_eq!(run_id, runtime.app.run_id);
+        assert!(
+            matches!(items.next(), Some(QueueItem::Compact { instructions: Some(instructions), run_id }) if instructions == COMPACT && run_id == runtime.app.run_id)
+        );
+        assert!(
+            matches!(items.next(), Some(QueueItem::Message { text, run_id, displayed: false, .. }) if text == SECOND && run_id == runtime.app.run_id)
+        );
+        assert!(items.next().is_none());
+        release_runtime(runtime);
+    }
+
+    #[test]
     fn clear_plan_implementation_uses_selected_model_in_replacement_runtime() {
         const IMPLEMENTATION_MODEL: &str = "synthetic/hf:test-model";
         const OLD_PROMPT: &str = "old conversation";
@@ -7194,6 +7325,46 @@ mod tests {
         );
         assert!(target_path.exists());
         release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn replacement_failure_preserves_held_work() {
+        const EARLIER: &str = "queued before approval";
+        const HELD_PROMPT: &str = "held prompt";
+
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let (manager, root) = runtime.handles.manager_and_root();
+        manager.actor(root).unwrap().set_queue_paused(true);
+        runtime.app.queue_and_notify(QueuedMessage {
+            text: EARLIER.into(),
+            images: Vec::new(),
+        });
+        runtime.handles.queue.set_gated(true);
+        runtime.app.queue_and_notify(QueuedMessage {
+            text: HELD_PROMPT.into(),
+            images: Vec::new(),
+        });
+        let target = harness.session();
+        let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target.id);
+        std::fs::write(&target_path, "4294967294").unwrap();
+        let prepared = harness.ctx().prepare_runtime(target).unwrap();
+        assert!(
+            replace_session_runtime(
+                &mut runtime,
+                prepared,
+                &harness.ctx().sessions_dir,
+                &harness.ctx().model_slot,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            runtime.handles.queue.text_messages(),
+            [EARLIER, HELD_PROMPT]
+        );
+        assert_eq!(runtime.handles.queue.take_pending_work().len(), 2);
+        std::fs::remove_file(target_path).unwrap();
         release_runtime(runtime);
     }
 

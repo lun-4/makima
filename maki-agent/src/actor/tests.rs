@@ -15,7 +15,7 @@ use super::queue::{ActorQueue, QueueProjection};
 use super::types::{
     ActorLifecycle, ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind,
 };
-use super::{ActorBackend, ActorError, ActorWork, AgentActorHandle, TurnAdmission};
+use super::{ActorBackend, ActorError, ActorWork, AgentActorHandle, QueuedUiWork, TurnAdmission};
 use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnOutcome};
 use crate::{AgentEvent, AgentInput, AgentMode, ExtractedCommand, SharedMessages};
 
@@ -376,6 +376,97 @@ fn failed_actor_is_reusable() {
         assert_eq!(state.runs.lock().unwrap().len(), 2);
         handle.close();
         task.await;
+    });
+}
+
+#[test]
+fn paused_queue_keeps_active_turn_running_and_resumes_queued_turn() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let active = handle
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let queued = handle
+            .admit_turn(input("queued"), None, "queued".into())
+            .unwrap();
+
+        handle.set_queue_paused(true);
+        gate.open();
+        assert!(matches!(active.wait().await, TurnOutcome::Completed { .. }));
+        assert_eq!(handle.snapshot().queued, 1);
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+
+        handle.set_queue_paused(false);
+        assert!(matches!(queued.wait().await, TurnOutcome::Completed { .. }));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 2);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn paused_queue_blocks_interrupt_polling_without_stopping_active_turn() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let active = handle
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        handle
+            .rush(RootWork::new(
+                input("deferred"),
+                1,
+                false,
+                "deferred".into(),
+                Vec::new(),
+                "r1".into(),
+            ))
+            .unwrap();
+
+        handle.set_queue_paused(true);
+        gate.open();
+        assert!(matches!(active.wait().await, TurnOutcome::Completed { .. }));
+        assert!(state.folds.lock().unwrap().is_empty());
+        assert_eq!(handle.snapshot().queued, 1);
+
+        handle.set_queue_paused(false);
+        until(|| state.entered.load(Ordering::SeqCst) == 2).await;
+        assert_eq!(state.runs.lock().unwrap()[1].1, "deferred");
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn close_while_paused_terminalizes_queued_turn_and_exits() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.set_queue_paused(true);
+        let queued = handle
+            .admit_turn(input("queued"), None, "queued".into())
+            .unwrap();
+        until(|| handle.snapshot().queued == 1).await;
+        let closer = handle.clone();
+        std::thread::spawn(move || closer.close()).join().unwrap();
+        assert!(matches!(
+            queued.wait().await,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::Closed,
+                ..
+            }
+        ));
+        task.await;
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+        assert_eq!(handle.snapshot().queued, 0);
     });
 }
 
@@ -957,6 +1048,121 @@ fn close_rejects_new_admissions() {
         assert_eq!(handle.snapshot().lifecycle, ActorLifecycle::Closed);
         task.await;
     });
+}
+
+#[test]
+fn paused_ui_work_drains_fifo_without_touching_turns_or_controls() {
+    smol::block_on(async {
+        let (handle, task) = spawn(ScriptedBackend::new());
+        handle.set_queue_paused(true);
+        let turn = handle
+            .admit_turn(input("admitted"), None, "turn".into())
+            .unwrap();
+        let image = test_image();
+        let mut root_input = input("image prompt");
+        root_input.images.push(image.clone());
+        handle
+            .rush(RootWork::new(
+                root_input,
+                11,
+                false,
+                "visible prompt".into(),
+                vec![image.clone()],
+                "r11".into(),
+            ))
+            .unwrap();
+        handle
+            .push_control(ControlWork {
+                name: "control".into(),
+                correlation: "control".into(),
+            })
+            .unwrap();
+        handle.push_compact(12, Some("details".into())).unwrap();
+        handle
+            .rush(RootWork::new(
+                input("last"),
+                13,
+                false,
+                "last".into(),
+                Vec::new(),
+                "r13".into(),
+            ))
+            .unwrap();
+
+        let taken = handle.take_paused_ui_work();
+        assert_eq!(taken.len(), 3);
+        let mut taken = taken.into_iter();
+        let Some(QueuedUiWork::Root(root)) = taken.next() else {
+            panic!("expected first root");
+        };
+        assert_eq!(root.text, "visible prompt");
+        assert_eq!(root.input.message, "image prompt");
+        assert_eq!(root.input.images, [image]);
+        assert!(
+            matches!(taken.next(), Some(QueuedUiWork::Compact { run_id: 12, instructions: Some(details) }) if details == "details")
+        );
+        assert!(matches!(taken.next(), Some(QueuedUiWork::Root(root)) if root.text == "last"));
+        assert!(taken.next().is_none());
+        assert_eq!(
+            handle.snapshot().queue,
+            [
+                QueueProjection::Turn("turn".into()),
+                QueueProjection::Control("control".into())
+            ]
+        );
+        assert!(handle.take_paused_ui_work().is_empty());
+        handle.close();
+        assert!(matches!(turn.wait().await, TurnOutcome::Cancelled { .. }));
+        task.await;
+    });
+}
+
+#[test]
+fn ui_work_drain_requires_paused_queue() {
+    let queue = ActorQueue::new();
+    queue.push(ActorWork::Compact {
+        run_id: 3,
+        instructions: None,
+    });
+    assert!(queue.take_paused_ui_work().is_empty());
+    assert_eq!(queue.len(), 1);
+    queue.set_paused(true);
+    assert!(matches!(
+        queue.take_paused_ui_work().as_slice(),
+        [QueuedUiWork::Compact { run_id: 3, .. }]
+    ));
+}
+
+#[test]
+fn paused_queue_blocks_both_pop_paths_and_preserves_fifo() {
+    let queue = ActorQueue::new();
+    queue.push(ActorWork::Root(RootWork::new(
+        input("root"),
+        1,
+        false,
+        "root".into(),
+        Vec::new(),
+        "r1".into(),
+    )));
+    queue.push(ActorWork::Compact {
+        run_id: 2,
+        instructions: None,
+    });
+    queue.set_paused(true);
+    assert!(queue.pop().is_none());
+    assert!(queue.pop_interrupt().is_none());
+    assert_eq!(queue.len(), 2);
+
+    queue.set_paused(false);
+    assert!(matches!(queue.pop(), Some(ActorWork::Root(_))));
+    queue.set_paused(true);
+    assert!(queue.pop_interrupt().is_none());
+    queue.set_paused(false);
+    assert!(matches!(
+        queue.pop_interrupt(),
+        Some(ExtractedCommand::Compact(None))
+    ));
+    assert!(queue.is_empty());
 }
 
 #[test]
