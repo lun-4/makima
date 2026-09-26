@@ -3359,14 +3359,12 @@ impl App {
         Some((self.plan_approval_id, active))
     }
 
-    pub(crate) fn finish_plan_approval(&mut self, id: u64) -> bool {
+    pub(crate) fn plan_approval_valid(&self, id: u64) -> bool {
         let Some(approval) = self.pending_plan_approval.as_ref() else {
             return false;
         };
-        if approval.id != id {
-            return false;
-        }
-        let valid = approval.active.load(Ordering::Acquire)
+        approval.id == id
+            && approval.active.load(Ordering::Acquire)
             && self.state.mode == Mode::Plan
             && self.state.plan.is_ready()
             && self.plan_form.is_visible()
@@ -3374,11 +3372,17 @@ impl App {
             && self.plan_form.implementation_model() == approval.model.as_deref()
             && self.plan_form.parallel() == approval.parallel
             && approval.content.is_some()
-            && std::fs::read_to_string(&approval.path).ok() == approval.content;
-        if !valid {
+            && std::fs::read_to_string(&approval.path).ok() == approval.content
+    }
+
+    pub(crate) fn finish_plan_approval(&mut self, id: u64) -> bool {
+        let valid = self.plan_approval_valid(id);
+        if self
+            .pending_plan_approval
+            .as_ref()
+            .is_some_and(|approval| approval.id == id)
+        {
             self.invalidate_plan_approval();
-        } else {
-            self.pending_plan_approval = None;
         }
         valid
     }

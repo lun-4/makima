@@ -6009,6 +6009,17 @@ fn approvable_plan_app() -> (TempDir, App) {
 }
 
 #[test]
+fn plan_approval_validation_does_not_consume_pending_approval() {
+    let (_dir, mut app) = approvable_plan_app();
+    let (id, active) = app.begin_plan_approval().unwrap();
+    assert!(app.plan_approval_valid(id));
+    assert!(active.load(std::sync::atomic::Ordering::Acquire));
+    assert!(app.begin_plan_approval().is_none());
+    assert!(app.finish_plan_approval(id));
+    assert!(!app.plan_approval_valid(id));
+}
+
+#[test]
 fn delayed_plan_approval_ignores_duplicate_and_allows_retry_after_failure() {
     let (_dir, mut app) = approvable_plan_app();
     app.plan_form

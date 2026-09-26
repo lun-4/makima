@@ -22,7 +22,7 @@ use maki_storage::{StateDir, StorageError};
 use tracing::warn;
 
 use maki_agent::ThinkingConfig;
-use maki_agent::session_coordinator::SessionCheckpoint;
+use maki_agent::session_coordinator::{CHECKPOINT_REBASE_EPOCH, SessionCheckpoint};
 use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
     YOLO_OPTION_ID,
@@ -61,11 +61,18 @@ struct PendingState {
     latest: HashMap<MakiId, Arc<AppSession>>,
     latest_generations: HashMap<MakiId, u64>,
     coordinator_pending: HashMap<MakiId, CoordinatorPending>,
+    in_flight: HashMap<MakiId, InFlightSave>,
     coordinator_history_bases: HashMap<MakiId, HistoryIdentity>,
     next_generation: u64,
 }
 
 struct CoordinatorPending {
+    generation: u64,
+    session: Arc<AppSession>,
+    history_base: Option<HistoryIdentity>,
+}
+
+struct InFlightSave {
     generation: u64,
     session: Arc<AppSession>,
     history_base: Option<HistoryIdentity>,
@@ -126,28 +133,59 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
         let session_id = request.session_id;
         let version = request.version;
         let mut state = lock(&self.pending);
-        let (base, mut history_base) =
-            if let Some(pending) = state.coordinator_pending.get(&session_id) {
-                (Arc::clone(&pending.session), pending.history_base)
-            } else if let Some(latest) = state.latest.get(&session_id) {
-                (
-                    Arc::clone(latest),
-                    state.coordinator_history_bases.get(&session_id).copied(),
+        let rebase = version.epoch == CHECKPOINT_REBASE_EPOCH;
+        let Some(latest) = state.latest.get(&session_id) else {
+            return Box::pin(async move {
+                Err(CheckpointError::Save {
+                    session_id,
+                    message: Arc::from("session snapshot is unavailable"),
+                })
+            });
+        };
+        let (base, mut history_base) = if rebase {
+            (
+                Arc::clone(latest),
+                state.coordinator_history_bases.get(&session_id).copied(),
+            )
+        } else if let Some(pending) = state.coordinator_pending.get(&session_id) {
+            (Arc::clone(&pending.session), pending.history_base)
+        } else {
+            (
+                Arc::clone(latest),
+                state.coordinator_history_bases.get(&session_id).copied(),
+            )
+        };
+        let mut merged = merge_checkpoint(&base, &request.snapshot);
+        if rebase {
+            let history_candidate = state
+                .coordinator_pending
+                .get(&session_id)
+                .filter(|pending| pending.history_base.is_some())
+                .map(|pending| (pending.generation, &pending.session, pending.history_base))
+                .into_iter()
+                .chain(
+                    state
+                        .in_flight
+                        .get(&session_id)
+                        .filter(|save| save.history_base.is_some())
+                        .map(|save| (save.generation, &save.session, save.history_base)),
                 )
-            } else {
-                return Box::pin(async move {
-                    Err(CheckpointError::Save {
-                        session_id,
-                        message: Arc::from("session snapshot is unavailable"),
-                    })
-                });
-            };
+                .max_by_key(|(generation, _, _)| *generation);
+            if let Some((_, history, base)) = history_candidate {
+                merged.adopt_history(&history.history_snapshot());
+                history_base = base;
+            }
+        }
         if history_base.is_none() && request.snapshot.history.is_some() {
             history_base = Some(base.history_identity());
         }
-        let merged = Arc::new(merge_checkpoint(&base, &request.snapshot));
+        let merged = Arc::new(merged);
         let generation = next_generation(&mut state);
         state.latest_generations.insert(session_id, generation);
+        if rebase {
+            state.latest.insert(session_id, Arc::clone(&merged));
+            state.coordinator_pending.remove(&session_id);
+        }
         state.coordinator_pending.insert(
             session_id,
             CoordinatorPending {
@@ -346,6 +384,7 @@ impl StorageWriter {
         state.latest.remove(&id);
         state.latest_generations.remove(&id);
         state.coordinator_pending.remove(&id);
+        state.in_flight.remove(&id);
         state.coordinator_history_bases.remove(&id);
     }
 
@@ -378,6 +417,7 @@ impl StorageWriter {
             state.latest.remove(&id);
             state.latest_generations.remove(&id);
             state.coordinator_pending.remove(&id);
+            state.in_flight.remove(&id);
             state.coordinator_history_bases.remove(&id);
         }
         let replaced = state.entries.insert(id, Entry::Delete(Box::new(done)));
@@ -624,7 +664,23 @@ impl Writer {
     fn flush(&mut self, pending: &Pending) -> Option<Instant> {
         // Bound first: a `for` head temporary lives for the whole loop, so
         // iterating the guard directly would deadlock the re-insert below.
-        let batch = mem::take(&mut lock(pending).entries);
+        let batch = {
+            let mut state = lock(pending);
+            let batch = mem::take(&mut state.entries);
+            for (&id, entry) in &batch {
+                if let Entry::Save(save) = entry {
+                    state.in_flight.insert(
+                        id,
+                        InFlightSave {
+                            generation: save.generation,
+                            session: Arc::clone(&save.session),
+                            history_base: save.coordinator_history_base,
+                        },
+                    );
+                }
+            }
+            batch
+        };
         for (id, entry) in batch {
             match entry {
                 Entry::Save(mut save) => {
@@ -635,6 +691,7 @@ impl Writer {
                         if let Err(waiters) = requeue_save(pending, id, save) {
                             fail_waiters(id, waiters, "checkpoint superseded by session deletion");
                         }
+                        lock(pending).in_flight.remove(&id);
                         continue;
                     }
                     save.retry_at = None;
@@ -661,6 +718,7 @@ impl Writer {
                                         "checkpoint superseded by session deletion",
                                     );
                                 }
+                                lock(pending).in_flight.remove(&id);
                                 continue;
                             }
 
@@ -668,6 +726,7 @@ impl Writer {
                             if save.coordinator_generation.is_some() {
                                 discard_coordinator_candidate(pending, id, &save);
                                 fail_waiters(id, waiters, &message);
+                                lock(pending).in_flight.remove(&id);
                                 continue;
                             }
                             if !waiters.is_empty() {
@@ -700,6 +759,7 @@ impl Writer {
                     });
                 }
             }
+            lock(pending).in_flight.remove(&id);
         }
         lock(pending)
             .entries
@@ -753,6 +813,14 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::SessionMailbox;
+    use maki_agent::session_coordinator::{
+        DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCoordinatorError,
+        SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
+    };
+    use maki_config::ModelPolicy;
+    use maki_providers::Model;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -774,6 +842,43 @@ mod tests {
     fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
         let (warn_tx, warn_rx) = flume::unbounded();
         (StorageWriter::new(dir.clone(), warn_tx), warn_rx)
+    }
+
+    const PREVIOUS_MODEL: &str = "ollama/llama3";
+    const ADOPTED_MODEL: &str = "anthropic/claude-opus-4-8";
+
+    fn coordinator(writer: &StorageWriter, session: &AppSession) -> SessionCoordinatorHandle {
+        coordinator_with_checkpoint(session, writer.coordinator_checkpoint())
+    }
+
+    fn coordinator_with_checkpoint(
+        session: &AppSession,
+        checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
+    ) -> SessionCoordinatorHandle {
+        SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id: session.id,
+            catalog: Default::default(),
+            definitions: builtin_option_definitions(
+                PREVIOUS_MODEL,
+                [Arc::from(PREVIOUS_MODEL)],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            ),
+            persisted_options: Default::default(),
+            history: session.messages().to_vec(),
+            model: Arc::from(PREVIOUS_MODEL),
+            cwd: CWD.into(),
+            model_policy: Arc::new(ModelPolicy::default()),
+            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
+            directory_adopter: Arc::new(|path| {
+                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
+            }),
+            checkpoint,
+            mailbox: SessionMailbox::new(session.id),
+        })
+        .unwrap()
     }
 
     fn message_texts(session: &AppSession) -> Vec<String> {
@@ -815,6 +920,116 @@ mod tests {
 
         assert!(AppSession::load(a_id, &dir).is_ok());
         assert_eq!(AppSession::load(b_id, &dir).unwrap().title, "renamed");
+    }
+
+    #[test]
+    fn rebase_preserves_pending_and_in_flight_history_before_acknowledging_it() {
+        for in_flight in [false, true] {
+            let (_tmp, dir) = state_dir();
+            let pending: Pending = Arc::default();
+            let (wake, _wake_rx) = flume::unbounded();
+            let checkpoint = CoordinatorCheckpointWriter {
+                pending: Arc::clone(&pending),
+                wake,
+            };
+            let mut session = AppSession::new(PREVIOUS_MODEL, CWD);
+            session.push_message(user_message(0));
+            let id = session.id;
+            lock(&pending).latest.insert(id, Arc::new(session));
+            let candidate_options = maki_agent::session_options::SessionOptions::new(
+                builtin_option_definitions(
+                    ADOPTED_MODEL,
+                    [Arc::from(ADOPTED_MODEL)],
+                    true,
+                    true,
+                    true,
+                    ThinkingConfig::Off,
+                ),
+                &Default::default(),
+            )
+            .unwrap()
+            .snapshot();
+            let restored_options = maki_agent::session_options::SessionOptions::new(
+                builtin_option_definitions(
+                    PREVIOUS_MODEL,
+                    [Arc::from(PREVIOUS_MODEL)],
+                    false,
+                    false,
+                    false,
+                    ThinkingConfig::Off,
+                ),
+                &Default::default(),
+            )
+            .unwrap()
+            .snapshot();
+            let history_ack = checkpoint.checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 1,
+                    epoch: 1,
+                },
+                snapshot: Arc::new(SessionCheckpoint {
+                    history: Some(Arc::new(vec![user_message(0), user_message(1)])),
+                    model: Arc::from(ADOPTED_MODEL),
+                    cwd: CWD.into(),
+                    options: candidate_options,
+                }),
+            });
+            let writing = if in_flight {
+                let mut state = lock(&pending);
+                let Entry::Save(save) = state.entries.remove(&id).unwrap() else {
+                    unreachable!()
+                };
+                state.in_flight.insert(
+                    id,
+                    InFlightSave {
+                        generation: save.generation,
+                        session: Arc::clone(&save.session),
+                        history_base: save.coordinator_history_base,
+                    },
+                );
+                Some(save)
+            } else {
+                None
+            };
+            let rebase_ack = checkpoint.checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 2,
+                    epoch: CHECKPOINT_REBASE_EPOCH,
+                },
+                snapshot: Arc::new(SessionCheckpoint {
+                    history: None,
+                    model: Arc::from(PREVIOUS_MODEL),
+                    cwd: CWD.into(),
+                    options: restored_options,
+                }),
+            });
+            if let Some(save) = writing {
+                assert!(requeue_save(&pending, id, save).is_ok());
+                lock(&pending).in_flight.remove(&id);
+            }
+            let (warn_tx, _warn_rx) = flume::unbounded();
+            let mut writer = Writer {
+                dir: dir.clone(),
+                warn_tx,
+                logs: HashMap::new(),
+                failing: HashSet::new(),
+            };
+            writer.flush(&pending);
+            assert_eq!(smol::block_on(history_ack).unwrap().version.revision, 1);
+            assert_eq!(
+                smol::block_on(rebase_ack).unwrap().version.epoch,
+                CHECKPOINT_REBASE_EPOCH
+            );
+            let saved = AppSession::load(id, &dir).unwrap();
+            assert_eq!(message_texts(&saved), [msg_text(0), msg_text(1)]);
+            assert_eq!(saved.model, PREVIOUS_MODEL);
+            assert_eq!(saved.meta.yolo, Some(false));
+            assert!(!saved.meta.fast);
+            assert!(!saved.meta.workflow);
+            assert_eq!(pending.lock().unwrap().latest[&id].model, PREVIOUS_MODEL);
+        }
     }
 
     #[test]
@@ -1168,6 +1383,183 @@ mod tests {
     }
 
     #[test]
+    fn canceled_conditional_adoption_never_reaches_saved_app_snapshot() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(PREVIOUS_MODEL, CWD);
+            session.push_message(user_message(0));
+            let id = session.id;
+            writer.seed(Arc::new(session.clone()));
+            let coordinator = coordinator(&writer, &session);
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(ADOPTED_MODEL), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+            assert_eq!(coordinator.read().model().as_ref(), PREVIOUS_MODEL);
+
+            session.set_title(TITLE.into());
+            writer.send(Arc::new(session.clone()));
+            let saved = writer
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: session.revision(),
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(session.clone()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(saved.session_id, id);
+            assert_eq!(AppSession::load(id, &dir).unwrap().model, PREVIOUS_MODEL);
+            assert!(
+                coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            coordinator.close().await.unwrap();
+            writer.shutdown(DRAIN_TIMEOUT);
+
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, PREVIOUS_MODEL);
+            assert_eq!(loaded.title, TITLE);
+            assert_eq!(message_texts(&loaded), [msg_text(0)]);
+        });
+    }
+
+    #[test]
+    fn app_send_while_adoption_is_pending_does_not_persist_unapproved_model() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(PREVIOUS_MODEL, CWD);
+            session.push_message(user_message(0));
+            let id = session.id;
+            writer.seed(Arc::new(session.clone()));
+            let coordinator = coordinator(&writer, &session);
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(ADOPTED_MODEL), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+            session.set_title(TITLE.into());
+            writer.send(Arc::new(session));
+            assert!(
+                coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            coordinator.close().await.unwrap();
+            writer.shutdown(DRAIN_TIMEOUT);
+
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, PREVIOUS_MODEL);
+            assert_eq!(loaded.title, TITLE);
+            assert_eq!(message_texts(&loaded), [msg_text(0)]);
+        });
+    }
+
+    #[test]
+    fn conditional_adoption_commits_only_after_finalize_and_preserves_app_state() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(PREVIOUS_MODEL, CWD);
+            session.push_message(user_message(0));
+            let id = session.id;
+            writer.seed(Arc::new(session.clone()));
+            let coordinator = coordinator(&writer, &session);
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(ADOPTED_MODEL), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+
+            session.set_title(TITLE.into());
+            writer.send(Arc::new(session.clone()));
+            let saved = writer
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: session.revision(),
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(session.clone()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(saved.session_id, id);
+            assert_eq!(AppSession::load(id, &dir).unwrap().model, PREVIOUS_MODEL);
+            assert!(coordinator.finalize_model_if_active(receipt).await.unwrap());
+            assert_eq!(coordinator.read().model().as_ref(), ADOPTED_MODEL);
+            coordinator.close().await.unwrap();
+            writer.shutdown(DRAIN_TIMEOUT);
+
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, ADOPTED_MODEL);
+            assert_eq!(loaded.title, TITLE);
+            assert_eq!(message_texts(&loaded), [msg_text(0)]);
+        });
+    }
+
+    #[test]
+    fn failed_conditional_finalize_does_not_contaminate_next_app_save() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, warn_rx) = writer(&dir);
+            let mut session = AppSession::new(PREVIOUS_MODEL, CWD);
+            session.push_message(user_message(0));
+            let id = session.id;
+            writer
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: session.revision(),
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(session.clone()),
+                })
+                .await
+                .unwrap();
+            let coordinator = coordinator(&writer, &session);
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(ADOPTED_MODEL), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+            let sessions_dir = dir.path().join(SESSIONS_DIR);
+            let parked_dir = dir.path().join("parked-sessions");
+            std::fs::rename(&sessions_dir, &parked_dir).unwrap();
+            block_sessions_dir(&dir);
+
+            let result = coordinator.finalize_model_if_active(receipt).await;
+            assert!(matches!(
+                result,
+                Err(SessionCoordinatorError::Checkpoint(_))
+            ));
+            assert!(
+                warn_rx
+                    .recv_async()
+                    .await
+                    .unwrap()
+                    .starts_with(SAVE_FAILED_PREFIX)
+            );
+            assert_eq!(coordinator.read().model().as_ref(), PREVIOUS_MODEL);
+            std::fs::remove_file(&sessions_dir).unwrap();
+            std::fs::rename(parked_dir, &sessions_dir).unwrap();
+            assert_eq!(AppSession::load(id, &dir).unwrap().model, PREVIOUS_MODEL);
+            session.set_title(TITLE.into());
+            writer.send(Arc::new(session));
+            coordinator.close().await.unwrap();
+            writer.shutdown(DRAIN_TIMEOUT);
+
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, PREVIOUS_MODEL);
+            assert_eq!(loaded.title, TITLE);
+        });
+    }
+
+    #[test]
     fn divergent_tui_history_is_not_overwritten_by_coordinator_history() {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
@@ -1216,6 +1608,181 @@ mod tests {
 
             let loaded = AppSession::load(id, &dir).unwrap();
             assert_eq!(message_texts(&loaded), ["tui"]);
+        });
+    }
+
+    #[test]
+    fn finalize_ack_failure_after_write_compensates_before_later_app_save() {
+        smol::block_on(async {
+            const ACK_FAILURE: &str = "ack lost after write";
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(PREVIOUS_MODEL, CWD);
+            session.push_message(user_message(0));
+            let id = session.id;
+            writer.seed(Arc::new(session.clone()));
+            let fail_once = Arc::new(AtomicBool::new(true));
+            let backend = writer.coordinator_checkpoint();
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new({
+                let fail_once = Arc::clone(&fail_once);
+                move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let ack = backend.checkpoint(request);
+                    let fail = fail_once.swap(false, Ordering::AcqRel);
+                    Box::pin(async move {
+                        let saved = ack.await?;
+                        if fail {
+                            Err(CheckpointError::Save {
+                                session_id: saved.session_id,
+                                message: Arc::from(ACK_FAILURE),
+                            })
+                        } else {
+                            Ok(saved)
+                        }
+                    }) as CheckpointFuture
+                }
+            });
+            let coordinator = coordinator_with_checkpoint(&session, checkpoint);
+            let before = coordinator.read().options();
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(ADOPTED_MODEL), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                coordinator.finalize_model_if_active(receipt).await,
+                Err(SessionCoordinatorError::Checkpoint(_))
+            ));
+            assert_eq!(coordinator.read().model().as_ref(), PREVIOUS_MODEL);
+            assert_eq!(coordinator.read().options(), before);
+            assert_eq!(writer.latest_snapshot(id).unwrap().model, PREVIOUS_MODEL);
+            assert_eq!(AppSession::load(id, &dir).unwrap().model, PREVIOUS_MODEL);
+
+            session.set_title(TITLE.into());
+            writer.send(Arc::new(session));
+            coordinator.close().await.unwrap();
+            writer.shutdown(DRAIN_TIMEOUT);
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, PREVIOUS_MODEL);
+            assert_eq!(loaded.title, TITLE);
+            assert_eq!(message_texts(&loaded), [msg_text(0)]);
+        });
+    }
+
+    #[test]
+    fn two_failed_finalize_acks_rebase_next_app_save() {
+        smol::block_on(async {
+            const ACK_FAILURE: &str = "ack lost after write";
+            const FAILED_ACKS: usize = 2;
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(PREVIOUS_MODEL, CWD);
+            session.push_message(user_message(0));
+            let id = session.id;
+            writer.seed(Arc::new(session.clone()));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let backend = writer.coordinator_checkpoint();
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new({
+                let seen = Arc::clone(&seen);
+                move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let version = request.version;
+                    let ack = backend.checkpoint(request);
+                    let seen = Arc::clone(&seen);
+                    Box::pin(async move {
+                        let saved = ack.await?;
+                        let mut versions = seen.lock().unwrap();
+                        versions.push(version);
+                        if versions.len() <= FAILED_ACKS {
+                            Err(CheckpointError::Save {
+                                session_id: saved.session_id,
+                                message: Arc::from(ACK_FAILURE),
+                            })
+                        } else {
+                            Ok(saved)
+                        }
+                    }) as CheckpointFuture
+                }
+            });
+            let coordinator = coordinator_with_checkpoint(&session, checkpoint);
+            let before = coordinator.read().options();
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(ADOPTED_MODEL), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                coordinator.finalize_model_if_active(receipt).await,
+                Err(SessionCoordinatorError::Checkpoint(_))
+            ));
+            {
+                let versions = seen.lock().unwrap();
+                assert_eq!(versions.len(), FAILED_ACKS);
+                assert_eq!(versions[1].epoch, CHECKPOINT_REBASE_EPOCH);
+                assert!(versions[1].revision > versions[0].revision);
+            }
+            assert_eq!(AppSession::load(id, &dir).unwrap().model, PREVIOUS_MODEL);
+            assert_eq!(writer.latest_snapshot(id).unwrap().model, PREVIOUS_MODEL);
+            assert_eq!(coordinator.read().model().as_ref(), PREVIOUS_MODEL);
+            assert_eq!(coordinator.read().options(), before);
+
+            session.set_title(TITLE.into());
+            writer.send(Arc::new(session));
+            coordinator.close().await.unwrap();
+            writer.shutdown(DRAIN_TIMEOUT);
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, PREVIOUS_MODEL);
+            assert_eq!(loaded.title, TITLE);
+            assert_eq!(message_texts(&loaded), [msg_text(0)]);
+        });
+    }
+
+    #[test]
+    fn expiry_after_candidate_write_rebases_even_when_compensation_ack_fails() {
+        smol::block_on(async {
+            const ACK_FAILURE: &str = "compensating ack lost";
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let mut session = AppSession::new(PREVIOUS_MODEL, CWD);
+            session.push_message(user_message(0));
+            let id = session.id;
+            writer.seed(Arc::new(session.clone()));
+            let active = Arc::new(AtomicBool::new(true));
+            let backend = writer.coordinator_checkpoint();
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new({
+                let active = Arc::clone(&active);
+                move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let rebase = request.version.epoch == CHECKPOINT_REBASE_EPOCH;
+                    let ack = backend.checkpoint(request);
+                    let active = Arc::clone(&active);
+                    Box::pin(async move {
+                        let saved = ack.await?;
+                        if rebase {
+                            Err(CheckpointError::Save {
+                                session_id: saved.session_id,
+                                message: Arc::from(ACK_FAILURE),
+                            })
+                        } else {
+                            active.store(false, Ordering::Release);
+                            Ok(saved)
+                        }
+                    }) as CheckpointFuture
+                }
+            });
+            let coordinator = coordinator_with_checkpoint(&session, checkpoint);
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(ADOPTED_MODEL), active)
+                .await
+                .unwrap();
+            assert!(matches!(
+                coordinator.finalize_model_if_active(receipt).await,
+                Err(SessionCoordinatorError::Checkpoint(_))
+            ));
+            assert_eq!(writer.latest_snapshot(id).unwrap().model, PREVIOUS_MODEL);
+            assert_eq!(coordinator.read().model().as_ref(), PREVIOUS_MODEL);
+            session.set_title(TITLE.into());
+            writer.send(Arc::new(session));
+            coordinator.close().await.unwrap();
+            writer.shutdown(DRAIN_TIMEOUT);
+            let loaded = AppSession::load(id, &dir).unwrap();
+            assert_eq!(loaded.model, PREVIOUS_MODEL);
+            assert_eq!(loaded.title, TITLE);
         });
     }
 

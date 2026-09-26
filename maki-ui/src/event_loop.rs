@@ -27,7 +27,7 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_coordinator::{
-    DirectoryAdoptionFuture, ModelAdoptionFuture, PreparedSessionCoordinator,
+    DirectoryAdoptionFuture, ModelAdoptionFuture, ModelAdoptionReceipt, PreparedSessionCoordinator,
     SessionCoordinatorError, SessionCoordinatorHandle, SessionCoordinatorParams,
     builtin_option_definitions,
 };
@@ -520,7 +520,9 @@ fn project_committed_options_for_app(app: &mut App, snapshot: &SessionOptionsSna
                     app.permissions.set_yolo(enabled);
                 }
             }
-            FAST_OPTION_ID => app.state.fast = option.current_value.as_ref() == ENABLED_VALUE,
+            FAST_OPTION_ID => app
+                .state
+                .set_fast(option.current_value.as_ref() == ENABLED_VALUE),
             WORKFLOW_OPTION_ID => {
                 app.state.workflow = option.current_value.as_ref() == ENABLED_VALUE
             }
@@ -609,6 +611,8 @@ struct SessionRuntime {
     restore_pending: bool,
     pending_plan_transitions: usize,
     deferred_plan_approval: Option<(u64, bool)>,
+    plan_model_recovery_at: Option<Instant>,
+    plan_finalized_rollback: Option<(ModelAdoptionReceipt, Option<Instant>)>,
 }
 
 struct PendingReplacement {
@@ -708,6 +712,8 @@ impl PreparedSessionRuntime {
             restore_pending: resumed,
             pending_plan_transitions: 0,
             deferred_plan_approval: None,
+            plan_model_recovery_at: None,
+            plan_finalized_rollback: None,
         })
     }
 
@@ -762,6 +768,8 @@ impl PreparedSessionRuntime {
             restore_pending: resumed,
             pending_plan_transitions: 0,
             deferred_plan_approval: None,
+            plan_model_recovery_at: None,
+            plan_finalized_rollback: None,
         })
     }
 }
@@ -1334,6 +1342,26 @@ enum InternalEvent {
         generation: u64,
         error: Option<String>,
     },
+    PlanModelRecovered {
+        session: MakiId,
+        generation: u64,
+        result: std::result::Result<bool, SessionCoordinatorError>,
+    },
+    PlanModelFinalized {
+        session: MakiId,
+        generation: u64,
+        approval_id: u64,
+        spec: String,
+        clear_context: bool,
+        receipt: ModelAdoptionReceipt,
+        result: std::result::Result<bool, SessionCoordinatorError>,
+    },
+    PlanFinalizedModelRolledBack {
+        session: MakiId,
+        generation: u64,
+        receipt: ModelAdoptionReceipt,
+        result: std::result::Result<bool, SessionCoordinatorError>,
+    },
     PlanModelChanged {
         session: MakiId,
         generation: u64,
@@ -1892,6 +1920,120 @@ impl<'t> EventLoop<'t> {
                 result,
             } => self.handle_session_op(session, kind, result),
             event @ InternalEvent::PlanModelChanged { .. } => self.handle_plan_model_changed(event),
+            InternalEvent::PlanModelRecovered {
+                session,
+                generation,
+                result,
+            } => {
+                if let Some(idx) = self
+                    .position(session)
+                    .filter(|&idx| self.sessions[idx].generation == generation)
+                {
+                    let runtime = &mut self.sessions[idx];
+                    if runtime.pending_plan_transitions == 0 {
+                        warn!(%session, "unexpected plan model recovery");
+                        return;
+                    }
+                    runtime.plan_model_recovery_at = None;
+                    match result {
+                        Ok(_) => {
+                            runtime.pending_plan_transitions -= 1;
+                            reconcile_model(runtime);
+                        }
+                        Err(error) => {
+                            runtime.plan_model_recovery_at =
+                                Some(Instant::now() + Duration::from_secs(1));
+                            runtime
+                                .app
+                                .flash(format!("plan model recovery failed: {error}"));
+                        }
+                    }
+                }
+            }
+            InternalEvent::PlanModelFinalized {
+                session,
+                generation,
+                approval_id,
+                spec,
+                clear_context,
+                receipt,
+                result,
+            } => {
+                if let Some(idx) = self
+                    .position(session)
+                    .filter(|&idx| self.sessions[idx].generation == generation)
+                {
+                    if self.sessions[idx].pending_plan_transitions == 0 {
+                        warn!(%session, "unexpected plan model finalization");
+                        return;
+                    }
+                    match result {
+                        Ok(true) => {
+                            if self.sessions[idx].app.finish_plan_approval(approval_id) {
+                                self.sessions[idx].pending_plan_transitions -= 1;
+                                self.apply_model_change(idx, &spec);
+                                let actions = self.sessions[idx].app.implement_plan(clear_context);
+                                self.dispatch(idx, actions);
+                            } else {
+                                self.sessions[idx].deferred_plan_approval = None;
+                                self.start_finalized_model_rollback(idx, receipt);
+                                return;
+                            }
+                        }
+                        Ok(false) => {
+                            self.sessions[idx].pending_plan_transitions -= 1;
+                            self.sessions[idx].app.cancel_plan_approval(approval_id);
+                            reconcile_model(&mut self.sessions[idx]);
+                        }
+                        Err(error) => {
+                            if matches!(error, SessionCoordinatorError::ConditionalModelRollback(_))
+                            {
+                                self.sessions[idx].app.invalidate_plan_approval();
+                                self.sessions[idx].deferred_plan_approval = None;
+                                self.sessions[idx].plan_model_recovery_at = Some(Instant::now());
+                            } else {
+                                self.sessions[idx].pending_plan_transitions -= 1;
+                                self.sessions[idx].app.cancel_plan_approval(approval_id);
+                                reconcile_model(&mut self.sessions[idx]);
+                            }
+                            self.sessions[idx].app.flash(error.to_string());
+                        }
+                    }
+                    self.resume_deferred_plan_approval(idx);
+                }
+            }
+            InternalEvent::PlanFinalizedModelRolledBack {
+                session,
+                generation,
+                receipt,
+                result,
+            } => {
+                if let Some(idx) = self
+                    .position(session)
+                    .filter(|&idx| self.sessions[idx].generation == generation)
+                {
+                    let runtime = &mut self.sessions[idx];
+                    if runtime.pending_plan_transitions == 0 {
+                        warn!(%session, "unexpected finalized plan model rollback");
+                        return;
+                    }
+                    match result {
+                        Ok(_) => {
+                            runtime.plan_finalized_rollback = None;
+                            runtime.pending_plan_transitions -= 1;
+                            reconcile_model(runtime);
+                            self.resume_deferred_plan_approval(idx);
+                        }
+                        Err(error) => {
+                            runtime.plan_finalized_rollback =
+                                Some((receipt, Some(Instant::now() + Duration::from_secs(1))));
+                            runtime
+                                .app
+                                .flash(format!("plan model rollback failed: {error}"));
+                        }
+                    }
+                }
+            }
             InternalEvent::PlanModelSettled {
                 session,
                 generation,
@@ -1905,11 +2047,15 @@ impl<'t> EventLoop<'t> {
                         warn!(%session, "unexpected plan model settlement");
                         return;
                     }
+                    if let Some(error) = error {
+                        self.sessions[idx].app.invalidate_plan_approval();
+                        self.sessions[idx].deferred_plan_approval = None;
+                        self.sessions[idx].plan_model_recovery_at = Some(Instant::now());
+                        self.sessions[idx].app.flash(error);
+                        return;
+                    }
                     self.sessions[idx].pending_plan_transitions -= 1;
                     reconcile_model(&mut self.sessions[idx]);
-                    if let Some(error) = error {
-                        self.sessions[idx].app.flash(error);
-                    }
                     self.resume_deferred_plan_approval(idx);
                 }
             }
@@ -2065,6 +2211,31 @@ impl<'t> EventLoop<'t> {
         }
         for (i, actions) in login_actions {
             self.dispatch(i, actions);
+        }
+        for runtime in &mut self.sessions {
+            if runtime.plan_model_recovery_at.is_some_and(|at| at <= now) {
+                runtime.plan_model_recovery_at = None;
+                let coordinator = runtime.coordinator.clone();
+                let session = runtime.id();
+                let generation = runtime.generation;
+                let internal_tx = self.internal_tx.clone();
+                smol::spawn(async move {
+                    let result = coordinator.abort_pending_model().await;
+                    let _ = internal_tx.send(InternalEvent::PlanModelRecovered {
+                        session,
+                        generation,
+                        result,
+                    });
+                })
+                .detach();
+            }
+            if let Some((receipt, Some(at))) = runtime.plan_finalized_rollback.as_ref()
+                && *at <= now
+            {
+                let receipt = receipt.clone();
+                runtime.plan_finalized_rollback = Some((receipt.clone(), None));
+                spawn_finalized_model_rollback(runtime, receipt, &self.internal_tx);
+            }
         }
         dirty
     }
@@ -3223,7 +3394,9 @@ impl<'t> EventLoop<'t> {
                 clear_context,
                 model,
             } => {
-                if model.is_some() && self.sessions[idx].pending_plan_transitions != 0 {
+                if self.sessions[idx].plan_finalized_rollback.is_some()
+                    || model.is_some() && self.sessions[idx].pending_plan_transitions != 0
+                {
                     return;
                 }
                 let Some((approval_id, active)) = self.sessions[idx].app.begin_plan_approval()
@@ -3457,6 +3630,11 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    fn start_finalized_model_rollback(&mut self, idx: usize, receipt: ModelAdoptionReceipt) {
+        self.sessions[idx].plan_finalized_rollback = Some((receipt.clone(), None));
+        spawn_finalized_model_rollback(&self.sessions[idx], receipt, &self.internal_tx);
+    }
+
     fn resume_deferred_plan_approval(&mut self, idx: usize) {
         if self.sessions[idx].pending_plan_transitions != 0 {
             return;
@@ -3499,17 +3677,20 @@ impl<'t> EventLoop<'t> {
         match result {
             Ok(receipt) => {
                 if approved {
-                    if let Some(idx) = current_idx {
-                        self.apply_model_change(idx, &spec);
-                        let actions = self.sessions[idx].app.implement_plan(clear_context);
-                        if self.sessions[idx].pending_plan_transitions == 0 {
-                            warn!(%session, "unexpected plan model completion");
-                            return;
-                        }
-                        self.sessions[idx].pending_plan_transitions -= 1;
-                        self.dispatch(idx, actions);
-                        self.resume_deferred_plan_approval(idx);
-                    }
+                    let internal_tx = self.internal_tx.clone();
+                    smol::spawn(async move {
+                        let result = coordinator.finalize_model_if_active(receipt.clone()).await;
+                        let _ = internal_tx.send(InternalEvent::PlanModelFinalized {
+                            receipt,
+                            session,
+                            generation,
+                            approval_id,
+                            spec,
+                            clear_context,
+                            result,
+                        });
+                    })
+                    .detach();
                 } else {
                     let internal_tx = self.internal_tx.clone();
                     smol::spawn(async move {
@@ -3534,6 +3715,13 @@ impl<'t> EventLoop<'t> {
                 if let Some(idx) = current_idx {
                     if self.sessions[idx].pending_plan_transitions == 0 {
                         warn!(%session, "unexpected plan model error");
+                        return;
+                    }
+                    if matches!(error, SessionCoordinatorError::ConditionalModelRollback(_)) {
+                        self.sessions[idx].app.invalidate_plan_approval();
+                        self.sessions[idx].deferred_plan_approval = None;
+                        self.sessions[idx].plan_model_recovery_at = Some(Instant::now());
+                        self.sessions[idx].app.flash(error.to_string());
                         return;
                     }
                     self.sessions[idx].pending_plan_transitions -= 1;
@@ -3844,6 +4032,29 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+fn spawn_finalized_model_rollback(
+    runtime: &SessionRuntime,
+    receipt: ModelAdoptionReceipt,
+    internal_tx: &flume::Sender<InternalEvent>,
+) {
+    let coordinator = runtime.coordinator.clone();
+    let session = runtime.id();
+    let generation = runtime.generation;
+    let internal_tx = internal_tx.clone();
+    smol::spawn(async move {
+        let result = coordinator
+            .rollback_finalized_model_if_version(receipt.clone())
+            .await;
+        let _ = internal_tx.send(InternalEvent::PlanFinalizedModelRolledBack {
+            session,
+            generation,
+            receipt,
+            result,
+        });
+    })
+    .detach();
+}
+
 fn reconcile_model(runtime: &mut SessionRuntime) {
     let model = runtime.model_slot.load().model.clone();
     if runtime.app.state.model.spec() != model.spec() {
@@ -3864,12 +4075,16 @@ fn plan_model_approval(
     }
     if receipt.is_some_and(|receipt| {
         let read = coordinator.read();
-        read.model() != receipt.adopted || read.model_revision() != receipt.model_revision
+        read.model() != receipt.previous || read.model_revision() != receipt.model_revision
     }) {
         runtime.app.cancel_plan_approval(approval_id);
         return false;
     }
-    runtime.app.finish_plan_approval(approval_id)
+    let valid = runtime.app.plan_approval_valid(approval_id);
+    if !valid {
+        runtime.app.cancel_plan_approval(approval_id);
+    }
+    valid
 }
 
 fn dispatch_option_toggle(
@@ -3909,7 +4124,7 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
-    use maki_providers::TokenUsage;
+    use maki_providers::{TokenUsage, model::FastSupport};
     use ratatui::{Terminal, TerminalOptions, Viewport, backend::TestBackend, layout::Rect};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -4048,6 +4263,8 @@ mod tests {
             restore_pending: false,
             pending_plan_transitions: 0,
             deferred_plan_approval: None,
+            plan_model_recovery_at: None,
+            plan_finalized_rollback: None,
         }
     }
 
@@ -4573,6 +4790,57 @@ mod tests {
         release_runtime(runtime);
     }
 
+    #[test_case(FastSupport::Supported, true ; "discovery_enables_committed_fast")]
+    #[test_case(FastSupport::Supported, false ; "disable_prevents_discovery_reenabling_fast")]
+    #[test_case(FastSupport::Unsupported, true ; "discovery_rejects_committed_fast")]
+    fn committed_fast_projection_tracks_discovery(discovered_support: FastSupport, enabled: bool) {
+        let harness = RuntimeHarness::new();
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        harness
+            .ctx()
+            .model_slot
+            .install(model, Arc::new(StubProvider));
+        let mut runtime = harness.runtime(harness.session());
+        runtime.app.state.model.supports_fast_override = Some(FastSupport::Pending);
+        let message = QueuedMessage {
+            text: String::new(),
+            images: Vec::new(),
+        };
+
+        smol::block_on(
+            runtime
+                .coordinator
+                .set_option(FAST_OPTION_ID, ENABLED_VALUE),
+        )
+        .unwrap();
+        project_committed_options(&mut runtime);
+        assert!(!runtime.app.state.fast);
+        assert!(runtime.app.state.pending_fast);
+        assert!(runtime.app.state.fast_intent());
+        assert!(!runtime.app.build_agent_input(&message).fast);
+
+        if !enabled {
+            smol::block_on(
+                runtime
+                    .coordinator
+                    .set_option(FAST_OPTION_ID, maki_agent::session_options::DISABLED_VALUE),
+            )
+            .unwrap();
+            project_committed_options(&mut runtime);
+            assert!(!runtime.app.state.pending_fast);
+            assert!(!runtime.app.state.fast_intent());
+        }
+
+        let mut discovered = runtime.app.state.model.clone();
+        discovered.supports_fast_override = Some(discovered_support);
+        runtime.app.update_model(&discovered);
+        let active = enabled && discovered_support == FastSupport::Supported;
+        assert_eq!(runtime.app.state.fast, active);
+        assert!(!runtime.app.state.pending_fast);
+        assert_eq!(runtime.app.build_agent_input(&message).fast, active);
+        release_runtime(runtime);
+    }
+
     #[test]
     fn coordinator_directory_adopter_rejects_files() {
         const FILE_NAME: &str = "not-a-directory";
@@ -4970,13 +5238,39 @@ mod tests {
     }
 
     #[test]
-    fn stale_adoption_error_reconciles_live_slot() {
+    fn failed_adoption_rollback_keeps_unapproved_model_provisional() {
         const ERROR: &str = "model adoption expired";
+        const CANDIDATE: &str = "anthropic/recovered";
+        const ORIGINAL: &str = "anthropic/test-model";
         let mut harness = RuntimeHarness::new();
-        let mut runtime = test_runtime(crate::components::test_model());
-        runtime
-            .model_slot
-            .install(model_named("recovered"), Arc::new(StubProvider));
+        let fail_rollback = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail = Arc::clone(&fail_rollback);
+        let slot_holder: Arc<std::sync::Mutex<Option<Arc<ProviderSlot>>>> = Arc::default();
+        let adopter_slot = Arc::clone(&slot_holder);
+        let adopter = Arc::new(move |model: Model| {
+            let slot = adopter_slot.lock().unwrap().as_ref().unwrap().clone();
+            let fail = Arc::clone(&fail);
+            Box::pin(async move {
+                if model.spec() == ORIGINAL && fail.load(Ordering::SeqCst) {
+                    return Err(Arc::from(ERROR));
+                }
+                let provider = slot.load().provider.clone();
+                slot.install(model, provider);
+                Ok(())
+            }) as ModelAdoptionFuture
+        });
+        let mut runtime = test_runtime_with_adopter(crate::components::test_model(), adopter);
+        *slot_holder.lock().unwrap() = Some(Arc::clone(&runtime.model_slot));
+        let coordinator = runtime.coordinator.clone();
+        let receipt = smol::block_on(coordinator.set_model_if_active(
+            Arc::from(CANDIDATE),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ))
+        .unwrap();
+        assert!(matches!(
+            smol::block_on(coordinator.rollback_model_if_version(receipt)),
+            Err(SessionCoordinatorError::ConditionalModelRollback(_))
+        ));
         runtime.pending_plan_transitions = 1;
         smol::block_on(
             runtime
@@ -5044,12 +5338,12 @@ mod tests {
                 Arc::from(ERROR),
             )),
         });
-        assert_eq!(loop_state.sessions[0].pending_plan_transitions, 0);
-        assert_eq!(
+        assert_eq!(loop_state.sessions[0].pending_plan_transitions, 1);
+        assert_ne!(
             loop_state.sessions[0].app.state.model.spec(),
             "anthropic/recovered"
         );
-        assert!(loop_state.sessions[0].app.state.workflow);
+        assert!(!loop_state.sessions[0].app.state.workflow);
         assert!(
             loop_state.sessions[0]
                 .app
@@ -5057,6 +5351,39 @@ mod tests {
                 .flash_text()
                 .is_some_and(|text| text.contains(ERROR))
         );
+        let _ = loop_state.tick();
+        let failed = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
+        assert!(matches!(
+            failed,
+            InternalEvent::PlanModelRecovered { result: Err(_), .. }
+        ));
+        loop_state.handle_internal(failed);
+        assert_eq!(loop_state.sessions[0].pending_plan_transitions, 1);
+        assert!(loop_state.sessions[0].plan_model_recovery_at.is_some());
+        assert_eq!(
+            loop_state.sessions[0].model_slot.load().model.spec(),
+            CANDIDATE
+        );
+        fail_rollback.store(false, Ordering::SeqCst);
+        loop_state.sessions[0].plan_model_recovery_at = Some(Instant::now());
+        let _ = loop_state.tick();
+        let recovered = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
+        assert!(matches!(
+            recovered,
+            InternalEvent::PlanModelRecovered {
+                result: Ok(true),
+                ..
+            }
+        ));
+        loop_state.handle_internal(recovered);
+        assert_eq!(loop_state.sessions[0].pending_plan_transitions, 0);
+        assert!(loop_state.sessions[0].plan_model_recovery_at.is_none());
+        assert_eq!(
+            loop_state.sessions[0].model_slot.load().model.spec(),
+            ORIGINAL
+        );
+        assert_eq!(loop_state.sessions[0].app.state.model.spec(), ORIGINAL);
+        assert!(loop_state.sessions[0].app.state.workflow);
         let runtime = loop_state.sessions.remove(0);
         drop(loop_state);
         release_runtime(runtime);
@@ -5207,6 +5534,197 @@ mod tests {
         assert_eq!(
             loop_state.sessions[0].app.state.mode,
             crate::app::mode::Mode::Plan
+        );
+        let runtime = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(runtime);
+    }
+
+    #[test_case("unchanged" ; "unchanged_plan_implements")]
+    #[test_case("content" ; "revised_content")]
+    #[test_case("path" ; "revised_path")]
+    #[test_case("parallel" ; "revised_parallel")]
+    #[test_case("model" ; "revised_model")]
+    #[test_case("mode" ; "revised_mode")]
+    fn finalized_model_does_not_implement_revised_plan(revision: &str) {
+        const IMPLEMENTATION_MODEL: &str = "anthropic/claude-opus-4-8";
+        const ORIGINAL_PLAN: &str = "original plan";
+        const REVISED_PLAN: &str = "revised plan";
+
+        let mut harness = RuntimeHarness::new();
+        let slot_holder: Arc<std::sync::Mutex<Option<Arc<ProviderSlot>>>> = Arc::default();
+        let adopter_slot = Arc::clone(&slot_holder);
+        let adopter = Arc::new(move |model: Model| {
+            let slot = adopter_slot.lock().unwrap().as_ref().unwrap().clone();
+            Box::pin(async move {
+                let provider = slot.load().provider.clone();
+                slot.install(model, provider);
+                Ok(())
+            }) as ModelAdoptionFuture
+        });
+        let mut runtime = test_runtime_with_adopter(crate::components::test_model(), adopter);
+        *slot_holder.lock().unwrap() = Some(Arc::clone(&runtime.model_slot));
+        let path = harness.ctx().sessions_dir.join("plan.md");
+        std::fs::write(&path, ORIGINAL_PLAN).unwrap();
+        runtime.app.state.mode = crate::app::mode::Mode::Plan;
+        runtime.app.state.plan = crate::app::mode::PlanState::Ready(path.clone());
+        runtime.app.plan_form.on_plan_ready();
+        runtime
+            .app
+            .plan_form
+            .set_implementation_model(IMPLEMENTATION_MODEL.into(), &runtime.app.state.model.spec());
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        loop_state.handle_action(
+            0,
+            Action::ImplementPlan {
+                clear_context: false,
+                model: Some(IMPLEMENTATION_MODEL.into()),
+            },
+        );
+        let changed = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
+        assert!(matches!(
+            &changed,
+            InternalEvent::PlanModelChanged { result: Ok(_), .. }
+        ));
+        loop_state.handle_internal(changed);
+        assert_eq!(loop_state.sessions[0].pending_plan_transitions, 1);
+        assert_eq!(
+            loop_state.sessions[0].app.state.mode,
+            crate::app::mode::Mode::Plan
+        );
+        let finalized = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
+        assert!(matches!(
+            &finalized,
+            InternalEvent::PlanModelFinalized {
+                result: Ok(true),
+                ..
+            }
+        ));
+        let app = &mut loop_state.sessions[0].app;
+        match revision {
+            "unchanged" => {}
+            "content" => std::fs::write(&path, REVISED_PLAN).unwrap(),
+            "path" => {
+                let revised_path = path.with_file_name("revised.md");
+                std::fs::write(&revised_path, REVISED_PLAN).unwrap();
+                app.state.plan = crate::app::mode::PlanState::Ready(revised_path);
+            }
+            "parallel" => {
+                app.plan_form.handle_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                ));
+            }
+            "model" => app.plan_form.use_current_model(),
+            "mode" => app.state.mode = crate::app::mode::Mode::Build,
+            _ => unreachable!(),
+        }
+        loop_state.handle_internal(finalized);
+        if revision != "unchanged" {
+            assert_eq!(loop_state.sessions[0].pending_plan_transitions, 1);
+            assert_eq!(
+                loop_state.sessions[0].app.state.model.spec(),
+                "anthropic/test-model"
+            );
+            loop_state.handle_action(
+                0,
+                Action::ImplementPlan {
+                    clear_context: false,
+                    model: None,
+                },
+            );
+            assert_eq!(loop_state.sessions[0].pending_plan_transitions, 1);
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            loop_state.handle_session_request(
+                SessionRequest::New {
+                    prompt: None,
+                    focus: false,
+                },
+                reply_tx,
+            );
+            assert!(reply_rx.recv().unwrap().is_err());
+            assert_eq!(loop_state.sessions.len(), 1);
+            let rolled_back = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
+            assert!(matches!(
+                &rolled_back,
+                InternalEvent::PlanFinalizedModelRolledBack {
+                    result: Ok(true),
+                    ..
+                }
+            ));
+            loop_state.handle_internal(rolled_back);
+            assert_eq!(
+                loop_state.sessions[0].coordinator.read().model().as_ref(),
+                "anthropic/test-model"
+            );
+            assert_eq!(
+                loop_state.sessions[0].model_slot.load().model.spec(),
+                "anthropic/test-model"
+            );
+            assert_eq!(
+                loop_state.sessions[0].app.state.model.spec(),
+                "anthropic/test-model"
+            );
+        } else {
+            assert_eq!(
+                loop_state.sessions[0].app.state.model.spec(),
+                IMPLEMENTATION_MODEL
+            );
+            assert_eq!(
+                loop_state.sessions[0].coordinator.read().model().as_ref(),
+                IMPLEMENTATION_MODEL
+            );
+        }
+        assert_eq!(loop_state.sessions[0].pending_plan_transitions, 0);
+        assert_eq!(
+            loop_state.sessions[0].app.state.plan.path().is_some(),
+            revision != "unchanged"
+        );
+        assert_eq!(
+            loop_state.sessions[0].app.plan_form.is_visible(),
+            revision != "unchanged"
+        );
+        assert_eq!(
+            loop_state.sessions[0].app.state.mode,
+            if revision == "unchanged" || revision == "mode" {
+                crate::app::mode::Mode::Build
+            } else {
+                crate::app::mode::Mode::Plan
+            }
         );
         let runtime = loop_state.sessions.remove(0);
         drop(loop_state);
