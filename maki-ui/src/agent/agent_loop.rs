@@ -179,7 +179,7 @@ impl TuiActorBackend {
         }
         self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
-        let slot = self.model_slot.load();
+        let slot = self.model_slot.committed();
         self.tools = self.build_tools(&slot.model, false);
         if let Some(ref mcp) = self.mcp {
             // The queue is drained right after this, and a prompt typed during
@@ -200,7 +200,7 @@ impl TuiActorBackend {
         &mut self,
         input: &mut AgentInput,
     ) -> Result<(String, RequestTools, Arc<maki_agent::prompt::ResolvedSlots>), AgentError> {
-        let slot = self.model_slot.load();
+        let slot = self.model_slot.committed();
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
         self.vars = template::env_vars_for(&self.cwd.load());
@@ -316,7 +316,7 @@ impl TuiActorBackend {
             }
         };
         self.run_id.store(run_id, Ordering::Relaxed);
-        let slot = self.model_slot.load();
+        let slot = self.model_slot.committed();
         let mut agent = Agent::new(
             AgentParams {
                 agent_id: self.agent_id,
@@ -543,7 +543,7 @@ impl ActorBackend for TuiActorBackend {
             // source and emits `CompactionDone`.
             let run_id = self.current_run_id();
             let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-            let slot = self.model_slot.load();
+            let slot = self.model_slot.committed();
             let current_provider =
                 Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>;
             let (provider, model) = maki_agent::agent::resolve_compaction_model(

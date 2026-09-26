@@ -149,12 +149,22 @@ impl ActorQueue {
         match first {
             ActorWork::Root(root) => {
                 let key = crate::batch_key(&root.input);
-                if key.is_none() {
+                if key.is_none()
+                    || !root.earlier.is_empty()
+                    || !root.input.preamble.is_empty()
+                    || (root.input.message.is_empty() && root.input.images.is_empty())
+                {
                     return Some(ActorWork::Root(root));
                 }
                 let mut roots = vec![root];
                 while items.front().and_then(|w| match w {
-                    ActorWork::Root(r) => crate::batch_key(&r.input),
+                    ActorWork::Root(r)
+                        if r.earlier.is_empty()
+                            && r.input.preamble.is_empty()
+                            && (!r.input.message.is_empty() || !r.input.images.is_empty()) =>
+                    {
+                        crate::batch_key(&r.input)
+                    }
                     _ => None,
                 }) == key
                 {
@@ -267,19 +277,95 @@ impl ActorQueue {
         let items = &mut state.items;
         let mut seen = 0usize;
         let mut target = None;
-        for (i, w) in items.iter().enumerate() {
-            if Self::is_visible(w) {
+        for (index, work) in items.iter().enumerate() {
+            if let ActorWork::Root(root) = work {
+                for (earlier_index, earlier) in root.earlier.iter().enumerate() {
+                    if !earlier.displayed {
+                        if seen == visible_index {
+                            target = Some((index, Some(earlier_index)));
+                            break;
+                        }
+                        seen += 1;
+                    }
+                }
+            }
+            if target.is_some() {
+                break;
+            }
+            if Self::is_visible(work) {
                 if seen == visible_index {
-                    target = Some(i);
+                    target = Some((index, None));
                     break;
                 }
                 seen += 1;
             }
         }
-        let index = target?;
-        let work = items.remove(index)?;
+        let (index, earlier_index) = target?;
+        let work = if let Some(earlier_index) = earlier_index {
+            let Some(ActorWork::Root(root)) = items.remove(index) else {
+                unreachable!("earlier root belongs to root work");
+            };
+            let mut roots = Self::split_root(root);
+            let removed = ActorWork::Root(roots.remove(earlier_index));
+            for (offset, root) in roots.into_iter().enumerate() {
+                items.insert(index + offset, ActorWork::Root(root));
+            }
+            removed
+        } else if matches!(items.get(index), Some(ActorWork::Root(root)) if !root.earlier.is_empty())
+        {
+            let Some(ActorWork::Root(root)) = items.remove(index) else {
+                unreachable!("matched root work");
+            };
+            let mut roots = Self::split_root(root);
+            let removed = ActorWork::Root(roots.pop().expect("batched root"));
+            for (offset, root) in roots.into_iter().enumerate() {
+                items.insert(index + offset, ActorWork::Root(root));
+            }
+            removed
+        } else {
+            items.remove(index)?
+        };
         let projection = (&work).into();
         Some((work, projection))
+    }
+
+    fn split_root(mut root: RootWork) -> Vec<RootWork> {
+        let mut roots = Vec::with_capacity(root.earlier.len() + 1);
+        let mut preamble = std::mem::take(&mut root.input.preamble).into_iter();
+        for earlier in root.earlier.drain(..) {
+            let message = preamble.next().expect("batched root input");
+            let mut text = String::new();
+            let mut images = Vec::new();
+            for block in message.content {
+                match block {
+                    maki_providers::ContentBlock::Text { text: content } => text = content,
+                    maki_providers::ContentBlock::Image { source } => images.push(source),
+                    _ => {}
+                }
+            }
+            let input = crate::AgentInput {
+                message: text,
+                images,
+                mode: root.input.mode.clone(),
+                preamble: Vec::new(),
+                thinking: root.input.thinking,
+                fast: root.input.fast,
+                workflow: root.input.workflow,
+                prompt: None,
+                cancel: None,
+                lease_committer: None,
+            };
+            roots.push(RootWork::new(
+                input,
+                earlier.run_id,
+                earlier.displayed,
+                earlier.text,
+                earlier.images,
+                earlier.correlation,
+            ));
+        }
+        roots.push(root);
+        roots
     }
 
     pub fn len(&self) -> usize {
@@ -301,7 +387,13 @@ impl ActorQueue {
         let mut taken = Vec::new();
         while let Some(work) = state.items.pop_front() {
             match work {
-                ActorWork::Root(root) => taken.push(QueuedUiWork::Root(Box::new(root))),
+                ActorWork::Root(root) => {
+                    taken.extend(
+                        Self::split_root(root)
+                            .into_iter()
+                            .map(|root| QueuedUiWork::Root(Box::new(root))),
+                    );
+                }
                 ActorWork::Compact {
                     run_id,
                     instructions,
@@ -343,7 +435,22 @@ impl ActorQueue {
 
     /// A neutral snapshot of the queue for the TUI projection.
     pub fn snapshot(&self) -> Vec<QueueProjection> {
-        lock(&self.state).items.iter().map(Into::into).collect()
+        lock(&self.state)
+            .items
+            .iter()
+            .flat_map(|work| {
+                let mut projected = Vec::new();
+                if let ActorWork::Root(root) = work {
+                    projected.extend(root.earlier.iter().map(|earlier| QueueProjection::Message {
+                        text: earlier.text.clone(),
+                        image_count: earlier.images.len(),
+                        displayed: earlier.displayed,
+                    }));
+                }
+                projected.push(work.into());
+                projected
+            })
+            .collect()
     }
 
     /// Runs `publish` under the queue lock, and only when the queue is empty,
@@ -439,6 +546,7 @@ mod tests {
     use super::*;
     use crate::{AgentInput, AgentMode, SessionDefaults};
     use maki_providers::{ContentBlock, ImageMediaType, ImageSource};
+    use test_case::test_case;
 
     fn test_image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))
@@ -519,6 +627,181 @@ mod tests {
         };
         assert_eq!(img_count(&merged.input.preamble[0]), 1);
         assert_eq!(img_count(&merged.input.preamble[1]), 1);
+    }
+
+    #[test]
+    fn paused_batched_roots_transfer_in_fifo_with_original_inputs() {
+        const FIRST: &str = "first prompt";
+        const SECOND: &str = "second prompt";
+        const THIRD: &str = "";
+        let queue = ActorQueue::new();
+        let image = test_image();
+        for root in [
+            test_root(FIRST, 1, vec![image.clone()]),
+            test_root(SECOND, 2, Vec::new()),
+            test_root(THIRD, 3, vec![image.clone()]),
+        ] {
+            queue.push(ActorWork::Root(RootWork {
+                displayed: false,
+                ..root
+            }));
+        }
+        let batched = queue.pop().expect("batched roots");
+        queue.set_paused(true);
+        queue.defer(batched);
+        queue.push(ActorWork::Compact {
+            run_id: 4,
+            instructions: None,
+        });
+        let projected = queue.snapshot();
+        assert_eq!(projected.len(), 4);
+        for (entry, text) in projected.iter().zip([FIRST, SECOND, THIRD]) {
+            assert!(
+                matches!(entry, QueueProjection::Message { text: projected, displayed: false, .. } if projected == text)
+            );
+        }
+
+        let taken = queue.take_paused_ui_work();
+        assert_eq!(taken.len(), 4);
+        let mut taken = taken.into_iter();
+        for (text, run_id) in [(FIRST, 1), (SECOND, 2), (THIRD, 3)] {
+            let work = taken.next().expect("root work");
+            let QueuedUiWork::Root(root) = work else {
+                panic!("expected root");
+            };
+            assert_eq!(root.text, text);
+            assert_eq!(root.input.message, text);
+            assert_eq!(root.run_id, run_id);
+            assert!(!root.displayed);
+            assert_eq!(root.correlation, format!("r{run_id}"));
+            assert!(root.input.preamble.is_empty());
+            assert!(root.earlier.is_empty());
+            assert_eq!(root.images, root.input.images);
+            if run_id == 1 || run_id == 3 {
+                assert_eq!(root.input.images.as_slice(), std::slice::from_ref(&image));
+            } else {
+                assert!(root.input.images.is_empty());
+            }
+        }
+        assert!(matches!(
+            taken.next(),
+            Some(QueuedUiWork::Compact { run_id: 4, .. })
+        ));
+        assert!(taken.next().is_none());
+        assert!(queue.is_empty());
+    }
+
+    #[test_case(0, &["second prompt", "third prompt"] ; "remove_first")]
+    #[test_case(1, &["first prompt", "third prompt"] ; "remove_middle")]
+    #[test_case(2, &["first prompt", "second prompt"] ; "remove_last")]
+    fn remove_visible_batched_row_preserves_other_prompts(
+        removed_index: usize,
+        remaining: &[&str],
+    ) {
+        const PROMPTS: [&str; 3] = ["first prompt", "second prompt", "third prompt"];
+        let queue = ActorQueue::new();
+        for (index, text) in PROMPTS.iter().enumerate() {
+            queue.push(ActorWork::Root(RootWork {
+                displayed: false,
+                ..test_root(text, index as u64 + 1, Vec::new())
+            }));
+        }
+        let batch = queue.pop().expect("batched roots");
+        queue.defer(batch);
+        queue.push(ActorWork::Compact {
+            run_id: 4,
+            instructions: None,
+        });
+        let (work, projection) = queue
+            .remove_visible_at(removed_index)
+            .expect("visible prompt");
+        assert!(
+            matches!(work, ActorWork::Root(root) if root.input.message == PROMPTS[removed_index])
+        );
+        assert!(
+            matches!(projection, QueueProjection::Message { text, .. } if text == PROMPTS[removed_index])
+        );
+        let projected = queue.snapshot();
+        let texts: Vec<_> = projected
+            .iter()
+            .filter_map(|entry| match entry {
+                QueueProjection::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, remaining);
+        assert!(matches!(
+            projected.last(),
+            Some(QueueProjection::Compact(None))
+        ));
+        queue.set_paused(true);
+        let pending = queue.take_paused_ui_work();
+        assert_eq!(pending.len(), 3);
+        for (work, text) in pending.into_iter().zip(remaining.iter()) {
+            let QueuedUiWork::Root(root) = work else {
+                panic!("expected root");
+            };
+            assert_eq!(&root.input.message, text);
+        }
+    }
+
+    #[test]
+    fn remove_visible_batched_row_skips_hidden_roots_and_keeps_images() {
+        let queue = ActorQueue::new();
+        let image = test_image();
+        for (index, text) in ["hidden", "visible", "last"].iter().enumerate() {
+            queue.push(ActorWork::Root(RootWork {
+                displayed: index == 0,
+                ..test_root(text, index as u64 + 1, vec![image.clone()])
+            }));
+        }
+        let batch = queue.pop().expect("batched roots");
+        queue.defer(batch);
+        let (work, projection) = queue.remove_visible_at(1).expect("last visible root");
+        assert!(
+            matches!(projection, QueueProjection::Message { text, image_count: 1, .. } if text == "last")
+        );
+        assert!(matches!(work, ActorWork::Root(root) if root.input.message == "last"));
+        assert!(queue.remove_visible_at(1).is_none());
+        queue.set_paused(true);
+        let pending = queue.take_paused_ui_work();
+        assert_eq!(pending.len(), 2);
+        for (work, (text, displayed)) in pending
+            .into_iter()
+            .zip([("hidden", true), ("visible", false)])
+        {
+            let QueuedUiWork::Root(root) = work else {
+                panic!("expected root");
+            };
+            assert_eq!(root.input.message, text);
+            assert_eq!(root.input.images, vec![image.clone()]);
+            assert_eq!(root.displayed, displayed);
+        }
+    }
+
+    #[test]
+    fn deferred_batch_is_not_batched_again() {
+        const FIRST: &str = "first prompt";
+        const SECOND: &str = "second prompt";
+        const THIRD: &str = "third prompt";
+        let queue = ActorQueue::new();
+        queue.push(ActorWork::Root(test_root(FIRST, 1, Vec::new())));
+        queue.push(ActorWork::Root(test_root(SECOND, 2, Vec::new())));
+        let batched = queue.pop().expect("batched roots");
+        queue.defer(batched);
+        queue.push(ActorWork::Root(test_root(THIRD, 3, Vec::new())));
+        let Some(ActorWork::Root(first)) = queue.pop() else {
+            panic!("expected deferred batch");
+        };
+        assert_eq!(first.earlier.len(), 1);
+        assert_eq!(first.input.preamble[0].user_text(), Some(FIRST));
+        assert_eq!(first.input.message, SECOND);
+        queue.finish_admission();
+        let Some(ActorWork::Root(next)) = queue.pop() else {
+            panic!("expected following root");
+        };
+        assert_eq!(next.input.message, THIRD);
+        assert!(next.earlier.is_empty());
     }
 
     #[test]

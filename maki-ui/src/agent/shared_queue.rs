@@ -175,7 +175,7 @@ impl QueueSender {
                 .into_iter()
                 .map(|work| match work {
                     QueuedUiWork::Root(root) => QueueItem::Message {
-                        image_count: root.input.images.len(),
+                        image_count: root.images.len(),
                         text: root.text,
                         input: root.input,
                         run_id: root.run_id,
@@ -571,6 +571,7 @@ mod tests {
         }
 
         const EARLIER: &str = "earlier root";
+        const NEXT: &str = "next root";
         const HELD: &str = "held root";
         const DETAILS: &str = "preserve details";
         let (actor, task) = AgentActorHandle::spawn(
@@ -600,7 +601,21 @@ mod tests {
                 correlation(1),
             ))
             .unwrap();
-        actor.push_compact(2, Some(DETAILS.into())).unwrap();
+        let QueueItem::Message { mut input, .. } = msg(false) else {
+            unreachable!();
+        };
+        input.message = NEXT.into();
+        actor
+            .rush(RootWork::new(
+                input,
+                2,
+                false,
+                NEXT.into(),
+                Vec::new(),
+                correlation(2),
+            ))
+            .unwrap();
+        actor.push_compact(3, Some(DETAILS.into())).unwrap();
         let QueueItem::Message { mut input, .. } = msg(false) else {
             unreachable!();
         };
@@ -609,7 +624,7 @@ mod tests {
             text: HELD.into(),
             input,
             image_count: 0,
-            run_id: 3,
+            run_id: 4,
             displayed: false,
         });
 
@@ -618,6 +633,7 @@ mod tests {
         let mut pending = pending.into_iter();
         let Some(QueueItem::Message {
             text,
+            image_count,
             input,
             run_id,
             ..
@@ -628,12 +644,17 @@ mod tests {
         assert_eq!(text, EARLIER);
         assert_eq!(input.message, EARLIER);
         assert_eq!(input.images, [image]);
+        assert_eq!(image_count, 1);
+        assert!(input.preamble.is_empty());
         assert_eq!(run_id, 1);
         assert!(
-            matches!(pending.next(), Some(QueueItem::Compact { run_id: 2, instructions: Some(details) }) if details == DETAILS)
+            matches!(pending.next(), Some(QueueItem::Message { text, input, run_id: 2, image_count: 0, .. }) if text == NEXT && input.message == NEXT && input.preamble.is_empty())
         );
         assert!(
-            matches!(pending.next(), Some(QueueItem::Message { text, run_id: 3, .. }) if text == HELD)
+            matches!(pending.next(), Some(QueueItem::Compact { run_id: 3, instructions: Some(details) }) if details == DETAILS)
+        );
+        assert!(
+            matches!(pending.next(), Some(QueueItem::Message { text, run_id: 4, .. }) if text == HELD)
         );
         assert!(pending.next().is_none());
         actor.close();

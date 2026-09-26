@@ -908,6 +908,13 @@ impl SessionRuntime {
         self.notifications.reset();
     }
 
+    fn finish_plan_transition(&mut self) {
+        self.pending_plan_transitions -= 1;
+        if self.pending_plan_transitions == 0 {
+            self.model_slot.end_provisional_model();
+        }
+    }
+
     /// A wake may only start a background run when the session is fully
     /// quiescent. Idle status alone is not enough: restored queue items start
     /// runs without `start_run` (the app only learns of them via
@@ -1504,7 +1511,7 @@ struct BackgroundModels {
 }
 
 fn new_session_from_slot(slot: &ProviderSlot, cwd: &str) -> (AppSession, PreparedProvider) {
-    let current = slot.load();
+    let current = slot.committed();
     (
         AppSession::new(&current.model.spec(), cwd),
         PreparedProvider {
@@ -1978,7 +1985,7 @@ impl<'t> EventLoop<'t> {
                     runtime.plan_model_recovery_at = None;
                     match result {
                         Ok(_) => {
-                            runtime.pending_plan_transitions -= 1;
+                            runtime.finish_plan_transition();
                             reconcile_model(runtime);
                         }
                         Err(error) => {
@@ -2011,7 +2018,7 @@ impl<'t> EventLoop<'t> {
                     match result {
                         Ok(true) => {
                             if self.sessions[idx].app.finish_plan_approval(approval_id) {
-                                self.sessions[idx].pending_plan_transitions -= 1;
+                                self.sessions[idx].finish_plan_transition();
                                 self.apply_model_change(idx, &spec);
                                 let actions = self.sessions[idx].app.implement_plan(clear_context);
                                 self.dispatch(idx, actions);
@@ -2022,7 +2029,7 @@ impl<'t> EventLoop<'t> {
                             }
                         }
                         Ok(false) => {
-                            self.sessions[idx].pending_plan_transitions -= 1;
+                            self.sessions[idx].finish_plan_transition();
                             self.sessions[idx].app.cancel_plan_approval(approval_id);
                             reconcile_model(&mut self.sessions[idx]);
                         }
@@ -2033,7 +2040,7 @@ impl<'t> EventLoop<'t> {
                                 self.sessions[idx].deferred_plan_approval = None;
                                 self.sessions[idx].plan_model_recovery_at = Some(Instant::now());
                             } else {
-                                self.sessions[idx].pending_plan_transitions -= 1;
+                                self.sessions[idx].finish_plan_transition();
                                 self.sessions[idx].app.cancel_plan_approval(approval_id);
                                 reconcile_model(&mut self.sessions[idx]);
                             }
@@ -2061,7 +2068,7 @@ impl<'t> EventLoop<'t> {
                     match result {
                         Ok(true) => {
                             runtime.plan_finalized_rollback = None;
-                            runtime.pending_plan_transitions -= 1;
+                            runtime.finish_plan_transition();
                             reconcile_model(runtime);
                             self.resume_deferred_plan_approval(idx);
                         }
@@ -2073,7 +2080,7 @@ impl<'t> EventLoop<'t> {
                             } =>
                         {
                             runtime.plan_finalized_rollback = None;
-                            runtime.pending_plan_transitions -= 1;
+                            runtime.finish_plan_transition();
                             reconcile_model(runtime);
                             self.resume_deferred_plan_approval(idx);
                         }
@@ -2111,7 +2118,7 @@ impl<'t> EventLoop<'t> {
                         self.sessions[idx].app.flash(error);
                         return;
                     }
-                    self.sessions[idx].pending_plan_transitions -= 1;
+                    self.sessions[idx].finish_plan_transition();
                     reconcile_model(&mut self.sessions[idx]);
                     self.resume_deferred_plan_approval(idx);
                 }
@@ -3513,6 +3520,7 @@ impl<'t> EventLoop<'t> {
                 }
                 if let Some(spec) = model {
                     self.sessions[idx].handles.queue.set_gated(true);
+                    self.sessions[idx].model_slot.begin_provisional_model();
                     self.sessions[idx].pending_plan_transitions += 1;
                     let coordinator = self.sessions[idx].coordinator.clone();
                     let (manager, root) = self.sessions[idx].handles.manager_and_root();
@@ -3602,7 +3610,7 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::Btw(question, images) => {
-                let slot = self.sessions[idx].model_slot.load();
+                let slot = self.sessions[idx].model_slot.committed();
                 self.sessions[idx].app.start_btw(
                     question,
                     images,
@@ -3836,7 +3844,7 @@ impl<'t> EventLoop<'t> {
                         self.sessions[idx].app.flash(error.to_string());
                         return;
                     }
-                    self.sessions[idx].pending_plan_transitions -= 1;
+                    self.sessions[idx].finish_plan_transition();
                     reconcile_model(&mut self.sessions[idx]);
                     if approved || !matches!(error, SessionCoordinatorError::ModelAdoptionExpired) {
                         self.sessions[idx].app.flash(error.to_string());
@@ -5419,6 +5427,10 @@ mod tests {
                 loop_state.sessions[0].model_slot.load().model.spec(),
                 SELECTED_MODEL
             );
+            assert_eq!(
+                loop_state.sessions[0].model_slot.committed().model.spec(),
+                "anthropic/test-model"
+            );
             let actions = loop_state.sessions[0].app.start_mailbox_run(Vec::new());
             loop_state.dispatch(0, actions);
             assert_eq!(loop_state.sessions[0].handles.queue.len(), 1);
@@ -5505,6 +5517,10 @@ mod tests {
             .unwrap();
             loop_state.handle_internal(event);
             assert_eq!(loop_state.sessions[0].pending_plan_transitions, 0);
+            assert_eq!(
+                loop_state.sessions[0].model_slot.committed().model.spec(),
+                "anthropic/test-model"
+            );
             assert!(loop_state.sessions[0].deferred_plan_approval.is_none());
             assert_eq!(
                 loop_state.sessions[0].app.state.mode,

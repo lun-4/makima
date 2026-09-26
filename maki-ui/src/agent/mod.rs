@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::{ArcSwap, ArcSwapOption, Guard};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
@@ -146,6 +146,7 @@ fn next_provider_instance() -> ProviderInstanceGeneration {
 
 pub(crate) struct ProviderSlot {
     current: ArcSwap<ProviderSnapshot>,
+    committed: ArcSwapOption<ProviderSnapshot>,
     change_tx: flume::Sender<ProviderChange>,
 }
 
@@ -177,12 +178,27 @@ impl ProviderSlot {
                 model,
                 provider: tracked,
             }),
+            committed: ArcSwapOption::empty(),
             change_tx,
         })
     }
 
     pub(crate) fn load(&self) -> Guard<Arc<ProviderSnapshot>> {
         self.current.load()
+    }
+
+    pub(crate) fn begin_provisional_model(&self) {
+        self.committed.store(Some(self.current.load_full()));
+    }
+
+    pub(crate) fn end_provisional_model(&self) {
+        self.committed.store(None);
+    }
+
+    pub(crate) fn committed(&self) -> Arc<ProviderSnapshot> {
+        self.committed
+            .load_full()
+            .unwrap_or_else(|| self.current.load_full())
     }
 
     pub(crate) fn change_tx(&self) -> flume::Sender<ProviderChange> {
@@ -208,7 +224,7 @@ impl ProviderSlot {
 
 impl maki_agent::ModelSource for ProviderSlot {
     fn current(&self) -> Option<(Arc<dyn Provider>, Model)> {
-        let snapshot = self.load();
+        let snapshot = self.committed();
         Some((
             Arc::clone(&snapshot.provider) as Arc<dyn Provider>,
             snapshot.model.clone(),
@@ -686,6 +702,8 @@ mod tests {
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
+    const CANDIDATE_MODEL: &str = "candidate-model";
+    const CANDIDATE_SPEC: &str = "anthropic/candidate-model";
 
     struct StubProvider;
 
@@ -745,6 +763,39 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[test]
+    fn provisional_model_is_hidden_from_active_runs_until_settlement() {
+        let (slot, _changes) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let original = slot.load().model.spec();
+        slot.begin_provisional_model();
+        let mut candidate = slot.load().model.clone();
+        candidate.id = CANDIDATE_MODEL.into();
+        slot.install(candidate, Arc::new(StubProvider));
+        assert_eq!(slot.load().model.spec(), CANDIDATE_SPEC);
+        assert_eq!(slot.committed().model.spec(), original);
+        assert_eq!(
+            maki_agent::ModelSource::current(&*slot).unwrap().1.spec(),
+            original
+        );
+        slot.end_provisional_model();
+        assert_eq!(slot.committed().model.spec(), CANDIDATE_SPEC);
+    }
+
+    #[test]
+    fn rolled_back_provisional_model_does_not_leak_to_active_runs() {
+        let (slot, _changes) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let previous = slot.load().model.clone();
+        slot.begin_provisional_model();
+        let mut candidate = previous.clone();
+        candidate.id = CANDIDATE_MODEL.into();
+        slot.install(candidate, Arc::new(StubProvider));
+        slot.install(previous.clone(), Arc::new(StubProvider));
+        slot.end_provisional_model();
+        assert_eq!(slot.committed().model.spec(), previous.spec());
     }
 
     fn auth_slot(reload_ok: bool) -> (Arc<ProviderSlot>, flume::Receiver<ProviderChange>) {
