@@ -613,6 +613,7 @@ struct SessionRuntime {
     deferred_plan_approval: Option<(u64, bool)>,
     plan_model_recovery_at: Option<Instant>,
     plan_finalized_rollback: Option<(ModelAdoptionReceipt, Option<Instant>)>,
+    deferred_agent_messages: Vec<QueueItem>,
 }
 
 struct PendingReplacement {
@@ -714,6 +715,7 @@ impl PreparedSessionRuntime {
             deferred_plan_approval: None,
             plan_model_recovery_at: None,
             plan_finalized_rollback: None,
+            deferred_agent_messages: Vec::new(),
         })
     }
 
@@ -770,6 +772,7 @@ impl PreparedSessionRuntime {
             deferred_plan_approval: None,
             plan_model_recovery_at: None,
             plan_finalized_rollback: None,
+            deferred_agent_messages: Vec::new(),
         })
     }
 }
@@ -874,7 +877,8 @@ impl SessionRuntime {
     /// `QueueItemConsumed`), and `start_run` destroys text held for recovery
     /// after an agent error.
     fn quiescent(&self) -> bool {
-        SessionStatus::of(&self.app) == SessionStatus::Idle
+        self.pending_plan_transitions == 0
+            && SessionStatus::of(&self.app) == SessionStatus::Idle
             && self.handles.queue.is_empty()
             && !self.app.holds_recovery_text()
     }
@@ -1838,8 +1842,8 @@ impl<'t> EventLoop<'t> {
         };
         // Fatal errors still save every session, kill MCP process groups,
         // and drain the storage writer before the process exits.
-        let report = self.shutdown();
-        result.map(|()| report)
+        let shutdown = self.shutdown();
+        result.and(shutdown)
     }
 
     /// Wait for the next event from any source, or time out so animations
@@ -2018,11 +2022,21 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     match result {
-                        Ok(_) => {
+                        Ok(true) => {
                             runtime.plan_finalized_rollback = None;
                             runtime.pending_plan_transitions -= 1;
                             reconcile_model(runtime);
                             self.resume_deferred_plan_approval(idx);
+                        }
+                        Ok(false) if runtime.coordinator.read().model() != receipt.adopted => {
+                            runtime.plan_finalized_rollback = None;
+                            runtime.pending_plan_transitions -= 1;
+                            reconcile_model(runtime);
+                            self.resume_deferred_plan_approval(idx);
+                        }
+                        Ok(false) => {
+                            runtime.plan_finalized_rollback =
+                                Some((receipt, Some(Instant::now() + Duration::from_secs(1))));
                         }
                         Err(error) => {
                             runtime.plan_finalized_rollback =
@@ -2213,6 +2227,18 @@ impl<'t> EventLoop<'t> {
             self.dispatch(i, actions);
         }
         for runtime in &mut self.sessions {
+            if runtime.pending_plan_transitions == 0 {
+                for message in runtime.deferred_agent_messages.drain(..) {
+                    runtime.handles.queue.push(message);
+                }
+            }
+        }
+        self.retry_plan_model_transitions(now);
+        dirty
+    }
+
+    fn retry_plan_model_transitions(&mut self, now: Instant) {
+        for runtime in &mut self.sessions {
             if runtime.plan_model_recovery_at.is_some_and(|at| at <= now) {
                 runtime.plan_model_recovery_at = None;
                 let coordinator = runtime.coordinator.clone();
@@ -2237,7 +2263,6 @@ impl<'t> EventLoop<'t> {
                 spawn_finalized_model_rollback(runtime, receipt, &self.internal_tx);
             }
         }
-        dirty
     }
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
@@ -3345,17 +3370,23 @@ impl<'t> EventLoop<'t> {
                 let mut input = *input;
                 prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Message {
+                let message = QueueItem::Message {
                     text: input.message.clone(),
                     image_count: input.images.len(),
                     input,
                     run_id,
                     displayed: true,
-                });
+                };
+                if rt.pending_plan_transitions == 0 {
+                    rt.handles.queue.push(message);
+                } else {
+                    rt.deferred_agent_messages.push(message);
+                }
             }
             Action::CancelAgent { run_id } => {
                 let rt = &mut self.sessions[idx];
                 rt.notifications.reset();
+                rt.deferred_agent_messages.clear();
                 let _ = rt.handles.cmd_tx.try_send(AgentCommand::Cancel { run_id });
             }
             Action::CancelSubagent { tool_use_id } => {
@@ -3836,7 +3867,64 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn shutdown(mut self) -> ShutdownReport {
+    fn settle_plan_models(&mut self) -> Result<()> {
+        for runtime in &mut self.sessions {
+            runtime.app.invalidate_plan_approval();
+            runtime.deferred_plan_approval = None;
+            runtime.deferred_agent_messages.clear();
+            let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);
+        }
+        let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
+        while self
+            .sessions
+            .iter()
+            .any(|runtime| runtime.pending_plan_transitions != 0)
+        {
+            let now = Instant::now();
+            if now >= deadline {
+                let sessions: Vec<_> = self
+                    .sessions
+                    .iter()
+                    .filter(|runtime| runtime.pending_plan_transitions != 0)
+                    .map(SessionRuntime::id)
+                    .collect();
+                return Err(eyre!(
+                    "plan model transitions did not settle before shutdown: {sessions:?}"
+                ));
+            }
+            self.retry_plan_model_transitions(now);
+            let next_retry = self
+                .sessions
+                .iter()
+                .flat_map(|runtime| {
+                    [
+                        runtime.plan_model_recovery_at,
+                        runtime
+                            .plan_finalized_rollback
+                            .as_ref()
+                            .and_then(|(_, at)| *at),
+                    ]
+                })
+                .flatten()
+                .min()
+                .unwrap_or(deadline);
+            let timeout = deadline
+                .min(next_retry)
+                .saturating_duration_since(Instant::now());
+            match self.internal_rx.recv_timeout(timeout) {
+                Ok(event) => self.handle_internal(event),
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    return Err(eyre!(
+                        "internal event channel closed during plan model settlement"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown(mut self) -> Result<ShutdownReport> {
         let outputs = self.provider_usage.handle(ProviderUsageInput::Shutdown);
         self.handle_provider_usage_outputs(outputs);
         let started = Instant::now();
@@ -3847,6 +3935,28 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
+        let mut plan_settlement = self.settle_plan_models();
+        if let Err(error) = &plan_settlement {
+            warn!(%error, "plan model transitions failed to settle during shutdown");
+            for runtime in self
+                .sessions
+                .iter()
+                .filter(|runtime| runtime.pending_plan_transitions != 0 && !runtime.lock_lost)
+            {
+                let session = Arc::clone(&runtime.app.state.session);
+                if let Err(error) = self
+                    .ctx
+                    .storage_writer
+                    .fail_closed_checkpoint(session, AGENT_SHUTDOWN_TIMEOUT)
+                {
+                    plan_settlement = Err(eyre!(
+                        "failed to restore accepted model for session {}: {error}",
+                        runtime.id()
+                    ));
+                    break;
+                }
+            }
+        }
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
@@ -3866,6 +3976,7 @@ impl<'t> EventLoop<'t> {
                 coordinator,
                 session_lock,
                 lock_lost,
+                pending_plan_transitions,
                 ..
             } = rt;
             let heartbeat_timeout = heartbeat_deadline.saturating_duration_since(Instant::now());
@@ -3874,7 +3985,7 @@ impl<'t> EventLoop<'t> {
                 LockSettlement::Held(lease) => {
                     let snapshot = coordinator.read().options();
                     project_committed_options_for_app(&mut app, &snapshot);
-                    if !lock_lost {
+                    if !lock_lost && pending_plan_transitions == 0 {
                         app.checkpoint_now();
                     }
                     let mut session = Arc::unwrap_or_clone(Arc::clone(&app.state.session));
@@ -3930,11 +4041,12 @@ impl<'t> EventLoop<'t> {
             total_ms = started.elapsed().as_millis() as u64,
             "ui shutdown phases"
         );
-        ShutdownReport {
+        plan_settlement?;
+        Ok(ShutdownReport {
             exit,
             tabs,
             focused: self.focused,
-        }
+        })
     }
 }
 
@@ -4265,6 +4377,7 @@ mod tests {
             deferred_plan_approval: None,
             plan_model_recovery_at: None,
             plan_finalized_rollback: None,
+            deferred_agent_messages: Vec::new(),
         }
     }
 
@@ -5138,6 +5251,13 @@ mod tests {
                 loop_state.sessions[0].model_slot.load().model.spec(),
                 SELECTED_MODEL
             );
+            let actions = loop_state.sessions[0].app.start_mailbox_run(Vec::new());
+            loop_state.dispatch(0, actions);
+            assert!(loop_state.sessions[0].handles.queue.is_empty());
+            assert_eq!(loop_state.sessions[0].deferred_agent_messages.len(), 1);
+            let run_id = loop_state.sessions[0].app.run_id;
+            loop_state.handle_action(0, Action::CancelAgent { run_id });
+            assert!(loop_state.sessions[0].deferred_agent_messages.is_empty());
             let committed = loop_state.sessions[0].app.state.session.model.clone();
             let stored = maki_storage::model::read_model(&loop_state.sessions[0].app.storage);
             assert!(!sync_session_models(&mut loop_state.sessions));
@@ -5538,6 +5658,111 @@ mod tests {
         let runtime = loop_state.sessions.remove(0);
         drop(loop_state);
         release_runtime(runtime);
+    }
+
+    #[test_case(false ; "finalization_queued")]
+    #[test_case(true ; "rollback_in_flight")]
+    fn shutdown_settles_rejected_finalized_model(rollback_started: bool) {
+        const IMPLEMENTATION_MODEL: &str = "anthropic/claude-opus-4-8";
+        const ORIGINAL_PLAN: &str = "original plan";
+        const REVISED_PLAN: &str = "revised plan";
+
+        let mut harness = RuntimeHarness::new();
+        let slot_holder: Arc<std::sync::Mutex<Option<Arc<ProviderSlot>>>> = Arc::default();
+        let adopter_slot = Arc::clone(&slot_holder);
+        let adopter = Arc::new(move |model: Model| {
+            let slot = adopter_slot.lock().unwrap().as_ref().unwrap().clone();
+            Box::pin(async move {
+                let provider = slot.load().provider.clone();
+                slot.install(model, provider);
+                Ok(())
+            }) as ModelAdoptionFuture
+        });
+        let mut runtime = test_runtime_with_adopter(crate::components::test_model(), adopter);
+        *slot_holder.lock().unwrap() = Some(Arc::clone(&runtime.model_slot));
+        let previous_model = runtime.app.state.model.spec();
+        Arc::make_mut(&mut runtime.app.state.session)
+            .save(&harness.ctx().storage)
+            .unwrap();
+        let coordinator = runtime.coordinator.clone();
+        let path = harness.ctx().sessions_dir.join("plan.md");
+        std::fs::write(&path, ORIGINAL_PLAN).unwrap();
+        runtime.app.state.mode = crate::app::mode::Mode::Plan;
+        runtime.app.state.plan = crate::app::mode::PlanState::Ready(path.clone());
+        runtime.app.plan_form.on_plan_ready();
+        runtime
+            .app
+            .plan_form
+            .set_implementation_model(IMPLEMENTATION_MODEL.into(), &previous_model);
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        loop_state.handle_action(
+            0,
+            Action::ImplementPlan {
+                clear_context: false,
+                model: Some(IMPLEMENTATION_MODEL.into()),
+            },
+        );
+        let changed = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
+        loop_state.handle_internal(changed);
+        let finalized = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
+        assert!(matches!(
+            finalized,
+            InternalEvent::PlanModelFinalized {
+                result: Ok(true),
+                ..
+            }
+        ));
+        if rollback_started {
+            std::fs::write(&path, REVISED_PLAN).unwrap();
+            loop_state.handle_internal(finalized);
+            assert!(loop_state.sessions[0].plan_finalized_rollback.is_some());
+        } else {
+            loop_state.internal_tx.send(finalized).unwrap();
+        }
+        let id = loop_state.sessions[0].id();
+        let storage = loop_state.ctx.storage.clone();
+        let report = loop_state.shutdown().unwrap();
+        assert_eq!(report.tabs[0].model, previous_model);
+        assert_eq!(coordinator.read().model().as_ref(), previous_model);
+        assert_eq!(
+            AppSession::load(id, &storage).unwrap().model,
+            previous_model
+        );
+        drop(coordinator);
     }
 
     #[test_case("unchanged" ; "unchanged_plan_implements")]
