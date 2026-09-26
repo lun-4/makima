@@ -6047,6 +6047,19 @@ fn delayed_plan_approval_rejects_stale_completion(revised: bool) {
 }
 
 #[test]
+fn plan_approval_rejects_parallel_toggled_back() {
+    let (_dir, mut app) = approvable_plan_app();
+    let original = app.plan_form.parallel();
+    let (id, active) = app.begin_plan_approval().unwrap();
+    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    app.update(Msg::Key(key(KeyCode::Char(' '))));
+    assert_eq!(app.plan_form.parallel(), original);
+    assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!app.finish_plan_approval(id));
+    assert!(app.begin_plan_approval().is_some());
+}
+
+#[test]
 fn plan_approval_rejects_revision_reverted_to_same_content() {
     let (_dir, mut app) = approvable_plan_app();
     let (id, active) = app.begin_plan_approval().unwrap();

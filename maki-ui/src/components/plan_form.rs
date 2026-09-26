@@ -70,6 +70,7 @@ const CHROME_LINES: u16 = 4;
 #[derive(Debug, PartialEq)]
 pub enum PlanFormAction {
     Consumed,
+    ParallelToggled,
     Passthrough,
     ClearAndImplement,
     Implement,
@@ -212,7 +213,7 @@ impl PlanForm {
             }
             KeyCode::Char(' ') => {
                 self.parallel = !self.parallel;
-                PlanFormAction::Consumed
+                PlanFormAction::ParallelToggled
             }
             KeyCode::Enter => (MENU[self.selected].action)(),
             KeyCode::Tab => PlanFormAction::Passthrough,
@@ -410,12 +411,12 @@ mod tests {
         assert_eq!(form.parallel(), initial);
         assert_eq!(
             form.handle_key(key(KeyCode::Char(' '))),
-            PlanFormAction::Consumed
+            PlanFormAction::ParallelToggled
         );
         assert_eq!(form.parallel(), !initial);
         assert_eq!(
             form.handle_key(key(KeyCode::Char(' '))),
-            PlanFormAction::Consumed
+            PlanFormAction::ParallelToggled
         );
         assert_eq!(form.parallel(), initial);
     }

@@ -1453,6 +1453,9 @@ fn new_session_from_slot(slot: &ProviderSlot, cwd: &str) -> (AppSession, Prepare
 fn sync_session_models(sessions: &mut [SessionRuntime]) -> bool {
     let mut changed = false;
     for rt in sessions {
+        if rt.pending_plan_transitions != 0 {
+            continue;
+        }
         let slot_model = rt.model_slot.load();
         if rt.app.state.session.model != slot_model.model.spec()
             || rt.app.state.model.context_window != slot_model.model.context_window
@@ -2618,6 +2621,11 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(Ok(reply));
             }
             SessionRequest::New { prompt, focus } => {
+                if self.sessions[self.focused].pending_plan_transitions != 0 {
+                    let _ =
+                        reply_tx.send(Err("model change pending; retry after it settles".into()));
+                    return;
+                }
                 let (session, provider) =
                     new_session_from_slot(self.focused_model_slot(), &self.session_cwd);
                 let runtime = match self
@@ -4862,6 +4870,24 @@ mod tests {
                 loop_state.sessions[0].model_slot.load().model.spec(),
                 SELECTED_MODEL
             );
+            let committed = loop_state.sessions[0].app.state.session.model.clone();
+            let stored = maki_storage::model::read_model(&loop_state.sessions[0].app.storage);
+            assert!(!sync_session_models(&mut loop_state.sessions));
+            assert_eq!(loop_state.sessions[0].app.state.session.model, committed);
+            assert_eq!(
+                maki_storage::model::read_model(&loop_state.sessions[0].app.storage),
+                stored
+            );
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            loop_state.handle_session_request(
+                SessionRequest::New {
+                    prompt: None,
+                    focus: false,
+                },
+                reply_tx,
+            );
+            assert!(reply_rx.recv().unwrap().is_err());
+            assert_eq!(loop_state.sessions.len(), 1);
             release_tx.send(()).unwrap();
             let event = smol::future::or(loop_state.internal_rx.recv_async(), async {
                 smol::Timer::after(Duration::from_secs(5)).await;

@@ -1123,7 +1123,7 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
                 &*ctx.model_adopter,
                 &*ctx.checkpoint,
                 spec,
-                fast,
+                fast.map(FastSetting::Explicit),
                 thinking,
             )
             .await;
@@ -1162,7 +1162,9 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
                             &*ctx.model_adopter,
                             &*ctx.checkpoint,
                             Some(previous),
-                            Some(previous_fast.as_ref() == ENABLED_VALUE),
+                            Some(FastSetting::Restore(
+                                previous_fast.as_ref() == ENABLED_VALUE,
+                            )),
                             Some(previous_thinking.parse().map_err(|error| {
                                 SessionCoordinatorError::ConditionalModelRollback(Arc::from(
                                     format!("invalid previous thinking setting: {error}"),
@@ -1868,6 +1870,15 @@ fn bump_setting_revision(read: &SessionReadHandle, id: &str) {
     }
 }
 
+fn fast_allowed(model: &Model) -> bool {
+    model.supports_fast() || model.fast_pending()
+}
+
+enum FastSetting {
+    Explicit(bool),
+    Restore(bool),
+}
+
 async fn rollback_model(
     read: &SessionReadHandle,
     model_policy: &ModelPolicy,
@@ -1904,7 +1915,9 @@ async fn rollback_model(
             "invalid thinking setting during rollback: {error}"
         )))
     })?;
-    if fast && !model.supports_fast() || thinking.is_enabled() && !model.supports_thinking() {
+    if fast && !fast_allowed(&model) && !restore_fast
+        || thinking.is_enabled() && !model.supports_thinking()
+    {
         return Ok(false);
     }
     set_model(
@@ -1913,7 +1926,11 @@ async fn rollback_model(
         model_adopter,
         checkpoint,
         Some(receipt.previous),
-        Some(fast),
+        Some(if restore_fast {
+            FastSetting::Restore(fast)
+        } else {
+            FastSetting::Explicit(fast)
+        }),
         Some(thinking),
     )
     .await
@@ -1929,7 +1946,7 @@ async fn set_model(
     model_adopter: &dyn ModelAdopter,
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
     spec: Option<Arc<str>>,
-    fast: Option<bool>,
+    fast: Option<FastSetting>,
     thinking: Option<ThinkingConfig>,
 ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
     let previous_spec = read.model();
@@ -1942,16 +1959,18 @@ async fn set_model(
         id: Arc::from(MODEL_OPTION_ID),
         value: Arc::from(target_spec),
     })?;
-    if fast == Some(true) && !model.supports_fast() {
+    if matches!(fast, Some(FastSetting::Explicit(true))) && !fast_allowed(&model) {
         return Err(SessionOptionError::FastUnsupported.into());
     }
     if thinking.is_some_and(ThinkingConfig::is_enabled) && !model.supports_thinking() {
         return Err(SessionOptionError::ThinkingUnsupported.into());
     }
     let fast_value: Arc<str> = match fast {
-        Some(true) => Arc::from(ENABLED_VALUE),
-        Some(false) => Arc::from(DISABLED_VALUE),
-        None if model.supports_fast() || model.fast_pending() => {
+        Some(FastSetting::Explicit(true) | FastSetting::Restore(true)) => Arc::from(ENABLED_VALUE),
+        Some(FastSetting::Explicit(false) | FastSetting::Restore(false)) => {
+            Arc::from(DISABLED_VALUE)
+        }
+        None if fast_allowed(&model) => {
             current_option_value(read, FAST_OPTION_ID).unwrap_or_else(|| Arc::from(DISABLED_VALUE))
         }
         None => Arc::from(DISABLED_VALUE),
@@ -2081,9 +2100,7 @@ async fn set_option(
 ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
     if id == FAST_OPTION_ID && value == ENABLED_VALUE {
         let state = lock(&read.state);
-        if !Model::from_spec(&state.model)
-            .is_ok_and(|model| model.supports_fast() || model.fast_pending())
-        {
+        if !Model::from_spec(&state.model).is_ok_and(|model| fast_allowed(&model)) {
             return Err(SessionOptionError::FastUnsupported.into());
         }
     }
@@ -2234,6 +2251,7 @@ fn toggle_definition(
 
 #[cfg(test)]
 mod tests {
+    use maki_providers::model::FastSupport;
     use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture};
 
     use super::*;
@@ -3626,6 +3644,82 @@ mod tests {
                 "high"
             );
             coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn pending_fast_is_valid_for_model_transition() {
+        let mut model = Model::from_spec("ollama/llama3").unwrap();
+        model.supports_fast_override = Some(FastSupport::Pending);
+        assert!(!model.supports_fast());
+        assert!(model.fast_pending());
+        assert!(fast_allowed(&model));
+        model.supports_fast_override = Some(FastSupport::Unsupported);
+        assert!(!fast_allowed(&model));
+    }
+
+    #[test]
+    fn model_adoption_rollback_restores_previous_fast() {
+        smol::block_on(async {
+            const PREVIOUS: &str = "openai/gpt-5";
+            const ADOPTED: &str = "ollama/llama3";
+            for cancel_during_adoption in [false, true] {
+                let id = MakiId::generate();
+                let active = Arc::new(AtomicBool::new(true));
+                let adopted = Arc::new(Mutex::new(Vec::new()));
+                let mut params = params(id, writer(false));
+                params.model = Arc::from(PREVIOUS);
+                params.definitions = builtin_option_definitions(
+                    PREVIOUS,
+                    [Arc::from(PREVIOUS)],
+                    false,
+                    true,
+                    false,
+                    ThinkingConfig::Off,
+                );
+                params.model_adopter = Arc::new({
+                    let adopted = Arc::clone(&adopted);
+                    let active = Arc::clone(&active);
+                    move |model: Model| {
+                        if cancel_during_adoption && model.spec() == ADOPTED {
+                            active.store(false, Ordering::Release);
+                        }
+                        lock(&adopted).push(model.spec());
+                        Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                    }
+                });
+                let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+                assert!(!fast_allowed(&Model::from_spec(PREVIOUS).unwrap()));
+                assert!(matches!(
+                    coordinator.set_model(None, Some(true), None).await,
+                    Err(SessionCoordinatorError::Option(
+                        SessionOptionError::FastUnsupported
+                    ))
+                ));
+                let result = coordinator
+                    .set_model_if_active(Arc::from(ADOPTED), Arc::clone(&active))
+                    .await;
+                if cancel_during_adoption {
+                    assert_eq!(result, Err(SessionCoordinatorError::ModelAdoptionExpired));
+                } else {
+                    let receipt = result.unwrap();
+                    assert_eq!(receipt.previous_fast.as_ref(), ENABLED_VALUE);
+                    assert_eq!(receipt.adopted_fast.as_ref(), DISABLED_VALUE);
+                    assert!(
+                        coordinator
+                            .rollback_model_if_version(receipt)
+                            .await
+                            .unwrap()
+                    );
+                }
+                assert_eq!(coordinator.read().model().as_ref(), PREVIOUS);
+                assert_eq!(
+                    current_option_value(&coordinator.read(), FAST_OPTION_ID).as_deref(),
+                    Some(ENABLED_VALUE)
+                );
+                assert_eq!(lock(&adopted).as_slice(), [ADOPTED, PREVIOUS]);
+                coordinator.close().await.unwrap();
+            }
         });
     }
 

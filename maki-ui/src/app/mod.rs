@@ -3276,6 +3276,10 @@ impl App {
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
         match action {
             PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
+            PlanFormAction::ParallelToggled => {
+                self.invalidate_plan_approval();
+                vec![]
+            }
             PlanFormAction::Hide => {
                 self.invalidate_plan_approval();
                 self.plan_form.hide();
