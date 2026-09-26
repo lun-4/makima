@@ -3902,11 +3902,28 @@ mod tests {
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
     use maki_providers::TokenUsage;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, TerminalOptions, Viewport, backend::TestBackend, layout::Rect};
     use tempfile::TempDir;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
+    const TEST_TERMINAL_WIDTH: u16 = 80;
+    const TEST_TERMINAL_HEIGHT: u16 = 24;
+
+    fn test_event_loop_terminal() -> ratatui::DefaultTerminal {
+        Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(
+                    0,
+                    0,
+                    TEST_TERMINAL_WIDTH,
+                    TEST_TERMINAL_HEIGHT,
+                )),
+            },
+        )
+        .unwrap()
+    }
 
     #[test]
     fn rapid_double_toggle_preserves_both_intents() {
@@ -4792,9 +4809,7 @@ mod tests {
                 .app
                 .plan_form
                 .set_implementation_model(SELECTED_MODEL.into(), &runtime.app.state.model.spec());
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-                    .unwrap();
+            let mut terminal = test_event_loop_terminal();
             let (internal_tx, internal_rx) = flume::unbounded();
             let (_provider_tx, provider_change_rx) = flume::unbounded();
             let (_ui_tx, ui_action_rx) = flume::unbounded();
@@ -4944,9 +4959,7 @@ mod tests {
         )
         .unwrap();
         assert!(!runtime.app.state.workflow);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-                .unwrap();
+        let mut terminal = test_event_loop_terminal();
         let (internal_tx, internal_rx) = flume::unbounded();
         let (_provider_tx, provider_change_rx) = flume::unbounded();
         let (_ui_tx, ui_action_rx) = flume::unbounded();
@@ -5036,9 +5049,7 @@ mod tests {
         runtime
             .model_slot
             .install(model_named("recovered"), Arc::new(StubProvider));
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-                .unwrap();
+        let mut terminal = test_event_loop_terminal();
         let (internal_tx, internal_rx) = flume::unbounded();
         let (_provider_tx, provider_change_rx) = flume::unbounded();
         let (_ui_tx, ui_action_rx) = flume::unbounded();
@@ -5117,9 +5128,7 @@ mod tests {
         runtime.app.state.plan = crate::app::mode::PlanState::Ready(path);
         runtime.app.plan_form.on_plan_ready();
         runtime.pending_plan_transitions = 1;
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-                .unwrap();
+        let mut terminal = test_event_loop_terminal();
         let (internal_tx, internal_rx) = flume::unbounded();
         let (_provider_tx, provider_change_rx) = flume::unbounded();
         let (_ui_tx, ui_action_rx) = flume::unbounded();
