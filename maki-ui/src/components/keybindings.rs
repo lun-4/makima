@@ -497,6 +497,24 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single("Space"),
+        description: "Toggle parallel implementation",
+        context: KeybindContext::FormInput,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::OPEN_EDITOR.label),
+        description: "Edit plan",
+        context: KeybindContext::FormInput,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::MODEL_PICKER.label),
+        description: "Choose implementation model",
+        context: KeybindContext::FormInput,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Esc"),
         description: "Close",
         context: KeybindContext::FormInput,

@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::types::EarlierRoot;
-use super::{ActorWork, RootWork, TurnAdmission};
+use super::{ActorWork, QueuedUiWork, RootWork, TurnAdmission};
 use crate::ExtractedCommand;
 use crate::types::TurnId;
 
@@ -54,16 +54,24 @@ impl From<&ActorWork> for QueueProjection {
 
 /// One lock-backed FIFO deque of [`ActorWork`]. Shared through `Arc`.
 pub struct ActorQueue {
-    items: Mutex<VecDeque<ActorWork>>,
+    state: Mutex<QueueState>,
     notify_tx: flume::Sender<()>,
     notify_rx: Mutex<Option<flume::Receiver<()>>>,
+}
+
+struct QueueState {
+    items: VecDeque<ActorWork>,
+    paused: bool,
 }
 
 impl ActorQueue {
     pub fn new() -> Self {
         let (notify_tx, notify_rx) = flume::bounded::<()>(1);
         Self {
-            items: Mutex::new(VecDeque::new()),
+            state: Mutex::new(QueueState {
+                items: VecDeque::new(),
+                paused: false,
+            }),
             notify_tx,
             notify_rx: Mutex::new(Some(notify_rx)),
         }
@@ -71,14 +79,29 @@ impl ActorQueue {
 
     /// Pushes `work` at the back and wakes the runner.
     pub fn push(&self, work: ActorWork) {
-        lock(&self.items).push_back(work);
+        lock(&self.state).items.push_back(work);
         self.notify();
     }
 
-    /// Pops the front item, or `None` when the queue is empty.
+    /// Pauses or resumes consumption without changing queued work. Removals and
+    /// lifecycle drains remain available while paused.
+    pub fn set_paused(&self, paused: bool) {
+        let mut state = lock(&self.state);
+        state.paused = paused;
+        drop(state);
+        if !paused {
+            self.notify();
+        }
+    }
+
+    /// Pops the front item, or `None` when the queue is empty or paused.
     /// Consecutive plain root inputs that share a batch key are condensed into a single turn.
     pub fn pop(&self) -> Option<ActorWork> {
-        let mut items = lock(&self.items);
+        let mut state = lock(&self.state);
+        if state.paused {
+            return None;
+        }
+        let items = &mut state.items;
         let first = items.pop_front()?;
         match first {
             ActorWork::Root(root) => {
@@ -126,7 +149,8 @@ impl ActorQueue {
     /// disturbing the others. Returns `None` when it is not queued (already
     /// running or already consumed).
     pub fn remove_turn(&self, turn_id: TurnId) -> Option<TurnAdmission> {
-        let mut items = lock(&self.items);
+        let mut state = lock(&self.state);
+        let items = &mut state.items;
         let index = items
             .iter()
             .position(|w| matches!(w, ActorWork::Turn(a) if a.turn_id == turn_id))?;
@@ -139,7 +163,8 @@ impl ActorQueue {
     /// Removes the item at raw `index` (the same index [`snapshot`](Self::snapshot)
     /// uses) and returns it. `None` when out of bounds.
     pub fn remove_at(&self, index: usize) -> Option<ActorWork> {
-        let mut items = lock(&self.items);
+        let mut state = lock(&self.state);
+        let items = &mut state.items;
         if index >= items.len() {
             return None;
         }
@@ -163,7 +188,8 @@ impl ActorQueue {
     /// Removes every queued item whose correlation matches, returning them in
     /// FIFO order. Unrelated items stay untouched.
     pub fn remove_correlation(&self, correlation: &str) -> Vec<ActorWork> {
-        let mut items = lock(&self.items);
+        let mut state = lock(&self.state);
+        let items = &mut state.items;
         let matching: Vec<usize> = items
             .iter()
             .enumerate()
@@ -194,7 +220,8 @@ impl ActorQueue {
     /// Removes the `visible_index`-th item in panel order and returns its
     /// projection plus the work. `None` when the panel has fewer rows.
     pub fn remove_visible_at(&self, visible_index: usize) -> Option<(ActorWork, QueueProjection)> {
-        let mut items = lock(&self.items);
+        let mut state = lock(&self.state);
+        let items = &mut state.items;
         let mut seen = 0usize;
         let mut target = None;
         for (i, w) in items.iter().enumerate() {
@@ -213,29 +240,56 @@ impl ActorQueue {
     }
 
     pub fn len(&self) -> usize {
-        lock(&self.items).len()
+        lock(&self.state).items.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Takes queued roots and compacts in FIFO order only while paused.
+    /// Turns and controls remain queued for their normal lifecycle handling.
+    pub(crate) fn take_paused_ui_work(&self) -> Vec<QueuedUiWork> {
+        let mut state = lock(&self.state);
+        if !state.paused {
+            return Vec::new();
+        }
+        let mut kept = VecDeque::new();
+        let mut taken = Vec::new();
+        while let Some(work) = state.items.pop_front() {
+            match work {
+                ActorWork::Root(root) => taken.push(QueuedUiWork::Root(Box::new(root))),
+                ActorWork::Compact {
+                    run_id,
+                    instructions,
+                } => taken.push(QueuedUiWork::Compact {
+                    run_id,
+                    instructions,
+                }),
+                other => kept.push_back(other),
+            }
+        }
+        state.items = kept;
+        taken
+    }
+
     /// Removes every item and returns them in FIFO order.
     pub fn drain_all(&self) -> Vec<ActorWork> {
-        let mut items = lock(&self.items);
+        let mut state = lock(&self.state);
+        let items = &mut state.items;
         std::mem::take(&mut *items).into()
     }
 
     /// A neutral snapshot of the queue for the TUI projection.
     pub fn snapshot(&self) -> Vec<QueueProjection> {
-        lock(&self.items).iter().map(Into::into).collect()
+        lock(&self.state).items.iter().map(Into::into).collect()
     }
 
     /// Runs `publish` under the queue lock, and only when the queue is empty,
     /// so a drain publication can never interleave with a concurrent push.
     pub fn publish_if_empty(&self, publish: impl FnOnce()) {
-        let items = lock(&self.items);
-        if items.is_empty() {
+        let state = lock(&self.state);
+        if state.items.is_empty() {
             publish();
         }
     }
@@ -255,12 +309,15 @@ impl ActorQueue {
             .expect("actor queue notify receiver taken once")
     }
 
-    /// Extracts the front item only when it is interrupt-compatible. Roots
-    /// fold into the active turn as `Interrupt`; compacts become `Compact`.
-    /// Turns and controls are never popped here, so interrupt polling cannot
-    /// discard incompatible FIFO entries.
+    /// Extracts the front item only when it is interrupt-compatible and the
+    /// queue is not paused. Roots fold into the active turn as `Interrupt`;
+    /// compacts become `Compact`. Turns and controls stay in the queue.
     pub(crate) fn pop_interrupt(&self) -> Option<ExtractedCommand> {
-        let mut items = lock(&self.items);
+        let mut state = lock(&self.state);
+        if state.paused {
+            return None;
+        }
+        let items = &mut state.items;
         match items.front() {
             Some(ActorWork::Root(_)) | Some(ActorWork::Compact { .. }) => {}
             _ => return None,

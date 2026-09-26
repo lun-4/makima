@@ -1,26 +1,19 @@
 //! Queue of work handed from the UI to the agent actor.
 //!
-//! This is a thin presentation facade over the actor's single scheduling
-//! queue. Production uses the actor-backed variant only: `push` translates a
-//! TUI [`QueueItem`] into actor work (a queued root input, an admitted turn,
-//! or a compact command) and every read projects [`ActorSnapshot::queue`].
-//! There is no second scheduling deque in production.
+//! Production normally delegates to the actor's scheduling queue. During a
+//! plan transition, a shared gate holds new UI work outside the actor until
+//! settlement, while still projecting it in the queue panel and persistence.
 //!
 //! The `#[cfg(test)]` variant is a presentation-only deque used exclusively
 //! by App unit tests that need deterministic queue-panel behavior without an
 //! actor runner racing their assertions. It never compiles into production.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use std::sync::Arc;
-
-#[cfg(test)]
 use std::collections::VecDeque;
-#[cfg(test)]
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_agent::actor::{ActorError, AgentActorHandle, QueueProjection, RootWork};
+use maki_agent::actor::{ActorError, AgentActorHandle, QueueProjection, QueuedUiWork, RootWork};
 use maki_agent::{AgentInput, ImageSource};
 use maki_commands::COMPACT_COMMAND_NAME;
 use tracing::warn;
@@ -69,9 +62,8 @@ impl QueueItem {
     }
 }
 
-/// The actual storage behind a [`QueueSender`]. Production always uses
-/// [`QueueBackend::Actor`], delegating every operation to the actor's single
-/// queue. The test variant is compiled out of production builds.
+/// The scheduling backend behind a [`QueueSender`]. The test variant is
+/// compiled out of production builds.
 #[derive(Clone)]
 pub(crate) enum QueueBackend {
     /// The actor's scheduling queue, via its handle.
@@ -82,21 +74,28 @@ pub(crate) enum QueueBackend {
     Test(Arc<Mutex<VecDeque<QueueItem>>>),
 }
 
-/// Actor-backed queue facade shared with the app. Clones all reference the
-/// same backend, so every push lands in the same actor queue (or, in tests,
-/// the same deterministic deque).
+/// Actor-backed queue facade shared with the app. Clones share the gate so
+/// work cannot pass held messages during a plan transition.
 #[derive(Clone)]
 pub(crate) struct QueueSender {
     backend: QueueBackend,
+    gate: Arc<Mutex<QueueGate>>,
     /// App-visible run id of the most recent message/compact push, shared so
     /// the backend can stamp controls/compacts that carry no correlation.
     last_run_id: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct QueueGate {
+    gated: bool,
+    held: VecDeque<QueueItem>,
 }
 
 /// Actor-backed facade used by production `AgentHandles`.
 pub(crate) fn actor_queue(actor: Arc<AgentActorHandle>, run_id: Arc<AtomicU64>) -> QueueSender {
     QueueSender {
         backend: QueueBackend::Actor(actor),
+        gate: Arc::new(Mutex::new(QueueGate::default())),
         last_run_id: run_id,
     }
 }
@@ -108,11 +107,11 @@ pub(crate) fn queue() -> QueueSender {
     let items: Arc<Mutex<VecDeque<QueueItem>>> = Arc::new(Mutex::new(VecDeque::new()));
     QueueSender {
         backend: QueueBackend::Test(items),
+        gate: Arc::new(Mutex::new(QueueGate::default())),
         last_run_id: Arc::new(AtomicU64::new(0)),
     }
 }
 
-#[cfg(test)]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -124,8 +123,80 @@ pub(crate) fn correlation(run_id: u64) -> String {
 }
 
 impl QueueSender {
+    pub(crate) fn set_gated(&self, gated: bool) {
+        let mut gate = lock(&self.gate);
+        if gated {
+            match &self.backend {
+                QueueBackend::Actor(actor) => actor.set_queue_paused(true),
+                #[cfg(test)]
+                QueueBackend::Test(_) => {}
+            }
+            gate.gated = true;
+        } else {
+            while let Some(entry) = gate.held.pop_front() {
+                self.push_to_backend(entry);
+            }
+            gate.gated = false;
+            match &self.backend {
+                QueueBackend::Actor(actor) => actor.set_queue_paused(false),
+                #[cfg(test)]
+                QueueBackend::Test(_) => {}
+            }
+        }
+    }
+
+    pub(crate) fn clear_held(&self) {
+        lock(&self.gate).held.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_held(&self) -> VecDeque<QueueItem> {
+        std::mem::take(&mut lock(&self.gate).held)
+    }
+
+    /// Call only after the replacement runtime has been installed. Actor work
+    /// predates gate-held work and must be transferred first.
+    pub(crate) fn take_pending_work(&self) -> VecDeque<QueueItem> {
+        let mut gate = lock(&self.gate);
+        let mut pending = match &self.backend {
+            QueueBackend::Actor(actor) => actor
+                .take_paused_ui_work()
+                .into_iter()
+                .map(|work| match work {
+                    QueuedUiWork::Root(root) => QueueItem::Message {
+                        image_count: root.input.images.len(),
+                        text: root.text,
+                        input: root.input,
+                        run_id: root.run_id,
+                        displayed: root.displayed,
+                    },
+                    QueuedUiWork::Compact {
+                        run_id,
+                        instructions,
+                    } => QueueItem::Compact {
+                        run_id,
+                        instructions,
+                    },
+                })
+                .collect::<VecDeque<_>>(),
+            #[cfg(test)]
+            QueueBackend::Test(items) => std::mem::take(&mut *lock(items)),
+        };
+        pending.append(&mut gate.held);
+        pending
+    }
+
     pub(crate) fn push(&self, entry: QueueItem) {
+        let mut gate = lock(&self.gate);
         self.last_run_id.store(entry.run_id(), Ordering::Relaxed);
+        if gate.gated {
+            gate.held.push_back(entry);
+        } else {
+            self.push_to_backend(entry);
+        }
+    }
+
+    fn push_to_backend(&self, entry: QueueItem) {
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).push_back(entry),
@@ -137,10 +208,34 @@ impl QueueSender {
         }
     }
 
-    /// Removes the panel-visible item at `index`, returning whether a row
-    /// was removed. Production delegates to the actor's queue removal; the
-    /// test facade removes directly from its presentation deque.
+    /// Removes the panel-visible item at `index`, including held work.
     pub(crate) fn remove(&self, index: usize) -> bool {
+        let mut gate = lock(&self.gate);
+        let backend_visible = match &self.backend {
+            #[cfg(test)]
+            QueueBackend::Test(items) => lock(items)
+                .iter()
+                .filter(|item| visible_in_panel(&(*item).into()))
+                .count(),
+            QueueBackend::Actor(actor) => actor
+                .snapshot()
+                .queue
+                .iter()
+                .filter(|entry| visible_in_panel(entry))
+                .count(),
+        };
+        if index >= backend_visible {
+            let held_index = gate
+                .held
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| visible_in_panel(&(*item).into()))
+                .nth(index - backend_visible)
+                .map(|(index, _)| index);
+            return held_index
+                .and_then(|index| gate.held.remove(index))
+                .is_some();
+        }
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => {
@@ -158,11 +253,13 @@ impl QueueSender {
     }
 
     pub(crate) fn len(&self) -> usize {
-        match &self.backend {
-            #[cfg(test)]
-            QueueBackend::Test(items) => lock(items).len(),
-            QueueBackend::Actor(actor) => actor.snapshot().queued,
-        }
+        let gate = lock(&self.gate);
+        gate.held.len()
+            + match &self.backend {
+                #[cfg(test)]
+                QueueBackend::Test(items) => lock(items).len(),
+                QueueBackend::Actor(actor) => actor.snapshot().queued,
+            }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -170,6 +267,8 @@ impl QueueSender {
     }
 
     pub(crate) fn clear(&self) {
+        let mut gate = lock(&self.gate);
+        gate.held.clear();
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).clear(),
@@ -209,11 +308,14 @@ impl QueueSender {
     }
 
     fn projections(&self) -> Vec<QueueProjection> {
-        match &self.backend {
+        let gate = lock(&self.gate);
+        let mut projections = match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).iter().map(Into::into).collect(),
             QueueBackend::Actor(actor) => actor.snapshot().queue,
-        }
+        };
+        projections.extend(gate.held.iter().map(Into::into));
+        projections
     }
 }
 
@@ -350,5 +452,197 @@ mod tests {
         assert!(tx.remove(0), "visible row removed");
         assert!(tx.is_empty());
         assert!(!tx.remove(0), "queue is empty again");
+    }
+
+    #[test]
+    fn gate_releases_fifo_across_clones() {
+        let tx = queue();
+        let clone = tx.clone();
+        tx.push(msg(false));
+        tx.set_gated(true);
+        clone.push(QueueItem::Compact {
+            run_id: 1,
+            instructions: None,
+        });
+        tx.push(msg(true));
+        clone.push(QueueItem::Compact {
+            run_id: 2,
+            instructions: Some("last".into()),
+        });
+        assert_eq!(lock(&tx.gate).held.len(), 3);
+        let QueueBackend::Test(items) = &tx.backend else {
+            unreachable!()
+        };
+        assert_eq!(lock(items).len(), 1);
+        assert_eq!(tx.len(), 4);
+        assert_eq!(tx.panel_len(), 3);
+        assert_eq!(tx.text_messages(), ["t"]);
+        tx.set_gated(false);
+        assert!(lock(&tx.gate).held.is_empty());
+        assert_eq!(
+            tx.projections(),
+            vec![
+                QueueProjection::from(&msg(false)),
+                QueueProjection::Compact(None),
+                QueueProjection::from(&msg(true)),
+                QueueProjection::Compact(Some("last".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn take_pending_work_keeps_backend_before_held() {
+        let tx = queue();
+        tx.push(msg(false));
+        tx.push(QueueItem::Compact {
+            run_id: 1,
+            instructions: Some("earlier".into()),
+        });
+        tx.set_gated(true);
+        tx.push(QueueItem::Compact {
+            run_id: 2,
+            instructions: Some("held".into()),
+        });
+        let pending = tx.take_pending_work();
+        assert_eq!(pending.len(), 3);
+        assert!(tx.is_empty());
+        let mut pending = pending.into_iter();
+        assert!(matches!(pending.next(), Some(QueueItem::Message { .. })));
+        assert!(matches!(
+            pending.next(),
+            Some(QueueItem::Compact { run_id: 1, .. })
+        ));
+        assert!(matches!(
+            pending.next(),
+            Some(QueueItem::Compact { run_id: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn actor_pending_work_rebuilds_original_input_before_held() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
+        use maki_agent::{AgentId, History};
+        use maki_providers::{ImageMediaType, Message};
+
+        struct Backend;
+
+        impl ActorBackend for Backend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: AgentInput,
+                _: WorkKind,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+
+            fn run_control<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: &'a ControlWork,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+
+            fn run_compact<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: Option<&'a str>,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::CompactDone })
+            }
+        }
+
+        const EARLIER: &str = "earlier root";
+        const HELD: &str = "held root";
+        const DETAILS: &str = "preserve details";
+        let (actor, task) = AgentActorHandle::spawn(
+            AgentId::generate(),
+            Vec::<Message>::new(),
+            None,
+            Box::new(Backend),
+        );
+        let tx = actor_queue(Arc::new(actor), Arc::new(AtomicU64::new(0)));
+        tx.set_gated(true);
+        let image = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
+        let QueueItem::Message { mut input, .. } = msg(false) else {
+            unreachable!();
+        };
+        input.message = EARLIER.into();
+        input.images = vec![image.clone()];
+        let QueueBackend::Actor(actor) = &tx.backend else {
+            unreachable!();
+        };
+        actor
+            .rush(RootWork::new(
+                input,
+                1,
+                false,
+                EARLIER.into(),
+                vec![image.clone()],
+                correlation(1),
+            ))
+            .unwrap();
+        actor.push_compact(2, Some(DETAILS.into())).unwrap();
+        let QueueItem::Message { mut input, .. } = msg(false) else {
+            unreachable!();
+        };
+        input.message = HELD.into();
+        tx.push(QueueItem::Message {
+            text: HELD.into(),
+            input,
+            image_count: 0,
+            run_id: 3,
+            displayed: false,
+        });
+
+        let pending = tx.take_pending_work();
+        assert!(tx.is_empty());
+        let mut pending = pending.into_iter();
+        let Some(QueueItem::Message {
+            text,
+            input,
+            run_id,
+            ..
+        }) = pending.next()
+        else {
+            panic!("expected earlier root");
+        };
+        assert_eq!(text, EARLIER);
+        assert_eq!(input.message, EARLIER);
+        assert_eq!(input.images, [image]);
+        assert_eq!(run_id, 1);
+        assert!(
+            matches!(pending.next(), Some(QueueItem::Compact { run_id: 2, instructions: Some(details) }) if details == DETAILS)
+        );
+        assert!(
+            matches!(pending.next(), Some(QueueItem::Message { text, run_id: 3, .. }) if text == HELD)
+        );
+        assert!(pending.next().is_none());
+        actor.close();
+        smol::block_on(task);
+    }
+
+    #[test]
+    fn gated_clear_drops_held_work() {
+        let tx = queue();
+        tx.set_gated(true);
+        tx.push(msg(false));
+        tx.push(QueueItem::Compact {
+            run_id: 1,
+            instructions: None,
+        });
+        tx.push(msg(false));
+        assert!(tx.remove(1));
+        assert_eq!(tx.panel_entries()[1].text, "t");
+        tx.clear();
+        tx.set_gated(false);
+        assert!(tx.is_empty());
     }
 }

@@ -214,7 +214,7 @@ impl App {
     /// Deferred path: the agent is busy, so park the message and let
     /// `QueueItemConsumed` draw it once the agent picks it up. Returns
     /// false when there is no shared queue, meaning the message was dropped.
-    pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) -> bool {
+    pub(crate) fn queue_and_notify(&mut self, msg: QueuedMessage) -> bool {
         let Some(ref shared) = self.queue.shared else {
             return false;
         };
@@ -246,7 +246,7 @@ impl App {
         }
     }
 
-    pub(super) fn queue_compact(&mut self, instructions: Option<String>) -> bool {
+    pub(crate) fn queue_compact(&mut self, instructions: Option<String>) -> bool {
         let Some(ref shared) = self.queue.shared else {
             return false;
         };

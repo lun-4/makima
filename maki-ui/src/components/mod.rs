@@ -230,6 +230,10 @@ pub enum Action {
     },
     ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
+    ImplementPlan {
+        clear_context: bool,
+        model: Option<String>,
+    },
     /// A session option toggled from a command. Applied by the event loop
     /// through the coordinator, off the event-loop thread.
     ToggleSessionOption {

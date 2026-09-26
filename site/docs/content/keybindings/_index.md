@@ -63,6 +63,9 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `↑` / `↓` | Navigate options |
 | `Enter` | Select option |
+| `Space` | Toggle parallel implementation |
+| `Ctrl+O` | Edit plan |
+| `Ctrl+M` | Choose implementation model |
 | `Esc` | Close |
 
 ## Pickers

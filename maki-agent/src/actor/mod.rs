@@ -56,6 +56,16 @@ pub enum ActorWork {
     },
 }
 
+/// Queued host work that can be moved to a replacement UI runtime.
+/// Admitted turns and controls are not transferable.
+pub enum QueuedUiWork {
+    Root(Box<RootWork>),
+    Compact {
+        run_id: u64,
+        instructions: Option<String>,
+    },
+}
+
 /// The mutable half of an actor, shared with every clone of the handle.
 pub(crate) struct ActorInner {
     pub(crate) agent_id: AgentId,
@@ -293,6 +303,19 @@ impl AgentActorHandle {
 
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
+    }
+
+    /// Pauses or resumes queued work, including interrupt extraction. An
+    /// active turn continues running; close and shutdown still drain the queue.
+    pub fn set_queue_paused(&self, paused: bool) {
+        self.inner.queue.set_paused(paused);
+    }
+
+    /// Moves pending roots and compacts out of a paused actor in FIFO order.
+    /// Leaves admitted turns and controls queued for normal shutdown handling.
+    /// Returns no work if the actor is not paused.
+    pub fn take_paused_ui_work(&self) -> Vec<QueuedUiWork> {
+        self.inner.queue.take_paused_ui_work()
     }
 
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
@@ -791,7 +814,7 @@ impl AgentActorHandle {
     }
 
     fn close_internal(&self, lifecycle: ActorLifecycle, reason: TurnCancellationReason) {
-        let active = {
+        let (active, drained) = {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             // First terminal lifecycle/reason wins: repeated close/shutdown are
             // idempotent no-ops, so a race cannot overwrite Closed with Shutdown
@@ -802,12 +825,11 @@ impl AgentActorHandle {
             state.lifecycle = lifecycle;
             state.cancelled_correlations.clear();
             state.cancelled_turns.clear();
-            state.active.take()
+            (state.active.take(), self.inner.queue.drain_all())
         };
         if let Some(active) = active {
             active.fire(reason);
         }
-        let drained = self.inner.queue.drain_all();
         terminalize_work(&self.inner, drained, reason);
         self.inner.queue.notify();
         self.wake.wake();

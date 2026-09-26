@@ -337,6 +337,15 @@ pub(crate) struct InputDemand {
     perm: Option<PermissionPayload>,
 }
 
+struct PlanApproval {
+    id: u64,
+    active: Arc<AtomicBool>,
+    path: PathBuf,
+    content: Option<String>,
+    model: Option<String>,
+    parallel: bool,
+}
+
 pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
@@ -363,6 +372,9 @@ pub struct App {
     pub(super) file_completion: FileCompletionMenu,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
+    plan_picker_open: bool,
+    plan_approval_id: u64,
+    pending_plan_approval: Option<PlanApproval>,
     pub(super) status_bar: StatusBar,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -529,6 +541,9 @@ impl App {
             file_completion: FileCompletionMenu::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
+            plan_picker_open: false,
+            plan_approval_id: 0,
+            pending_plan_approval: None,
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
             state,
@@ -798,7 +813,9 @@ impl App {
             Msg::Paste(text) => {
                 self.last_input = Some(Instant::now());
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                if text.is_empty() {
+                if self.paste_targets_overlay() {
+                    self.route_text_paste(&text);
+                } else if text.is_empty() {
                     if self.is_main_chat() && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
                     }
@@ -1047,14 +1064,6 @@ impl App {
             return Some(vec![]);
         }
 
-        // plan_form is non-modal: Passthrough falls through to the rest of dispatch
-        if self.plan_form_active() {
-            let action = self.plan_form.handle_key(key);
-            if action != PlanFormAction::Passthrough {
-                return Some(self.handle_plan_form_action(action));
-            }
-        }
-
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
             return Some(vec![]);
@@ -1063,6 +1072,18 @@ impl App {
         if self.btw_modal.is_open() {
             self.btw_modal.handle_key(key);
             return Some(vec![]);
+        }
+
+        if self.model_picker.is_open() {
+            return Some(self.handle_model_picker_key(key));
+        }
+
+        // plan_form is non-modal: Passthrough falls through to the rest of dispatch
+        if self.plan_form_active() {
+            let action = self.plan_form.handle_key(key);
+            if action != PlanFormAction::Passthrough {
+                return Some(self.handle_plan_form_action(action));
+            }
         }
 
         if self.lua_picker.is_open() {
@@ -1183,22 +1204,6 @@ impl App {
             });
         }
 
-        if self.model_picker.is_open() {
-            return Some(match self.model_picker.handle_key(key) {
-                ModelPickerAction::Consumed => vec![],
-                ModelPickerAction::Select(spec) => {
-                    vec![Action::ChangeModel(spec)]
-                }
-                ModelPickerAction::AssignTier(spec, tier) => {
-                    vec![Action::AssignTier(spec, tier)]
-                }
-                ModelPickerAction::UnassignTier(spec, tier) => {
-                    vec![Action::UnassignTier(spec, tier)]
-                }
-                ModelPickerAction::Close => vec![],
-            });
-        }
-
         if self.login_picker.is_open() {
             let action = self.login_picker.handle_key(key);
             return Some(self.login_picker_actions(action));
@@ -1222,6 +1227,31 @@ impl App {
         }
 
         None
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match self.model_picker.handle_key(key) {
+            ModelPickerAction::Consumed => vec![],
+            ModelPickerAction::Select(spec) => {
+                if self.plan_picker_open {
+                    self.plan_picker_open = false;
+                    self.invalidate_plan_approval();
+                    self.plan_form
+                        .set_implementation_model(spec, &self.state.model.spec());
+                    vec![]
+                } else {
+                    vec![Action::ChangeModel(spec)]
+                }
+            }
+            ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
+            ModelPickerAction::UnassignTier(spec, tier) => {
+                vec![Action::UnassignTier(spec, tier)]
+            }
+            ModelPickerAction::Close => {
+                self.plan_picker_open = false;
+                vec![]
+            }
+        }
     }
 
     fn plan_toggle_ready(&self) -> bool {
@@ -1256,6 +1286,7 @@ impl App {
                 return vec![];
             }
         };
+        self.invalidate_plan_approval();
         self.state.plan.mark_ready();
         self.plan_form.on_plan_ready();
         self.main_chat()
@@ -1287,6 +1318,7 @@ impl App {
             BuiltinAction::PlanToggle => {
                 if self.plan_toggle_ready() {
                     self.plan_form.toggle();
+                    self.invalidate_plan_approval();
                 }
             }
             BuiltinAction::PlanEditor => {
@@ -1308,6 +1340,7 @@ impl App {
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
             BuiltinAction::ModelPicker => {
+                self.plan_picker_open = false;
                 self.model_picker.open(&self.state.model.spec());
                 return vec![Action::RefreshModels];
             }
@@ -2022,6 +2055,7 @@ impl App {
                 && !self.plan_submit_active()
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
+                self.invalidate_plan_approval();
                 self.transition_plan(PlanTrigger::WriteDone);
             }
             self.state
@@ -2209,6 +2243,7 @@ impl App {
         self.float_mgr
             .open(buf, config, open_focus, event_tx, cmd_rx);
         if is_input_demand && !defer {
+            self.invalidate_plan_approval();
             self.transition_plan(PlanTrigger::InteractivePrompt);
             if self.ui_config.bell.ask {
                 self.pending_bell = true;
@@ -2849,6 +2884,7 @@ impl App {
             }
             InputKind::Question => {
                 self.float_mgr.focus_input_window();
+                self.invalidate_plan_approval();
                 self.transition_plan(PlanTrigger::InteractivePrompt);
                 self.ui_config.bell.ask
             }
@@ -2980,6 +3016,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        self.plan_picker_open = false;
         self.close_command_palette();
         self.file_completion.close();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
@@ -3166,7 +3203,35 @@ impl App {
         }
     }
 
+    fn paste_targets_overlay(&self) -> bool {
+        self.permission_active()
+            || self.help_modal.is_open()
+            || self.btw_modal.is_open()
+            || self.model_picker.is_open()
+            || self.plan_form_active()
+            || self.lua_picker.is_open()
+            || self.float_mgr.is_open()
+            || self.search_modal.is_open()
+            || self.file_picker.is_open()
+            || self.task_picker.is_open()
+            || self.rewind_picker.is_open()
+            || self.theme_picker.is_open()
+            || self.mcp_picker.is_open()
+            || self.login_picker.is_open()
+    }
+
     fn route_text_paste(&mut self, text: &str) {
+        if self.permission_active() {
+            self.permission_prompt.handle_paste(text);
+            return;
+        }
+        if self.help_modal.is_open() || self.btw_modal.is_open() {
+            return;
+        }
+        if self.model_picker.is_open() {
+            self.model_picker.handle_paste(text);
+            return;
+        }
         if self.plan_form_active() {
             return;
         }
@@ -3195,7 +3260,6 @@ impl App {
         try_picker!(self.task_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.theme_picker);
-        try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
@@ -3212,9 +3276,30 @@ impl App {
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
         match action {
             PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
+            PlanFormAction::ParallelToggled => {
+                self.invalidate_plan_approval();
+                vec![]
+            }
             PlanFormAction::Hide => {
+                self.invalidate_plan_approval();
                 self.plan_form.hide();
                 vec![]
+            }
+            PlanFormAction::UseCurrentModel => {
+                self.invalidate_plan_approval();
+                self.plan_form.use_current_model();
+                vec![]
+            }
+            PlanFormAction::OpenModelPicker => {
+                self.invalidate_plan_approval();
+                self.plan_picker_open = true;
+                let spec = self
+                    .plan_form
+                    .implementation_model()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.state.model.spec());
+                self.model_picker.open(&spec);
+                vec![Action::RefreshModels]
             }
             PlanFormAction::OpenEditor => match self.state.plan.path() {
                 Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
@@ -3223,12 +3308,86 @@ impl App {
                     vec![]
                 }
             },
-            PlanFormAction::Implement => self.implement_plan(false),
-            PlanFormAction::ClearAndImplement => self.implement_plan(true),
+            PlanFormAction::Implement if self.pending_plan_approval.is_some() => vec![],
+            PlanFormAction::ClearAndImplement if self.pending_plan_approval.is_some() => vec![],
+            PlanFormAction::Implement => vec![Action::ImplementPlan {
+                clear_context: false,
+                model: self.plan_form.implementation_model().map(str::to_owned),
+            }],
+            PlanFormAction::ClearAndImplement => vec![Action::ImplementPlan {
+                clear_context: true,
+                model: self.plan_form.implementation_model().map(str::to_owned),
+            }],
         }
     }
 
-    fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+    pub(crate) fn invalidate_plan_approval(&mut self) {
+        if let Some(approval) = self.pending_plan_approval.take() {
+            approval.active.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn cancel_plan_approval(&mut self, id: u64) {
+        if self
+            .pending_plan_approval
+            .as_ref()
+            .is_some_and(|pending| pending.id == id)
+        {
+            self.invalidate_plan_approval();
+        }
+    }
+
+    pub(crate) fn begin_plan_approval(&mut self) -> Option<(u64, Arc<AtomicBool>)> {
+        if self.pending_plan_approval.is_some()
+            || self.state.mode != Mode::Plan
+            || !self.state.plan.is_ready()
+            || !self.plan_form.is_visible()
+        {
+            return None;
+        }
+        let path = self.state.plan.path()?.to_path_buf();
+        self.plan_approval_id = self.plan_approval_id.wrapping_add(1);
+        let active = Arc::new(AtomicBool::new(true));
+        self.pending_plan_approval = Some(PlanApproval {
+            id: self.plan_approval_id,
+            active: Arc::clone(&active),
+            content: std::fs::read_to_string(&path).ok(),
+            model: self.plan_form.implementation_model().map(str::to_owned),
+            parallel: self.plan_form.parallel(),
+            path,
+        });
+        Some((self.plan_approval_id, active))
+    }
+
+    pub(crate) fn plan_approval_valid(&self, id: u64) -> bool {
+        let Some(approval) = self.pending_plan_approval.as_ref() else {
+            return false;
+        };
+        approval.id == id
+            && approval.active.load(Ordering::Acquire)
+            && self.state.mode == Mode::Plan
+            && self.state.plan.is_ready()
+            && self.plan_form.is_visible()
+            && self.state.plan.path() == Some(approval.path.as_path())
+            && self.plan_form.implementation_model() == approval.model.as_deref()
+            && self.plan_form.parallel() == approval.parallel
+            && approval.content.is_some()
+            && std::fs::read_to_string(&approval.path).ok() == approval.content
+    }
+
+    pub(crate) fn finish_plan_approval(&mut self, id: u64) -> bool {
+        let valid = self.plan_approval_valid(id);
+        if self
+            .pending_plan_approval
+            .as_ref()
+            .is_some_and(|approval| approval.id == id)
+        {
+            self.invalidate_plan_approval();
+        }
+        valid
+    }
+
+    pub(crate) fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
         let parallel = self.plan_form.parallel();
         let plan_snapshot = self.state.plan.path().map(|path| {
             (
