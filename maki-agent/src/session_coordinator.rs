@@ -105,6 +105,12 @@ pub struct ModelAdoptionReceipt {
     pub previous: Arc<str>,
     pub adopted: Arc<str>,
     pub model_revision: u64,
+    pub previous_fast: Arc<str>,
+    pub previous_thinking: Arc<str>,
+    pub adopted_fast: Arc<str>,
+    pub adopted_thinking: Arc<str>,
+    pub fast_revision: u64,
+    pub thinking_revision: u64,
 }
 
 #[derive(Clone)]
@@ -206,6 +212,8 @@ struct CoordinatorState {
     checkpoint_revision: u64,
     history_revision: u64,
     model_revision: u64,
+    fast_revision: u64,
+    thinking_revision: u64,
 }
 
 pub struct SessionCoordinatorParams {
@@ -777,6 +785,8 @@ impl PreparedSessionCoordinator {
                 checkpoint_revision: 0,
                 history_revision: 0,
                 model_revision: 0,
+                fast_revision: 0,
+                thinking_revision: 0,
             })),
         };
         let (tx, rx) = flume::unbounded();
@@ -1129,6 +1139,8 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
                     return Err(SessionCoordinatorError::ModelAdoptionExpired);
                 }
                 let previous = ctx.read.model();
+                let previous_fast = required_option_value(&ctx.read, FAST_OPTION_ID)?;
+                let previous_thinking = required_option_value(&ctx.read, THINKING_OPTION_ID)?;
                 let result = set_model(
                     &ctx.read,
                     &ctx.model_policy,
@@ -1140,15 +1152,22 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
                 )
                 .await;
                 if !active.load(Ordering::Acquire) {
-                    if previous != ctx.read.model() {
+                    if let Err(error @ SessionCoordinatorError::ModelRollback(_)) = &result {
+                        return Err(error.clone());
+                    }
+                    if result.is_ok() {
                         set_model(
                             &ctx.read,
                             &ctx.model_policy,
                             &*ctx.model_adopter,
                             &*ctx.checkpoint,
                             Some(previous),
-                            None,
-                            None,
+                            Some(previous_fast.as_ref() == ENABLED_VALUE),
+                            Some(previous_thinking.parse().map_err(|error| {
+                                SessionCoordinatorError::ConditionalModelRollback(Arc::from(
+                                    format!("invalid previous thinking setting: {error}"),
+                                ))
+                            })?),
                         )
                         .await
                         .map_err(|error| {
@@ -1159,10 +1178,21 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
                     }
                     return Err(SessionCoordinatorError::ModelAdoptionExpired);
                 }
-                result.map(|_| ModelAdoptionReceipt {
+                let (fast_revision, thinking_revision) = {
+                    let state = lock(&ctx.read.state);
+                    (state.fast_revision, state.thinking_revision)
+                };
+                result?;
+                Ok(ModelAdoptionReceipt {
                     previous,
                     adopted: spec,
                     model_revision: ctx.read.model_revision(),
+                    previous_fast,
+                    previous_thinking,
+                    adopted_fast: required_option_value(&ctx.read, FAST_OPTION_ID)?,
+                    adopted_thinking: required_option_value(&ctx.read, THINKING_OPTION_ID)?,
+                    fast_revision,
+                    thinking_revision,
                 })
             }
             .await;
@@ -1173,24 +1203,15 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
                 || ctx.read.model() != receipt.adopted
             {
                 Ok(false)
-            } else if receipt.previous == receipt.adopted {
-                lock(&ctx.read.state).model_revision += 1;
-                Ok(true)
             } else {
-                set_model(
+                rollback_model(
                     &ctx.read,
                     &ctx.model_policy,
                     &*ctx.model_adopter,
                     &*ctx.checkpoint,
-                    Some(receipt.previous),
-                    None,
-                    None,
+                    receipt,
                 )
                 .await
-                .map(|_| true)
-                .map_err(|error| {
-                    SessionCoordinatorError::ConditionalModelRollback(Arc::from(error.to_string()))
-                })
             };
             let _ = reply.send(result);
         }
@@ -1838,6 +1859,70 @@ async fn change_directory(
     Ok(canonical)
 }
 
+fn bump_setting_revision(read: &SessionReadHandle, id: &str) {
+    let mut state = lock(&read.state);
+    match id {
+        FAST_OPTION_ID => state.fast_revision += 1,
+        THINKING_OPTION_ID => state.thinking_revision += 1,
+        _ => {}
+    }
+}
+
+async fn rollback_model(
+    read: &SessionReadHandle,
+    model_policy: &ModelPolicy,
+    model_adopter: &dyn ModelAdopter,
+    checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
+    receipt: ModelAdoptionReceipt,
+) -> Result<bool, SessionCoordinatorError> {
+    let (fast_revision, thinking_revision) = {
+        let state = lock(&read.state);
+        (state.fast_revision, state.thinking_revision)
+    };
+    let restore_fast = fast_revision == receipt.fast_revision
+        && current_option_value(read, FAST_OPTION_ID).as_deref()
+            == Some(receipt.adopted_fast.as_ref());
+    let restore_thinking = thinking_revision == receipt.thinking_revision
+        && current_option_value(read, THINKING_OPTION_ID).as_deref()
+            == Some(receipt.adopted_thinking.as_ref());
+    let model = Model::from_spec(&receipt.previous).map_err(|error| {
+        SessionCoordinatorError::ConditionalModelRollback(Arc::from(error.to_string()))
+    })?;
+    let fast_value = if restore_fast {
+        receipt.previous_fast
+    } else {
+        required_option_value(read, FAST_OPTION_ID)?
+    };
+    let thinking_value = if restore_thinking {
+        receipt.previous_thinking
+    } else {
+        required_option_value(read, THINKING_OPTION_ID)?
+    };
+    let fast = fast_value.as_ref() == ENABLED_VALUE;
+    let thinking: ThinkingConfig = thinking_value.parse().map_err(|error| {
+        SessionCoordinatorError::ConditionalModelRollback(Arc::from(format!(
+            "invalid thinking setting during rollback: {error}"
+        )))
+    })?;
+    if fast && !model.supports_fast() || thinking.is_enabled() && !model.supports_thinking() {
+        return Ok(false);
+    }
+    set_model(
+        read,
+        model_policy,
+        model_adopter,
+        checkpoint,
+        Some(receipt.previous),
+        Some(fast),
+        Some(thinking),
+    )
+    .await
+    .map(|_| true)
+    .map_err(|error| {
+        SessionCoordinatorError::ConditionalModelRollback(Arc::from(error.to_string()))
+    })
+}
+
 async fn set_model(
     read: &SessionReadHandle,
     model_policy: &ModelPolicy,
@@ -1883,9 +1968,17 @@ async fn set_model(
         thinking_value.as_ref(),
     )?
     else {
+        let mut state = lock(&read.state);
         if selects_model {
-            lock(&read.state).model_revision += 1;
+            state.model_revision += 1;
         }
+        if fast.is_some() {
+            state.fast_revision += 1;
+        }
+        if thinking.is_some() {
+            state.thinking_revision += 1;
+        }
+        drop(state);
         return Ok(read.options.snapshot());
     };
     let options = SessionOptions::candidate_snapshot(&candidate);
@@ -1920,8 +2013,15 @@ async fn set_model(
     lock(&read.state).model = Arc::from(target_spec);
     match read.options.commit(candidate) {
         Ok(snapshot) => {
+            let mut state = lock(&read.state);
             if selects_model {
-                lock(&read.state).model_revision += 1;
+                state.model_revision += 1;
+            }
+            if fast.is_some() {
+                state.fast_revision += 1;
+            }
+            if thinking.is_some() {
+                state.thinking_revision += 1;
             }
             Ok(snapshot)
         }
@@ -1930,6 +2030,14 @@ async fn set_model(
             Err(error.into())
         }
     }
+}
+
+fn required_option_value(
+    read: &SessionReadHandle,
+    id: &str,
+) -> Result<Arc<str>, SessionCoordinatorError> {
+    current_option_value(read, id)
+        .ok_or_else(|| SessionOptionError::UnknownId(Arc::from(id)).into())
 }
 
 fn current_option_value(read: &SessionReadHandle, id: &str) -> Option<Arc<str>> {
@@ -1990,6 +2098,7 @@ async fn set_option(
         }
     }
     let Some(candidate) = read.options.prepare_set(id, value)? else {
+        bump_setting_revision(read, id);
         return Ok(read.options.snapshot());
     };
     let options = SessionOptions::candidate_snapshot(&candidate);
@@ -1998,7 +2107,9 @@ async fn set_option(
         (Arc::clone(&state.model), state.cwd.clone())
     };
     checkpoint_state(read, checkpoint, None, model, cwd, options).await?;
-    read.options.commit(candidate).map_err(Into::into)
+    let snapshot = read.options.commit(candidate)?;
+    bump_setting_revision(read, id);
+    Ok(snapshot)
 }
 
 fn unregister(session_id: MakiId, generation: u64) {
@@ -3359,6 +3470,47 @@ mod tests {
     }
 
     #[test]
+    fn conditional_same_model_expiry_invalidates_receipt() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let active = Arc::new(AtomicBool::new(true));
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("anthropic/claude-opus-4-8");
+            params.definitions = builtin_option_definitions(
+                "anthropic/claude-opus-4-8",
+                [Arc::from("anthropic/claude-opus-4-8")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let receipt = coordinator
+                .set_model_if_active(Arc::from("anthropic/claude-opus-4-8"), Arc::clone(&active))
+                .await
+                .unwrap();
+            active.store(false, Ordering::Release);
+            assert!(
+                coordinator
+                    .rollback_model_if_version(receipt.clone())
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn conditional_model_expired_after_adoption_rolls_back_before_newer_model() {
         smol::block_on(async {
             let id = MakiId::generate();
@@ -3431,6 +3583,53 @@ mod tests {
     }
 
     #[test]
+    fn conditional_model_expiry_restores_fast_and_thinking() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let active = Arc::new(AtomicBool::new(true));
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("anthropic/claude-opus-4-8");
+            params.definitions = builtin_option_definitions(
+                "anthropic/claude-opus-4-8",
+                [Arc::from("anthropic/claude-opus-4-8")],
+                false,
+                true,
+                false,
+                ThinkingConfig::Effort(maki_providers::Effort::High),
+            );
+            params.model_adopter = Arc::new({
+                let active = Arc::clone(&active);
+                move |model: Model| {
+                    if model.spec() == "ollama/llama3" {
+                        active.store(false, Ordering::Release);
+                    }
+                    Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            assert_eq!(
+                coordinator
+                    .set_model_if_active(Arc::from("ollama/llama3"), active)
+                    .await,
+                Err(SessionCoordinatorError::ModelAdoptionExpired)
+            );
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
+            );
+            assert_eq!(
+                current_option_value(&coordinator.read(), FAST_OPTION_ID).as_deref(),
+                Some(ENABLED_VALUE)
+            );
+            assert_eq!(
+                thinking_value(&coordinator.read().options()).as_ref(),
+                "high"
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn conditional_model_expired_during_failed_checkpoint_restores_runtime() {
         smol::block_on(async {
             let id = MakiId::generate();
@@ -3471,6 +3670,48 @@ mod tests {
             assert_eq!(
                 lock(&adopted).as_slice(),
                 ["anthropic/claude-opus-4-8", "ollama/llama3"]
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn conditional_model_expiry_reports_failed_runtime_rollback() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let active = Arc::new(AtomicBool::new(true));
+            let mut params = params(id, writer(true));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [Arc::from("ollama/llama3")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let active = Arc::clone(&active);
+                move |model: Model| {
+                    if model.spec() == "anthropic/claude-opus-4-8" {
+                        active.store(false, Ordering::Release);
+                        Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                    } else {
+                        Box::pin(async { Err(Arc::from("runtime rollback refused")) })
+                            as ModelAdoptionFuture
+                    }
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            assert!(matches!(
+                coordinator
+                    .set_model_if_active(Arc::from("anthropic/claude-opus-4-8"), active)
+                    .await,
+                Err(SessionCoordinatorError::ModelRollback(_))
+            ));
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
             );
             coordinator.close().await.unwrap();
         });
@@ -3537,6 +3778,185 @@ mod tests {
     }
 
     #[test]
+    fn rollback_model_restores_fast_and_thinking_after_unrelated_option_change() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("anthropic/claude-opus-4-8");
+            params.definitions = builtin_option_definitions(
+                "anthropic/claude-opus-4-8",
+                [Arc::from("anthropic/claude-opus-4-8")],
+                false,
+                true,
+                false,
+                ThinkingConfig::Effort(maki_providers::Effort::High),
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let receipt = coordinator
+                .set_model_if_active(Arc::from("ollama/llama3"), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+            coordinator
+                .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                .await
+                .unwrap();
+            assert!(
+                coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
+            );
+            assert_eq!(
+                current_option_value(&coordinator.read(), FAST_OPTION_ID).as_deref(),
+                Some(ENABLED_VALUE)
+            );
+            assert_eq!(
+                thinking_value(&coordinator.read().options()).as_ref(),
+                "high"
+            );
+            assert_eq!(
+                current_option_value(&coordinator.read(), YOLO_OPTION_ID).as_deref(),
+                Some(ENABLED_VALUE)
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn rollback_model_restores_fast_while_preserving_newer_thinking() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("anthropic/claude-opus-4-8");
+            params.definitions = builtin_option_definitions(
+                "anthropic/claude-opus-4-8",
+                [Arc::from("anthropic/claude-opus-4-8")],
+                false,
+                true,
+                false,
+                ThinkingConfig::Effort(maki_providers::Effort::High),
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let receipt = coordinator
+                .set_model_if_active(
+                    Arc::from("anthropic/claude-sonnet-5"),
+                    Arc::new(AtomicBool::new(true)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                current_option_value(&coordinator.read(), FAST_OPTION_ID).as_deref(),
+                Some(DISABLED_VALUE)
+            );
+            coordinator
+                .set_option(THINKING_OPTION_ID, "low")
+                .await
+                .unwrap();
+            coordinator
+                .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                .await
+                .unwrap();
+            assert!(
+                coordinator
+                    .rollback_model_if_version(receipt)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                coordinator.read().model().as_ref(),
+                "anthropic/claude-opus-4-8"
+            );
+            assert_eq!(
+                current_option_value(&coordinator.read(), FAST_OPTION_ID).as_deref(),
+                Some(ENABLED_VALUE)
+            );
+            assert_eq!(
+                thinking_value(&coordinator.read().options()).as_ref(),
+                "low"
+            );
+            assert_eq!(
+                current_option_value(&coordinator.read(), YOLO_OPTION_ID).as_deref(),
+                Some(ENABLED_VALUE)
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn rollback_model_restores_only_unchanged_settings_after_same_value_selection() {
+        smol::block_on(async {
+            for setting in [FAST_OPTION_ID, THINKING_OPTION_ID] {
+                let id = MakiId::generate();
+                let mut params = params(id, writer(false));
+                params.model = Arc::from("anthropic/claude-opus-4-8");
+                params.definitions = builtin_option_definitions(
+                    "anthropic/claude-opus-4-8",
+                    [Arc::from("anthropic/claude-opus-4-8")],
+                    false,
+                    true,
+                    false,
+                    ThinkingConfig::Effort(maki_providers::Effort::High),
+                );
+                let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+                let receipt = coordinator
+                    .set_model_if_active(
+                        Arc::from("ollama/llama3"),
+                        Arc::new(AtomicBool::new(true)),
+                    )
+                    .await
+                    .unwrap();
+                coordinator
+                    .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                    .await
+                    .unwrap();
+                let same_value = if setting == FAST_OPTION_ID {
+                    DISABLED_VALUE
+                } else {
+                    "off"
+                };
+                coordinator.set_option(setting, same_value).await.unwrap();
+                assert!(
+                    coordinator
+                        .rollback_model_if_version(receipt)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    coordinator.read().model().as_ref(),
+                    "anthropic/claude-opus-4-8"
+                );
+                assert_eq!(
+                    current_option_value(&coordinator.read(), setting).as_deref(),
+                    Some(same_value)
+                );
+                let other = if setting == FAST_OPTION_ID {
+                    THINKING_OPTION_ID
+                } else {
+                    FAST_OPTION_ID
+                };
+                let restored = if other == FAST_OPTION_ID {
+                    ENABLED_VALUE
+                } else {
+                    "high"
+                };
+                assert_eq!(
+                    current_option_value(&coordinator.read(), other).as_deref(),
+                    Some(restored)
+                );
+                assert_eq!(
+                    current_option_value(&coordinator.read(), YOLO_OPTION_ID).as_deref(),
+                    Some(ENABLED_VALUE)
+                );
+                coordinator.close().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn rollback_model_if_version_ignores_unrelated_option_change() {
         smol::block_on(async {
             let id = MakiId::generate();
@@ -3576,6 +3996,114 @@ mod tests {
                 Some(ENABLED_VALUE)
             );
             coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn rollback_model_preserves_newer_settings_only_changes() {
+        smol::block_on(async {
+            for setting in [FAST_OPTION_ID, THINKING_OPTION_ID] {
+                let id = MakiId::generate();
+                let mut params = params(id, writer(false));
+                params.model = Arc::from("anthropic/claude-opus-4-8");
+                params.definitions = builtin_option_definitions(
+                    "anthropic/claude-opus-4-8",
+                    [Arc::from("anthropic/claude-opus-4-8")],
+                    false,
+                    false,
+                    false,
+                    ThinkingConfig::Off,
+                );
+                let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+                let receipt = coordinator
+                    .set_model_if_active(
+                        Arc::from("anthropic/claude-opus-4-8"),
+                        Arc::new(AtomicBool::new(true)),
+                    )
+                    .await
+                    .unwrap();
+                coordinator
+                    .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                    .await
+                    .unwrap();
+                let value = if setting == FAST_OPTION_ID {
+                    ENABLED_VALUE
+                } else {
+                    "high"
+                };
+                let newer = coordinator.set_option(setting, value).await.unwrap();
+                assert!(
+                    coordinator
+                        .rollback_model_if_version(receipt)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    coordinator.read().model().as_ref(),
+                    "anthropic/claude-opus-4-8"
+                );
+                assert_eq!(
+                    current_option_value(&coordinator.read(), setting).as_deref(),
+                    Some(value)
+                );
+                assert!(coordinator.read().options().version >= newer.version);
+                assert_eq!(
+                    current_option_value(&coordinator.read(), YOLO_OPTION_ID).as_deref(),
+                    Some(ENABLED_VALUE)
+                );
+                coordinator.close().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn rollback_model_skips_incompatible_newer_settings() {
+        smol::block_on(async {
+            for (setting, value) in [
+                (FAST_OPTION_ID, ENABLED_VALUE),
+                (THINKING_OPTION_ID, "high"),
+            ] {
+                let id = MakiId::generate();
+                let mut params = params(id, writer(false));
+                params.model = Arc::from("ollama/llama3");
+                params.definitions = builtin_option_definitions(
+                    "ollama/llama3",
+                    [Arc::from("ollama/llama3")],
+                    false,
+                    false,
+                    false,
+                    ThinkingConfig::Off,
+                );
+                let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+                let receipt = coordinator
+                    .set_model_if_active(
+                        Arc::from("anthropic/claude-opus-4-8"),
+                        Arc::new(AtomicBool::new(true)),
+                    )
+                    .await
+                    .unwrap();
+                coordinator
+                    .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                    .await
+                    .unwrap();
+                let newer = coordinator.set_option(setting, value).await.unwrap();
+                assert!(
+                    !coordinator
+                        .rollback_model_if_version(receipt)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    coordinator.read().model().as_ref(),
+                    "anthropic/claude-opus-4-8"
+                );
+                assert_eq!(coordinator.read().options(), newer);
+                assert_eq!(
+                    current_option_value(&coordinator.read(), YOLO_OPTION_ID).as_deref(),
+                    Some(ENABLED_VALUE)
+                );
+                coordinator.close().await.unwrap();
+            }
         });
     }
 
