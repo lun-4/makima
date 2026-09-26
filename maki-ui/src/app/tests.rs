@@ -3914,6 +3914,37 @@ fn queue_command_sets_focus(has_queue: bool) {
 }
 
 #[test]
+fn busy_queue_and_notify_waits_for_gate_release() {
+    let mut app = test_app();
+    let shared = shared_queue::queue();
+    app.queue.set_shared(shared.clone());
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    shared.set_gated(true);
+
+    assert!(matches!(
+        app.submit_prompt(queued_msg("first")),
+        SubmitOutcome::Queued
+    ));
+    assert!(matches!(
+        app.submit_prompt(queued_msg("second")),
+        SubmitOutcome::Queued
+    ));
+    assert_eq!(app.queue.len(), 2);
+    assert_eq!(app.queue.text_messages(), ["first", "second"]);
+    assert_eq!(
+        app.queue
+            .panel_entries()
+            .iter()
+            .map(|entry| entry.text.as_ref())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    shared.set_gated(false);
+    assert_eq!(app.queue.text_messages(), ["first", "second"]);
+}
+
+#[test]
 fn queue_boundary_clamps() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));

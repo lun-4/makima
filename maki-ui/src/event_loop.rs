@@ -105,6 +105,7 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const PENDING_MODEL_REPLACEMENT_ERR: &str = "model change pending; retry after it settles";
 const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
     "session lock ownership is unavailable; replacement is disabled";
@@ -613,7 +614,6 @@ struct SessionRuntime {
     deferred_plan_approval: Option<(u64, bool)>,
     plan_model_recovery_at: Option<Instant>,
     plan_finalized_rollback: Option<(ModelAdoptionReceipt, Option<Instant>)>,
-    deferred_agent_messages: Vec<QueueItem>,
 }
 
 struct PendingReplacement {
@@ -715,7 +715,6 @@ impl PreparedSessionRuntime {
             deferred_plan_approval: None,
             plan_model_recovery_at: None,
             plan_finalized_rollback: None,
-            deferred_agent_messages: Vec::new(),
         })
     }
 
@@ -772,7 +771,6 @@ impl PreparedSessionRuntime {
             deferred_plan_approval: None,
             plan_model_recovery_at: None,
             plan_finalized_rollback: None,
-            deferred_agent_messages: Vec::new(),
         })
     }
 }
@@ -2028,7 +2026,13 @@ impl<'t> EventLoop<'t> {
                             reconcile_model(runtime);
                             self.resume_deferred_plan_approval(idx);
                         }
-                        Ok(false) if runtime.coordinator.read().model() != receipt.adopted => {
+                        Ok(false)
+                            if {
+                                let read = runtime.coordinator.read();
+                                read.model() != receipt.adopted
+                                    || read.model_revision() != receipt.model_revision + 1
+                            } =>
+                        {
                             runtime.plan_finalized_rollback = None;
                             runtime.pending_plan_transitions -= 1;
                             reconcile_model(runtime);
@@ -2228,9 +2232,7 @@ impl<'t> EventLoop<'t> {
         }
         for runtime in &mut self.sessions {
             if runtime.pending_plan_transitions == 0 {
-                for message in runtime.deferred_agent_messages.drain(..) {
-                    runtime.handles.queue.push(message);
-                }
+                runtime.handles.queue.set_gated(false);
             }
         }
         self.retry_plan_model_transitions(now);
@@ -3083,6 +3085,9 @@ impl<'t> EventLoop<'t> {
     }
 
     fn replace_runtime(&mut self, idx: usize, session: AppSession) -> Result<(), String> {
+        if self.sessions[idx].pending_plan_transitions != 0 {
+            return Err(PENDING_MODEL_REPLACEMENT_ERR.into());
+        }
         if self.sessions[idx].lock_lost {
             return Err(LOCK_LOST_REPLACEMENT_ERR.into());
         }
@@ -3100,6 +3105,9 @@ impl<'t> EventLoop<'t> {
         idx: usize,
         prepared: PreparedSessionRuntime,
     ) -> Result<(), String> {
+        if self.sessions[idx].pending_plan_transitions != 0 {
+            return Err(PENDING_MODEL_REPLACEMENT_ERR.into());
+        }
         let target_id = prepared.app.session_id();
         let current_id = self.sessions[idx].id();
         let old = match replace_session_runtime(
@@ -3195,6 +3203,12 @@ impl<'t> EventLoop<'t> {
     }
 
     fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
+        if self.sessions[idx].pending_plan_transitions != 0 {
+            self.sessions[idx]
+                .app
+                .flash(PENDING_MODEL_REPLACEMENT_ERR.into());
+            return;
+        }
         if let Err(error) =
             ensure_replacement_lock_available(&self.sessions[idx], request.session.id)
         {
@@ -3377,16 +3391,12 @@ impl<'t> EventLoop<'t> {
                     run_id,
                     displayed: true,
                 };
-                if rt.pending_plan_transitions == 0 {
-                    rt.handles.queue.push(message);
-                } else {
-                    rt.deferred_agent_messages.push(message);
-                }
+                rt.handles.queue.push(message);
             }
             Action::CancelAgent { run_id } => {
                 let rt = &mut self.sessions[idx];
                 rt.notifications.reset();
-                rt.deferred_agent_messages.clear();
+                rt.handles.queue.clear_held();
                 let _ = rt.handles.cmd_tx.try_send(AgentCommand::Cancel { run_id });
             }
             Action::CancelSubagent { tool_use_id } => {
@@ -3439,6 +3449,7 @@ impl<'t> EventLoop<'t> {
                     return;
                 }
                 if let Some(spec) = model {
+                    self.sessions[idx].handles.queue.set_gated(true);
                     self.sessions[idx].pending_plan_transitions += 1;
                     let coordinator = self.sessions[idx].coordinator.clone();
                     let op_spec = Arc::<str>::from(spec.as_str());
@@ -3871,7 +3882,7 @@ impl<'t> EventLoop<'t> {
         for runtime in &mut self.sessions {
             runtime.app.invalidate_plan_approval();
             runtime.deferred_plan_approval = None;
-            runtime.deferred_agent_messages.clear();
+            runtime.handles.queue.clear_held();
             let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
         let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
@@ -4377,7 +4388,6 @@ mod tests {
             deferred_plan_approval: None,
             plan_model_recovery_at: None,
             plan_finalized_rollback: None,
-            deferred_agent_messages: Vec::new(),
         }
     }
 
@@ -4772,6 +4782,92 @@ mod tests {
         let manager = handles.manager_and_root().0;
         drop(handles);
         shutdown_manager(&manager);
+    }
+
+    #[test_case(false ; "replace_session_action")]
+    #[test_case(true ; "blank_tab_focus_session")]
+    fn pending_plan_transition_blocks_replacement_until_settlement(focus_stored: bool) {
+        let mut harness = RuntimeHarness::new();
+        let mut target = harness.session();
+        target.save(&harness.ctx().storage).unwrap();
+        let mut runtime = harness.runtime(harness.session());
+        runtime.pending_plan_transitions = 1;
+        let id = runtime.id();
+        let generation = runtime.generation;
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: target.cwd.clone(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+
+        if focus_stored {
+            assert!(SessionStatus::of(&loop_state.sessions[0].app) == SessionStatus::Idle);
+            assert!(!loop_state.sessions[0].app.has_content());
+            assert_eq!(
+                loop_state.focus_session(target.id).unwrap_err(),
+                PENDING_MODEL_REPLACEMENT_ERR
+            );
+        } else {
+            loop_state.handle_action(
+                0,
+                Action::ReplaceSession(Box::new(SessionReplacementRequest {
+                    session: target,
+                    kind: SessionReplacementKind::Load,
+                    post_commit: None,
+                })),
+            );
+            assert_eq!(
+                loop_state.sessions[0].app.status_bar.flash_text(),
+                Some(PENDING_MODEL_REPLACEMENT_ERR)
+            );
+        }
+        assert_eq!(loop_state.sessions.len(), 1);
+        assert_eq!(loop_state.focused, 0);
+        assert_eq!(loop_state.sessions[0].id(), id);
+        assert_eq!(loop_state.sessions[0].generation, generation);
+        assert_eq!(loop_state.sessions[0].pending_plan_transitions, 1);
+
+        loop_state.handle_internal(InternalEvent::PlanModelSettled {
+            session: id,
+            generation,
+            error: None,
+        });
+        assert_eq!(loop_state.sessions[0].pending_plan_transitions, 0);
+        assert_eq!(loop_state.sessions[0].id(), id);
+        assert_eq!(loop_state.sessions[0].generation, generation);
+        let runtime = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(runtime);
     }
 
     #[test]
@@ -5253,11 +5349,10 @@ mod tests {
             );
             let actions = loop_state.sessions[0].app.start_mailbox_run(Vec::new());
             loop_state.dispatch(0, actions);
-            assert!(loop_state.sessions[0].handles.queue.is_empty());
-            assert_eq!(loop_state.sessions[0].deferred_agent_messages.len(), 1);
+            assert_eq!(loop_state.sessions[0].handles.queue.len(), 1);
             let run_id = loop_state.sessions[0].app.run_id;
             loop_state.handle_action(0, Action::CancelAgent { run_id });
-            assert!(loop_state.sessions[0].deferred_agent_messages.is_empty());
+            assert!(loop_state.sessions[0].handles.queue.is_empty());
             let committed = loop_state.sessions[0].app.state.session.model.clone();
             let stored = maki_storage::model::read_model(&loop_state.sessions[0].app.storage);
             assert!(!sync_session_models(&mut loop_state.sessions));
@@ -5770,6 +5865,7 @@ mod tests {
     #[test_case("path" ; "revised_path")]
     #[test_case("parallel" ; "revised_parallel")]
     #[test_case("model" ; "revised_model")]
+    #[test_case("newer_same_model" ; "newer_same_model_selection")]
     #[test_case("mode" ; "revised_mode")]
     fn finalized_model_does_not_implement_revised_plan(revision: &str) {
         const IMPLEMENTATION_MODEL: &str = "anthropic/claude-opus-4-8";
@@ -5875,6 +5971,15 @@ mod tests {
                 ));
             }
             "model" => app.plan_form.use_current_model(),
+            "newer_same_model" => {
+                app.plan_form.use_current_model();
+                smol::block_on(loop_state.sessions[0].coordinator.set_model(
+                    Some(IMPLEMENTATION_MODEL.into()),
+                    None,
+                    None,
+                ))
+                .unwrap();
+            }
             "mode" => app.state.mode = crate::app::mode::Mode::Build,
             _ => unreachable!(),
         }
@@ -5904,26 +6009,35 @@ mod tests {
             assert!(reply_rx.recv().unwrap().is_err());
             assert_eq!(loop_state.sessions.len(), 1);
             let rolled_back = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
-            assert!(matches!(
-                &rolled_back,
-                InternalEvent::PlanFinalizedModelRolledBack {
-                    result: Ok(true),
-                    ..
-                }
-            ));
+            assert!(
+                matches!(
+                    &rolled_back,
+                    InternalEvent::PlanFinalizedModelRolledBack {
+                        result: Ok(false), ..
+                    } if revision == "newer_same_model"
+                ) || matches!(
+                    &rolled_back,
+                    InternalEvent::PlanFinalizedModelRolledBack {
+                        result: Ok(true), ..
+                    } if revision != "newer_same_model"
+                )
+            );
             loop_state.handle_internal(rolled_back);
+            let expected = if revision == "newer_same_model" {
+                IMPLEMENTATION_MODEL
+            } else {
+                "anthropic/test-model"
+            };
             assert_eq!(
                 loop_state.sessions[0].coordinator.read().model().as_ref(),
-                "anthropic/test-model"
+                expected
             );
             assert_eq!(
                 loop_state.sessions[0].model_slot.load().model.spec(),
-                "anthropic/test-model"
+                expected
             );
-            assert_eq!(
-                loop_state.sessions[0].app.state.model.spec(),
-                "anthropic/test-model"
-            );
+            assert_eq!(loop_state.sessions[0].app.state.model.spec(), expected);
+            assert!(loop_state.sessions[0].plan_finalized_rollback.is_none());
         } else {
             assert_eq!(
                 loop_state.sessions[0].app.state.model.spec(),
