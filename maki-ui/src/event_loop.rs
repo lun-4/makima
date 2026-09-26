@@ -788,6 +788,29 @@ fn ensure_replacement_lock_available(
     }
 }
 
+fn pause_for_clear_context(runtime: &SessionRuntime, clear_context: bool) {
+    if clear_context {
+        runtime.handles.queue.set_gated(true);
+        runtime.handles.queue.wait_for_paused_admissions();
+    }
+}
+
+fn settle_replaced_turns(handles: &AgentHandles) -> usize {
+    let (manager, root) = handles.manager_and_root();
+    manager
+        .actor(root)
+        .map(|actor| actor.cancel_paused_queued_turns())
+        .unwrap_or(0)
+}
+
+fn flash_replaced_turns(app: &mut App, count: usize) {
+    if count > 0 {
+        app.flash(format!(
+            "{count} accepted prompt(s) were cancelled during session replacement; resubmit them"
+        ));
+    }
+}
+
 fn transfer_held_queue(app: &mut App, held: Vec<QueueItem>) {
     for item in held {
         match item {
@@ -3113,8 +3136,9 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].id(),
             self.sessions[idx].app.permissions.as_ref(),
         )?;
-        let held = self.replace_prepared_runtime(idx, prepared)?;
+        let (held, cancelled_turns) = self.replace_prepared_runtime(idx, prepared)?;
         transfer_held_queue(&mut self.sessions[idx].app, held);
+        flash_replaced_turns(&mut self.sessions[idx].app, cancelled_turns);
         Ok(())
     }
 
@@ -3122,10 +3146,14 @@ impl<'t> EventLoop<'t> {
         &mut self,
         idx: usize,
         prepared: PreparedSessionRuntime,
-    ) -> Result<Vec<QueueItem>, String> {
+    ) -> Result<(Vec<QueueItem>, usize), String> {
         if self.sessions[idx].pending_plan_transitions != 0 {
             return Err(PENDING_MODEL_REPLACEMENT_ERR.into());
         }
+        self.sessions[idx]
+            .handles
+            .queue
+            .wait_for_paused_admissions();
         let target_id = prepared.app.session_id();
         let current_id = self.sessions[idx].id();
         let old = match replace_session_runtime(
@@ -3152,6 +3180,20 @@ impl<'t> EventLoop<'t> {
         let retired_id = app.state.session.id;
         let held = handles.queue.take_pending_work();
         let replaced_session = retired_id != self.sessions[idx].id();
+        let cancelled_turns = settle_replaced_turns(&handles);
+        if replaced_session {
+            self.ctx.storage_writer.remove_transferred_queue(
+                retired_id,
+                held.iter().filter_map(|item| match item {
+                    QueueItem::Message {
+                        text,
+                        displayed: false,
+                        ..
+                    } => Some(text.as_str()),
+                    _ => None,
+                }),
+            );
+        }
         if let Err(error) = release_lock_state(session_lock) {
             warn!(%error, "old session lock release failed");
         }
@@ -3165,7 +3207,7 @@ impl<'t> EventLoop<'t> {
             })
             .detach();
         }
-        Ok(held.into_iter().collect())
+        Ok((held.into_iter().collect(), cancelled_turns))
     }
 
     fn prepare_replacement(
@@ -3203,7 +3245,7 @@ impl<'t> EventLoop<'t> {
             post_commit,
         } = pending;
         match self.replace_prepared_runtime(idx, prepared) {
-            Ok(held) => {
+            Ok((held, cancelled_turns)) => {
                 if let SessionReplacementKind::Reset { ended_id } = kind {
                     self.sessions[idx].app.lua_event_handle.fire_autocmd(
                         "SessionReset",
@@ -3217,6 +3259,7 @@ impl<'t> EventLoop<'t> {
                     self.dispatch(idx, actions);
                 }
                 transfer_held_queue(&mut self.sessions[idx].app, held);
+                flash_replaced_turns(&mut self.sessions[idx].app, cancelled_turns);
             }
             Err(error) => self.sessions[idx].app.flash(error),
         }
@@ -3472,11 +3515,16 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx].handles.queue.set_gated(true);
                     self.sessions[idx].pending_plan_transitions += 1;
                     let coordinator = self.sessions[idx].coordinator.clone();
+                    let (manager, root) = self.sessions[idx].handles.manager_and_root();
+                    let actor = manager.actor(root);
                     let op_spec = Arc::<str>::from(spec.as_str());
                     let session = self.sessions[idx].id();
                     let generation = self.sessions[idx].generation;
                     let internal_tx = self.internal_tx.clone();
                     smol::spawn(async move {
+                        if let Ok(actor) = actor {
+                            actor.wait_for_queue_admissions().await;
+                        }
                         let result = coordinator.set_model_if_active(op_spec, active).await;
                         let _ = internal_tx.send(InternalEvent::PlanModelChanged {
                             session,
@@ -3490,6 +3538,7 @@ impl<'t> EventLoop<'t> {
                     })
                     .detach();
                 } else if self.sessions[idx].app.finish_plan_approval(approval_id) {
+                    pause_for_clear_context(&self.sessions[idx], clear_context);
                     let actions = self.sessions[idx].app.implement_plan(clear_context);
                     self.dispatch(idx, actions);
                 }
@@ -3706,6 +3755,7 @@ impl<'t> EventLoop<'t> {
             return;
         };
         if self.sessions[idx].app.finish_plan_approval(approval_id) {
+            pause_for_clear_context(&self.sessions[idx], clear_context);
             let actions = self.sessions[idx].app.implement_plan(clear_context);
             self.dispatch(idx, actions);
         }
@@ -6204,6 +6254,182 @@ mod tests {
         ));
         assert!(!smol::block_on(coordinator.rollback_model_if_version(receipt)).unwrap());
         assert_eq!(coordinator.read().model().as_ref(), MODEL);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn clear_plan_without_model_pauses_old_queue_before_replacement() {
+        const PROMPT: &str = "still waiting";
+        const COMPACT: &str = "compact first";
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        runtime.app.state.mode = crate::app::mode::Mode::Plan;
+        runtime.app.state.plan = crate::app::mode::PlanState::Ready(PathBuf::from("test-plan.md"));
+        runtime.app.plan_form.on_plan_ready();
+
+        pause_for_clear_context(&runtime, true);
+        runtime.app.queue_and_notify(QueuedMessage {
+            text: PROMPT.into(),
+            images: Vec::new(),
+        });
+        runtime.app.queue_compact(Some(COMPACT.into()));
+        let mut actions = runtime.app.implement_plan(true);
+        let Action::ReplaceSession(request) = actions.pop().unwrap() else {
+            panic!("expected replacement request");
+        };
+        let prepared = harness
+            .ctx()
+            .prepare_replacement_runtime(
+                request.session,
+                runtime.id(),
+                runtime.app.permissions.as_ref(),
+            )
+            .unwrap();
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+        let pending = old.handles.queue.take_pending_work();
+        assert!(matches!(pending.front(), Some(QueueItem::Message { text, .. }) if text == PROMPT));
+        assert!(
+            matches!(pending.back(), Some(QueueItem::Compact { instructions: Some(text), .. }) if text == COMPACT)
+        );
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn clear_plan_settles_admitted_turn_after_successful_replacement() {
+        const PROMPT: &str = "accepted before plan approval";
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let (manager, root) = runtime.handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        actor.set_queue_paused(true);
+        let outcome = runtime.app.submit_prompt(QueuedMessage {
+            text: PROMPT.into(),
+            images: Vec::new(),
+        });
+        let SubmitOutcome::Started(actions) = outcome else {
+            panic!("expected accepted prompt");
+        };
+        for action in actions {
+            let Action::SendMessage(input) = action else {
+                panic!("expected send action");
+            };
+            runtime.handles.queue.push(QueueItem::Message {
+                text: input.message.clone(),
+                image_count: input.images.len(),
+                input: *input,
+                run_id: runtime.app.run_id,
+                displayed: true,
+            });
+        }
+        assert!(
+            actor
+                .snapshot()
+                .queue
+                .iter()
+                .any(|item| matches!(item, maki_agent::actor::QueueProjection::Turn(_)))
+        );
+        let prepared = harness
+            .ctx()
+            .prepare_replacement_runtime(
+                {
+                    let mut session = harness.session();
+                    session.model = runtime.app.state.session.model.clone();
+                    session
+                },
+                runtime.id(),
+                runtime.app.permissions.as_ref(),
+            )
+            .unwrap();
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+        let (old_manager, old_root) = old.handles.manager_and_root();
+        let old_actor = old_manager.actor(old_root).unwrap();
+        assert_eq!(settle_replaced_turns(&old.handles), 1);
+        let turn = old_actor.snapshot().queue;
+        assert!(
+            !turn
+                .iter()
+                .any(|item| matches!(item, maki_agent::actor::QueueProjection::Turn(_)))
+        );
+        flash_replaced_turns(&mut runtime.app, 1);
+        assert!(
+            runtime
+                .app
+                .status_bar
+                .flash_text()
+                .unwrap()
+                .contains("resubmit")
+        );
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn failed_replacement_keeps_admitted_turn_pending() {
+        const PROMPT: &str = "accepted before failed replacement";
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let (manager, root) = runtime.handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        actor.set_queue_paused(true);
+        let SubmitOutcome::Started(actions) = runtime.app.submit_prompt(QueuedMessage {
+            text: PROMPT.into(),
+            images: Vec::new(),
+        }) else {
+            panic!("expected accepted prompt");
+        };
+        let Action::SendMessage(input) = actions.into_iter().next().unwrap() else {
+            panic!("expected send action");
+        };
+        runtime.handles.queue.push(QueueItem::Message {
+            text: PROMPT.into(),
+            image_count: 0,
+            input: *input,
+            run_id: runtime.app.run_id,
+            displayed: true,
+        });
+        let prepared = harness
+            .ctx()
+            .prepare_replacement_runtime(
+                {
+                    let mut session = harness.session();
+                    session.model = runtime.app.state.session.model.clone();
+                    session
+                },
+                runtime.id(),
+                runtime.app.permissions.as_ref(),
+            )
+            .unwrap();
+        runtime.lock_lost = true;
+        let error = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, LOCK_LOST_REPLACEMENT_ERR);
+        assert!(
+            actor
+                .snapshot()
+                .queue
+                .iter()
+                .any(|item| matches!(item, maki_agent::actor::QueueProjection::Turn(_)))
+        );
+        runtime.lock_lost = false;
         release_runtime(runtime);
     }
 

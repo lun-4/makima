@@ -449,6 +449,63 @@ impl StorageWriter {
         lock(&self.pending).latest.get(&id).cloned()
     }
 
+    pub(crate) fn remove_transferred_queue<'a>(
+        &self,
+        id: MakiId,
+        transferred: impl Iterator<Item = &'a str>,
+    ) {
+        let mut state = lock(&self.pending);
+        let Some(latest) = state.latest.get(&id).cloned() else {
+            return;
+        };
+        let mut session = latest.as_ref().clone();
+        let mut transferred_any = false;
+        for text in transferred {
+            transferred_any = true;
+            if let Some(index) = session
+                .meta
+                .queued_messages
+                .iter()
+                .position(|queued| queued == text)
+            {
+                session.meta.queued_messages.remove(index);
+            }
+        }
+        if !transferred_any {
+            return;
+        }
+        let remaining = session.meta.queued_messages.clone();
+        let generation = next_generation(&mut state);
+        let session = with_queued_messages(&latest, &remaining);
+        state.latest.insert(id, Arc::clone(&session));
+        state.latest_generations.insert(id, generation);
+        if let Some(pending) = state.coordinator_pending.get_mut(&id) {
+            pending.session = with_queued_messages(&pending.session, &remaining);
+        }
+        if let Some(guard) = state.fail_closed.get_mut(&id) {
+            *guard = with_queued_messages(guard, &remaining);
+        }
+        let save = if let Some(Entry::Save(save)) = state.entries.get(&id) {
+            with_queued_messages(&save.session, &remaining)
+        } else {
+            session
+        };
+        enqueue_locked(
+            &mut state.entries,
+            PendingSave {
+                session: save,
+                waiters: Vec::new(),
+                generation,
+                coordinator_generation: None,
+                coordinator_history_base: None,
+                retry_attempt: 0,
+                retry_at: None,
+            },
+        );
+        drop(state);
+        wake_checkpoint(&self.pending, &self.wake, id);
+    }
+
     fn enqueue_checkpoint(&self, request: CheckpointRequest<AppSession>) -> CheckpointFuture {
         let session_id = request.session_id;
         let version = request.version;
@@ -675,6 +732,15 @@ fn requeue_save(
             Ok(())
         }
     }
+}
+
+fn with_queued_messages(session: &Arc<AppSession>, queued_messages: &[String]) -> Arc<AppSession> {
+    let mut updated = Arc::clone(session);
+    let mut meta = updated.meta.clone();
+    meta.queued_messages = queued_messages.to_vec();
+    let usage = updated.token_usage;
+    AppSession::checkpoint(&mut updated, None, meta, usage);
+    updated
 }
 
 fn merge_tui_snapshot(
@@ -1676,6 +1742,117 @@ mod tests {
                 .await;
             assert!(ack.is_err(), "a deleted session must not be resurrected");
         });
+    }
+
+    #[test]
+    fn transferred_queue_clears_pending_and_in_flight_saves_without_losing_waiters() {
+        const TRANSFERRED: &str = "moved to replacement";
+        const RETAINED: &str = "stays in old session";
+        let (_tmp, dir) = state_dir();
+        let (wake, _wake_rx) = flume::unbounded();
+        let (_done_tx, done_rx) = flume::bounded(1);
+        let writer = StorageWriter {
+            pending: Arc::default(),
+            wake,
+            done_rx,
+            stop: Arc::default(),
+        };
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(maki_providers::Message::user("history".into()));
+        session.meta.queued_messages =
+            vec![TRANSFERRED.into(), RETAINED.into(), TRANSFERRED.into()];
+        let id = session.id;
+        let session = Arc::new(session);
+        writer.seed(Arc::clone(&session));
+        let (reply, response) = flume::bounded(1);
+        let old = PendingSave {
+            session: Arc::clone(&session),
+            waiters: vec![CheckpointWaiter {
+                version: CheckpointVersion {
+                    revision: 1,
+                    epoch: 1,
+                },
+                reply,
+            }],
+            generation: 1,
+            coordinator_generation: None,
+            coordinator_history_base: None,
+            retry_attempt: 0,
+            retry_at: None,
+        };
+        {
+            let mut state = lock(&writer.pending);
+            state.in_flight.insert(
+                id,
+                InFlightSave {
+                    generation: old.generation,
+                    session: Arc::clone(&session),
+                    history_base: None,
+                },
+            );
+            state.entries.insert(id, Entry::Save(old));
+        }
+        writer.remove_transferred_queue(id, [TRANSFERRED].into_iter());
+        assert_eq!(
+            writer.latest_snapshot(id).unwrap().meta.queued_messages,
+            [RETAINED, TRANSFERRED]
+        );
+        writer.forget(id);
+        let (stale_reply, stale_response) = flume::bounded(1);
+        requeue_save(
+            &writer.pending,
+            id,
+            PendingSave {
+                session: Arc::clone(&session),
+                waiters: vec![CheckpointWaiter {
+                    version: CheckpointVersion {
+                        revision: 1,
+                        epoch: 1,
+                    },
+                    reply: stale_reply,
+                }],
+                generation: 1,
+                coordinator_generation: None,
+                coordinator_history_base: None,
+                retry_attempt: 0,
+                retry_at: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("clean save must take precedence"));
+        assert!(writer.latest_snapshot(id).is_none());
+        assert_eq!(
+            lock(&writer.pending)
+                .entries
+                .get(&id)
+                .and_then(|entry| match entry {
+                    Entry::Save(save) => Some(save.session.meta.queued_messages.as_slice()),
+                    Entry::Delete(_) => None,
+                })
+                .unwrap(),
+            [RETAINED, TRANSFERRED]
+        );
+        let mut pending = lock(&writer.pending);
+        let Some(Entry::Save(save)) = pending.entries.remove(&id) else {
+            panic!("expected replacement save");
+        };
+        assert_eq!(save.session.meta.queued_messages, [RETAINED, TRANSFERRED]);
+        assert_eq!(save.waiters.len(), 2);
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx: flume::unbounded().0,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        disk.write(&session).unwrap();
+        pending.entries.insert(id, Entry::Save(save));
+        pending.in_flight.remove(&id);
+        drop(pending);
+        disk.flush(&writer.pending);
+        assert!(response.try_recv().unwrap().is_ok());
+        assert!(stale_response.try_recv().unwrap().is_ok());
+        let loaded = AppSession::load(id, &dir).unwrap();
+        assert_eq!(loaded.meta.queued_messages, [RETAINED, TRANSFERRED]);
+        assert_eq!(message_texts(&loaded), ["history"]);
     }
 
     #[test]

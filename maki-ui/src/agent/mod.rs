@@ -391,7 +391,6 @@ impl AgentHandles {
         self.mailbox = Some(mailbox);
     }
 
-    #[cfg(test)]
     pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, maki_agent::AgentId) {
         (self.manager.clone(), self.root_id)
     }

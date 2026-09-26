@@ -57,11 +57,14 @@ pub struct ActorQueue {
     state: Mutex<QueueState>,
     notify_tx: flume::Sender<()>,
     notify_rx: Mutex<Option<flume::Receiver<()>>>,
+    admission_event: event_listener::Event,
+    pause_event: event_listener::Event,
 }
 
 struct QueueState {
     items: VecDeque<ActorWork>,
     paused: bool,
+    admitting: bool,
 }
 
 impl ActorQueue {
@@ -71,9 +74,12 @@ impl ActorQueue {
             state: Mutex::new(QueueState {
                 items: VecDeque::new(),
                 paused: false,
+                admitting: false,
             }),
             notify_tx,
             notify_rx: Mutex::new(Some(notify_rx)),
+            admission_event: event_listener::Event::new(),
+            pause_event: event_listener::Event::new(),
         }
     }
 
@@ -83,11 +89,47 @@ impl ActorQueue {
         self.notify();
     }
 
+    pub(crate) fn finish_admission(&self) {
+        let mut state = lock(&self.state);
+        state.admitting = false;
+        self.admission_event.notify(usize::MAX);
+    }
+
+    pub(crate) fn defer(&self, work: ActorWork) {
+        let mut state = lock(&self.state);
+        state.items.push_front(work);
+        state.admitting = false;
+        self.admission_event.notify(usize::MAX);
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) async fn wait_for_admission(&self) {
+        loop {
+            let listener = self.admission_event.listen();
+            if !lock(&self.state).admitting {
+                return;
+            }
+            listener.await;
+        }
+    }
+
+    pub(crate) fn paused(&self) -> bool {
+        lock(&self.state).paused
+    }
+
+    pub(crate) fn pause_listener(&self) -> event_listener::EventListener {
+        self.pause_event.listen()
+    }
+
     /// Pauses or resumes consumption without changing queued work. Removals and
     /// lifecycle drains remain available while paused.
     pub fn set_paused(&self, paused: bool) {
         let mut state = lock(&self.state);
         state.paused = paused;
+        if paused {
+            self.pause_event.notify(usize::MAX);
+        }
         drop(state);
         if !paused {
             self.notify();
@@ -101,8 +143,9 @@ impl ActorQueue {
         if state.paused {
             return None;
         }
+        let first = state.items.pop_front()?;
+        state.admitting = true;
         let items = &mut state.items;
-        let first = items.pop_front()?;
         match first {
             ActorWork::Root(root) => {
                 let key = crate::batch_key(&root.input);
@@ -271,6 +314,24 @@ impl ActorQueue {
         }
         state.items = kept;
         taken
+    }
+
+    /// Takes admitted turns while paused, leaving all other work in place.
+    pub(crate) fn take_paused_turns(&self) -> Vec<TurnAdmission> {
+        let mut state = lock(&self.state);
+        if !state.paused {
+            return Vec::new();
+        }
+        let mut kept = VecDeque::new();
+        let mut turns = Vec::new();
+        while let Some(work) = state.items.pop_front() {
+            match work {
+                ActorWork::Turn(admission) => turns.push(admission),
+                other => kept.push_back(other),
+            }
+        }
+        state.items = kept;
+        turns
     }
 
     /// Removes every item and returns them in FIFO order.

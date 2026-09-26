@@ -1,9 +1,10 @@
 //! The actor's scheduler loop: drains the FIFO queue, executes work through
 //! the backend, and wakes on pushes and lifecycle changes.
 
+use std::future::Future;
 use std::sync::Arc;
 
-use futures_lite::future::{self};
+use futures_lite::future;
 use maki_providers::TokenUsage;
 use tracing::{debug, info, warn};
 
@@ -12,6 +13,17 @@ use super::types::{ActorStatus, BackendResult, ControlWork, RootWork, TurnContex
 use super::{ActiveCancel, ActorInner, ActorWork, TurnAdmission, cancelled_outcome, finalize_turn};
 use crate::types::{TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
+
+#[cfg(test)]
+fn take_before_backend_poll_hook(
+    inner: &ActorInner,
+) -> Option<(flume::Sender<()>, flume::Receiver<()>)> {
+    inner
+        .before_backend_poll
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+}
 
 #[cfg(test)]
 fn take_after_pop_hook(inner: &ActorInner) -> Option<(flume::Sender<()>, flume::Receiver<()>)> {
@@ -129,7 +141,19 @@ impl Runner {
                 let _ = popped.send(());
                 let _ = release.recv_async().await;
             }
+            {
+                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.lifecycle == ActorLifecycle::Open
+                    && state.cancellation_generation == cancellation_generation
+                    && self.queue.paused()
+                    && !matches!(&work, ActorWork::Turn(admission) if state.cancelled_turns.contains(&admission.turn_id))
+                {
+                    self.queue.defer(work);
+                    continue;
+                }
+            }
             self.process(work, cancellation_generation).await;
+            self.queue.finish_admission();
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
 
@@ -165,9 +189,50 @@ impl Runner {
                 run_id,
                 instructions,
             } => {
-                self.run_compact(run_id, instructions.as_deref(), cancellation_generation)
+                self.run_compact(run_id, instructions, cancellation_generation)
                     .await
             }
+        }
+    }
+
+    async fn poll_backend<F: Future>(inner: &ActorInner, backend: F) -> F::Output {
+        #[cfg(test)]
+        if let Some((entered, release)) = take_before_backend_poll_hook(inner) {
+            let _ = entered.send(());
+            let _ = release.recv_async().await;
+        }
+        let mut backend = std::pin::pin!(backend);
+        let mut first_poll = true;
+        future::poll_fn(|context| {
+            let result = backend.as_mut().poll(context);
+            if first_poll {
+                first_poll = false;
+                inner.queue.finish_admission();
+            }
+            result
+        })
+        .await
+    }
+
+    fn defer_turn(admission: TurnAdmission, work: WorkKind) -> ActorWork {
+        match work {
+            WorkKind::Turn => ActorWork::Turn(admission),
+            WorkKind::Root {
+                run_id,
+                displayed,
+                text,
+                images,
+                earlier,
+            } => ActorWork::Root(RootWork {
+                input: admission.input.expect("pending root input"),
+                run_id,
+                displayed,
+                text,
+                images,
+                correlation: admission.correlation,
+                earlier,
+            }),
+            WorkKind::Control | WorkKind::Compact => unreachable!("not turn work"),
         }
     }
 
@@ -225,6 +290,11 @@ impl Runner {
                 self.settle_turn(&admission, outcome, true);
                 return;
             }
+            if self.queue.paused() {
+                drop(active);
+                self.queue.defer(Self::defer_turn(admission, work));
+                return;
+            }
             // A precancelled correlation's mark is retired once its matching
             // work is consumed, so it cannot poison a later generation.
             state.cancelled_correlations.remove(&correlation);
@@ -252,28 +322,113 @@ impl Runner {
             return;
         }
 
-        let (managed_guard, managed_turn) = match &self.inner.managed_admission {
-            Some(managed) => match crate::manager::enter_managed_turn(
-                &managed.manager,
-                managed.agent_id,
-                turn_id,
-                &reasoned,
-            )
-            .await
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if self.queue.paused()
+                && !plain.is_cancelled()
+                && state.lifecycle == ActorLifecycle::Open
             {
-                Ok((guard, current)) => (Some(guard), Some(current)),
-                Err(reason) => {
-                    if admission.root {
-                        self.settle_turn(&admission, None, false);
-                    } else {
-                        let outcome = cancelled_outcome(agent_id, turn_id, reason);
-                        self.settle_turn(&admission, Some(outcome), true);
+                state.active = None;
+                state.status = ActorStatus::Idle;
+                drop(state);
+                self.queue.defer(Self::defer_turn(admission, work));
+                return;
+            }
+        }
+        let (managed_guard, managed_turn) = match &self.inner.managed_admission {
+            Some(managed) => loop {
+                let pause_listener = self.queue.pause_listener();
+                let deferred = {
+                    let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let deferred = self.queue.paused()
+                        && !plain.is_cancelled()
+                        && state.lifecycle == ActorLifecycle::Open;
+                    if deferred {
+                        state.active = None;
+                        state.status = ActorStatus::Idle;
                     }
+                    deferred
+                };
+                if deferred {
+                    self.queue.defer(Self::defer_turn(admission, work));
                     return;
+                }
+                match future::or(
+                    async {
+                        Some(
+                            crate::manager::enter_managed_turn(
+                                &managed.manager,
+                                managed.agent_id,
+                                turn_id,
+                                &reasoned,
+                            )
+                            .await,
+                        )
+                    },
+                    async {
+                        pause_listener.await;
+                        None
+                    },
+                )
+                .await
+                {
+                    None => {
+                        let deferred = {
+                            let mut state =
+                                self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                            let deferred = state.lifecycle == ActorLifecycle::Open
+                                && !plain.is_cancelled()
+                                && self.queue.paused();
+                            if deferred {
+                                state.active = None;
+                                state.status = ActorStatus::Idle;
+                            }
+                            deferred
+                        };
+                        if deferred {
+                            self.queue.defer(Self::defer_turn(admission, work));
+                            return;
+                        }
+                        if !plain.is_cancelled() {
+                            continue;
+                        }
+                        let reason = reasoned.reason().unwrap_or(TurnCancellationReason::User);
+                        if admission.root {
+                            self.settle_turn(&admission, None, false);
+                        } else {
+                            let outcome = cancelled_outcome(agent_id, turn_id, reason);
+                            self.settle_turn(&admission, Some(outcome), true);
+                        }
+                        return;
+                    }
+                    Some(Ok((guard, current))) => break (Some(guard), Some(current)),
+                    Some(Err(reason)) => {
+                        if admission.root {
+                            self.settle_turn(&admission, None, false);
+                        } else {
+                            let outcome = cancelled_outcome(agent_id, turn_id, reason);
+                            self.settle_turn(&admission, Some(outcome), true);
+                        }
+                        return;
+                    }
                 }
             },
             None => (None, None),
         };
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if self.queue.paused()
+                && !plain.is_cancelled()
+                && state.lifecycle == ActorLifecycle::Open
+            {
+                state.active = None;
+                state.status = ActorStatus::Idle;
+                drop(state);
+                drop(managed_guard);
+                self.queue.defer(Self::defer_turn(admission, work));
+                return;
+            }
+        }
         let backend = self.backend.run_turn(
             &mut self.history,
             TurnContext {
@@ -290,10 +445,13 @@ impl Runner {
         );
         let result = match (managed_guard, managed_turn) {
             (Some(guard), Some(current)) => {
-                crate::manager::manage_execution(backend, guard, current.lease.inner, reasoned)
-                    .await
+                Self::poll_backend(
+                    &self.inner,
+                    crate::manager::manage_execution(backend, guard, current.lease.inner, reasoned),
+                )
+                .await
             }
-            (None, None) => backend.await,
+            (None, None) => Self::poll_backend(&self.inner, backend).await,
             _ => unreachable!("managed guard and context are created together"),
         };
         let (outcome, deliver) = match result {
@@ -373,6 +531,11 @@ impl Runner {
             if state.cancellation_generation != popped_generation {
                 return;
             }
+            if self.queue.paused() && state.lifecycle == ActorLifecycle::Open {
+                drop(active);
+                self.queue.defer(ActorWork::Control(control));
+                return;
+            }
             state.cancelled_correlations.remove(&correlation);
             state.active = Some(active);
         }
@@ -381,22 +544,32 @@ impl Runner {
             state.active = None;
             return;
         }
-        let result = self
-            .backend
-            .run_control(
-                &mut self.history,
-                TurnContext {
-                    agent_id: self.inner.agent_id,
-                    turn_id: None,
-                    cancel: plain,
-                    cancel_reason: reasoned,
-                    correlation: control.correlation.clone(),
-                    interrupt: None,
-                    managed_turn: None,
-                },
-                &control,
-            )
-            .await;
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if self.queue.paused()
+                && !plain.is_cancelled()
+                && state.lifecycle == ActorLifecycle::Open
+            {
+                state.active = None;
+                drop(state);
+                self.queue.defer(ActorWork::Control(control));
+                return;
+            }
+        }
+        let backend = self.backend.run_control(
+            &mut self.history,
+            TurnContext {
+                agent_id: self.inner.agent_id,
+                turn_id: None,
+                cancel: plain,
+                cancel_reason: reasoned,
+                correlation: control.correlation.clone(),
+                interrupt: None,
+                managed_turn: None,
+            },
+            &control,
+        );
+        let result = Self::poll_backend(&self.inner, backend).await;
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active = None;
@@ -413,7 +586,7 @@ impl Runner {
     async fn run_compact(
         &mut self,
         run_id: u64,
-        instructions: Option<&str>,
+        instructions: Option<String>,
         popped_generation: u64,
     ) {
         // Consumed: retire any precancel mark for this run_id's canonical
@@ -425,6 +598,14 @@ impl Runner {
             if state.cancellation_generation != popped_generation {
                 return;
             }
+            if self.queue.paused() && state.lifecycle == ActorLifecycle::Open {
+                drop(active);
+                self.queue.defer(ActorWork::Compact {
+                    run_id,
+                    instructions,
+                });
+                return;
+            }
             state.cancelled_correlations.remove(&correlation);
             state.active = Some(active);
         }
@@ -433,22 +614,35 @@ impl Runner {
             state.active = None;
             return;
         }
-        let result = self
-            .backend
-            .run_compact(
-                &mut self.history,
-                TurnContext {
-                    agent_id: self.inner.agent_id,
-                    turn_id: None,
-                    cancel: plain,
-                    cancel_reason: reasoned,
-                    correlation: correlation.clone(),
-                    interrupt: None,
-                    managed_turn: None,
-                },
-                instructions,
-            )
-            .await;
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if self.queue.paused()
+                && !plain.is_cancelled()
+                && state.lifecycle == ActorLifecycle::Open
+            {
+                state.active = None;
+                drop(state);
+                self.queue.defer(ActorWork::Compact {
+                    run_id,
+                    instructions,
+                });
+                return;
+            }
+        }
+        let backend = self.backend.run_compact(
+            &mut self.history,
+            TurnContext {
+                agent_id: self.inner.agent_id,
+                turn_id: None,
+                cancel: plain,
+                cancel_reason: reasoned,
+                correlation: correlation.clone(),
+                interrupt: None,
+                managed_turn: None,
+            },
+            instructions.as_deref(),
+        );
+        let result = Self::poll_backend(&self.inner, backend).await;
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active = None;

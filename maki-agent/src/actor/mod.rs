@@ -78,6 +78,8 @@ pub(crate) struct ActorInner {
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     #[cfg(test)]
+    pub(crate) before_backend_poll: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
+    #[cfg(test)]
     pub(crate) after_pop: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     #[cfg(test)]
     pub(crate) after_finalization_retire: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
@@ -286,6 +288,8 @@ impl AgentActorHandle {
             tickets: Mutex::new(HashMap::new()),
             managed_admission,
             #[cfg(test)]
+            before_backend_poll: Mutex::new(None),
+            #[cfg(test)]
             after_pop: Mutex::new(None),
             #[cfg(test)]
             after_finalization_retire: Mutex::new(None),
@@ -308,7 +312,22 @@ impl AgentActorHandle {
     /// Pauses or resumes queued work, including interrupt extraction. An
     /// active turn continues running; close and shutdown still drain the queue.
     pub fn set_queue_paused(&self, paused: bool) {
+        let _state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         self.inner.queue.set_paused(paused);
+    }
+
+    /// Pauses queue admissions and waits until popped work has entered its
+    /// backend or returned to the queue. Does not interrupt active work.
+    pub async fn pause_queue_admissions(&self) {
+        self.set_queue_paused(true);
+        self.wait_for_queue_admissions().await;
+    }
+
+    /// Waits for popped work to enter its backend or return to the queue.
+    /// Does not change the queue's paused state; use after an external gate
+    /// has synchronously paused the actor.
+    pub async fn wait_for_queue_admissions(&self) {
+        self.inner.queue.wait_for_admission().await;
     }
 
     /// Moves pending roots and compacts out of a paused actor in FIFO order.
@@ -318,12 +337,50 @@ impl AgentActorHandle {
         self.inner.queue.take_paused_ui_work()
     }
 
+    /// Cancels queued admitted turns while paused, resolving their tickets and
+    /// outcomes. Other queued work and active turns are left unchanged. Call
+    /// `pause_queue_admissions().await` first to include popped work, and only
+    /// cancel after the replacement has succeeded.
+    pub fn cancel_paused_queued_turns(&self) -> usize {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let turns = self.inner.queue.take_paused_turns();
+        drop(state);
+        let count = turns.len();
+        for admission in turns {
+            let outcome = cancelled_outcome(
+                self.inner.agent_id,
+                admission.turn_id,
+                TurnCancellationReason::User,
+            );
+            finalize_turn(
+                &self.inner,
+                admission.turn_id,
+                outcome,
+                Some(&admission),
+                true,
+            );
+        }
+        count
+    }
+
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner.identity, &other.inner.identity)
     }
 
     pub(crate) fn owns_ticket(&self, ticket: &TurnTicket) -> bool {
         ticket.belongs_to(&self.inner.identity)
+    }
+
+    #[cfg(test)]
+    fn pause_before_next_backend_poll(&self) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        *self
+            .inner
+            .before_backend_poll
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 
     #[cfg(test)]

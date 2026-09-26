@@ -445,6 +445,418 @@ fn paused_queue_blocks_interrupt_polling_without_stopping_active_turn() {
 }
 
 #[test]
+fn pause_waits_for_popped_turn_to_return_without_blocking_resume() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let (popped, release) = handle.pause_after_next_pop();
+        let first = handle
+            .admit_turn(input("first"), None, "first".into())
+            .unwrap();
+        popped.recv_async().await.unwrap();
+        let second = handle
+            .admit_turn(input("second"), None, "second".into())
+            .unwrap();
+
+        let pauser = handle.clone();
+        let paused = smol::spawn(async move { pauser.pause_queue_admissions().await });
+        until(|| handle.inner.queue.paused()).await;
+        release.send(()).unwrap();
+        paused.await;
+
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            handle.snapshot().queue,
+            [
+                QueueProjection::Turn("first".into()),
+                QueueProjection::Turn("second".into())
+            ]
+        );
+        handle.set_queue_paused(false);
+        assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
+        assert!(matches!(second.wait().await, TurnOutcome::Completed { .. }));
+        assert_eq!(
+            state
+                .runs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn stale_admission_wait_does_not_repause_resumed_queue() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.set_queue_paused(true);
+        handle.set_queue_paused(false);
+        handle.wait_for_queue_admissions().await;
+        assert!(!handle.inner.queue.paused());
+
+        let ticket = handle
+            .admit_turn(input("after-resume"), None, "after-resume".into())
+            .unwrap();
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn pause_waits_until_backend_is_polled() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let (before_poll, release) = handle.pause_before_next_backend_poll();
+        let ticket = handle
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        before_poll.recv_async().await.unwrap();
+
+        let pauser = handle.clone();
+        let (paused_tx, paused_rx) = flume::bounded(1);
+        let pause_task = smol::spawn(async move {
+            pauser.pause_queue_admissions().await;
+            paused_tx.send(()).unwrap();
+        });
+        until(|| handle.inner.queue.paused()).await;
+        assert!(paused_rx.try_recv().is_err());
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        paused_rx.recv_async().await.unwrap();
+        pause_task.await;
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.snapshot().queued, 0);
+        gate.open();
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn pause_returns_popped_ui_work_for_clear_context_transfer() {
+    smol::block_on(async {
+        for compact in [false, true] {
+            let backend = ScriptedBackend::new();
+            let state = Arc::clone(&backend.state);
+            let (handle, task) = spawn(backend);
+            let (popped, release) = handle.pause_after_next_pop();
+            if compact {
+                handle.push_compact(42, Some("details".into())).unwrap();
+            } else {
+                handle
+                    .rush(RootWork::new(
+                        input("prompt"),
+                        42,
+                        false,
+                        "prompt".into(),
+                        Vec::new(),
+                        "r42".into(),
+                    ))
+                    .unwrap();
+            }
+            popped.recv_async().await.unwrap();
+            let pauser = handle.clone();
+            let paused = smol::spawn(async move { pauser.pause_queue_admissions().await });
+            until(|| handle.inner.queue.paused()).await;
+            release.send(()).unwrap();
+            paused.await;
+            assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+            assert_eq!(state.compacts.load(Ordering::SeqCst), 0);
+            let transferred = handle.take_paused_ui_work();
+            if compact {
+                assert!(
+                    matches!(transferred.as_slice(), [QueuedUiWork::Compact { run_id: 42, instructions: Some(details) }] if details == "details")
+                );
+            } else {
+                assert!(
+                    matches!(transferred.as_slice(), [QueuedUiWork::Root(root)] if root.text == "prompt" && root.input.message == "prompt")
+                );
+            }
+            assert!(handle.snapshot().queue.is_empty());
+            handle.close();
+            task.await;
+        }
+    });
+}
+
+#[test]
+fn pause_then_cancel_settles_popped_admitted_turn_once() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let (popped, release) = handle.pause_after_next_pop();
+        let (sender, events) = flume::unbounded();
+        let ticket = handle
+            .admit_turn(
+                input("queued"),
+                Some(EventSender::new(sender, 0)),
+                "queued".into(),
+            )
+            .unwrap();
+        popped.recv_async().await.unwrap();
+        let pauser = handle.clone();
+        let paused = smol::spawn(async move { pauser.pause_queue_admissions().await });
+        until(|| handle.inner.queue.paused()).await;
+        release.send(()).unwrap();
+        paused.await;
+        assert_eq!(handle.cancel_paused_queued_turns(), 1);
+        assert_eq!(handle.cancel_paused_queued_turns(), 0);
+        let outcome = ticket.wait().await;
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        assert_eq!(handle.outcome(ticket.turn_id()), Some(outcome));
+        assert_eq!(events.try_iter().count(), 1);
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn cancel_paused_queued_turns_settles_tickets_without_touching_other_work() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let active = handle
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let (sender, events) = flume::unbounded();
+        let first = handle
+            .admit_turn(
+                input("first"),
+                Some(EventSender::new(sender.clone(), 0)),
+                "first".into(),
+            )
+            .unwrap();
+        handle.push_compact(1, None).unwrap();
+        let second = handle
+            .admit_turn(
+                input("second"),
+                Some(EventSender::new(sender, 0)),
+                "second".into(),
+            )
+            .unwrap();
+        handle.set_queue_paused(true);
+        assert_eq!(handle.cancel_paused_queued_turns(), 2);
+        assert_eq!(handle.cancel_paused_queued_turns(), 0);
+        for ticket in [&first, &second] {
+            let outcome = ticket.wait().await;
+            assert!(matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: TurnCancellationReason::User,
+                    ..
+                }
+            ));
+            assert_eq!(handle.outcome(ticket.turn_id()), Some(outcome));
+        }
+        assert_eq!(events.try_iter().count(), 2);
+        assert_eq!(handle.snapshot().queue, [QueueProjection::Compact(None)]);
+        gate.open();
+        assert!(matches!(active.wait().await, TurnOutcome::Completed { .. }));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        handle.set_queue_paused(false);
+        until(|| state.compacts.load(Ordering::SeqCst) == 1).await;
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn cancel_paused_queued_turns_is_noop_when_unpaused() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let (handle, task) = spawn(backend);
+        let active = handle
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        until(|| matches!(handle.snapshot().status, ActorStatus::Running(_))).await;
+        let queued = handle
+            .admit_turn(input("queued"), None, "queued".into())
+            .unwrap();
+        assert_eq!(handle.cancel_paused_queued_turns(), 0);
+        assert_eq!(
+            handle.snapshot().queue,
+            [QueueProjection::Turn("queued".into())]
+        );
+        gate.open();
+        assert!(matches!(active.wait().await, TurnOutcome::Completed { .. }));
+        assert!(matches!(queued.wait().await, TurnOutcome::Completed { .. }));
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn pause_defers_managed_turn_waiting_for_permit() {
+    smol::block_on(async {
+        struct ManagedBackend {
+            entered: flume::Sender<crate::CurrentManagedTurn>,
+            gate: Option<Arc<Gate>>,
+            runs: Arc<AtomicU32>,
+        }
+
+        impl ActorBackend for ManagedBackend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                context: TurnContext,
+                _input: AgentInput,
+                _work: WorkKind,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    self.runs.fetch_add(1, Ordering::SeqCst);
+                    self.entered
+                        .send(context.managed_turn.clone().unwrap())
+                        .unwrap();
+                    if let Some(gate) = &self.gate {
+                        gate.wait().await;
+                    }
+                    default_completed(&context)
+                })
+            }
+
+            fn run_control<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                _context: TurnContext,
+                _control: &'a ControlWork,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+
+            fn run_compact<'a>(
+                &'a mut self,
+                _history: &'a mut crate::History,
+                _context: TurnContext,
+                _instructions: Option<&'a str>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+            {
+                Box::pin(async { BackendResult::CompactDone })
+            }
+        }
+
+        let manager = crate::AgentManagerHandle::new(crate::AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..crate::AgentLimits::default()
+        })
+        .unwrap();
+        let gate = Gate::new();
+        let (entered, received) = flume::unbounded();
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(ManagedBackend {
+                    entered: entered.clone(),
+                    gate: Some(Arc::clone(&gate)),
+                    runs: Arc::new(AtomicU32::new(0)),
+                }),
+            )
+            .unwrap();
+        let root_ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input("root"), None, "root".into())
+            .unwrap();
+        let current = received.recv_async().await.unwrap();
+        let runs = Arc::new(AtomicU32::new(0));
+        let child = manager
+            .spawn_child(
+                &current,
+                crate::AgentMetadata::default(),
+                Vec::new(),
+                None,
+                Box::new(ManagedBackend {
+                    entered,
+                    gate: None,
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .unwrap();
+        let actor = child.actor().unwrap();
+        let waiting = actor
+            .admit_turn(input("waiting"), None, "waiting".into())
+            .unwrap();
+        until(|| matches!(actor.snapshot().status, ActorStatus::Running(_))).await;
+        actor.pause_queue_admissions().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            actor.snapshot().queue,
+            [QueueProjection::Turn("waiting".into())]
+        );
+        gate.open();
+        assert!(matches!(
+            root_ticket.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        actor.set_queue_paused(false);
+        assert!(matches!(
+            waiting.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn cancelled_permit_waiter_releases_pause_barrier() {
+    smol::block_on(async {
+        let (handle, task) = spawn(ScriptedBackend::new());
+        let (popped, release) = handle.pause_after_next_pop();
+        let ticket = handle
+            .admit_turn(input("pending"), None, "pending".into())
+            .unwrap();
+        popped.recv_async().await.unwrap();
+        let pauser = handle.clone();
+        let barrier = smol::spawn(async move { pauser.pause_queue_admissions().await });
+        until(|| handle.inner.queue.paused()).await;
+        handle.cancel_turn(ticket.turn_id()).unwrap();
+        release.send(()).unwrap();
+        barrier.await;
+        assert!(matches!(
+            ticket.wait().await,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        assert_eq!(handle.snapshot().queued, 0);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn close_while_paused_terminalizes_queued_turn_and_exits() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();

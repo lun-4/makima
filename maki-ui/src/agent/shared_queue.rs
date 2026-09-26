@@ -145,6 +145,17 @@ impl QueueSender {
         }
     }
 
+    pub(crate) fn wait_for_paused_admissions(&self) {
+        if !lock(&self.gate).gated {
+            return;
+        }
+        match &self.backend {
+            QueueBackend::Actor(actor) => smol::block_on(actor.wait_for_queue_admissions()),
+            #[cfg(test)]
+            QueueBackend::Test(_) => {}
+        }
+    }
+
     pub(crate) fn clear_held(&self) {
         lock(&self.gate).held.clear();
     }
