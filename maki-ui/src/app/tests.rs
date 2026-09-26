@@ -9795,6 +9795,24 @@ fn plan_form_model_selection_is_staged() {
 }
 
 #[test]
+fn mode_switch_clears_plan_picker_routing() {
+    let (mut app, models) = app_with_model_slot();
+    const SELECTED_MODEL: &str = "zai/glm-5";
+    models.store(Some(Arc::new(vec![SELECTED_MODEL.into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    assert!(app.plan_picker_open);
+    app.set_mode_id("build".into());
+    assert!(!app.plan_picker_open);
+    let _ = app.model_picker.refresh();
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(&actions[..], [Action::ChangeModel(spec)] if spec == SELECTED_MODEL));
+    assert_eq!(app.plan_form.implementation_model(), None);
+}
+
+#[test]
 fn plan_form_renders_implementation_model() {
     let mut app = plan_app();
     let rows = rendered_area(&mut app);
