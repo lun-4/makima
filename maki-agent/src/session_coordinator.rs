@@ -118,6 +118,13 @@ pub struct ModelAdoptionReceipt {
     token: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizedModelRollback {
+    Applied,
+    Skipped,
+    Stale,
+}
+
 #[derive(Clone)]
 pub struct SessionCoordinatorHandle {
     session_id: MakiId,
@@ -286,7 +293,7 @@ enum Operation {
     },
     RollbackFinalizedModelIfVersion {
         receipt: ModelAdoptionReceipt,
-        reply: flume::Sender<Result<bool, SessionCoordinatorError>>,
+        reply: flume::Sender<Result<FinalizedModelRollback, SessionCoordinatorError>>,
     },
     AbortPendingModel {
         reply: flume::Sender<Result<bool, SessionCoordinatorError>>,
@@ -684,7 +691,7 @@ impl SessionCoordinatorHandle {
     pub async fn rollback_finalized_model_if_version(
         &self,
         receipt: ModelAdoptionReceipt,
-    ) -> Result<bool, SessionCoordinatorError> {
+    ) -> Result<FinalizedModelRollback, SessionCoordinatorError> {
         self.ensure_live()?;
         let (reply, response) = flume::bounded(1);
         self.tx
@@ -1124,8 +1131,10 @@ fn reject_operation(operation: Operation, session_id: MakiId) {
         }
         Operation::RestoreModelIfVersion { reply, .. }
         | Operation::FinalizeModelIfActive { reply, .. }
-        | Operation::RollbackFinalizedModelIfVersion { reply, .. }
         | Operation::AbortPendingModel { reply } => {
+            let _ = reply.send(Err(error()));
+        }
+        Operation::RollbackFinalizedModelIfVersion { reply, .. } => {
             let _ = reply.send(Err(error()));
         }
         Operation::ReplaceHistory { reply, .. } => {
@@ -1166,7 +1175,7 @@ fn reject_with_error(operation: Operation, error: SessionCoordinatorError, sessi
 async fn rollback_finalized_model_if_version(
     ctx: &CoordinatorCtx,
     receipt: ModelAdoptionReceipt,
-) -> Result<bool, SessionCoordinatorError> {
+) -> Result<FinalizedModelRollback, SessionCoordinatorError> {
     let (fast_changed, thinking_changed, cwd) = {
         let state = lock(&ctx.read.state);
         let matches = lock(&ctx.finalized_model).as_ref() == Some(&receipt)
@@ -1176,7 +1185,7 @@ async fn rollback_finalized_model_if_version(
             && current_option_value(&ctx.read, MODEL_OPTION_ID).as_deref()
                 == Some(receipt.adopted.as_ref());
         if !matches {
-            return Ok(false);
+            return Ok(FinalizedModelRollback::Stale);
         }
         (
             state.fast_revision != receipt.fast_revision,
@@ -1197,6 +1206,21 @@ async fn rollback_finalized_model_if_version(
     } else {
         Arc::clone(&receipt.previous_thinking)
     };
+    if fast_changed && fast.as_ref() == ENABLED_VALUE && !fast_allowed(&model)
+        || thinking_changed
+            && !model.supports_thinking()
+            && thinking
+                .parse::<ThinkingConfig>()
+                .map_err(|error| {
+                    SessionCoordinatorError::ConditionalModelRollback(Arc::from(format!(
+                        "invalid thinking setting during rollback: {error}"
+                    )))
+                })?
+                .is_enabled()
+    {
+        *lock(&ctx.finalized_model) = None;
+        return Ok(FinalizedModelRollback::Skipped);
+    }
     let fast = if fast_allowed(&model) {
         fast
     } else {
@@ -1237,7 +1261,7 @@ async fn rollback_finalized_model_if_version(
     }
     lock(&ctx.read.state).model_revision += 1;
     *lock(&ctx.finalized_model) = None;
-    Ok(true)
+    Ok(FinalizedModelRollback::Applied)
 }
 
 async fn abort_pending_model(ctx: &CoordinatorCtx) -> Result<(), SessionCoordinatorError> {
@@ -2573,6 +2597,7 @@ fn toggle_definition(
 mod tests {
     use maki_providers::model::FastSupport;
     use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture};
+    use test_case::test_case;
 
     use super::*;
 
@@ -5147,17 +5172,19 @@ mod tests {
                 .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
                 .await
                 .unwrap();
-            assert!(
+            assert_eq!(
                 coordinator
                     .rollback_finalized_model_if_version(receipt.clone())
                     .await
-                    .unwrap()
+                    .unwrap(),
+                FinalizedModelRollback::Applied
             );
-            assert!(
-                !coordinator
+            assert_eq!(
+                coordinator
                     .rollback_finalized_model_if_version(receipt)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                FinalizedModelRollback::Stale
             );
             assert_eq!(coordinator.read().model().as_ref(), PREVIOUS);
             assert_eq!(
@@ -5216,11 +5243,12 @@ mod tests {
                 .set_option(THINKING_OPTION_ID, "high")
                 .await
                 .unwrap();
-            assert!(
+            assert_eq!(
                 coordinator
                     .rollback_finalized_model_if_version(receipt)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                FinalizedModelRollback::Applied
             );
             assert_eq!(coordinator.read().model().as_ref(), PREVIOUS);
             assert_eq!(
@@ -5231,6 +5259,66 @@ mod tests {
                 thinking_value(&coordinator.read().options()).as_ref(),
                 "high"
             );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(THINKING_OPTION_ID, "high" ; "thinking")]
+    #[test_case(FAST_OPTION_ID, ENABLED_VALUE ; "fast")]
+    fn finalized_model_rollback_skips_newer_incompatible_setting(id: &str, value: &str) {
+        smol::block_on(async {
+            const PREVIOUS: &str = "ollama/llama3";
+            const TARGET: &str = "anthropic/claude-opus-4-8";
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let adopted = Arc::new(Mutex::new(Vec::new()));
+            let mut params = params(MakiId::generate(), recording_writer(&saved));
+            params.model = Arc::from(PREVIOUS);
+            params.definitions = builtin_option_definitions(
+                PREVIOUS,
+                [Arc::from(PREVIOUS)],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            params.model_adopter = Arc::new({
+                let adopted = Arc::clone(&adopted);
+                move |model: Model| {
+                    lock(&adopted).push(model.spec());
+                    Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+                }
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(TARGET), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+            assert!(
+                coordinator
+                    .finalize_model_if_active(receipt.clone())
+                    .await
+                    .unwrap()
+            );
+            let selected = coordinator.set_option(id, value).await.unwrap();
+            let saved_count = lock(&saved).len();
+            assert_eq!(
+                coordinator
+                    .rollback_finalized_model_if_version(receipt.clone())
+                    .await
+                    .unwrap(),
+                FinalizedModelRollback::Skipped
+            );
+            assert_eq!(
+                coordinator
+                    .rollback_finalized_model_if_version(receipt)
+                    .await
+                    .unwrap(),
+                FinalizedModelRollback::Stale
+            );
+            assert_eq!(coordinator.read().model().as_ref(), TARGET);
+            assert_eq!(coordinator.read().options(), selected);
+            assert_eq!(lock(&saved).len(), saved_count);
+            assert_eq!(lock(&adopted).as_slice(), [TARGET]);
             coordinator.close().await.unwrap();
         });
     }
@@ -5266,11 +5354,12 @@ mod tests {
                 .set_model(Some(Arc::from(TARGET)), None, None)
                 .await
                 .unwrap();
-            assert!(
-                !coordinator
+            assert_eq!(
+                coordinator
                     .rollback_finalized_model_if_version(receipt)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                FinalizedModelRollback::Stale
             );
             assert_eq!(coordinator.read().model().as_ref(), TARGET);
             assert_eq!(coordinator.read().options(), newer);
@@ -5340,11 +5429,12 @@ mod tests {
                 CHECKPOINT_REBASE_EPOCH
             );
             assert_eq!(lock(&saved).last().unwrap().1.model.as_ref(), TARGET);
-            assert!(
+            assert_eq!(
                 coordinator
                     .rollback_finalized_model_if_version(receipt)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                FinalizedModelRollback::Applied
             );
             assert_eq!(coordinator.read().model().as_ref(), PREVIOUS);
             coordinator.close().await.unwrap();
@@ -5403,11 +5493,12 @@ mod tests {
             );
             assert_eq!(coordinator.read().model().as_ref(), TARGET);
             assert_eq!(lock(&saved).last().unwrap().model.as_ref(), TARGET);
-            assert!(
+            assert_eq!(
                 coordinator
                     .rollback_finalized_model_if_version(receipt)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                FinalizedModelRollback::Applied
             );
             assert_eq!(coordinator.read().model().as_ref(), PREVIOUS);
             coordinator.close().await.unwrap();

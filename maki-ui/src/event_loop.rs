@@ -27,9 +27,9 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_coordinator::{
-    DirectoryAdoptionFuture, ModelAdopter, ModelAdoptionFuture, ModelAdoptionReceipt,
-    PreparedSessionCoordinator, SessionCoordinatorError, SessionCoordinatorHandle,
-    SessionCoordinatorParams, builtin_option_definitions,
+    DirectoryAdoptionFuture, FinalizedModelRollback, ModelAdopter, ModelAdoptionFuture,
+    ModelAdoptionReceipt, PreparedSessionCoordinator, SessionCoordinatorError,
+    SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
 };
 use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
@@ -1410,7 +1410,7 @@ enum InternalEvent {
         session: MakiId,
         generation: u64,
         receipt: ModelAdoptionReceipt,
-        result: std::result::Result<bool, SessionCoordinatorError>,
+        result: std::result::Result<FinalizedModelRollback, SessionCoordinatorError>,
     },
     PlanModelChanged {
         session: MakiId,
@@ -2071,13 +2071,13 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     match result {
-                        Ok(true) => {
+                        Ok(FinalizedModelRollback::Applied | FinalizedModelRollback::Skipped) => {
                             runtime.plan_finalized_rollback = None;
                             runtime.finish_plan_transition();
                             reconcile_model(runtime);
                             self.resume_deferred_plan_approval(idx);
                         }
-                        Ok(false)
+                        Ok(FinalizedModelRollback::Stale)
                             if {
                                 let read = runtime.coordinator.read();
                                 read.model() != receipt.adopted
@@ -2089,13 +2089,14 @@ impl<'t> EventLoop<'t> {
                             reconcile_model(runtime);
                             self.resume_deferred_plan_approval(idx);
                         }
-                        Ok(false) => {
+                        Ok(FinalizedModelRollback::Stale) => {
                             runtime.plan_finalized_rollback =
                                 Some((receipt, Some(Instant::now() + Duration::from_secs(1))));
                         }
                         Err(error) => {
                             runtime.plan_finalized_rollback =
                                 Some((receipt, Some(Instant::now() + Duration::from_secs(1))));
+                            reconcile_model(runtime);
                             runtime
                                 .app
                                 .flash(format!("plan model rollback failed: {error}"));
@@ -6507,18 +6508,27 @@ mod tests {
     #[test_case("parallel" ; "revised_parallel")]
     #[test_case("model" ; "revised_model")]
     #[test_case("newer_same_model" ; "newer_same_model_selection")]
+    #[test_case("rollback_failure" ; "failed_runtime_rollback")]
     #[test_case("mode" ; "revised_mode")]
     fn finalized_model_does_not_implement_revised_plan(revision: &str) {
         const IMPLEMENTATION_MODEL: &str = "anthropic/claude-opus-4-8";
+        const ORIGINAL_MODEL: &str = "anthropic/test-model";
         const ORIGINAL_PLAN: &str = "original plan";
         const REVISED_PLAN: &str = "revised plan";
+        const ROLLBACK_FAILURE: &str = "runtime rollback refused";
 
         let mut harness = RuntimeHarness::new();
         let slot_holder: Arc<std::sync::Mutex<Option<Arc<ProviderSlot>>>> = Arc::default();
         let adopter_slot = Arc::clone(&slot_holder);
+        let fail_rollback = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail = Arc::clone(&fail_rollback);
         let adopter = Arc::new(move |model: Model| {
             let slot = adopter_slot.lock().unwrap().as_ref().unwrap().clone();
+            let fail = Arc::clone(&fail);
             Box::pin(async move {
+                if fail.load(Ordering::SeqCst) && model.spec() == ORIGINAL_MODEL {
+                    return Err(Arc::from(ROLLBACK_FAILURE));
+                }
                 let provider = slot.load().provider.clone();
                 slot.install(model, provider);
                 Ok(())
@@ -6612,6 +6622,10 @@ mod tests {
                 ));
             }
             "model" => app.plan_form.use_current_model(),
+            "rollback_failure" => {
+                std::fs::write(&path, REVISED_PLAN).unwrap();
+                fail_rollback.store(true, Ordering::SeqCst);
+            }
             "newer_same_model" => {
                 app.plan_form.use_current_model();
                 smol::block_on(loop_state.sessions[0].coordinator.set_model(
@@ -6654,20 +6668,64 @@ mod tests {
                 matches!(
                     &rolled_back,
                     InternalEvent::PlanFinalizedModelRolledBack {
-                        result: Ok(false), ..
+                        result: Ok(FinalizedModelRollback::Stale), ..
                     } if revision == "newer_same_model"
                 ) || matches!(
                     &rolled_back,
                     InternalEvent::PlanFinalizedModelRolledBack {
-                        result: Ok(true), ..
-                    } if revision != "newer_same_model"
+                        result: Ok(FinalizedModelRollback::Applied), ..
+                    } if revision != "newer_same_model" && revision != "rollback_failure"
+                ) || matches!(
+                    &rolled_back,
+                    InternalEvent::PlanFinalizedModelRolledBack {
+                        result: Err(SessionCoordinatorError::ConditionalModelRollback(error)), ..
+                    } if revision == "rollback_failure" && error.as_ref() == ROLLBACK_FAILURE
                 )
             );
             loop_state.handle_internal(rolled_back);
+            if revision == "rollback_failure" {
+                let runtime = &loop_state.sessions[0];
+                assert_eq!(runtime.pending_plan_transitions, 1);
+                assert!(
+                    runtime
+                        .plan_finalized_rollback
+                        .as_ref()
+                        .is_some_and(|(_, retry)| retry.is_some())
+                );
+                assert_eq!(
+                    runtime.coordinator.read().model().as_ref(),
+                    IMPLEMENTATION_MODEL
+                );
+                assert_eq!(runtime.model_slot.load().model.spec(), IMPLEMENTATION_MODEL);
+                assert_eq!(runtime.app.state.model.spec(), IMPLEMENTATION_MODEL);
+                assert!(
+                    runtime
+                        .app
+                        .status_bar
+                        .flash_text()
+                        .is_some_and(|text| text.contains(ROLLBACK_FAILURE))
+                );
+                fail_rollback.store(false, Ordering::SeqCst);
+                loop_state.sessions[0]
+                    .plan_finalized_rollback
+                    .as_mut()
+                    .unwrap()
+                    .1 = Some(Instant::now());
+                let _ = loop_state.tick();
+                let retried = smol::block_on(loop_state.internal_rx.recv_async()).unwrap();
+                assert!(matches!(
+                    retried,
+                    InternalEvent::PlanFinalizedModelRolledBack {
+                        result: Ok(FinalizedModelRollback::Applied),
+                        ..
+                    }
+                ));
+                loop_state.handle_internal(retried);
+            }
             let expected = if revision == "newer_same_model" {
                 IMPLEMENTATION_MODEL
             } else {
-                "anthropic/test-model"
+                ORIGINAL_MODEL
             };
             assert_eq!(
                 loop_state.sessions[0].coordinator.read().model().as_ref(),
