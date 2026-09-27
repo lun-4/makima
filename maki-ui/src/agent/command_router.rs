@@ -211,14 +211,17 @@ mod tests {
         }
     }
 
-    fn policy() -> maki_agent::RunSettings {
-        maki_agent::RunSettings {
-            provider: Arc::new(StubProvider),
-            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
-            fast: false,
-            workflow: false,
-            thinking: Default::default(),
-        }
+    fn policy() -> maki_agent::actor::EffectiveAgentConfig {
+        maki_agent::actor::EffectiveAgentConfig::new(
+            maki_agent::RunSettings {
+                provider: Arc::new(StubProvider),
+                model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+                fast: false,
+                workflow: false,
+                thinking: Default::default(),
+            },
+            maki_agent::AgentMode::Build,
+        )
     }
 
     fn input() -> AgentInput {

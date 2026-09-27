@@ -332,13 +332,16 @@ impl Provider for ConfigTestProvider {
 }
 
 fn config(model: &str, fast: bool) -> crate::actor::EffectiveAgentConfig {
-    crate::actor::EffectiveAgentConfig {
-        provider: Arc::new(ConfigTestProvider),
-        model: Model::from_spec(model).unwrap(),
-        fast,
-        workflow: false,
-        thinking: Default::default(),
-    }
+    crate::actor::EffectiveAgentConfig::new(
+        crate::RunSettings {
+            provider: Arc::new(ConfigTestProvider),
+            model: Model::from_spec(model).unwrap(),
+            fast,
+            workflow: false,
+            thinking: Default::default(),
+        },
+        AgentMode::Build,
+    )
 }
 
 fn input() -> AgentInput {
@@ -403,7 +406,7 @@ fn actor_owned_config_inherits_and_isolates_nodes() {
         let captured = current.policy_snapshot().unwrap();
         assert_eq!(captured.model.id, initial.model.id);
         assert!(Arc::ptr_eq(&captured.provider, &initial.provider));
-        root.update_policy(config("anthropic/claude-sonnet-4-20250514", true))
+        root.update_policy(config("anthropic/claude-sonnet-4-20250514", true).settings)
             .unwrap();
         let child = current
             .spawn_child(
@@ -422,7 +425,7 @@ fn actor_owned_config_inherits_and_isolates_nodes() {
         assert!(matches!(
             manager.update_policy(
                 child.id(),
-                config("anthropic/claude-sonnet-4-20250514", true)
+                config("anthropic/claude-sonnet-4-20250514", true).settings
             ),
             Err(ManagerError::Policy(_))
         ));
@@ -490,7 +493,7 @@ fn agent_config_isolation_and_failed_switch() {
         assert!(second_turn.policy_snapshot().unwrap().fast);
         assert!(!child.effective_config().unwrap().unwrap().fast);
         assert!(matches!(
-            first.update_policy(child.id(), other.clone()),
+            first.update_policy(child.id(), other.settings.clone()),
             Err(ManagerError::Policy(_))
         ));
         assert!(Arc::ptr_eq(
@@ -577,27 +580,27 @@ fn child_ceiling_rejects_policy_and_mode_expansion() {
             .unwrap();
         let actor = child.actor().unwrap();
         let mut broader = initial.clone();
-        broader.model = Model::from_spec("anthropic/claude-opus-4-20250514").unwrap();
+        broader.settings.model = Model::from_spec("anthropic/claude-opus-4-20250514").unwrap();
         assert!(matches!(
-            child.update_policy(broader),
+            child.update_policy(broader.settings),
             Err(ManagerError::Policy(_))
         ));
         let mut broader = initial.clone();
-        broader.workflow = true;
+        broader.settings.workflow = true;
         assert!(matches!(
-            child.update_policy(broader),
+            child.update_policy(broader.settings),
             Err(ManagerError::Policy(_))
         ));
         let mut broader = initial.clone();
-        broader.fast = true;
+        broader.settings.fast = true;
         assert!(matches!(
-            child.update_policy(broader),
+            child.update_policy(broader.settings),
             Err(ManagerError::Policy(_))
         ));
         let mut broader = initial.clone();
-        broader.provider = Arc::new(ConfigTestProvider);
+        broader.settings.provider = Arc::new(ConfigTestProvider);
         assert!(matches!(
-            child.update_policy(broader),
+            child.update_policy(broader.settings),
             Err(ManagerError::Policy(_))
         ));
         let mut plan_input = input();
@@ -646,6 +649,54 @@ fn restrictive_parent_delegates_without_broadening_child_mode() {
         assert!(
             child_actor
                 .admit_turn(plan_input, None, "plan-child".into())
+                .is_ok()
+        );
+        assert!(
+            child_actor
+                .admit_turn(input(), None, "build-child".into())
+                .is_err()
+        );
+        gate.release(1);
+        manager.shutdown(std::time::Duration::from_secs(1)).await;
+    });
+}
+
+#[test]
+fn custom_parent_mode_is_admitted_by_managed_child() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::bounded(1);
+        let gate = Gate::new();
+        let root = manager
+            .create_root_with_config(
+                Some(config("anthropic/claude-sonnet-4-20250514", false)),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate)))),
+            )
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let custom_mode = AgentMode::Custom(crate::ModeId::parse("review"));
+        let mut parent_input = input();
+        parent_input.mode = custom_mode.clone();
+        actor
+            .admit_turn(parent_input, None, "root-custom".into())
+            .unwrap();
+        let current = rx.recv_async().await.unwrap();
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let child_actor = child.actor().unwrap();
+        let mut child_input = input();
+        child_input.mode = custom_mode;
+        assert!(
+            child_actor
+                .admit_turn(child_input, None, "custom-child".into())
                 .is_ok()
         );
         assert!(

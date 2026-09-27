@@ -286,17 +286,23 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
         let result = pending.result.unwrap();
         *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
-        if let Ok(policy) = result {
+        if let Ok(settings) = result {
+            let mode = state
+                .policy
+                .as_ref()
+                .map_or(crate::AgentMode::Build, |config| config.mode.clone());
+            let config = EffectiveAgentConfig::new(settings, mode);
             let changed = state.policy.as_ref().is_none_or(|current| {
-                !Arc::ptr_eq(&current.provider, &policy.provider)
-                    || current.model.spec() != policy.model.spec()
-                    || current.fast != policy.fast
-                    || current.workflow != policy.workflow
-                    || current.thinking != policy.thinking
+                !Arc::ptr_eq(&current.settings.provider, &config.settings.provider)
+                    || current.settings.model.spec() != config.settings.model.spec()
+                    || current.settings.fast != config.settings.fast
+                    || current.settings.workflow != config.settings.workflow
+                    || current.settings.thinking != config.settings.thinking
+                    || current.mode != config.mode
             });
             if changed {
                 state.policy_generation = state.policy_generation.wrapping_add(1);
-                state.policy = Some(Arc::new(policy));
+                state.policy = Some(Arc::new(config));
                 inner.queue.push(ActorWork::PolicyBarrier {
                     generation: state.policy_generation,
                 });
@@ -317,6 +323,12 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
                     ..
                 } => {
                     let turn_id = ticket.turn_id();
+                    let policy = state.policy.as_ref().map(|config| {
+                        Arc::new(EffectiveAgentConfig::new(
+                            config.settings.clone(),
+                            input.mode.clone(),
+                        ))
+                    });
                     let admission = TurnAdmission {
                         turn_id,
                         admission: snapshot,
@@ -325,7 +337,7 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
                         correlation,
                         root: false,
                         generation: state.policy_generation,
-                        policy: state.policy.clone(),
+                        policy,
                         ticket,
                     };
                     inner.queue.push(ActorWork::Turn(admission));
@@ -333,7 +345,12 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
                 DeferredAdmission::Root { mut root, .. } => {
                     if !state.cancelled_correlations.contains_key(&root.correlation) {
                         root.generation = state.policy_generation;
-                        root.policy = state.policy.clone();
+                        root.policy = state.policy.as_ref().map(|config| {
+                            Arc::new(EffectiveAgentConfig::new(
+                                config.settings.clone(),
+                                root.input.mode.clone(),
+                            ))
+                        });
                         inner.queue.push(ActorWork::Root(root));
                     }
                 }
@@ -628,25 +645,17 @@ impl AgentActorHandle {
                 return Err(lifecycle_error(state.lifecycle));
             }
         }
+        let mode = input.mode.clone();
         let snapshot = self
             .inner
             .admission_preparation
             .as_ref()
-            .map(|prepare| prepare(&input));
+            .map(|prepare| prepare(&input, &mode));
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
         if let Some(after) = state.pending_policy.back().map(|pending| pending.id) {
-            if self
-                .inner
-                .managed_admission
-                .as_ref()
-                .and_then(|admission| admission.mode_ceiling.as_ref())
-                .is_some_and(|ceiling| &input.mode != ceiling)
-            {
-                return Err(ActorError::PolicyCeiling);
-            }
             let turn_id = TurnId::generate();
             let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
             if let Some(reason) = state.cancelled_correlations.get(&correlation).copied() {
@@ -683,6 +692,8 @@ impl AgentActorHandle {
                 });
             return Ok(ticket);
         }
+        let mut input = input;
+        input.mode = mode;
         self.admit_turn_locked(state, input, snapshot, event_sender, correlation)
     }
 
@@ -694,6 +705,12 @@ impl AgentActorHandle {
         event_sender: Option<EventSender>,
         correlation: String,
     ) -> Result<TurnTicket, ActorError> {
+        let policy = state.policy.as_ref().map(|config| {
+            Arc::new(EffectiveAgentConfig::new(
+                config.settings.clone(),
+                input.mode.clone(),
+            ))
+        });
         if self
             .inner
             .managed_admission
@@ -718,7 +735,7 @@ impl AgentActorHandle {
                 correlation: correlation.clone(),
                 root: false,
                 generation: state.policy_generation,
-                policy: state.policy.clone(),
+                policy: policy.clone(),
                 ticket: ticket.clone(),
             };
             let outcome = cancelled_outcome(self.inner.agent_id, turn_id, reason);
@@ -752,7 +769,7 @@ impl AgentActorHandle {
             correlation: correlation.clone(),
             root: false,
             generation: state.policy_generation,
-            policy: state.policy.clone(),
+            policy,
             ticket: ticket.clone(),
         }));
         info!(
@@ -779,21 +796,12 @@ impl AgentActorHandle {
             .inner
             .admission_preparation
             .as_ref()
-            .map(|prepare| prepare(&root.input));
+            .map(|prepare| prepare(&root.input, &root.input.mode));
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
         if let Some(after) = state.pending_policy.back().map(|pending| pending.id) {
-            if self
-                .inner
-                .managed_admission
-                .as_ref()
-                .is_some_and(|admission| admission.ceiling.is_some())
-                && root.input.mode != crate::AgentMode::Build
-            {
-                return Err(ActorError::PolicyCeiling);
-            }
             state
                 .deferred_admissions
                 .push_back(DeferredAdmission::Root { after, root });
@@ -803,21 +811,26 @@ impl AgentActorHandle {
     }
 
     fn rush_locked(&self, state: &ActorState, root: RootWork) -> Result<(), ActorError> {
-        if self
-            .inner
-            .managed_admission
-            .as_ref()
-            .is_some_and(|admission| admission.ceiling.is_some())
-            && root.input.mode != crate::AgentMode::Build
-        {
-            return Err(ActorError::PolicyCeiling);
-        }
         if state.cancelled_correlations.contains_key(&root.correlation) {
             return Ok(());
         }
         let mut root = root;
         root.generation = state.policy_generation;
-        root.policy = state.policy.clone();
+        root.policy = state.policy.as_ref().map(|config| {
+            Arc::new(EffectiveAgentConfig::new(
+                config.settings.clone(),
+                root.input.mode.clone(),
+            ))
+        });
+        if self
+            .inner
+            .managed_admission
+            .as_ref()
+            .and_then(|admission| admission.mode_ceiling.as_ref())
+            .is_some_and(|ceiling| &root.input.mode != ceiling)
+        {
+            return Err(ActorError::PolicyCeiling);
+        }
         self.inner.queue.push(ActorWork::Root(root));
         Ok(())
     }
@@ -835,10 +848,14 @@ impl AgentActorHandle {
 
     pub fn policy_snapshot(&self) -> Option<Arc<RunSettings>> {
         self.effective_config()
+            .map(|config| Arc::new(config.settings.clone()))
     }
 
     pub fn update_policy(&self, policy: RunSettings) -> Result<u64, ActorError> {
-        self.set_effective_config(policy)
+        let mode = self
+            .effective_config()
+            .map_or(crate::AgentMode::Build, |config| config.mode.clone());
+        self.set_effective_config(EffectiveAgentConfig::new(policy, mode))
     }
 
     pub fn reserve_policy_update(&self) -> Result<PolicyUpdateTicket, ActorError> {
@@ -904,7 +921,16 @@ impl AgentActorHandle {
         if !state.pending_policy.is_empty() {
             return Err(ActorError::PolicyPending);
         }
-        self.inner.validate_policy(&config)?;
+        self.inner.validate_policy(&config.settings)?;
+        if self
+            .inner
+            .managed_admission
+            .as_ref()
+            .and_then(|admission| admission.mode_ceiling.as_ref())
+            .is_some_and(|ceiling| &config.mode != ceiling)
+        {
+            return Err(ActorError::PolicyCeiling);
+        }
         state.policy_generation = state.policy_generation.wrapping_add(1);
         state.policy = Some(Arc::new(config));
         let generation = state.policy_generation;

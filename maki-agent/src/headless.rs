@@ -445,6 +445,19 @@ async fn collect_turn_events(
     None
 }
 
+fn admit_pending_inputs(
+    pending_rx: &Receiver<AgentInput>,
+    admission_sender: &InteractiveInputSender,
+    settings: &crate::RunSettings,
+    ready: &std::sync::Mutex<bool>,
+) {
+    let mut ready = ready.lock().unwrap_or_else(|error| error.into_inner());
+    while let Ok(input) = pending_rx.try_recv() {
+        let _ = admission_sender.send_with_settings(input, settings.clone());
+    }
+    *ready = true;
+}
+
 async fn receive_wake_and_refresh(
     input_rx: &Receiver<QueuedInput>,
     control_rx: &Receiver<InteractiveControl>,
@@ -600,6 +613,8 @@ struct QueuedInput {
 #[derive(Clone)]
 pub struct InteractiveInputSender {
     tx: flume::Sender<QueuedInput>,
+    pending_tx: flume::Sender<AgentInput>,
+    ready: Arc<std::sync::Mutex<bool>>,
     mirror: Option<flume::Sender<AgentInput>>,
     model: crate::SharedModel,
     session_id: MakiId,
@@ -626,11 +641,17 @@ impl InteractiveInputSender {
                 .send(input)
                 .map_err(|error| flume::SendError(Box::new(error.0)));
         }
-        let settings = crate::RunSettingsSource::current(&crate::SessionRunSettings {
+        let ready = self.ready.lock().unwrap_or_else(|error| error.into_inner());
+        if !*ready {
+            return self
+                .pending_tx
+                .send(input)
+                .map_err(|error| flume::SendError(Box::new(error.0)));
+        }
+        let Some(settings) = crate::RunSettingsSource::current(&crate::SessionRunSettings {
             model: Arc::new(self.model.clone()),
             session_id: self.session_id,
-        });
-        let Some(settings) = settings else {
+        }) else {
             return Err(flume::SendError(Box::new(input)));
         };
         self.send_with_settings(input, settings)
@@ -740,6 +761,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let raw_tx = guard.tx().clone();
     let event_rx = events.into_receiver();
     let (input_tx, input_rx) = flume::unbounded::<QueuedInput>();
+    let (pending_tx, pending_rx) = flume::unbounded::<AgentInput>();
+    let input_ready = Arc::new(std::sync::Mutex::new(false));
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
@@ -762,7 +785,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let admission_cwd = Arc::new(std::sync::Mutex::new(PathBuf::from(&working_dir)));
     let input_tx = InteractiveInputSender {
-        tx: input_tx,
+        tx: input_tx.clone(),
+        pending_tx,
+        ready: Arc::clone(&input_ready),
         mirror: None,
         model: shared_model.clone(),
         session_id,
@@ -776,6 +801,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         mcp_handle: params.mcp_handle.clone(),
         local_tools: Arc::clone(&params.local_tools),
     };
+    let admission_sender = input_tx.clone();
     let mut permissions_config = params.permissions_config.clone();
     permissions_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new(
@@ -809,6 +835,18 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 };
             shared_model.install(Arc::clone(&provider), model.clone());
+            let settings = loop {
+                if let Some(settings) =
+                    crate::RunSettingsSource::current(&crate::SessionRunSettings {
+                        model: Arc::new(shared_model.clone()),
+                        session_id,
+                    })
+                {
+                    break settings;
+                }
+                smol::future::yield_now().await;
+            };
+            admit_pending_inputs(&pending_rx, &admission_sender, &settings, &input_ready);
 
             let mut history = History::restored(params.initial_history);
             let mut working_dir = PathBuf::from(working_dir);
@@ -1702,9 +1740,12 @@ mod tests {
     fn queued_input_keeps_admission_settings_and_prompt() {
         let params = test_params();
         let (tx, rx) = flume::unbounded();
+        let (pending_tx, pending_rx) = flume::unbounded();
         let cwd = Arc::new(std::sync::Mutex::new(params.initial_wd));
         let sender = InteractiveInputSender {
             tx,
+            pending_tx: pending_tx.clone(),
+            ready: Arc::new(std::sync::Mutex::new(false)),
             mirror: None,
             model: crate::SharedModel::default(),
             session_id: MakiId::generate(),
@@ -1718,8 +1759,27 @@ mod tests {
             mcp_handle: None,
             local_tools: Arc::new(Default::default()),
         };
-        assert!(sender.send(test_params().input).is_err());
+        sender.send(test_params().input).unwrap();
         assert!(rx.is_empty());
+        let pending_input = pending_rx.try_recv().unwrap();
+        assert_eq!(pending_input.message, "hello");
+        let initialized_provider: Arc<dyn Provider> = Arc::new(TestProvider);
+        let initialized_settings = crate::RunSettings {
+            provider: Arc::clone(&initialized_provider),
+            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+            fast: true,
+            workflow: true,
+            thinking: Default::default(),
+        };
+        pending_tx.send(pending_input).unwrap();
+        admit_pending_inputs(&pending_rx, &sender, &initialized_settings, &sender.ready);
+        let admitted = rx.recv().unwrap();
+        assert!(Arc::ptr_eq(
+            &admitted.settings.provider,
+            &initialized_provider
+        ));
+        assert!(admitted.input.fast && admitted.input.workflow);
+        assert_eq!(admitted.prepared.0, "admitted system");
         sender
             .modes
             .define(crate::ModeDefSpec {

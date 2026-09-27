@@ -267,8 +267,11 @@ impl Runner {
             .await
             {
                 Ok((guard, mut current)) => {
-                    current.policy = admission.policy.clone();
-                    current.mode = admission.input.as_ref().map(|input| input.mode.clone());
+                    current.policy = admission
+                        .policy
+                        .as_ref()
+                        .map(|config| Arc::new(config.settings.clone()));
+                    current.mode = admission.policy.as_ref().map(|config| config.mode.clone());
                     (Some(guard), Some(current))
                 }
                 Err(reason) => {

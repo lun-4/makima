@@ -20,7 +20,7 @@ Tab toggles between them (build is the default).
 - **plan `[PLAN]`** - analyse and plan. The mode names one plan file as its
   intended write target, and the model gets a directive not to change other files.
 
-Switching to plan mode allocates a plan file under `plans/`. The host admits only tools named by the mode and classified as safe bundled tools. The built-in safe set includes `read`, `glob`, `grep`, `webfetch`, `question`, `plan_submit`, and `task`. Bundled write and edit tools can change only the designated plan file. The host opens its parent without following symlinks and replaces the file through that directory handle. Missing plan file parent directories are created before the anchored write. Writes fail closed on platforms without this anchored write path. Same-named third-party tools do not receive bundled authority. Other Lua tools, shell commands, MCP execution, and deferred MCP search are denied even with YOLO on.
+Switching to plan mode allocates a plan file under `plans/`. The host admits only tools named by the mode and classified as safe bundled tools. The built-in safe set includes `read`, `glob`, `grep`, `webfetch`, `question`, `plan_submit`, and `task`. Bundled write and edit tools can change only the designated plan file. The host compares normalized path keys and rejects writes whose keys do not match. This check does not use an anchored filesystem write. Lua filesystem writes are not subject to the mode's plan-path restriction. They require the plugin's `fs_write` permission. Same-named third-party tools do not receive bundled authority. Other Lua tools, shell commands, MCP execution, and deferred MCP search are denied even with YOLO on.
 
 Model changes apply to later admitted turns. Active turns keep their selected
 model through continuations. Queued roots do not fold across a model-policy
@@ -35,7 +35,7 @@ Under the hood a mode is a definition in a shared registry:
 - **name** (`"build"`, `"plan"`, or a custom id) and a **label** for the badge.
 - **system_prompt** - a snippet appended to the system prompt, like the plan
   directive. `{plan_path}` and the other prompt variables are filled in.
-- **restrict_write_to** (optional) - names the only write target. Bundled write and edit tools use an anchored write path for that file. Other filesystem writes are blocked.
+- **restrict_write_to** (optional) - names the only write target for bundled native write and edit tools. The host compares normalized path keys before allowing those tools to write. Lua filesystem writes are not restricted to this path; they require the plugin's `fs_write` permission.
 - **tools** (optional) - when set, the model sees *only* this exact toolset for
   that mode. When absent, the mode inherits the default (build) set. This is how
   a tool like `plan_submit` exists only while you are in plan mode.

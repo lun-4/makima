@@ -143,9 +143,6 @@ struct Hook<'a> {
 
 impl<'a> Hook<'a> {
     fn of(ctx: &'a ToolContext, resolved: &Resolved<'a>, origin: CallOrigin) -> Option<Self> {
-        if ctx.restrict_write_to().is_some() {
-            return None;
-        }
         Some(Self {
             installed: ctx.registry.hook()?,
             ctx,
@@ -322,6 +319,7 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
 }
 
 const MODE_DENIED: &str = "tool not allowed in restricted mode";
+const STRUCTURED_OUTPUT_TOOL_NAME: &str = "structured_output";
 
 fn mode_denied(id: String, name: &str, reason: String) -> ToolDoneEvent {
     ToolDoneEvent {
@@ -361,6 +359,7 @@ fn mode_offers(ctx: &ToolContext, resolved: &Resolved<'_>) -> bool {
         return true;
     }
     matches!(&resolved.route, Route::Native(entry) if entry.is_bundled_read_only() || entry.is_bundled_mutation())
+        || matches!(&resolved.route, Route::Local(_) if resolved.name == STRUCTURED_OUTPUT_TOOL_NAME)
 }
 
 pub(crate) fn authorize_advertised(ctx: &ToolContext, name: &str) -> bool {
@@ -1742,21 +1741,62 @@ mod tests {
     }
 
     #[test]
-    fn restricted_write_never_reaches_input_hooks_even_for_plan_path() {
+    fn restricted_mode_hooks_run_for_allowed_native_tools() {
         smol::block_on(async {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
-            let (ctx, hook) = hooked_with(
-                stub_ctx(&plan),
-                None,
-                RecordingHook::answering(rewrite_the_target),
-            );
-            let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
-            assert!(done.is_error);
+            let mut ctx = stub_ctx(&plan);
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    mock_tool("read", ToolAudience::all()),
+                    ToolSource::Bundled {
+                        plugin: "read".into(),
+                    },
+                )
+                .unwrap();
+            ctx.registry = Arc::new(registry);
+            let hook = RecordingHook::default();
+            ctx.registry.set_hook(hook.clone());
+            pin(&mut ctx);
+
+            dispatch(&ctx, "read", &json!({})).await;
+
+            assert_eq!(hook.stages(), both_stages(Authority::Unbounded));
+        });
+    }
+
+    #[test]
+    fn restricted_mode_allows_only_the_structured_output_local_route() {
+        smol::block_on(async {
+            let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
+            let mut ctx = stub_ctx(&plan);
+            ctx.local_tools = Arc::new(HashMap::from([
+                (
+                    STRUCTURED_OUTPUT_TOOL_NAME.into(),
+                    local_tool(ToolAudience::all(), |_, _| {
+                        Box::pin(async { Ok("recorded".into()) })
+                    }),
+                ),
+                (
+                    CLIENT_NAME.into(),
+                    local_tool(ToolAudience::all(), |_, _| {
+                        Box::pin(async { Ok("arbitrary".into()) })
+                    }),
+                ),
+            ]));
+            pin(&mut ctx);
+
+            assert!(authorize_advertised(&ctx, STRUCTURED_OUTPUT_TOOL_NAME));
+            assert!(!authorize_advertised(&ctx, CLIENT_NAME));
+            let allowed = dispatch(&ctx, STRUCTURED_OUTPUT_TOOL_NAME, &json!({})).await;
+            assert!(!allowed.is_error);
+            assert_eq!(allowed.output.as_text(), "recorded");
+            let denied = dispatch(&ctx, CLIENT_NAME, &json!({})).await;
+            assert!(denied.is_error);
             assert_eq!(
-                done.output.as_text(),
-                format!("{MODE_DENIED}: {HOOK_TOOL_NAME}")
+                denied.output.as_text(),
+                format!("{MODE_DENIED}: {CLIENT_NAME}")
             );
-            assert!(hook.seen.lock().unwrap().is_empty());
         });
     }
 

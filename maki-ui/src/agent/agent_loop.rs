@@ -390,7 +390,12 @@ impl TuiActorBackend {
         } else {
             None
         };
-        if let Some(settings) = context.policy.as_deref().or(fallback.as_ref()) {
+        if let Some(settings) = context
+            .policy
+            .as_deref()
+            .map(|config| &config.settings)
+            .or(fallback.as_ref())
+        {
             provider = Arc::clone(&settings.provider);
             model = settings.model.clone();
             input.fast = settings.fast;
@@ -398,6 +403,11 @@ impl TuiActorBackend {
             input.thinking = settings.thinking;
         }
         drop(slot);
+        let mode = context
+            .policy
+            .as_ref()
+            .map_or_else(|| input.mode.clone(), |config| config.mode.clone());
+        input.mode = mode;
         let (system, tools, prompt_slots) = match self
             .prepare_run(&mut input, &model, context.admission.as_ref())
             .await
@@ -514,12 +524,13 @@ impl ActorBackend for TuiActorBackend {
         let mcp = self.mcp.clone();
         let cwd = Arc::clone(&self.cwd);
         let lua_handle = self.lua_handle.clone();
-        Some(Arc::new(move |input| {
+        Some(Arc::new(move |input, mode| {
             let cwd = (**cwd.load()).clone();
             let instructions = maki_agent::agent::load_instructions(&cwd.to_string_lossy());
-            let mode_def = match &input.mode {
+            let mode = mode.clone();
+            let mode_def = match &mode {
                 maki_agent::AgentMode::Custom(id) => modes.get(id).map(Arc::new),
-                _ => Some(Arc::new(modes.current(&input.mode))),
+                _ => Some(Arc::new(modes.current(&mode))),
             };
             let binding = input
                 .prompt
@@ -689,12 +700,13 @@ impl ActorBackend for TuiActorBackend {
             // source and emits `CompactionDone`.
             let run_id = self.current_run_id();
             let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-            let slot = self.model_slot.load();
-            let current_provider =
-                Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>;
+            let (base_provider, base_model) = compaction_source(
+                context.policy.as_deref().map(|config| &config.settings),
+                &self.model_slot,
+            );
             let (provider, model) = maki_agent::agent::resolve_compaction_model(
-                &current_provider,
-                &slot.model,
+                &base_provider,
+                &base_model,
                 self.timeouts,
                 &self.model_policy,
             );
@@ -743,6 +755,21 @@ impl ActorBackend for TuiActorBackend {
             }
         })
     }
+}
+
+fn compaction_source(
+    policy: Option<&maki_agent::RunSettings>,
+    model_slot: &ProviderSlot,
+) -> (Arc<dyn maki_providers::provider::Provider>, Model) {
+    policy
+        .map(|settings| (Arc::clone(&settings.provider), settings.model.clone()))
+        .unwrap_or_else(|| {
+            let slot = model_slot.load();
+            (
+                Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>,
+                slot.model.clone(),
+            )
+        })
 }
 
 /// A no-op interrupt source used when the actor provides none (standalone
@@ -812,6 +839,38 @@ mod tests {
     use crate::agent::ProviderSlot;
 
     #[test]
+    fn idle_compaction_source_uses_pinned_policy_over_live_model_slot() {
+        let (live_slot, _change_rx) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let mut pinned_model = crate::components::test_model();
+        pinned_model.id = "pinned-model".into();
+        let settings = maki_agent::RunSettings {
+            provider: Arc::new(StubProvider),
+            model: pinned_model.clone(),
+            fast: false,
+            workflow: false,
+            thinking: Default::default(),
+        };
+
+        let (provider, model) = compaction_source(Some(&settings), &live_slot);
+
+        assert_eq!(model.id, pinned_model.id);
+        assert!(Arc::ptr_eq(&provider, &settings.provider));
+    }
+
+    #[test]
+    fn idle_compaction_source_falls_back_to_live_model_slot() {
+        let (live_slot, _change_rx) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let (provider, model) = compaction_source(None, &live_slot);
+        let snapshot = live_slot.load();
+
+        assert_eq!(model.id, snapshot.model.id);
+        let expected: Arc<dyn maki_providers::provider::Provider> = snapshot.provider.clone();
+        assert!(Arc::ptr_eq(&provider, &expected));
+    }
+
+    #[test]
     fn admitted_prompt_inputs_survive_cwd_change() {
         let (model_slot, _change_rx) =
             ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
@@ -855,7 +914,7 @@ mod tests {
             Vec::new(),
             maki_config::SessionDefaults::default(),
         );
-        let mut snapshot = backend.admission_preparation().unwrap()(&input);
+        let mut snapshot = backend.admission_preparation().unwrap()(&input, &input.mode);
         let prompt = Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap());
         prompt.instructions.text = "admitted instructions".into();
         let (tx, rx) = flume::bounded(1);

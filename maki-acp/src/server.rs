@@ -920,12 +920,12 @@ async fn install_session_with_lock(
             cwd: cwd.clone(),
             model_policy: Arc::clone(&params.model_policy),
             model_adopter: Arc::new({
-                // Installing into the shared source rather than asking the
+                // Install into the shared source rather than asking the
                 // session loop to adopt: the loop only reads its control
                 // channel between turns, so a round-trip here would wait for
                 // the running turn -- and that turn cannot finish while the
-                // coordinator is blocked on this call. The store also lands on
-                // the run's next request instead of its next turn.
+                // coordinator is blocked on this call. The store takes effect
+                // between turns.
                 let shared = handle.model.clone();
                 let timeouts = params.timeouts;
                 move |mut model: Model| {
@@ -5063,13 +5063,18 @@ mod tests {
                 Model::from_spec(OFFLINE_SPEC).unwrap(),
             );
 
-            handle_prompt(
+            let prompt_result = handle_prompt(
                 &mut srv,
                 &prompt_request(&new_id, "new primary", false),
                 &RequestId::Number(82),
             )
-            .await
-            .unwrap();
+            .await;
+            assert!(
+                prompt_result.is_ok(),
+                "prompt after provider initialization must be admitted; {}",
+                lifecycle_state(&srv)
+            );
+
             let started = std::time::Instant::now();
             let terminal = smol::future::or(
                 async {

@@ -592,7 +592,10 @@ fn spawn_agent_internal(
     drop(selected);
     let root = manager
         .create_root_with_config(
-            Some(initial_settings),
+            Some(maki_agent::actor::EffectiveAgentConfig::new(
+                initial_settings,
+                maki_agent::AgentMode::Build,
+            )),
             initial_history.clone(),
             Some(Arc::clone(&shared_history)),
             |agent_id| {

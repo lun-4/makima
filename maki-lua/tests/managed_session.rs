@@ -533,14 +533,17 @@ impl ActorBackend for SpawnManagedChildBackend {
     }
 }
 
-fn parent_policy(context: &ToolContext) -> RunSettings {
-    RunSettings {
-        provider: Arc::clone(&context.provider),
-        model: (*context.model).clone(),
-        fast: false,
-        workflow: context.workflow,
-        thinking: Default::default(),
-    }
+fn parent_policy(context: &ToolContext) -> maki_agent::actor::EffectiveAgentConfig {
+    maki_agent::actor::EffectiveAgentConfig::new(
+        RunSettings {
+            provider: Arc::clone(&context.provider),
+            model: (*context.model).clone(),
+            fast: false,
+            workflow: context.workflow,
+            thinking: Default::default(),
+        },
+        AgentMode::Build,
+    )
 }
 
 fn task_input() -> Value {
@@ -564,7 +567,7 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
 
 async fn spawn_managed_parent(
     manager: &AgentManagerHandle,
-    policy: RunSettings,
+    policy: maki_agent::actor::EffectiveAgentConfig,
     child_backend: Box<dyn ActorBackend>,
 ) -> (AgentRef, TurnTicket) {
     let (child_tx, child_rx) = flume::bounded(1);

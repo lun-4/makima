@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::manager::{CurrentManagedTurn, ManagerInner};
 use crate::types::{AgentId, TurnId, TurnOutcome};
-use crate::{InterruptSource, RunSettings};
+use crate::{AgentMode, InterruptSource, RunSettings};
 
 #[derive(Clone)]
 pub(crate) struct ManagedTurnAdmission {
@@ -18,8 +18,26 @@ pub(crate) struct ManagedTurnAdmission {
     pub(crate) mode_ceiling: Option<crate::AgentMode>,
 }
 
-/// The actor's immutable per-admission settings shape.
-pub type EffectiveAgentConfig = RunSettings;
+/// The actor's immutable per-admission configuration snapshot.
+#[derive(Clone)]
+pub struct EffectiveAgentConfig {
+    pub settings: RunSettings,
+    pub mode: AgentMode,
+}
+
+impl EffectiveAgentConfig {
+    pub fn new(settings: RunSettings, mode: AgentMode) -> Self {
+        Self { settings, mode }
+    }
+}
+
+impl std::ops::Deref for EffectiveAgentConfig {
+    type Target = RunSettings;
+
+    fn deref(&self) -> &Self::Target {
+        &self.settings
+    }
+}
 
 impl ManagedTurnAdmission {
     pub(crate) fn new(
@@ -213,8 +231,9 @@ pub struct ActorSnapshot {
 /// Captures the external state pinned to an admission. The actor always calls
 /// this before taking its state lock, so implementations may perform blocking
 /// work but must tolerate the actor closing before the prepared snapshot commits.
-pub type AdmissionPreparation =
-    Arc<dyn Fn(&crate::AgentInput) -> crate::agent::TurnAdmissionSnapshot + Send + Sync>;
+pub type AdmissionPreparation = Arc<
+    dyn Fn(&crate::AgentInput, &AgentMode) -> crate::agent::TurnAdmissionSnapshot + Send + Sync,
+>;
 
 pub trait ActorBackend: Send {
     fn admission_preparation(&self) -> Option<AdmissionPreparation> {

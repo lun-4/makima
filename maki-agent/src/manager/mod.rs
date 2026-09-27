@@ -40,7 +40,7 @@ static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 type RunnerTask = smol::Task<()>;
 
 struct CommitPolicy {
-    config: Option<crate::RunSettings>,
+    config: Option<crate::actor::EffectiveAgentConfig>,
     ceiling: Option<crate::RunSettings>,
     mode_ceiling: Option<crate::AgentMode>,
 }
@@ -314,13 +314,17 @@ impl AgentManagerHandle {
         let inherited_config = current.policy_snapshot().ok_or_else(|| {
             ManagerError::Policy("child delegation requires a parent policy snapshot".into())
         })?;
-        let inherited_config = Some(crate::RunSettings {
-            provider: Arc::clone(&inherited_config.provider),
-            model: inherited_config.model.clone(),
-            fast: inherited_config.fast,
-            workflow: inherited_config.workflow,
-            thinking: inherited_config.thinking,
-        });
+        let inherited_config = crate::actor::EffectiveAgentConfig::new(
+            crate::RunSettings {
+                provider: Arc::clone(&inherited_config.provider),
+                model: inherited_config.model.clone(),
+                fast: inherited_config.fast,
+                workflow: inherited_config.workflow,
+                thinking: inherited_config.thinking,
+            },
+            parent_mode.clone(),
+        );
+        let inherited_config = Some(inherited_config);
         let child_id = AgentId::generate();
         let reservation = {
             let mut graph = self.lock_graph();
@@ -425,7 +429,9 @@ impl AgentManagerHandle {
             backend,
             CommitPolicy {
                 config: inherited_config.clone(),
-                ceiling: inherited_config,
+                ceiling: inherited_config
+                    .as_ref()
+                    .map(|config| config.settings.clone()),
                 mode_ceiling: Some(parent_mode),
             },
         )

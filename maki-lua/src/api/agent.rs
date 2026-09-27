@@ -273,15 +273,15 @@ impl Drop for LuaActorBackend {
 impl ActorBackend for LuaActorBackend {
     fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
         let state = Arc::clone(&self.state);
-        Some(Arc::new(move |input| {
+        Some(Arc::new(move |_input, mode| {
             let params = state
                 .params
                 .get()
                 .expect("session parameters initialized before admission");
-            let mode_def = if input.mode == state.mode {
-                state.mode_def.clone().or_else(|| match &input.mode {
+            let mode_def = if *mode == state.mode {
+                state.mode_def.clone().or_else(|| match mode {
                     AgentMode::Custom(id) => params.modes.get(id).map(Arc::new),
-                    _ => Some(Arc::new(params.modes.current(&input.mode))),
+                    _ => Some(Arc::new(params.modes.current(mode))),
                 })
             } else {
                 None
@@ -1119,7 +1119,8 @@ async fn session(
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
     let initial_tools = RequestTools::assembled(tools_json.clone(), &agent_ctx.config, &model);
-    let child_mode = if restrictive_parent {
+    let inherit_parent_mode = restrictive_parent || matches!(&parent_mode, AgentMode::Custom(_));
+    let child_mode = if inherit_parent_mode {
         let mut child_ctx = agent_ctx.to_tool_context();
         child_ctx.audience = audience;
         child_ctx.tool_filter = Arc::clone(initial_tools.filter());
@@ -1182,7 +1183,7 @@ async fn session(
         tools,
         opts,
         mode: child_mode,
-        mode_def: restrictive_parent
+        mode_def: inherit_parent_mode
             .then(|| agent_ctx.mode_def.clone())
             .flatten(),
         mcp: agent_ctx
@@ -2714,7 +2715,7 @@ mod tests {
             Vec::new(),
             Default::default(),
         );
-        let admitted = prepare(&input);
+        let admitted = prepare(&input, &input.mode);
         modes
             .define(maki_agent::ModeDefSpec {
                 name: "build".into(),
@@ -2727,7 +2728,7 @@ mod tests {
             Some("before")
         );
         assert_eq!(
-            prepare(&input)
+            prepare(&input, &input.mode)
                 .mode_def
                 .as_ref()
                 .unwrap()

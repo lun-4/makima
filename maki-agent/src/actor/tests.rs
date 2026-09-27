@@ -422,7 +422,7 @@ fn admission_preparation_does_not_hold_actor_state_lock() {
     let (entered_tx, entered_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
     let mut backend = ScriptedBackend::new();
-    backend.preparation = Some(Arc::new(move |_| {
+    backend.preparation = Some(Arc::new(move |_, _| {
         entered_tx.send(()).unwrap();
         release_rx.recv().unwrap();
         crate::agent::TurnAdmissionSnapshot {
@@ -468,8 +468,8 @@ fn queued_turn_keeps_admitted_mode_and_tool_binding() {
         backend.preparation = Some(Arc::new({
             let modes = Arc::clone(&modes);
             let registry = Arc::clone(&registry);
-            move |input| crate::agent::TurnAdmissionSnapshot {
-                mode_def: Some(Arc::new(modes.current(&input.mode))),
+            move |_, mode| crate::agent::TurnAdmissionSnapshot {
+                mode_def: Some(Arc::new(modes.current(mode))),
                 prompt_inputs: None,
                 bindings: Arc::new(crate::tools::TurnToolBindings::capture(
                     &registry,

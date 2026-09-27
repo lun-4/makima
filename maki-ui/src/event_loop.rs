@@ -2758,6 +2758,7 @@ impl<'t> EventLoop<'t> {
                 return;
             }
         };
+        self.note_if_deferred(idx, "thinking");
         let coordinator = self.sessions[idx].coordinator.clone();
         let value = resolved.to_string();
         self.dispatch_session_op(
@@ -2805,6 +2806,15 @@ impl<'t> EventLoop<'t> {
                 return;
             }
         };
+        if spec.is_some() {
+            self.note_if_deferred(idx, "model");
+        }
+        if thinking.is_some() {
+            self.note_if_deferred(idx, "thinking");
+        }
+        if fast.is_some() {
+            self.note_if_deferred(idx, "fast");
+        }
         let coordinator = self.sessions[idx].coordinator.clone();
         let op_spec = spec.as_deref().map(Arc::from);
         self.dispatch_session_op(
@@ -3215,6 +3225,9 @@ impl<'t> EventLoop<'t> {
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
             Action::ToggleSessionOption { id } => {
+                if id == FAST_OPTION_ID {
+                    self.note_if_deferred(idx, "fast");
+                }
                 dispatch_option_toggle(
                     self.sessions[idx].coordinator.clone(),
                     Arc::clone(&self.sessions[idx].model_slot),
@@ -3549,6 +3562,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn change_model(&mut self, idx: usize, spec: &str) {
+        self.note_if_deferred(idx, "model");
         let coordinator = self.sessions[idx].coordinator.clone();
         let spec = spec.to_owned();
         let op_spec = spec.clone();
