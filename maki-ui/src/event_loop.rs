@@ -2824,6 +2824,10 @@ impl<'t> EventLoop<'t> {
                         let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
                         return;
                     }
+                    if self.sessions[i].pending_plan_transitions != 0 {
+                        let _ = reply_tx.send(Err(PENDING_MODEL_REPLACEMENT_ERR.into()));
+                        return;
+                    }
                     let rt = self.remove_runtime(i);
                     let coordinator = rt.coordinator.clone();
                     rt.handles.shutdown().detach();
@@ -3532,6 +3536,9 @@ impl<'t> EventLoop<'t> {
                 if self.sessions[idx].plan_finalized_rollback.is_some()
                     || model.is_some() && self.sessions[idx].pending_plan_transitions != 0
                 {
+                    self.sessions[idx]
+                        .app
+                        .flash(PENDING_MODEL_REPLACEMENT_ERR.into());
                     return;
                 }
                 let Some((approval_id, active)) = self.sessions[idx].app.begin_plan_approval()
@@ -5505,6 +5512,68 @@ mod tests {
     }
 
     #[test]
+    fn pending_plan_transition_blocks_background_session_deletion() {
+        let mut harness = RuntimeHarness::new();
+        let focused = harness.runtime(harness.session());
+        let mut background = harness.runtime(harness.session());
+        background.pending_plan_transitions = 1;
+        let background_id = background.id();
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![focused, background],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        loop_state.handle_session_request(
+            SessionRequest::Delete {
+                id: background_id.to_string(),
+            },
+            reply_tx,
+        );
+        assert_eq!(
+            reply_rx.recv().unwrap(),
+            Err(PENDING_MODEL_REPLACEMENT_ERR.into())
+        );
+        assert_eq!(loop_state.sessions.len(), 2);
+        assert_eq!(loop_state.sessions[1].id(), background_id);
+        let background = loop_state.sessions.remove(1);
+        let focused = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(background);
+        release_runtime(focused);
+    }
+
+    #[test]
     fn failed_runtime_claim_cannot_rewrite_session() {
         const OWNER_CONTENT: &str = "written by lock owner";
         const LOSER_CONTENT: &str = "stale losing snapshot";
@@ -6044,8 +6113,12 @@ mod tests {
                 0,
                 Action::ImplementPlan {
                     clear_context: false,
-                    model: None,
+                    model: Some(SELECTED_MODEL.into()),
                 },
+            );
+            assert_eq!(
+                loop_state.sessions[0].app.status_bar.flash_text(),
+                Some(PENDING_MODEL_REPLACEMENT_ERR)
             );
             assert_eq!(
                 loop_state.sessions[0].app.state.mode,
@@ -6704,6 +6777,17 @@ mod tests {
                         .status_bar
                         .flash_text()
                         .is_some_and(|text| text.contains(ROLLBACK_FAILURE))
+                );
+                loop_state.handle_action(
+                    0,
+                    Action::ImplementPlan {
+                        clear_context: false,
+                        model: Some(IMPLEMENTATION_MODEL.into()),
+                    },
+                );
+                assert_eq!(
+                    loop_state.sessions[0].app.status_bar.flash_text(),
+                    Some(PENDING_MODEL_REPLACEMENT_ERR)
                 );
                 fail_rollback.store(false, Ordering::SeqCst);
                 loop_state.sessions[0]

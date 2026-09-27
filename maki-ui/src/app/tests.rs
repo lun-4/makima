@@ -9989,6 +9989,20 @@ fn plan_form_renders_implementation_model() {
 }
 
 #[test]
+fn plan_form_renders_selected_implementation_model() {
+    let mut app = plan_app();
+    let default_height = app.plan_form.height();
+    app.plan_form
+        .set_implementation_model("zai/glm-5".into(), "anthropic/test-model");
+    let text = rendered_area(&mut app).join("\n");
+    assert!(text.contains("Implementation model: zai/glm-5  selected"));
+    assert!(text.contains("Use current model"));
+    assert_eq!(app.plan_form.height(), default_height + 1);
+    let (_msg, bottom, _status, _input, _splits) = app.layout_geometry(RENDER_AREA);
+    assert_eq!(bottom.height, default_height + 1);
+}
+
+#[test]
 fn plan_form_reset_implementation_model_uses_current_model() {
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec!["zai/glm-5".into()])));

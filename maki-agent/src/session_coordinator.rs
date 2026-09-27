@@ -5323,6 +5323,68 @@ mod tests {
         });
     }
 
+    #[test_case(FAST_OPTION_ID, DISABLED_VALUE ; "fast")]
+    #[test_case(THINKING_OPTION_ID, "off" ; "thinking")]
+    fn finalized_model_rollback_preserves_same_value_selection(setting: &str, value: &str) {
+        smol::block_on(async {
+            const PREVIOUS: &str = "anthropic/claude-opus-4-8";
+            const TARGET: &str = "ollama/llama3";
+            let mut params = params(MakiId::generate(), writer(false));
+            params.model = Arc::from(PREVIOUS);
+            params.definitions = builtin_option_definitions(
+                PREVIOUS,
+                [Arc::from(PREVIOUS)],
+                false,
+                true,
+                false,
+                ThinkingConfig::Effort(maki_providers::Effort::High),
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let receipt = coordinator
+                .set_model_if_active(Arc::from(TARGET), Arc::new(AtomicBool::new(true)))
+                .await
+                .unwrap();
+            assert!(
+                coordinator
+                    .finalize_model_if_active(receipt.clone())
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                current_option_value(&coordinator.read(), setting).as_deref(),
+                Some(value)
+            );
+            coordinator.set_option(setting, value).await.unwrap();
+            assert_eq!(
+                coordinator
+                    .rollback_finalized_model_if_version(receipt)
+                    .await
+                    .unwrap(),
+                FinalizedModelRollback::Applied
+            );
+            assert_eq!(coordinator.read().model().as_ref(), PREVIOUS);
+            assert_eq!(
+                current_option_value(&coordinator.read(), setting).as_deref(),
+                Some(value)
+            );
+            let other = if setting == FAST_OPTION_ID {
+                THINKING_OPTION_ID
+            } else {
+                FAST_OPTION_ID
+            };
+            let restored = if other == FAST_OPTION_ID {
+                ENABLED_VALUE
+            } else {
+                "high"
+            };
+            assert_eq!(
+                current_option_value(&coordinator.read(), other).as_deref(),
+                Some(restored)
+            );
+            coordinator.close().await.unwrap();
+        });
+    }
+
     #[test]
     fn finalized_model_rollback_skips_newer_same_spec_selection() {
         smol::block_on(async {

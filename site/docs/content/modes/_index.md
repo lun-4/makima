@@ -115,8 +115,10 @@ maki.setup({
    model calls `plan_submit` explicitly when the plan is ready. The review form
    shows the current implementation model as a selectable row. Press `Ctrl+M`
    or select that row to search for another model. A choice is staged without
-   changing the active model or recents; Escape cancels it. Approving the plan
-   applies the selected model and keeps it as the session model.
+   changing the active model or recents. When a different model is selected,
+   the "Use current model" row removes the choice. Escape closes the model
+   picker without removing a staged choice. Approving the plan applies the
+   selected model and keeps it as the session model.
 
 The built-in `task` tool grows a `plan_reviewer` subagent type when the plan
 override is active: a read-only audit that verifies the plan follows the shared
