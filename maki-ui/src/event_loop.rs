@@ -3817,22 +3817,33 @@ fn dispatch_option_toggle(
     let committed: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
     let slot = Arc::clone(&committed);
     let internal_tx = internal_tx.clone();
-    let reservation = actor
-        .0
-        .actor(actor.1)
-        .map_err(|error| error.to_string())
-        .and_then(|actor| {
-            actor
-                .reserve_policy_update()
-                .map_err(|error| error.to_string())
-        });
-    let (previous, next) = sequence.reserve();
+    let reservation = if matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID) {
+        actor
+            .0
+            .actor(actor.1)
+            .map_err(|error| error.to_string())
+            .and_then(|actor| {
+                actor
+                    .reserve_policy_update()
+                    .map_err(|error| error.to_string())
+            })
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    let sequence = matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID)
+        .then(|| sequence.reserve());
     smol::spawn(async move {
-        if let Some(previous) = previous {
-            let _ = previous.recv_async().await;
-        }
+        let next = if let Some((previous, next)) = sequence {
+            if let Some(previous) = previous {
+                let _ = previous.recv_async().await;
+            }
+            Some(next)
+        } else {
+            None
+        };
         let result = match reservation {
-            Ok(reservation) => match coordinator.toggle_boolean_option(id).await {
+            Ok(Some(reservation)) => match coordinator.toggle_boolean_option(id).await {
                 Ok((enabled, _)) => {
                     *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
                     match reservation
@@ -3847,6 +3858,13 @@ fn dispatch_option_toggle(
                     Err(error.to_string())
                 }
             },
+            Ok(None) => coordinator
+                .toggle_boolean_option(id)
+                .await
+                .map(|(enabled, _)| {
+                    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
+                })
+                .map_err(|error| error.to_string()),
             Err(error) => Err(error),
         };
         drop(next);
