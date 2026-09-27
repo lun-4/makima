@@ -287,11 +287,20 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
         *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
         if let Ok(policy) = result {
-            state.policy_generation = state.policy_generation.wrapping_add(1);
-            state.policy = Some(Arc::new(policy));
-            inner.queue.push(ActorWork::PolicyBarrier {
-                generation: state.policy_generation,
+            let changed = state.policy.as_ref().is_none_or(|current| {
+                !Arc::ptr_eq(&current.provider, &policy.provider)
+                    || current.model.spec() != policy.model.spec()
+                    || current.fast != policy.fast
+                    || current.workflow != policy.workflow
+                    || current.thinking != policy.thinking
             });
+            if changed {
+                state.policy_generation = state.policy_generation.wrapping_add(1);
+                state.policy = Some(Arc::new(policy));
+                inner.queue.push(ActorWork::PolicyBarrier {
+                    generation: state.policy_generation,
+                });
+            }
         }
         while state
             .deferred_admissions
@@ -1084,10 +1093,6 @@ impl AgentActorHandle {
     pub fn cancel_existing(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
-        for pending in &mut state.pending_policy {
-            pending.result = Some(Err(ActorError::PolicyCancelled));
-        }
-        flush_policy_updates(&self.inner, &mut state);
         let deferred = state.deferred_admissions.drain(..).collect::<Vec<_>>();
         let active = state.active.take();
         let drained = self.inner.queue.drain_all();

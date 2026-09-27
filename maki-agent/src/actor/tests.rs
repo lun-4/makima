@@ -1246,6 +1246,23 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
 }
 
 #[test]
+fn no_op_policy_update_keeps_generation() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let (handle, task) = spawn(backend);
+        let unchanged = policy(false);
+        handle.update_policy(unchanged.clone()).unwrap();
+        let before = handle.inner.state.lock().unwrap().policy_generation;
+        let reservation = handle.reserve_policy_update().unwrap();
+        reservation.resolve(Ok(unchanged)).unwrap();
+        reservation.wait().await.unwrap();
+        assert_eq!(handle.inner.state.lock().unwrap().policy_generation, before);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn reserved_policy_orders_admissions_and_failed_updates() {
     smol::block_on(async {
         let gate = Gate::new();
@@ -1285,7 +1302,7 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
 }
 
 #[test]
-fn overlapping_reservations_commit_fifo_and_cancel_wakes_waiter() {
+fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
@@ -1308,7 +1325,8 @@ fn overlapping_reservations_commit_fifo_and_cancel_wakes_waiter() {
             .admit_turn(input("cancelled"), None, "cancelled".into())
             .unwrap();
         handle.cancel_existing();
-        assert_eq!(pending.wait().await, Err(ActorError::PolicyCancelled));
+        pending.resolve(Ok(policy(true))).unwrap();
+        pending.wait().await.unwrap();
         assert!(matches!(
             cancelled.wait().await,
             TurnOutcome::Cancelled { .. }
@@ -1321,6 +1339,36 @@ fn overlapping_reservations_commit_fifo_and_cancel_wakes_waiter() {
             pending.resolve(Ok(policy(false))),
             Err(ActorError::PolicyCancelled)
         );
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn cancel_existing_does_not_cancel_pending_policy_updates() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        handle.update_policy(policy(false)).unwrap();
+        let pending = handle.reserve_policy_update().unwrap();
+        let deferred = handle
+            .admit_turn(input("deferred"), None, "deferred".into())
+            .unwrap();
+
+        handle.cancel_existing();
+        pending.resolve(Ok(policy(true))).unwrap();
+        pending.wait().await.unwrap();
+        assert!(matches!(
+            deferred.wait().await,
+            TurnOutcome::Cancelled { .. }
+        ));
+
+        let next = handle
+            .admit_turn(input("next"), None, "next".into())
+            .unwrap();
+        next.wait().await;
+        assert_eq!(state.policies.lock().unwrap()[0].2, 2);
         handle.close();
         task.await;
     });
