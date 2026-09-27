@@ -147,6 +147,7 @@ fn next_provider_instance() -> ProviderInstanceGeneration {
 pub(crate) struct ProviderSlot {
     current: ArcSwap<ProviderSnapshot>,
     committed: ArcSwapOption<ProviderSnapshot>,
+    independent: std::sync::Mutex<Option<(u64, Arc<ProviderSnapshot>)>>,
     change_tx: flume::Sender<ProviderChange>,
 }
 
@@ -179,6 +180,7 @@ impl ProviderSlot {
                 provider: tracked,
             }),
             committed: ArcSwapOption::empty(),
+            independent: std::sync::Mutex::new(None),
             change_tx,
         })
     }
@@ -195,13 +197,21 @@ impl ProviderSlot {
         self.committed.store(None);
     }
 
-    pub(crate) fn commit_independent_model(&self, spec: &str) {
+    pub(crate) fn commit_independent_model(&self, spec: &str, revision: u64) {
         if self.committed.load().is_some() {
-            let current = self.current.load_full();
-            if current.model.spec() == spec {
-                self.committed.store(Some(current));
+            let independent = self.independent.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((recorded, snapshot)) = independent.as_ref()
+                && *recorded == revision
+                && snapshot.model.spec() == spec
+            {
+                self.committed.store(Some(Arc::clone(snapshot)));
             }
         }
+    }
+
+    pub(crate) fn record_independent_model(&self, revision: u64) {
+        let snapshot = self.current.load_full();
+        *self.independent.lock().unwrap_or_else(|e| e.into_inner()) = Some((revision, snapshot));
     }
 
     pub(crate) fn committed(&self) -> Arc<ProviderSnapshot> {
@@ -802,7 +812,8 @@ mod tests {
         candidate.id = CANDIDATE_MODEL.into();
         slot.install(candidate, Arc::new(StubProvider));
         assert_ne!(slot.committed().model.spec(), CANDIDATE_SPEC);
-        slot.commit_independent_model(CANDIDATE_SPEC);
+        slot.record_independent_model(1);
+        slot.commit_independent_model(CANDIDATE_SPEC, 1);
         assert_eq!(slot.committed().model.spec(), CANDIDATE_SPEC);
     }
 

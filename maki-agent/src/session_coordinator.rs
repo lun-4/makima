@@ -199,6 +199,8 @@ where
 
 pub trait ModelAdopter: Send + Sync {
     fn adopt(&self, model: Model) -> ModelAdoptionFuture;
+
+    fn committed(&self, _revision: u64) {}
 }
 
 impl<F> ModelAdopter for F
@@ -2306,6 +2308,7 @@ async fn set_model(
         let mut state = lock(&read.state);
         if selects_model {
             state.model_revision += 1;
+            model_adopter.committed(state.model_revision);
         }
         if fast.is_some() {
             state.fast_revision += 1;
@@ -2351,6 +2354,7 @@ async fn set_model(
             let mut state = lock(&read.state);
             if selects_model {
                 state.model_revision += 1;
+                model_adopter.committed(state.model_revision);
             }
             if fast.is_some() {
                 state.fast_revision += 1;

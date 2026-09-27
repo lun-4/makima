@@ -27,9 +27,9 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_coordinator::{
-    DirectoryAdoptionFuture, ModelAdoptionFuture, ModelAdoptionReceipt, PreparedSessionCoordinator,
-    SessionCoordinatorError, SessionCoordinatorHandle, SessionCoordinatorParams,
-    builtin_option_definitions,
+    DirectoryAdoptionFuture, ModelAdopter, ModelAdoptionFuture, ModelAdoptionReceipt,
+    PreparedSessionCoordinator, SessionCoordinatorError, SessionCoordinatorHandle,
+    SessionCoordinatorParams, builtin_option_definitions,
 };
 use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
@@ -1062,6 +1062,28 @@ fn register_coordinator_with_mailbox<H: CoordinatorHandles>(
     .map_err(|error| eyre!(error))
 }
 
+struct SlotModelAdopter {
+    slot: Arc<ProviderSlot>,
+    timeouts: Timeouts,
+}
+
+impl ModelAdopter for SlotModelAdopter {
+    fn adopt(&self, mut model: Model) -> ModelAdoptionFuture {
+        let slot = Arc::clone(&self.slot);
+        let timeouts = self.timeouts;
+        Box::pin(async move {
+            let provider =
+                from_model(&mut model, timeouts).map_err(|error| Arc::from(error.to_string()))?;
+            slot.install(model, Arc::from(provider));
+            Ok(())
+        })
+    }
+
+    fn committed(&self, revision: u64) {
+        self.slot.record_independent_model(revision);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
     deps: &CoordinatorDeps,
@@ -1092,18 +1114,9 @@ fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
         model: Arc::from(model_spec.as_str()),
         cwd: PathBuf::from(&session.cwd),
         model_policy: Arc::clone(&deps.model_policy),
-        model_adopter: Arc::new({
-            let model_slot = Arc::clone(model_slot);
-            let timeouts = deps.timeouts;
-            move |mut model: Model| {
-                let model_slot = Arc::clone(&model_slot);
-                Box::pin(async move {
-                    let provider = from_model(&mut model, timeouts)
-                        .map_err(|error| Arc::from(error.to_string()))?;
-                    model_slot.install(model, Arc::from(provider));
-                    Ok(())
-                }) as ModelAdoptionFuture
-            }
+        model_adopter: Arc::new(SlotModelAdopter {
+            slot: Arc::clone(model_slot),
+            timeouts: deps.timeouts,
         }),
         directory_adopter: Arc::new({
             let cwd = handles.cwd_slot();
@@ -1370,8 +1383,9 @@ enum InternalEvent {
     /// finished. See [`SessionOpKind`] for why they cannot run inline.
     SessionOp {
         session: MakiId,
+        generation: u64,
         kind: SessionOpKind,
-        result: Result<(), String>,
+        result: Result<Option<SessionOpCommit>, String>,
     },
     PlanModelSettled {
         session: MakiId,
@@ -1420,6 +1434,11 @@ enum InternalEvent {
 /// question), the wait is circular and the process hangs unkillably. So the
 /// operation is dispatched, the loop keeps rendering, and the follow-up work
 /// named here runs when the result comes back.
+struct SessionOpCommit {
+    version: u64,
+    model_revision: Option<u64>,
+}
+
 enum SessionOpKind {
     /// `/model` from a keybinding or command: apply the adopted model.
     ModelChanged { spec: String },
@@ -1952,9 +1971,10 @@ impl<'t> EventLoop<'t> {
             }
             InternalEvent::SessionOp {
                 session,
+                generation,
                 kind,
                 result,
-            } => self.handle_session_op(session, kind, result),
+            } => self.handle_session_op(session, generation, kind, result),
             event @ InternalEvent::PlanModelChanged { .. } => self.handle_plan_model_changed(event),
             InternalEvent::PlanModelRecovered {
                 session,
@@ -2983,7 +3003,12 @@ impl<'t> EventLoop<'t> {
                         value.as_str(),
                     )
                     .await
-                    .map(|_| ())
+                    .map(|options| {
+                        Some(SessionOpCommit {
+                            version: options.version,
+                            model_revision: None,
+                        })
+                    })
                     .map_err(|error| error.to_string())
             },
         );
@@ -3018,6 +3043,7 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].app.invalidate_plan_approval();
         }
         let coordinator = self.sessions[idx].coordinator.clone();
+        let selects_model = spec.is_some();
         let op_spec = spec.as_deref().map(Arc::from);
         self.dispatch_session_op(
             idx,
@@ -3028,11 +3054,14 @@ impl<'t> EventLoop<'t> {
                 reply_tx,
             },
             async move {
-                coordinator
+                let options = coordinator
                     .set_model(op_spec, fast, thinking)
                     .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(SessionOpCommit {
+                    version: options.version,
+                    model_revision: selects_model.then(|| coordinator.read().model_revision()),
+                }))
             },
         );
     }
@@ -3467,6 +3496,7 @@ impl<'t> EventLoop<'t> {
             Action::ToggleSessionOption { id } => dispatch_option_toggle(
                 self.sessions[idx].coordinator.clone(),
                 self.sessions[idx].id(),
+                self.sessions[idx].generation,
                 id,
                 &self.internal_tx,
             ),
@@ -3484,7 +3514,7 @@ impl<'t> EventLoop<'t> {
                             .await
                             .map_err(|error| error.to_string())?;
                         *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(canonical);
-                        Ok(())
+                        Ok(None)
                     },
                 );
             }
@@ -3622,14 +3652,16 @@ impl<'t> EventLoop<'t> {
     /// [`InternalEvent::SessionOp`]. See [`SessionOpKind`] for why.
     fn dispatch_session_op<F>(&self, idx: usize, kind: SessionOpKind, op: F)
     where
-        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+        F: std::future::Future<Output = Result<Option<SessionOpCommit>, String>> + Send + 'static,
     {
         let session = self.sessions[idx].id();
+        let generation = self.sessions[idx].generation;
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
             let result = op.await;
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
+                generation,
                 kind,
                 result,
             });
@@ -3651,11 +3683,14 @@ impl<'t> EventLoop<'t> {
     fn handle_session_op(
         &mut self,
         session: MakiId,
+        generation: u64,
         kind: SessionOpKind,
-        result: Result<(), String>,
+        result: Result<Option<SessionOpCommit>, String>,
     ) {
-        // The tab may have been closed or reordered while the operation ran.
-        let Some(idx) = self.position(session) else {
+        let Some(idx) = self
+            .position(session)
+            .filter(|&idx| self.sessions[idx].generation == generation)
+        else {
             match kind {
                 SessionOpKind::ModelSet { reply_tx, .. }
                 | SessionOpKind::ThinkingSet { reply_tx, .. } => {
@@ -3665,18 +3700,24 @@ impl<'t> EventLoop<'t> {
             }
             return;
         };
+        let current_version = self.sessions[idx].coordinator.read().options().version;
         match kind {
             SessionOpKind::ModelChanged { spec } => match result {
-                Ok(()) => {
-                    self.sessions[idx]
-                        .model_slot
-                        .commit_independent_model(&spec);
-                    self.apply_model_change(idx, &spec);
+                Ok(Some(commit)) if commit.version == current_version => {
+                    if let Some(revision) = commit.model_revision
+                        && revision == self.sessions[idx].coordinator.read().model_revision()
+                    {
+                        self.sessions[idx]
+                            .model_slot
+                            .commit_independent_model(&spec, revision);
+                        self.apply_model_change(idx, &spec);
+                    }
                 }
+                Ok(_) => {}
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::OptionToggled { id, committed } => match result {
-                Ok(()) => {
+                Ok(_) => {
                     let enabled = committed
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
@@ -3688,7 +3729,7 @@ impl<'t> EventLoop<'t> {
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::DirectoryChanged { adopted } => match result {
-                Ok(()) => {
+                Ok(_) => {
                     let adopted = adopted.lock().unwrap_or_else(|e| e.into_inner()).take();
                     if let Some(path) = adopted {
                         self.sessions[idx].app.apply_directory_change(path);
@@ -3701,7 +3742,15 @@ impl<'t> EventLoop<'t> {
                 set_default,
                 reply_tx,
             } => {
-                let reply = result.and_then(|()| {
+                let reply = result.and_then(|commit| {
+                    if commit
+                        .as_ref()
+                        .is_some_and(|commit| commit.version != current_version)
+                    {
+                        return Ok(
+                            json!({ "mode": self.sessions[idx].app.state.thinking.to_string() }),
+                        );
+                    }
                     if set_default {
                         write_prefs(
                             &self.ctx.storage,
@@ -3725,16 +3774,25 @@ impl<'t> EventLoop<'t> {
                 fast,
                 reply_tx,
             } => {
-                let reply = result.and_then(|()| {
-                    if let Some(spec) = &spec {
-                        self.sessions[idx].model_slot.commit_independent_model(spec);
-                        self.apply_model_change(idx, spec);
-                    }
-                    if let Some(thinking) = thinking {
-                        self.sessions[idx].app.state.thinking = thinking;
-                    }
-                    if let Some(fast) = fast {
-                        self.sessions[idx].app.set_fast(fast)?;
+                let reply = result.and_then(|commit| {
+                    if let Some(commit) = commit
+                        && commit.version == current_version
+                    {
+                        if let Some(spec) = &spec
+                            && let Some(revision) = commit.model_revision
+                            && revision == self.sessions[idx].coordinator.read().model_revision()
+                        {
+                            self.sessions[idx]
+                                .model_slot
+                                .commit_independent_model(spec, revision);
+                            self.apply_model_change(idx, spec);
+                        }
+                        if let Some(thinking) = thinking {
+                            self.sessions[idx].app.state.thinking = thinking;
+                        }
+                        if let Some(fast) = fast {
+                            self.sessions[idx].app.set_fast(fast)?;
+                        }
                     }
                     Ok(self.sessions[idx].app.model_state())
                 });
@@ -3915,11 +3973,14 @@ impl<'t> EventLoop<'t> {
         let spec = spec.to_owned();
         let op_spec = spec.clone();
         self.dispatch_session_op(idx, SessionOpKind::ModelChanged { spec }, async move {
-            coordinator
+            let options = coordinator
                 .set_option("model", op_spec.as_str())
                 .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            Ok(Some(SessionOpCommit {
+                version: options.version,
+                model_revision: Some(coordinator.read().model_revision()),
+            }))
         });
     }
 
@@ -4288,6 +4349,7 @@ fn plan_model_approval(
 fn dispatch_option_toggle(
     coordinator: SessionCoordinatorHandle,
     session: MakiId,
+    generation: u64,
     id: &'static str,
     internal_tx: &flume::Sender<InternalEvent>,
 ) {
@@ -4300,10 +4362,12 @@ fn dispatch_option_toggle(
             .await
             .map(|(enabled, _)| {
                 *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
+                None
             })
             .map_err(|error| error.to_string());
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
+            generation,
             kind: SessionOpKind::OptionToggled { id, committed },
             result,
         });
@@ -4358,12 +4422,14 @@ mod tests {
             dispatch_option_toggle(
                 coordinator.clone(),
                 id,
+                1,
                 maki_agent::session_options::YOLO_OPTION_ID,
                 &internal_tx,
             );
             dispatch_option_toggle(
                 coordinator.clone(),
                 id,
+                1,
                 maki_agent::session_options::YOLO_OPTION_ID,
                 &internal_tx,
             );
@@ -4372,6 +4438,7 @@ mod tests {
             for _ in 0..2 {
                 let InternalEvent::SessionOp {
                     session,
+                    generation,
                     kind:
                         SessionOpKind::OptionToggled {
                             committed: value, ..
@@ -4382,6 +4449,7 @@ mod tests {
                     panic!("expected option toggle completion");
                 };
                 assert_eq!(session, id);
+                assert_eq!(generation, 1);
                 result.unwrap();
                 committed.push(value.lock().unwrap().take().unwrap());
             }
@@ -4921,10 +4989,17 @@ mod tests {
                 spec: COMMITTED.into(),
             }
         };
+        runtime
+            .model_slot
+            .record_independent_model(runtime.coordinator.read().model_revision());
         let delayed = InternalEvent::SessionOp {
             session: id,
+            generation: runtime.generation,
             kind,
-            result: Ok(()),
+            result: Ok(Some(SessionOpCommit {
+                version: runtime.coordinator.read().options().version,
+                model_revision: Some(runtime.coordinator.read().model_revision()),
+            })),
         };
         runtime.model_slot.begin_provisional_model();
         runtime.pending_plan_transitions = 1;
@@ -4943,6 +5018,252 @@ mod tests {
         let runtime = loop_state.sessions.remove(0);
         drop(loop_state);
         release_runtime(runtime);
+    }
+
+    #[test]
+    fn delayed_same_spec_model_result_preserves_committed_provider() {
+        const EARLIER: &str = "anthropic/model-a";
+        const COMMITTED: &str = "anthropic/model-b";
+        let mut harness = RuntimeHarness::new();
+        let runtime = harness.runtime(harness.session());
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        let runtime = &mut loop_state.sessions[0];
+        let id = runtime.id();
+        let generation = runtime.generation;
+        runtime
+            .model_slot
+            .install(model_named("model-a"), Arc::new(StubProvider));
+        let earlier_version = runtime.coordinator.read().options().version;
+        let older = InternalEvent::SessionOp {
+            session: id,
+            generation,
+            kind: SessionOpKind::ModelChanged {
+                spec: EARLIER.into(),
+            },
+            result: Ok(Some(SessionOpCommit {
+                version: earlier_version,
+                model_revision: Some(runtime.coordinator.read().model_revision()),
+            })),
+        };
+        let newer = smol::block_on(
+            runtime
+                .coordinator
+                .set_option(WORKFLOW_OPTION_ID, ENABLED_VALUE),
+        )
+        .unwrap();
+        runtime
+            .model_slot
+            .install(model_named("model-b"), Arc::new(StubProvider));
+        let current_provider = runtime.model_slot.load().provider.identity();
+        let revision = runtime.coordinator.read().model_revision();
+        runtime.model_slot.record_independent_model(revision);
+        runtime.model_slot.begin_provisional_model();
+        runtime.pending_plan_transitions = 1;
+        runtime
+            .model_slot
+            .install(model_named("model-a"), Arc::new(StubProvider));
+        let provisional_provider = runtime.model_slot.load().provider.identity();
+        let newer = InternalEvent::SessionOp {
+            session: id,
+            generation,
+            kind: SessionOpKind::ModelChanged {
+                spec: COMMITTED.into(),
+            },
+            result: Ok(Some(SessionOpCommit {
+                version: newer.version,
+                model_revision: Some(runtime.coordinator.read().model_revision()),
+            })),
+        };
+        loop_state.handle_internal(older);
+        loop_state.handle_internal(newer);
+        let slot = &loop_state.sessions[0].model_slot;
+        assert_eq!(slot.committed().model.spec(), COMMITTED);
+        assert_eq!(slot.committed().provider.identity(), current_provider);
+        assert_ne!(slot.committed().provider.identity(), provisional_provider);
+        assert_eq!(
+            maki_agent::ModelSource::current(&**slot).unwrap().1.spec(),
+            COMMITTED
+        );
+        let runtime = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn reversed_model_set_results_preserve_newer_thinking() {
+        let mut harness = RuntimeHarness::new();
+        let runtime = harness.runtime(harness.session());
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        let runtime = &mut loop_state.sessions[0];
+        let id = runtime.id();
+        let generation = runtime.generation;
+        let older = smol::block_on(runtime.coordinator.set_model(
+            None,
+            Some(false),
+            Some(maki_agent::ThinkingConfig::Off),
+        ))
+        .unwrap();
+        let newer = smol::block_on(runtime.coordinator.set_model(
+            None,
+            Some(false),
+            Some(maki_agent::ThinkingConfig::Adaptive),
+        ))
+        .unwrap();
+        assert!(newer.version > older.version);
+        for (snapshot, thinking, fast) in [
+            (newer, maki_agent::ThinkingConfig::Adaptive, false),
+            (older, maki_agent::ThinkingConfig::Off, false),
+        ] {
+            let (reply_tx, _reply_rx) = flume::bounded(1);
+            loop_state.handle_internal(InternalEvent::SessionOp {
+                session: id,
+                generation,
+                kind: SessionOpKind::ModelSet {
+                    spec: None,
+                    thinking: Some(thinking),
+                    fast: Some(fast),
+                    reply_tx,
+                },
+                result: Ok(Some(SessionOpCommit {
+                    version: snapshot.version,
+                    model_revision: None,
+                })),
+            });
+        }
+        assert_eq!(
+            loop_state.sessions[0].app.state.thinking,
+            DomainThinkingConfig::Adaptive
+        );
+        assert!(!loop_state.sessions[0].app.state.fast);
+        let runtime = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn retired_runtime_completion_does_not_mutate_same_id_replacement() {
+        let mut harness = RuntimeHarness::new();
+        let old = harness.runtime(harness.session());
+        let mut replacement = test_runtime(crate::components::test_model());
+        Arc::make_mut(&mut replacement.app.state.session).id = old.id();
+        let id = old.id();
+        let old_generation = old.generation;
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![replacement],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        let original_cwd = loop_state.sessions[0].app.state.session.cwd.clone();
+        let adopted = Arc::new(std::sync::Mutex::new(Some(PathBuf::from("/stale"))));
+        loop_state.handle_internal(InternalEvent::SessionOp {
+            session: id,
+            generation: old_generation,
+            kind: SessionOpKind::DirectoryChanged { adopted },
+            result: Ok(None),
+        });
+        assert_eq!(loop_state.sessions[0].app.state.session.cwd, original_cwd);
+        let replacement = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(old);
+        release_runtime(replacement);
     }
 
     #[test_case(false ; "replace_session_action")]
