@@ -420,7 +420,6 @@ impl ToolInvocation for LuaToolInvocation {
             return Box::pin(std::future::ready(()));
         };
         let (reply_tx, reply_rx) = flume::bounded::<()>(1);
-        let plan_write_path = ctx.restrict_write_to().map(Arc::from);
         let req = Request::StartTool {
             plugin: Arc::clone(&self.plugin),
             tool: Arc::clone(&self.tool),
@@ -430,7 +429,6 @@ impl ToolInvocation for LuaToolInvocation {
                 tool_use_id: id.clone(),
             },
             ctx: Box::new(LuaCtx::start(ctx)),
-            plan_write_path,
             reply: reply_tx,
             nested: crate::runtime::under_inflight_slot(),
         };
@@ -1029,11 +1027,6 @@ fn register_command(
     #[ctx] plugin: Arc<str>,
     spec: Table,
 ) -> LuaResult<()> {
-    if crate::runtime::restrictive_effects(lua) {
-        return Err(mlua::Error::runtime(
-            "plan mode prohibits command registration",
-        ));
-    }
     register_command_from_lua(lua, &spec, plugin, pending)
 }
 
@@ -1084,11 +1077,6 @@ async fn run_command(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
-    if crate::runtime::restrictive_effects(&lua) {
-        return Ok(crate::api::util::pair::err_pair(
-            "plan mode prohibits slash commands",
-        ));
-    }
     let depth = command_depth(&lua).saturating_add(1);
     let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));
     if let Some(invocation) = command_invocation(&lua) {
@@ -1588,11 +1576,6 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
 }
 
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
-    if crate::runtime::restrictive_effects(lua) {
-        return Err(mlua::Error::runtime(
-            "plan mode prohibits tool registration",
-        ));
-    }
     let name: String = spec
         .get("name")
         .map_err(|_| mlua::Error::runtime("register_tool: missing 'name'"))?;

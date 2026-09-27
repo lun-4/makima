@@ -333,7 +333,6 @@ pub enum Request {
         input: Value,
         live: LiveCtx,
         ctx: Box<LuaCtx>,
-        plan_write_path: Option<Arc<std::path::Path>>,
         reply: flume::Sender<()>,
         /// See [`Request::CallTool::nested`].
         nested: bool,
@@ -539,8 +538,6 @@ pub(crate) struct TaskCell {
     pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
     pub(crate) managed_turn: Option<CurrentManagedTurn>,
-    pub(crate) plan_write_path: Option<Arc<std::path::Path>>,
-    pub(crate) restrict_effects: bool,
     /// End of the current kill grace, armed by the first watchdog poke that
     /// sees a doomed task and cleared at every yield.
     kill_at: Cell<Option<Instant>>,
@@ -589,8 +586,6 @@ impl TaskCell {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
             managed_turn: None,
-            plan_write_path: None,
-            restrict_effects: false,
             kill_at: Cell::new(None),
             kill_grace: KILL_GRACE,
             deadline: Cell::new(deadline),
@@ -1080,10 +1075,13 @@ pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
     run_scoped(lua, TaskScope::detached(lua), fut).await
 }
 
-async fn run_restricted_callback<F: Future>(lua: &Lua, fut: F) -> F::Output {
-    let mut cell = TaskCell::new(CancelToken::none(), None, None);
-    cell.restrict_effects = true;
-    run_scoped(lua, TaskScope::new(lua, cell), fut).await
+async fn run_callback<F: Future>(lua: &Lua, fut: F) -> F::Output {
+    run_scoped(
+        lua,
+        TaskScope::new(lua, TaskCell::new(CancelToken::none(), None, None)),
+        fut,
+    )
+    .await
 }
 
 /// [`run_detached`] for plugin code a host caller is blocked on, carrying every
@@ -1412,35 +1410,20 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
     lock_cell(&handle).live.as_ref().map(f)
 }
 
-pub(crate) fn restrictive_effects(lua: &Lua) -> bool {
-    lua.app_data_ref::<TaskHandle>()
-        .is_some_and(|handle| lock_cell(&handle).restrict_effects)
-}
-
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (
-        cancel,
-        live_ctx,
-        managed_turn,
-        plan_write_path,
-        restrict_effects,
-        command_depth,
-        command_invocation,
-    ) = match &handle {
+    let (cancel, live_ctx, managed_turn, command_depth, command_invocation) = match &handle {
         Some(h) => {
             let cell = lock_cell(h);
             (
                 cell.cancel.clone(),
                 cell.live.clone(),
                 cell.managed_turn.clone(),
-                cell.plan_write_path.clone(),
-                cell.restrict_effects,
                 cell.command_depth,
                 cell.command_invocation.clone(),
             )
         }
-        None => (CancelToken::none(), None, None, None, false, 0, None),
+        None => (CancelToken::none(), None, None, 0, None),
     };
 
     let mut task = PendingAsyncTask {
@@ -1450,8 +1433,6 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         live_ctx,
         owner: None,
         managed_turn,
-        plan_write_path,
-        restrict_effects,
         command_depth,
         command_invocation,
         timer_id: None,
@@ -1681,8 +1662,6 @@ pub(crate) struct PendingAsyncTask {
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
     pub managed_turn: Option<CurrentManagedTurn>,
-    pub plan_write_path: Option<Arc<std::path::Path>>,
-    pub restrict_effects: bool,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
     /// Timer fires pass their id as the first callback argument.
@@ -1898,8 +1877,6 @@ fn spawn_async_task(
 
         let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
         cell.managed_turn = task.managed_turn;
-        cell.plan_write_path = task.plan_write_path;
-        cell.restrict_effects = task.restrict_effects;
         cell.command_depth = task.command_depth;
         cell.command_invocation = task.command_invocation;
         let scope = TaskScope::new(&lua, cell);
@@ -1971,15 +1948,9 @@ struct ToolKeys {
     describe: Option<RegistryKey>,
 }
 
-struct StartRestrictions {
-    plan_write_path: Option<Arc<std::path::Path>>,
-    restrict_effects: bool,
-}
-
 struct PluginOwner {
     tools: HashMap<Arc<str>, ToolKeys>,
     permissions: PluginPermissions,
-    bundled_read_only: bool,
 }
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, PluginOwner>>>;
@@ -3601,17 +3572,6 @@ impl LuaRuntime {
             PluginOwner {
                 tools: keys,
                 permissions: permissions.clone(),
-                bundled_read_only: bundled
-                    && matches!(
-                        source_name,
-                        "read"
-                            | "glob"
-                            | "grep"
-                            | "webfetch"
-                            | "question"
-                            | "plan_submit_tool"
-                            | "task"
-                    ),
             },
         );
 
@@ -3718,7 +3678,7 @@ impl LuaRuntime {
             return Some(PermissionScopes::force_prompt(input.to_string()));
         }
         let result: LuaValue =
-            match run_restricted_callback(&self.lua, func.call_async((lua_input, context))).await {
+            match run_callback(&self.lua, func.call_async((lua_input, context))).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(plugin, tool, error = %e, "permission_scopes callback failed");
@@ -3768,7 +3728,7 @@ impl LuaRuntime {
         let context = self.lua.create_table().ok()?;
         context.set("cwd", cwd.to_string_lossy().as_ref()).ok()?;
         let result: LuaValue =
-            match run_restricted_callback(&self.lua, func.call_async((lua_input, context))).await {
+            match run_callback(&self.lua, func.call_async((lua_input, context))).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(plugin, tool, error = %e, "mutable_path callback failed");
@@ -3865,7 +3825,7 @@ async fn compute_header(
         return HeaderResult::plain(tool.to_string());
     };
 
-    let result = run_restricted_callback(lua, func.call_async::<LuaValue>(input_lua)).await;
+    let result = run_callback(lua, func.call_async::<LuaValue>(input_lua)).await;
 
     match result {
         Ok(LuaValue::String(s)) => match s.to_str() {
@@ -4328,11 +4288,8 @@ async fn run_tool_start(
     input: Value,
     live: LiveCtx,
     ctx: Box<LuaCtx>,
-    restrictions: StartRestrictions,
 ) {
-    let mut cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
-    cell.plan_write_path = restrictions.plan_write_path;
-    cell.restrict_effects = restrictions.restrict_effects;
+    let cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
     let scope = TaskScope::new(lua, cell);
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
@@ -4362,7 +4319,7 @@ async fn run_tool_call(
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
-    let (handler, bundled_read_only): (Function, bool) = {
+    let handler: Function = {
         let plugins_ref = plugins.borrow();
         let Some(owner) = plugins_ref.get(&*plugin) else {
             return ToolCallReply::err(format!("plugin not loaded: {plugin}"));
@@ -4370,12 +4327,11 @@ async fn run_tool_call(
         let Some(tool_keys) = owner.tools.get(&*tool) else {
             return ToolCallReply::err(format!("tool not found: {tool}"));
         };
-        let bundled_read_only = owner.bundled_read_only;
         if tool_keys.generation != generation {
             return ToolCallReply::err(format!("tool binding changed: {tool}"));
         }
         match lua.registry_value(&tool_keys.handler) {
-            Ok(handler) => (handler, bundled_read_only),
+            Ok(handler) => handler,
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
         }
     };
@@ -4393,9 +4349,6 @@ async fn run_tool_call(
     };
     let live_sink = ctx.agent().and_then(|agent| agent.live_sink.clone());
     let managed_turn = ctx.agent().and_then(|agent| agent.managed_turn.clone());
-    let plan_write_path = ctx
-        .agent()
-        .and_then(|agent| agent.restrict_write_to().map(Arc::from));
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -4409,8 +4362,6 @@ async fn run_tool_call(
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
     cell.managed_turn = managed_turn;
-    cell.restrict_effects = plan_write_path.is_some() && !bundled_read_only;
-    cell.plan_write_path = plan_write_path;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
@@ -5201,18 +5152,16 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             input,
                             live,
                             ctx,
-                            plan_write_path,
                             reply,
                             nested,
                         } => {
-                            let (func, bundled_read_only) = {
+                            let func = {
                                 let plugins = rt.plugins.borrow();
                                 let owner = plugins.get(&*plugin);
-                                let func = owner
+                                owner
                                     .and_then(|p| p.tools.get(&*tool))
                                     .and_then(|tk| tk.start.as_ref())
-                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok());
-                                (func, owner.is_some_and(|owner| owner.bundled_read_only))
+                                    .and_then(|key| rt.lua.registry_value::<Function>(key).ok())
                             };
                             let Some(func) = func else {
                                 let _ = reply.send(());
@@ -5225,11 +5174,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     true => None,
                                     false => Some(g.acquire().await),
                                 };
-                                let restrictions = StartRestrictions {
-                                    restrict_effects: plan_write_path.is_some()
-                                        && !bundled_read_only,
-                                    plan_write_path,
-                                };
                                 covered(
                                     slot,
                                     run_tool_start(
@@ -5239,7 +5183,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         input,
                                         live,
                                         ctx,
-                                        restrictions,
                                     ),
                                 )
                                 .await;
@@ -6143,29 +6086,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restrictive_callback_propagates_to_async_children_without_leaking_scope() {
-        let lua = Lua::new();
-        lua.set_app_data(SpawnQueue::new());
-        let work = lua
-            .create_function(|lua, ()| {
-                enqueue_async_task(lua, enqueue_dummy(lua)).unwrap();
-                Ok(restrictive_effects(lua))
-            })
-            .unwrap();
-        assert!(
-            smol::block_on(run_restricted_callback(&lua, work.call_async::<bool>(()))).unwrap()
-        );
-        let task = lua
-            .app_data_ref::<SpawnQueue>()
-            .unwrap()
-            .rx
-            .try_recv()
-            .unwrap();
-        assert!(task.restrict_effects);
-        assert!(!restrictive_effects(&lua));
-    }
-
     fn pending_task(lua: &Lua, cancel: CancelToken, deadline: Option<Instant>) -> PendingAsyncTask {
         PendingAsyncTask {
             work_fn: enqueue_dummy(lua),
@@ -6174,8 +6094,6 @@ mod tests {
             live_ctx: None,
             owner: None,
             managed_turn: None,
-            plan_write_path: None,
-            restrict_effects: false,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,
@@ -6708,8 +6626,6 @@ mod tests {
             live_ctx: None,
             owner: None,
             managed_turn: None,
-            plan_write_path: None,
-            restrict_effects: false,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,

@@ -80,9 +80,6 @@ fn spec_from_table(lua: &Lua, opts: Table) -> LuaResult<ModeDefSpec> {
 /// maki.api.mode.define({ name = "plan", label = "[PLAN]", tools = { "read", "write" } })
 #[lua_fn]
 fn define(lua: &Lua, opts: Table) -> LuaResult<Pair<bool>> {
-    if crate::runtime::restrictive_effects(lua) || crate::api::fs::plan_write_path(lua).is_some() {
-        return Ok(err_pair("plan mode prohibits mode definitions"));
-    }
     let spec = spec_from_table(lua, opts)?;
     let reg = registry(lua)?;
     match reg.define(spec) {
@@ -130,9 +127,6 @@ fn set_inner(
     tx: Option<flume::Sender<UiAction>>,
     name: String,
 ) -> LuaResult<Pair<bool>> {
-    if crate::runtime::restrictive_effects(lua) || crate::api::fs::plan_write_path(lua).is_some() {
-        return Ok(err_pair("plan mode prohibits mode changes"));
-    }
     let id = ModeId::parse(&name);
     let reg = registry(lua)?;
     if !reg.contains(id.key()) {
@@ -176,9 +170,6 @@ fn list(lua: &Lua) -> LuaResult<Pair<Table>> {
 /// maki.api.mode.reset("plan")
 #[lua_fn]
 fn reset(lua: &Lua, name: Option<String>) -> LuaResult<Pair<bool>> {
-    if crate::runtime::restrictive_effects(lua) || crate::api::fs::plan_write_path(lua).is_some() {
-        return Ok(err_pair("plan mode prohibits mode resets"));
-    }
     let reg = registry(lua)?;
     let result = match name {
         Some(name) => reg.reset(&ModeId::parse(&name)),
@@ -212,36 +203,6 @@ mod tests {
         let t = create_mode_table(&lua, None).unwrap();
         lua.globals().set("mode", t).unwrap();
         lua
-    }
-
-    fn restrict(lua: &Lua) {
-        let mut cell =
-            crate::runtime::TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
-        cell.plan_write_path = Some(Arc::from(std::path::PathBuf::from("/plan.md")));
-        lua.set_app_data(cell.into_handle());
-    }
-
-    #[test]
-    fn restrictive_context_rejects_mode_mutations() {
-        let lua = prep(None);
-        restrict(&lua);
-        smol::block_on(
-            lua.load(
-                r#"
-                local mutations = {
-                    function() return mode.define({ name = "audit" }) end,
-                    function() return mode.set("build") end,
-                    function() return mode.reset("plan") end,
-                }
-                for _, mutate in ipairs(mutations) do
-                    local value, err = mutate()
-                    assert(value == nil and type(err) == "string", tostring(value) .. "|" .. tostring(err))
-                end
-                "#,
-            )
-            .exec_async(),
-        )
-        .unwrap();
     }
 
     #[test]

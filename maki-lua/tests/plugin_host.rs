@@ -252,6 +252,39 @@ maki.api.register_tool({
 })
 "#;
 
+const SESSION_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "whoami",
+    description = "reports the calling session",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function(_, ctx)
+        local id, err = ctx:session_id()
+        if err then
+            return "err:" .. err
+        end
+        return "id:" .. tostring(id)
+    end,
+})
+"#;
+
+fn exec_with_ctx(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<String, String> {
+    let entry = reg
+        .get(name)
+        .unwrap_or_else(|| panic!("tool {name} not registered"));
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    smol::block_on(async { inv.execute(ctx).await })
+        .output
+        .map(|out| match out {
+            maki_agent::ToolOutput::Plain(s) => s.text,
+            other => panic!("unexpected output: {other:?}"),
+        })
+}
+
 const MINIMAL_SCHEMA: &str =
     r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 
@@ -360,95 +393,6 @@ fn register_echo_tool() {
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
     assert_eq!(out, "hello");
-}
-
-const SESSION_PLUGIN: &str = r#"
-maki.api.register_tool({
-    name = "whoami",
-    description = "reports the calling session",
-    schema = { type = "object", properties = {}, additionalProperties = false },
-    handler = function(_, ctx)
-        local id, err = ctx:session_id()
-        if err then
-            return "err:" .. err
-        end
-        return "id:" .. tostring(id)
-    end,
-})
-"#;
-
-fn exec_with_ctx(
-    reg: &ToolRegistry,
-    name: &str,
-    input: serde_json::Value,
-    ctx: &ToolContext,
-) -> Result<String, String> {
-    let entry = reg
-        .get(name)
-        .unwrap_or_else(|| panic!("tool {name} not registered"));
-    let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
-        .output
-        .map(|out| match out {
-            maki_agent::ToolOutput::Plain(s) => s.text,
-            other => panic!("unexpected output: {other:?}"),
-        })
-}
-
-#[test_case::test_case(
-    r#"local ok, err = maki.fs.write("/not-the-plan", "bad")
-        return tostring(ok) .. "|" .. tostring(err)"#,
-    "nil|plan mode prohibits this mutation"
-    ; "direct_fs_write"
-)]
-#[test_case::test_case(
-    r#"maki.async.run(function()
-            local ok, err = maki.fs.write("/not-the-plan", "bad")
-            ctx:finish(tostring(ok) .. "|" .. tostring(err))
-        end)"#,
-    "nil|plan mode prohibits this mutation"
-    ; "async_fs_write"
-)]
-#[test_case::test_case(
-    r#"local ok, err = pcall(maki.fn.jobstart, "true")
-        return tostring(ok) .. "|" .. tostring(err)"#,
-    "false|runtime error: plan mode prohibits this mutation"
-    ; "jobstart"
-)]
-fn lua_host_effects_respect_turn_policy(handler: &str, expected: &str) {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(
-        "restrictive_effect_probe",
-        &format!(
-            r#"maki.api.register_tool({{
-                name = "restrictive_effect_probe",
-                description = "probes restrictive effects",
-                schema = {MINIMAL_SCHEMA},
-                handler = function(_, ctx)
-                    {handler}
-                end,
-            }})"#,
-        ),
-    )
-    .unwrap();
-    let mut ctx =
-        maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Plan("plan.md".into()));
-    ctx.registry = Arc::clone(&reg);
-    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
-        &ctx.registry,
-        &ctx.local_tools,
-        ctx.mcp.as_ref(),
-    ));
-
-    let output = exec_with_ctx(
-        &reg,
-        "restrictive_effect_probe",
-        serde_json::json!({}),
-        &ctx,
-    )
-    .expect("probe output");
-    assert!(output.contains(expected), "got: {output}");
 }
 
 /// The point of the whole thing: a handler learns who called it without
@@ -4906,43 +4850,37 @@ maki.api.register_tool({{
     (reg, host)
 }
 
-#[test]
-fn start_hook_respects_restrictive_turn_policy() {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source(
-        "restricted_start",
-        &format!(
-            r#"maki.api.register_tool({{
-                name = "restricted_start",
-                description = "test",
-                schema = {MINIMAL_SCHEMA},
-                start = function(_, ctx)
-                    local ok, err = maki.fs.write("/not-the-plan", "bad")
-                    local buf = maki.ui.buf()
-                    buf:set_lines({{ tostring(ok) .. "|" .. tostring(err) }})
-                    ctx:live_buf(buf)
-                end,
-                handler = function() return "handled" end,
-            }})"#,
-        ),
-    )
-    .unwrap();
-
-    let rx = run_start_in_mode(
-        &reg,
-        "restricted_start",
-        serde_json::json!({}),
-        &maki_agent::AgentMode::Plan("plan.md".into()),
-    );
-    let buf = recv_live_buf(&rx, START_TOOL_USE_ID).expect("start preview");
-    let lines = buf.read();
-    assert_eq!(
-        lines[0].spans[0].text,
-        "nil|plan mode prohibits this mutation"
-    );
+fn recv_live_buf(
+    rx: &flume::Receiver<maki_agent::Envelope>,
+    id: &str,
+) -> Option<Arc<maki_agent::SharedBuf>> {
+    rx.drain().find_map(|env| match env.event {
+        maki_agent::AgentEvent::LiveToolBuf { id: got, body } if got == id => Some(body),
+        _ => None,
+    })
 }
 
+#[test]
+fn start_annotation_timeout_happy_path() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "sa_to",
+            description = "test",
+            schema = {TIMEOUT_SCHEMA},
+            start_annotation = {{ field = "timeout", kind = "timeout" }},
+            handler = function(input, ctx) return "" end
+        }})"#,
+    );
+    host.load_source("sa_to_plugin", &src).unwrap();
+    let entry = reg.get("sa_to").expect("tool not registered");
+    let inv = entry
+        .tool
+        .parse(&serde_json::json!({"timeout": 90}))
+        .expect("parse failed");
+    assert_eq!(inv.start_annotation(), Some(timeout_annotation(90)));
+}
 /// `start` is awaited to completion, so the returned receiver already holds
 /// everything the hook emitted.
 fn run_start(
@@ -4974,38 +4912,6 @@ fn run_start_in_mode(
         .expect("parse failed");
     smol::block_on(inv.start(&ctx));
     rx
-}
-
-fn recv_live_buf(
-    rx: &flume::Receiver<maki_agent::Envelope>,
-    id: &str,
-) -> Option<Arc<maki_agent::SharedBuf>> {
-    rx.drain().find_map(|env| match env.event {
-        maki_agent::AgentEvent::LiveToolBuf { id: got, body } if got == id => Some(body),
-        _ => None,
-    })
-}
-
-#[test]
-fn start_annotation_timeout_happy_path() {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let src = format!(
-        r#"maki.api.register_tool({{
-            name = "sa_to",
-            description = "test",
-            schema = {TIMEOUT_SCHEMA},
-            start_annotation = {{ field = "timeout", kind = "timeout" }},
-            handler = function(input, ctx) return "" end
-        }})"#,
-    );
-    host.load_source("sa_to_plugin", &src).unwrap();
-    let entry = reg.get("sa_to").expect("tool not registered");
-    let inv = entry
-        .tool
-        .parse(&serde_json::json!({"timeout": 90}))
-        .expect("parse failed");
-    assert_eq!(inv.start_annotation(), Some(timeout_annotation(90)));
 }
 
 #[test]

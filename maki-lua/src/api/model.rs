@@ -124,9 +124,6 @@ async fn set(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Value,
 ) -> LuaResult<Pair<Value>> {
-    if crate::runtime::restrictive_effects(&lua) {
-        return Ok(err_pair("plan mode prohibits model changes"));
-    }
     let req = match opts {
         Value::String(spec) => ModelRequest::Set {
             spec: Some(spec.to_str()?.to_owned()),
