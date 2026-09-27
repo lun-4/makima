@@ -243,11 +243,12 @@ impl StorageWriter {
 
     pub fn send(&self, session: Arc<AppSession>) {
         let id = session.id;
+        let incoming_history = session.history_identity();
         let mut state = lock(&self.pending);
         let preserve_history = state
             .coordinator_history_bases
             .get(&id)
-            .is_some_and(|base| session.history_identity() == *base);
+            .is_some_and(|base| incoming_history == *base);
         if !preserve_history {
             state.coordinator_history_bases.remove(&id);
         }
@@ -267,6 +268,12 @@ impl StorageWriter {
             .coordinator_pending
             .get_mut(&id)
             .map(|pending| {
+                if pending
+                    .history_base
+                    .is_some_and(|base| base != incoming_history)
+                {
+                    pending.history_base = None;
+                }
                 let merged = Arc::new(merge_tui_snapshot(
                     &authoritative,
                     &pending.session,
@@ -753,7 +760,13 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::ToolOutput;
+    use maki_agent::session_coordinator::builtin_option_definitions;
+    use maki_agent::session_options::SessionOptions;
+    use maki_providers::{Effort, Message};
+    use maki_storage::sessions::{StoredMode, StoredThinking};
     use tempfile::TempDir;
+    use test_case::test_case;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
     const MODEL: &str = "test-model";
@@ -764,6 +777,9 @@ mod tests {
     const TOOL_ID: &str = "tool-1";
     const TOOL_TEXT: &str = "tool output";
     const TITLE: &str = "renamed after reload";
+    const BASE_MSG: &str = "base";
+    const COORDINATOR_MSG: &str = "coordinator";
+    const REWOUND_MSG: &str = "rewound";
 
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
@@ -788,8 +804,8 @@ mod tests {
         format!("{MSG_PREFIX}{n}")
     }
 
-    fn user_message(n: usize) -> maki_providers::Message {
-        maki_providers::Message::user(msg_text(n))
+    fn user_message(n: usize) -> Message {
+        Message::user(msg_text(n))
     }
 
     /// A plain file where the sessions dir should be. `create_dir_all` cannot
@@ -999,14 +1015,14 @@ mod tests {
 
             writer.delete_empty(id);
 
-            let options = maki_agent::session_options::SessionOptions::new(
-                maki_agent::session_coordinator::builtin_option_definitions(
+            let options = SessionOptions::new(
+                builtin_option_definitions(
                     "next/model",
                     [Arc::from("next/model")],
                     false,
                     false,
                     false,
-                    maki_agent::ThinkingConfig::Off,
+                    ThinkingConfig::Off,
                 ),
                 &Default::default(),
             )
@@ -1052,14 +1068,14 @@ mod tests {
             });
             done_rx.recv_async().await.unwrap().unwrap();
 
-            let options = maki_agent::session_options::SessionOptions::new(
-                maki_agent::session_coordinator::builtin_option_definitions(
+            let options = SessionOptions::new(
+                builtin_option_definitions(
                     "next/model",
                     [Arc::from("next/model")],
                     false,
                     false,
                     false,
-                    maki_agent::ThinkingConfig::Off,
+                    ThinkingConfig::Off,
                 ),
                 &Default::default(),
             )
@@ -1092,25 +1108,25 @@ mod tests {
             let (writer, _warn_rx) = writer(&dir);
             let mut session = AppSession::new(MODEL, CWD);
             session.set_title(TITLE.into());
-            session.meta.mode = Some(maki_storage::sessions::StoredMode::Plan);
+            session.meta.mode = Some(StoredMode::Plan);
             session.meta.queued_messages = vec!["queued".into()];
             let id = session.id;
             writer.send(Arc::new(session.clone()));
 
-            let options = maki_agent::session_options::SessionOptions::new(
-                maki_agent::session_coordinator::builtin_option_definitions(
+            let options = SessionOptions::new(
+                builtin_option_definitions(
                     "next/model",
                     [Arc::from("next/model")],
                     true,
                     true,
                     true,
-                    maki_agent::ThinkingConfig::Effort(maki_providers::Effort::High),
+                    ThinkingConfig::Effort(Effort::High),
                 ),
                 &Default::default(),
             )
             .unwrap()
             .snapshot();
-            let history = vec![maki_providers::Message::user("coordinator history".into())];
+            let history = vec![Message::user("coordinator history".into())];
             let version = CheckpointVersion {
                 revision: 1,
                 epoch: 1,
@@ -1134,23 +1150,20 @@ mod tests {
             let persisted = AppSession::load(id, &dir).unwrap();
             assert_eq!(
                 persisted.meta.thinking,
-                Some(maki_storage::sessions::StoredThinking::Effort {
-                    level: maki_providers::Effort::High
+                Some(StoredThinking::Effort {
+                    level: Effort::High
                 })
             );
             let mut later_ui = session;
             later_ui.set_title("later UI title".into());
-            later_ui.meta.mode = Some(maki_storage::sessions::StoredMode::Plan);
+            later_ui.meta.mode = Some(StoredMode::Plan);
             later_ui.meta.queued_messages = vec!["queued".into()];
             writer.send(Arc::new(later_ui));
             drop(checkpoint);
             writer.shutdown(DRAIN_TIMEOUT);
             let loaded = AppSession::load(id, &dir).unwrap();
             assert_eq!(loaded.title, "later UI title");
-            assert_eq!(
-                loaded.meta.mode,
-                Some(maki_storage::sessions::StoredMode::Plan)
-            );
+            assert_eq!(loaded.meta.mode, Some(StoredMode::Plan));
             assert_eq!(loaded.meta.queued_messages, ["queued"]);
             assert_eq!(loaded.model, "next/model");
             assert_eq!(loaded.cwd, "/tmp/next");
@@ -1159,8 +1172,8 @@ mod tests {
             assert!(loaded.meta.workflow);
             assert_eq!(
                 loaded.meta.thinking,
-                Some(maki_storage::sessions::StoredThinking::Effort {
-                    level: maki_providers::Effort::High
+                Some(StoredThinking::Effort {
+                    level: Effort::High
                 })
             );
             assert_eq!(message_texts(&loaded), ["coordinator history"]);
@@ -1173,18 +1186,18 @@ mod tests {
             let (_tmp, dir) = state_dir();
             let (writer, _warn_rx) = writer(&dir);
             let mut session = AppSession::new(MODEL, CWD);
-            session.push_message(maki_providers::Message::user("base".into()));
+            session.push_message(Message::user("base".into()));
             let id = session.id;
             writer.send(Arc::new(session.clone()));
 
-            let options = maki_agent::session_options::SessionOptions::new(
-                maki_agent::session_coordinator::builtin_option_definitions(
+            let options = SessionOptions::new(
+                builtin_option_definitions(
                     MODEL,
                     [Arc::from(MODEL)],
                     false,
                     false,
                     false,
-                    maki_agent::ThinkingConfig::Off,
+                    ThinkingConfig::Off,
                 ),
                 &Default::default(),
             )
@@ -1199,9 +1212,7 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Some(Arc::new(vec![maki_providers::Message::user(
-                            "coordinator".into(),
-                        )])),
+                        history: Some(Arc::new(vec![Message::user("coordinator".into())])),
                         model: Arc::from(MODEL),
                         cwd: CWD.into(),
                         options,
@@ -1210,13 +1221,81 @@ mod tests {
                 .await
                 .unwrap();
 
-            session.replace_messages(vec![maki_providers::Message::user("tui".into())]);
+            session.replace_messages(vec![Message::user("tui".into())]);
             writer.send(Arc::new(session));
             writer.shutdown(DRAIN_TIMEOUT);
 
             let loaded = AppSession::load(id, &dir).unwrap();
             assert_eq!(message_texts(&loaded), ["tui"]);
         });
+    }
+
+    /// A retiring coordinator's history flush can still be pending when the
+    /// TUI rewinds the same session. Merging that stale history into every
+    /// later TUI snapshot silently undid the rewind on disk.
+    #[test_case(true, &[COORDINATOR_MSG] ; "matching_history_adopts_pending_coordinator_history")]
+    #[test_case(false, &[REWOUND_MSG] ; "divergent_history_discards_pending_coordinator_history")]
+    fn tui_snapshot_merges_pending_coordinator_history_only_from_its_base(
+        history_matches_base: bool,
+        expected: &[&str],
+    ) {
+        let (wake, _wake_rx) = flume::unbounded();
+        let (_done_tx, done_rx) = flume::bounded(1);
+        let writer = StorageWriter {
+            pending: Arc::default(),
+            wake,
+            done_rx,
+            stop: Arc::default(),
+        };
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
+        let id = session.id;
+        writer.seed(Arc::new(session.clone()));
+
+        let options = SessionOptions::new(
+            builtin_option_definitions(
+                MODEL,
+                [Arc::from(MODEL)],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            ),
+            &Default::default(),
+        )
+        .unwrap()
+        .snapshot();
+        let _pending_ack = writer
+            .coordinator_checkpoint()
+            .checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 1,
+                    epoch: 1,
+                },
+                snapshot: Arc::new(SessionCheckpoint {
+                    history: Some(Arc::new(vec![Message::user(COORDINATOR_MSG.into())])),
+                    model: Arc::from(MODEL),
+                    cwd: CWD.into(),
+                    options,
+                }),
+            });
+
+        if !history_matches_base {
+            session.replace_messages(vec![Message::user(REWOUND_MSG.into())]);
+        }
+        for _ in 0..2 {
+            writer.send(Arc::new(session.clone()));
+            let state = lock(&writer.pending);
+            let Some(Entry::Save(save)) = state.entries.get(&id) else {
+                unreachable!()
+            };
+            assert_eq!(message_texts(&save.session), expected);
+            assert_eq!(
+                save.coordinator_history_base.is_some(),
+                history_matches_base
+            );
+        }
     }
 
     #[test]
@@ -1231,14 +1310,14 @@ mod tests {
             let warning = warn_rx.recv_async().await.unwrap();
             assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
-            let options = maki_agent::session_options::SessionOptions::new(
-                maki_agent::session_coordinator::builtin_option_definitions(
+            let options = SessionOptions::new(
+                builtin_option_definitions(
                     FAILED_MODEL,
                     [Arc::from(FAILED_MODEL)],
                     true,
                     true,
                     true,
-                    maki_agent::ThinkingConfig::Off,
+                    ThinkingConfig::Off,
                 ),
                 &Default::default(),
             )
@@ -1423,10 +1502,10 @@ mod tests {
         first.shutdown(DRAIN_TIMEOUT);
 
         session.truncate_messages(2);
-        session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
+        session.push_message(Message::user(RESUMED_MSG.into()));
         session.insert_tool_output(
             TOOL_ID.into(),
-            maki_agent::ToolOutput::Plain(TOOL_TEXT.to_string().into()),
+            ToolOutput::Plain(TOOL_TEXT.to_string().into()),
         );
         session.set_title(TITLE.into());
 
@@ -1441,7 +1520,7 @@ mod tests {
         );
         assert_eq!(loaded.title, TITLE);
         match loaded.tool_outputs().get(TOOL_ID).map(Arc::as_ref) {
-            Some(maki_agent::ToolOutput::Plain(out)) => assert_eq!(out.text, TOOL_TEXT),
+            Some(ToolOutput::Plain(out)) => assert_eq!(out.text, TOOL_TEXT),
             other => panic!("tool output lost: {other:?}"),
         }
         assert!(second_warn_rx.is_empty());
@@ -1493,7 +1572,7 @@ mod tests {
         session.push_message(user_message(0));
         writer.send(Arc::new(session.clone()));
         writer.delete(id, |_| {});
-        session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
+        session.push_message(Message::user(RESUMED_MSG.into()));
         writer.send(Arc::new(session));
         writer.shutdown(DRAIN_TIMEOUT);
 
@@ -1543,7 +1622,7 @@ mod tests {
         done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
         assert!(AppSession::load(id, &dir).is_err());
 
-        session.push_message(maki_providers::Message::user(RESUMED_MSG.into()));
+        session.push_message(Message::user(RESUMED_MSG.into()));
         writer.send(Arc::new(session));
         writer.shutdown(DRAIN_TIMEOUT);
 
