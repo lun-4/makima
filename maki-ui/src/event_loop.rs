@@ -3668,7 +3668,9 @@ impl<'t> EventLoop<'t> {
         match kind {
             SessionOpKind::ModelChanged { spec } => match result {
                 Ok(()) => {
-                    self.sessions[idx].model_slot.commit_independent_model();
+                    self.sessions[idx]
+                        .model_slot
+                        .commit_independent_model(&spec);
                     self.apply_model_change(idx, &spec);
                 }
                 Err(error) => self.sessions[idx].app.flash(error),
@@ -3725,7 +3727,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 let reply = result.and_then(|()| {
                     if let Some(spec) = &spec {
-                        self.sessions[idx].model_slot.commit_independent_model();
+                        self.sessions[idx].model_slot.commit_independent_model(spec);
                         self.apply_model_change(idx, spec);
                     }
                     if let Some(thinking) = thinking {
@@ -3850,9 +3852,12 @@ impl<'t> EventLoop<'t> {
     /// The app-side half of a model change, run once the coordinator has
     /// adopted the model into the session's slot.
     fn apply_model_change(&mut self, idx: usize, spec: &str) {
-        let model = self.sessions[idx].model_slot.load().model.clone();
+        let slot = self.sessions[idx].model_slot.committed();
+        if slot.model.spec() != spec {
+            return;
+        }
         let app = &mut self.sessions[idx].app;
-        app.update_model(&model);
+        app.update_model(&slot.model);
         app.record_recent_model(spec);
     }
 
@@ -4854,6 +4859,90 @@ mod tests {
         let manager = handles.manager_and_root().0;
         drop(handles);
         shutdown_manager(&manager);
+    }
+
+    #[test_case(false ; "model_command")]
+    #[test_case(true ; "model_api")]
+    fn delayed_independent_model_result_does_not_expose_plan_candidate(api: bool) {
+        const COMMITTED: &str = "anthropic/model-a";
+        const PROVISIONAL: &str = "anthropic/model-b";
+        let mut harness = RuntimeHarness::new();
+        let runtime = harness.runtime(harness.session());
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        let runtime = &mut loop_state.sessions[0];
+        let id = runtime.id();
+        runtime
+            .model_slot
+            .install(model_named("model-a"), Arc::new(StubProvider));
+        let kind = if api {
+            let (reply_tx, _reply_rx) = flume::bounded(1);
+            SessionOpKind::ModelSet {
+                spec: Some(COMMITTED.into()),
+                thinking: None,
+                fast: None,
+                reply_tx,
+            }
+        } else {
+            SessionOpKind::ModelChanged {
+                spec: COMMITTED.into(),
+            }
+        };
+        let delayed = InternalEvent::SessionOp {
+            session: id,
+            kind,
+            result: Ok(()),
+        };
+        runtime.model_slot.begin_provisional_model();
+        runtime.pending_plan_transitions = 1;
+        runtime
+            .model_slot
+            .install(model_named("model-b"), Arc::new(StubProvider));
+        loop_state.handle_internal(delayed);
+        let slot = &loop_state.sessions[0].model_slot;
+        assert_eq!(slot.load().model.spec(), PROVISIONAL);
+        assert_eq!(slot.committed().model.spec(), COMMITTED);
+        assert_eq!(
+            maki_agent::ModelSource::current(&**slot).unwrap().1.spec(),
+            COMMITTED
+        );
+        assert_ne!(loop_state.sessions[0].app.state.model.spec(), PROVISIONAL);
+        let runtime = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(runtime);
     }
 
     #[test_case(false ; "replace_session_action")]

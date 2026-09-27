@@ -195,9 +195,12 @@ impl ProviderSlot {
         self.committed.store(None);
     }
 
-    pub(crate) fn commit_independent_model(&self) {
+    pub(crate) fn commit_independent_model(&self, spec: &str) {
         if self.committed.load().is_some() {
-            self.committed.store(Some(self.current.load_full()));
+            let current = self.current.load_full();
+            if current.model.spec() == spec {
+                self.committed.store(Some(current));
+            }
         }
     }
 
@@ -799,7 +802,7 @@ mod tests {
         candidate.id = CANDIDATE_MODEL.into();
         slot.install(candidate, Arc::new(StubProvider));
         assert_ne!(slot.committed().model.spec(), CANDIDATE_SPEC);
-        slot.commit_independent_model();
+        slot.commit_independent_model(CANDIDATE_SPEC);
         assert_eq!(slot.committed().model.spec(), CANDIDATE_SPEC);
     }
 
