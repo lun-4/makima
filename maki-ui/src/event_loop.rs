@@ -812,19 +812,7 @@ fn flash_replaced_turns(app: &mut App, count: usize) {
 }
 
 fn transfer_held_queue(app: &mut App, held: Vec<QueueItem>) {
-    for item in held {
-        match item {
-            QueueItem::Message { text, input, .. } => {
-                app.queue_and_notify(QueuedMessage {
-                    text,
-                    images: input.images,
-                });
-            }
-            QueueItem::Compact { instructions, .. } => {
-                app.queue_compact(instructions);
-            }
-        }
-    }
+    app.transfer_queued_work(held);
 }
 
 fn replace_session_runtime(
@@ -3679,7 +3667,10 @@ impl<'t> EventLoop<'t> {
         };
         match kind {
             SessionOpKind::ModelChanged { spec } => match result {
-                Ok(()) => self.apply_model_change(idx, &spec),
+                Ok(()) => {
+                    self.sessions[idx].model_slot.commit_independent_model();
+                    self.apply_model_change(idx, &spec);
+                }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::OptionToggled { id, committed } => match result {
@@ -3734,6 +3725,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 let reply = result.and_then(|()| {
                     if let Some(spec) = &spec {
+                        self.sessions[idx].model_slot.commit_independent_model();
                         self.apply_model_change(idx, spec);
                     }
                     if let Some(thinking) = thinking {
@@ -6473,6 +6465,16 @@ mod tests {
             text: FIRST.into(),
             images: vec![image.clone()],
         });
+        let mut queued = runtime.handles.queue.take_held();
+        let Some(QueueItem::Message { input, .. }) = queued.front_mut() else {
+            panic!("expected queued prompt");
+        };
+        input.thinking = maki_agent::ThinkingConfig::Budget(256);
+        input.fast = true;
+        input.workflow = true;
+        for item in queued {
+            runtime.handles.queue.push(item);
+        }
         runtime.app.queue_compact(Some(COMPACT.into()));
         runtime.app.queue_and_notify(QueuedMessage {
             text: SECOND.into(),
@@ -6546,7 +6548,10 @@ mod tests {
         assert_eq!(text, FIRST);
         assert_eq!(input.images, [image]);
         assert_eq!(input.message, FIRST);
-        assert_eq!(input.mode, maki_agent::AgentMode::Build);
+        assert!(matches!(input.mode, maki_agent::AgentMode::Plan(_)));
+        assert_eq!(input.thinking, maki_agent::ThinkingConfig::Budget(256));
+        assert!(input.fast);
+        assert!(input.workflow);
         assert_eq!(run_id, runtime.app.run_id);
         assert!(
             matches!(items.next(), Some(QueueItem::Compact { instructions: Some(instructions), run_id }) if instructions == COMPACT && run_id == runtime.app.run_id)

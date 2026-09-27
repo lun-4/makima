@@ -195,6 +195,12 @@ impl ProviderSlot {
         self.committed.store(None);
     }
 
+    pub(crate) fn commit_independent_model(&self) {
+        if self.committed.load().is_some() {
+            self.committed.store(Some(self.current.load_full()));
+        }
+    }
+
     pub(crate) fn committed(&self) -> Arc<ProviderSnapshot> {
         self.committed
             .load_full()
@@ -781,6 +787,19 @@ mod tests {
             original
         );
         slot.end_provisional_model();
+        assert_eq!(slot.committed().model.spec(), CANDIDATE_SPEC);
+    }
+
+    #[test]
+    fn independent_model_change_supersedes_provisional_snapshot() {
+        let (slot, _changes) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        slot.begin_provisional_model();
+        let mut candidate = slot.load().model.clone();
+        candidate.id = CANDIDATE_MODEL.into();
+        slot.install(candidate, Arc::new(StubProvider));
+        assert_ne!(slot.committed().model.spec(), CANDIDATE_SPEC);
+        slot.commit_independent_model();
         assert_eq!(slot.committed().model.spec(), CANDIDATE_SPEC);
     }
 

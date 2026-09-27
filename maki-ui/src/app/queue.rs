@@ -229,6 +229,33 @@ impl App {
         true
     }
 
+    pub(crate) fn transfer_queued_work(&mut self, work: Vec<QueueItem>) {
+        let Some(shared) = &self.queue.shared else {
+            return;
+        };
+        for item in work {
+            let item = match item {
+                QueueItem::Message {
+                    text,
+                    image_count,
+                    input,
+                    ..
+                } => QueueItem::Message {
+                    text,
+                    image_count,
+                    input,
+                    run_id: self.run_id,
+                    displayed: false,
+                },
+                QueueItem::Compact { instructions, .. } => QueueItem::Compact {
+                    run_id: self.run_id,
+                    instructions,
+                },
+            };
+            shared.push(item);
+        }
+    }
+
     /// Push restored queue items only here, never in `restore_display`: on
     /// load/rewind the display is restored before `respawn` swaps the shared
     /// queue, so pushing earlier would fill a queue that is about to die.

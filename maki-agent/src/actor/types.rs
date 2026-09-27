@@ -2,7 +2,7 @@
 
 use std::future::Future;
 
-use maki_providers::{ImageSource, TokenUsage};
+use maki_providers::{ImageSource, ThinkingConfig, TokenUsage};
 
 use crate::InterruptSource;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
@@ -28,6 +28,8 @@ pub struct EarlierRoot {
     pub text: String,
     pub images: Vec<ImageSource>,
     pub correlation: String,
+    pub thinking: ThinkingConfig,
+    pub fast: bool,
 }
 
 /// What category of work the backend is asked to execute. Controls and

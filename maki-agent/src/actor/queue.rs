@@ -180,14 +180,16 @@ impl ActorQueue {
                 let mut inputs = Vec::with_capacity(roots.len() + 1);
                 let mut earlier = Vec::with_capacity(roots.len());
                 for r in roots {
-                    inputs.push(r.input);
                     earlier.push(EarlierRoot {
+                        thinking: r.input.thinking,
+                        fast: r.input.fast,
                         run_id: r.run_id,
                         displayed: r.displayed,
                         text: r.text,
                         images: r.images,
                         correlation: r.correlation,
                     });
+                    inputs.push(r.input);
                 }
                 inputs.push(last.input);
                 last.input = crate::merge_inputs(inputs).expect("at least two inputs");
@@ -348,8 +350,8 @@ impl ActorQueue {
                 images,
                 mode: root.input.mode.clone(),
                 preamble: Vec::new(),
-                thinking: root.input.thinking,
-                fast: root.input.fast,
+                thinking: earlier.thinking,
+                fast: earlier.fast,
                 workflow: root.input.workflow,
                 prompt: None,
                 cancel: None,
@@ -636,11 +638,25 @@ mod tests {
         const THIRD: &str = "";
         let queue = ActorQueue::new();
         let image = test_image();
-        for root in [
-            test_root(FIRST, 1, vec![image.clone()]),
-            test_root(SECOND, 2, Vec::new()),
-            test_root(THIRD, 3, vec![image.clone()]),
+        for (mut root, thinking, fast) in [
+            (
+                test_root(FIRST, 1, vec![image.clone()]),
+                crate::ThinkingConfig::Budget(128),
+                true,
+            ),
+            (
+                test_root(SECOND, 2, Vec::new()),
+                crate::ThinkingConfig::Adaptive,
+                false,
+            ),
+            (
+                test_root(THIRD, 3, vec![image.clone()]),
+                crate::ThinkingConfig::Off,
+                true,
+            ),
         ] {
+            root.input.thinking = thinking;
+            root.input.fast = fast;
             queue.push(ActorWork::Root(RootWork {
                 displayed: false,
                 ..root
@@ -664,7 +680,11 @@ mod tests {
         let taken = queue.take_paused_ui_work();
         assert_eq!(taken.len(), 4);
         let mut taken = taken.into_iter();
-        for (text, run_id) in [(FIRST, 1), (SECOND, 2), (THIRD, 3)] {
+        for (text, run_id, thinking, fast) in [
+            (FIRST, 1, crate::ThinkingConfig::Budget(128), true),
+            (SECOND, 2, crate::ThinkingConfig::Adaptive, false),
+            (THIRD, 3, crate::ThinkingConfig::Off, true),
+        ] {
             let work = taken.next().expect("root work");
             let QueuedUiWork::Root(root) = work else {
                 panic!("expected root");
@@ -672,6 +692,8 @@ mod tests {
             assert_eq!(root.text, text);
             assert_eq!(root.input.message, text);
             assert_eq!(root.run_id, run_id);
+            assert_eq!(root.input.thinking, thinking);
+            assert_eq!(root.input.fast, fast);
             assert!(!root.displayed);
             assert_eq!(root.correlation, format!("r{run_id}"));
             assert!(root.input.preamble.is_empty());
@@ -776,6 +798,43 @@ mod tests {
             assert_eq!(root.input.message, text);
             assert_eq!(root.input.images, vec![image.clone()]);
             assert_eq!(root.displayed, displayed);
+        }
+    }
+
+    #[test]
+    fn split_batch_restores_each_prompts_preferences() {
+        let queue = ActorQueue::new();
+        for (index, (thinking, fast)) in [
+            (crate::ThinkingConfig::Budget(128), true),
+            (crate::ThinkingConfig::Adaptive, false),
+            (crate::ThinkingConfig::Off, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut root = test_root(&format!("prompt {index}"), index as u64, Vec::new());
+            root.input.thinking = thinking;
+            root.input.fast = fast;
+            root.displayed = false;
+            queue.push(ActorWork::Root(root));
+        }
+        let batch = queue.pop().expect("batch");
+        queue.defer(batch);
+        let (removed, _) = queue.remove_visible_at(1).expect("middle prompt");
+        assert!(
+            matches!(removed, ActorWork::Root(root) if root.input.thinking == crate::ThinkingConfig::Adaptive && !root.input.fast)
+        );
+        queue.set_paused(true);
+        let remaining = queue.take_paused_ui_work();
+        for (work, (thinking, fast)) in remaining.into_iter().zip([
+            (crate::ThinkingConfig::Budget(128), true),
+            (crate::ThinkingConfig::Off, true),
+        ]) {
+            let QueuedUiWork::Root(root) = work else {
+                panic!("expected root");
+            };
+            assert_eq!(root.input.thinking, thinking);
+            assert_eq!(root.input.fast, fast);
         }
     }
 

@@ -199,7 +199,15 @@ impl TuiActorBackend {
     async fn prepare_run(
         &mut self,
         input: &mut AgentInput,
-    ) -> Result<(String, RequestTools, Arc<maki_agent::prompt::ResolvedSlots>), AgentError> {
+    ) -> Result<
+        (
+            String,
+            RequestTools,
+            Arc<maki_agent::prompt::ResolvedSlots>,
+            Arc<super::ProviderSnapshot>,
+        ),
+        AgentError,
+    > {
         let slot = self.model_slot.committed();
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
@@ -240,12 +248,12 @@ impl TuiActorBackend {
         let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
         let system = self.build_system_with(&input.mode, &prompt_slots);
         self.publish_btw_system(&prompt_slots);
-        self.tools = self.build_tools(&slot.model, input.workflow);
-        let tools = self.tools.clone();
-
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
-        Ok((system, tools, Arc::new(prompt_slots)))
+        let slot = self.model_slot.committed();
+        self.tools = self.build_tools(&slot.model, input.workflow);
+        let tools = self.tools.clone();
+        Ok((system, tools, Arc::new(prompt_slots), slot))
     }
 
     /// Resolves this session's coordinator lease for a run. `Ok(None)` when
@@ -308,7 +316,7 @@ impl TuiActorBackend {
                 return None;
             }
         };
-        let (system, tools, prompt_slots) = match self.prepare_run(&mut input).await {
+        let (system, tools, prompt_slots, slot) = match self.prepare_run(&mut input).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.report_setup_failure(run_id, turn_id, "agent turn setup failed", &error);
@@ -316,7 +324,6 @@ impl TuiActorBackend {
             }
         };
         self.run_id.store(run_id, Ordering::Relaxed);
-        let slot = self.model_slot.committed();
         let mut agent = Agent::new(
             AgentParams {
                 agent_id: self.agent_id,
@@ -759,6 +766,80 @@ mod tests {
             "a turn that dies in setup must say so: {:?}",
             envelopes.iter().map(|e| &e.event).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn prepare_run_uses_model_at_tool_build_for_agent_creation() {
+        smol::block_on(async {
+            let (model_slot, _changes) =
+                ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+            let (_agent_tx, agent_rx) = flume::unbounded();
+            let (_answer_tx, answer_rx) = flume::unbounded();
+            let (drain_tx, _drain_rx) = flume::unbounded();
+            let (_init_trigger, init_cancel) = CancelToken::new();
+            let mut backend = new_backend(
+                AgentId::generate(),
+                Arc::clone(&model_slot),
+                Arc::new(ArcSwap::from_pointee(PathBuf::from("/tmp"))),
+                AgentConfig::default(),
+                ToolOutputLines::default(),
+                Arc::new(ArcSwap::from_pointee(String::new())),
+                None,
+                &[],
+                Arc::new(PermissionManager::new(
+                    PermissionsConfig::default(),
+                    PathBuf::from("/tmp"),
+                    maki_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
+                    Arc::default(),
+                )),
+                _agent_tx,
+                answer_rx,
+                None,
+                None,
+                maki_providers::Timeouts::default(),
+                EventHandle::disconnected_for_test(),
+                Arc::new(CancelMap::new()),
+                Arc::new(ModelPolicy::default()),
+                SystemPromptOverride::default(),
+                Arc::new(maki_agent::tools::FileWriteLocks::new()),
+                init_cancel,
+                drain_tx,
+                Arc::new(AtomicU64::new(0)),
+            );
+            backend.vars = template::env_vars_for(&backend.cwd.load());
+            let mut input = AgentInput {
+                message: "hello".into(),
+                mode: AgentMode::Build,
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: Default::default(),
+                fast: false,
+                workflow: false,
+                prompt: None,
+                cancel: None,
+                lease_committer: None,
+            };
+            let answer_rx = Arc::clone(&backend.answer_rx);
+            let guard = answer_rx.lock().await;
+            let mut preparing = Box::pin(backend.prepare_run(&mut input));
+            assert!(
+                futures_lite::future::poll_once(&mut preparing)
+                    .await
+                    .is_none()
+            );
+            let mut new_model = model_slot.load().model.clone();
+            new_model.supports_vision_override = Some(false);
+            model_slot.install(new_model, Arc::new(StubProvider));
+            drop(guard);
+            drop(agent_rx);
+            let (_, tools, _, slot) = preparing.await.expect("prepared run");
+            assert!(!slot.model.supports_vision());
+            assert!(
+                !tools
+                    .filter()
+                    .matches(maki_agent::tools::VIEW_IMAGE_TOOL_NAME)
+            );
+        });
     }
 
     struct StubProvider;
