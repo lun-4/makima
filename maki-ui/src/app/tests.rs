@@ -884,6 +884,8 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     assert_eq!(app.main_chat().message_count(), 1);
 
     app.queue_and_notify(queued_msg("queued"));
+    app.queue.set_focus_at(0);
+    assert_eq!(app.queue.focus(), Some(0));
     assert_eq!(
         app.main_chat().message_count(),
         1,
@@ -898,6 +900,7 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         app.run_id,
     ));
 
+    assert_eq!(app.queue.focus(), None);
     assert_eq!(app.main_chat().message_count(), 2);
     assert_eq!(app.main_chat().last_message_text(), "queued");
     assert_eq!(
@@ -3987,7 +3990,25 @@ fn queue_focus_uses_visible_rows() {
     assert!(shared.remove(1));
     assert_eq!(app.queue.focus(), None);
     app.queue.remove(1);
-    assert_eq!(app.queue.focus(), Some(0));
+    assert_eq!(app.queue.focus(), None);
+}
+
+#[test]
+fn consumed_queue_focus_does_not_return_on_new_prompt() {
+    let mut app = test_app();
+    let shared = shared_queue::queue();
+    app.queue.set_shared(shared.clone());
+    shared.push(shared_queue::QueueItem::Compact {
+        run_id: 0,
+        instructions: None,
+    });
+    app.queue.set_focus_at(0);
+    assert!(shared.remove(0));
+    assert_eq!(app.queue.focus(), None);
+    app.queue_and_notify(queued_msg("new prompt"));
+    assert_eq!(app.queue.focus(), None);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.queue.text_messages(), ["new prompt"]);
 }
 
 #[test]

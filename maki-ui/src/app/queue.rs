@@ -1,6 +1,7 @@
 //! Queue for messages typed while the agent is busy.
 
 use maki_agent::{AgentInput, ImageSource};
+use std::cell::Cell;
 
 use super::{Action, App, Status};
 
@@ -23,7 +24,7 @@ pub(crate) enum SubmitOutcome {
 #[derive(Default)]
 pub(crate) struct MessageQueue {
     shared: Option<QueueSender>,
-    focus: Option<usize>,
+    focus: Cell<Option<usize>>,
 }
 
 impl MessageQueue {
@@ -54,11 +55,13 @@ impl MessageQueue {
         if let Some(ref shared) = self.shared {
             shared.clear();
         }
-        self.focus = None;
+        self.focus.set(None);
     }
 
     pub(crate) fn focus(&self) -> Option<usize> {
-        self.focus.filter(|&index| index < self.panel_len())
+        let focus = self.focus.get().filter(|&index| index < self.panel_len());
+        self.focus.set(focus);
+        focus
     }
 
     pub(crate) fn set_focus(&mut self) {
@@ -66,28 +69,28 @@ impl MessageQueue {
     }
 
     pub(crate) fn unfocus(&mut self) {
-        self.focus = None;
+        self.focus.set(None);
     }
 
     pub(crate) fn move_focus_up(&mut self) {
-        if let Some(sel) = self.focus
+        if let Some(sel) = self.focus()
             && sel > 0
         {
-            self.focus = Some(sel - 1);
+            self.focus.set(Some(sel - 1));
         }
     }
 
     pub(crate) fn move_focus_down(&mut self) {
-        if let Some(sel) = self.focus {
+        if let Some(sel) = self.focus() {
             let len = self.panel_len();
             if sel + 1 < len {
-                self.focus = Some(sel + 1);
+                self.focus.set(Some(sel + 1));
             }
         }
     }
 
     pub(crate) fn remove_focused(&mut self) {
-        if let Some(sel) = self.focus {
+        if let Some(sel) = self.focus() {
             self.remove(sel);
         }
     }
@@ -112,16 +115,16 @@ impl MessageQueue {
 
     fn clamp_focus(&mut self) {
         let len = self.panel_len();
-        self.focus = match self.focus {
+        self.focus.set(match self.focus.get() {
             Some(_) if len == 0 => None,
             Some(sel) if sel >= len => Some(len - 1),
             other => other,
-        };
+        });
     }
 
     pub(crate) fn set_focus_at(&mut self, index: usize) {
         if index < self.panel_len() {
-            self.focus = Some(index);
+            self.focus.set(Some(index));
         }
     }
 }
@@ -290,6 +293,7 @@ impl App {
     /// learns the agent is busy. Immediate-dispatch items skip this event,
     /// so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: String, images: Vec<ImageSource>) {
+        self.queue.unfocus();
         self.status = Status::Streaming;
         self.main_chat().show_user_message(text, images);
     }

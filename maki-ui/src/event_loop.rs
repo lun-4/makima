@@ -3284,7 +3284,9 @@ impl<'t> EventLoop<'t> {
                         .apply_replacement_post_commit(post_commit);
                     self.dispatch(idx, actions);
                 }
-                transfer_held_queue(&mut self.sessions[idx].app, held);
+                if kind != SessionReplacementKind::Rewind {
+                    transfer_held_queue(&mut self.sessions[idx].app, held);
+                }
                 flash_replaced_turns(&mut self.sessions[idx].app, cancelled_turns);
             }
             Err(error) => self.sessions[idx].app.flash(error),
@@ -8132,8 +8134,9 @@ mod tests {
         release_runtime(runtime);
     }
 
-    #[test]
-    fn ordinary_replacement_transfers_queued_roots() {
+    #[test_case(false ; "reset_transfers_queued_roots")]
+    #[test_case(true ; "rewind_discards_queued_roots")]
+    fn replacement_respects_queue_intent(rewind: bool) {
         const PROMPT: &str = "queued before reset";
         let mut harness = RuntimeHarness::new();
         let runtime = harness.runtime(harness.session());
@@ -8193,6 +8196,10 @@ mod tests {
             .unwrap();
         let mut target = harness.session();
         target.model = loop_state.sessions[0].app.state.session.model.clone();
+        if rewind {
+            target.meta.input_draft = Some("rewound prompt".into());
+            target.meta.queued_messages.clear();
+        }
         let prepared = loop_state
             .ctx
             .prepare_replacement_runtime(
@@ -8201,10 +8208,30 @@ mod tests {
                 loop_state.sessions[0].app.permissions.as_ref(),
             )
             .unwrap();
-        let (held, _) = loop_state.replace_prepared_runtime(0, prepared).unwrap();
-        assert!(matches!(held.as_slice(), [QueueItem::Message { text, .. }] if text == PROMPT));
-        transfer_held_queue(&mut loop_state.sessions[0].app, held);
-        assert_eq!(loop_state.sessions[0].app.queue.text_messages(), [PROMPT]);
+        let kind = if rewind {
+            SessionReplacementKind::Rewind
+        } else {
+            SessionReplacementKind::Reset {
+                ended_id: loop_state.sessions[0].id(),
+            }
+        };
+        loop_state.commit_replacement(
+            0,
+            PendingReplacement {
+                prepared,
+                kind,
+                post_commit: None,
+            },
+        );
+        if rewind {
+            assert!(loop_state.sessions[0].app.queue.text_messages().is_empty());
+            assert_eq!(
+                loop_state.sessions[0].app.input_box.buffer.value(),
+                "rewound prompt"
+            );
+        } else {
+            assert_eq!(loop_state.sessions[0].app.queue.text_messages(), [PROMPT]);
+        }
         let runtime = loop_state.sessions.remove(0);
         drop(loop_state);
         release_runtime(runtime);
