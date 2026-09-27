@@ -36,6 +36,7 @@ impl MessageQueue {
         self.shared.as_ref().is_none_or(|s| s.is_empty())
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.shared.as_ref().map_or(0, |s| s.len())
     }
@@ -57,7 +58,7 @@ impl MessageQueue {
     }
 
     pub(crate) fn focus(&self) -> Option<usize> {
-        self.focus
+        self.focus.filter(|&index| index < self.panel_len())
     }
 
     pub(crate) fn set_focus(&mut self) {
@@ -78,7 +79,7 @@ impl MessageQueue {
 
     pub(crate) fn move_focus_down(&mut self) {
         if let Some(sel) = self.focus {
-            let len = self.len();
+            let len = self.panel_len();
             if sel + 1 < len {
                 self.focus = Some(sel + 1);
             }
@@ -110,7 +111,7 @@ impl MessageQueue {
     }
 
     fn clamp_focus(&mut self) {
-        let len = self.len();
+        let len = self.panel_len();
         self.focus = match self.focus {
             Some(_) if len == 0 => None,
             Some(sel) if sel >= len => Some(len - 1),
@@ -119,7 +120,7 @@ impl MessageQueue {
     }
 
     pub(crate) fn set_focus_at(&mut self, index: usize) {
-        if index < self.len() {
+        if index < self.panel_len() {
             self.focus = Some(index);
         }
     }

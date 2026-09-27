@@ -123,6 +123,10 @@ pub(crate) fn correlation(run_id: u64) -> String {
 }
 
 impl QueueSender {
+    pub(crate) fn is_gated(&self) -> bool {
+        lock(&self.gate).gated
+    }
+
     pub(crate) fn set_gated(&self, gated: bool) {
         let mut gate = lock(&self.gate);
         if gated {
@@ -657,6 +661,100 @@ mod tests {
             matches!(pending.next(), Some(QueueItem::Message { text, run_id: 4, .. }) if text == HELD)
         );
         assert!(pending.next().is_none());
+        actor.close();
+        smol::block_on(task);
+    }
+
+    #[test]
+    fn visible_panel_rows_skip_hidden_work() {
+        use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
+        use maki_agent::{AgentId, History};
+        use maki_providers::Message;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct Backend;
+        impl ActorBackend for Backend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: AgentInput,
+                _: WorkKind,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+            fn run_control<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: &'a ControlWork,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::ControlDone })
+            }
+            fn run_compact<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: Option<&'a str>,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { BackendResult::CompactDone })
+            }
+        }
+        let (actor, task) = AgentActorHandle::spawn(
+            AgentId::generate(),
+            Vec::<Message>::new(),
+            None,
+            Box::new(Backend),
+        );
+        let tx = actor_queue(Arc::new(actor), Arc::new(AtomicU64::new(0)));
+        tx.set_gated(true);
+        let QueueBackend::Actor(actor) = &tx.backend else {
+            unreachable!()
+        };
+        let QueueItem::Message {
+            input: mut first, ..
+        } = msg(false)
+        else {
+            unreachable!()
+        };
+        first.message = "first".into();
+        let QueueItem::Message {
+            input: mut second, ..
+        } = msg(false)
+        else {
+            unreachable!()
+        };
+        second.message = "second".into();
+        actor
+            .rush(RootWork::new(
+                first,
+                1,
+                false,
+                "first".into(),
+                Vec::new(),
+                correlation(1),
+            ))
+            .unwrap();
+        actor
+            .rush(RootWork::new(
+                second,
+                2,
+                false,
+                "second".into(),
+                Vec::new(),
+                correlation(2),
+            ))
+            .unwrap();
+        tx.push(msg(true));
+        assert_eq!(tx.panel_len(), 2);
+        assert_eq!(
+            tx.panel_entries()
+                .iter()
+                .map(|entry| entry.text.as_ref())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
         actor.close();
         smol::block_on(task);
     }

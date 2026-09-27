@@ -1443,10 +1443,7 @@ enum SessionOpKind {
     /// `/model` from a keybinding or command: apply the adopted model.
     ModelChanged { spec: String },
     /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
-    OptionToggled {
-        id: &'static str,
-        committed: Arc<std::sync::Mutex<Option<bool>>>,
-    },
+    OptionToggled { id: &'static str },
     /// `/cd`: apply the canonical path the coordinator resolved, which is not
     /// necessarily the one that was typed.
     DirectoryChanged {
@@ -3174,10 +3171,12 @@ impl<'t> EventLoop<'t> {
         if self.sessions[idx].pending_plan_transitions != 0 {
             return Err(PENDING_MODEL_REPLACEMENT_ERR.into());
         }
-        self.sessions[idx]
-            .handles
-            .queue
-            .wait_for_paused_admissions();
+        let queue = self.sessions[idx].handles.queue.clone();
+        let was_gated = queue.is_gated();
+        if !was_gated {
+            queue.set_gated(true);
+        }
+        queue.wait_for_paused_admissions();
         let target_id = prepared.app.session_id();
         let current_id = self.sessions[idx].id();
         let old = match replace_session_runtime(
@@ -3188,6 +3187,9 @@ impl<'t> EventLoop<'t> {
         ) {
             Ok(old) => old,
             Err(error) => {
+                if !was_gated {
+                    queue.set_gated(false);
+                }
                 if target_id != current_id {
                     self.ctx.storage_writer.forget(target_id);
                 }
@@ -3700,10 +3702,9 @@ impl<'t> EventLoop<'t> {
             }
             return;
         };
-        let current_version = self.sessions[idx].coordinator.read().options().version;
         match kind {
             SessionOpKind::ModelChanged { spec } => match result {
-                Ok(Some(commit)) if commit.version == current_version => {
+                Ok(Some(commit)) => {
                     if let Some(revision) = commit.model_revision
                         && revision == self.sessions[idx].coordinator.read().model_revision()
                     {
@@ -3716,14 +3717,20 @@ impl<'t> EventLoop<'t> {
                 Ok(_) => {}
                 Err(error) => self.sessions[idx].app.flash(error),
             },
-            SessionOpKind::OptionToggled { id, committed } => match result {
+            SessionOpKind::OptionToggled { id } => match result {
                 Ok(_) => {
-                    let enabled = committed
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .take();
-                    if let Some(enabled) = enabled {
-                        self.sessions[idx].app.apply_toggled_option(id, enabled);
+                    if let Some(option) = self.sessions[idx]
+                        .coordinator
+                        .read()
+                        .options()
+                        .options
+                        .iter()
+                        .find(|option| option.definition.id.as_ref() == id)
+                    {
+                        self.sessions[idx].app.apply_toggled_option(
+                            id,
+                            option.current_value.as_ref() == ENABLED_VALUE,
+                        );
                     }
                 }
                 Err(error) => self.sessions[idx].app.flash(error),
@@ -3743,15 +3750,23 @@ impl<'t> EventLoop<'t> {
                 reply_tx,
             } => {
                 let reply = result.and_then(|commit| {
-                    if commit
+                    let options = self.sessions[idx].coordinator.read().options();
+                    let current_thinking = if commit
                         .as_ref()
-                        .is_some_and(|commit| commit.version != current_version)
+                        .is_some_and(|commit| commit.version == options.version)
                     {
-                        return Ok(
-                            json!({ "mode": self.sessions[idx].app.state.thinking.to_string() }),
-                        );
-                    }
-                    if set_default {
+                        thinking
+                    } else {
+                        options
+                            .options
+                            .iter()
+                            .find(|option| option.definition.id.as_ref() == THINKING_OPTION_ID)
+                            .and_then(|option| {
+                                option.current_value.parse::<DomainThinkingConfig>().ok()
+                            })
+                            .unwrap_or(thinking)
+                    };
+                    if set_default && current_thinking == thinking {
                         write_prefs(
                             &self.ctx.storage,
                             &Prefs {
@@ -3761,8 +3776,8 @@ impl<'t> EventLoop<'t> {
                         .map_err(|error| error.to_string())?;
                     }
                     let app = &mut self.sessions[idx].app;
-                    app.state.thinking = thinking;
-                    let mode = thinking.to_string();
+                    app.state.thinking = current_thinking;
+                    let mode = current_thinking.to_string();
                     app.flash(format!("Thinking: {mode}"));
                     Ok(json!({ "mode": mode }))
                 });
@@ -3774,27 +3789,24 @@ impl<'t> EventLoop<'t> {
                 fast,
                 reply_tx,
             } => {
-                let reply = result.and_then(|commit| {
-                    if let Some(commit) = commit
-                        && commit.version == current_version
+                let reply = result.map(|commit| {
+                    let Some(commit) = commit else {
+                        return self.sessions[idx].app.model_state();
+                    };
+                    if let Some(spec) = &spec
+                        && let Some(revision) = commit.model_revision
+                        && revision == self.sessions[idx].coordinator.read().model_revision()
                     {
-                        if let Some(spec) = &spec
-                            && let Some(revision) = commit.model_revision
-                            && revision == self.sessions[idx].coordinator.read().model_revision()
-                        {
-                            self.sessions[idx]
-                                .model_slot
-                                .commit_independent_model(spec, revision);
-                            self.apply_model_change(idx, spec);
-                        }
-                        if let Some(thinking) = thinking {
-                            self.sessions[idx].app.state.thinking = thinking;
-                        }
-                        if let Some(fast) = fast {
-                            self.sessions[idx].app.set_fast(fast)?;
-                        }
+                        self.sessions[idx]
+                            .model_slot
+                            .commit_independent_model(spec, revision);
+                        self.apply_model_change(idx, spec);
                     }
-                    Ok(self.sessions[idx].app.model_state())
+                    let options = self.sessions[idx].coordinator.read().options();
+                    if thinking.is_some() || fast.is_some() {
+                        project_committed_options_for_app(&mut self.sessions[idx].app, &options);
+                    }
+                    self.sessions[idx].app.model_state()
                 });
                 let _ = reply_tx.send(reply);
             }
@@ -4353,22 +4365,17 @@ fn dispatch_option_toggle(
     id: &'static str,
     internal_tx: &flume::Sender<InternalEvent>,
 ) {
-    let committed: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
-    let slot = Arc::clone(&committed);
     let internal_tx = internal_tx.clone();
     smol::spawn(async move {
         let result = coordinator
             .toggle_boolean_option(id)
             .await
-            .map(|(enabled, _)| {
-                *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
-                None
-            })
+            .map(|_| None)
             .map_err(|error| error.to_string());
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             generation,
-            kind: SessionOpKind::OptionToggled { id, committed },
+            kind: SessionOpKind::OptionToggled { id },
             result,
         });
     })
@@ -4434,15 +4441,11 @@ mod tests {
                 &internal_tx,
             );
 
-            let mut committed = Vec::new();
             for _ in 0..2 {
                 let InternalEvent::SessionOp {
                     session,
                     generation,
-                    kind:
-                        SessionOpKind::OptionToggled {
-                            committed: value, ..
-                        },
+                    kind: SessionOpKind::OptionToggled { id: option_id },
                     result,
                 } = internal_rx.recv_async().await.unwrap()
                 else {
@@ -4450,11 +4453,10 @@ mod tests {
                 };
                 assert_eq!(session, id);
                 assert_eq!(generation, 1);
+                assert_eq!(option_id, YOLO_OPTION_ID);
                 result.unwrap();
-                committed.push(value.lock().unwrap().take().unwrap());
             }
 
-            assert_eq!(committed, [true, false]);
             let yolo = coordinator
                 .read()
                 .options()
@@ -5203,6 +5205,151 @@ mod tests {
             DomainThinkingConfig::Adaptive
         );
         assert!(!loop_state.sessions[0].app.state.fast);
+        let runtime = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn reordered_yolo_toggle_completions_keep_permissions_disabled() {
+        let mut harness = RuntimeHarness::new();
+        let runtime = harness.runtime(harness.session());
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        let runtime = &loop_state.sessions[0];
+        let id = runtime.id();
+        let generation = runtime.generation;
+        let coordinator = runtime.coordinator.clone();
+        let (enabled, _) =
+            smol::block_on(coordinator.toggle_boolean_option(YOLO_OPTION_ID)).unwrap();
+        assert!(enabled);
+        let (enabled, _) =
+            smol::block_on(coordinator.toggle_boolean_option(YOLO_OPTION_ID)).unwrap();
+        assert!(!enabled);
+        for _ in 0..2 {
+            loop_state.handle_internal(InternalEvent::SessionOp {
+                session: id,
+                generation,
+                kind: SessionOpKind::OptionToggled { id: YOLO_OPTION_ID },
+                result: Ok(None),
+            });
+            assert!(!loop_state.sessions[0].app.permissions.is_yolo());
+        }
+        let runtime = loop_state.sessions.remove(0);
+        drop(loop_state);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn unrelated_option_update_does_not_suppress_model_set() {
+        const TARGET: &str = "anthropic/model-a";
+        let mut harness = RuntimeHarness::new();
+        let runtime = test_runtime(crate::components::test_model());
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        let runtime = &mut loop_state.sessions[0];
+        let adopted = smol::block_on(runtime.coordinator.set_model(
+            Some(Arc::from(TARGET)),
+            None,
+            Some(maki_agent::ThinkingConfig::Adaptive),
+        ))
+        .unwrap();
+        let revision = runtime.coordinator.read().model_revision();
+        let newer = smol::block_on(
+            runtime
+                .coordinator
+                .set_option(WORKFLOW_OPTION_ID, ENABLED_VALUE),
+        )
+        .unwrap();
+        assert!(newer.version > adopted.version);
+        loop_state.sessions[0]
+            .model_slot
+            .install(model_named("model-a"), Arc::new(StubProvider));
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        loop_state.handle_internal(InternalEvent::SessionOp {
+            session: loop_state.sessions[0].id(),
+            generation: loop_state.sessions[0].generation,
+            kind: SessionOpKind::ModelSet {
+                spec: Some(TARGET.into()),
+                thinking: Some(DomainThinkingConfig::Adaptive),
+                fast: None,
+                reply_tx,
+            },
+            result: Ok(Some(SessionOpCommit {
+                version: adopted.version,
+                model_revision: Some(revision),
+            })),
+        });
+        let reply = reply_rx.recv().unwrap().unwrap();
+        assert_eq!(reply["spec"], TARGET);
+        assert_eq!(reply["thinking"], "adaptive");
+        assert_eq!(loop_state.sessions[0].app.state.model.spec(), TARGET);
         let runtime = loop_state.sessions.remove(0);
         drop(loop_state);
         release_runtime(runtime);
@@ -7982,6 +8129,84 @@ mod tests {
         );
         assert!(target_path.exists());
         release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn ordinary_replacement_transfers_queued_roots() {
+        const PROMPT: &str = "queued before reset";
+        let mut harness = RuntimeHarness::new();
+        let runtime = harness.runtime(harness.session());
+        let mut terminal = test_event_loop_terminal();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (_provider_tx, provider_change_rx) = flume::unbounded();
+        let (_ui_tx, ui_action_rx) = flume::unbounded();
+        let (_command_tx, command_rx) = flume::unbounded();
+        let (_warn_tx, warn_rx) = flume::unbounded();
+        let (warn_tx, _warning_rx) = flume::unbounded();
+        let mut loop_state = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: false,
+            notifier: None,
+            sessions_dir: harness.ctx().sessions_dir.clone(),
+            session_cwd: String::new(),
+            last_heartbeat: Instant::now(),
+            input: InputReader::spawn(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx,
+            command_rx,
+            provider_change_rx,
+            provider_usage: ProviderUsageCoordinator::new(
+                harness.ctx().model_slot.load().provider.identity(),
+            ),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+            ctx: harness.ctx.take().unwrap(),
+        };
+        let (manager, root) = loop_state.sessions[0].handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        let input = maki_agent::AgentInput::from_defaults(
+            PROMPT.into(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+        );
+        actor.set_queue_paused(true);
+        actor
+            .rush(maki_agent::actor::RootWork::new(
+                input,
+                1,
+                false,
+                PROMPT.into(),
+                Vec::new(),
+                crate::agent::shared_queue::correlation(1),
+            ))
+            .unwrap();
+        let mut target = harness.session();
+        target.model = loop_state.sessions[0].app.state.session.model.clone();
+        let prepared = loop_state
+            .ctx
+            .prepare_replacement_runtime(
+                target,
+                loop_state.sessions[0].id(),
+                loop_state.sessions[0].app.permissions.as_ref(),
+            )
+            .unwrap();
+        let (held, _) = loop_state.replace_prepared_runtime(0, prepared).unwrap();
+        assert!(matches!(held.as_slice(), [QueueItem::Message { text, .. }] if text == PROMPT));
+        transfer_held_queue(&mut loop_state.sessions[0].app, held);
+        assert_eq!(loop_state.sessions[0].app.queue.text_messages(), [PROMPT]);
+        let runtime = loop_state.sessions.remove(0);
+        drop(loop_state);
         release_runtime(runtime);
     }
 

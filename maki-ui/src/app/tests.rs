@@ -3945,6 +3945,52 @@ fn busy_queue_and_notify_waits_for_gate_release() {
 }
 
 #[test]
+fn queue_focus_uses_visible_rows() {
+    let mut app = test_app();
+    let shared = shared_queue::queue();
+    app.queue.set_shared(shared.clone());
+    shared.push(shared_queue::QueueItem::Message {
+        text: "hidden".into(),
+        image_count: 0,
+        input: maki_agent::AgentInput::from_defaults(
+            "hidden".into(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+        ),
+        run_id: 1,
+        displayed: true,
+    });
+    app.queue.set_focus_at(0);
+    assert_eq!(app.queue.focus(), None);
+    shared.push(shared_queue::QueueItem::Message {
+        text: "visible".into(),
+        image_count: 0,
+        input: maki_agent::AgentInput::from_defaults(
+            "visible".into(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+        ),
+        run_id: 2,
+        displayed: false,
+    });
+    app.queue.set_focus_at(0);
+    app.queue.move_focus_down();
+    assert_eq!(app.queue.focus(), Some(0));
+    shared.push(shared_queue::QueueItem::Compact {
+        run_id: 3,
+        instructions: None,
+    });
+    app.queue.move_focus_down();
+    assert_eq!(app.queue.focus(), Some(1));
+    assert!(shared.remove(1));
+    assert_eq!(app.queue.focus(), None);
+    app.queue.remove(1);
+    assert_eq!(app.queue.focus(), Some(0));
+}
+
+#[test]
 fn queue_boundary_clamps() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));
