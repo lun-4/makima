@@ -579,7 +579,7 @@ fn pause_returns_popped_ui_work_for_clear_context_transfer() {
             let transferred = handle.take_paused_ui_work();
             if compact {
                 assert!(
-                    matches!(transferred.as_slice(), [QueuedUiWork::Compact { run_id: 42, instructions: Some(details) }] if details == "details")
+                    matches!(transferred.as_slice(), [QueuedUiWork::Compact { run_id: 42, instructions: Some(details), .. }] if details == "details")
                 );
             } else {
                 assert!(
@@ -674,7 +674,13 @@ fn cancel_paused_queued_turns_settles_tickets_without_touching_other_work() {
             assert_eq!(handle.outcome(ticket.turn_id()), Some(outcome));
         }
         assert_eq!(events.try_iter().count(), 2);
-        assert_eq!(handle.snapshot().queue, [QueueProjection::Compact(None)]);
+        assert!(matches!(
+            handle.snapshot().queue.as_slice(),
+            [QueueProjection::Compact {
+                instructions: None,
+                ..
+            }]
+        ));
         gate.open();
         assert!(matches!(active.wait().await, TurnOutcome::Completed { .. }));
         assert_eq!(state.entered.load(Ordering::SeqCst), 1);
@@ -1338,16 +1344,16 @@ fn idle_root_start_preserves_metadata_to_backend() {
         let (handle, task) = spawn(backend);
         // Queue the root while idle: the runner pops it and starts it as its
         // own turn, carrying the neutral display metadata.
-        handle
-            .rush(RootWork::new(
-                input("deferred"),
-                7,
-                false,
-                "deferred bubble".into(),
-                vec![test_image(), test_image(), test_image()],
-                "r7".into(),
-            ))
-            .unwrap();
+        let root = RootWork::new(
+            input("deferred"),
+            7,
+            false,
+            "deferred bubble".into(),
+            vec![test_image(), test_image(), test_image()],
+            "r7".into(),
+        );
+        let row_id = root.row_id;
+        handle.rush(root).unwrap();
         // The runner starts the root (entered) and settles to Idle; both are
         // observed before asserting, so the backend's run completed.
         until(|| {
@@ -1362,6 +1368,7 @@ fn idle_root_start_preserves_metadata_to_backend() {
         assert_eq!(
             runs[0].0,
             WorkKind::Root {
+                row_id,
                 run_id: 7,
                 displayed: false,
                 text: "deferred bubble".into(),
@@ -1511,7 +1518,7 @@ fn paused_ui_work_drains_fifo_without_touching_turns_or_controls() {
         assert_eq!(root.input.message, "image prompt");
         assert_eq!(root.input.images, [image]);
         assert!(
-            matches!(taken.next(), Some(QueuedUiWork::Compact { run_id: 12, instructions: Some(details) }) if details == "details")
+            matches!(taken.next(), Some(QueuedUiWork::Compact { run_id: 12, instructions: Some(details), .. }) if details == "details")
         );
         assert!(matches!(taken.next(), Some(QueuedUiWork::Root(root)) if root.text == "last"));
         assert!(taken.next().is_none());
@@ -1533,6 +1540,7 @@ fn paused_ui_work_drains_fifo_without_touching_turns_or_controls() {
 fn ui_work_drain_requires_paused_queue() {
     let queue = ActorQueue::new();
     queue.push(ActorWork::Compact {
+        row_id: super::next_queue_row_id(),
         run_id: 3,
         instructions: None,
     });
@@ -1557,6 +1565,7 @@ fn paused_queue_blocks_both_pop_paths_and_preserves_fifo() {
         "r1".into(),
     )));
     queue.push(ActorWork::Compact {
+        row_id: super::next_queue_row_id(),
         run_id: 2,
         instructions: None,
     });
@@ -1581,6 +1590,7 @@ fn paused_queue_blocks_both_pop_paths_and_preserves_fifo() {
 fn queue_pop_interrupt_keeps_incompatible_entries() {
     let queue = ActorQueue::new();
     queue.push(ActorWork::Compact {
+        row_id: super::next_queue_row_id(),
         run_id: 1,
         instructions: None,
     });
@@ -1628,6 +1638,7 @@ fn queue_drain_publication_is_ordered() {
     queue.publish_if_empty(|| *published.lock().unwrap() += 1);
     assert_eq!(*published.lock().unwrap(), 1, "empty queue publishes");
     queue.push(ActorWork::Compact {
+        row_id: super::next_queue_row_id(),
         run_id: 1,
         instructions: None,
     });
@@ -2008,7 +2019,7 @@ fn cancel_r7_precancels_and_drops_compact_7_but_not_8() {
         handle.cancel_correlation("r7", TurnCancellationReason::User);
         let queue = handle.snapshot().queue;
         assert_eq!(queue.len(), 1, "compact 7 removed, compact 8 survives");
-        assert!(matches!(queue[0], QueueProjection::Compact(_)));
+        assert!(matches!(queue[0], QueueProjection::Compact { .. }));
 
         gate.open();
         assert!(matches!(

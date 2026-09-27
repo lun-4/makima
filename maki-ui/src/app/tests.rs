@@ -883,6 +883,8 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     type_and_submit(&mut app, "first");
     assert_eq!(app.main_chat().message_count(), 1);
 
+    let shared = shared_queue::queue();
+    app.queue.set_shared(shared.clone());
     app.queue_and_notify(queued_msg("queued"));
     app.queue.set_focus_at(0);
     assert_eq!(app.queue.focus(), Some(0));
@@ -892,6 +894,7 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         "queueing while streaming must not render the bubble yet",
     );
 
+    assert!(shared.remove(0));
     app.update(agent_msg_with_run_id(
         AgentEvent::QueueItemConsumed {
             text: "queued".into(),
@@ -907,6 +910,30 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         app.main_chat().last_message_role(),
         Some(&DisplayRole::User),
     );
+}
+
+#[test]
+fn delayed_queue_item_consumed_preserves_other_focus() {
+    let mut app = test_app();
+    let shared = shared_queue::queue();
+    app.queue.set_shared(shared.clone());
+    app.queue_and_notify(queued_msg("consumed"));
+    app.queue_and_notify(queued_msg("remaining"));
+    app.queue.set_focus_at(0);
+    assert!(shared.remove(0));
+    app.queue.set_focus_at(0);
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "consumed".into(),
+            images: Vec::new(),
+        },
+        app.run_id,
+    ));
+
+    assert_eq!(app.queue.focus(), Some(0));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.queue.is_empty());
 }
 
 /// Restored queue items start runs without `start_run`, so the consumed
@@ -3953,6 +3980,7 @@ fn queue_focus_uses_visible_rows() {
     let shared = shared_queue::queue();
     app.queue.set_shared(shared.clone());
     shared.push(shared_queue::QueueItem::Message {
+        row_id: maki_agent::actor::next_queue_row_id(),
         text: "hidden".into(),
         image_count: 0,
         input: maki_agent::AgentInput::from_defaults(
@@ -3967,6 +3995,7 @@ fn queue_focus_uses_visible_rows() {
     app.queue.set_focus_at(0);
     assert_eq!(app.queue.focus(), None);
     shared.push(shared_queue::QueueItem::Message {
+        row_id: maki_agent::actor::next_queue_row_id(),
         text: "visible".into(),
         image_count: 0,
         input: maki_agent::AgentInput::from_defaults(
@@ -3982,6 +4011,7 @@ fn queue_focus_uses_visible_rows() {
     app.queue.move_focus_down();
     assert_eq!(app.queue.focus(), Some(0));
     shared.push(shared_queue::QueueItem::Compact {
+        row_id: maki_agent::actor::next_queue_row_id(),
         run_id: 3,
         instructions: None,
     });
@@ -3994,17 +4024,31 @@ fn queue_focus_uses_visible_rows() {
 }
 
 #[test]
+fn queue_focus_follows_same_row_after_earlier_removal() {
+    let mut app = test_app();
+    let shared = shared_queue::queue();
+    app.queue.set_shared(shared.clone());
+    app.queue_and_notify(queued_msg("first"));
+    app.queue_and_notify(queued_msg("second"));
+    app.queue.set_focus_at(1);
+    assert!(shared.remove(0));
+    assert_eq!(app.queue.focus(), Some(0));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.queue.is_empty());
+}
+
+#[test]
 fn consumed_queue_focus_does_not_return_on_new_prompt() {
     let mut app = test_app();
     let shared = shared_queue::queue();
     app.queue.set_shared(shared.clone());
     shared.push(shared_queue::QueueItem::Compact {
+        row_id: maki_agent::actor::next_queue_row_id(),
         run_id: 0,
         instructions: None,
     });
     app.queue.set_focus_at(0);
     assert!(shared.remove(0));
-    assert_eq!(app.queue.focus(), None);
     app.queue_and_notify(queued_msg("new prompt"));
     assert_eq!(app.queue.focus(), None);
     app.update(Msg::Key(key(KeyCode::Enter)));

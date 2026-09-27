@@ -22,11 +22,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueProjection {
     Message {
+        row_id: u64,
         text: String,
         image_count: usize,
         displayed: bool,
     },
-    Compact(Option<String>),
+    Compact {
+        row_id: u64,
+        instructions: Option<String>,
+    },
     Control(String),
     Turn(String),
 }
@@ -34,6 +38,7 @@ pub enum QueueProjection {
 impl From<&RootWork> for QueueProjection {
     fn from(root: &RootWork) -> Self {
         Self::Message {
+            row_id: root.row_id,
             text: root.text.clone(),
             image_count: root.images.len(),
             displayed: root.displayed,
@@ -45,7 +50,14 @@ impl From<&ActorWork> for QueueProjection {
     fn from(work: &ActorWork) -> Self {
         match work {
             ActorWork::Root(root) => Self::from(root),
-            ActorWork::Compact { instructions, .. } => Self::Compact(instructions.clone()),
+            ActorWork::Compact {
+                row_id,
+                instructions,
+                ..
+            } => Self::Compact {
+                row_id: *row_id,
+                instructions: instructions.clone(),
+            },
             ActorWork::Control(control) => Self::Control(control.name.clone()),
             ActorWork::Turn(admission) => Self::Turn(admission.correlation.clone()),
         }
@@ -181,6 +193,7 @@ impl ActorQueue {
                 let mut earlier = Vec::with_capacity(roots.len());
                 for r in roots {
                     earlier.push(EarlierRoot {
+                        row_id: r.row_id,
                         thinking: r.input.thinking,
                         fast: r.input.fast,
                         run_id: r.run_id,
@@ -365,6 +378,7 @@ impl ActorQueue {
                 earlier.images,
                 earlier.correlation,
             ));
+            roots.last_mut().unwrap().row_id = earlier.row_id;
         }
         roots.push(root);
         roots
@@ -399,9 +413,11 @@ impl ActorQueue {
                 ActorWork::Compact {
                     run_id,
                     instructions,
+                    row_id,
                 } => taken.push(QueuedUiWork::Compact {
                     run_id,
                     instructions,
+                    row_id,
                 }),
                 other => kept.push_back(other),
             }
@@ -444,6 +460,7 @@ impl ActorQueue {
                 let mut projected = Vec::new();
                 if let ActorWork::Root(root) = work {
                     projected.extend(root.earlier.iter().map(|earlier| QueueProjection::Message {
+                        row_id: earlier.row_id,
                         text: earlier.text.clone(),
                         image_count: earlier.images.len(),
                         displayed: earlier.displayed,
@@ -666,6 +683,7 @@ mod tests {
         queue.set_paused(true);
         queue.defer(batched);
         queue.push(ActorWork::Compact {
+            row_id: crate::actor::next_queue_row_id(),
             run_id: 4,
             instructions: None,
         });
@@ -728,9 +746,18 @@ mod tests {
                 ..test_root(text, index as u64 + 1, Vec::new())
             }));
         }
+        let original_ids = queue
+            .snapshot()
+            .iter()
+            .filter_map(|entry| match entry {
+                QueueProjection::Message { row_id, .. } => Some(*row_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let batch = queue.pop().expect("batched roots");
         queue.defer(batch);
         queue.push(ActorWork::Compact {
+            row_id: crate::actor::next_queue_row_id(),
             run_id: 4,
             instructions: None,
         });
@@ -752,9 +779,27 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, remaining);
+        let remaining_ids = original_ids
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, id)| (index != removed_index).then_some(id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected
+                .iter()
+                .filter_map(|entry| match entry {
+                    QueueProjection::Message { row_id, .. } => Some(*row_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            remaining_ids
+        );
         assert!(matches!(
             projected.last(),
-            Some(QueueProjection::Compact(None))
+            Some(QueueProjection::Compact {
+                instructions: None,
+                ..
+            })
         ));
         queue.set_paused(true);
         let pending = queue.take_paused_ui_work();
@@ -868,6 +913,7 @@ mod tests {
         let queue = ActorQueue::new();
         queue.push(ActorWork::Root(test_root("first", 1, Vec::new())));
         queue.push(ActorWork::Compact {
+            row_id: crate::actor::next_queue_row_id(),
             run_id: 2,
             instructions: None,
         });

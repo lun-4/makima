@@ -188,8 +188,9 @@ impl Runner {
             ActorWork::Compact {
                 run_id,
                 instructions,
+                row_id,
             } => {
-                self.run_compact(run_id, instructions, cancellation_generation)
+                self.run_compact(run_id, instructions, row_id, cancellation_generation)
                     .await
             }
         }
@@ -218,12 +219,14 @@ impl Runner {
         match work {
             WorkKind::Turn => ActorWork::Turn(admission),
             WorkKind::Root {
+                row_id,
                 run_id,
                 displayed,
                 text,
                 images,
                 earlier,
             } => ActorWork::Root(RootWork {
+                row_id,
                 input: admission.input.expect("pending root input"),
                 run_id,
                 displayed,
@@ -506,6 +509,7 @@ impl Runner {
         self.run_turn(
             admission,
             WorkKind::Root {
+                row_id: root.row_id,
                 run_id: root.run_id,
                 displayed: root.displayed,
                 text: root.text,
@@ -587,6 +591,7 @@ impl Runner {
         &mut self,
         run_id: u64,
         instructions: Option<String>,
+        row_id: u64,
         popped_generation: u64,
     ) {
         // Consumed: retire any precancel mark for this run_id's canonical
@@ -603,6 +608,7 @@ impl Runner {
                 self.queue.defer(ActorWork::Compact {
                     run_id,
                     instructions,
+                    row_id,
                 });
                 return;
             }
@@ -625,6 +631,7 @@ impl Runner {
                 self.queue.defer(ActorWork::Compact {
                     run_id,
                     instructions,
+                    row_id,
                 });
                 return;
             }

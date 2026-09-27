@@ -23,6 +23,7 @@ impl ManagedTurnAdmission {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EarlierRoot {
+    pub row_id: u64,
     pub run_id: u64,
     pub displayed: bool,
     pub text: String,
@@ -41,6 +42,7 @@ pub struct EarlierRoot {
 pub enum WorkKind {
     Turn,
     Root {
+        row_id: u64,
         run_id: u64,
         displayed: bool,
         text: String,
@@ -96,6 +98,7 @@ pub enum BackendResult {
 /// (`run_id`, displayed, text, image count) so the TUI can project the queue
 /// without importing UI types into the core.
 pub struct RootWork {
+    pub row_id: u64,
     pub input: crate::AgentInput,
     pub run_id: u64,
     pub displayed: bool,
@@ -115,6 +118,7 @@ impl RootWork {
         correlation: String,
     ) -> Self {
         Self {
+            row_id: super::next_queue_row_id(),
             input,
             run_id,
             displayed,

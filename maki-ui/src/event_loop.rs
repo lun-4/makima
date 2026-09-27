@@ -3476,6 +3476,7 @@ impl<'t> EventLoop<'t> {
                 prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
                 let message = QueueItem::Message {
+                    row_id: maki_agent::actor::next_queue_row_id(),
                     text: input.message.clone(),
                     image_count: input.images.len(),
                     input,
@@ -3585,6 +3586,7 @@ impl<'t> EventLoop<'t> {
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem::Compact {
+                    row_id: maki_agent::actor::next_queue_row_id(),
                     run_id,
                     instructions,
                 });
@@ -6888,6 +6890,7 @@ mod tests {
                 panic!("expected send action");
             };
             runtime.handles.queue.push(QueueItem::Message {
+                row_id: maki_agent::actor::next_queue_row_id(),
                 text: input.message.clone(),
                 image_count: input.images.len(),
                 input: *input,
@@ -6961,6 +6964,7 @@ mod tests {
             panic!("expected send action");
         };
         runtime.handles.queue.push(QueueItem::Message {
+            row_id: maki_agent::actor::next_queue_row_id(),
             text: PROMPT.into(),
             image_count: 0,
             input: *input,
@@ -7074,6 +7078,7 @@ mod tests {
         assert!(input.message.starts_with("Implement the plan"));
         runtime.handles.queue.set_gated(true);
         runtime.handles.queue.push(QueueItem::Message {
+            row_id: maki_agent::actor::next_queue_row_id(),
             text: input.message.clone(),
             image_count: 0,
             input: *input,
@@ -7113,7 +7118,7 @@ mod tests {
         assert!(input.workflow);
         assert_eq!(run_id, runtime.app.run_id);
         assert!(
-            matches!(items.next(), Some(QueueItem::Compact { instructions: Some(instructions), run_id }) if instructions == COMPACT && run_id == runtime.app.run_id)
+            matches!(items.next(), Some(QueueItem::Compact { instructions: Some(instructions), run_id, .. }) if instructions == COMPACT && run_id == runtime.app.run_id)
         );
         assert!(
             matches!(items.next(), Some(QueueItem::Message { text, run_id, displayed: false, .. }) if text == SECOND && run_id == runtime.app.run_id)
@@ -7193,6 +7198,7 @@ mod tests {
         assert!(prompt.starts_with("Implement the plan"));
         assert!(!prompt.contains(OLD_PROMPT));
         runtime.handles.queue.push(QueueItem::Message {
+            row_id: maki_agent::actor::next_queue_row_id(),
             text: prompt.clone(),
             image_count: input.images.len(),
             input: *input,

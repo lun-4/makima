@@ -24,7 +24,7 @@ pub(crate) enum SubmitOutcome {
 #[derive(Default)]
 pub(crate) struct MessageQueue {
     shared: Option<QueueSender>,
-    focus: Cell<Option<usize>>,
+    focus: Cell<Option<(usize, u64)>>,
 }
 
 impl MessageQueue {
@@ -59,9 +59,14 @@ impl MessageQueue {
     }
 
     pub(crate) fn focus(&self) -> Option<usize> {
-        let focus = self.focus.get().filter(|&index| index < self.panel_len());
+        let ids = self.shared.as_ref()?.visible_row_ids();
+        let focus = self.focus.get().and_then(|(_, id)| {
+            ids.iter()
+                .position(|row_id| *row_id == id)
+                .map(|index| (index, id))
+        });
         self.focus.set(focus);
-        focus
+        focus.map(|(index, _)| index)
     }
 
     pub(crate) fn set_focus(&mut self) {
@@ -76,7 +81,7 @@ impl MessageQueue {
         if let Some(sel) = self.focus()
             && sel > 0
         {
-            self.focus.set(Some(sel - 1));
+            self.set_focus_at(sel - 1);
         }
     }
 
@@ -84,7 +89,7 @@ impl MessageQueue {
         if let Some(sel) = self.focus() {
             let len = self.panel_len();
             if sel + 1 < len {
-                self.focus.set(Some(sel + 1));
+                self.set_focus_at(sel + 1);
             }
         }
     }
@@ -114,17 +119,27 @@ impl MessageQueue {
     }
 
     fn clamp_focus(&mut self) {
-        let len = self.panel_len();
-        self.focus.set(match self.focus.get() {
-            Some(_) if len == 0 => None,
-            Some(sel) if sel >= len => Some(len - 1),
-            other => other,
-        });
+        let ids = self
+            .shared
+            .as_ref()
+            .map(|shared| shared.visible_row_ids())
+            .unwrap_or_default();
+        self.focus.set(self.focus.get().and_then(|(index, id)| {
+            if let Some(current) = ids.iter().position(|row_id| *row_id == id) {
+                return Some((current, id));
+            }
+            let index = index.min(ids.len().checked_sub(1)?);
+            Some((index, ids[index]))
+        }));
     }
 
     pub(crate) fn set_focus_at(&mut self, index: usize) {
-        if index < self.panel_len() {
-            self.focus.set(Some(index));
+        if let Some(id) = self
+            .shared
+            .as_ref()
+            .and_then(|shared| shared.visible_row_ids().get(index).copied())
+        {
+            self.focus.set(Some((index, id)));
         }
     }
 }
@@ -224,6 +239,7 @@ impl App {
         };
         let input = self.build_agent_input(&msg);
         shared.push(QueueItem::Message {
+            row_id: maki_agent::actor::next_queue_row_id(),
             text: msg.text,
             image_count: msg.images.len(),
             input,
@@ -240,18 +256,25 @@ impl App {
         for item in work {
             let item = match item {
                 QueueItem::Message {
+                    row_id,
                     text,
                     image_count,
                     input,
                     ..
                 } => QueueItem::Message {
+                    row_id,
                     text,
                     image_count,
                     input,
                     run_id: self.run_id,
                     displayed: false,
                 },
-                QueueItem::Compact { instructions, .. } => QueueItem::Compact {
+                QueueItem::Compact {
+                    row_id,
+                    instructions,
+                    ..
+                } => QueueItem::Compact {
+                    row_id,
                     run_id: self.run_id,
                     instructions,
                 },
@@ -282,6 +305,7 @@ impl App {
             return false;
         };
         shared.push(QueueItem::Compact {
+            row_id: maki_agent::actor::next_queue_row_id(),
             run_id: self.run_id,
             instructions,
         });
@@ -293,7 +317,7 @@ impl App {
     /// learns the agent is busy. Immediate-dispatch items skip this event,
     /// so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: String, images: Vec<ImageSource>) {
-        self.queue.unfocus();
+        self.queue.focus();
         self.status = Status::Streaming;
         self.main_chat().show_user_message(text, images);
     }

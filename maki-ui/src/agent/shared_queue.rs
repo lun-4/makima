@@ -38,6 +38,7 @@ impl From<Submission> for QueuedMessage {
 
 pub(crate) enum QueueItem {
     Message {
+        row_id: u64,
         text: String,
         image_count: usize,
         input: AgentInput,
@@ -49,12 +50,19 @@ pub(crate) enum QueueItem {
         displayed: bool,
     },
     Compact {
+        row_id: u64,
         run_id: u64,
         instructions: Option<String>,
     },
 }
 
 impl QueueItem {
+    pub(crate) fn row_id(&self) -> u64 {
+        match self {
+            Self::Message { row_id, .. } | Self::Compact { row_id, .. } => *row_id,
+        }
+    }
+
     pub(crate) fn run_id(&self) -> u64 {
         match self {
             Self::Message { run_id, .. } | Self::Compact { run_id, .. } => *run_id,
@@ -179,6 +187,7 @@ impl QueueSender {
                 .into_iter()
                 .map(|work| match work {
                     QueuedUiWork::Root(root) => QueueItem::Message {
+                        row_id: root.row_id,
                         image_count: root.images.len(),
                         text: root.text,
                         input: root.input,
@@ -188,7 +197,9 @@ impl QueueSender {
                     QueuedUiWork::Compact {
                         run_id,
                         instructions,
+                        row_id,
                     } => QueueItem::Compact {
+                        row_id,
                         run_id,
                         instructions,
                     },
@@ -307,6 +318,39 @@ impl QueueSender {
             .collect()
     }
 
+    pub(crate) fn visible_row_ids(&self) -> Vec<u64> {
+        let gate = lock(&self.gate);
+        let mut ids = match &self.backend {
+            QueueBackend::Actor(actor) => actor
+                .snapshot()
+                .queue
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    QueueProjection::Message {
+                        row_id,
+                        displayed: false,
+                        ..
+                    }
+                    | QueueProjection::Compact { row_id, .. } => Some(row_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            #[cfg(test)]
+            QueueBackend::Test(items) => lock(items)
+                .iter()
+                .filter(|item| visible_in_panel(&(*item).into()))
+                .map(QueueItem::row_id)
+                .collect(),
+        };
+        ids.extend(
+            gate.held
+                .iter()
+                .filter(|item| visible_in_panel(&(*item).into()))
+                .map(QueueItem::row_id),
+        );
+        ids
+    }
+
     pub(crate) fn panel_len(&self) -> usize {
         self.projections()
             .into_iter()
@@ -341,6 +385,7 @@ impl QueueSender {
 fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), ActorError> {
     match entry {
         QueueItem::Message {
+            row_id,
             text,
             image_count: _,
             input,
@@ -352,20 +397,17 @@ fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), Actor
                 let _ticket = actor.admit_turn(input, None, correlation(run_id))?;
                 Ok(())
             } else {
-                actor.rush(RootWork::new(
-                    input,
-                    run_id,
-                    displayed,
-                    text,
-                    images,
-                    correlation(run_id),
-                ))
+                let mut root =
+                    RootWork::new(input, run_id, displayed, text, images, correlation(run_id));
+                root.row_id = row_id;
+                actor.rush(root)
             }
         }
         QueueItem::Compact {
+            row_id,
             run_id,
             instructions,
-        } => actor.push_compact(run_id, instructions),
+        } => actor.push_compact_with_row_id(run_id, instructions, row_id),
     }
 }
 
@@ -374,7 +416,7 @@ fn visible_in_panel(entry: &QueueProjection) -> bool {
         QueueProjection::Message { displayed, .. } => !displayed,
         // Admitted turns project as `Turn`; they are already running or
         // already drawn, so the panel never reserves a row for them.
-        QueueProjection::Compact(_) => true,
+        QueueProjection::Compact { .. } => true,
         QueueProjection::Control(_) | QueueProjection::Turn(_) => false,
     }
 }
@@ -385,7 +427,7 @@ fn as_queue_entry(entry: &QueueProjection) -> QueueEntry<'static> {
             text: Cow::Owned(text.clone()),
             color: theme::current().foreground,
         },
-        QueueProjection::Compact(instructions) => QueueEntry {
+        QueueProjection::Compact { instructions, .. } => QueueEntry {
             text: match instructions {
                 Some(extra) => Cow::Owned(format!("{COMPACT_COMMAND_NAME} {extra}")),
                 None => Cow::Borrowed(COMPACT_COMMAND_NAME),
@@ -411,13 +453,15 @@ impl From<&QueueItem> for QueueProjection {
                 displayed,
                 ..
             } => QueueProjection::Message {
+                row_id: item.row_id(),
                 text: text.clone(),
                 image_count: *image_count,
                 displayed: *displayed,
             },
-            QueueItem::Compact { instructions, .. } => {
-                QueueProjection::Compact(instructions.clone())
-            }
+            QueueItem::Compact { instructions, .. } => QueueProjection::Compact {
+                row_id: item.row_id(),
+                instructions: instructions.clone(),
+            },
         }
     }
 }
@@ -429,6 +473,7 @@ mod tests {
 
     fn msg(displayed: bool) -> QueueItem {
         QueueItem::Message {
+            row_id: maki_agent::actor::next_queue_row_id(),
             text: "t".into(),
             image_count: 0,
             input: AgentInput {
@@ -450,7 +495,7 @@ mod tests {
 
     #[test_case(msg(false), true  ; "deferred_message_visible")]
     #[test_case(msg(true),  false ; "displayed_message_hidden")]
-    #[test_case(QueueItem::Compact { run_id: 0, instructions: None }, true  ; "compact_visible")]
+    #[test_case(QueueItem::Compact { row_id: maki_agent::actor::next_queue_row_id(), run_id: 0, instructions: None }, true  ; "compact_visible")]
     fn panel_visibility(item: QueueItem, visible: bool) {
         let tx = queue();
         tx.push(item);
@@ -476,11 +521,13 @@ mod tests {
         tx.push(msg(false));
         tx.set_gated(true);
         clone.push(QueueItem::Compact {
+            row_id: maki_agent::actor::next_queue_row_id(),
             run_id: 1,
             instructions: None,
         });
         tx.push(msg(true));
         clone.push(QueueItem::Compact {
+            row_id: maki_agent::actor::next_queue_row_id(),
             run_id: 2,
             instructions: Some("last".into()),
         });
@@ -494,14 +541,8 @@ mod tests {
         assert_eq!(tx.text_messages(), ["t"]);
         tx.set_gated(false);
         assert!(lock(&tx.gate).held.is_empty());
-        assert_eq!(
-            tx.projections(),
-            vec![
-                QueueProjection::from(&msg(false)),
-                QueueProjection::Compact(None),
-                QueueProjection::from(&msg(true)),
-                QueueProjection::Compact(Some("last".into())),
-            ]
+        assert!(
+            matches!(tx.projections().as_slice(), [QueueProjection::Message { text: first, displayed: false, .. }, QueueProjection::Compact { instructions: None, .. }, QueueProjection::Message { text: third, displayed: true, .. }, QueueProjection::Compact { instructions: Some(last), .. }] if first == "t" && third == "t" && last == "last")
         );
     }
 
@@ -510,11 +551,13 @@ mod tests {
         let tx = queue();
         tx.push(msg(false));
         tx.push(QueueItem::Compact {
+            row_id: maki_agent::actor::next_queue_row_id(),
             run_id: 1,
             instructions: Some("earlier".into()),
         });
         tx.set_gated(true);
         tx.push(QueueItem::Compact {
+            row_id: maki_agent::actor::next_queue_row_id(),
             run_id: 2,
             instructions: Some("held".into()),
         });
@@ -625,6 +668,7 @@ mod tests {
         };
         input.message = HELD.into();
         tx.push(QueueItem::Message {
+            row_id: maki_agent::actor::next_queue_row_id(),
             text: HELD.into(),
             input,
             image_count: 0,
@@ -655,7 +699,7 @@ mod tests {
             matches!(pending.next(), Some(QueueItem::Message { text, input, run_id: 2, image_count: 0, .. }) if text == NEXT && input.message == NEXT && input.preamble.is_empty())
         );
         assert!(
-            matches!(pending.next(), Some(QueueItem::Compact { run_id: 3, instructions: Some(details) }) if details == DETAILS)
+            matches!(pending.next(), Some(QueueItem::Compact { run_id: 3, instructions: Some(details), .. }) if details == DETAILS)
         );
         assert!(
             matches!(pending.next(), Some(QueueItem::Message { text, run_id: 4, .. }) if text == HELD)
@@ -765,6 +809,7 @@ mod tests {
         tx.set_gated(true);
         tx.push(msg(false));
         tx.push(QueueItem::Compact {
+            row_id: maki_agent::actor::next_queue_row_id(),
             run_id: 1,
             instructions: None,
         });

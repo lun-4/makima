@@ -33,7 +33,10 @@ pub use types::{
 };
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use maki_providers::{Message, TokenUsage};
 use tracing::info;
@@ -41,6 +44,12 @@ use tracing::info;
 use crate::cancel::{CancelToken, ReasonedCancelToken, ReasonedCancelTrigger};
 use crate::types::{AgentEvent, AgentId, EventSender, TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{AgentInput, CancelTrigger, History, InterruptSource, SharedMessages};
+
+static NEXT_ROW_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_queue_row_id() -> u64 {
+    NEXT_ROW_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One unit of work the scheduler consumes. Variants map onto behavior: a
 /// `Turn` always settles into exactly one [`TurnOutcome`], `Root` becomes a
@@ -53,6 +62,7 @@ pub enum ActorWork {
     Compact {
         run_id: u64,
         instructions: Option<String>,
+        row_id: u64,
     },
 }
 
@@ -63,6 +73,7 @@ pub enum QueuedUiWork {
     Compact {
         run_id: u64,
         instructions: Option<String>,
+        row_id: u64,
     },
 }
 
@@ -523,6 +534,15 @@ impl AgentActorHandle {
         run_id: u64,
         instructions: Option<String>,
     ) -> Result<(), ActorError> {
+        self.push_compact_with_row_id(run_id, instructions, next_queue_row_id())
+    }
+
+    pub fn push_compact_with_row_id(
+        &self,
+        run_id: u64,
+        instructions: Option<String>,
+        row_id: u64,
+    ) -> Result<(), ActorError> {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(match state.lifecycle {
@@ -541,6 +561,7 @@ impl AgentActorHandle {
         self.inner.queue.push(ActorWork::Compact {
             run_id,
             instructions,
+            row_id,
         });
         Ok(())
     }
