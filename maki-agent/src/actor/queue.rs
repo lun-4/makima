@@ -277,8 +277,9 @@ impl ActorQueue {
         let mut items = lock(&self.items);
         match items.front() {
             Some(ActorWork::Root(root))
-                if root.generation == generation && &crate::batch_key(&root.input) == batch_key => {
-            }
+                if batch_key.is_some()
+                    && root.generation == generation
+                    && &crate::batch_key(&root.input) == batch_key => {}
             Some(ActorWork::Compact { .. }) => {}
             _ => return None,
         }
@@ -466,6 +467,22 @@ mod tests {
         };
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].message, "new");
+    }
+
+    #[test]
+    fn interrupt_does_not_fold_roots_without_batch_keys() {
+        let queue = ActorQueue::new();
+        let mut active = test_input("active");
+        active.prompt = Some(Box::new(crate::McpPromptRef {
+            qualified_name: "server.prompt".into(),
+            arguments: Default::default(),
+        }));
+        let mut root = test_root("queued", 1, Vec::new());
+        root.input.cancel = Some(crate::CancelToken::new().1);
+        queue.push(ActorWork::Root(root));
+
+        assert!(queue.pop_interrupt(0, &crate::batch_key(&active)).is_none());
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]

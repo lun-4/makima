@@ -970,7 +970,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     mut input,
                     settings,
                     prepared,
-                    mut admission,
+                    admission,
                 } = queued;
                 let turn_id = TurnId::generate();
                 let lease_committer = input.lease_committer.clone();
@@ -994,11 +994,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 // is racing cancel: a slow server must not pin the whole session.
                 if let Some(mcp) = &mcp {
                     let _ = cancel.race(mcp.ready()).await;
-                    admission.bindings = Arc::new(crate::tools::TurnToolBindings::capture(
-                        ToolRegistry::global(),
-                        &params.local_tools,
-                        Some(mcp),
-                    ));
                 }
 
                 let (turn_event_tx, turn_event_rx) = flume::unbounded::<Envelope>();

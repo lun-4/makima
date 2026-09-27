@@ -243,7 +243,6 @@ pub struct McpToolBinding {
     qualified_name: Arc<str>,
     raw_name: String,
     transport: Arc<dyn McpTransport>,
-    generation: u64,
 }
 
 impl McpToolBinding {
@@ -636,7 +635,16 @@ impl McpSession {
     }
 
     pub fn published_is_current(&self, binding: &McpPublishedBinding) -> bool {
-        Arc::ptr_eq(&self.handle.published.load_full(), &binding.0)
+        let current = self.handle.published.load();
+        let pinned_tools = &binding.0.index.tools;
+        let current_tools = &current.index.tools;
+        pinned_tools.len() == current_tools.len()
+            && pinned_tools.iter().all(|(name, pinned)| {
+                current_tools.get(name).is_some_and(|tool| {
+                    tool.raw_name == pinned.raw_name
+                        && Arc::ptr_eq(&tool.transport, &pinned.transport)
+                })
+            })
     }
 
     pub fn extend_bound_tools(&self, binding: &McpPublishedBinding, tools: &mut Value) {
@@ -669,7 +677,6 @@ impl McpSession {
                 qualified_name: Arc::clone(name),
                 raw_name: tool.raw_name.clone(),
                 transport: Arc::clone(&tool.transport),
-                generation: state.snapshot.generation,
             })
             .collect()
     }
@@ -685,21 +692,19 @@ impl McpSession {
             qualified_name: Arc::clone(qualified.0),
             raw_name: qualified.1.raw_name.clone(),
             transport: Arc::clone(&qualified.1.transport),
-            generation: state.snapshot.generation,
         })
     }
 
     pub fn binding_is_current(&self, binding: &McpToolBinding) -> bool {
         let state = self.handle.published.load();
-        state.snapshot.generation == binding.generation
-            && state
-                .index
-                .tools
-                .get(&binding.qualified_name)
-                .is_some_and(|current| {
-                    current.raw_name == binding.raw_name
-                        && Arc::ptr_eq(&current.transport, &binding.transport)
-                })
+        state
+            .index
+            .tools
+            .get(&binding.qualified_name)
+            .is_some_and(|current| {
+                current.raw_name == binding.raw_name
+                    && Arc::ptr_eq(&current.transport, &binding.transport)
+            })
     }
 
     pub async fn call_bound_tool(
