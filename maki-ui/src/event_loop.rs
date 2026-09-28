@@ -3530,7 +3530,8 @@ impl<'t> EventLoop<'t> {
         let mode = agent_mode_for_app(&self.sessions[idx].app);
         let mode_def = self.ctx.lua_event_handle.mode_registry().current(&mode);
         let reservation = match kind {
-            SessionOpKind::ModelChanged { .. }
+            SessionOpKind::DirectoryChanged { .. }
+            | SessionOpKind::ModelChanged { .. }
             | SessionOpKind::ProviderRefreshed
             | SessionOpKind::ThinkingSet { .. }
             | SessionOpKind::ModelSet { .. } => manager
@@ -3542,8 +3543,7 @@ impl<'t> EventLoop<'t> {
                         .map_err(|error| error.to_string())
                 })
                 .map(Some),
-            SessionOpKind::DirectoryChanged { .. }
-            | SessionOpKind::OptionToggled { .. }
+            SessionOpKind::OptionToggled { .. }
             | SessionOpKind::LuaOptionSet { .. }
             | SessionOpKind::LuaModeSet { .. } => Ok(None),
         };

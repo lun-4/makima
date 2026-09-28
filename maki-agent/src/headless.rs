@@ -692,13 +692,30 @@ impl InteractiveInputSender {
             input.workflow,
             self.mcp_handle.is_some(),
         );
+        let mode_def = match &input.mode {
+            AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
+            _ => Some(Arc::new(self.modes.current(&input.mode))),
+        };
         let mut system = self.system_prompt_override.clone().unwrap_or_else(|| {
-            agent::build_system_prompt(
-                &vars,
-                &self.modes,
-                &input.mode,
-                &instructions.text,
-                &self.prompt_slots,
+            mode_def.as_ref().map_or_else(
+                || {
+                    agent::build_system_prompt(
+                        &vars,
+                        &self.modes,
+                        &input.mode,
+                        &instructions.text,
+                        &self.prompt_slots,
+                    )
+                },
+                |definition| {
+                    agent::build_system_prompt_with_def(
+                        &vars,
+                        definition,
+                        &input.mode,
+                        &instructions.text,
+                        &self.prompt_slots,
+                    )
+                },
             )
         });
         if let Some(append) = &self.append_system_prompt {
@@ -706,10 +723,6 @@ impl InteractiveInputSender {
             system.push_str(append);
         }
         let prepared = (system, tools, instructions);
-        let mode_def = match &input.mode {
-            AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
-            _ => Some(Arc::new(self.modes.current(&input.mode))),
-        };
         let mcp = self
             .mcp_handle
             .clone()

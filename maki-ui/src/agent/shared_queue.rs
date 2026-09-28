@@ -161,12 +161,7 @@ impl QueueSender {
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).len(),
-            QueueBackend::Actor(actor) => actor
-                .snapshot()
-                .queue
-                .iter()
-                .filter(|entry| !matches!(entry, QueueProjection::PolicyBarrier))
-                .count(),
+            QueueBackend::Actor(actor) => actor.snapshot().queue.len(),
         }
     }
 
@@ -263,9 +258,7 @@ fn visible_in_panel(entry: &QueueProjection) -> bool {
         // Admitted turns project as `Turn`; they are already running or
         // already drawn, so the panel never reserves a row for them.
         QueueProjection::Compact(_) => true,
-        QueueProjection::Control(_) | QueueProjection::Turn(_) | QueueProjection::PolicyBarrier => {
-            false
-        }
+        QueueProjection::Control(_) | QueueProjection::Turn(_) => false,
     }
 }
 
@@ -284,10 +277,6 @@ fn as_queue_entry(entry: &QueueProjection) -> QueueEntry<'static> {
                 .queue
                 .fg
                 .unwrap_or(theme::current().foreground),
-        },
-        QueueProjection::PolicyBarrier => QueueEntry {
-            text: Cow::Borrowed("policy"),
-            color: theme::current().foreground,
         },
         QueueProjection::Control(name) | QueueProjection::Turn(name) => QueueEntry {
             text: Cow::Owned(name.clone()),

@@ -273,6 +273,8 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(actual["spec"], model.spec());
         assert_eq!(actual["provider"], model.provider.to_string());
+        assert_eq!(actual["fast"], true);
+        assert_eq!(actual["thinking"], THINKING);
     }
 
     /// Every way of not getting an answer lands in the error slot, instead of

@@ -411,9 +411,7 @@ impl TurnToolBindings {
             Some(TurnToolRoute::Mcp(binding)) => {
                 mcp.is_some_and(|mcp| mcp.binding_is_current(binding))
             }
-            Some(TurnToolRoute::ToolSearch) => mcp
-                .zip(self.mcp_published.as_ref())
-                .is_some_and(|(mcp, binding)| mcp.published_is_current(binding)),
+            Some(TurnToolRoute::ToolSearch) => mcp.is_some(),
             None => false,
         }
     }

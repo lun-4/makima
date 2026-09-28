@@ -3385,8 +3385,8 @@ local mode = maki.api.mode.get()
 maki.api.mode.set({name})
 ```
 
-Enters a mode by name; fails when it is not defined. The UI owns the
-active mode, so this answers `(true, nil)` once the switch is requested.
+Enters a mode by name; fails when it is not defined. Success is returned
+after the actor accepts the configuration transition.
 
 **Parameters:**
 

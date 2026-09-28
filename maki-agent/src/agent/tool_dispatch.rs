@@ -1921,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_mcp_catalog_rejects_tool_search() {
+    fn stale_mcp_catalog_filters_replaced_search_results() {
         smol::block_on(async {
             let original = stub_mcp(&[PROBE_QUALIFIED]);
             let replacement = stub_mcp(&[PROBE_QUALIFIED]);
@@ -1934,10 +1934,11 @@ mod tests {
                 &ctx,
                 CallOrigin::Model,
             );
-            assert!(done.is_error);
-            assert_eq!(
-                done.output.as_text(),
-                "MCP tool catalog changed during this turn"
+            assert!(!done.is_error);
+            assert!(
+                done.output
+                    .as_text()
+                    .contains("No deferred MCP tools matched")
             );
         });
     }

@@ -1339,6 +1339,10 @@ fn compacts_wait_behind_pending_policy_and_follow_the_turns() {
         reservation.resolve(Ok(policy(true))).unwrap();
         reservation.wait().await.unwrap();
         until(|| observed.compacts.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(
+            observed.compact_policies.lock().unwrap().as_slice(),
+            &[(Some(true), 1)]
+        );
         handle.close();
         task.await;
     });
@@ -1551,19 +1555,19 @@ fn deferred_work_projects_and_removes_without_orphan_tickets() {
 }
 
 #[test]
-fn unpolled_admission_future_reserves_between_setters() {
+fn admissions_reserve_between_setters() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let first = handle.reserve_policy_update().unwrap();
-        let b = handle.admit_turn_after_policy(input("b"), None, "b".into());
+        let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
         let second = handle.reserve_policy_update().unwrap();
-        let c = handle.admit_turn_after_policy(input("c"), None, "c".into());
+        let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
         second.resolve(Ok(policy(false))).unwrap();
         first.resolve(Ok(policy(true))).unwrap();
-        b.await.unwrap().wait().await;
-        c.await.unwrap().wait().await;
+        b.wait().await;
+        c.wait().await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
             vec![("b".into(), Some(true), 1), ("c".into(), Some(false), 2)]
@@ -1665,33 +1669,35 @@ fn deferred_roots_keep_setter_order() {
 }
 
 #[test]
-fn unpolled_root_future_reserves_between_setters() {
+fn roots_reserve_between_setters() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let first = handle.reserve_policy_update().unwrap();
-        let b = handle.rush_after_policy(RootWork::new(
-            input("b"),
-            1,
-            false,
-            "b".into(),
-            Vec::new(),
-            "b".into(),
-        ));
+        handle
+            .rush(RootWork::new(
+                input("b"),
+                1,
+                false,
+                "b".into(),
+                Vec::new(),
+                "b".into(),
+            ))
+            .unwrap();
         let second = handle.reserve_policy_update().unwrap();
-        let c = handle.rush_after_policy(RootWork::new(
-            input("c"),
-            2,
-            false,
-            "c".into(),
-            Vec::new(),
-            "c".into(),
-        ));
+        handle
+            .rush(RootWork::new(
+                input("c"),
+                2,
+                false,
+                "c".into(),
+                Vec::new(),
+                "c".into(),
+            ))
+            .unwrap();
         second.resolve(Ok(policy(false))).unwrap();
         first.resolve(Ok(policy(true))).unwrap();
-        b.await.unwrap();
-        c.await.unwrap();
         until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
@@ -2148,8 +2154,7 @@ fn remove_at_raw_index_terminalizes_real_turn() {
             .admit_turn(input("queued2"), None, "r3".into())
             .unwrap();
 
-        // Snapshot and removal indices omit invariant policy barriers.
-        let removed = handle.remove_at(1).unwrap();
+        let removed = handle.remove_at(0).unwrap();
         assert!(matches!(removed, QueueProjection::Turn(_)));
         assert!(matches!(
             t2.wait().await,

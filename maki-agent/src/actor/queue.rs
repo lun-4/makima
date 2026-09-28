@@ -29,7 +29,6 @@ pub enum QueueProjection {
     Compact(Option<String>),
     Control(String),
     Turn(String),
-    PolicyBarrier,
 }
 
 impl From<&RootWork> for QueueProjection {
@@ -47,7 +46,6 @@ impl From<&ActorWork> for QueueProjection {
         match work {
             ActorWork::Root(root) => Self::from(root),
             ActorWork::Compact { instructions, .. } => Self::Compact(instructions.clone()),
-            ActorWork::PolicyBarrier { .. } => Self::PolicyBarrier,
             ActorWork::Control(control) => Self::Control(control.name.clone()),
             ActorWork::Turn(admission) => Self::Turn(admission.correlation.clone()),
         }
@@ -140,14 +138,9 @@ impl ActorQueue {
     }
 
     /// Removes the item at raw `index` (the same index [`snapshot`](Self::snapshot)
-    /// uses) and returns it. Policy barriers are invariant queue entries and
-    /// cannot be removed. `None` is returned for barriers and out-of-bounds indices.
+    /// uses) and returns it. `None` is returned for out-of-bounds indices.
     pub fn remove_at(&self, index: usize) -> Option<ActorWork> {
         let mut items = lock(&self.items);
-        if index >= items.len() || matches!(items.get(index), Some(ActorWork::PolicyBarrier { .. }))
-        {
-            return None;
-        }
         items.remove(index)
     }
 
@@ -161,7 +154,7 @@ impl ActorQueue {
             ActorWork::Compact { run_id, .. } => {
                 Some(std::borrow::Cow::Owned(super::run_correlation(*run_id)))
             }
-            ActorWork::Control(_) | ActorWork::PolicyBarrier { .. } => None,
+            ActorWork::Control(_) => None,
         }
     }
 
@@ -192,7 +185,7 @@ impl ActorQueue {
         match work {
             ActorWork::Root(root) => !root.displayed,
             ActorWork::Compact { .. } => true,
-            ActorWork::Turn(_) | ActorWork::Control(_) | ActorWork::PolicyBarrier { .. } => false,
+            ActorWork::Turn(_) | ActorWork::Control(_) => false,
         }
     }
 
@@ -229,14 +222,12 @@ impl ActorQueue {
                 generation: queued_generation,
                 ..
             } => *queued_generation > generation,
-            ActorWork::Control(_) | ActorWork::PolicyBarrier { .. } => false,
+            ActorWork::Control(_) => false,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        lock(&self.items)
-            .iter()
-            .all(|work| matches!(work, ActorWork::PolicyBarrier { .. }))
+        lock(&self.items).is_empty()
     }
 
     /// Removes every item and returns them in FIFO order.
@@ -254,10 +245,7 @@ impl ActorQueue {
     /// so a drain publication can never interleave with a concurrent push.
     pub fn publish_if_empty(&self, publish: impl FnOnce()) {
         let items = lock(&self.items);
-        if items
-            .iter()
-            .all(|work| matches!(work, ActorWork::PolicyBarrier { .. }))
-        {
+        if items.is_empty() {
             publish();
         }
     }
@@ -287,11 +275,12 @@ impl ActorQueue {
         batch_key: &Option<BatchKey>,
     ) -> Option<ExtractedCommand> {
         let mut items = lock(&self.items);
+
         match items.front() {
             Some(ActorWork::Root(root))
                 if batch_key.is_some()
                     && root.generation == generation
-                    && &crate::batch_key(&root.input) == batch_key => {}
+                    && crate::batch_key(&root.input).as_ref() == batch_key.as_ref() => {}
             Some(ActorWork::Compact {
                 generation: compact_generation,
                 ..
@@ -501,6 +490,20 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_does_not_fold_roots_when_active_batch_key_is_none() {
+        let queue = ActorQueue::new();
+        let mut active = test_input("active");
+        active.prompt = Some(Box::new(crate::McpPromptRef {
+            qualified_name: "server.prompt".into(),
+            arguments: Default::default(),
+        }));
+        queue.push(ActorWork::Root(test_root("plain", 1, Vec::new())));
+
+        assert!(queue.pop_interrupt(0, &crate::batch_key(&active)).is_none());
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
     fn interrupt_rejects_same_generation_different_mode() {
         let queue = ActorQueue::new();
         let mut plan = test_root("plan", 1, Vec::new());
@@ -513,71 +516,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(queue.len(), 1);
-    }
-
-    #[test]
-    fn policy_barrier_separates_root_batches_and_interrupts() {
-        let queue = ActorQueue::new();
-        queue.push(ActorWork::Root(test_root("old", 1, Vec::new())));
-        queue.push(ActorWork::PolicyBarrier { generation: 1 });
-        let mut next = test_root("new", 2, Vec::new());
-        next.generation = 1;
-        queue.push(ActorWork::Root(next));
-
-        let Some(ExtractedCommand::Interrupt(inputs)) =
-            queue.pop_interrupt(0, &crate::batch_key(&test_input("old")))
-        else {
-            panic!("expected first interrupt");
-        };
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].message, "old");
-        assert!(
-            queue
-                .pop_interrupt(0, &crate::batch_key(&test_input("old")))
-                .is_none()
-        );
-        assert!(matches!(
-            queue.pop(),
-            Some(ActorWork::PolicyBarrier { generation: 1 })
-        ));
-        let Some(ActorWork::Root(next)) = queue.pop() else {
-            panic!("expected next root");
-        };
-        assert_eq!(next.input.message, "new");
-    }
-
-    #[test]
-    fn policy_barriers_do_not_block_empty_publication() {
-        let queue = ActorQueue::new();
-        queue.push(ActorWork::PolicyBarrier { generation: 1 });
-        assert!(queue.is_empty());
-        let mut published = false;
-        queue.publish_if_empty(|| published = true);
-        assert!(published);
-        queue.push(ActorWork::Root(test_root("pending", 2, Vec::new())));
-        assert!(!queue.is_empty());
-        published = false;
-        queue.publish_if_empty(|| published = true);
-        assert!(!published);
-    }
-
-    #[test]
-    fn policy_barrier_cannot_be_removed_at_raw_index() {
-        let queue = ActorQueue::new();
-        queue.push(ActorWork::Root(test_root("before", 1, Vec::new())));
-        queue.push(ActorWork::PolicyBarrier { generation: 1 });
-        queue.push(ActorWork::Root(test_root("after", 2, Vec::new())));
-
-        assert!(queue.remove_at(1).is_none());
-        assert_eq!(queue.snapshot().len(), 3);
-        assert!(matches!(queue.remove_at(0), Some(ActorWork::Root(_))));
-        assert!(matches!(
-            queue.snapshot().as_slice(),
-            [
-                QueueProjection::PolicyBarrier,
-                QueueProjection::Message { .. }
-            ]
-        ));
     }
 
     #[test]

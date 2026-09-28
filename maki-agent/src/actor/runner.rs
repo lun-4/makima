@@ -156,7 +156,6 @@ impl Runner {
                     .await
             }
             ActorWork::Root(root) => self.run_root(root, cancellation_generation).await,
-            ActorWork::PolicyBarrier { .. } => {}
             ActorWork::Control(control) => self.run_control(control, cancellation_generation).await,
             ActorWork::Compact {
                 run_id,

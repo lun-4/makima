@@ -670,9 +670,6 @@ impl McpSession {
         query: &str,
         origin: CallOrigin,
     ) -> Result<String, String> {
-        if !self.published_is_current(binding) {
-            return Err("MCP tool catalog changed during this turn".into());
-        }
         self.search_tools_from(
             &binding.state,
             Some(&self.handle.published.load()),

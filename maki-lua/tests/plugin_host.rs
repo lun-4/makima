@@ -6483,6 +6483,25 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     host.load_source("session_option_e2e", SESSION_OPTION_PLUGIN)
         .unwrap();
     let session_id = session.read().session_id().to_string();
+    let actions = host.ui_action_rx();
+    let responder_session = session.clone();
+    let responder = std::thread::spawn(move || {
+        let action = actions.recv_timeout(Duration::from_secs(5)).unwrap();
+        if let maki_lua::UiAction::Session {
+            req:
+                maki_lua::SessionRequest::SetOption {
+                    id, value, version, ..
+                },
+            reply_tx,
+        } = action
+        {
+            let result =
+                smol::block_on(responder_session.set_option_if_version(id, value, Some(version)))
+                    .map(|_| json!(true))
+                    .map_err(|error| error.to_string());
+            reply_tx.send(result).unwrap();
+        }
+    });
 
     let (value, _) = plugin_option_state(&session);
     assert_eq!(value, "a");
@@ -6511,4 +6530,6 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     let (value, version) = plugin_option_state(&session);
     assert_eq!(value, "b");
     assert_eq!(version, set_version);
+    responder.join().unwrap();
+    smol::block_on(session.close()).unwrap();
 }

@@ -51,9 +51,6 @@ use crate::{AgentInput, CancelTrigger, History, RunSettings, SharedMessages};
 pub enum ActorWork {
     Turn(TurnAdmission),
     Root(RootWork),
-    PolicyBarrier {
-        generation: u64,
-    },
     Control(ControlWork),
     Compact {
         run_id: u64,
@@ -122,12 +119,19 @@ enum DeferredAdmission {
         after: u64,
         root: RootWork,
     },
+    Compact {
+        after: u64,
+        run_id: u64,
+        instructions: Option<String>,
+    },
 }
 
 impl DeferredAdmission {
     fn after(&self) -> u64 {
         match self {
-            Self::Turn { after, .. } | Self::Root { after, .. } => *after,
+            Self::Turn { after, .. } | Self::Root { after, .. } | Self::Compact { after, .. } => {
+                *after
+            }
         }
     }
 
@@ -135,11 +139,13 @@ impl DeferredAdmission {
         match self {
             Self::Turn { correlation, .. } => QueueProjection::Turn(correlation.clone()),
             Self::Root { root, .. } => root.into(),
+            Self::Compact { instructions, .. } => QueueProjection::Compact(instructions.clone()),
         }
     }
 
     fn visible(&self) -> bool {
         matches!(self, Self::Root { root, .. } if !root.displayed)
+            || matches!(self, Self::Compact { .. })
     }
 }
 
@@ -316,13 +322,11 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
                     || current.settings.workflow != config.settings.workflow
                     || current.settings.thinking != config.settings.thinking
                     || current.mode != config.mode
+                    || current.mode_def != config.mode_def
             });
             if changed {
                 state.policy_generation = state.policy_generation.wrapping_add(1);
                 state.policy = Some(Arc::new(config));
-                inner.queue.push(ActorWork::PolicyBarrier {
-                    generation: state.policy_generation,
-                });
             }
         }
         while state
@@ -366,12 +370,6 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
                     if !state.cancelled_correlations.contains_key(&root.correlation) {
                         root.generation = state.policy_generation;
                         root.policy = state.policy.clone();
-                        if let (Some(config), Some(snapshot)) = (&root.policy, &mut root.admission)
-                            && let Some(mode_def) = &config.mode_def
-                        {
-                            snapshot.mode_def = Some(Arc::new(mode_def.clone()));
-                        }
-
                         if let Some(config) = &root.policy {
                             root.input.mode = config.mode.clone();
                             if let Some(snapshot) = &mut root.admission
@@ -381,6 +379,23 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
                             }
                         }
                         inner.queue.push(ActorWork::Root(root));
+                    }
+                }
+                DeferredAdmission::Compact {
+                    run_id,
+                    instructions,
+                    ..
+                } => {
+                    if !state
+                        .cancelled_correlations
+                        .contains_key(&run_correlation(run_id))
+                    {
+                        inner.queue.push(ActorWork::Compact {
+                            run_id,
+                            instructions,
+                            generation: state.policy_generation,
+                            policy: state.policy.clone(),
+                        });
                     }
                 }
             }
@@ -909,19 +924,6 @@ impl AgentActorHandle {
         })
     }
 
-    pub fn admit_turn_after_policy(
-        &self,
-        input: AgentInput,
-        event_sender: Option<EventSender>,
-        correlation: String,
-    ) -> std::future::Ready<Result<TurnTicket, ActorError>> {
-        std::future::ready(self.admit_turn(input, event_sender, correlation))
-    }
-
-    pub fn rush_after_policy(&self, root: RootWork) -> std::future::Ready<Result<(), ActorError>> {
-        std::future::ready(self.rush(root))
-    }
-
     fn has_pending_policy_updates(&self) -> Result<bool, ActorError> {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
@@ -956,9 +958,6 @@ impl AgentActorHandle {
         state.policy_generation = state.policy_generation.wrapping_add(1);
         state.policy = Some(Arc::new(config));
         let generation = state.policy_generation;
-        self.inner
-            .queue
-            .push(ActorWork::PolicyBarrier { generation });
         Ok(generation)
     }
 
@@ -971,7 +970,7 @@ impl AgentActorHandle {
         run_id: u64,
         instructions: Option<String>,
     ) -> Result<(), ActorError> {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(match state.lifecycle {
                 ActorLifecycle::Closed => ActorError::Closed,
@@ -986,12 +985,22 @@ impl AgentActorHandle {
         {
             return Ok(());
         }
-        self.inner.queue.push(ActorWork::Compact {
-            run_id,
-            instructions,
-            generation: state.policy_generation,
-            policy: state.policy.clone(),
-        });
+        if let Some(after) = state.pending_policy.back().map(|pending| pending.id) {
+            state
+                .deferred_admissions
+                .push_back(DeferredAdmission::Compact {
+                    after,
+                    run_id,
+                    instructions,
+                });
+        } else {
+            self.inner.queue.push(ActorWork::Compact {
+                run_id,
+                instructions,
+                generation: state.policy_generation,
+                policy: state.policy.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -1275,6 +1284,9 @@ impl AgentActorHandle {
                     correlation: key, ..
                 } => key == correlation,
                 DeferredAdmission::Root { root, .. } => root.correlation == correlation,
+                DeferredAdmission::Compact { run_id, .. } => {
+                    run_correlation(*run_id) == correlation
+                }
             };
             if matches {
                 deferred.push(admission);
@@ -1345,13 +1357,7 @@ impl AgentActorHandle {
             ActorStatus::Running(turn_id) => Some(turn_id),
             ActorStatus::Idle => None,
         };
-        let mut queue = self
-            .inner
-            .queue
-            .snapshot()
-            .into_iter()
-            .filter(|item| !matches!(item, QueueProjection::PolicyBarrier))
-            .collect::<Vec<_>>();
+        let mut queue = self.inner.queue.snapshot();
         queue.extend(
             state
                 .deferred_admissions
