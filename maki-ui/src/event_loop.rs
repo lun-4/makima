@@ -563,14 +563,14 @@ fn sync_actor_policy(runtime: &SessionRuntime) -> Result<(), String> {
         .def(&runtime.app.lua_event_handle.mode_registry());
     let actor = manager.actor(root).map_err(|error| error.to_string())?;
     actor
-        .set_effective_config(
-            maki_agent::EffectiveAgentConfig::new(
+        .reserve_config_update()
+        .and_then(|reservation| {
+            reservation.resolve_config(Ok(maki_agent::EffectiveAgentConfig::new(
                 policy_from_coordinator(&runtime.model_slot, &runtime.coordinator),
                 mode,
             )
-            .with_mode_def(Some(mode_def)),
-        )
-        .map(|_| ())
+            .with_mode_def(Some(mode_def))))
+        })
         .map_err(|error| error.to_string())
 }
 
