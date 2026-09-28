@@ -1146,8 +1146,6 @@ async fn session(
     let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let build_params = |agent_id| AgentParams {
-        settings_source: None,
-        tool_builder: None,
         agent_id,
         provider,
         model,
@@ -2152,8 +2150,6 @@ mod tests {
         let (child_trigger, child_cancel) = CancelToken::new();
         let ctx = AgentContext::from(&stub_ctx(&AgentMode::Build));
         let params = AgentParams {
-            settings_source: None,
-            tool_builder: None,
             agent_id,
             provider,
             model: ctx.model.as_ref().clone(),

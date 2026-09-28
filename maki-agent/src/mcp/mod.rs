@@ -678,10 +678,6 @@ impl McpSession {
         )
     }
 
-    pub fn generation(&self) -> u64 {
-        self.handle.published.load().snapshot.generation
-    }
-
     pub fn tool_bindings(&self, binding: &McpPublishedBinding) -> Vec<McpToolBinding> {
         let state = &binding.state;
         state
@@ -694,20 +690,6 @@ impl McpSession {
                 transport: Arc::clone(&tool.transport),
             })
             .collect()
-    }
-
-    pub fn tool_binding(&self, name: &str) -> Option<McpToolBinding> {
-        let state = self.handle.published.load();
-        let qualified = state.index.tools.get_key_value(name).or_else(|| {
-            name.contains(WIRE_SEPARATOR)
-                .then(|| state.index.tools.get_key_value(&*internal_tool_name(name)))
-                .flatten()
-        })?;
-        Some(McpToolBinding {
-            qualified_name: Arc::clone(qualified.0),
-            raw_name: qualified.1.raw_name.clone(),
-            transport: Arc::clone(&qualified.1.transport),
-        })
     }
 
     pub fn binding_is_current(&self, binding: &McpToolBinding) -> bool {
@@ -1864,6 +1846,32 @@ mod tests {
             .search_bound_tools(&published, "pinned", CallOrigin::Model)
             .unwrap();
         assert!(result.contains(SEARCH_NO_MATCH), "got: {result}");
+    }
+
+    #[test]
+    fn tool_binding_survives_unrelated_server_publication() {
+        smol::block_on(async {
+            let transport = FakeTransport::new();
+            let (mut inner, session) = setup(vec![fake_entry("pinned", transport.clone())]);
+            let published = session.published_binding();
+            let binding = session
+                .tool_bindings(&published)
+                .into_iter()
+                .find(|binding| binding.qualified_name().as_ref() == "pinned.tool")
+                .unwrap();
+
+            inner
+                .entries
+                .push(fake_entry("unrelated", FakeTransport::new()));
+            inner.generation += 1;
+            publish(&inner, &session.handle.published);
+
+            assert!(session.binding_is_current(&binding));
+            assert_eq!(
+                session.call_bound_tool(&binding, &json!({})).await.unwrap(),
+                "ok"
+            );
+        });
     }
 
     #[test_case(false ; "removed")]

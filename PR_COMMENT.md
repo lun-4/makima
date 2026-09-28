@@ -94,8 +94,12 @@ Verdict: Deny.
 
 The branch addresses several earlier findings. MCP binding validity no longer depends on the manager generation (`maki-agent/src/mcp/mod.rs:713-723`). Headless input queues before provider readiness (`maki-agent/src/headless.rs:643-655`). Interrupt folding rejects roots without a batch key (`maki-agent/src/actor/queue.rs:291-300`). UI compaction uses its pinned policy (`maki-ui/src/agent/agent_loop.rs:722-730`). Mode and its resolved definition are represented in `EffectiveAgentConfig` (`maki-agent/src/actor/types.rs:20-40`).
 
-The coordinator still owns model and option changes. UI synchronization still projects policy from the coordinator (`maki-ui/src/event_loop.rs:556-570`), while Lua `session.set_option` writes directly to the coordinator (`maki-lua/src/api/session.rs:456-462`). The actor-owned configuration and projection direction recommended above remain incomplete.
+Policy-affecting `fast`, `workflow`, and `thinking` updates now stage a coordinator candidate, resolve the actor ticket against that candidate, then commit the coordinator snapshot (`maki-agent/src/session_coordinator.rs:582-617`, `maki-ui/src/event_loop.rs:2888-2945, 3083-3121, 4242-4301`). Failed actor resolution aborts the staged checkpoint. The coordinator still owns model changes, and policy reads still project settings from coordinator options (`maki-ui/src/event_loop.rs:608-634`). The broader actor-owned configuration direction remains incomplete.
 
 Managed task behavior in custom modes and plan-mode structured output still lack end-to-end verification. The reviewed paths retain mode-ceiling checks in manager admission (`maki-agent/src/manager/mod.rs:309-325`) and restrictive-mode route filtering (`maki-agent/src/agent/tool_dispatch.rs:357-363`).
 
-The MCP startup notice change now annotates both newly displayed and previously displayed user messages. The latter path invalidates and rebuilds the message cache. Remote CI passes, including all 6,386 tests.
+The MCP startup notice change now annotates both newly displayed and previously displayed user messages. The latter path invalidates and rebuilds the message cache. Remote CI passes on the current tree: clippy, all 6,404 tests, generated documentation checks, and dependency checks.
+
+### Review update
+
+The plan-mode toolset finding in bug 15 above is withdrawn. Current documentation and the existing host-verified bundled-tool tests establish the intended built-in safe set: `read`, `glob`, `grep`, `index`, `webfetch`, `websearch`, `skill`, `question`, `plan_submit`, `task`, and `todo_write` remain available. Plan mode intentionally excludes `memory`, `batch`, and `code_execution`; those are not missing safe tools. No allowlist change is warranted. The new negative coverage verifies these exclusions; existing positive coverage verifies the safe tools. Other claims in the original review history above are unchanged.

@@ -102,6 +102,8 @@ use crate::theme::ThemesProvider;
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_OP_TIMEOUT_ERR: &str = "session operation timed out";
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
@@ -553,6 +555,35 @@ fn agent_mode_for_app(app: &App) -> maki_agent::AgentMode {
     }
 }
 
+fn reserve_refined_model_updates(
+    sessions: &[SessionRuntime],
+    requested_spec: &str,
+    expected_provider: ProviderIdentity,
+) -> Vec<(MakiId, Result<maki_agent::PolicyUpdateTicket, String>)> {
+    sessions
+        .iter()
+        .filter_map(|runtime| {
+            let current = runtime.model_slot.load();
+            let matches = current.model.spec() == requested_spec
+                && current.provider.identity() == expected_provider;
+            drop(current);
+            if !matches {
+                return None;
+            }
+            let (manager, root) = runtime.handles.manager_and_root();
+            let reservation = manager
+                .actor(root)
+                .map_err(|error| error.to_string())
+                .and_then(|actor| {
+                    actor
+                        .reserve_config_update()
+                        .map_err(|error| error.to_string())
+                });
+            Some((runtime.id(), reservation))
+        })
+        .collect()
+}
+
 fn sync_actor_policy(runtime: &SessionRuntime) -> Result<(), String> {
     let (manager, root) = runtime.handles.manager_and_root();
     let mode = agent_mode_for_app(&runtime.app);
@@ -578,8 +609,11 @@ fn policy_from_coordinator(
     model_slot: &ProviderSlot,
     coordinator: &SessionCoordinatorHandle,
 ) -> RunSettings {
+    policy_from_options(model_slot, &coordinator.read().options())
+}
+
+fn policy_from_options(model_slot: &ProviderSlot, options: &SessionOptionsSnapshot) -> RunSettings {
     let selected = model_slot.load();
-    let options = coordinator.read().options();
     let enabled = |id: &str| {
         options
             .options
@@ -1384,6 +1418,10 @@ enum InternalEvent {
         model: Model,
         provider: Arc<dyn Provider>,
     },
+    ModelCandidateReconciled {
+        session: MakiId,
+        result: Result<(), String>,
+    },
     ProviderUsageFetched {
         fetch_id: ProviderUsageFetchId,
         provider: ProviderIdentity,
@@ -1929,21 +1967,76 @@ impl<'t> EventLoop<'t> {
                     && current.provider.identity() == expected_provider;
                 drop(current);
                 if still_current {
+                    // Reserve first: otherwise an actor can admit a turn with
+                    // the old policy after its provider slot has been refined.
+                    let updates = reserve_refined_model_updates(
+                        &self.sessions,
+                        &requested_spec,
+                        expected_provider,
+                    );
                     self.ctx
                         .model_slot
                         .install(model.clone(), Arc::clone(&provider));
-                    // Sessions spawned before the fetch resolved copied the
-                    // unrefined startup model; hand them the resolved one so
-                    // context windows and capabilities are not left stale.
-                    for rt in &mut self.sessions {
-                        if rt.model_slot.load().model.spec() == requested_spec {
-                            rt.model_slot.install(model.clone(), Arc::clone(&provider));
-                            rt.app.update_model(&model);
-                            if let Err(error) = sync_actor_policy(rt) {
-                                warn!(%error, "failed to sync refined model policy");
+                    for (session, reservation) in updates {
+                        let Some(idx) = self.position(session) else {
+                            continue;
+                        };
+                        match reservation {
+                            Ok(reservation) => {
+                                let rt = &mut self.sessions[idx];
+                                rt.model_slot.install(model.clone(), Arc::clone(&provider));
+                                rt.app.update_model(&model);
+                                let mode = agent_mode_for_app(&rt.app);
+                                let mode_def = rt
+                                    .app
+                                    .state
+                                    .mode
+                                    .def(&rt.app.lua_event_handle.mode_registry());
+                                let config = maki_agent::EffectiveAgentConfig::new(
+                                    policy_from_coordinator(&rt.model_slot, &rt.coordinator),
+                                    mode,
+                                )
+                                .with_mode_def(Some(mode_def));
+                                let internal_tx = self.internal_tx.clone();
+                                smol::spawn(async move {
+                                    let result = reservation
+                                        .resolve_config(Ok(config))
+                                        .map_err(|error| error.to_string());
+                                    let result = match result {
+                                        Ok(()) => reservation
+                                            .wait()
+                                            .await
+                                            .map_err(|error| error.to_string()),
+                                        Err(error) => Err(error),
+                                    };
+                                    let _ =
+                                        internal_tx.send(InternalEvent::ModelCandidateReconciled {
+                                            session,
+                                            result,
+                                        });
+                                })
+                                .detach();
+                            }
+                            Err(error) => {
+                                let _ = self.internal_tx.send(
+                                    InternalEvent::ModelCandidateReconciled {
+                                        session,
+                                        result: Err(error),
+                                    },
+                                );
                             }
                         }
                     }
+                }
+            }
+            InternalEvent::ModelCandidateReconciled { session, result } => {
+                if let Err(error) = result {
+                    if let Some(idx) = self.position(session) {
+                        self.sessions[idx]
+                            .app
+                            .flash(format!("failed to reconcile refined model policy: {error}"));
+                    }
+                    warn!(%session, %error, "failed to reconcile refined model policy");
                 }
             }
             InternalEvent::SessionOp {
@@ -2794,30 +2887,65 @@ impl<'t> EventLoop<'t> {
         smol::spawn(async move {
             let result = match reservation {
                 Ok(reservation) => {
-                    let option_result = coordinator
-                        .set_option_if_version(id, value, Some(version))
-                        .await
-                        .map_err(|error| error.to_string());
-                    match (option_result, reservation) {
-                        (Ok(_), Some(reservation)) => {
-                            let config = maki_agent::EffectiveAgentConfig::new(
-                                policy_from_coordinator(&model_slot, &coordinator),
-                                mode,
-                            )
-                            .with_mode_def(Some(mode_def));
-                            match reservation.resolve_config(Ok(config)) {
-                                Ok(()) => {
-                                    reservation.wait().await.map_err(|error| error.to_string())
+                    if matches!(
+                        id.as_str(),
+                        FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID
+                    ) {
+                        match coordinator
+                            .prepare_policy_option(id, value, Some(version))
+                            .await
+                        {
+                            Ok(prepared) => {
+                                let config = maki_agent::EffectiveAgentConfig::new(
+                                    policy_from_options(&model_slot, prepared.snapshot()),
+                                    mode,
+                                )
+                                .with_mode_def(Some(mode_def));
+                                match reservation {
+                                    Some(reservation) => {
+                                        match reservation.resolve_config(Ok(config)) {
+                                            Ok(()) => match reservation.wait().await {
+                                                Ok(()) => prepared
+                                                    .commit()
+                                                    .await
+                                                    .map(|_| ())
+                                                    .map_err(|error| error.to_string()),
+                                                Err(error) => Err(abort_policy_option(
+                                                    prepared,
+                                                    error.to_string(),
+                                                )
+                                                .await),
+                                            },
+                                            Err(error) => {
+                                                let _ = reservation.cancel();
+                                                Err(abort_policy_option(
+                                                    prepared,
+                                                    error.to_string(),
+                                                )
+                                                .await)
+                                            }
+                                        }
+                                    }
+                                    None => Err(abort_policy_option(
+                                        prepared,
+                                        "missing actor policy reservation".to_owned(),
+                                    )
+                                    .await),
                                 }
-                                Err(error) => Err(error.to_string()),
+                            }
+                            Err(error) => {
+                                if let Some(reservation) = reservation {
+                                    let _ = reservation.cancel();
+                                }
+                                Err(error.to_string())
                             }
                         }
-                        (Ok(_), None) => Ok(()),
-                        (Err(error), Some(reservation)) => {
-                            let _ = reservation.cancel();
-                            Err(error)
-                        }
-                        (Err(error), None) => Err(error),
+                    } else {
+                        coordinator
+                            .set_option_if_version(id, value, Some(version))
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
                     }
                 }
                 Err(error) => Err(error),
@@ -2940,27 +3068,71 @@ impl<'t> EventLoop<'t> {
                 return;
             }
         };
-        self.note_if_deferred(idx, "thinking");
+        let session = self.sessions[idx].id();
         let coordinator = self.sessions[idx].coordinator.clone();
-        let value = resolved.to_string();
-        self.dispatch_session_op(
-            idx,
-            SessionOpKind::ThinkingSet {
-                thinking: resolved,
-                set_default,
-                reply_tx,
-            },
-            async move {
-                coordinator
-                    .set_option(
-                        maki_agent::session_options::THINKING_OPTION_ID,
-                        value.as_str(),
-                    )
-                    .await
-                    .map(|_| ())
+        let model_slot = Arc::clone(&self.sessions[idx].model_slot);
+        let mode = agent_mode_for_app(&self.sessions[idx].app);
+        let mode_def = self.ctx.lua_event_handle.mode_registry().current(&mode);
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        let reservation = manager
+            .actor(root)
+            .map_err(|error| error.to_string())
+            .and_then(|actor| {
+                actor
+                    .reserve_config_update()
                     .map_err(|error| error.to_string())
-            },
-        );
+            });
+        let internal_tx = self.internal_tx.clone();
+        let value = resolved.to_string();
+        smol::spawn(async move {
+            let result = match reservation {
+                Ok(reservation) => {
+                    match coordinator
+                        .prepare_policy_option(THINKING_OPTION_ID, value, None)
+                        .await
+                    {
+                        Ok(prepared) => {
+                            let config = maki_agent::EffectiveAgentConfig::new(
+                                policy_from_options(&model_slot, prepared.snapshot()),
+                                mode,
+                            )
+                            .with_mode_def(Some(mode_def));
+                            match reservation.resolve_config(Ok(config)) {
+                                Ok(()) => match reservation.wait().await {
+                                    Ok(()) => prepared
+                                        .commit()
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|error| error.to_string()),
+                                    Err(error) => {
+                                        Err(abort_policy_option(prepared, error.to_string()).await)
+                                    }
+                                },
+                                Err(error) => {
+                                    let _ = reservation.cancel();
+                                    Err(abort_policy_option(prepared, error.to_string()).await)
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = reservation.cancel();
+                            Err(error.to_string())
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                kind: SessionOpKind::ThinkingSet {
+                    thinking: resolved,
+                    set_default,
+                    reply_tx,
+                },
+                result,
+            });
+        })
+        .detach();
     }
 
     /// `maki.model.set`: atomically adopt all requested model settings through
@@ -2990,12 +3162,6 @@ impl<'t> EventLoop<'t> {
         };
         if spec.is_some() {
             self.note_if_deferred(idx, "model");
-        }
-        if thinking.is_some() {
-            self.note_if_deferred(idx, "thinking");
-        }
-        if fast.is_some() {
-            self.note_if_deferred(idx, "fast");
         }
         let coordinator = self.sessions[idx].coordinator.clone();
         let op_spec = spec.as_deref().map(Arc::from);
@@ -3409,9 +3575,6 @@ impl<'t> EventLoop<'t> {
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
             Action::ToggleSessionOption { id } => {
-                if id == FAST_OPTION_ID {
-                    self.note_if_deferred(idx, "fast");
-                }
                 dispatch_option_toggle(
                     self.sessions[idx].coordinator.clone(),
                     Arc::clone(&self.sessions[idx].model_slot),
@@ -3551,23 +3714,25 @@ impl<'t> EventLoop<'t> {
         let coordinator = self.sessions[idx].coordinator.clone();
         smol::spawn(async move {
             let result = match reservation {
-                Ok(Some(reservation)) => match op.await {
-                    Ok(()) => {
-                        match reservation.resolve_config(Ok(maki_agent::EffectiveAgentConfig::new(
-                            policy_from_coordinator(&model_slot, &coordinator),
-                            mode,
-                        )
-                        .with_mode_def(Some(mode_def))))
-                        {
-                            Ok(()) => reservation.wait().await.map_err(|error| error.to_string()),
-                            Err(error) => Err(error.to_string()),
+                Ok(Some(reservation)) => {
+                    match bounded_reserved_session_op(&reservation, op, SESSION_OP_TIMEOUT).await {
+                        Ok(()) => {
+                            match reservation.resolve_config(Ok(
+                                maki_agent::EffectiveAgentConfig::new(
+                                    policy_from_coordinator(&model_slot, &coordinator),
+                                    mode,
+                                )
+                                .with_mode_def(Some(mode_def)),
+                            )) {
+                                Ok(()) => {
+                                    reservation.wait().await.map_err(|error| error.to_string())
+                                }
+                                Err(error) => Err(error.to_string()),
+                            }
                         }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => {
-                        let _ = reservation.cancel();
-                        Err(error)
-                    }
-                },
+                }
                 Ok(None) => op.await,
                 Err(error) => Err(error),
             };
@@ -3662,7 +3827,11 @@ impl<'t> EventLoop<'t> {
                     let app = &mut self.sessions[idx].app;
                     app.state.thinking = thinking;
                     let mode = thinking.to_string();
-                    app.flash(format!("Thinking: {mode}"));
+                    if SessionStatus::of(app) == SessionStatus::Idle {
+                        app.flash(format!("Thinking: {mode}"));
+                    } else {
+                        app.flash("thinking applies when this turn finishes".into());
+                    }
                     Ok(json!({ "mode": mode }))
                 });
                 let _ = reply_tx.send(reply);
@@ -4009,6 +4178,42 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+async fn abort_policy_option(
+    prepared: maki_agent::session_coordinator::PreparedPolicyOption,
+    error: String,
+) -> String {
+    match prepared.abort().await {
+        Ok(()) => error,
+        Err(rollback) => format!("{error}; coordinator rollback failed: {rollback}"),
+    }
+}
+
+async fn bounded_session_op<T, F>(op: F, timeout: Duration) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    futures_lite::future::or(op, async move {
+        smol::Timer::after(timeout).await;
+        Err(SESSION_OP_TIMEOUT_ERR.to_owned())
+    })
+    .await
+}
+
+async fn bounded_reserved_session_op<T, F>(
+    reservation: &maki_agent::PolicyUpdateTicket,
+    op: F,
+    timeout: Duration,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let result = bounded_session_op(op, timeout).await;
+    if result.is_err() {
+        let _ = reservation.cancel();
+    }
+    result
+}
+
 fn dispatch_option_toggle(
     coordinator: SessionCoordinatorHandle,
     model_slot: Arc<ProviderSlot>,
@@ -4048,31 +4253,79 @@ fn dispatch_option_toggle(
     };
     smol::spawn(async move {
         let result = match reservation {
-            Ok(Some(reservation)) => match coordinator.toggle_boolean_option(id).await {
-                Ok((enabled, _)) => {
-                    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
-                    match reservation.resolve_config(Ok(maki_agent::EffectiveAgentConfig::new(
-                        policy_from_coordinator(&model_slot, &coordinator),
-                        mode,
+            Ok(Some(reservation)) => {
+                let options = coordinator.read().options();
+                let Some(option) = options
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == id)
+                else {
+                    let _ = reservation.cancel();
+                    let _ = internal_tx.send(InternalEvent::SessionOp {
+                        session,
+                        kind: SessionOpKind::OptionToggled { id, committed },
+                        result: Err(format!("unknown session option: {id}")),
+                    });
+                    return;
+                };
+                let enabled = option.current_value.as_ref() != ENABLED_VALUE;
+                let version = options.version;
+                match coordinator
+                    .prepare_policy_option(
+                        id,
+                        if enabled { ENABLED_VALUE } else { "disabled" },
+                        Some(version),
                     )
-                    .with_mode_def(mode_def)))
-                    {
-                        Ok(()) => reservation.wait().await.map_err(|error| error.to_string()),
-                        Err(error) => Err(error.to_string()),
+                    .await
+                {
+                    Ok(prepared) => {
+                        let config = maki_agent::EffectiveAgentConfig::new(
+                            policy_from_options(&model_slot, prepared.snapshot()),
+                            mode,
+                        )
+                        .with_mode_def(mode_def);
+                        match reservation.resolve_config(Ok(config)) {
+                            Ok(()) => match reservation.wait().await {
+                                Ok(()) => match prepared.commit().await {
+                                    Ok(_) => {
+                                        *slot.lock().unwrap_or_else(|error| error.into_inner()) =
+                                            Some(enabled);
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                },
+                                Err(error) => {
+                                    Err(abort_policy_option(prepared, error.to_string()).await)
+                                }
+                            },
+                            Err(error) => {
+                                let _ = reservation.cancel();
+                                Err(abort_policy_option(prepared, error.to_string()).await)
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = reservation.cancel();
+                        Err(error.to_string())
                     }
                 }
-                Err(error) => {
-                    let _ = reservation.cancel();
-                    Err(error.to_string())
-                }
-            },
-            Ok(None) => coordinator
-                .toggle_boolean_option(id)
+            }
+            Ok(None) => {
+                bounded_session_op(
+                    async {
+                        coordinator
+                            .toggle_boolean_option(id)
+                            .await
+                            .map(|(enabled, _)| {
+                                *slot.lock().unwrap_or_else(|error| error.into_inner()) =
+                                    Some(enabled);
+                            })
+                            .map_err(|error| error.to_string())
+                    },
+                    SESSION_OP_TIMEOUT,
+                )
                 .await
-                .map(|(enabled, _)| {
-                    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
-                })
-                .map_err(|error| error.to_string()),
+            }
             Err(error) => Err(error),
         };
         let _ = internal_tx.send(InternalEvent::SessionOp {
@@ -4152,6 +4405,94 @@ mod tests {
             assert!(selected.workflow);
             assert_eq!(selected.model.id, runtime.model_slot.load().model.id);
             assert_eq!(runtime.app.state.session.model, selected.model.spec());
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn yolo_toggle_commits_while_turn_holds_lease() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let id = runtime.id();
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            let (manager, root) = runtime.handles.manager_and_root();
+
+            dispatch_option_toggle(
+                runtime.coordinator.clone(),
+                Arc::clone(&runtime.model_slot),
+                (manager, root),
+                (id, YOLO_OPTION_ID),
+                &internal_tx,
+            );
+
+            let InternalEvent::SessionOp {
+                kind: SessionOpKind::OptionToggled { committed, .. },
+                result,
+                ..
+            } = internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected option toggle completion");
+            };
+            result.unwrap();
+            assert_eq!(committed.lock().unwrap().take(), Some(true));
+            assert_eq!(
+                runtime
+                    .coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == YOLO_OPTION_ID)
+                    .unwrap()
+                    .current_value
+                    .as_ref(),
+                ENABLED_VALUE
+            );
+            drop(lease);
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn timed_out_setter_releases_ticket_and_reports_failure() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let ticket = actor.reserve_config_update().unwrap();
+            let (_gate_tx, gate_rx) = flume::bounded::<()>(0);
+            let result = bounded_reserved_session_op(
+                &ticket,
+                async move {
+                    gate_rx.recv_async().await.unwrap();
+                    Ok(())
+                },
+                Duration::from_millis(1),
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), SESSION_OP_TIMEOUT_ERR);
+            actor.wait_policy_updates().await.unwrap();
+            assert!(
+                actor
+                    .admit_turn(
+                        maki_agent::AgentInput {
+                            message: "after timeout".into(),
+                            mode: Default::default(),
+                            images: Vec::new(),
+                            preamble: Vec::new(),
+                            thinking: Default::default(),
+                            fast: false,
+                            workflow: false,
+                            prompt: None,
+                            cancel: None,
+                            lease_committer: None,
+                        },
+                        None,
+                        String::new(),
+                    )
+                    .is_ok()
+            );
             release_runtime(runtime);
         });
     }
@@ -4279,6 +4620,69 @@ mod tests {
             assert_eq!(yolo.as_ref(), maki_agent::session_options::DISABLED_VALUE);
             release_runtime(runtime);
         });
+    }
+
+    #[test]
+    fn refined_model_reservations_precede_provider_slot_installation() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let current = runtime.model_slot.load();
+            let original_provider = current.provider.identity();
+            let requested_spec = current.model.spec();
+            drop(current);
+            let updates = reserve_refined_model_updates(
+                std::slice::from_ref(&runtime),
+                &requested_spec,
+                original_provider,
+            );
+            assert_eq!(updates.len(), 1);
+            let (_, reservation) = updates.into_iter().next().unwrap();
+            let reservation = reservation.unwrap();
+            let refined = model_named("test-model");
+            runtime
+                .model_slot
+                .install(refined.clone(), Arc::new(FocusedProvider));
+            assert_eq!(runtime.model_slot.load().model.spec(), refined.spec());
+            let policy = runtime
+                .handles
+                .manager_and_root()
+                .0
+                .effective_config(runtime.handles.manager_and_root().1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(policy.model.spec(), requested_spec);
+            reservation
+                .resolve_config(Ok(maki_agent::EffectiveAgentConfig::new(
+                    policy_from_coordinator(&runtime.model_slot, &runtime.coordinator),
+                    agent_mode_for_app(&runtime.app),
+                )))
+                .unwrap();
+            reservation.wait().await.unwrap();
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn refined_model_reservation_skips_distinct_provider_identity() {
+        let runtime = test_runtime(model_named("test-model"));
+        let (other_slot, _) =
+            ProviderSlot::new(model_named("test-model"), Arc::new(FocusedProvider));
+        let mut other = test_runtime(model_named("test-model"));
+        other.model_slot = other_slot;
+        let current = runtime.model_slot.load();
+        let expected_provider = current.provider.identity();
+        let requested_spec = current.model.spec();
+        drop(current);
+        assert_ne!(
+            other.model_slot.load().provider.identity(),
+            expected_provider
+        );
+
+        let updates =
+            reserve_refined_model_updates(&[runtime, other], &requested_spec, expected_provider);
+
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].1.is_ok());
     }
 
     fn model_named(id: &str) -> Model {

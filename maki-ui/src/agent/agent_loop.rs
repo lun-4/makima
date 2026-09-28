@@ -25,8 +25,8 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{FileReadTracker, QuestionMode, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, Envelope, EventSender, History, Instructions, McpCommand, ModelSource, PromptRole,
-    RunSettingsSource, SessionMailbox, ToolOutputLines, TurnId, TurnOutcome,
+    CancelToken, Envelope, EventSender, History, Instructions, McpCommand, PromptRole, RunSettings,
+    SessionMailbox, ToolOutputLines, TurnId, TurnOutcome,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -381,11 +381,34 @@ impl TuiActorBackend {
         let mut model = slot.model.clone();
         let fallback = if context.policy.is_none() {
             self.session_id.as_ref().and_then(|session| {
-                maki_agent::SessionRunSettings {
-                    model: Arc::clone(&self.model_slot) as Arc<dyn ModelSource>,
-                    session_id: session.id(),
-                }
-                .current()
+                let (provider, model) = (
+                    Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>,
+                    slot.model.clone(),
+                );
+                let options = maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(
+                    session.id(),
+                )
+                .ok()?
+                .read()
+                .options();
+                let value = |id: &str| {
+                    options
+                        .options
+                        .iter()
+                        .find(|option| option.definition.id.as_ref() == id)
+                        .map(|option| option.current_value.as_ref())
+                };
+                Some(RunSettings {
+                    provider,
+                    model,
+                    fast: value(maki_agent::session_options::FAST_OPTION_ID)
+                        == Some(maki_agent::session_options::ENABLED_VALUE),
+                    workflow: value(maki_agent::session_options::WORKFLOW_OPTION_ID)
+                        == Some(maki_agent::session_options::ENABLED_VALUE),
+                    thinking: value(maki_agent::session_options::THINKING_OPTION_ID)
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or_default(),
+                })
             })
         } else {
             None
@@ -424,8 +447,6 @@ impl TuiActorBackend {
                 agent_id: self.agent_id,
                 provider,
                 model,
-                settings_source: None,
-                tool_builder: None,
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),

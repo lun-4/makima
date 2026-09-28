@@ -877,8 +877,7 @@ impl AgentActorHandle {
         Ok(())
     }
 
-    /// Installs a policy snapshot for subsequent admissions. The queued barrier
-    /// keeps earlier work ahead of the policy change in FIFO order.
+    /// Installs a policy snapshot for subsequent admissions.
     pub fn effective_config(&self) -> Option<Arc<EffectiveAgentConfig>> {
         self.inner
             .state
@@ -1038,9 +1037,8 @@ impl AgentActorHandle {
     /// Removes the queue item at raw `index` (the same index
     /// [`snapshot`](Self::snapshot) reports) under the queue lock. Admitted
     /// turns are terminalized exactly once with `User` and delivered; roots,
-    /// compacts, and controls are dropped. Policy barriers are invariant and
-    /// cannot be removed. Returns the removed item's projection, or `None`
-    /// when the raw index is out of bounds or points to a barrier.
+    /// compacts, and controls are dropped. Returns the removed item's
+    /// projection, or `None` when the raw index is out of bounds.
     pub fn remove_at(&self, index: usize) -> Option<QueueProjection> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let queued = self.inner.queue.len();
@@ -1369,7 +1367,10 @@ impl AgentActorHandle {
             lifecycle,
             status,
             active_turn,
-            queued: queue.len(),
+            queued: queue
+                .iter()
+                .filter(|item| !matches!(item, QueueProjection::Control(_)))
+                .count(),
             queue,
             latest: self
                 .inner

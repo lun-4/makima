@@ -224,8 +224,8 @@ pub enum ActorStatus {
 }
 
 /// A point-in-time projection of every actor lens: lifecycle, status, active
-/// turn id, queued count and (for the TUI) the queue's neutral messages, the
-/// latest retained outcome, and cumulative usage.
+/// turn id, queued user work count and (for the TUI) the queue's neutral
+/// messages, the latest retained outcome, and cumulative usage.
 #[derive(Debug, Clone)]
 pub struct ActorSnapshot {
     pub lifecycle: ActorLifecycle,

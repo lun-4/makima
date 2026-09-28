@@ -303,7 +303,6 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
-        self.validate_manager(current)?;
         self.validate_active(current)?;
         let parent_id = current.agent_id();
         let parent_mode = current.mode.clone().ok_or_else(|| {
@@ -313,13 +312,7 @@ impl AgentManagerHandle {
             ManagerError::Policy("child delegation requires a parent policy snapshot".into())
         })?;
         let inherited_config = crate::actor::EffectiveAgentConfig::new(
-            crate::RunSettings {
-                provider: Arc::clone(&inherited_config.provider),
-                model: inherited_config.model.clone(),
-                fast: inherited_config.fast,
-                workflow: inherited_config.workflow,
-                thinking: inherited_config.thinking,
-            },
+            (**inherited_config).clone(),
             parent_mode.clone(),
         )
         .with_mode_def(current.mode_def.clone());

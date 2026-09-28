@@ -16,6 +16,6 @@ pub use instructions::{
 };
 pub use run::{
     Agent, AgentParams, AgentRunParams, ModelSource, ResolvedPromptInputs, RunSettings,
-    RunSettingsSource, SessionRunSettings, SharedModel, ToolBuilder, TurnAdmissionSnapshot,
-    TurnPromptInputs, estimate_message_tokens, resolve_compaction_model,
+    SharedModel, TurnAdmissionSnapshot, TurnPromptInputs, estimate_message_tokens,
+    resolve_compaction_model,
 };

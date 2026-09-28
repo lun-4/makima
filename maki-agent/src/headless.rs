@@ -223,8 +223,6 @@ fn spawn_with_session_id(
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
-                    settings_source: None,
-                    tool_builder: None,
                     agent_id: AgentId::generate(),
                     provider,
                     model,
@@ -425,6 +423,41 @@ async fn checkpoint_and_forward_terminal(
         }
     }
     result
+}
+
+fn current_interactive_settings(
+    model_source: &impl crate::ModelSource,
+    session_id: MakiId,
+) -> Option<crate::RunSettings> {
+    use crate::session_options::{
+        ENABLED_VALUE, FAST_OPTION_ID, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
+    };
+
+    let (provider, model) = model_source.current()?;
+    let options = SessionCoordinatorHandle::resolve(session_id)
+        .ok()?
+        .read()
+        .options();
+    let enabled = |id: &str| {
+        options
+            .options
+            .iter()
+            .find(|option| option.definition.id.as_ref() == id)
+            .is_some_and(|option| option.current_value.as_ref() == ENABLED_VALUE)
+    };
+    let thinking = options
+        .options
+        .iter()
+        .find(|option| option.definition.id.as_ref() == THINKING_OPTION_ID)
+        .and_then(|option| option.current_value.parse().ok())
+        .unwrap_or_default();
+    Some(crate::RunSettings {
+        provider,
+        model,
+        fast: enabled(FAST_OPTION_ID),
+        workflow: enabled(WORKFLOW_OPTION_ID),
+        thinking,
+    })
 }
 
 enum InteractiveWake {
@@ -653,16 +686,14 @@ impl InteractiveInputSender {
                 .send(input)
                 .map_err(|error| flume::SendError(Box::new(error.0)));
         }
-        let Some(settings) = crate::RunSettingsSource::current(&crate::SessionRunSettings {
-            model: Arc::new(self.model.clone()),
-            session_id: self.session_id,
-        })
-        .or_else(|| {
-            self.fallback_settings
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-        }) else {
+        let Some(settings) =
+            current_interactive_settings(&self.model, self.session_id).or_else(|| {
+                self.fallback_settings
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+            })
+        else {
             return Err(flume::SendError(Box::new(input)));
         };
         self.send_with_settings(input, settings)
@@ -865,12 +896,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
             shared_model.install(Arc::clone(&provider), model.clone());
             let settings = loop {
-                if let Some(settings) =
-                    crate::RunSettingsSource::current(&crate::SessionRunSettings {
-                        model: Arc::new(shared_model.clone()),
-                        session_id,
-                    })
-                {
+                if let Some(settings) = current_interactive_settings(&shared_model, session_id) {
                     break settings;
                 }
                 smol::future::yield_now().await;
@@ -1056,13 +1082,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 };
 
-                // MCP connects in the background, so a prompt that beats it waits
-                // here instead of shipping a turn without the MCP tools. The wait
-                // is racing cancel: a slow server must not pin the whole session.
-                if let Some(mcp) = &mcp {
-                    let _ = cancel.race(mcp.ready()).await;
-                }
-
                 let (turn_event_tx, turn_event_rx) = flume::unbounded::<Envelope>();
                 let terminal_task = smol::spawn(collect_turn_events(turn_event_rx, raw_tx.clone()));
                 let event_tx = EventSender::new(turn_event_tx.clone(), run_id);
@@ -1121,8 +1140,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
                 let mut agent = Agent::new(
                     AgentParams {
-                        settings_source: None,
-                        tool_builder: None,
                         agent_id,
                         provider: Arc::clone(&provider),
                         model: model.clone(),

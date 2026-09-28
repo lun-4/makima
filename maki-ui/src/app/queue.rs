@@ -293,6 +293,7 @@ impl App {
         // The turn runs on whatever the model is now; a change after this
         // point lands on the next turn.
         self.run_model = Some(self.state.session.model.clone());
+        self.run_context_window = Some(self.state.model.context_window);
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()

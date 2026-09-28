@@ -87,9 +87,6 @@ fn filter_tools(all: &Value, allowed: &[String]) -> Value {
     )
 }
 
-/// Rebuilds a run's base tool schema for the model and workflow snapshot.
-pub type ToolBuilder = Arc<dyn Fn(&Model, bool) -> RequestTools + Send + Sync>;
-
 #[derive(Clone)]
 pub struct TurnAdmissionSnapshot {
     pub mode_def: Option<Arc<crate::ModeDef>>,
@@ -120,55 +117,6 @@ pub struct RunSettings {
     pub fast: bool,
     pub workflow: bool,
     pub thinking: ThinkingConfig,
-}
-
-/// Supplies settings once at the start of a run.
-pub trait RunSettingsSource: Send + Sync {
-    /// `None` when the source cannot answer; the caller's settings are retained.
-    fn current(&self) -> Option<RunSettings>;
-}
-
-/// Layers a session's option values over a [`ModelSource`]. The coordinator
-/// owns `fast` and `workflow`, so reading them here keeps one authority rather
-/// than mirroring them into a second place.
-pub struct SessionRunSettings {
-    pub model: Arc<dyn ModelSource>,
-    pub session_id: maki_storage::id::MakiId,
-}
-
-impl RunSettingsSource for SessionRunSettings {
-    fn current(&self) -> Option<RunSettings> {
-        use crate::session_options::{
-            ENABLED_VALUE, FAST_OPTION_ID, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
-        };
-
-        let (provider, model) = self.model.current()?;
-        let options =
-            crate::session_coordinator::SessionCoordinatorHandle::resolve(self.session_id)
-                .ok()?
-                .read()
-                .options();
-        let enabled = |id: &str| {
-            options
-                .options
-                .iter()
-                .find(|option| option.definition.id.as_ref() == id)
-                .is_some_and(|option| option.current_value.as_ref() == ENABLED_VALUE)
-        };
-        let thinking = options
-            .options
-            .iter()
-            .find(|option| option.definition.id.as_ref() == THINKING_OPTION_ID)
-            .and_then(|option| option.current_value.parse().ok())
-            .unwrap_or_default();
-        Some(RunSettings {
-            provider,
-            model,
-            fast: enabled(FAST_OPTION_ID),
-            workflow: enabled(WORKFLOW_OPTION_ID),
-            thinking,
-        })
-    }
 }
 
 /// The provider and model available when a run begins.
@@ -203,10 +151,6 @@ pub struct AgentParams {
     pub agent_id: AgentId,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
-    /// `None` when the caller's settings are already the run's snapshot.
-    pub settings_source: Option<Arc<dyn RunSettingsSource>>,
-    /// Rebuilds the base tool schema if the initial snapshot changes either.
-    pub tool_builder: Option<ToolBuilder>,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
@@ -239,8 +183,6 @@ pub struct Agent<'h> {
     agent_id: AgentId,
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
-    settings_source: Option<Arc<dyn RunSettingsSource>>,
-    tool_builder: Option<ToolBuilder>,
     history: &'h mut History,
     system: String,
     event_tx: EventSender,
@@ -289,8 +231,6 @@ impl<'h> Agent<'h> {
             agent_id: params.agent_id,
             provider: params.provider,
             model: Arc::new(params.model),
-            settings_source: params.settings_source,
-            tool_builder: params.tool_builder,
             config: params.config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
@@ -446,14 +386,6 @@ impl<'h> Agent<'h> {
                 ))
             });
         self.opts = RequestOptions { thinking, fast };
-        if let Some(settings) = self
-            .settings_source
-            .as_ref()
-            .and_then(|source| source.current())
-        {
-            self.adopt_settings(settings);
-        }
-
         info!(
             agent_id = %self.agent_id,
             %turn_id,
@@ -537,40 +469,6 @@ impl<'h> Agent<'h> {
                 TurnProgress::Continue => {}
                 TurnProgress::Done(reason) => return Ok(reason),
             }
-        }
-    }
-
-    fn adopt_settings(&mut self, settings: RunSettings) {
-        let provider_changed = !Arc::ptr_eq(&self.provider, &settings.provider);
-        let model_changed = settings.model.spec() != self.model.spec();
-        let workflow_changed = settings.workflow != self.workflow;
-        if !provider_changed
-            && !model_changed
-            && !workflow_changed
-            && settings.fast == self.opts.fast
-            && settings.thinking == self.opts.thinking
-        {
-            return;
-        }
-        if model_changed {
-            info!(
-                from = %self.model.spec(),
-                to = %settings.model.spec(),
-                "adopting model for new run"
-            );
-            let _ = self.event_tx.send(AgentEvent::ModelSwitched {
-                spec: settings.model.spec(),
-            });
-        }
-        self.provider = settings.provider;
-        self.model = Arc::new(settings.model);
-        self.workflow = settings.workflow;
-        self.opts.fast = settings.fast;
-        self.opts.thinking = settings.thinking;
-        if (model_changed || workflow_changed)
-            && let Some(build) = &self.tool_builder
-        {
-            self.tools = build(&self.model, self.workflow);
         }
     }
 
@@ -1207,70 +1105,6 @@ mod tests {
         make_agent_with_sender(provider, history, raw_tx, event_rx)
     }
 
-    /// A source that can change after an agent captures its settings.
-    struct StubSettings(std::sync::Mutex<RunSettings>);
-
-    impl RunSettingsSource for StubSettings {
-        fn current(&self) -> Option<RunSettings> {
-            let settings = self.0.lock().unwrap();
-            Some(RunSettings {
-                provider: Arc::clone(&settings.provider),
-                model: settings.model.clone(),
-                fast: settings.fast,
-                workflow: settings.workflow,
-                thinking: settings.thinking,
-            })
-        }
-    }
-
-    #[test]
-    fn run_snapshots_settings_and_rebuilds_tools() {
-        let mut history = History::new(Vec::new());
-        let replacement: Arc<dyn Provider> =
-            Arc::new(MockProvider::new(vec![text_response(StopReason::EndTurn)]));
-        let source = Arc::new(StubSettings(Mutex::new(RunSettings {
-            provider: Arc::clone(&replacement),
-            model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
-            fast: true,
-            workflow: true,
-            thinking: ThinkingConfig::Budget(8192),
-        })));
-        let builder: ToolBuilder = Arc::new(|model, workflow| {
-            RequestTools::assembled(
-                serde_json::json!([{ "name": if workflow { "with-workflow" } else { "without" } }]),
-                &AgentConfig::default(),
-                model,
-            )
-        });
-        let (raw_tx, event_rx) = flume::unbounded();
-        let (mut agent, _rx) = make_agent_with_settings(
-            MockProvider::new(vec![]),
-            &mut history,
-            raw_tx,
-            event_rx,
-            Some(source.clone()),
-            Some(builder),
-        );
-        source.0.lock().unwrap().fast = false;
-        smol::block_on(agent.run(TurnId::generate(), default_input()));
-        assert!(Arc::ptr_eq(&agent.provider, &replacement));
-        assert_eq!(agent.model.spec(), "anthropic/claude-opus-4-8");
-        assert_eq!(
-            agent.tools.definitions(),
-            &serde_json::json!([{ "name": "with-workflow" }])
-        );
-        assert!(agent.workflow);
-        assert!(!agent.opts.fast);
-        assert_eq!(agent.opts.thinking, ThinkingConfig::Budget(8192));
-
-        source.0.lock().unwrap().workflow = false;
-        source.0.lock().unwrap().thinking = ThinkingConfig::Off;
-        source.0.lock().unwrap().model = default_model();
-        assert_eq!(agent.model.spec(), "anthropic/claude-opus-4-8");
-        assert!(agent.workflow);
-        assert_eq!(agent.opts.thinking, ThinkingConfig::Budget(8192));
-    }
-
     #[test]
     fn run_uses_input_options_without_settings_snapshot() {
         let mut history = History::new(Vec::new());
@@ -1293,21 +1127,8 @@ mod tests {
         raw_tx: flume::Sender<Envelope>,
         event_rx: flume::Receiver<Envelope>,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
-        make_agent_with_settings(provider, history, raw_tx, event_rx, None, None)
-    }
-
-    fn make_agent_with_settings(
-        provider: impl Provider + 'static,
-        history: &mut History,
-        raw_tx: flume::Sender<Envelope>,
-        event_rx: flume::Receiver<Envelope>,
-        settings_source: Option<Arc<dyn RunSettingsSource>>,
-        tool_builder: Option<ToolBuilder>,
-    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let agent = Agent::new(
             AgentParams {
-                settings_source,
-                tool_builder,
                 agent_id: AgentId::generate(),
                 provider: Arc::new(provider),
                 model: default_model(),

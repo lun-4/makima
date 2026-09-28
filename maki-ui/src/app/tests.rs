@@ -6259,6 +6259,19 @@ fn set_opus_model(app: &mut App) {
 }
 
 #[test]
+fn deferred_fast_toggle_flash_says_when_it_applies() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+
+    app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, true);
+
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some("fast applies when this turn finishes")
+    );
+}
+
+#[test]
 fn fast_toggle_on_off_on_opus() {
     let mut app = test_app();
     set_opus_model(&mut app);
@@ -6297,6 +6310,45 @@ fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
     assert_eq!(app.state.fast, !cancel);
     assert!(!app.state.pending_fast);
     assert_eq!(app.build_meta().fast, !cancel);
+}
+
+#[test]
+fn streaming_status_uses_context_window_of_active_run() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_context_window = Some(123_456);
+    app.state.model.context_window = 987_654;
+
+    let status = rendered_rows(&mut app, 120, 24).pop().expect("status row");
+
+    assert!(status.contains(&maki_providers::format_tokens(123_456)));
+    assert!(!status.contains(&maki_providers::format_tokens(987_654)));
+}
+
+#[test]
+fn model_switch_updates_active_run_status() {
+    const SWITCHED_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+    const INITIAL_CONTEXT_WINDOW: u32 = 123_456;
+
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_context_window = Some(INITIAL_CONTEXT_WINDOW);
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ModelSwitched {
+            spec: SWITCHED_MODEL_SPEC.into(),
+        },
+        app.run_id,
+    ));
+
+    let expected_context_window = maki_providers::Model::from_spec(SWITCHED_MODEL_SPEC)
+        .unwrap()
+        .context_window;
+    let status = rendered_rows(&mut app, 120, 24).pop().expect("status row");
+
+    assert!(status.contains(SWITCHED_MODEL_SPEC));
+    assert!(status.contains(&maki_providers::format_tokens(expected_context_window)));
+    assert!(!status.contains(&maki_providers::format_tokens(INITIAL_CONTEXT_WINDOW)));
 }
 
 #[test]

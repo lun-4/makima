@@ -1638,14 +1638,16 @@ mod tests {
 
     #[test]
     fn explicit_yolo_setter_is_idempotent() {
-        let mgr = default_mgr();
+        let mgr = seeded_mgr(true);
 
         mgr.set_yolo(true);
         mgr.set_yolo(true);
         assert!(mgr.is_yolo());
+        assert_eq!(mgr.persisted_yolo(), Some(true));
         mgr.set_yolo(false);
         mgr.set_yolo(false);
         assert!(!mgr.is_yolo());
+        assert_eq!(mgr.persisted_yolo(), Some(false));
     }
 
     fn seeded_mgr(yolo: bool) -> PermissionManager {

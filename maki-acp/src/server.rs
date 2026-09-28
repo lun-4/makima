@@ -4951,6 +4951,64 @@ mod tests {
     }
 
     #[test]
+    fn prompt_immediately_after_new_session_is_queued() {
+        smol::block_on(async {
+            let previous_host = std::env::var_os("OLLAMA_HOST");
+            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let temp = TempDir::new().unwrap();
+            let cwd = temp.path().to_path_buf();
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
+            let params = test_params(model, cwd.clone());
+            let request = serde_json::json!({
+                "params": { "cwd": cwd, "mcpServers": [] }
+            });
+
+            handle_request(
+                &mut srv,
+                "session/new",
+                RequestId::Number(82),
+                &request,
+                &params,
+            )
+            .await;
+            let new_response = out_rx.recv_async().await.unwrap();
+            assert_eq!(new_response["id"], 82);
+            let session = srv.session.as_ref().unwrap();
+            assert!(maki_agent::ModelSource::current(&session.handle.model).is_none());
+            let session_id = session.handle.session_id.to_string();
+            handle_request(
+                &mut srv,
+                "session/prompt",
+                RequestId::Number(83),
+                &prompt_request(&session_id, "immediate prompt", false),
+                &params,
+            )
+            .await;
+
+            let pending = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .operation
+                .is_some();
+            assert!(pending, "immediate prompt must remain queued");
+            assert!(
+                out_rx.try_iter().all(|message| message["id"] != 83),
+                "queued prompt must not return a terminal response"
+            );
+            close_session(&mut srv).await;
+            match previous_host {
+                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
+                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+            }
+        });
+    }
+
+    #[test]
     fn completed_then_cancelled_session_can_be_replaced_and_prompted() {
         smol::block_on(async {
             let previous_host = std::env::var_os("OLLAMA_HOST");

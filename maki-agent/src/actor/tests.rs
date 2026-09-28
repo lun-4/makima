@@ -73,6 +73,7 @@ struct ScriptedState {
     controls: Mutex<Vec<String>>,
     compacts: AtomicU32,
     compact_policies: Mutex<Vec<(Option<bool>, u64)>>,
+    compact_modes: Mutex<Vec<Option<AgentMode>>>,
     entered: AtomicU32,
     policies: Mutex<Vec<(String, Option<bool>, u64)>>,
     modes: Mutex<Vec<(String, Option<AgentMode>)>>,
@@ -281,6 +282,11 @@ impl ActorBackend for ScriptedBackend {
                 context.policy.as_ref().map(|policy| policy.fast),
                 context.generation,
             ));
+            self.state
+                .compact_modes
+                .lock()
+                .unwrap()
+                .push(context.policy.as_ref().map(|policy| policy.mode.clone()));
             history.push(Message::user("compact".to_owned()));
             BackendResult::CompactDone
         })
@@ -1117,6 +1123,43 @@ fn idle_root_start_preserves_metadata_to_backend() {
 }
 
 #[test]
+fn snapshot_queued_excludes_controls_from_pending_work_count() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let (handle, task) = spawn(ScriptedBackend::gated(Arc::clone(&gate)));
+        let running = handle
+            .admit_turn(input("running"), None, "running".into())
+            .unwrap();
+        until(|| handle.snapshot().status != ActorStatus::Idle).await;
+        handle
+            .push_control(ControlWork {
+                name: "pin".into(),
+                correlation: "control".into(),
+            })
+            .unwrap();
+        handle
+            .rush(RootWork::new(
+                input("queued"),
+                1,
+                false,
+                "queued".into(),
+                Vec::new(),
+                "queued".into(),
+            ))
+            .unwrap();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.queued, 1);
+        assert_eq!(snapshot.queue.len(), 2);
+
+        gate.open();
+        running.wait().await;
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn control_produces_no_outcome() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
@@ -1340,12 +1383,21 @@ fn compacts_wait_behind_pending_policy_and_follow_the_turns() {
             snapshot.queue,
             [QueueProjection::Compact(Some("compact".into()))]
         );
-        reservation.resolve(Ok(policy(true))).unwrap();
+        reservation
+            .resolve_config(Ok(crate::actor::EffectiveAgentConfig::new(
+                policy(true),
+                AgentMode::Plan("pinned-plan.md".into()),
+            )))
+            .unwrap();
         reservation.wait().await.unwrap();
         until(|| observed.compacts.load(Ordering::SeqCst) == 1).await;
         assert_eq!(
             observed.compact_policies.lock().unwrap().as_slice(),
             &[(Some(true), 1)]
+        );
+        assert_eq!(
+            observed.compact_modes.lock().unwrap().as_slice(),
+            &[Some(AgentMode::Plan("pinned-plan.md".into()))]
         );
         handle.close();
         task.await;
@@ -1410,30 +1462,43 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
 }
 
 #[test]
-fn cancel_existing_does_not_cancel_pending_policy_updates() {
+fn cancel_all_does_not_cancel_in_flight_reserved_setter() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         handle.update_policy(policy(false)).unwrap();
         let pending = handle.reserve_policy_update().unwrap();
+        let gate = Gate::new();
+        let setter_gate = Arc::clone(&gate);
+        let setter = smol::spawn(async move {
+            setter_gate.wait().await;
+            pending.resolve(Ok(policy(true)))
+        });
         let deferred = handle
             .admit_turn(input("deferred"), None, "deferred".into())
             .unwrap();
 
-        handle.cancel_existing();
-        pending.resolve(Ok(policy(true))).unwrap();
-        pending.wait().await.unwrap();
+        handle.cancel_all();
         assert!(matches!(
             deferred.wait().await,
             TurnOutcome::Cancelled { .. }
         ));
+        assert!(handle.policy_snapshot().is_some_and(|policy| !policy.fast));
+
+        gate.open();
+        setter.await.unwrap();
+        handle.wait_policy_updates().await.unwrap();
+        assert!(handle.policy_snapshot().is_some_and(|policy| policy.fast));
 
         let next = handle
             .admit_turn(input("next"), None, "next".into())
             .unwrap();
         next.wait().await;
-        assert_eq!(state.policies.lock().unwrap()[0].2, 2);
+        assert_eq!(
+            state.policies.lock().unwrap()[0],
+            ("next".into(), Some(true), 2)
+        );
         handle.close();
         task.await;
     });

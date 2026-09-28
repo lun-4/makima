@@ -379,6 +379,7 @@ pub struct App {
     /// turn; this is what lets the status bar say so instead of showing a name
     /// the running turn is not using.
     pub(crate) run_model: Option<String>,
+    pub(crate) run_context_window: Option<u32>,
     pub(super) retry_info: Option<RetryInfo>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
@@ -541,6 +542,7 @@ impl App {
             pending_input: PendingInput::None,
             run_id: 0,
             run_model: None,
+            run_context_window: None,
             retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
@@ -1844,6 +1846,9 @@ impl App {
             && let AgentEvent::ModelSwitched { spec } = &envelope.event
         {
             self.run_model = Some(spec.clone());
+            if let Ok(model) = maki_providers::Model::from_spec(spec) {
+                self.run_context_window = Some(model.context_window);
+            }
             return vec![];
         }
 
@@ -2416,7 +2421,11 @@ impl App {
                 return;
             }
         };
-        self.flash(message.into());
+        if id == maki_agent::session_options::FAST_OPTION_ID && self.status == Status::Streaming {
+            self.flash("fast applies when this turn finishes".into());
+        } else {
+            self.flash(message.into());
+        }
     }
 
     pub(crate) fn execute_host_request(

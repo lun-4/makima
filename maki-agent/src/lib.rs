@@ -25,9 +25,8 @@ pub use actor::{
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    ModelSource, RunSettings, RunSettingsSource, SessionRunSettings, SharedMessages, SharedModel,
-    ToolBuilder, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
-    is_instruction_file,
+    ModelSource, RunSettings, SharedMessages, SharedModel, UNAVAILABLE_RESULT,
+    close_dangling_tool_calls, find_subdirectory_instructions, is_instruction_file,
 };
 pub use cancel::{
     CancelMap, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
