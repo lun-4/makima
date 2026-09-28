@@ -234,7 +234,9 @@ impl ActorQueue {
     }
 
     pub fn is_empty(&self) -> bool {
-        lock(&self.items).is_empty()
+        lock(&self.items)
+            .iter()
+            .all(|work| matches!(work, ActorWork::PolicyBarrier { .. }))
     }
 
     /// Removes every item and returns them in FIFO order.

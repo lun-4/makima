@@ -762,7 +762,7 @@ mod tests {
                 .options()
                 .options
                 .iter()
-                .any(|option| option.definition.id.as_ref() == "fast"
+                .any(|option| option.definition.id.as_ref() == "yolo"
                     && option.current_value.as_ref() == "enabled")
         );
         responder.join().unwrap();
