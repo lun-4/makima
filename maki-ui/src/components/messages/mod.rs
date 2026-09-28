@@ -197,6 +197,18 @@ impl MessagesPanel {
         self.messages.push(msg);
     }
 
+    pub fn annotate_last_user_message(&mut self, annotation: String) {
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == DisplayRole::User)
+        {
+            message.annotation = Some(annotation);
+            self.cache.clear();
+        }
+    }
+
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
         if !self.show_thinking {
             for msg in &mut msgs {
@@ -1758,6 +1770,14 @@ fn build_message_lines(msg: &DisplayMessage, width: u16) -> Vec<Line<'static>> {
     } else {
         plain_lines(text, prefix, style.text_style, style.prefix_style)
     };
+    if let Some(annotation) = &msg.annotation
+        && msg.role == DisplayRole::User
+    {
+        lines.push(Line::from(Span::styled(
+            annotation.clone(),
+            theme::current().tool_dim,
+        )));
+    }
     if let Some(pp) = &msg.plan_path {
         if !msg.text.is_empty() {
             let rule = hr_line(width, theme::current().plan_rule);

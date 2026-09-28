@@ -69,6 +69,8 @@ pub struct EarlierRoot {
     pub text: String,
     pub images: Vec<ImageSource>,
     pub correlation: String,
+    pub mcp_startup_notice: Option<usize>,
+    pub already_displayed: bool,
 }
 
 /// What category of work the backend is asked to execute. Controls and
@@ -85,7 +87,10 @@ pub enum WorkKind {
         text: String,
         images: Vec<ImageSource>,
         earlier: Vec<EarlierRoot>,
+        mcp_startup_notice: Option<usize>,
+        already_displayed: bool,
     },
+
     Control,
     Compact,
 }

@@ -434,6 +434,7 @@ fn admission_preparation_does_not_hold_actor_state_lock() {
             mode_def: None,
             prompt_inputs: None,
             bindings: Arc::default(),
+            mcp_startup_notice: None,
         }
     }));
     let (handle, task) = spawn(backend);
@@ -481,6 +482,7 @@ fn queued_turn_keeps_admitted_mode_and_tool_binding() {
                     &crate::tools::LocalTools::default(),
                     None,
                 )),
+                mcp_startup_notice: None,
             }
         }));
         let (handle, task) = spawn(backend);
@@ -1098,6 +1100,8 @@ fn idle_root_start_preserves_metadata_to_backend() {
                 text: "deferred bubble".into(),
                 images: vec![test_image(), test_image(), test_image()],
                 earlier: Vec::new(),
+                mcp_startup_notice: None,
+                already_displayed: false,
             }
         );
         assert_eq!(runs[0].1, "deferred");

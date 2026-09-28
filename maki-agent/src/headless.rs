@@ -735,6 +735,10 @@ impl InteractiveInputSender {
                 &self.local_tools,
                 mcp.as_ref(),
             )),
+            mcp_startup_notice: mcp.as_ref().and_then(|mcp| {
+                let count = mcp.connecting_count();
+                (count > 0).then_some(count)
+            }),
         };
         self.tx
             .send(QueuedInput {

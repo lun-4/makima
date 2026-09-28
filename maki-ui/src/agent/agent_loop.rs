@@ -524,7 +524,17 @@ impl ActorBackend for TuiActorBackend {
         let mcp = self.mcp.clone();
         let cwd = Arc::clone(&self.cwd);
         let lua_handle = self.lua_handle.clone();
+        let mcp_reader = mcp.as_ref().map(|mcp| mcp.reader());
         Some(Arc::new(move |input, mode| {
+            let mcp_startup_notice = mcp_reader.as_ref().and_then(|reader| {
+                let count = reader
+                    .load()
+                    .infos
+                    .iter()
+                    .filter(|info| info.status == maki_agent::McpServerStatus::Connecting)
+                    .count();
+                (count > 0).then_some(count)
+            });
             let cwd = (**cwd.load()).clone();
             let instructions = maki_agent::agent::load_instructions(&cwd.to_string_lossy());
             let mode = mode.clone();
@@ -583,6 +593,7 @@ impl ActorBackend for TuiActorBackend {
                     &Default::default(),
                     mcp.as_ref(),
                 )),
+                mcp_startup_notice,
             }
         }))
     }
@@ -639,20 +650,29 @@ impl ActorBackend for TuiActorBackend {
                 } = &work
                 {
                     for item in earlier {
-                        if !item.displayed {
+                        let notice = item.mcp_startup_notice;
+                        if !item.displayed || notice.is_some() {
                             let _ = EventSender::new(self.agent_tx.clone(), item.run_id).send(
                                 AgentEvent::QueueItemConsumed {
                                     text: item.text.clone(),
                                     images: item.images.clone(),
+                                    mcp_startup_notice: notice,
+                                    already_displayed: item.already_displayed,
                                 },
                             );
                         }
                     }
-                    if !displayed {
+                    let notice = context
+                        .admission
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.mcp_startup_notice);
+                    if !displayed || notice.is_some() {
                         let _ = EventSender::new(self.agent_tx.clone(), run_id).send(
                             AgentEvent::QueueItemConsumed {
                                 text: text.clone(),
                                 images: images.clone(),
+                                mcp_startup_notice: notice,
+                                already_displayed: *displayed,
                             },
                         );
                     }

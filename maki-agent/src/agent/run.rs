@@ -95,6 +95,7 @@ pub struct TurnAdmissionSnapshot {
     pub mode_def: Option<Arc<crate::ModeDef>>,
     pub bindings: Arc<TurnToolBindings>,
     pub prompt_inputs: Option<Arc<TurnPromptInputs>>,
+    pub mcp_startup_notice: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -403,8 +404,25 @@ impl<'h> Agent<'h> {
         } = input;
         self.push_input_context(preamble);
         if !message.trim().is_empty() || !images.is_empty() {
-            self.history
-                .push(Message::user_with_images(message.clone(), images));
+            let mut user_message = Message::user_with_images(message.clone(), images);
+            if let Some(count) = self
+                .admission
+                .as_ref()
+                .and_then(|snapshot| snapshot.mcp_startup_notice)
+            {
+                let notice = format!(
+                    "[system: {count} MCP servers are not ready; MCP tools are unavailable for this turn]"
+                );
+                user_message.content.push(ContentBlock::Text {
+                    text: notice.clone(),
+                });
+                user_message.display_text = Some(if message.is_empty() {
+                    format!("{IMAGE_PLACEHOLDER}\n{notice}")
+                } else {
+                    format!("{message}\n{notice}")
+                });
+            }
+            self.history.push(user_message);
         }
         self.mode = mode;
         self.mode_def = self
@@ -906,6 +924,8 @@ impl<'h> Agent<'h> {
                     self.event_tx.send(AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
                         images: input.images.clone(),
+                        mcp_startup_notice: None,
+                        already_displayed: true,
                     })?;
                     self.push_input_context(input.preamble);
                     let wrapped = format!(
@@ -1341,6 +1361,38 @@ mod tests {
             cancel: None,
             lease_committer: None,
         }
+    }
+
+    #[test]
+    fn startup_notice_is_appended_to_user_turn_for_model_and_display() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.admission = Some(TurnAdmissionSnapshot {
+                mode_def: None,
+                bindings: Arc::default(),
+                prompt_inputs: None,
+                mcp_startup_notice: Some(2),
+            });
+
+            agent.run(TurnId::generate(), default_input()).await;
+            drop(agent);
+
+            let message = history.as_slice().last().unwrap();
+            assert_eq!(
+                message.user_text(),
+                Some(
+                    "hello\n[system: 2 MCP servers are not ready; MCP tools are unavailable for this turn]"
+                )
+            );
+            assert!(matches!(
+                message.content.last(),
+                Some(ContentBlock::Text { text }) if text == "[system: 2 MCP servers are not ready; MCP tools are unavailable for this turn]"
+            ));
+        });
     }
 
     #[test]

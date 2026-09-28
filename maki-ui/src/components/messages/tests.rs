@@ -1145,6 +1145,28 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
 }
 
 #[test]
+fn user_annotation_renders_below_message() {
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
+    rebuild(&mut panel);
+
+    panel.annotate_last_user_message("2 MCP servers are not ready; no MCP tools exposed".into());
+    rebuild(&mut panel);
+
+    let lines = panel.cache.segments()[0]
+        .lines()
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    assert!(lines[0].contains("hello"));
+    assert!(lines[1].contains("2 MCP servers are not ready"));
+}
+
+#[test]
 fn toggle_expand_collapse_truncated_tool() {
     let mut panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);

@@ -918,6 +918,8 @@ pub enum AgentEvent {
     QueueItemConsumed {
         text: String,
         images: Vec<ImageSource>,
+        mcp_startup_notice: Option<usize>,
+        already_displayed: bool,
     },
     QueueDrained,
     /// A run picked up a model that changed while it was in flight. Carries

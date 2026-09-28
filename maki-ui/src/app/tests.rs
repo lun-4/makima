@@ -894,6 +894,8 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         AgentEvent::QueueItemConsumed {
             text: "queued".into(),
             images: Vec::new(),
+            mcp_startup_notice: None,
+            already_displayed: false,
         },
         app.run_id,
     ));
@@ -903,6 +905,27 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     assert_eq!(
         app.main_chat().last_message_role(),
         Some(&DisplayRole::User),
+    );
+}
+
+#[test]
+fn queue_item_consumed_shows_mcp_startup_notice() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "queued".into(),
+            images: Vec::new(),
+            mcp_startup_notice: Some(2),
+            already_displayed: false,
+        },
+        app.run_id,
+    ));
+
+    assert_eq!(
+        app.main_chat().message_at(1).unwrap().annotation.as_deref(),
+        Some("2 MCP servers are not ready; no MCP tools exposed")
     );
 }
 
@@ -918,6 +941,8 @@ fn queue_item_consumed_marks_agent_streaming() {
         AgentEvent::QueueItemConsumed {
             text: "restored".into(),
             images: Vec::new(),
+            mcp_startup_notice: None,
+            already_displayed: false,
         },
         app.run_id,
     ));

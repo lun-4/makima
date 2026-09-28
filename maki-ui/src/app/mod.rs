@@ -2094,9 +2094,23 @@ impl App {
         };
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
 
-        if let ChatEventResult::QueueItemConsumed { text, images } = result {
+        if let ChatEventResult::QueueItemConsumed {
+            text,
+            images,
+            mcp_startup_notice,
+            already_displayed,
+        } = result
+        {
             if chat_idx == 0 {
-                self.on_queue_item_consumed(text, images);
+                let notice = mcp_startup_notice.map(|count| {
+                    format!("{count} MCP servers are not ready; no MCP tools exposed")
+                });
+                if !already_displayed {
+                    self.chats[chat_idx].show_user_message_with_notice(text, images, notice);
+                } else if let Some(notice) = notice {
+                    self.chats[chat_idx].annotate_last_user_message(notice);
+                }
+                self.status = Status::Streaming;
             }
             return vec![];
         }

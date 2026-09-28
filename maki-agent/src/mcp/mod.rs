@@ -777,6 +777,16 @@ impl McpHandle {
         let _ = self.ready_rx.recv_async().await;
     }
 
+    pub fn connecting_count(&self) -> usize {
+        self.published
+            .load()
+            .snapshot
+            .infos
+            .iter()
+            .filter(|info| info.status == McpServerStatus::Connecting)
+            .count()
+    }
+
     pub fn reader(&self) -> McpSnapshotReader {
         McpSnapshotReader(Arc::clone(&self.published))
     }

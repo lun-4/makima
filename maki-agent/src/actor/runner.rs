@@ -360,6 +360,10 @@ impl Runner {
     /// idle: a root popped during an active turn is folded by the interrupt
     /// source into the active run, so no orphan [`TurnId`] exists here.
     async fn run_root(&mut self, root: RootWork, cancellation_generation: u64) {
+        let mcp_startup_notice = root
+            .admission
+            .as_ref()
+            .and_then(|admission| admission.mcp_startup_notice);
         let admission = TurnAdmission {
             turn_id: TurnId::generate(),
             input: Some(root.input),
@@ -379,6 +383,8 @@ impl Runner {
                 text: root.text,
                 images: root.images,
                 earlier: root.earlier,
+                mcp_startup_notice,
+                already_displayed: root.displayed,
             },
             cancellation_generation,
         )

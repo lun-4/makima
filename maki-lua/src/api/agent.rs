@@ -294,6 +294,7 @@ impl ActorBackend for LuaActorBackend {
                     &state.local_tools,
                     state.mcp.as_ref(),
                 )),
+                mcp_startup_notice: None,
             }
         }))
     }

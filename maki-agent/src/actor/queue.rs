@@ -112,10 +112,22 @@ impl ActorQueue {
                         text: r.text,
                         images: r.images,
                         correlation: r.correlation,
+                        mcp_startup_notice: r
+                            .admission
+                            .as_ref()
+                            .and_then(|admission| admission.mcp_startup_notice),
+                        already_displayed: r.displayed,
                     });
                 }
+                let notice = last
+                    .admission
+                    .as_ref()
+                    .and_then(|admission| admission.mcp_startup_notice);
                 inputs.push(last.input);
                 last.input = crate::merge_inputs(inputs).expect("at least two inputs");
+                if let Some(admission) = &mut last.admission {
+                    admission.mcp_startup_notice = notice;
+                }
                 last.earlier = earlier;
                 Some(ActorWork::Root(last))
             }
