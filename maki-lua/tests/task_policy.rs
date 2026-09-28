@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
-use maki_agent::{AgentMode, ToolOutput};
+use maki_agent::{AgentMode, ModeDef, ModeId, ToolOutput};
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -1129,7 +1129,9 @@ fn task_policy_general_task_runs_in_custom_mode_real_driver() {
     let provider = Arc::new(common::CannedProvider::new(vec![common::canned_reply(
         "done",
     )]));
-    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    ctx.mode = AgentMode::Custom(ModeId::parse("audit"));
+    ctx.mode_def = Some(Arc::new(ModeDef::default_for(ctx.mode.id())));
 
     let (reg, _host) = load_real_driver_host("audit");
     let mut input = task_input(SCENARIO_PLAIN, None);
@@ -1138,7 +1140,12 @@ fn task_policy_general_task_runs_in_custom_mode_real_driver() {
 
     assert_eq!(out, "done");
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(1));
-    assert_eq!(provider.captured_tools().len(), 1);
+    let captured_tools = provider.captured_tools();
+    assert_eq!(captured_tools.len(), 1);
+    assert!(
+        common::tool_names(&captured_tools[0]).is_empty(),
+        "the custom-mode test harness offers no tools to the child"
+    );
 }
 
 #[test]

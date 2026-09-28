@@ -2940,6 +2940,29 @@ impl<'t> EventLoop<'t> {
                                 Err(error.to_string())
                             }
                         }
+                    } else if id.as_str() == "model" {
+                        let result = coordinator
+                            .set_option_if_version(id, value, Some(version))
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string());
+                        match (result, reservation) {
+                            (Ok(()), Some(reservation)) => {
+                                reconcile_actor_model_policy(
+                                    reservation,
+                                    &model_slot,
+                                    &coordinator,
+                                    mode,
+                                    mode_def,
+                                )
+                                .await
+                            }
+                            (Err(error), Some(reservation)) => {
+                                let _ = reservation.cancel();
+                                Err(error)
+                            }
+                            (result, None) => result,
+                        }
                     } else {
                         coordinator
                             .set_option_if_version(id, value, Some(version))
@@ -4178,6 +4201,24 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+async fn reconcile_actor_model_policy(
+    reservation: maki_agent::PolicyUpdateTicket,
+    model_slot: &ProviderSlot,
+    coordinator: &SessionCoordinatorHandle,
+    mode: maki_agent::AgentMode,
+    mode_def: maki_agent::ModeDef,
+) -> Result<(), String> {
+    let config = maki_agent::EffectiveAgentConfig::new(
+        policy_from_coordinator(model_slot, coordinator),
+        mode,
+    )
+    .with_mode_def(Some(mode_def));
+    reservation
+        .resolve_config(Ok(config))
+        .map_err(|error| error.to_string())?;
+    reservation.wait().await.map_err(|error| error.to_string())
+}
+
 async fn abort_policy_option(
     prepared: maki_agent::session_coordinator::PreparedPolicyOption,
     error: String,
@@ -4492,6 +4533,42 @@ mod tests {
                         String::new(),
                     )
                     .is_ok()
+            );
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn lua_model_option_updates_actor_policy() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let reservation = actor.reserve_config_update().unwrap();
+            let coordinator = runtime.coordinator.clone();
+            let model_slot = Arc::clone(&runtime.model_slot);
+            let target_model = model_named("test-model");
+            let mode = agent_mode_for_app(&runtime.app);
+            let mode_def = runtime
+                .app
+                .state
+                .mode
+                .def(&runtime.app.lua_event_handle.mode_registry());
+            let version = coordinator.read().options().version;
+            coordinator
+                .set_option_if_version("model", target_model.spec(), Some(version))
+                .await
+                .unwrap();
+            reconcile_actor_model_policy(reservation, &model_slot, &coordinator, mode, mode_def)
+                .await
+                .unwrap();
+            assert_eq!(
+                actor.effective_config().unwrap().model.spec(),
+                target_model.spec()
+            );
+            assert_eq!(
+                runtime.coordinator.read().model().as_ref(),
+                target_model.spec()
             );
             release_runtime(runtime);
         });
