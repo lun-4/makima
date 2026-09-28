@@ -452,6 +452,10 @@ fn admit_pending_inputs(
     ready: &std::sync::Mutex<bool>,
 ) {
     let mut ready = ready.lock().unwrap_or_else(|error| error.into_inner());
+    *admission_sender
+        .fallback_settings
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(settings.clone());
     while let Ok(input) = pending_rx.try_recv() {
         let _ = admission_sender.send_with_settings(input, settings.clone());
     }
@@ -615,6 +619,7 @@ pub struct InteractiveInputSender {
     tx: flume::Sender<QueuedInput>,
     pending_tx: flume::Sender<AgentInput>,
     ready: Arc<std::sync::Mutex<bool>>,
+    fallback_settings: Arc<std::sync::Mutex<Option<crate::RunSettings>>>,
     mirror: Option<flume::Sender<AgentInput>>,
     model: crate::SharedModel,
     session_id: MakiId,
@@ -651,6 +656,12 @@ impl InteractiveInputSender {
         let Some(settings) = crate::RunSettingsSource::current(&crate::SessionRunSettings {
             model: Arc::new(self.model.clone()),
             session_id: self.session_id,
+        })
+        .or_else(|| {
+            self.fallback_settings
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
         }) else {
             return Err(flume::SendError(Box::new(input)));
         };
@@ -788,6 +799,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         tx: input_tx.clone(),
         pending_tx,
         ready: Arc::clone(&input_ready),
+        fallback_settings: Arc::new(std::sync::Mutex::new(None)),
         mirror: None,
         model: shared_model.clone(),
         session_id,
@@ -1746,6 +1758,7 @@ mod tests {
             tx,
             pending_tx: pending_tx.clone(),
             ready: Arc::new(std::sync::Mutex::new(false)),
+            fallback_settings: Arc::new(std::sync::Mutex::new(None)),
             mirror: None,
             model: crate::SharedModel::default(),
             session_id: MakiId::generate(),
@@ -1771,9 +1784,17 @@ mod tests {
             workflow: true,
             thinking: Default::default(),
         };
+        sender
+            .fallback_settings
+            .lock()
+            .unwrap()
+            .replace(initialized_settings.clone());
         pending_tx.send(pending_input).unwrap();
         admit_pending_inputs(&pending_rx, &sender, &initialized_settings, &sender.ready);
+        sender.send(test_params().input).unwrap();
         let admitted = rx.recv().unwrap();
+        let ready_admitted = rx.recv().unwrap();
+        assert_eq!(ready_admitted.input.message, "hello");
         assert!(Arc::ptr_eq(
             &admitted.settings.provider,
             &initialized_provider

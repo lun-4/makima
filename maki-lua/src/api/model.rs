@@ -73,7 +73,17 @@ async fn get(
                 Ok(model) => model,
                 Err(error) => return Ok(err_pair(error.to_string())),
             };
-            let opts = RequestOptions::default();
+            let opts = RequestOptions {
+                fast: snapshot
+                    .get("fast")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                thinking: snapshot
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|thinking| thinking.parse().ok())
+                    .unwrap_or_default(),
+            };
             return model_value(&lua, &model, &opts);
         }
     }
@@ -256,7 +266,7 @@ mod tests {
         let lua = lua_with_model(None);
         lua.set_app_data(crate::api::session::SessionSnapshotSlot(Box::new(|id| {
             assert!(id.is_none());
-            Ok(json!({ "model": SPEC }))
+            Ok(json!({ "model": SPEC, "fast": true, "thinking": THINKING }))
         })));
         let model = Model::from_spec(SPEC).unwrap();
         let (actual, error) = eval(&lua, "return model.get()");

@@ -371,6 +371,8 @@ pub fn run(
                 id: session_id.to_string(),
                 cwd: cwd.clone(),
                 model: model.spec(),
+                fast: false,
+                thinking: String::new(),
             },
             // `maki -p` always runs the agent in build mode
             // (`headless::spawn` hardcodes `AgentMode::Build`).

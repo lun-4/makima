@@ -529,8 +529,8 @@ impl ActorBackend for TuiActorBackend {
             let instructions = maki_agent::agent::load_instructions(&cwd.to_string_lossy());
             let mode = mode.clone();
             let mode_def = match &mode {
-                maki_agent::AgentMode::Custom(id) => modes.get(id).map(Arc::new),
-                _ => Some(Arc::new(modes.current(&mode))),
+                maki_agent::AgentMode::Custom(id) => modes.get(id),
+                _ => Some(modes.current(&mode)),
             };
             let binding = input
                 .prompt
@@ -569,8 +569,9 @@ impl ActorBackend for TuiActorBackend {
                     );
             })
             .detach();
+            let mode_def = mode_def.map(Arc::new);
             maki_agent::agent::TurnAdmissionSnapshot {
-                mode_def,
+                mode_def: mode_def.clone(),
                 prompt_inputs: Some(Arc::new(maki_agent::agent::TurnPromptInputs {
                     cwd,
                     instructions,

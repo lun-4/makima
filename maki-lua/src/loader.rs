@@ -493,7 +493,11 @@ impl PluginHost {
                     "read"
                         | "glob"
                         | "grep"
+                        | "index"
                         | "webfetch"
+                        | "websearch"
+                        | "skill"
+                        | "todo_write"
                         | "question"
                         | "write"
                         | "edit"
@@ -1954,7 +1958,11 @@ mod tests {
             "read",
             "glob",
             "grep",
+            "index",
             "webfetch",
+            "websearch",
+            "skill",
+            "todo_write",
             "question",
             "plan_submit_tool",
             "task",
@@ -1969,7 +1977,11 @@ mod tests {
             "read",
             "glob",
             "grep",
+            "index",
             "webfetch",
+            "websearch",
+            "skill",
+            "todo_write",
             "question",
             "plan_submit",
             "task",
@@ -1985,7 +1997,11 @@ mod tests {
         for name in [
             "glob",
             "grep",
+            "index",
             "webfetch",
+            "websearch",
+            "skill",
+            "todo_write",
             "question",
             "plan_submit",
             "task",

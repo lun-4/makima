@@ -450,14 +450,42 @@ pub enum SessionRequest {
     Live,
     Current,
     Usage,
-    Read { id: Option<String> },
-    New { prompt: Option<String>, focus: bool },
-    Prompt { id: Option<String>, text: String },
-    Focus { id: String },
-    Delete { id: String },
-    SetTitle { id: String, title: String },
+    Read {
+        id: Option<String>,
+    },
+    New {
+        prompt: Option<String>,
+        focus: bool,
+    },
+    Prompt {
+        id: Option<String>,
+        text: String,
+    },
+    Focus {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    SetTitle {
+        id: String,
+        title: String,
+    },
     GetThinking,
-    SetThinking { set_default: bool, thinking: String },
+    SetThinking {
+        set_default: bool,
+        thinking: String,
+    },
+    SetOption {
+        session: String,
+        id: String,
+        value: String,
+        version: u64,
+    },
+    SetMode {
+        session: Option<String>,
+        id: String,
+    },
 }
 
 pub enum ModelRequest {

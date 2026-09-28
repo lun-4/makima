@@ -105,7 +105,7 @@ pub(crate) struct ActorState {
 
 struct PendingPolicy {
     id: u64,
-    result: Option<Result<RunSettings, ActorError>>,
+    result: Option<Result<EffectiveAgentConfig, ActorError>>,
     completion: Arc<Mutex<Option<Result<(), ActorError>>>>,
 }
 
@@ -172,6 +172,27 @@ impl ActorInner {
 
 impl PolicyUpdateTicket {
     pub fn resolve(&self, result: Result<RunSettings, ActorError>) -> Result<(), ActorError> {
+        let config = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .policy
+            .as_ref()
+            .map(|config| (**config).clone());
+        self.resolve_config(result.map(|settings| {
+            let mut config = config.clone().unwrap_or_else(|| {
+                EffectiveAgentConfig::new(settings.clone(), crate::AgentMode::Build)
+            });
+            config.settings = settings;
+            config
+        }))
+    }
+
+    pub fn resolve_config(
+        &self,
+        result: Result<EffectiveAgentConfig, ActorError>,
+    ) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -184,9 +205,10 @@ impl PolicyUpdateTicket {
         if pending.result.is_some() {
             return Err(ActorError::PolicyCancelled);
         }
-        let result = result.and_then(|policy| {
-            self.inner.validate_policy(&policy)?;
-            Ok(policy)
+        let result = result.and_then(|config| {
+            self.inner.validate_policy(&config.settings)?;
+
+            Ok(config)
         });
         let rejected = result.as_ref().err().cloned();
         pending.result = Some(result);
@@ -286,12 +308,7 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
         let result = pending.result.unwrap();
         *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
-        if let Ok(settings) = result {
-            let mode = state
-                .policy
-                .as_ref()
-                .map_or(crate::AgentMode::Build, |config| config.mode.clone());
-            let config = EffectiveAgentConfig::new(settings, mode);
+        if let Ok(config) = result {
             let changed = state.policy.as_ref().is_none_or(|current| {
                 !Arc::ptr_eq(&current.settings.provider, &config.settings.provider)
                     || current.settings.model.spec() != config.settings.model.spec()
@@ -315,20 +332,23 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
         {
             match state.deferred_admissions.pop_front().unwrap() {
                 DeferredAdmission::Turn {
-                    input,
-                    admission: snapshot,
+                    mut input,
+                    admission: mut snapshot,
                     event_sender,
                     correlation,
                     ticket,
                     ..
                 } => {
                     let turn_id = ticket.turn_id();
-                    let policy = state.policy.as_ref().map(|config| {
-                        Arc::new(EffectiveAgentConfig::new(
-                            config.settings.clone(),
-                            input.mode.clone(),
-                        ))
-                    });
+                    let policy = state.policy.clone();
+                    if let Some(config) = &policy {
+                        input.mode = config.mode.clone();
+                        if let Some(snapshot) = &mut snapshot
+                            && let Some(mode_def) = &config.mode_def
+                        {
+                            snapshot.mode_def = Some(Arc::new(mode_def.clone()));
+                        }
+                    }
                     let admission = TurnAdmission {
                         turn_id,
                         admission: snapshot,
@@ -345,12 +365,21 @@ fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
                 DeferredAdmission::Root { mut root, .. } => {
                     if !state.cancelled_correlations.contains_key(&root.correlation) {
                         root.generation = state.policy_generation;
-                        root.policy = state.policy.as_ref().map(|config| {
-                            Arc::new(EffectiveAgentConfig::new(
-                                config.settings.clone(),
-                                root.input.mode.clone(),
-                            ))
-                        });
+                        root.policy = state.policy.clone();
+                        if let (Some(config), Some(snapshot)) = (&root.policy, &mut root.admission)
+                            && let Some(mode_def) = &config.mode_def
+                        {
+                            snapshot.mode_def = Some(Arc::new(mode_def.clone()));
+                        }
+
+                        if let Some(config) = &root.policy {
+                            root.input.mode = config.mode.clone();
+                            if let Some(snapshot) = &mut root.admission
+                                && let Some(mode_def) = &config.mode_def
+                            {
+                                snapshot.mode_def = Some(Arc::new(mode_def.clone()));
+                            }
+                        }
                         inner.queue.push(ActorWork::Root(root));
                     }
                 }
@@ -645,12 +674,22 @@ impl AgentActorHandle {
                 return Err(lifecycle_error(state.lifecycle));
             }
         }
-        let mode = input.mode.clone();
-        let snapshot = self
+        let config = self.effective_config();
+        let mode = config
+            .as_ref()
+            .map_or_else(|| input.mode.clone(), |config| config.mode.clone());
+        let mut input = input;
+        input.mode = mode.clone();
+        let mut snapshot = self
             .inner
             .admission_preparation
             .as_ref()
             .map(|prepare| prepare(&input, &mode));
+        if let (Some(config), Some(snapshot)) = (&config, &mut snapshot)
+            && let Some(mode_def) = &config.mode_def
+        {
+            snapshot.mode_def = Some(Arc::new(mode_def.clone()));
+        }
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -692,33 +731,25 @@ impl AgentActorHandle {
                 });
             return Ok(ticket);
         }
-        let mut input = input;
-        input.mode = mode;
         self.admit_turn_locked(state, input, snapshot, event_sender, correlation)
     }
 
     fn admit_turn_locked(
         &self,
         state: std::sync::MutexGuard<'_, ActorState>,
-        input: AgentInput,
-        snapshot: Option<crate::agent::TurnAdmissionSnapshot>,
+        mut input: AgentInput,
+        mut snapshot: Option<crate::agent::TurnAdmissionSnapshot>,
         event_sender: Option<EventSender>,
         correlation: String,
     ) -> Result<TurnTicket, ActorError> {
-        let policy = state.policy.as_ref().map(|config| {
-            Arc::new(EffectiveAgentConfig::new(
-                config.settings.clone(),
-                input.mode.clone(),
-            ))
-        });
-        if self
-            .inner
-            .managed_admission
-            .as_ref()
-            .and_then(|admission| admission.mode_ceiling.as_ref())
-            .is_some_and(|ceiling| &input.mode != ceiling)
-        {
-            return Err(ActorError::PolicyCeiling);
+        let policy = state.policy.clone();
+        if let Some(config) = &policy {
+            input.mode = config.mode.clone();
+            if let Some(snapshot) = &mut snapshot
+                && let Some(mode_def) = &config.mode_def
+            {
+                snapshot.mode_def = Some(Arc::new(mode_def.clone()));
+            }
         }
         let turn_id = TurnId::generate();
         let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
@@ -792,11 +823,20 @@ impl AgentActorHandle {
                 return Err(lifecycle_error(state.lifecycle));
             }
         }
+        let config = self.effective_config();
+        if let Some(config) = &config {
+            root.input.mode = config.mode.clone();
+        }
         root.admission = self
             .inner
             .admission_preparation
             .as_ref()
             .map(|prepare| prepare(&root.input, &root.input.mode));
+        if let (Some(config), Some(snapshot)) = (&config, &mut root.admission)
+            && let Some(mode_def) = &config.mode_def
+        {
+            snapshot.mode_def = Some(Arc::new(mode_def.clone()));
+        }
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -816,21 +856,8 @@ impl AgentActorHandle {
         }
         let mut root = root;
         root.generation = state.policy_generation;
-        root.policy = state.policy.as_ref().map(|config| {
-            Arc::new(EffectiveAgentConfig::new(
-                config.settings.clone(),
-                root.input.mode.clone(),
-            ))
-        });
-        if self
-            .inner
-            .managed_admission
-            .as_ref()
-            .and_then(|admission| admission.mode_ceiling.as_ref())
-            .is_some_and(|ceiling| &root.input.mode != ceiling)
-        {
-            return Err(ActorError::PolicyCeiling);
-        }
+        root.policy = state.policy.clone();
+
         self.inner.queue.push(ActorWork::Root(root));
         Ok(())
     }
@@ -856,6 +883,10 @@ impl AgentActorHandle {
             .effective_config()
             .map_or(crate::AgentMode::Build, |config| config.mode.clone());
         self.set_effective_config(EffectiveAgentConfig::new(policy, mode))
+    }
+
+    pub fn reserve_config_update(&self) -> Result<PolicyUpdateTicket, ActorError> {
+        self.reserve_policy_update()
     }
 
     pub fn reserve_policy_update(&self) -> Result<PolicyUpdateTicket, ActorError> {
@@ -922,15 +953,6 @@ impl AgentActorHandle {
             return Err(ActorError::PolicyPending);
         }
         self.inner.validate_policy(&config.settings)?;
-        if self
-            .inner
-            .managed_admission
-            .as_ref()
-            .and_then(|admission| admission.mode_ceiling.as_ref())
-            .is_some_and(|ceiling| &config.mode != ceiling)
-        {
-            return Err(ActorError::PolicyCeiling);
-        }
         state.policy_generation = state.policy_generation.wrapping_add(1);
         state.policy = Some(Arc::new(config));
         let generation = state.policy_generation;
@@ -1323,7 +1345,13 @@ impl AgentActorHandle {
             ActorStatus::Running(turn_id) => Some(turn_id),
             ActorStatus::Idle => None,
         };
-        let mut queue = self.inner.queue.snapshot();
+        let mut queue = self
+            .inner
+            .queue
+            .snapshot()
+            .into_iter()
+            .filter(|item| !matches!(item, QueueProjection::PolicyBarrier))
+            .collect::<Vec<_>>();
         queue.extend(
             state
                 .deferred_admissions

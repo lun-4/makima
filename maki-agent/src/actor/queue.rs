@@ -221,10 +221,20 @@ impl ActorQueue {
         lock(&self.items).len()
     }
 
+    pub fn has_work_after_generation(&self, generation: u64) -> bool {
+        lock(&self.items).iter().any(|work| match work {
+            ActorWork::Root(root) => root.generation > generation,
+            ActorWork::Turn(turn) => turn.generation > generation,
+            ActorWork::Compact {
+                generation: queued_generation,
+                ..
+            } => *queued_generation > generation,
+            ActorWork::Control(_) | ActorWork::PolicyBarrier { .. } => false,
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
-        lock(&self.items)
-            .iter()
-            .all(|work| matches!(work, ActorWork::PolicyBarrier { .. }))
+        lock(&self.items).is_empty()
     }
 
     /// Removes every item and returns them in FIFO order.
@@ -280,7 +290,10 @@ impl ActorQueue {
                 if batch_key.is_some()
                     && root.generation == generation
                     && &crate::batch_key(&root.input) == batch_key => {}
-            Some(ActorWork::Compact { .. }) => {}
+            Some(ActorWork::Compact {
+                generation: compact_generation,
+                ..
+            }) if *compact_generation == generation => {}
             _ => return None,
         }
         match items.pop_front()? {

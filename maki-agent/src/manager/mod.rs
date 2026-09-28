@@ -42,7 +42,6 @@ type RunnerTask = smol::Task<()>;
 struct CommitPolicy {
     config: Option<crate::actor::EffectiveAgentConfig>,
     ceiling: Option<crate::RunSettings>,
-    mode_ceiling: Option<crate::AgentMode>,
 }
 
 struct Node {
@@ -275,7 +274,6 @@ impl AgentManagerHandle {
             CommitPolicy {
                 config,
                 ceiling: None,
-                mode_ceiling: None,
             },
         )
     }
@@ -323,7 +321,8 @@ impl AgentManagerHandle {
                 thinking: inherited_config.thinking,
             },
             parent_mode.clone(),
-        );
+        )
+        .with_mode_def(current.mode_def.clone());
         let inherited_config = Some(inherited_config);
         let child_id = AgentId::generate();
         let reservation = {
@@ -432,7 +431,6 @@ impl AgentManagerHandle {
                 ceiling: inherited_config
                     .as_ref()
                     .map(|config| config.settings.clone()),
-                mode_ceiling: Some(parent_mode),
             },
         )
     }
@@ -643,12 +641,8 @@ impl AgentManagerHandle {
         backend: Box<dyn ActorBackend>,
         policy: CommitPolicy,
     ) -> Result<AgentRef, ManagerError> {
-        let admission = ManagedTurnAdmission::new(
-            Arc::downgrade(&self.0),
-            agent_id,
-            policy.ceiling,
-            policy.mode_ceiling,
-        );
+        let admission =
+            ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id, policy.ceiling);
         let (actor, task) = AgentActorHandle::spawn_managed(
             agent_id,
             initial_messages,
@@ -1718,6 +1712,7 @@ pub(crate) async fn enter_managed_turn(
         },
         policy: None,
         mode: None,
+        mode_def: None,
     };
     Ok((
         ManagedTurnGuard {

@@ -75,6 +75,7 @@ struct ScriptedState {
     compact_policies: Mutex<Vec<(Option<bool>, u64)>>,
     entered: AtomicU32,
     policies: Mutex<Vec<(String, Option<bool>, u64)>>,
+    modes: Mutex<Vec<(String, Option<AgentMode>)>>,
     admissions: Mutex<Vec<(String, Option<String>, bool)>>,
 }
 
@@ -207,6 +208,10 @@ impl ActorBackend for ScriptedBackend {
                 input.message.clone(),
                 context.policy.as_ref().map(|policy| policy.fast),
                 context.generation,
+            ));
+            self.state.modes.lock().unwrap().push((
+                input.message.clone(),
+                context.policy.as_ref().map(|config| config.mode.clone()),
             ));
             self.state.admissions.lock().unwrap().push((
                 input.message.clone(),
@@ -1276,13 +1281,29 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
         let next = handle.clone();
         let b = next.admit_turn(input("b"), None, "b".into()).unwrap();
         assert!(handle.policy_snapshot().is_some_and(|p| !p.fast));
-        reservation.resolve(Ok(policy(true))).unwrap();
+        reservation
+            .resolve_config(Ok(crate::actor::EffectiveAgentConfig::new(
+                policy(true),
+                AgentMode::Plan("plan.md".into()),
+            )))
+            .unwrap();
         gate.open();
         a.wait().await;
         b.wait().await;
         assert_eq!(
             *state.policies.lock().unwrap(),
             vec![("a".into(), Some(false), 1), ("b".into(), Some(true), 2)]
+        );
+        assert_eq!(
+            handle.effective_config().unwrap().mode,
+            AgentMode::Plan("plan.md".into())
+        );
+        assert_eq!(
+            state.modes.lock().unwrap().as_slice(),
+            &[
+                ("a".into(), Some(AgentMode::Build)),
+                ("b".into(), Some(AgentMode::Plan("plan.md".into())))
+            ]
         );
 
         let failed = handle.reserve_policy_update().unwrap();
@@ -1302,6 +1323,28 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
 }
 
 #[test]
+fn compacts_wait_behind_pending_policy_and_follow_the_turns() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let reservation = handle.reserve_policy_update().unwrap();
+        handle.push_compact(7, Some("compact".into())).unwrap();
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.queued, 1);
+        assert_eq!(
+            snapshot.queue,
+            [QueueProjection::Compact(Some("compact".into()))]
+        );
+        reservation.resolve(Ok(policy(true))).unwrap();
+        reservation.wait().await.unwrap();
+        until(|| observed.compacts.load(Ordering::SeqCst) == 1).await;
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
@@ -1309,16 +1352,30 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
         let (handle, task) = spawn(backend);
         let first = handle.reserve_policy_update().unwrap();
         let second = handle.reserve_policy_update().unwrap();
-        second.resolve(Ok(policy(true))).unwrap();
+        second
+            .resolve_config(Ok(crate::actor::EffectiveAgentConfig::new(
+                policy(true),
+                AgentMode::Plan("plan.md".into()),
+            )))
+            .unwrap();
         assert!(handle.policy_snapshot().is_none());
         let after = handle
             .admit_turn(input("after"), None, "after".into())
             .unwrap();
-        first.resolve(Ok(policy(false))).unwrap();
+        first
+            .resolve_config(Ok(crate::actor::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            )))
+            .unwrap();
         after.wait().await;
         assert_eq!(
             state.policies.lock().unwrap()[0],
             ("after".into(), Some(true), 2)
+        );
+        assert_eq!(
+            handle.effective_config().unwrap().mode,
+            AgentMode::Plan("plan.md".into())
         );
         let pending = handle.reserve_policy_update().unwrap();
         let cancelled = handle
@@ -2091,9 +2148,7 @@ fn remove_at_raw_index_terminalizes_real_turn() {
             .admit_turn(input("queued2"), None, "r3".into())
             .unwrap();
 
-        // The queue is [policy barrier, queued, queued2]. The barrier cannot
-        // be removed, so raw index 1 remains t2.
-        assert_eq!(handle.remove_at(0), None);
+        // Snapshot and removal indices omit invariant policy barriers.
         let removed = handle.remove_at(1).unwrap();
         assert!(matches!(removed, QueueProjection::Turn(_)));
         assert!(matches!(
@@ -2103,13 +2158,9 @@ fn remove_at_raw_index_terminalizes_real_turn() {
                 ..
             }
         ));
-        assert_eq!(
-            handle.snapshot().queue,
-            vec![
-                QueueProjection::PolicyBarrier,
-                QueueProjection::Turn("r3".into())
-            ]
-        );
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.queued, 1);
+        assert_eq!(snapshot.queue, vec![QueueProjection::Turn("r3".into())]);
         gate.open();
         t1.wait().await;
         t3.wait().await;

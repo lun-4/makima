@@ -490,6 +490,10 @@ impl SessionCoordinatorHandle {
         self.read.clone()
     }
 
+    pub fn session_id(&self) -> MakiId {
+        self.session_id
+    }
+
     pub fn mailbox(&self) -> Result<SessionMailbox, SessionCoordinatorError> {
         let directory = lock(&DIRECTORY);
         directory

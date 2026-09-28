@@ -266,7 +266,17 @@ impl RegisteredTool {
         self.is_bundled()
             && matches!(
                 self.name(),
-                "read" | "glob" | "grep" | "webfetch" | "question" | "plan_submit" | "task"
+                "read"
+                    | "glob"
+                    | "grep"
+                    | "index"
+                    | "webfetch"
+                    | "websearch"
+                    | "skill"
+                    | "question"
+                    | "plan_submit"
+                    | "task"
+                    | "todo_write"
             )
     }
 

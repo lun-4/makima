@@ -27,6 +27,8 @@ pub struct SessionSnapshot {
     pub title: Option<String>,
     /// Model spec as shown in the status bar (`provider/id`).
     pub model: String,
+    pub fast: bool,
+    pub thinking: String,
     /// [`MODE_BUILD`] or [`MODE_PLAN`].
     pub mode: &'static str,
     /// [`STATUS_IDLE`], [`STATUS_WORKING`], or [`STATUS_NEEDS_INPUT`].
@@ -67,6 +69,8 @@ pub struct HeadlessMeta {
     pub cwd: String,
     /// Model spec (`provider/id`).
     pub model: String,
+    pub fast: bool,
+    pub thinking: String,
 }
 
 #[derive(Default)]
@@ -148,6 +152,8 @@ impl HeadlessSnapshot {
                 cwd: meta.cwd.clone(),
                 title: None,
                 model: meta.model.clone(),
+                fast: meta.fast,
+                thinking: meta.thinking.clone(),
                 mode,
                 status: if totals.working {
                     STATUS_WORKING

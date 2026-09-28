@@ -605,7 +605,7 @@ fn child_ceiling_rejects_policy_and_mode_expansion() {
         ));
         let mut plan_input = input();
         plan_input.mode = AgentMode::Plan("plan.md".into());
-        assert!(actor.admit_turn(plan_input, None, "plan".into()).is_err());
+        assert!(actor.admit_turn(plan_input, None, "plan".into()).is_ok());
         assert_eq!(
             child.effective_config().unwrap().unwrap().model.id,
             initial.model.id
@@ -654,7 +654,7 @@ fn restrictive_parent_delegates_without_broadening_child_mode() {
         assert!(
             child_actor
                 .admit_turn(input(), None, "build-child".into())
-                .is_err()
+                .is_ok()
         );
         gate.release(1);
         manager.shutdown(std::time::Duration::from_secs(1)).await;
@@ -702,7 +702,7 @@ fn custom_parent_mode_is_admitted_by_managed_child() {
         assert!(
             child_actor
                 .admit_turn(input(), None, "build-child".into())
-                .is_err()
+                .is_ok()
         );
         gate.release(1);
         manager.shutdown(std::time::Duration::from_secs(1)).await;

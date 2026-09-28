@@ -272,6 +272,10 @@ impl Runner {
                         .as_ref()
                         .map(|config| Arc::new(config.settings.clone()));
                     current.mode = admission.policy.as_ref().map(|config| config.mode.clone());
+                    current.mode_def = admission
+                        .policy
+                        .as_ref()
+                        .and_then(|config| config.mode_def.clone());
                     (Some(guard), Some(current))
                 }
                 Err(reason) => {

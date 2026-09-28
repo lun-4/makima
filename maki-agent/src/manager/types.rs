@@ -116,6 +116,7 @@ pub struct CurrentManagedTurn {
     pub(crate) lease: TurnPermitLease,
     pub(crate) policy: Option<Arc<crate::RunSettings>>,
     pub(crate) mode: Option<crate::AgentMode>,
+    pub(crate) mode_def: Option<crate::ModeDef>,
 }
 
 impl CurrentManagedTurn {
@@ -129,6 +130,10 @@ impl CurrentManagedTurn {
 
     pub fn policy_snapshot(&self) -> Option<&Arc<crate::RunSettings>> {
         self.policy.as_ref()
+    }
+
+    pub fn mode_definition(&self) -> Option<&crate::ModeDef> {
+        self.mode_def.as_ref()
     }
 
     pub fn node_snapshot(&self) -> Result<AgentNodeSnapshot, super::ManagerError> {

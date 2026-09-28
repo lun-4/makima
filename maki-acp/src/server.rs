@@ -920,12 +920,10 @@ async fn install_session_with_lock(
             cwd: cwd.clone(),
             model_policy: Arc::clone(&params.model_policy),
             model_adopter: Arc::new({
-                // Install into the shared source rather than asking the
-                // session loop to adopt: the loop only reads its control
-                // channel between turns, so a round-trip here would wait for
-                // the running turn -- and that turn cannot finish while the
-                // coordinator is blocked on this call. The store takes effect
-                // between turns.
+                // Install into the shared source without waiting for the
+                // running turn. The actor pins model settings at admission, so
+                // this takes effect for later turns while the active turn keeps
+                // its selected model.
                 let shared = handle.model.clone();
                 let timeouts = params.timeouts;
                 move |mut model: Model| {

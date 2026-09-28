@@ -19,8 +19,9 @@ pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 pub(crate) mod task_set;
 pub use actor::{
     ActorBackend, ActorError, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
-    AgentActorHandle, BackendResult, ControlWork, InterruptQueue, QueueProjection, RootWork,
-    TurnAdmission, TurnContext, TurnTicket, WorkKind,
+    AgentActorHandle, BackendResult, ControlWork, EffectiveAgentConfig, InterruptQueue,
+    PolicyUpdateTicket, QueueProjection, RootWork, TurnAdmission, TurnContext, TurnTicket,
+    WorkKind,
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
