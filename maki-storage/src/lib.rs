@@ -297,6 +297,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn atomic_write_supports_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let path = link.join("plan.md");
+
+        atomic_write(&path, REPLACEMENT).unwrap();
+
+        assert_eq!(fs::read(target.join("plan.md")).unwrap(), REPLACEMENT);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn atomic_write_preserves_destination_permissions() {
         const MODE: u32 = 0o640;
 

@@ -3598,6 +3598,13 @@ impl<'t> EventLoop<'t> {
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
             Action::ToggleSessionOption { id } => {
+                if SessionStatus::of(&self.sessions[idx].app) != SessionStatus::Idle {
+                    match id {
+                        FAST_OPTION_ID => self.note_if_deferred(idx, "fast"),
+                        WORKFLOW_OPTION_ID => self.note_if_deferred(idx, "workflow"),
+                        _ => {}
+                    }
+                }
                 dispatch_option_toggle(
                     self.sessions[idx].coordinator.clone(),
                     Arc::clone(&self.sessions[idx].model_slot),
