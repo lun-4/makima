@@ -406,6 +406,88 @@ fn output(reg: &ToolRegistry, tool: &str, text: &str, is_error: bool) -> Option<
     }
 }
 
+#[test_case(false ; "selected_plugin_read")]
+#[test_case(true ; "selected_plugin_mutation")]
+fn custom_restricted_mode_dispatches_plugin_and_checks_hook_target(mutation: bool) {
+    use maki_agent::agent::tool_dispatch;
+    use maki_agent::tools::{TurnToolBindings, test_support::stub_ctx};
+    use maki_agent::{AgentMode, ModeDef, ModeId};
+
+    const TOOL: &str = "restricted_probe";
+    const RESULT: &str = "plugin executed";
+    const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
+    let (reg, host) = host();
+    load(
+        &host,
+        TOOL,
+        &format!(
+            r#"
+        maki.api.register_tool({{
+            name = "{TOOL}", description = "probe",
+            schema = {{ type = "object", properties = {{ path = {{ type = "string" }} }} }},
+            mutable_path = {},
+            handler = function() return "{RESULT}" end,
+        }})
+    "#,
+            if mutation { "\"path\"" } else { "nil" }
+        ),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = dir.path().join("plan.md");
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.cwd = dir.path().to_path_buf();
+    ctx.mode = AgentMode::Custom(ModeId::Custom(TOOL.into()));
+    let mut mode = ModeDef::default_for(ctx.mode.id());
+    mode.tools = Some(vec![TOOL.into()]);
+    mode.restrict_write_to = Some(allowed.clone());
+    ctx.mode_def = Some(Arc::new(mode));
+    ctx.registry = reg;
+    ctx.permissions.set_yolo(true);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let input = serde_json::json!({ "path": allowed });
+    let done = within(tool_dispatch::run(
+        TOOL_ID.into(),
+        TOOL,
+        &input,
+        &ctx,
+        CallOrigin::Model,
+    ));
+    assert!(!done.is_error, "{}", done.output.as_text());
+    assert_eq!(done.output.as_text(), RESULT);
+    load(
+        &host,
+        "rewrite_target",
+        &format!(
+            r#"
+        maki.api.set_slot("tool.{TOOL}.input", function(prev, input, ctx)
+            input.path = "other.md"
+            return prev(input, ctx)
+        end)
+    "#
+        ),
+    );
+    let done = within(tool_dispatch::run(
+        TOOL_ID.into(),
+        TOOL,
+        &input,
+        &ctx,
+        CallOrigin::Model,
+    ));
+    assert_eq!(done.is_error, mutation);
+    assert_eq!(
+        done.output.as_text(),
+        if mutation {
+            PLAN_WRITE_RESTRICTED
+        } else {
+            RESULT
+        }
+    );
+}
+
 #[test]
 fn tool_input_slot_rewrites_denies_and_passes_through() {
     let (reg, host) = host();

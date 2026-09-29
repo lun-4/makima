@@ -497,14 +497,21 @@ fn prompt_message(pm: maki_agent::mcp::protocol::PromptMessage) -> Message {
 }
 
 impl ActorBackend for TuiActorBackend {
+    fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
+        let agent_tx = self.agent_tx.clone();
+        Some(Arc::new(move |run_id, message| {
+            EventSender::new(agent_tx.clone(), run_id)
+                .try_send(AgentEvent::ControlError { message });
+        }))
+    }
+
     fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
-        let modes = self.lua_handle.mode_registry();
         let registry = Arc::clone(ToolRegistry::global_arc());
         let mcp = self.mcp.clone();
         let cwd = Arc::clone(&self.cwd);
         let lua_handle = self.lua_handle.clone();
         let mcp_reader = mcp.as_ref().map(|mcp| mcp.reader());
-        Some(Arc::new(move |input, mode| {
+        Some(Arc::new(move |input, _mode, config| {
             let mcp_startup_notice = mcp_reader.as_ref().and_then(|reader| {
                 let count = reader
                     .load()
@@ -516,11 +523,6 @@ impl ActorBackend for TuiActorBackend {
             });
             let cwd = (**cwd.load()).clone();
             let instructions = maki_agent::agent::load_instructions(&cwd.to_string_lossy());
-            let mode = mode.clone();
-            let mode_def = match &mode {
-                maki_agent::AgentMode::Custom(id) => modes.get(id),
-                _ => Some(modes.current(&mode)),
-            };
             let binding = input
                 .prompt
                 .as_ref()
@@ -558,7 +560,9 @@ impl ActorBackend for TuiActorBackend {
                     );
             })
             .detach();
-            let mode_def = mode_def.map(Arc::new);
+            let mode_def = config
+                .and_then(|config| config.mode_def.clone())
+                .map(Arc::new);
             maki_agent::agent::TurnAdmissionSnapshot {
                 mode_def: mode_def.clone(),
                 prompt_inputs: Some(Arc::new(maki_agent::agent::TurnPromptInputs {
@@ -897,7 +901,7 @@ mod tests {
             Vec::new(),
             maki_config::SessionDefaults::default(),
         );
-        let mut snapshot = backend.admission_preparation().unwrap()(&input, &input.mode);
+        let mut snapshot = backend.admission_preparation().unwrap()(&input, &input.mode, None);
         let prompt = Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap());
         prompt.instructions.text = "admitted instructions".into();
         let (tx, rx) = flume::bounded(1);

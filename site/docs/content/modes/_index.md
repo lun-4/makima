@@ -20,13 +20,17 @@ Tab toggles between them (build is the default).
 - **plan `[PLAN]`** - analyse and plan. The mode names one plan file as its
   intended write target, and the model gets a directive not to change other files.
 
-Switching to plan mode allocates a plan file under `plans/`. The host admits only tools named by the mode and classified as safe bundled tools. The built-in safe set includes `read`, `glob`, `grep`, `index`, `webfetch`, `websearch`, `skill`, `question`, `plan_submit`, `task`, and `todo_write`. Bundled write and edit tools can change only the designated plan file. The host compares normalized path keys and rejects writes whose keys do not match. This check does not use an anchored filesystem write. Lua filesystem writes are not subject to the mode's plan-path restriction. They require the plugin's `fs_write` permission. Same-named third-party tools do not receive bundled authority. Other Lua tools, shell commands, MCP execution, and deferred MCP search are denied even with YOLO on.
+Switching to plan mode allocates a plan file under `plans/`. Native write and edit tools can change only the designated plan file. The host checks normalized target paths, including arguments changed by input hooks. A custom mode can explicitly offer third-party local tools; tool origin does not determine whether a mode offers them. MCP execution and deferred MCP search remain unavailable in write-restricted modes, even with YOLO enabled.
 
-Model changes apply to later admitted turns. Active turns keep their selected
-model through continuations. Queued roots do not fold across a model-policy
-barrier; a queued interrupt cannot change the active turn's mode. Mode
-selection still comes from the submitted input rather than a unified
-per-agent mode configuration.
+A mode is not a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and are not restricted to the plan path. Tool selection and native write-target checks do not constrain every effect of a selected plugin.
+
+## Configuration changes
+
+Managed TUI roots and Lua agent sessions own their model, thinking, fast, workflow, and mode configuration. Changes apply in order to later admitted work. An active or already admitted turn retains its provider, settings, resolved mode definition, prompt inputs, and tool bindings. A mode registry change does not replace the definition captured for that turn. Selecting an undefined custom mode fails.
+
+A successful managed setter means the actor committed the change. Session saving runs asynchronously and does not block admission. If saving fails, the committed configuration remains active and a warning reports that the configuration was applied but not saved. The storage writer retains the latest committed snapshot for retry. A successful retry clears the pending-save condition. A crash before saving can lose the latest configuration change.
+
+Headless, print, and ACP execution retain their existing frontend-owned initialization and configuration paths. They do not yet use the managed actor execution loop. YOLO and plugin options retain their existing owners; YOLO changes affect permission checks immediately.
 
 ## What a mode is
 

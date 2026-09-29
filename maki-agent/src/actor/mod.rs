@@ -15,6 +15,8 @@
 //! rather than stranded.
 
 mod actor_error;
+mod config;
+pub use config::{ConfigChange, ConfigCommit, ConfigPatch, PreparedModel};
 mod queue;
 mod runner;
 mod tickets;
@@ -33,6 +35,7 @@ pub use types::{
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use event_listener::Event;
@@ -73,12 +76,15 @@ pub(crate) struct ActorInner {
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     admission_preparation: Option<AdmissionPreparation>,
+    root_preparation_error: Option<Arc<dyn Fn(u64, String) + Send + Sync>>,
     #[cfg(test)]
     pub(crate) after_pop: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     #[cfg(test)]
     pub(crate) after_finalization_retire: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     #[cfg(test)]
     before_snapshot_state: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
+    #[cfg(test)]
+    stale_preparation: Mutex<Option<flume::Sender<()>>>,
 }
 
 /// Lifecycle, run status, and the active turn's cancellation wiring. One
@@ -95,51 +101,56 @@ pub(crate) struct ActorState {
     pub(crate) cancellation_generation: u64,
     pub(crate) policy_generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
-    pending_policy: VecDeque<PendingPolicy>,
-    deferred_admissions: VecDeque<DeferredAdmission>,
-    next_policy_id: u64,
+    operations: VecDeque<ActorOperation>,
+    preparing: Option<u64>,
+    config_observers: Vec<flume::Sender<ConfigCommit>>,
+    next_operation_id: u64,
 }
 
-struct PendingPolicy {
+struct ConfigOperation {
     id: u64,
-    result: Option<Result<EffectiveAgentConfig, ActorError>>,
-    completion: Arc<Mutex<Option<Result<(), ActorError>>>>,
+    result: Option<Result<ConfigChange, ActorError>>,
+    completion: Arc<Mutex<Option<Result<ConfigCommit, ActorError>>>>,
 }
 
-enum DeferredAdmission {
+enum ActorOperation {
+    Config(ConfigOperation),
     Turn {
-        after: u64,
+        id: u64,
         input: AgentInput,
-        admission: Option<crate::agent::TurnAdmissionSnapshot>,
         event_sender: Option<EventSender>,
         correlation: String,
         ticket: TurnTicket,
     },
     Root {
-        after: u64,
+        id: u64,
         root: RootWork,
     },
     Compact {
-        after: u64,
+        id: u64,
         run_id: u64,
         instructions: Option<String>,
     },
 }
 
-impl DeferredAdmission {
-    fn after(&self) -> u64 {
+impl ActorOperation {
+    fn id(&self) -> u64 {
         match self {
-            Self::Turn { after, .. } | Self::Root { after, .. } | Self::Compact { after, .. } => {
-                *after
-            }
+            Self::Config(config) => config.id,
+            Self::Turn { id: after, .. }
+            | Self::Root { id: after, .. }
+            | Self::Compact { id: after, .. } => *after,
         }
     }
 
-    fn projection(&self) -> QueueProjection {
+    fn projection(&self) -> Option<QueueProjection> {
         match self {
-            Self::Turn { correlation, .. } => QueueProjection::Turn(correlation.clone()),
-            Self::Root { root, .. } => root.into(),
-            Self::Compact { instructions, .. } => QueueProjection::Compact(instructions.clone()),
+            Self::Config(_) => None,
+            Self::Turn { correlation, .. } => Some(QueueProjection::Turn(correlation.clone())),
+            Self::Root { root, .. } => Some(root.into()),
+            Self::Compact { instructions, .. } => {
+                Some(QueueProjection::Compact(instructions.clone()))
+            }
         }
     }
 
@@ -149,108 +160,74 @@ impl DeferredAdmission {
     }
 }
 
-pub struct PolicyUpdateTicket {
+pub struct ConfigUpdateTicket {
     inner: Arc<ActorInner>,
     id: u64,
-    completion: Arc<Mutex<Option<Result<(), ActorError>>>>,
+    completion: Arc<Mutex<Option<Result<ConfigCommit, ActorError>>>>,
 }
 
-impl ActorInner {
-    fn validate_policy(&self, policy: &RunSettings) -> Result<(), ActorError> {
-        let Some(ceiling) = self
-            .managed_admission
-            .as_ref()
-            .and_then(|admission| admission.ceiling.as_ref())
-        else {
-            return Ok(());
-        };
-        if !Arc::ptr_eq(&policy.provider, &ceiling.provider)
-            || policy.model.spec() != ceiling.model.spec()
-            || (policy.fast && !ceiling.fast)
-            || (policy.workflow && !ceiling.workflow)
-            || policy.thinking != ceiling.thinking
-        {
-            return Err(ActorError::PolicyCeiling);
-        }
-        Ok(())
-    }
-}
-
-impl PolicyUpdateTicket {
-    pub fn resolve(&self, result: Result<RunSettings, ActorError>) -> Result<(), ActorError> {
-        let config = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .policy
-            .as_ref()
-            .map(|config| (**config).clone());
-        self.resolve_config(result.map(|settings| {
-            let mut config = config.clone().unwrap_or_else(|| {
-                EffectiveAgentConfig::new(settings.clone(), crate::AgentMode::Build)
-            });
-            config.settings = settings;
-            config
-        }))
-    }
-
-    pub fn resolve_config(
-        &self,
-        result: Result<EffectiveAgentConfig, ActorError>,
-    ) -> Result<(), ActorError> {
+impl ConfigUpdateTicket {
+    pub fn resolve(&self, result: Result<ConfigChange, ActorError>) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(result) = self
+            .completion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return result.map(|_| ());
+        }
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
         let pending = state
-            .pending_policy
-            .iter_mut()
-            .find(|pending| pending.id == self.id)
+            .pending_config(self.id)
             .ok_or(ActorError::PolicyCancelled)?;
         if pending.result.is_some() {
-            return Err(ActorError::PolicyCancelled);
+            return Err(ActorError::PolicyPending);
         }
-        let result = result.and_then(|config| {
-            self.inner.validate_policy(&config.settings)?;
-
-            Ok(config)
-        });
-        let rejected = result.as_ref().err().cloned();
         pending.result = Some(result);
-        flush_policy_updates(&self.inner, &mut state);
-        rejected.map_or(Ok(()), Err)
+        drive_operations(&self.inner, &mut state);
+        Ok(())
     }
 
-    pub fn cancel(&self) -> Result<(), ActorError> {
-        self.resolve(Err(ActorError::PolicyCancelled))
+    pub fn cancel(&self) -> Result<Option<ConfigCommit>, ActorError> {
+        self.cancel_with(ActorError::PolicyCancelled)
     }
 
-    fn pending_result(&self) -> Result<Option<Result<(), ActorError>>, ActorError> {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(lifecycle_error(state.lifecycle));
-        }
-        if state
-            .pending_policy
-            .iter()
-            .any(|pending| pending.id == self.id)
+    pub fn expire(&self) -> Result<Option<ConfigCommit>, ActorError> {
+        self.cancel_with(ActorError::ConfigExpired)
+    }
+
+    fn cancel_with(&self, error: ActorError) -> Result<Option<ConfigCommit>, ActorError> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(result) = self
+            .completion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
         {
-            return Ok(None);
+            return result.map(Some);
         }
-        Ok(Some(
-            self.completion
+        let pending = state
+            .pending_config(self.id)
+            .ok_or(ActorError::PolicyCancelled)?;
+        pending.result = Some(Err(error.clone()));
+        *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(error));
+        drive_operations(&self.inner, &mut state);
+        self.inner.policy_changed.notify(usize::MAX);
+        Ok(None)
+    }
+
+    pub async fn wait(&self) -> Result<ConfigCommit, ActorError> {
+        loop {
+            let listener = self.inner.policy_changed.listen();
+            if let Some(result) = self
+                .completion
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
-                .unwrap_or(Ok(())),
-        ))
-    }
-
-    pub async fn wait(&self) -> Result<(), ActorError> {
-        loop {
-            let listener = self.inner.policy_changed.listen();
-            if let Some(result) = self.pending_result()? {
+            {
                 return result;
             }
             listener.await;
@@ -258,7 +235,7 @@ impl PolicyUpdateTicket {
     }
 }
 
-impl Drop for PolicyUpdateTicket {
+impl Drop for ConfigUpdateTicket {
     fn drop(&mut self) {
         let _ = self.cancel();
     }
@@ -274,11 +251,11 @@ fn lifecycle_error(lifecycle: ActorLifecycle) -> ActorError {
 
 fn settle_deferred(
     inner: &ActorInner,
-    admissions: Vec<DeferredAdmission>,
+    admissions: Vec<ActorOperation>,
     reason: TurnCancellationReason,
 ) {
     for admission in admissions {
-        if let DeferredAdmission::Turn {
+        if let ActorOperation::Turn {
             input,
             event_sender,
             correlation,
@@ -304,107 +281,252 @@ fn settle_deferred(
     }
 }
 
-fn flush_policy_updates(inner: &ActorInner, state: &mut ActorState) {
-    while state
-        .pending_policy
-        .front()
-        .is_some_and(|pending| pending.result.is_some())
-    {
-        let pending = state.pending_policy.pop_front().unwrap();
-        let result = pending.result.unwrap();
-        *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
-        if let Ok(config) = result {
-            let changed = state.policy.as_ref().is_none_or(|current| {
-                !Arc::ptr_eq(&current.settings.provider, &config.settings.provider)
-                    || current.settings.model.spec() != config.settings.model.spec()
-                    || current.settings.fast != config.settings.fast
-                    || current.settings.workflow != config.settings.workflow
-                    || current.settings.thinking != config.settings.thinking
-                    || current.mode != config.mode
-                    || current.mode_def != config.mode_def
-            });
-            if changed {
-                state.policy_generation = state.policy_generation.wrapping_add(1);
-                state.policy = Some(Arc::new(config));
-            }
+fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
+    loop {
+        if state.lifecycle != ActorLifecycle::Open {
+            return;
         }
-        while state
-            .deferred_admissions
-            .front()
-            .is_some_and(|admission| admission.after() == pending.id)
-        {
-            match state.deferred_admissions.pop_front().unwrap() {
-                DeferredAdmission::Turn {
-                    mut input,
-                    admission: mut snapshot,
-                    event_sender,
-                    correlation,
-                    ticket,
-                    ..
-                } => {
-                    let turn_id = ticket.turn_id();
-                    let policy = state.policy.clone();
-                    if let Some(config) = &policy {
-                        input.mode = config.mode.clone();
-                        if let Some(snapshot) = &mut snapshot
+        let Some(head) = state.operations.front() else {
+            state.preparing = None;
+            return;
+        };
+        let id = head.id();
+        if state.preparing == Some(id) {
+            return;
+        }
+        state.preparing = None;
+        if let ActorOperation::Config(pending) = head {
+            if pending.result.is_none() {
+                return;
+            }
+            let ActorOperation::Config(pending) = state.operations.pop_front().unwrap() else {
+                unreachable!()
+            };
+            let previous_generation = state.policy_generation;
+            let result = pending.result.unwrap().and_then(|change| {
+                let current = state.policy.as_ref().ok_or_else(|| {
+                    ActorError::InvalidConfig("actor configuration is not initialized".into())
+                })?;
+                let config = change.apply(current)?;
+                if !config::equivalent(current, &config) {
+                    state.policy_generation = state.policy_generation.wrapping_add(1);
+                    state.policy = Some(Arc::new(config));
+                }
+                Ok(ConfigCommit {
+                    identity: Arc::clone(&inner.identity),
+                    generation: state.policy_generation,
+                    config: state.policy.clone().unwrap(),
+                })
+            });
+            if let Ok(commit) = &result
+                && commit.generation != previous_generation
+            {
+                state
+                    .config_observers
+                    .retain(|observer| observer.send(commit.clone()).is_ok());
+            }
+            *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+            inner.policy_changed.notify(usize::MAX);
+            continue;
+        }
+        let input = match head {
+            ActorOperation::Turn { input, .. } => Some(input),
+            ActorOperation::Root { root, .. } if root.admission.is_none() => Some(&root.input),
+            _ => None,
+        };
+        if let (Some(input), Some(prepare)) = (input, &inner.admission_preparation) {
+            let policy = state.policy.clone();
+            let mut input = preparation_input(input);
+            if let Some(config) = &policy {
+                input.mode = config.mode.clone();
+                input.thinking = config.thinking;
+                input.fast = config.fast;
+                input.workflow = config.workflow;
+            }
+            let prepare = Arc::clone(prepare);
+            let inner = Arc::clone(inner);
+            state.preparing = Some(id);
+            smol::spawn(async move {
+                let snapshot = smol::unblock(move || {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let mut snapshot = prepare(&input, &input.mode, policy.as_deref());
+                        if let Some(config) = policy
                             && let Some(mode_def) = &config.mode_def
                         {
                             snapshot.mode_def = Some(Arc::new(mode_def.clone()));
                         }
+                        snapshot
+                    }))
+                })
+                .await;
+                let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.lifecycle != ActorLifecycle::Open
+                    || state.preparing != Some(id)
+                    || state.operations.front().is_none_or(|head| head.id() != id)
+                {
+                    #[cfg(test)]
+                    if let Some(sender) = inner.stale_preparation.lock().unwrap().take() {
+                        let _ = sender.send(());
                     }
-                    let admission = TurnAdmission {
-                        turn_id,
-                        admission: snapshot,
-                        input: Some(input),
-                        event_sender,
-                        correlation,
-                        root: false,
-                        generation: state.policy_generation,
-                        policy,
-                        ticket,
-                    };
-                    inner.queue.push(ActorWork::Turn(admission));
+                    return;
                 }
-                DeferredAdmission::Root { mut root, .. } => {
-                    if !state.cancelled_correlations.contains_key(&root.correlation) {
-                        root.generation = state.policy_generation;
-                        root.policy = state.policy.clone();
-                        if let Some(config) = &root.policy {
-                            root.input.mode = config.mode.clone();
-                            if let Some(snapshot) = &mut root.admission
-                                && let Some(mode_def) = &config.mode_def
-                            {
-                                snapshot.mode_def = Some(Arc::new(mode_def.clone()));
-                            }
-                        }
-                        inner.queue.push(ActorWork::Root(root));
+                state.preparing = None;
+                let work = state.operations.pop_front().unwrap();
+                match snapshot {
+                    Ok(snapshot) => {
+                        materialize(&inner, &state, work, Some(snapshot));
+                        drive_operations(&inner, &mut state);
                     }
-                }
-                DeferredAdmission::Compact {
-                    run_id,
-                    instructions,
-                    ..
-                } => {
-                    if !state
-                        .cancelled_correlations
-                        .contains_key(&run_correlation(run_id))
-                    {
-                        inner.queue.push(ActorWork::Compact {
-                            run_id,
-                            instructions,
-                            generation: state.policy_generation,
-                            policy: state.policy.clone(),
-                        });
+                    Err(_) => {
+                        drive_operations(&inner, &mut state);
+                        drop(state);
+                        fail_preparation(&inner, work);
                     }
                 }
-            }
+            })
+            .detach();
+            return;
         }
-        inner.policy_changed.notify(usize::MAX);
+        let work = state.operations.pop_front().unwrap();
+        materialize(inner, state, work, None);
+    }
+}
+
+fn fail_preparation(inner: &ActorInner, work: ActorOperation) {
+    tracing::error!(agent_id = %inner.agent_id, "admission preparation panicked");
+    if let ActorOperation::Root { root, .. } = &work
+        && let Some(report) = &inner.root_preparation_error
+    {
+        report(
+            root.run_id,
+            "The agent could not start this turn: admission preparation failed.".into(),
+        );
+    }
+    if let ActorOperation::Turn {
+        input,
+        event_sender,
+        correlation,
+        ticket,
+        ..
+    } = work
+    {
+        let turn_id = ticket.turn_id();
+        let admission = TurnAdmission {
+            turn_id,
+            input: Some(input),
+            event_sender,
+            correlation,
+            ticket,
+            root: false,
+            generation: 0,
+            policy: None,
+            admission: None,
+        };
+        let outcome = TurnOutcome::failed(
+            inner.agent_id,
+            turn_id,
+            TokenUsage::default(),
+            0,
+            crate::types::TurnFailure {
+                kind: crate::types::TurnFailureKind::Internal,
+                diagnostic: "admission preparation panicked".into(),
+                user_message: "The agent could not start this turn.".into(),
+                retryable: true,
+            },
+        );
+        finalize_turn(inner, turn_id, outcome, Some(&admission), true);
+    }
+}
+
+fn preparation_input(input: &AgentInput) -> AgentInput {
+    AgentInput {
+        message: input.message.clone(),
+        mode: input.mode.clone(),
+        images: input.images.clone(),
+        preamble: input.preamble.clone(),
+        thinking: input.thinking,
+        fast: input.fast,
+        workflow: input.workflow,
+        prompt: input.prompt.clone(),
+        cancel: input.cancel.clone(),
+        lease_committer: None,
+    }
+}
+
+fn materialize(
+    inner: &ActorInner,
+    state: &ActorState,
+    work: ActorOperation,
+    snapshot: Option<crate::agent::TurnAdmissionSnapshot>,
+) {
+    match work {
+        ActorOperation::Turn {
+            mut input,
+            event_sender,
+            correlation,
+            ticket,
+            ..
+        } => {
+            if let Some(config) = &state.policy {
+                input.mode = config.mode.clone();
+            }
+            inner.queue.push(ActorWork::Turn(TurnAdmission {
+                turn_id: ticket.turn_id(),
+                input: Some(input),
+                event_sender,
+                correlation,
+                ticket,
+                root: false,
+                generation: state.policy_generation,
+                policy: state.policy.clone(),
+                admission: snapshot,
+            }));
+        }
+        ActorOperation::Root { mut root, .. } => {
+            if let Some(config) = &state.policy {
+                root.input.mode = config.mode.clone();
+            }
+            root.generation = state.policy_generation;
+            root.policy = state.policy.clone();
+            root.admission = snapshot.or(root.admission);
+            inner.queue.push(ActorWork::Root(root));
+        }
+        ActorOperation::Compact {
+            run_id,
+            instructions,
+            ..
+        } => inner.queue.push(ActorWork::Compact {
+            run_id,
+            instructions,
+            generation: state.policy_generation,
+            policy: state.policy.clone(),
+        }),
+        ActorOperation::Config(_) => unreachable!(),
     }
 }
 
 impl ActorState {
+    fn pending_config(&mut self, id: u64) -> Option<&mut ConfigOperation> {
+        self.operations.iter_mut().find_map(|entry| match entry {
+            ActorOperation::Config(pending) if pending.id == id => Some(pending),
+            _ => None,
+        })
+    }
+
+    fn drain_work(&mut self) -> Vec<ActorOperation> {
+        let mut work = Vec::new();
+        let mut configs = VecDeque::new();
+        for entry in self.operations.drain(..) {
+            if matches!(entry, ActorOperation::Config(_)) {
+                configs.push_back(entry);
+            } else {
+                work.push(entry);
+            }
+        }
+        self.operations = configs;
+        work
+    }
+
     fn idle(policy: Option<Arc<EffectiveAgentConfig>>) -> Self {
         Self {
             lifecycle: ActorLifecycle::Open,
@@ -415,9 +537,10 @@ impl ActorState {
             cancellation_generation: 0,
             policy_generation: 0,
             policy,
-            pending_policy: VecDeque::new(),
-            deferred_admissions: VecDeque::new(),
-            next_policy_id: 0,
+            operations: VecDeque::new(),
+            preparing: None,
+            config_observers: Vec::new(),
+            next_operation_id: 0,
         }
     }
 }
@@ -596,6 +719,7 @@ impl AgentActorHandle {
             None => History::restored(initial_messages),
         };
         let admission_preparation = backend.admission_preparation();
+        let root_preparation_error = backend.root_preparation_error_handler();
         let inner = Arc::new(ActorInner {
             agent_id,
             identity: Arc::new(()),
@@ -608,12 +732,15 @@ impl AgentActorHandle {
             tickets: Mutex::new(HashMap::new()),
             managed_admission,
             admission_preparation,
+            root_preparation_error,
             #[cfg(test)]
             after_pop: Mutex::new(None),
             #[cfg(test)]
             after_finalization_retire: Mutex::new(None),
             #[cfg(test)]
             before_snapshot_state: Mutex::new(None),
+            #[cfg(test)]
+            stale_preparation: Mutex::new(None),
         });
         let wake = Arc::new(runner::WakeFlag::new());
         let handle = Self {
@@ -626,6 +753,21 @@ impl AgentActorHandle {
 
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
+    }
+
+    pub fn identity(&self) -> Arc<()> {
+        Arc::clone(&self.inner.identity)
+    }
+
+    pub fn subscribe_config_commits(&self) -> flume::Receiver<ConfigCommit> {
+        let (sender, receiver) = flume::unbounded();
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .config_observers
+            .push(sender);
+        receiver
     }
 
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
@@ -683,147 +825,34 @@ impl AgentActorHandle {
         event_sender: Option<EventSender>,
         correlation: String,
     ) -> Result<TurnTicket, ActorError> {
-        {
-            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle != ActorLifecycle::Open {
-                return Err(lifecycle_error(state.lifecycle));
-            }
-        }
-        let config = self.effective_config();
-        let mode = config
-            .as_ref()
-            .map_or_else(|| input.mode.clone(), |config| config.mode.clone());
-        let mut input = input;
-        input.mode = mode.clone();
-        let mut snapshot = self
-            .inner
-            .admission_preparation
-            .as_ref()
-            .map(|prepare| prepare(&input, &mode));
-        if let (Some(config), Some(snapshot)) = (&config, &mut snapshot)
-            && let Some(mode_def) = &config.mode_def
-        {
-            snapshot.mode_def = Some(Arc::new(mode_def.clone()));
-        }
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        if let Some(after) = state.pending_policy.back().map(|pending| pending.id) {
-            let turn_id = TurnId::generate();
-            let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
-            if let Some(reason) = state.cancelled_correlations.get(&correlation).copied() {
-                let admission = TurnAdmission {
-                    turn_id,
-                    admission: snapshot,
-                    input: Some(input),
-                    event_sender,
-                    correlation,
-                    root: false,
-                    generation: state.policy_generation,
-                    policy: state.policy.clone(),
-                    ticket: ticket.clone(),
-                };
-                let outcome = cancelled_outcome(self.inner.agent_id, turn_id, reason);
-                drop(state);
-                finalize_turn(&self.inner, turn_id, outcome, Some(&admission), true);
-                return Ok(ticket);
-            }
-            self.inner
-                .tickets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(turn_id, ticket.clone());
-            state
-                .deferred_admissions
-                .push_back(DeferredAdmission::Turn {
-                    after,
-                    admission: snapshot,
-                    input,
-                    event_sender,
-                    correlation,
-                    ticket: ticket.clone(),
-                });
-            return Ok(ticket);
-        }
-        self.admit_turn_locked(state, input, snapshot, event_sender, correlation)
-    }
-
-    fn admit_turn_locked(
-        &self,
-        state: std::sync::MutexGuard<'_, ActorState>,
-        mut input: AgentInput,
-        mut snapshot: Option<crate::agent::TurnAdmissionSnapshot>,
-        event_sender: Option<EventSender>,
-        correlation: String,
-    ) -> Result<TurnTicket, ActorError> {
-        let policy = state.policy.clone();
-        if let Some(config) = &policy {
-            input.mode = config.mode.clone();
-            if let Some(snapshot) = &mut snapshot
-                && let Some(mode_def) = &config.mode_def
-            {
-                snapshot.mode_def = Some(Arc::new(mode_def.clone()));
-            }
-        }
         let turn_id = TurnId::generate();
         let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
-        if let Some(reason) = state.cancelled_correlations.get(&correlation) {
-            // Precancelled before admission: terminalize exactly once with the
-            // remembered reason, deliver, and resolve the waiter immediately.
-            // The mark stays until a matching run is consumed by the runner.
-            let reason = *reason;
-            let admission = TurnAdmission {
-                turn_id,
-                admission: snapshot,
-                input: Some(input),
-                event_sender,
-                correlation: correlation.clone(),
-                root: false,
-                generation: state.policy_generation,
-                policy: policy.clone(),
-                ticket: ticket.clone(),
-            };
-            let outcome = cancelled_outcome(self.inner.agent_id, turn_id, reason);
-            drop(state);
-            finalize_turn(
-                &self.inner,
-                turn_id,
-                outcome.clone(),
-                Some(&admission),
-                true,
-            );
-            info!(
-                agent_id = %self.inner.agent_id,
-                %turn_id,
-                correlation = %correlation,
-                ?reason,
-                "precancelled admission terminalized"
-            );
-            return Ok(ticket);
-        }
+        state.next_operation_id = state.next_operation_id.wrapping_add(1);
+        let after = state.next_operation_id;
+        let reason = state.cancelled_correlations.get(&correlation).copied();
+        let work = ActorOperation::Turn {
+            id: after,
+            input,
+            event_sender,
+            correlation,
+            ticket: ticket.clone(),
+        };
         self.inner
             .tickets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(turn_id, ticket.clone());
-        self.inner.queue.push(ActorWork::Turn(TurnAdmission {
-            turn_id,
-            admission: snapshot,
-            input: Some(input),
-            event_sender,
-            correlation: correlation.clone(),
-            root: false,
-            generation: state.policy_generation,
-            policy,
-            ticket: ticket.clone(),
-        }));
-        info!(
-            agent_id = %self.inner.agent_id,
-            %turn_id,
-            correlation = %correlation,
-            "turn admitted"
-        );
+        if let Some(reason) = reason {
+            drop(state);
+            settle_deferred(&self.inner, vec![work], reason);
+        } else {
+            state.operations.push_back(work);
+            drive_operations(&self.inner, &mut state);
+        }
         Ok(ticket)
     }
 
@@ -831,49 +860,20 @@ impl AgentActorHandle {
     /// when it starts it, and an active run folds it instead. A root whose
     /// correlation was precancelled is dropped. The mark stays until a
     /// matching run is consumed by the runner.
-    pub fn rush(&self, mut root: RootWork) -> Result<(), ActorError> {
-        {
-            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle != ActorLifecycle::Open {
-                return Err(lifecycle_error(state.lifecycle));
-            }
-        }
-        let config = self.effective_config();
-        if let Some(config) = &config {
-            root.input.mode = config.mode.clone();
-        }
-        root.admission = self
-            .inner
-            .admission_preparation
-            .as_ref()
-            .map(|prepare| prepare(&root.input, &root.input.mode));
-        if let (Some(config), Some(snapshot)) = (&config, &mut root.admission)
-            && let Some(mode_def) = &config.mode_def
-        {
-            snapshot.mode_def = Some(Arc::new(mode_def.clone()));
-        }
+    pub fn rush(&self, root: RootWork) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        if let Some(after) = state.pending_policy.back().map(|pending| pending.id) {
-            state
-                .deferred_admissions
-                .push_back(DeferredAdmission::Root { after, root });
-            return Ok(());
-        }
-        self.rush_locked(&state, root)
-    }
-
-    fn rush_locked(&self, state: &ActorState, root: RootWork) -> Result<(), ActorError> {
         if state.cancelled_correlations.contains_key(&root.correlation) {
             return Ok(());
         }
-        let mut root = root;
-        root.generation = state.policy_generation;
-        root.policy = state.policy.clone();
-
-        self.inner.queue.push(ActorWork::Root(root));
+        state.next_operation_id = state.next_operation_id.wrapping_add(1);
+        let after = state.next_operation_id;
+        state
+            .operations
+            .push_back(ActorOperation::Root { id: after, root });
+        drive_operations(&self.inner, &mut state);
         Ok(())
     }
 
@@ -887,36 +887,36 @@ impl AgentActorHandle {
             .clone()
     }
 
+    pub fn config_snapshot(&self) -> Option<ConfigCommit> {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.policy.clone().map(|config| ConfigCommit {
+            identity: Arc::clone(&self.inner.identity),
+            generation: state.policy_generation,
+            config,
+        })
+    }
+
     pub fn policy_snapshot(&self) -> Option<Arc<RunSettings>> {
         self.effective_config()
             .map(|config| Arc::new(config.settings.clone()))
     }
 
-    pub fn update_policy(&self, policy: RunSettings) -> Result<u64, ActorError> {
-        let mode = self
-            .effective_config()
-            .map_or(crate::AgentMode::Build, |config| config.mode.clone());
-        self.set_effective_config(EffectiveAgentConfig::new(policy, mode))
-    }
-
-    pub fn reserve_config_update(&self) -> Result<PolicyUpdateTicket, ActorError> {
-        self.reserve_policy_update()
-    }
-
-    pub fn reserve_policy_update(&self) -> Result<PolicyUpdateTicket, ActorError> {
+    pub fn reserve_config_update(&self) -> Result<ConfigUpdateTicket, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        state.next_policy_id = state.next_policy_id.wrapping_add(1);
-        let id = state.next_policy_id;
+        state.next_operation_id = state.next_operation_id.wrapping_add(1);
+        let id = state.next_operation_id;
         let completion = Arc::new(Mutex::new(None));
-        state.pending_policy.push_back(PendingPolicy {
-            id,
-            result: None,
-            completion: Arc::clone(&completion),
-        });
-        Ok(PolicyUpdateTicket {
+        state
+            .operations
+            .push_back(ActorOperation::Config(ConfigOperation {
+                id,
+                result: None,
+                completion: Arc::clone(&completion),
+            }));
+        Ok(ConfigUpdateTicket {
             inner: Arc::clone(&self.inner),
             id,
             completion,
@@ -928,7 +928,10 @@ impl AgentActorHandle {
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        Ok(!state.pending_policy.is_empty())
+        Ok(state
+            .operations
+            .iter()
+            .any(|entry| matches!(entry, ActorOperation::Config(_))))
     }
 
     pub async fn wait_policy_updates(&self) -> Result<(), ActorError> {
@@ -941,7 +944,7 @@ impl AgentActorHandle {
         }
     }
 
-    pub fn set_effective_config(&self, config: EffectiveAgentConfig) -> Result<u64, ActorError> {
+    pub fn initialize_config(&self, config: EffectiveAgentConfig) -> Result<u64, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(match state.lifecycle {
@@ -950,11 +953,18 @@ impl AgentActorHandle {
                 ActorLifecycle::Open => unreachable!(),
             });
         }
-        if !state.pending_policy.is_empty() {
+        if state.policy.is_some()
+            || state.status != ActorStatus::Idle
+            || !state.operations.is_empty()
+            || !self.inner.queue.is_empty()
+        {
             return Err(ActorError::PolicyPending);
         }
-        self.inner.validate_policy(&config.settings)?;
-        state.policy_generation = state.policy_generation.wrapping_add(1);
+        if matches!(config.mode, crate::AgentMode::Custom(_)) && config.mode_def.is_none() {
+            return Err(ActorError::InvalidConfig(
+                "custom mode requires a resolved definition".into(),
+            ));
+        }
         state.policy = Some(Arc::new(config));
         let generation = state.policy_generation;
         Ok(generation)
@@ -984,22 +994,14 @@ impl AgentActorHandle {
         {
             return Ok(());
         }
-        if let Some(after) = state.pending_policy.back().map(|pending| pending.id) {
-            state
-                .deferred_admissions
-                .push_back(DeferredAdmission::Compact {
-                    after,
-                    run_id,
-                    instructions,
-                });
-        } else {
-            self.inner.queue.push(ActorWork::Compact {
-                run_id,
-                instructions,
-                generation: state.policy_generation,
-                policy: state.policy.clone(),
-            });
-        }
+        state.next_operation_id = state.next_operation_id.wrapping_add(1);
+        let after = state.next_operation_id;
+        state.operations.push_back(ActorOperation::Compact {
+            id: after,
+            run_id,
+            instructions,
+        });
+        drive_operations(&self.inner, &mut state);
         Ok(())
     }
 
@@ -1008,11 +1010,12 @@ impl AgentActorHandle {
     pub fn remove(&self, turn_id: TurnId) -> Result<TurnOutcome, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let deferred = state
-            .deferred_admissions
+            .operations
             .iter()
-            .position(|admission| matches!(admission, DeferredAdmission::Turn { ticket, .. } if ticket.turn_id() == turn_id))
-            .and_then(|index| state.deferred_admissions.remove(index));
+            .position(|admission| matches!(admission, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == turn_id))
+            .and_then(|index| state.operations.remove(index));
         let queued = self.inner.queue.remove_turn(turn_id);
+        drive_operations(&self.inner, &mut state);
         drop(state);
         if let Some(admission) = deferred {
             let outcome =
@@ -1043,8 +1046,16 @@ impl AgentActorHandle {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let queued = self.inner.queue.len();
         if index >= queued {
-            let admission = state.deferred_admissions.remove(index - queued)?;
-            let projection = admission.projection();
+            let raw = state
+                .operations
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| !matches!(entry, ActorOperation::Config(_)))
+                .nth(index - queued)?
+                .0;
+            let admission = state.operations.remove(raw)?;
+            let projection = admission.projection()?;
+            drive_operations(&self.inner, &mut state);
             drop(state);
             settle_deferred(&self.inner, vec![admission], TurnCancellationReason::User);
             return Some(projection);
@@ -1092,14 +1103,15 @@ impl AgentActorHandle {
             .count();
         if visible_index >= queued_visible {
             let index = state
-                .deferred_admissions
+                .operations
                 .iter()
                 .enumerate()
                 .filter(|(_, admission)| admission.visible())
                 .nth(visible_index - queued_visible)?
                 .0;
-            let admission = state.deferred_admissions.remove(index)?;
-            let projection = admission.projection();
+            let admission = state.operations.remove(index)?;
+            let projection = admission.projection()?;
+            drive_operations(&self.inner, &mut state);
             drop(state);
             settle_deferred(&self.inner, vec![admission], TurnCancellationReason::User);
             return Some(projection);
@@ -1127,8 +1139,9 @@ impl AgentActorHandle {
     /// the number of items removed.
     pub fn clear(&self) -> usize {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let deferred = state.deferred_admissions.drain(..).collect::<Vec<_>>();
+        let deferred = state.drain_work();
         let drained = self.inner.queue.drain_all();
+        drive_operations(&self.inner, &mut state);
         let len = drained.len() + deferred.len();
         drop(state);
         settle_deferred(&self.inner, deferred, TurnCancellationReason::User);
@@ -1148,9 +1161,10 @@ impl AgentActorHandle {
     pub fn cancel_existing(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
-        let deferred = state.deferred_admissions.drain(..).collect::<Vec<_>>();
+        let deferred = state.drain_work();
         let active = state.active.take();
         let drained = self.inner.queue.drain_all();
+        drive_operations(&self.inner, &mut state);
         drop(state);
         settle_deferred(&self.inner, deferred, TurnCancellationReason::User);
         if let Some(active) = active {
@@ -1187,9 +1201,9 @@ impl AgentActorHandle {
             None
         };
         let queued = self.inner.queue.remove_turn(turn_id);
-        let deferred = state.deferred_admissions.iter().position(|admission| {
-            matches!(admission, DeferredAdmission::Turn { ticket, .. } if ticket.turn_id() == turn_id)
-        }).and_then(|index| state.deferred_admissions.remove(index));
+        let deferred = state.operations.iter().position(|admission| {
+            matches!(admission, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == turn_id)
+        }).and_then(|index| state.operations.remove(index));
         if active.is_none()
             && queued.is_none()
             && deferred.is_none()
@@ -1198,6 +1212,7 @@ impl AgentActorHandle {
         {
             state.cancelled_turns.insert(turn_id);
         }
+        drive_operations(&self.inner, &mut state);
         drop(state);
         settle_deferred(
             &self.inner,
@@ -1276,15 +1291,14 @@ impl AgentActorHandle {
             .collect();
         let mut deferred = Vec::new();
         let mut remaining = VecDeque::new();
-        while let Some(admission) = state.deferred_admissions.pop_front() {
+        while let Some(admission) = state.operations.pop_front() {
             let matches = match &admission {
-                DeferredAdmission::Turn {
+                ActorOperation::Config(_) => false,
+                ActorOperation::Turn {
                     correlation: key, ..
                 } => key == correlation,
-                DeferredAdmission::Root { root, .. } => root.correlation == correlation,
-                DeferredAdmission::Compact { run_id, .. } => {
-                    run_correlation(*run_id) == correlation
-                }
+                ActorOperation::Root { root, .. } => root.correlation == correlation,
+                ActorOperation::Compact { run_id, .. } => run_correlation(*run_id) == correlation,
             };
             if matches {
                 deferred.push(admission);
@@ -1292,7 +1306,8 @@ impl AgentActorHandle {
                 remaining.push_back(admission);
             }
         }
-        state.deferred_admissions = remaining;
+        state.operations = remaining;
+        drive_operations(&self.inner, &mut state);
         if !matched_active && matched.is_empty() && deferred.is_empty() {
             // Nothing matched now; precancel any later push with this
             // correlation, remembering the reason to terminalize with.
@@ -1331,7 +1346,7 @@ impl AgentActorHandle {
     /// push.
     pub fn publish_if_empty(&self, publish: impl FnOnce()) {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.deferred_admissions.is_empty() {
+        if state.operations.is_empty() {
             self.inner.queue.publish_if_empty(publish);
         }
     }
@@ -1358,9 +1373,9 @@ impl AgentActorHandle {
         let mut queue = self.inner.queue.snapshot();
         queue.extend(
             state
-                .deferred_admissions
+                .operations
                 .iter()
-                .map(DeferredAdmission::projection),
+                .filter_map(ActorOperation::projection),
         );
         drop(state);
         ActorSnapshot {
@@ -1435,13 +1450,22 @@ impl AgentActorHandle {
                 return;
             }
             state.lifecycle = lifecycle;
-            state.pending_policy.clear();
+            state.preparing = None;
+            for entry in &state.operations {
+                if let ActorOperation::Config(pending) = entry {
+                    pending
+                        .completion
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(|| Err(lifecycle_error(lifecycle)));
+                }
+            }
             self.inner.policy_changed.notify(usize::MAX);
             state.cancelled_correlations.clear();
             state.cancelled_turns.clear();
             (
                 state.active.take(),
-                state.deferred_admissions.drain(..).collect::<Vec<_>>(),
+                state.operations.drain(..).collect::<Vec<_>>(),
             )
         };
         settle_deferred(&self.inner, deferred, reason);

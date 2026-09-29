@@ -12,8 +12,8 @@ use serde_json::Value;
 
 use super::{AgentLimits, AgentManagerHandle, AgentMetadata, GraphLifecycle, ManagerError};
 use crate::{
-    ActorBackend, AgentEvent, AgentInput, AgentMode, BackendResult, ControlWork, EventSender,
-    History, TurnContext, TurnOutcome, WorkKind,
+    ActorBackend, AgentEvent, AgentInput, AgentMode, BackendResult, ConfigChange, ConfigPatch,
+    ControlWork, EventSender, History, PreparedModel, TurnContext, TurnOutcome, WorkKind,
 };
 
 struct Gate {
@@ -406,8 +406,7 @@ fn actor_owned_config_inherits_and_isolates_nodes() {
         let captured = current.policy_snapshot().unwrap();
         assert_eq!(captured.model.id, initial.model.id);
         assert!(Arc::ptr_eq(&captured.provider, &initial.provider));
-        root.update_policy(config("anthropic/claude-sonnet-4-20250514", true).settings)
-            .unwrap();
+
         let child = current
             .spawn_child(
                 AgentMetadata::default(),
@@ -420,15 +419,7 @@ fn actor_owned_config_inherits_and_isolates_nodes() {
         assert_eq!(inherited.model.id, initial.model.id);
         assert!(Arc::ptr_eq(&inherited.provider, &initial.provider));
         assert!(!inherited.fast);
-        assert!(root.effective_config().unwrap().unwrap().fast);
-        assert!(!child.effective_config().unwrap().unwrap().fast);
-        assert!(matches!(
-            manager.update_policy(
-                child.id(),
-                config("anthropic/claude-sonnet-4-20250514", true).settings
-            ),
-            Err(ManagerError::Policy(_))
-        ));
+        assert!(!root.effective_config().unwrap().unwrap().fast);
         assert!(!child.effective_config().unwrap().unwrap().fast);
         gate.release(1);
         let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
@@ -492,10 +483,7 @@ fn agent_config_isolation_and_failed_switch() {
         assert!(!first_turn.policy_snapshot().unwrap().fast);
         assert!(second_turn.policy_snapshot().unwrap().fast);
         assert!(!child.effective_config().unwrap().unwrap().fast);
-        assert!(matches!(
-            first.update_policy(child.id(), other.settings.clone()),
-            Err(ManagerError::Policy(_))
-        ));
+
         assert!(Arc::ptr_eq(
             &first_root.effective_config().unwrap().unwrap().provider,
             &initial.provider
@@ -554,7 +542,7 @@ fn child_spawn_without_parent_policy_fails_closed() {
 }
 
 #[test]
-fn child_ceiling_rejects_policy_and_mode_expansion() {
+fn child_configuration_can_change_independently() {
     smol::block_on(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (tx, rx) = flume::bounded(1);
@@ -578,36 +566,42 @@ fn child_ceiling_rejects_policy_and_mode_expansion() {
                 TestBackend::boxed(),
             )
             .unwrap();
-        let actor = child.actor().unwrap();
-        let mut broader = initial.clone();
-        broader.settings.model = Model::from_spec("anthropic/claude-opus-4-20250514").unwrap();
+        let before = manager.snapshot().len();
+        let mut invalid = initial.clone();
+        invalid.mode = AgentMode::Custom(crate::ModeId::Custom("missing-definition".into()));
         assert!(matches!(
-            child.update_policy(broader.settings),
+            current.spawn_child_with_config(
+                invalid,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            ),
             Err(ManagerError::Policy(_))
         ));
-        let mut broader = initial.clone();
-        broader.settings.workflow = true;
-        assert!(matches!(
-            child.update_policy(broader.settings),
-            Err(ManagerError::Policy(_))
-        ));
-        let mut broader = initial.clone();
-        broader.settings.fast = true;
-        assert!(matches!(
-            child.update_policy(broader.settings),
-            Err(ManagerError::Policy(_))
-        ));
-        let mut broader = initial.clone();
-        broader.settings.provider = Arc::new(ConfigTestProvider);
-        assert!(matches!(
-            child.update_policy(broader.settings),
-            Err(ManagerError::Policy(_))
-        ));
-        let mut plan_input = input();
-        plan_input.mode = AgentMode::Plan("plan.md".into());
-        assert!(actor.admit_turn(plan_input, None, "plan".into()).is_ok());
+        assert_eq!(manager.snapshot().len(), before);
+        let mut updated = config("anthropic/claude-opus-5", true);
+        updated.settings.workflow = true;
+        let update = child.actor().unwrap().reserve_config_update().unwrap();
+        update
+            .resolve(Ok(ConfigChange::Patch(ConfigPatch {
+                model: Some(PreparedModel {
+                    provider: Arc::clone(&updated.provider),
+                    model: updated.model.clone(),
+                }),
+                fast: Some(true),
+                workflow: Some(true),
+                ..Default::default()
+            })))
+            .unwrap();
+        update.wait().await.unwrap();
+        let actual = child.effective_config().unwrap().unwrap();
+        assert_eq!(actual.model.id, updated.model.id);
+        assert!(actual.fast);
+        assert!(actual.workflow);
+        assert!(Arc::ptr_eq(&actual.provider, &updated.provider));
         assert_eq!(
-            child.effective_config().unwrap().unwrap().model.id,
+            root.effective_config().unwrap().unwrap().model.id,
             initial.model.id
         );
         gate.release(1);

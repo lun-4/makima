@@ -14,8 +14,12 @@ pub enum ActorError {
     PolicyPending,
     #[error("policy update was cancelled")]
     PolicyCancelled,
-    #[error("child policy exceeds its inherited authority ceiling")]
-    PolicyCeiling,
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+    #[error(transparent)]
+    UnsupportedOption(#[from] crate::session_options::SessionOptionError),
+    #[error("configuration preparation expired")]
+    ConfigExpired,
     #[error("no such turn: {0}")]
     UnknownTurn(TurnId),
 }

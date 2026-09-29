@@ -374,14 +374,38 @@ async fn options(
         Ok(coordinator) => coordinator,
         Err(error) => return Ok(err_pair(error)),
     };
-    Ok((
-        Some(snapshot_table(&lua, &coordinator.read().options())?),
-        None,
-    ))
+    let snapshot = snapshot_table(&lua, &coordinator.read().options())?;
+    if let Some(tx) = tx {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        if let Err(error) = tx.send(UiAction::Session {
+            req: SessionRequest::Options {
+                session: coordinator.session_id().to_string(),
+            },
+            reply_tx,
+        }) {
+            return Ok(err_pair(error));
+        }
+        let values = match reply_rx.recv_async().await {
+            Ok(Ok(values)) => values,
+            Ok(Err(error)) => return Ok(err_pair(error)),
+            Err(error) => return Ok(err_pair(error)),
+        };
+        let options: Table = snapshot.get("options")?;
+        for option in options.sequence_values::<Table>() {
+            let option = option?;
+            let id: String = option.get("id")?;
+            if let Some(value) = values.get(&id).and_then(serde_json::Value::as_str) {
+                option.set("current_value", value)?;
+            }
+        }
+    }
+    Ok((Some(snapshot), None))
 }
 
-/// Sets one option explicitly for a live session. Validation, runtime adoption,
-/// and persistence complete before success is returned.
+/// Sets one option explicitly for a live session. Managed model, thinking,
+/// fast, and workflow changes succeed at actor commit; saving is asynchronous.
+/// Other options retain their existing owner and persistence behavior.
+/// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param id string Stable option id.
 /// @param value string Selectable value id.
@@ -413,28 +437,7 @@ async fn set_option(
     {
         return Ok(err_pair(error));
     }
-    let ui_tx = tx.clone();
-    let policy_affecting = matches!(id.as_str(), "model" | "fast" | "workflow" | "thinking");
-    if let Some(tx) = tx.filter(|_| policy_affecting) {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        if let Err(error) = tx.send(UiAction::Session {
-            req: SessionRequest::SetOption {
-                session: coordinator.session_id().to_string(),
-                id,
-                value,
-                version: snapshot.version,
-            },
-            reply_tx,
-        }) {
-            return Ok(err_pair(error));
-        }
-        return match reply_rx.recv_async().await {
-            Ok(Ok(_)) => Ok((Some(true), None)),
-            Ok(Err(error)) => Ok(err_pair(error)),
-            Err(_) => Ok(err_pair("ui dropped the option update")),
-        };
-    }
-    if let Some(tx) = ui_tx {
+    if let Some(tx) = tx {
         let (reply_tx, reply_rx) = flume::bounded(1);
         if let Err(error) = tx.send(UiAction::Session {
             req: SessionRequest::SetOption {
@@ -497,6 +500,8 @@ async fn thinking(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 /// `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 /// level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 /// the choice is also persisted as the global default for new sessions.
+/// The active session changes at actor commit and is saved asynchronously.
+/// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param opts table Required fields: mode (string) the thinking setting;
 ///   set_default (boolean) also persist as the default for new sessions.

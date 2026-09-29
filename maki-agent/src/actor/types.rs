@@ -14,7 +14,6 @@ use crate::{AgentMode, InterruptSource, RunSettings};
 pub(crate) struct ManagedTurnAdmission {
     pub(crate) manager: std::sync::Weak<ManagerInner>,
     pub(crate) agent_id: AgentId,
-    pub(crate) ceiling: Option<RunSettings>,
 }
 
 /// The actor's immutable per-admission configuration snapshot.
@@ -49,16 +48,8 @@ impl std::ops::Deref for EffectiveAgentConfig {
 }
 
 impl ManagedTurnAdmission {
-    pub(crate) fn new(
-        manager: std::sync::Weak<ManagerInner>,
-        agent_id: AgentId,
-        ceiling: Option<RunSettings>,
-    ) -> Self {
-        Self {
-            manager,
-            agent_id,
-            ceiling,
-        }
+    pub(crate) fn new(manager: std::sync::Weak<ManagerInner>, agent_id: AgentId) -> Self {
+        Self { manager, agent_id }
     }
 }
 
@@ -237,17 +228,25 @@ pub struct ActorSnapshot {
     pub cumulative_usage: TokenUsage,
 }
 
-/// The adapter owns its mutable configuration and executes work against the
-/// actor's shared history. Object-safe: every execution method returns a
-/// boxed future, so the TUI and Lua can share one `Box<dyn ActorBackend>`.
-/// Captures the external state pinned to an admission. The actor always calls
-/// this before taking its state lock, so implementations may perform blocking
-/// work but must tolerate the actor closing before the prepared snapshot commits.
+/// Captures external admission dependencies on the blocking pool, without the
+/// actor state lock. The supplied configuration is the committed FIFO predecessor;
+/// implementations must use its resolved mode definition when present. Cancellation
+/// can retire the admission before this callback returns.
 pub type AdmissionPreparation = Arc<
-    dyn Fn(&crate::AgentInput, &AgentMode) -> crate::agent::TurnAdmissionSnapshot + Send + Sync,
+    dyn Fn(
+            &crate::AgentInput,
+            &AgentMode,
+            Option<&EffectiveAgentConfig>,
+        ) -> crate::agent::TurnAdmissionSnapshot
+        + Send
+        + Sync,
 >;
 
 pub trait ActorBackend: Send {
+    fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
+        None
+    }
+
     fn admission_preparation(&self) -> Option<AdmissionPreparation> {
         None
     }

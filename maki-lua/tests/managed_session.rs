@@ -10,6 +10,7 @@ use maki_agent::{
     RunSettings, ToolOutput, TurnContext, TurnOutcome, TurnTicket, WorkKind,
 };
 use maki_lua::PluginHost;
+use maki_lua::test_support::InMemoryFs;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
@@ -35,6 +36,8 @@ const REJECT_FOREIGN_CTX_TOOL_NAME: &str = "reject_foreign_unmanaged_ctx";
 const MANAGED_AUTHORITY_ERROR: &str = "managed agent authority is not active in this invocation";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
 const NESTED_RESULT: &str = "nested child result";
+const SELECTED_MODEL: &str = "anthropic/claude-opus-4-20250514";
+const PREPARATION_ERROR: &str = "provider preparation rejected";
 const MANAGED_NESTED_SPAWN_ERR: &str = "managed general subagents must use the blocking task tool";
 const CORRELATION: &str = "managed-root";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -590,6 +593,220 @@ async fn spawn_managed_parent(
         TurnOutcome::Completed { .. }
     ));
     child
+}
+
+struct RecordingProvider {
+    requests: flume::Sender<(String, RequestOptions)>,
+}
+
+struct NestedRecordingProvider {
+    requests: flume::Sender<(String, RequestOptions)>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Provider for NestedRecordingProvider {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        opts: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            self.requests.send((model.spec(), opts)).unwrap();
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(common::canned_tool_use("spawn_nested", json!({})))
+            } else {
+                Ok(common::canned_reply(NESTED_RESULT))
+            }
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+impl Provider for RecordingProvider {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        opts: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            self.requests.send((model.spec(), opts)).unwrap();
+            Ok(common::canned_reply(SILENT_REPLY))
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+#[test]
+fn managed_lua_requests_follow_resolved_and_updated_configuration() {
+    smol::block_on(async {
+        let registry = Arc::clone(ToolRegistry::global_arc());
+        let (first_tx, first_rx) = flume::unbounded();
+        let selected_provider: Arc<dyn Provider> =
+            Arc::new(RecordingProvider { requests: first_tx });
+        let prepared_provider = Arc::clone(&selected_provider);
+        let (prepared_tx, prepared_rx) = flume::unbounded();
+        let host = PluginHost::with_session_provider_preparer(
+            Arc::clone(&registry),
+            Default::default(),
+            true,
+            Arc::new(InMemoryFs::new()),
+            None,
+            Some(Arc::new(move |model| {
+                prepared_tx.send(model.spec()).unwrap();
+                if model.spec() != SELECTED_MODEL {
+                    return Err(PREPARATION_ERROR.into());
+                }
+                Ok((model, Arc::clone(&prepared_provider)))
+            })),
+        )
+        .unwrap();
+        host.load_source(
+            "managed-config",
+            &r#"
+            local child
+            maki.api.register_tool({
+                name = "spawn_nested",
+                description = "spawn a child from the executing configuration",
+                schema = { type = "object", properties = {} },
+                audiences = { "general_sub" },
+                handler = function(_, ctx)
+                    assert(ctx:workflow() == true)
+                    local nested = assert(maki.agent.session(ctx, { inherit_provider = true }))
+                    local result = assert(nested:prompt("nested"))
+                    nested:close()
+                    return result.text
+                end,
+            })
+            maki.api.register_tool({
+                name = "managed_session",
+                description = "create and retain a configured child",
+                schema = { type = "object", properties = {} },
+                handler = function(_, ctx)
+                    local rejected, policy_err = maki.agent.session(ctx, { model_spec = "openai/gpt-4.1" })
+                    assert(rejected == nil and policy_err ~= nil)
+                    local failed, preparation_err = maki.agent.session(ctx, { model_spec = "anthropic/claude-opus-5" })
+                    assert(failed == nil and preparation_err == "$PREPARATION_ERROR")
+                    child = assert(maki.agent.session(ctx, {
+                        model_spec = "anthropic/claude-opus-4-20250514", fast = true, thinking = "off",
+                        tools = {{ name = "spawn_nested", description = "spawn nested", input_schema = { type = "object", properties = {} } }},
+                    }))
+                    assert(child:prompt("first"))
+                    return "ok"
+                end,
+            })
+        "#.replace("$PREPARATION_ERROR", PREPARATION_ERROR),
+        )
+        .unwrap();
+        let (mut context, _events, _cancel) = common::ctx_with_canned_provider();
+        let (parent_tx, parent_rx) = flume::unbounded();
+        context.provider = Arc::new(RecordingProvider {
+            requests: parent_tx,
+        });
+        context.model = Arc::new(Model::from_spec("anthropic/claude-opus-5").unwrap());
+        let parent_model = context.model.spec();
+        context.model_policy =
+            Arc::new(maki_config::ModelPolicy::new(&["anthropic/*".to_owned()], &[]).unwrap());
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let root = manager
+            .create_root_with_config(Some(parent_policy(&context)), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(LuaToolBackend {
+                    registry,
+                    context,
+                    completed: completed_tx,
+                    tool_name: TOOL_NAME,
+                }) as Box<dyn ActorBackend>)
+            })
+            .unwrap();
+        let ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
+        assert_eq!(completed_rx.recv_async().await.unwrap(), Ok(()));
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        let child_id = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(root.id()))
+            .unwrap()
+            .agent_id;
+        let actor = manager.actor(child_id).unwrap();
+        let initial = actor.effective_config().unwrap();
+        assert_eq!(manager.snapshot().len(), 2);
+        assert_eq!(
+            prepared_rx.try_iter().collect::<Vec<_>>(),
+            [parent_model.clone(), SELECTED_MODEL.to_owned()]
+        );
+        assert_eq!(initial.model.spec(), SELECTED_MODEL);
+        assert_ne!(initial.model.spec(), parent_model);
+        assert!(Arc::ptr_eq(&initial.provider, &selected_provider));
+        assert!(parent_rx.is_empty());
+        let (model, opts) = first_rx.try_recv().unwrap();
+        assert_eq!(model, initial.model.spec());
+        assert_eq!(opts.fast, initial.fast);
+        assert_eq!(opts.thinking, initial.thinking);
+        assert!(!initial.fast);
+        let (updated_tx, updated_rx) = flume::unbounded();
+        let mut updated = (*initial).clone();
+        updated.settings.provider = Arc::new(NestedRecordingProvider {
+            requests: updated_tx,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        updated.settings.model = Model::from_spec(&parent_model).unwrap();
+        updated.settings.fast = false;
+        updated.settings.thinking = maki_providers::ThinkingConfig::Budget(4096);
+        updated.settings.workflow = true;
+        let update = actor.reserve_config_update().unwrap();
+        update
+            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                maki_agent::actor::ConfigPatch {
+                    model: Some(maki_agent::actor::PreparedModel {
+                        provider: Arc::clone(&updated.provider),
+                        model: updated.model.clone(),
+                    }),
+                    fast: Some(false),
+                    thinking: Some(updated.thinking),
+                    workflow: Some(true),
+                    ..Default::default()
+                },
+            )))
+            .unwrap();
+        update.wait().await.unwrap();
+        let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        let requests: Vec<_> = updated_rx.try_iter().collect();
+        assert_eq!(requests.len(), 3);
+        for (model, opts) in requests {
+            assert_eq!(model, updated.model.spec());
+            assert!(!opts.fast);
+            assert_eq!(opts.thinking, updated.thinking);
+        }
+        let nested = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(child_id))
+            .unwrap();
+        assert_eq!(nested.depth, 2);
+        assert!(first_rx.is_empty());
+        manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
 }
 
 struct PendingProvider {

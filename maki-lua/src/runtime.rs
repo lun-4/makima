@@ -200,7 +200,6 @@ pub enum Request {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
-        bundled: bool,
         reply: flume::Sender<LoadResult>,
     },
     CallTool {
@@ -3143,14 +3142,14 @@ impl LuaRuntime {
 
     async fn load_source(
         &mut self,
-        identity: (Arc<str>, &str, bool),
+        identity: (Arc<str>, &str),
         source: &str,
         plugin_dir: Option<PathBuf>,
         permissions: &PluginPermissions,
         opts: PluginOpts,
         config_store: Option<&ConfigStore>,
     ) -> LoadResult {
-        let (name, source_name, bundled) = identity;
+        let (name, source_name) = identity;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: source_name.to_owned(),
             source: e,
@@ -3300,14 +3299,8 @@ impl LuaRuntime {
                 });
                 (
                     tool,
-                    if bundled {
-                        ToolSource::Bundled {
-                            plugin: Arc::clone(&name),
-                        }
-                    } else {
-                        ToolSource::Lua {
-                            plugin: Arc::clone(&name),
-                        }
+                    ToolSource::Lua {
+                        plugin: Arc::clone(&name),
                     },
                 )
             })
@@ -3761,7 +3754,7 @@ impl LuaRuntime {
             })
             .unwrap_or_else(PluginPermissions::trusted);
         self.load_source(
-            (owner, source_name, false),
+            (owner, source_name),
             source,
             plugin_dir,
             &perms,
@@ -4530,6 +4523,7 @@ pub struct SpawnConfig {
     pub plugin_rules: Arc<PluginRuleStore>,
     pub state_dir: Option<PathBuf>,
     pub fs: Arc<dyn FsBackend>,
+    pub session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
 }
 
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
@@ -4544,6 +4538,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
         plugin_rules,
         state_dir,
         fs,
+        session_provider_preparer,
     } = config;
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
@@ -4605,6 +4600,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                 fs,
             ) {
                 Ok(r) => {
+                    if let Some(prepare) = session_provider_preparer {
+                        r.lua.set_app_data(prepare);
+                    }
                     let _ = init_tx.send(Ok(()));
                     r
                 }
@@ -4748,13 +4746,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             plugin_dir,
                             permissions,
                             opts,
-                            bundled,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             let res = rt
                                 .load_source(
-                                    (Arc::clone(&name), &name, bundled),
+                                    (Arc::clone(&name), &name),
                                     &source,
                                     plugin_dir,
                                     &permissions,

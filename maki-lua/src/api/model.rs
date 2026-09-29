@@ -116,7 +116,10 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 
 /// Switches the focused session's model, thinking level, or fast mode. Fields
 /// you leave out stay as they are, so this doubles as a thinking-only switch.
-/// Answers with the new state, in the same shape `get` returns.
+/// Answers with the committed state, in the same shape `get` returns. Changes
+/// apply to subsequent admissions; saving runs asynchronously after commit.
+/// See [Configuration changes](/docs/modes/#configuration-changes) for save
+/// warnings, retry behavior, and crash limitations.
 ///
 /// @param opts string|table A model spec, or a table with any of:
 ///   `spec` (string) `"provider/id"`, as listed by `available()`;

@@ -275,6 +275,17 @@ impl PluginHost {
         fs: Arc<dyn FsBackend>,
         state_dir: Option<PathBuf>,
     ) -> Result<Self, PluginError> {
+        Self::with_session_provider_preparer(registry, command_registry, jit, fs, state_dir, None)
+    }
+
+    pub fn with_session_provider_preparer(
+        registry: Arc<ToolRegistry>,
+        command_registry: CommandRegistry,
+        jit: bool,
+        fs: Arc<dyn FsBackend>,
+        state_dir: Option<PathBuf>,
+        session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
+    ) -> Result<Self, PluginError> {
         let modes = Arc::new(maki_agent::ModeRegistry::builtin());
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let session_options = SessionOptionCatalog::default();
@@ -289,6 +300,7 @@ impl PluginHost {
                 session_options: session_options.clone(),
                 state_dir,
                 fs,
+                session_provider_preparer,
             },
         )?;
         Ok(Self {
@@ -488,22 +500,6 @@ impl PluginHost {
                 None,
                 PluginPermissions::trusted(),
                 opts,
-                matches!(
-                    builtin.as_str(),
-                    "read"
-                        | "glob"
-                        | "grep"
-                        | "index"
-                        | "webfetch"
-                        | "websearch"
-                        | "skill"
-                        | "todo_write"
-                        | "question"
-                        | "write"
-                        | "edit"
-                        | "plan_submit_tool"
-                        | "task"
-                ),
             )?;
         }
         Ok(())
@@ -516,7 +512,6 @@ impl PluginHost {
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
         opts: PluginOpts,
-        bundled: bool,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
@@ -527,7 +522,6 @@ impl PluginHost {
                 plugin_dir,
                 permissions,
                 opts,
-                bundled,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -564,7 +558,6 @@ impl PluginHost {
                 plugin_dir: None,
                 permissions: PluginPermissions::trusted(),
                 opts: PluginOpts::default(),
-                bundled: false,
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
@@ -651,7 +644,6 @@ impl PluginHost {
             None,
             PluginPermissions::trusted(),
             Arc::new(opts),
-            false,
         )
     }
 
@@ -667,7 +659,6 @@ impl PluginHost {
             None,
             permissions,
             PluginOpts::default(),
-            false,
         )
     }
 
@@ -688,7 +679,6 @@ impl PluginHost {
             plugin_dir,
             permissions,
             PluginOpts::default(),
-            false,
         )
     }
 
@@ -1951,7 +1941,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_read_only_identity_follows_loader_and_replacement() {
+    fn plugin_replacement_changes_tool_binding() {
         let registry = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
         let names = [
@@ -1973,41 +1963,21 @@ mod tests {
             opts: HashMap::new(),
         })
         .unwrap();
-        for name in [
-            "read",
-            "glob",
-            "grep",
-            "index",
-            "webfetch",
-            "websearch",
-            "skill",
-            "todo_write",
-            "question",
-            "plan_submit",
-            "task",
-        ] {
-            assert!(registry.get(name).unwrap().is_bundled_read_only());
-        }
+        let original = registry.get("read").unwrap();
+        let unchanged = registry.get("glob").unwrap();
         host.load_source(
             "read",
             r#"maki.api.register_tool({name = "read", description = "probe", schema = {type = "object", properties = {}}, handler = function() return "ok" end})"#,
         )
         .unwrap();
-        assert!(!registry.get("read").unwrap().is_bundled_read_only());
-        for name in [
-            "glob",
-            "grep",
-            "index",
-            "webfetch",
-            "websearch",
-            "skill",
-            "todo_write",
-            "question",
-            "plan_submit",
-            "task",
-        ] {
-            assert!(registry.get(name).unwrap().is_bundled_read_only());
-        }
+        assert!(!Arc::ptr_eq(
+            &original.tool,
+            &registry.get("read").unwrap().tool
+        ));
+        assert!(Arc::ptr_eq(
+            &unchanged.tool,
+            &registry.get("glob").unwrap().tool
+        ));
     }
 
     #[test]

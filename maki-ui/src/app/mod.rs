@@ -118,7 +118,6 @@ const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
 const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
 const FAST_UNSUPPORTED_MSG: &str = maki_agent::command::FAST_UNSUPPORTED;
-pub(crate) const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
@@ -696,15 +695,6 @@ impl App {
         }
         self.state.set_fast(fast);
         Ok(())
-    }
-
-    pub(crate) fn model_state(&self) -> serde_json::Value {
-        let model = &self.state.model;
-        serde_json::json!({
-            "spec": model.spec(), "id": model.id, "provider": model.provider.to_string(),
-            "thinking": self.state.thinking.to_string(), "fast": self.state.fast,
-            "supports_thinking": model.supports_thinking(), "supports_fast": model.supports_fast(),
-        })
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {

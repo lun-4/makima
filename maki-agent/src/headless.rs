@@ -115,6 +115,21 @@ fn spawn_with_session_id(
     params: HeadlessParams,
     session_id: MakiId,
 ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
+    spawn_initialized(params, session_id, None)
+}
+
+pub fn spawn_with_provider(
+    params: HeadlessParams,
+    provider: Arc<dyn Provider>,
+) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
+    spawn_initialized(params, MakiId::generate(), Some(provider))
+}
+
+fn spawn_initialized(
+    params: HeadlessParams,
+    session_id: MakiId,
+    initialized_provider: Option<Arc<dyn Provider>>,
+) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = params.input.mode.clone();
     let workflow = params.input.workflow;
@@ -208,18 +223,26 @@ fn spawn_with_session_id(
         async move {
             let event_tx = EventSender::new(raw_tx, 0);
             let mut model = params.model;
-            let provider: Arc<dyn Provider> =
-                match provider::from_model_async(&mut model, params.timeouts).await {
-                    Ok(p) => Arc::from(p),
-                    Err(e) => {
-                        error!(error = %e, "provider error");
-                        let _ = event_tx.send(AgentEvent::ControlError {
-                            message: e.user_message(),
-                        });
-                        let _ = coordinator.close().await;
-                        return;
-                    }
-                };
+            let provider: Arc<dyn Provider> = match async {
+                match initialized_provider {
+                    Some(provider) => Ok(provider),
+                    None => provider::from_model_async(&mut model, params.timeouts)
+                        .await
+                        .map(Arc::from),
+                }
+            }
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(error = %e, "provider error");
+                    let _ = event_tx.send(AgentEvent::ControlError {
+                        message: e.user_message(),
+                    });
+                    let _ = coordinator.close().await;
+                    return;
+                }
+            };
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
@@ -799,7 +822,32 @@ pub struct InteractiveHandle {
     pub task: smol::Task<()>,
 }
 
+pub type ProviderPreparation = Box<
+    dyn FnOnce(
+            Model,
+            Timeouts,
+        ) -> provider::BoxFuture<
+            'static,
+            Result<(Model, Arc<dyn Provider>), crate::AgentError>,
+        > + Send,
+>;
+
 pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
+    spawn_interactive_with_preparation(
+        params,
+        Box::new(|mut model, timeouts| {
+            Box::pin(async move {
+                let provider = provider::from_model_async(&mut model, timeouts).await?;
+                Ok((model, Arc::from(provider)))
+            })
+        }),
+    )
+}
+
+pub fn spawn_interactive_with_preparation(
+    params: InteractiveParams,
+    prepare: ProviderPreparation,
+) -> InteractiveHandle {
     let initial_tools = RequestTools::build(
         ToolRegistry::global(),
         &template::env_vars(),
@@ -882,18 +930,16 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         let file_write_locks = Arc::clone(&file_write_locks);
         let _stream_guard = guard;
         async move {
-            let mut model = params.model;
-            let mut provider: Arc<dyn Provider> =
-                match provider::from_model_async(&mut model, params.timeouts).await {
-                    Ok(p) => Arc::from(p),
-                    Err(e) => {
-                        error!(error = %e, "provider error");
-                        let _ = EventSender::new(raw_tx, 0).send(AgentEvent::ControlError {
-                            message: e.user_message(),
-                        });
-                        return;
-                    }
-                };
+            let (mut model, mut provider) = match prepare(params.model, params.timeouts).await {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    error!(error = %e, "provider error");
+                    let _ = EventSender::new(raw_tx, 0).send(AgentEvent::ControlError {
+                        message: e.user_message(),
+                    });
+                    return;
+                }
+            };
             shared_model.install(Arc::clone(&provider), model.clone());
             let settings = loop {
                 if let Some(settings) = current_interactive_settings(&shared_model, session_id) {
@@ -1486,6 +1532,53 @@ mod tests {
         });
     }
 
+    struct RecordingProvider {
+        name: &'static str,
+        requests: flume::Sender<(&'static str, String, String, bool)>,
+    }
+
+    impl Provider for RecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _: &'a [Message],
+            system: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            options: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, crate::AgentError>,
+        > {
+            Box::pin(async move {
+                self.requests
+                    .send((self.name, model.spec(), system.into(), options.fast))
+                    .unwrap();
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![maki_providers::ContentBlock::Text {
+                            text: self.name.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
     struct TestProvider;
 
     impl maki_providers::provider::Provider for TestProvider {
@@ -1783,7 +1876,10 @@ mod tests {
     }
 
     #[test]
-    fn queued_input_keeps_admission_settings_and_prompt() {
+    fn headless_queued_settings_survive_config_change() {
+        const FIRST: &str = "first provider";
+        const SECOND: &str = "second provider";
+        let (requests, received) = flume::unbounded();
         let params = test_params();
         let (tx, rx) = flume::unbounded();
         let (pending_tx, pending_rx) = flume::unbounded();
@@ -1843,9 +1939,12 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let first_provider: Arc<dyn Provider> = Arc::new(TestProvider);
-        let first_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let later_model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let first_provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+            name: FIRST,
+            requests: requests.clone(),
+        });
+        let first_model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let later_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         sender
             .send_with_settings(
                 test_params().input,
@@ -1871,7 +1970,10 @@ mod tests {
             .send_with_settings(
                 test_params().input,
                 crate::RunSettings {
-                    provider: Arc::new(TestProvider),
+                    provider: Arc::new(RecordingProvider {
+                        name: SECOND,
+                        requests,
+                    }),
                     model: later_model,
                     fast: false,
                     workflow: false,
@@ -1887,15 +1989,135 @@ mod tests {
         assert!(!second.input.fast && !second.input.workflow);
         assert_ne!(first.settings.model.spec(), second.settings.model.spec());
         assert_eq!(
-            first.admission.mode_def.unwrap().system_prompt.as_deref(),
+            first
+                .admission
+                .mode_def
+                .as_ref()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
             Some("before")
         );
         assert_eq!(
-            second.admission.mode_def.unwrap().system_prompt.as_deref(),
+            second
+                .admission
+                .mode_def
+                .as_ref()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
             Some("after")
         );
         assert_eq!(first.prepared.0, "admitted system");
         assert_eq!(second.prepared.0, "admitted system");
+        let expected = [
+            (FIRST, first.settings.model.spec(), first.input.fast),
+            (SECOND, second.settings.model.spec(), second.input.fast),
+        ];
+        smol::block_on(async {
+            let params = test_params();
+            let session_id = MakiId::generate();
+            let spec = params.model.spec();
+            let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+                session_id,
+                catalog: Default::default(),
+                definitions: builtin_option_definitions(
+                    Arc::from(spec.as_str()),
+                    [Arc::from(spec.as_str())],
+                    false,
+                    false,
+                    false,
+                    Default::default(),
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(spec.as_str()),
+                cwd: params.initial_wd.clone(),
+                model_policy: Arc::default(),
+                model_adopter: Arc::new(|_| {
+                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path| {
+                    Box::pin(async move { Ok(path) })
+                        as crate::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint: Arc::new(
+                    |request: maki_storage::checkpoint::CheckpointRequest<
+                        crate::session_coordinator::SessionCheckpoint,
+                    >| {
+                        Box::pin(async move {
+                            Ok(maki_storage::checkpoint::CheckpointAck {
+                                session_id: request.session_id,
+                                version: request.version,
+                            })
+                        }) as maki_storage::checkpoint::CheckpointFuture
+                    },
+                ),
+                mailbox: SessionMailbox::new(session_id),
+            })
+            .unwrap();
+            let handle = spawn_interactive_with_preparation(
+                InteractiveParams {
+                    model: params.model,
+                    config: params.config,
+                    permissions_config: params.permissions_config,
+                    timeouts: params.timeouts,
+                    prompt_slots: Arc::new(params.prompt_slots),
+                    excluded_tools: params.excluded_tools,
+                    mcp_handle: None,
+                    initial_wd: params.initial_wd,
+                    session_id: Some(SessionRef::from(session_id)),
+                    initial_history: Vec::new(),
+                    yolo: false,
+                    system_prompt_override: None,
+                    append_system_prompt: None,
+                    defaults: Default::default(),
+                    model_policy: params.model_policy,
+                    modes: params.modes,
+                    question_mode: crate::tools::QuestionMode::Headless,
+                    plugin_rules: params.plugin_rules,
+                    project_config: params.project_config,
+                    local_tools: Default::default(),
+                },
+                Box::new(|model, _| {
+                    Box::pin(
+                        async move { Ok((model, Arc::new(TestProvider) as Arc<dyn Provider>)) },
+                    )
+                }),
+            );
+            handle.input_tx.tx.send(first).unwrap();
+            handle.input_tx.tx.send(second).unwrap();
+            for _ in 0..2 {
+                loop {
+                    let event = smol::future::or(
+                        async { handle.event_rx.recv_async().await.ok() },
+                        async {
+                            smol::Timer::after(std::time::Duration::from_secs(5)).await;
+                            None
+                        },
+                    )
+                    .await
+                    .expect("interactive queued turn did not complete");
+                    match event.event {
+                        AgentEvent::TurnOutcome(outcome) => {
+                            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+                            break;
+                        }
+                        AgentEvent::ControlError { message } => panic!("{message}"),
+                        _ => {}
+                    }
+                }
+            }
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+        for (name, model, fast) in expected {
+            assert_eq!(
+                received.try_recv().unwrap(),
+                (name, model, "admitted system".into(), fast)
+            );
+        }
+        assert!(received.try_recv().is_err());
     }
 
     #[test]

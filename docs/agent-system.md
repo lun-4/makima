@@ -61,6 +61,12 @@ This is producer-side exactly-once terminalization, not durable exactly-once eve
 
 Standalone controls and compaction are not turns. They have no `TurnId`, create no retained outcome, and use control-specific events such as `ControlComplete`, `ControlError`, or `CompactionDone`.
 
+## Configuration ownership
+
+Managed actors own the committed `EffectiveAgentConfig`. Typed changes and admissions share one FIFO; materialized work runs through the separate execution queue. Preparation runs outside actor locks, and completion checks the reserved entry identity before committing or enqueueing work. Active execution does not wait for later configuration preparation.
+
+An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration saves use the existing session format and do not replace history. The user-visible commit, retry, and crash semantics are described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
+
 ## The actor
 
 The actor API is exported from `maki-agent::actor` and re-exported from `maki-agent`.

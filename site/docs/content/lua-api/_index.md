@@ -3385,8 +3385,9 @@ local mode = maki.api.mode.get()
 maki.api.mode.set({name})
 ```
 
-Enters a mode by name; fails when it is not defined. Success is returned
-after the actor accepts the configuration transition.
+Enters a mode by name; fails when it is not defined. Success means the actor
+committed the mode for subsequent admissions, not that saving has finished.
+See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
 
@@ -3502,7 +3503,10 @@ maki.model.set({opts})
 
 Switches the focused session's model, thinking level, or fast mode. Fields
 you leave out stay as they are, so this doubles as a thinking-only switch.
-Answers with the new state, in the same shape `get` returns.
+Answers with the committed state, in the same shape `get` returns. Changes
+apply to subsequent admissions; saving runs asynchronously after commit.
+See [Configuration changes](/docs/modes/#configuration-changes) for save
+warnings, retry behavior, and crash limitations.
 
 **Parameters:**
 
@@ -3900,8 +3904,10 @@ local snapshot, err = maki.session.options({ session = id })
 maki.session.set_option({id}, {value}, {opts?})
 ```
 
-Sets one option explicitly for a live session. Validation, runtime adoption,
-and persistence complete before success is returned.
+Sets one option explicitly for a live session. Managed model, thinking,
+fast, and workflow changes succeed at actor commit; saving is asynchronous.
+Other options retain their existing owner and persistence behavior.
+See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
 
@@ -3971,6 +3977,8 @@ Sets the focused session's thinking mode. `mode` accepts any value
 `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 the choice is also persisted as the global default for new sessions.
+The active session changes at actor commit and is saved asynchronously.
+See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
 

@@ -39,11 +39,6 @@ static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 type RunnerTask = smol::Task<()>;
 
-struct CommitPolicy {
-    config: Option<crate::actor::EffectiveAgentConfig>,
-    ceiling: Option<crate::RunSettings>,
-}
-
 struct Node {
     parent_id: Option<AgentId>,
     root_id: AgentId,
@@ -271,10 +266,7 @@ impl AgentManagerHandle {
             initial_messages,
             shared_messages,
             backend,
-            CommitPolicy {
-                config,
-                ceiling: None,
-            },
+            config,
         )
     }
 
@@ -304,7 +296,6 @@ impl AgentManagerHandle {
         E: ToString,
     {
         self.validate_active(current)?;
-        let parent_id = current.agent_id();
         let parent_mode = current.mode.clone().ok_or_else(|| {
             ManagerError::Policy("child delegation requires a parent mode snapshot".into())
         })?;
@@ -316,7 +307,37 @@ impl AgentManagerHandle {
             parent_mode.clone(),
         )
         .with_mode_def(current.mode_def.clone());
-        let inherited_config = Some(inherited_config);
+        self.spawn_child_with_config(
+            current,
+            inherited_config,
+            metadata,
+            initial_messages,
+            shared_messages,
+            factory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_child_with_config<F, E>(
+        &self,
+        current: &CurrentManagedTurn,
+        config: crate::actor::EffectiveAgentConfig,
+        metadata: AgentMetadata,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        factory: F,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
+        self.validate_active(current)?;
+        if matches!(config.mode, crate::AgentMode::Custom(_)) && config.mode_def.is_none() {
+            return Err(ManagerError::Policy(
+                "custom mode requires a resolved definition".into(),
+            ));
+        }
+        let parent_id = current.agent_id();
         let child_id = AgentId::generate();
         let reservation = {
             let mut graph = self.lock_graph();
@@ -419,12 +440,7 @@ impl AgentManagerHandle {
             initial_messages,
             shared_messages,
             backend,
-            CommitPolicy {
-                config: inherited_config.clone(),
-                ceiling: inherited_config
-                    .as_ref()
-                    .map(|config| config.settings.clone()),
-            },
+            Some(config),
         )
     }
 
@@ -632,17 +648,16 @@ impl AgentManagerHandle {
         initial_messages: Vec<Message>,
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
-        policy: CommitPolicy,
+        config: Option<crate::actor::EffectiveAgentConfig>,
     ) -> Result<AgentRef, ManagerError> {
-        let admission =
-            ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id, policy.ceiling);
+        let admission = ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id);
         let (actor, task) = AgentActorHandle::spawn_managed(
             agent_id,
             initial_messages,
             shared_messages,
             backend,
             admission,
-            policy.config,
+            config,
         );
         let manager = Arc::downgrade(&self.0);
         let task = smol::spawn(async move {
@@ -805,16 +820,6 @@ impl AgentManagerHandle {
         agent_id: AgentId,
     ) -> Result<Option<Arc<crate::actor::EffectiveAgentConfig>>, ManagerError> {
         Ok(self.actor(agent_id)?.effective_config())
-    }
-
-    pub fn update_policy(
-        &self,
-        agent_id: AgentId,
-        policy: crate::RunSettings,
-    ) -> Result<u64, ManagerError> {
-        self.actor(agent_id)?
-            .update_policy(policy)
-            .map_err(|error| ManagerError::Policy(error.to_string()))
     }
 
     pub fn node(&self, agent_id: AgentId) -> Result<AgentNodeSnapshot, ManagerError> {

@@ -106,8 +106,9 @@ async fn get(_lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
     }
 }
 
-/// Enters a mode by name; fails when it is not defined. Success is returned
-/// after the actor accepts the configuration transition.
+/// Enters a mode by name; fails when it is not defined. Success means the actor
+/// committed the mode for subsequent admissions, not that saving has finished.
+/// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param name string Mode id ("build", "plan", or a custom name).
 /// @return (boolean, string|nil) `true` on success, or nil and an error.

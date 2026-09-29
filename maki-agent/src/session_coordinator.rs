@@ -16,6 +16,7 @@ use maki_storage::id::MakiId;
 use thiserror::Error;
 
 use crate::SessionMailbox;
+use crate::actor::EffectiveAgentConfig;
 use crate::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, FreeValueDomain, MODEL_OPTION_ID,
     SessionOptionCategory, SessionOptionDefinition, SessionOptionError, SessionOptionOwner,
@@ -84,6 +85,44 @@ pub enum SessionCoordinatorError {
     DirectoryRollback(Arc<str>),
 }
 
+#[derive(Clone)]
+pub struct CommittedConfigProjection {
+    pub runtime: Arc<()>,
+    pub generation: u64,
+    pub runtime_epoch: u64,
+    pub config: Arc<EffectiveAgentConfig>,
+}
+
+impl std::fmt::Debug for CommittedConfigProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommittedConfigProjection")
+            .field("generation", &self.generation)
+            .field("runtime_epoch", &self.runtime_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct ConfigProjectionObserver {
+    pub options: SessionOptionsSnapshot,
+    session_id: MakiId,
+    version: CheckpointVersion,
+    checkpoint: CheckpointFuture,
+}
+
+impl ConfigProjectionObserver {
+    pub async fn wait(self) -> Result<(), CheckpointError> {
+        let ack = self.checkpoint.await?;
+        if ack.session_id == self.session_id && ack.version == self.version {
+            Ok(())
+        } else {
+            Err(CheckpointError::Save {
+                session_id: self.session_id,
+                message: Arc::from("checkpoint acknowledgement did not match request"),
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionCheckpoint {
     /// `None` when the operation being checkpointed does not change history,
@@ -94,6 +133,7 @@ pub struct SessionCheckpoint {
     pub model: Arc<str>,
     pub cwd: PathBuf,
     pub options: SessionOptionsSnapshot,
+    pub config: Option<CommittedConfigProjection>,
 }
 
 #[derive(Clone)]
@@ -194,6 +234,7 @@ struct CoordinatorState {
     cwd: PathBuf,
     checkpoint_revision: u64,
     history_revision: u64,
+    committed_config: Option<CommittedConfigProjection>,
 }
 
 pub struct SessionCoordinatorParams {
@@ -219,74 +260,9 @@ struct PreparedPluginOptions {
     candidate: crate::session_options::SessionOptionsCandidate,
 }
 
-struct PreparedPolicyOptions {
-    previous: SessionOptionsSnapshot,
-    candidate: crate::session_options::SessionOptionsCandidate,
-    snapshot: SessionOptionsSnapshot,
-}
-
 enum PluginOptionDecision {
     Commit(flume::Sender<Result<(), SessionCoordinatorError>>),
     Abort(flume::Sender<Result<(), SessionCoordinatorError>>),
-}
-
-enum PolicyOptionDecision {
-    Commit(flume::Sender<Result<SessionOptionsSnapshot, SessionCoordinatorError>>),
-    Abort(flume::Sender<Result<(), SessionCoordinatorError>>),
-}
-
-pub struct PreparedPolicyOption {
-    session_id: MakiId,
-    snapshot: SessionOptionsSnapshot,
-    decision: Option<flume::Sender<PolicyOptionDecision>>,
-}
-
-impl Drop for PreparedPolicyOption {
-    fn drop(&mut self) {
-        let Some(decision) = self.decision.take() else {
-            return;
-        };
-        if decision
-            .try_send(PolicyOptionDecision::Abort(flume::bounded(1).0))
-            .is_err()
-        {
-            tracing::warn!(session = %self.session_id, "failed to queue policy option rollback on drop");
-        }
-    }
-}
-
-impl PreparedPolicyOption {
-    pub fn snapshot(&self) -> &SessionOptionsSnapshot {
-        &self.snapshot
-    }
-
-    pub async fn commit(mut self) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
-        let (reply, response) = flume::bounded(1);
-        self.decision
-            .take()
-            .ok_or(SessionCoordinatorError::StaleSession(self.session_id))?
-            .send_async(PolicyOptionDecision::Commit(reply))
-            .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
-        response
-            .recv_async()
-            .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?
-    }
-
-    pub async fn abort(mut self) -> Result<(), SessionCoordinatorError> {
-        let (reply, response) = flume::bounded(1);
-        self.decision
-            .take()
-            .ok_or(SessionCoordinatorError::StaleSession(self.session_id))?
-            .send_async(PolicyOptionDecision::Abort(reply))
-            .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
-        response
-            .recv_async()
-            .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?
-    }
 }
 
 enum Operation {
@@ -327,12 +303,9 @@ enum Operation {
         prepared: flume::Sender<Result<PreparedPluginOptions, SessionCoordinatorError>>,
         decision: flume::Receiver<PluginOptionDecision>,
     },
-    PreparePolicyOption {
-        id: Arc<str>,
-        value: Arc<str>,
-        version: Option<u64>,
-        prepared: flume::Sender<Result<PreparedPolicyOptions, SessionCoordinatorError>>,
-        decision: flume::Receiver<PolicyOptionDecision>,
+    ProjectCommittedConfig {
+        projection: CommittedConfigProjection,
+        reply: flume::Sender<Result<ConfigProjectionObserver, SessionCoordinatorError>>,
     },
     Close {
         reply: flume::Sender<()>,
@@ -566,6 +539,10 @@ impl SessionCoordinatorHandle {
         self.session_id
     }
 
+    pub fn runtime_epoch(&self) -> u64 {
+        self.generation
+    }
+
     pub fn mailbox(&self) -> Result<SessionMailbox, SessionCoordinatorError> {
         let directory = lock(&DIRECTORY);
         directory
@@ -597,45 +574,30 @@ impl SessionCoordinatorHandle {
         self.set_option_if_version(id, value, None).await
     }
 
-    pub async fn prepare_policy_option(
+    pub async fn project_committed_config(
         &self,
-        id: impl Into<Arc<str>>,
-        value: impl Into<Arc<str>>,
-        version: Option<u64>,
-    ) -> Result<PreparedPolicyOption, SessionCoordinatorError> {
+        runtime: Arc<()>,
+        generation: u64,
+        config: Arc<EffectiveAgentConfig>,
+    ) -> Result<ConfigProjectionObserver, SessionCoordinatorError> {
         self.ensure_live()?;
-        let id = id.into();
-        if !matches!(
-            id.as_ref(),
-            FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID
-        ) {
-            return Err(SessionOptionError::InvalidValue {
-                id,
-                value: Arc::from("not a staged policy option"),
-            }
-            .into());
-        }
-        let (prepared, response) = flume::bounded(1);
-        let (decision, decision_rx) = flume::bounded(1);
+        let (reply, response) = flume::bounded(1);
         self.tx
-            .send_async(Operation::PreparePolicyOption {
-                id,
-                value: value.into(),
-                version,
-                prepared,
-                decision: decision_rx,
+            .send_async(Operation::ProjectCommittedConfig {
+                projection: CommittedConfigProjection {
+                    runtime,
+                    generation,
+                    runtime_epoch: self.generation,
+                    config,
+                },
+                reply,
             })
             .await
             .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
-        let staged = response
+        response
             .recv_async()
             .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))??;
-        Ok(PreparedPolicyOption {
-            session_id: self.session_id,
-            snapshot: staged.snapshot,
-            decision: Some(decision),
-        })
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?
     }
 
     pub async fn set_option_if_version(
@@ -835,6 +797,7 @@ impl PreparedSessionCoordinator {
                 cwd,
                 checkpoint_revision: 0,
                 history_revision: 0,
+                committed_config: None,
             })),
         };
         let (tx, rx) = flume::unbounded();
@@ -1066,6 +1029,68 @@ struct CoordinatorCtx {
     checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
 }
 
+fn project_committed_config(
+    ctx: &CoordinatorCtx,
+    projection: CommittedConfigProjection,
+) -> Result<ConfigProjectionObserver, SessionCoordinatorError> {
+    {
+        let state = lock(&ctx.read.state);
+        if projection.runtime_epoch != ctx.generation
+            || state.committed_config.as_ref().is_some_and(|current| {
+                !Arc::ptr_eq(&current.runtime, &projection.runtime)
+                    || projection.generation < current.generation
+                    || (projection.generation == current.generation
+                        && !Arc::ptr_eq(&current.config, &projection.config))
+            })
+        {
+            return Err(SessionCoordinatorError::StaleSession(ctx.session_id));
+        }
+    }
+    let config = &projection.config;
+    let model: Arc<str> = Arc::from(config.model.spec());
+    let boolean = |value| if value { ENABLED_VALUE } else { DISABLED_VALUE };
+    let candidate = ctx.read.options.prepare_actor_config(
+        &model,
+        boolean(config.fast),
+        &config.thinking.to_string(),
+        Some(boolean(config.workflow)),
+    )?;
+    let options = match candidate {
+        Some(candidate) => ctx.read.options.commit(candidate)?,
+        None => ctx.read.options(),
+    };
+    let (version, cwd) = {
+        let mut state = lock(&ctx.read.state);
+        state.model = Arc::clone(&model);
+        state.committed_config = Some(projection.clone());
+        state.checkpoint_revision += 1;
+        (
+            CheckpointVersion {
+                revision: state.checkpoint_revision,
+                epoch: options.version,
+            },
+            state.cwd.clone(),
+        )
+    };
+    let checkpoint = ctx.checkpoint.checkpoint(CheckpointRequest {
+        session_id: ctx.session_id,
+        version,
+        snapshot: Arc::new(SessionCheckpoint {
+            history: None,
+            model,
+            cwd,
+            options: options.clone(),
+            config: Some(projection),
+        }),
+    });
+    Ok(ConfigProjectionObserver {
+        options,
+        session_id: ctx.session_id,
+        version,
+        checkpoint,
+    })
+}
+
 fn defers_behind_lease(operation: &Operation) -> bool {
     matches!(
         operation,
@@ -1100,8 +1125,8 @@ fn reject_operation(operation: Operation, session_id: MakiId) {
         Operation::PreparePluginOptions { prepared, .. } => {
             let _ = prepared.send(Err(error()));
         }
-        Operation::PreparePolicyOption { prepared, .. } => {
-            let _ = prepared.send(Err(error()));
+        Operation::ProjectCommittedConfig { reply, .. } => {
+            let _ = reply.send(Err(error()));
         }
         Operation::Close { reply } => {
             let _ = reply.send(());
@@ -1178,65 +1203,8 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
             let result = update_model_values(&ctx.read, &*ctx.checkpoint, specs).await;
             let _ = reply.send(result);
         }
-        Operation::PreparePolicyOption {
-            id,
-            value,
-            version,
-            prepared,
-            decision,
-        } => {
-            let result = if version.is_some_and(|version| ctx.read.options().version != version) {
-                Err(SessionOptionError::StaleHandle(Arc::from(
-                    "session option snapshot changed during validation",
-                ))
-                .into())
-            } else if id.as_ref() == MODEL_OPTION_ID {
-                Err(SessionOptionError::InvalidValue {
-                    id: Arc::clone(&id),
-                    value: Arc::clone(&value),
-                }
-                .into())
-            } else {
-                prepare_policy_option(&ctx.read, &*ctx.checkpoint, &id, &value).await
-            };
-            let staged = match result {
-                Ok(staged) => staged,
-                Err(error) => {
-                    let _ = prepared.send(Err(error));
-                    return ControlFlow::Continue(());
-                }
-            };
-            if prepared
-                .send(Ok(PreparedPolicyOptions {
-                    snapshot: staged.snapshot.clone(),
-                    previous: staged.previous.clone(),
-                    candidate: staged.candidate.clone(),
-                }))
-                .is_err()
-            {
-                let _ = checkpoint_options(&ctx.read, &*ctx.checkpoint, staged.previous).await;
-                return ControlFlow::Continue(());
-            }
-            match decision.recv_async().await {
-                Ok(PolicyOptionDecision::Commit(reply)) => {
-                    let result = ctx
-                        .read
-                        .options
-                        .commit(staged.candidate)
-                        .map_err(Into::into);
-                    let _ = reply.send(result);
-                }
-                Ok(PolicyOptionDecision::Abort(reply)) => {
-                    let result = checkpoint_options(&ctx.read, &*ctx.checkpoint, staged.previous)
-                        .await
-                        .map(|_| ())
-                        .map_err(Into::into);
-                    let _ = reply.send(result);
-                }
-                Err(_) => {
-                    let _ = checkpoint_options(&ctx.read, &*ctx.checkpoint, staged.previous).await;
-                }
-            }
+        Operation::ProjectCommittedConfig { projection, reply } => {
+            let _ = reply.send(project_committed_config(ctx, projection));
         }
         Operation::PreparePluginOptions {
             plugin,
@@ -1710,6 +1678,7 @@ fn enqueue_checkpoint(
             model,
             cwd,
             options,
+            config: None,
         }),
     });
     (version, ack)
@@ -1984,51 +1953,6 @@ async fn toggle_boolean_option(
         .map(|snapshot| (enabled, snapshot))
 }
 
-async fn prepare_policy_option(
-    read: &SessionReadHandle,
-    checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
-    id: &str,
-    value: &str,
-) -> Result<PreparedPolicyOptions, SessionCoordinatorError> {
-    if id == FAST_OPTION_ID && value == ENABLED_VALUE {
-        let state = lock(&read.state);
-        if !Model::from_spec(&state.model)
-            .is_ok_and(|model| model.supports_fast() || model.fast_pending())
-        {
-            return Err(SessionOptionError::FastUnsupported.into());
-        }
-    }
-    if id == THINKING_OPTION_ID
-        && value
-            .parse::<ThinkingConfig>()
-            .is_ok_and(ThinkingConfig::is_enabled)
-    {
-        let state = lock(&read.state);
-        if !Model::from_spec(&state.model).is_ok_and(|model| model.supports_thinking()) {
-            return Err(SessionOptionError::ThinkingUnsupported.into());
-        }
-    }
-    let previous = read.options.snapshot();
-    let Some(candidate) = read.options.prepare_set(id, value)? else {
-        return Ok(PreparedPolicyOptions {
-            snapshot: previous.clone(),
-            previous,
-            candidate: read.options.unchanged_candidate(),
-        });
-    };
-    let snapshot = SessionOptions::candidate_snapshot(&candidate);
-    let (model, cwd) = {
-        let state = lock(&read.state);
-        (Arc::clone(&state.model), state.cwd.clone())
-    };
-    checkpoint_state(read, checkpoint, None, model, cwd, snapshot.clone()).await?;
-    Ok(PreparedPolicyOptions {
-        previous,
-        candidate,
-        snapshot,
-    })
-}
-
 async fn set_option(
     read: &SessionReadHandle,
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
@@ -2187,7 +2111,12 @@ fn toggle_definition(
 
 #[cfg(test)]
 mod tests {
+    use crate::{AgentMode, RunSettings};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
     use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture};
+    use maki_storage::id::SessionRef;
+    use serde_json::Value;
 
     use super::*;
 
@@ -3070,87 +2999,167 @@ mod tests {
         });
     }
 
-    #[test]
-    fn prepared_policy_option_is_not_published_until_commit() {
-        smol::block_on(async {
-            let id = MakiId::generate();
-            let coordinator =
-                SessionCoordinatorHandle::register(params(id, writer(false))).unwrap();
-            let before = coordinator.read().options();
-            let staged = coordinator
-                .prepare_policy_option(WORKFLOW_OPTION_ID, ENABLED_VALUE, Some(before.version))
-                .await
-                .unwrap();
-            assert_ne!(staged.snapshot(), &before);
-            assert_eq!(coordinator.read().options(), before);
+    struct ProjectionProvider;
 
-            let committed = staged.commit().await.unwrap();
-            assert_eq!(committed, coordinator.read().options());
-            assert_eq!(
-                committed
-                    .options
-                    .iter()
-                    .find(|option| option.definition.id.as_ref() == WORKFLOW_OPTION_ID)
-                    .unwrap()
-                    .current_value
-                    .as_ref(),
-                ENABLED_VALUE
-            );
-            coordinator.close().await.unwrap();
-        });
+    impl Provider for ProjectionProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn projection_config(workflow: bool) -> Arc<EffectiveAgentConfig> {
+        Arc::new(EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::new(ProjectionProvider),
+                model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+                fast: false,
+                workflow,
+                thinking: ThinkingConfig::Off,
+            },
+            AgentMode::Build,
+        ))
     }
 
     #[test]
-    fn aborting_policy_option_restores_checkpoint_without_publishing() {
+    fn committed_projection_under_lease_does_not_wait_for_saves() {
         smol::block_on(async {
-            let id = MakiId::generate();
             let saved = Arc::new(Mutex::new(Vec::new()));
             let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new({
                 let saved = Arc::clone(&saved);
                 move |request: CheckpointRequest<SessionCheckpoint>| {
-                    lock(&saved).push(request.snapshot.options.clone());
-                    Box::pin(async move {
-                        Ok(CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
-                    }) as CheckpointFuture
+                    lock(&saved).push(request.snapshot);
+                    Box::pin(std::future::pending()) as CheckpointFuture
                 }
             });
-            let coordinator = SessionCoordinatorHandle::register(params(id, checkpoint)).unwrap();
-            let before = coordinator.read().options();
-            coordinator
-                .prepare_policy_option(WORKFLOW_OPTION_ID, ENABLED_VALUE, Some(before.version))
-                .await
-                .unwrap()
-                .abort()
+            let coordinator =
+                SessionCoordinatorHandle::register(params(MakiId::generate(), checkpoint)).unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            let runtime = Arc::new(());
+            let first = coordinator
+                .project_committed_config(Arc::clone(&runtime), 1, projection_config(true))
                 .await
                 .unwrap();
-
-            assert_eq!(coordinator.read().options(), before);
+            assert_eq!(first.options, coordinator.read().options());
+            let second = coordinator
+                .project_committed_config(Arc::clone(&runtime), 2, projection_config(false))
+                .await
+                .unwrap();
+            assert_eq!(second.options, coordinator.read().options());
+            assert!(
+                coordinator
+                    .project_committed_config(Arc::clone(&runtime), 1, projection_config(true))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                coordinator
+                    .project_committed_config(Arc::new(()), 3, projection_config(true))
+                    .await
+                    .is_err()
+            );
             {
-                let checkpoints = lock(&saved);
-                assert_eq!(checkpoints.len(), 2);
-                assert_eq!(checkpoints[1], before);
+                let saved = lock(&saved);
+                assert_eq!(saved.len(), 2);
+                assert!(saved.iter().all(|snapshot| snapshot.history.is_none()));
+                assert_eq!(saved[1].config.as_ref().unwrap().generation, 2);
             }
+            drop(lease);
             coordinator.close().await.unwrap();
         });
     }
 
     #[test]
-    fn policy_option_prepare_failure_does_not_publish() {
+    fn committed_projection_preserves_yolo_plugin_values_and_catalog() {
         smol::block_on(async {
-            let id = MakiId::generate();
-            let coordinator = SessionCoordinatorHandle::register(params(id, writer(true))).unwrap();
+            let catalog = SessionOptionCatalog::default();
+            let coordinator = register_with_catalog(MakiId::generate(), writer(false), &catalog);
+            catalog
+                .replace_plugin_options("test", vec![plugin_option(1, &["a", "b"], "a")])
+                .await
+                .unwrap();
+            coordinator.set_option("test.choice", "b").await.unwrap();
+            coordinator
+                .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                .await
+                .unwrap();
             let before = coordinator.read().options();
+            let observer = coordinator
+                .project_committed_config(Arc::new(()), 1, projection_config(true))
+                .await
+                .unwrap();
+            let after = observer.options.clone();
+            for previous in before.options.iter().filter(|option| {
+                matches!(
+                    option.definition.id.as_ref(),
+                    YOLO_OPTION_ID | "test.choice"
+                )
+            }) {
+                assert_eq!(
+                    after
+                        .options
+                        .iter()
+                        .find(|option| option.definition.id == previous.definition.id),
+                    Some(previous)
+                );
+            }
+            for previous in before
+                .options
+                .iter()
+                .filter(|option| option.definition.id.as_ref() != MODEL_OPTION_ID)
+            {
+                assert_eq!(
+                    after
+                        .options
+                        .iter()
+                        .find(|option| option.definition.id == previous.definition.id)
+                        .unwrap()
+                        .definition,
+                    previous.definition
+                );
+            }
+            let model = after
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == MODEL_OPTION_ID)
+                .unwrap();
+            assert!(
+                model
+                    .definition
+                    .values
+                    .iter()
+                    .any(|value| value.value.as_ref() == "test/model")
+            );
+            observer.wait().await.unwrap();
+            coordinator.close().await.unwrap();
+        });
+    }
 
-            assert!(matches!(
-                coordinator
-                    .prepare_policy_option(WORKFLOW_OPTION_ID, ENABLED_VALUE, Some(before.version))
-                    .await,
-                Err(SessionCoordinatorError::Checkpoint(_))
-            ));
-            assert_eq!(coordinator.read().options(), before);
+    #[test]
+    fn failed_committed_projection_checkpoint_does_not_roll_back() {
+        smol::block_on(async {
+            let coordinator =
+                SessionCoordinatorHandle::register(params(MakiId::generate(), writer(true)))
+                    .unwrap();
+            let observer = coordinator
+                .project_committed_config(Arc::new(()), 1, projection_config(true))
+                .await
+                .unwrap();
+            let committed = observer.options.clone();
+            assert!(observer.wait().await.is_err());
+            assert_eq!(coordinator.read().options(), committed);
             coordinator.close().await.unwrap();
         });
     }

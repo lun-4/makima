@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::actor::{
-    ActorBackend, ActorLifecycle, ActorStatus, BackendResult, TurnContext, WorkKind,
+    ActorBackend, ActorLifecycle, ActorStatus, BackendResult, EffectiveAgentConfig, TurnContext,
+    WorkKind,
 };
 use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
@@ -24,7 +25,8 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
     AgentRunParams, EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, RunLedger,
-    SubagentCancel, SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId, TurnOutcome,
+    RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId,
+    TurnOutcome,
 };
 use maki_config::ToolKey;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
@@ -48,8 +50,12 @@ use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::CANCELLED_MSG;
 
+const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admitted configuration";
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+
+pub type SessionProviderPreparer =
+    Arc<dyn Fn(Model) -> Result<(Model, Arc<dyn provider::Provider>), String> + Send + Sync>;
 
 /// Build the `(model, provider)` pair that backs a `maki.agent.session` spawn.
 /// `inherit_provider` (or an absent `model_spec`) reuses the parent model and
@@ -60,6 +66,7 @@ async fn build_session_provider(
     model_spec: &Option<String>,
     inherit_provider: bool,
     agent_ctx: &AgentContext,
+    prepare: Option<SessionProviderPreparer>,
 ) -> Result<(Model, Arc<dyn provider::Provider>), String> {
     if inherit_provider || model_spec.is_none() {
         Ok((
@@ -70,6 +77,9 @@ async fn build_session_provider(
         let spec = model_spec.as_deref().expect("model_spec present");
         let mut m = Model::from_spec_with_policy(spec, &agent_ctx.model_policy)
             .map_err(|e| e.to_string())?;
+        if let Some(prepare) = prepare {
+            return prepare(m);
+        }
         let p = provider::from_model_async(&mut m, agent_ctx.timeouts)
             .await
             .map_err(|e| e.to_string())?;
@@ -273,12 +283,14 @@ impl Drop for LuaActorBackend {
 impl ActorBackend for LuaActorBackend {
     fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
         let state = Arc::clone(&self.state);
-        Some(Arc::new(move |_input, mode| {
+        Some(Arc::new(move |_input, mode, config| {
             let params = state
                 .params
                 .get()
                 .expect("session parameters initialized before admission");
-            let mode_def = if *mode == state.mode {
+            let mode_def = if let Some(config) = config {
+                config.mode_def.clone().map(Arc::new)
+            } else if *mode == state.mode {
                 state.mode_def.clone().or_else(|| match mode {
                     AgentMode::Custom(id) => params.modes.get(id).map(Arc::new),
                     _ => Some(Arc::new(params.modes.current(mode))),
@@ -303,7 +315,7 @@ impl ActorBackend for LuaActorBackend {
         &'a mut self,
         history: &'a mut History,
         context: TurnContext,
-        input: AgentInput,
+        mut input: AgentInput,
         _work: WorkKind,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
@@ -315,6 +327,20 @@ impl ActorBackend for LuaActorBackend {
             // keeping `sub_tx` alive, and `Agent::run` emits through it.
             let event_tx = state.chip_event_tx.clone();
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
+            if context.managed_turn.is_some() && context.policy.is_none() {
+                state.present_result(
+                    turn_id,
+                    AdapterResult {
+                        text: String::new(),
+                        captured: None,
+                        error: Some(MANAGED_POLICY_MISSING_ERR.to_owned()),
+                    },
+                );
+                return BackendResult::SetupFailed {
+                    agent_id: context.agent_id,
+                    turn_id,
+                };
+            }
             state.init_subagent_info(&input.message);
             info!(
                 agent_id = %context.agent_id,
@@ -364,6 +390,14 @@ impl ActorBackend for LuaActorBackend {
                 .get()
                 .expect("session parameters must be initialized before admission")
                 .clone();
+            if let Some(config) = &context.policy {
+                params.provider = Arc::clone(&config.provider);
+                params.model = config.model.clone();
+                input.mode = config.mode.clone();
+                input.thinking = config.thinking;
+                input.fast = config.fast;
+                input.workflow = config.workflow;
+            }
             params.managed_turn = context.managed_turn.clone();
             let mut agent = Agent::new(
                 params,
@@ -1008,8 +1042,11 @@ async fn session(
             .transpose()?
     };
 
+    let prepare = lua
+        .app_data_ref::<SessionProviderPreparer>()
+        .map(|p| Arc::clone(&p));
     let (model, provider): (Model, Arc<dyn provider::Provider>) =
-        try_pair!(build_session_provider(&model_spec, inherit_provider, &agent_ctx).await);
+        try_pair!(build_session_provider(&model_spec, inherit_provider, &agent_ctx, prepare).await);
     if let Some(current) = &managed_turn {
         try_pair!(current.validate_active());
     }
@@ -1144,6 +1181,21 @@ async fn session(
         AgentMode::Build
     };
     let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
+    let initial_config = EffectiveAgentConfig::new(
+        RunSettings {
+            provider: Arc::clone(&provider),
+            model: model.clone(),
+            thinking: opts.thinking,
+            fast: opts.fast,
+            workflow: false,
+        },
+        child_mode.clone(),
+    )
+    .with_mode_def(if inherit_parent_mode {
+        agent_ctx.mode_def.as_deref().cloned()
+    } else {
+        Some(agent_ctx.modes.current(&child_mode))
+    });
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let build_params = |agent_id| AgentParams {
         agent_id,
@@ -1215,7 +1267,8 @@ async fn session(
         presentation: Mutex::new(HashMap::new()),
     });
     let (actor, control) = if let Some(current) = &managed_turn {
-        let child = try_pair!(current.spawn_child(
+        let child = try_pair!(current.spawn_child_with_config(
+            initial_config,
             maki_agent::AgentMetadata {
                 label: (!name.is_empty()).then_some(name.clone()),
                 spawned_by_tool_use_id: agent_ctx.tool_use_id.clone(),
@@ -1948,6 +2001,7 @@ mod tests {
             &Some("anthropic/claude-opus-4-20250514".into()),
             true,
             &agent,
+            None,
         ))
         .unwrap();
 
@@ -1964,7 +2018,8 @@ mod tests {
         let parent_provider = Arc::clone(&ctx.provider);
         let agent = AgentContext::from(&ctx);
 
-        let (_, provider) = smol::block_on(build_session_provider(&None, false, &agent)).unwrap();
+        let (_, provider) =
+            smol::block_on(build_session_provider(&None, false, &agent, None)).unwrap();
         assert!(Arc::ptr_eq(&provider, &parent_provider));
     }
 
@@ -2264,6 +2319,82 @@ mod tests {
             .unwrap()
     }
 
+    struct MissingPolicyBackend(LuaActorBackend);
+
+    impl ActorBackend for MissingPolicyBackend {
+        fn run_turn<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            mut context: TurnContext,
+            input: AgentInput,
+            work: WorkKind,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+        {
+            assert!(context.managed_turn.is_some());
+            context.policy = None;
+            self.0.run_turn(history, context, input, work)
+        }
+
+        fn run_control<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            context: TurnContext,
+            control: &'a maki_agent::ControlWork,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+        {
+            self.0.run_control(history, context, control)
+        }
+
+        fn run_compact<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            context: TurnContext,
+            instructions: Option<&'a str>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+        {
+            self.0.run_compact(history, context, instructions)
+        }
+    }
+
+    #[test]
+    fn managed_missing_policy_returns_visible_failure_without_provider_request() {
+        smol::block_on(async {
+            let provider: Arc<dyn Provider> = Arc::new(HangingProvider);
+            let (_unused_actor, state, _session, _events) =
+                session_with_provider(provider, None, None);
+            let params = state.params.get().unwrap();
+            let config = EffectiveAgentConfig::new(
+                RunSettings {
+                    provider: Arc::clone(&params.provider),
+                    model: params.model.clone(),
+                    thinking: ThinkingConfig::Off,
+                    fast: false,
+                    workflow: false,
+                },
+                AgentMode::Build,
+            );
+            let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+            let root = manager
+                .create_root_with_config(Some(config), Vec::new(), None, |_| {
+                    Ok::<_, String>(Box::new(MissingPolicyBackend(LuaActorBackend::new(
+                        Arc::clone(&state),
+                    ))) as Box<dyn ActorBackend>)
+                })
+                .unwrap();
+            let ticket = admit(&state, &root.actor().unwrap(), "missing policy");
+            let outcome = ticket.wait().await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            let result = state
+                .presentation
+                .lock()
+                .unwrap()
+                .remove(&ticket.turn_id())
+                .unwrap();
+            assert_eq!(result.error.as_deref(), Some(MANAGED_POLICY_MISSING_ERR));
+            manager.shutdown(Duration::from_secs(1)).await;
+        });
+    }
+
     #[test]
     fn send_returns_during_policy_update() {
         smol::block_on(async {
@@ -2272,7 +2403,7 @@ mod tests {
             let provider: Arc<dyn Provider> =
                 Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
             let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
-            let reservation = actor.reserve_policy_update().unwrap();
+            let reservation = actor.reserve_config_update().unwrap();
             let lua = Lua::new();
             let userdata = lua.create_userdata(sess).unwrap();
             assert_eq!(
@@ -2347,7 +2478,7 @@ mod tests {
             let provider: Arc<dyn Provider> =
                 Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
             let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
-            let reservation = actor.reserve_policy_update().unwrap();
+            let reservation = actor.reserve_config_update().unwrap();
             let lua = Lua::new();
             let userdata = lua.create_userdata(sess).unwrap();
             let scope = crate::runtime::TaskScope::detached(&lua);
@@ -2759,7 +2890,19 @@ mod tests {
             Vec::new(),
             Default::default(),
         );
-        let admitted = prepare(&input, &input.mode);
+        let admitted = prepare(&input, &input.mode, None);
+        let params = state.params.get().unwrap();
+        let config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::clone(&params.provider),
+                model: params.model.clone(),
+                thinking: ThinkingConfig::Off,
+                fast: false,
+                workflow: false,
+            },
+            AgentMode::Build,
+        )
+        .with_mode_def(admitted.mode_def.as_deref().cloned());
         modes
             .define(maki_agent::ModeDefSpec {
                 name: "build".into(),
@@ -2768,11 +2911,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
+            prepare(&input, &input.mode, Some(&config))
+                .mode_def
+                .as_deref(),
+            admitted.mode_def.as_deref(),
+        );
+        assert_eq!(
             admitted.mode_def.as_ref().unwrap().system_prompt.as_deref(),
             Some("before")
         );
         assert_eq!(
-            prepare(&input, &input.mode)
+            prepare(&input, &input.mode, None)
                 .mode_def
                 .as_ref()
                 .unwrap()

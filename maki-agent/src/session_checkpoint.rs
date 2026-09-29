@@ -248,6 +248,7 @@ mod tests {
                 model: Arc::from(model),
                 cwd: PathBuf::from("/project"),
                 options: options.snapshot(),
+                config: None,
             }),
         }
     }
@@ -463,6 +464,7 @@ mod tests {
                         model: Arc::from("test/model"),
                         cwd: PathBuf::from("/project"),
                         options: options.snapshot(),
+                        config: None,
                     }),
                 })
                 .await

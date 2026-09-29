@@ -71,18 +71,17 @@ impl ToolAudience {
 pub enum ToolSource {
     Mcp { server: Arc<str> },
     Lua { plugin: Arc<str> },
-    Bundled { plugin: Arc<str> },
 }
 
 impl ToolSource {
     fn is_plugin(&self, name: &str) -> bool {
-        matches!(self, Self::Lua { plugin } | Self::Bundled { plugin } if plugin.as_ref() == name)
+        matches!(self, Self::Lua { plugin } if plugin.as_ref() == name)
     }
 
     pub fn as_log_field(&self) -> Cow<'static, str> {
         match self {
             Self::Mcp { server } => Cow::Owned(format!("mcp:{server}")),
-            Self::Lua { plugin } | Self::Bundled { plugin } => Cow::Owned(format!("lua:{plugin}")),
+            Self::Lua { plugin } => Cow::Owned(format!("lua:{plugin}")),
         }
     }
 }
@@ -262,40 +261,6 @@ pub struct RegisteredTool {
 }
 
 impl RegisteredTool {
-    pub fn is_bundled_read_only(&self) -> bool {
-        self.is_bundled()
-            && matches!(
-                self.name(),
-                "read"
-                    | "glob"
-                    | "grep"
-                    | "index"
-                    | "webfetch"
-                    | "websearch"
-                    | "skill"
-                    | "question"
-                    | "plan_submit"
-                    | "task"
-                    | "todo_write"
-            )
-    }
-
-    pub fn is_bundled_mutation(&self) -> bool {
-        self.is_bundled()
-            && matches!(
-                self.name(),
-                "write" | "edit" | "multiedit" | "edit_lines" | "insert_lines"
-            )
-    }
-
-    fn is_bundled(&self) -> bool {
-        matches!(&self.source, ToolSource::Bundled { plugin }
-            if plugin.as_ref() == self.name()
-                || plugin.as_ref() == "edit"
-                    && matches!(self.name(), "multiedit" | "edit_lines" | "insert_lines")
-                || plugin.as_ref() == "plan_submit_tool" && self.name() == "plan_submit")
-    }
-
     pub fn name(&self) -> &str {
         self.tool.name()
     }
@@ -449,9 +414,7 @@ impl ToolRegistry {
             .load()
             .iter()
             .filter_map(|entry| match &entry.source {
-                ToolSource::Lua { plugin: owner } | ToolSource::Bundled { plugin: owner }
-                    if owner.as_ref() == plugin =>
-                {
+                ToolSource::Lua { plugin: owner } if owner.as_ref() == plugin => {
                     Some((Arc::clone(&entry.tool), entry.source.clone()))
                 }
                 _ => None,
@@ -525,12 +488,7 @@ impl ToolRegistry {
         self.tools.rcu(|current| {
             current
                 .iter()
-                .filter(|t| {
-                    !matches!(
-                        t.source,
-                        ToolSource::Lua { .. } | ToolSource::Bundled { .. }
-                    )
-                })
+                .filter(|t| !matches!(t.source, ToolSource::Lua { .. }))
                 .cloned()
                 .collect::<Vec<_>>()
         });

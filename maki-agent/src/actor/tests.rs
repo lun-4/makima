@@ -2,6 +2,9 @@
 //! through a scripted backend and waits on exact outcome tickets, which
 //! resolve the moment the actor retains the outcome.
 
+#[path = "config_tests.rs"]
+mod config_tests;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -54,10 +57,19 @@ impl Provider for PolicyTestProvider {
     }
 }
 
+fn fast_change(fast: bool) -> super::ConfigChange {
+    super::ConfigChange::Patch(super::ConfigPatch {
+        fast: Some(fast),
+        ..Default::default()
+    })
+}
+
 fn policy(fast: bool) -> crate::RunSettings {
+    let mut model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+    model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
     crate::RunSettings {
         provider: Arc::new(PolicyTestProvider),
-        model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+        model,
         fast,
         workflow: false,
         thinking: Default::default(),
@@ -89,6 +101,7 @@ struct ScriptedBackend {
     gate: Option<Arc<Gate>>,
     outcomes: Mutex<Vec<BackendResult>>,
     preparation: Option<super::AdmissionPreparation>,
+    root_preparation_error: Option<Arc<dyn Fn(u64, String) + Send + Sync>>,
 }
 
 struct Gate {
@@ -130,6 +143,7 @@ impl ScriptedBackend {
             gate: None,
             outcomes: Mutex::new(Vec::new()),
             preparation: None,
+            root_preparation_error: None,
         }
     }
 
@@ -173,6 +187,10 @@ fn default_completed(context: &TurnContext) -> BackendResult {
 }
 
 impl ActorBackend for ScriptedBackend {
+    fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
+        self.root_preparation_error.clone()
+    }
+
     fn admission_preparation(&self) -> Option<super::AdmissionPreparation> {
         self.preparation.clone()
     }
@@ -433,7 +451,7 @@ fn admission_preparation_does_not_hold_actor_state_lock() {
     let (entered_tx, entered_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
     let mut backend = ScriptedBackend::new();
-    backend.preparation = Some(Arc::new(move |_, _| {
+    backend.preparation = Some(Arc::new(move |_, _, _| {
         entered_tx.send(()).unwrap();
         release_rx.recv().unwrap();
         crate::agent::TurnAdmissionSnapshot {
@@ -450,7 +468,11 @@ fn admission_preparation_does_not_hold_actor_state_lock() {
     entered_rx.recv().unwrap();
     handle.close();
     release_tx.send(()).unwrap();
-    assert!(matches!(admission.join().unwrap(), Err(ActorError::Closed)));
+    let ticket = admission.join().unwrap().unwrap();
+    assert!(matches!(
+        smol::block_on(ticket.wait()),
+        TurnOutcome::Cancelled { .. }
+    ));
     smol::block_on(task);
 }
 
@@ -480,7 +502,7 @@ fn queued_turn_keeps_admitted_mode_and_tool_binding() {
         backend.preparation = Some(Arc::new({
             let modes = Arc::clone(&modes);
             let registry = Arc::clone(&registry);
-            move |_, mode| crate::agent::TurnAdmissionSnapshot {
+            move |_, mode, _| crate::agent::TurnAdmissionSnapshot {
                 mode_def: Some(Arc::new(modes.current(mode))),
                 prompt_inputs: None,
                 bindings: Arc::new(crate::tools::TurnToolBindings::capture(
@@ -499,6 +521,12 @@ fn queued_turn_keeps_admitted_mode_and_tool_binding() {
         let second = handle
             .admit_turn(input("second"), None, "second".into())
             .unwrap();
+        let barrier = handle.reserve_config_update().unwrap();
+        barrier.resolve(Err(ActorError::PolicyCancelled)).unwrap();
+        assert!(matches!(
+            barrier.wait().await,
+            Err(ActorError::PolicyCancelled)
+        ));
         modes
             .define(crate::modes::ModeDefSpec {
                 name: "build".into(),
@@ -791,9 +819,16 @@ fn compact_keeps_admitted_policy() {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        handle.update_policy(policy(false)).unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
         handle.push_compact(1, None).unwrap();
-        handle.update_policy(policy(true)).unwrap();
+        let change = handle.reserve_config_update().unwrap();
+        change.resolve(Ok(fast_change(true))).unwrap();
+        change.wait().await.unwrap();
         handle
             .push_control(ControlWork {
                 name: "fence".into(),
@@ -803,7 +838,7 @@ fn compact_keeps_admitted_policy() {
         until(|| state.controls.lock().unwrap().len() == 1).await;
         assert_eq!(
             state.compact_policies.lock().unwrap().as_slice(),
-            &[(Some(false), 1)]
+            &[(Some(false), 0)]
         );
         handle.shutdown();
         task.await;
@@ -1303,10 +1338,19 @@ fn no_op_policy_update_keeps_generation() {
         let backend = ScriptedBackend::new();
         let (handle, task) = spawn(backend);
         let unchanged = policy(false);
-        handle.update_policy(unchanged.clone()).unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                unchanged,
+                AgentMode::Build,
+            ))
+            .unwrap();
         let before = handle.inner.state.lock().unwrap().policy_generation;
-        let reservation = handle.reserve_policy_update().unwrap();
-        reservation.resolve(Ok(unchanged)).unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
+        reservation
+            .resolve(Ok(
+                super::ConfigChange::Patch(super::ConfigPatch::default()),
+            ))
+            .unwrap();
         reservation.wait().await.unwrap();
         assert_eq!(handle.inner.state.lock().unwrap().policy_generation, before);
         handle.close();
@@ -1321,25 +1365,32 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        handle.update_policy(policy(false)).unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
         let a = handle.admit_turn(input("a"), None, "a".into()).unwrap();
         until(|| backend_reached(&handle)).await;
-        let reservation = handle.reserve_policy_update().unwrap();
+        let options = handle.reserve_config_update().unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
         let next = handle.clone();
         let b = next.admit_turn(input("b"), None, "b".into()).unwrap();
         assert!(handle.policy_snapshot().is_some_and(|p| !p.fast));
+        options.resolve(Ok(fast_change(true))).unwrap();
         reservation
-            .resolve_config(Ok(crate::actor::EffectiveAgentConfig::new(
-                policy(true),
-                AgentMode::Plan("plan.md".into()),
-            )))
+            .resolve(Ok(super::ConfigChange::Mode {
+                mode: AgentMode::Plan("plan.md".into()),
+                mode_def: None,
+            }))
             .unwrap();
         gate.open();
         a.wait().await;
         b.wait().await;
         assert_eq!(
             *state.policies.lock().unwrap(),
-            vec![("a".into(), Some(false), 1), ("b".into(), Some(true), 2)]
+            vec![("a".into(), Some(false), 0), ("b".into(), Some(true), 2)]
         );
         assert_eq!(
             handle.effective_config().unwrap().mode,
@@ -1353,11 +1404,12 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
             ]
         );
 
-        let failed = handle.reserve_policy_update().unwrap();
-        assert_eq!(
-            failed.resolve(Err(ActorError::PolicyCancelled)),
+        let failed = handle.reserve_config_update().unwrap();
+        failed.resolve(Err(ActorError::PolicyCancelled)).unwrap();
+        assert!(matches!(
+            failed.wait().await,
             Err(ActorError::PolicyCancelled)
-        );
+        ));
         let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
         c.wait().await;
         assert_eq!(
@@ -1370,12 +1422,18 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
 }
 
 #[test]
-fn compacts_wait_behind_pending_policy_and_follow_the_turns() {
+fn compact_uses_fifo_config() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let reservation = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(true),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
         handle.push_compact(7, Some("compact".into())).unwrap();
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.queued, 1);
@@ -1384,10 +1442,10 @@ fn compacts_wait_behind_pending_policy_and_follow_the_turns() {
             [QueueProjection::Compact(Some("compact".into()))]
         );
         reservation
-            .resolve_config(Ok(crate::actor::EffectiveAgentConfig::new(
-                policy(true),
-                AgentMode::Plan("pinned-plan.md".into()),
-            )))
+            .resolve(Ok(super::ConfigChange::Mode {
+                mode: AgentMode::Plan("pinned-plan.md".into()),
+                mode_def: None,
+            }))
             .unwrap();
         reservation.wait().await.unwrap();
         until(|| observed.compacts.load(Ordering::SeqCst) == 1).await;
@@ -1410,24 +1468,25 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let first = handle.reserve_policy_update().unwrap();
-        let second = handle.reserve_policy_update().unwrap();
-        second
-            .resolve_config(Ok(crate::actor::EffectiveAgentConfig::new(
-                policy(true),
-                AgentMode::Plan("plan.md".into()),
-            )))
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
             .unwrap();
-        assert!(handle.policy_snapshot().is_none());
+        let first = handle.reserve_config_update().unwrap();
+        let second = handle.reserve_config_update().unwrap();
+        second
+            .resolve(Ok(super::ConfigChange::Mode {
+                mode: AgentMode::Plan("plan.md".into()),
+                mode_def: None,
+            }))
+            .unwrap();
+        assert!(!handle.policy_snapshot().unwrap().fast);
         let after = handle
             .admit_turn(input("after"), None, "after".into())
             .unwrap();
-        first
-            .resolve_config(Ok(crate::actor::EffectiveAgentConfig::new(
-                policy(false),
-                AgentMode::Build,
-            )))
-            .unwrap();
+        first.resolve(Ok(fast_change(true))).unwrap();
         after.wait().await;
         assert_eq!(
             state.policies.lock().unwrap()[0],
@@ -1437,12 +1496,12 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
             handle.effective_config().unwrap().mode,
             AgentMode::Plan("plan.md".into())
         );
-        let pending = handle.reserve_policy_update().unwrap();
+        let pending = handle.reserve_config_update().unwrap();
         let cancelled = handle
             .admit_turn(input("cancelled"), None, "cancelled".into())
             .unwrap();
         handle.cancel_existing();
-        pending.resolve(Ok(policy(true))).unwrap();
+        pending.resolve(Ok(fast_change(true))).unwrap();
         pending.wait().await.unwrap();
         assert!(matches!(
             cancelled.wait().await,
@@ -1452,28 +1511,31 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
             .admit_turn(input("cancelled"), None, "cancelled".into())
             .unwrap();
         assert_eq!(after_cancel.wait().await.agent_id(), handle.agent_id());
-        assert_eq!(
-            pending.resolve(Ok(policy(false))),
-            Err(ActorError::PolicyCancelled)
-        );
+        pending.resolve(Ok(fast_change(false))).unwrap();
+        assert!(pending.wait().await.unwrap().config.fast);
         handle.close();
         task.await;
     });
 }
 
 #[test]
-fn cancel_all_does_not_cancel_in_flight_reserved_setter() {
+fn cancel_all_preserves_config_changes() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        handle.update_policy(policy(false)).unwrap();
-        let pending = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let pending = handle.reserve_config_update().unwrap();
         let gate = Gate::new();
         let setter_gate = Arc::clone(&gate);
         let setter = smol::spawn(async move {
             setter_gate.wait().await;
-            pending.resolve(Ok(policy(true)))
+            pending.resolve(Ok(fast_change(true)))
         });
         let deferred = handle
             .admit_turn(input("deferred"), None, "deferred".into())
@@ -1497,7 +1559,7 @@ fn cancel_all_does_not_cancel_in_flight_reserved_setter() {
         next.wait().await;
         assert_eq!(
             state.policies.lock().unwrap()[0],
-            ("next".into(), Some(true), 2)
+            ("next".into(), Some(true), 1)
         );
         handle.close();
         task.await;
@@ -1510,19 +1572,24 @@ fn admissions_between_setters_keep_their_fifo_policy() {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        handle.update_policy(policy(false)).unwrap();
-        let first = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let first = handle.reserve_config_update().unwrap();
         let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
-        let second = handle.reserve_policy_update().unwrap();
+        let second = handle.reserve_config_update().unwrap();
         let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
-        second.resolve(Ok(policy(false))).unwrap();
+        second.resolve(Ok(fast_change(false))).unwrap();
         assert!(b.peek().is_none());
-        first.resolve(Ok(policy(true))).unwrap();
+        first.resolve(Ok(fast_change(true))).unwrap();
         b.wait().await;
         c.wait().await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
-            vec![("b".into(), Some(true), 2), ("c".into(), Some(false), 3)]
+            vec![("b".into(), Some(true), 1), ("c".into(), Some(false), 2)]
         );
         handle.close();
         task.await;
@@ -1535,18 +1602,24 @@ fn first_setter_releases_b_while_second_still_blocks_c() {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let first = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let first = handle.reserve_config_update().unwrap();
         let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
-        let second = handle.reserve_policy_update().unwrap();
+        let second = handle.reserve_config_update().unwrap();
         let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
-        first.resolve(Ok(policy(true))).unwrap();
+        first.resolve(Ok(fast_change(true))).unwrap();
         b.wait().await;
         assert!(c.peek().is_none());
         assert_eq!(
             *observed.policies.lock().unwrap(),
             vec![("b".into(), Some(true), 1)]
         );
-        second.resolve(Ok(policy(false))).unwrap();
+        second.resolve(Ok(fast_change(false))).unwrap();
         c.wait().await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
@@ -1561,7 +1634,7 @@ fn first_setter_releases_b_while_second_still_blocks_c() {
 fn deferred_work_projects_and_removes_without_orphan_tickets() {
     smol::block_on(async {
         let (handle, task) = spawn(ScriptedBackend::new());
-        let reservation = handle.reserve_policy_update().unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
         let removed = handle
             .admit_turn(input("removed"), None, "removed".into())
             .unwrap();
@@ -1629,12 +1702,18 @@ fn admissions_reserve_between_setters() {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let first = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let first = handle.reserve_config_update().unwrap();
         let b = handle.admit_turn(input("b"), None, "b".into()).unwrap();
-        let second = handle.reserve_policy_update().unwrap();
+        let second = handle.reserve_config_update().unwrap();
         let c = handle.admit_turn(input("c"), None, "c".into()).unwrap();
-        second.resolve(Ok(policy(false))).unwrap();
-        first.resolve(Ok(policy(true))).unwrap();
+        second.resolve(Ok(fast_change(false))).unwrap();
+        first.resolve(Ok(fast_change(true))).unwrap();
         b.wait().await;
         c.wait().await;
         assert_eq!(
@@ -1653,7 +1732,12 @@ fn root_batch_and_interrupt_respect_policy_generation() {
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        handle.update_policy(policy(false)).unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
         let active = handle
             .admit_turn(input("active"), None, "active".into())
             .unwrap();
@@ -1670,8 +1754,8 @@ fn root_batch_and_interrupt_respect_policy_generation() {
                 ))
                 .unwrap();
         }
-        let reservation = handle.reserve_policy_update().unwrap();
-        reservation.resolve(Ok(policy(true))).unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
+        reservation.resolve(Ok(fast_change(true))).unwrap();
         handle
             .rush(RootWork::new(
                 input("new"),
@@ -1689,8 +1773,8 @@ fn root_batch_and_interrupt_respect_policy_generation() {
             observed.folds.lock().unwrap().as_slice(),
             &["old", "old too"]
         );
-        assert_eq!(observed.policies.lock().unwrap()[0].2, 1);
-        assert_eq!(observed.policies.lock().unwrap()[1].2, 2);
+        assert_eq!(observed.policies.lock().unwrap()[0].2, 0);
+        assert_eq!(observed.policies.lock().unwrap()[1].2, 1);
         assert_eq!(observed.root_metadata.lock().unwrap()[0].2, "new");
         handle.close();
         task.await;
@@ -1703,7 +1787,13 @@ fn deferred_roots_keep_setter_order() {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let first = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let first = handle.reserve_config_update().unwrap();
         handle
             .rush(RootWork::new(
                 input("b"),
@@ -1714,7 +1804,7 @@ fn deferred_roots_keep_setter_order() {
                 "b".into(),
             ))
             .unwrap();
-        let second = handle.reserve_policy_update().unwrap();
+        let second = handle.reserve_config_update().unwrap();
         handle
             .rush(RootWork::new(
                 input("c"),
@@ -1725,8 +1815,8 @@ fn deferred_roots_keep_setter_order() {
                 "c".into(),
             ))
             .unwrap();
-        second.resolve(Ok(policy(false))).unwrap();
-        first.resolve(Ok(policy(true))).unwrap();
+        second.resolve(Ok(fast_change(false))).unwrap();
+        first.resolve(Ok(fast_change(true))).unwrap();
         until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
@@ -1743,7 +1833,13 @@ fn roots_reserve_between_setters() {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let first = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let first = handle.reserve_config_update().unwrap();
         handle
             .rush(RootWork::new(
                 input("b"),
@@ -1754,7 +1850,7 @@ fn roots_reserve_between_setters() {
                 "b".into(),
             ))
             .unwrap();
-        let second = handle.reserve_policy_update().unwrap();
+        let second = handle.reserve_config_update().unwrap();
         handle
             .rush(RootWork::new(
                 input("c"),
@@ -1765,8 +1861,8 @@ fn roots_reserve_between_setters() {
                 "c".into(),
             ))
             .unwrap();
-        second.resolve(Ok(policy(false))).unwrap();
-        first.resolve(Ok(policy(true))).unwrap();
+        second.resolve(Ok(fast_change(false))).unwrap();
+        first.resolve(Ok(fast_change(true))).unwrap();
         until(|| observed.entered.load(Ordering::SeqCst) == 2).await;
         assert_eq!(
             *observed.policies.lock().unwrap(),
@@ -1783,7 +1879,13 @@ fn targeted_cancel_settles_deferred_turn_before_policy_commit() {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let reservation = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
         let cancelled = handle
             .admit_turn(input("cancelled"), None, "cancelled".into())
             .unwrap();
@@ -1792,7 +1894,7 @@ fn targeted_cancel_settles_deferred_turn_before_policy_commit() {
             cancelled.wait().await,
             TurnOutcome::Cancelled { .. }
         ));
-        reservation.resolve(Ok(policy(true))).unwrap();
+        reservation.resolve(Ok(fast_change(true))).unwrap();
         assert!(observed.policies.lock().unwrap().is_empty());
         handle.close();
         task.await;
@@ -1805,12 +1907,18 @@ fn precancelled_deferred_turn_is_cancelled_after_policy_commit() {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let reservation = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
         handle.cancel_correlation("deferred", TurnCancellationReason::User);
         let ticket = handle
             .admit_turn(input("cancelled"), None, "deferred".into())
             .unwrap();
-        reservation.resolve(Ok(policy(true))).unwrap();
+        reservation.resolve(Ok(fast_change(true))).unwrap();
         assert!(matches!(ticket.wait().await, TurnOutcome::Cancelled { .. }));
         assert!(observed.policies.lock().unwrap().is_empty());
         handle.close();
@@ -1824,8 +1932,13 @@ fn dropped_reservation_releases_async_admission() {
         let backend = ScriptedBackend::new();
         let observed = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        handle.update_policy(policy(false)).unwrap();
-        let reservation = handle.reserve_policy_update().unwrap();
+        handle
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
         let ticket = handle
             .admit_turn(input("after"), None, "after".into())
             .unwrap();
@@ -1834,7 +1947,7 @@ fn dropped_reservation_releases_async_admission() {
         ticket.wait().await;
         assert_eq!(
             observed.policies.lock().unwrap()[0],
-            ("after".into(), Some(false), 1)
+            ("after".into(), Some(false), 0)
         );
         handle.close();
         task.await;
@@ -1845,7 +1958,7 @@ fn dropped_reservation_releases_async_admission() {
 fn close_wakes_policy_waiter() {
     smol::block_on(async {
         let (handle, task) = spawn(ScriptedBackend::new());
-        let reservation = handle.reserve_policy_update().unwrap();
+        let reservation = handle.reserve_config_update().unwrap();
         let ticket = handle
             .admit_turn(input("after"), None, "after".into())
             .unwrap();
@@ -1860,7 +1973,7 @@ fn close_wakes_policy_waiter() {
         ));
         assert_eq!(handle.outcome(ticket.turn_id()), Some(outcome));
         drop(reservation);
-        assert!(handle.inner.state.lock().unwrap().pending_policy.is_empty());
+        assert!(handle.inner.state.lock().unwrap().operations.is_empty());
         assert!(handle.policy_snapshot().is_none());
         assert!(matches!(
             handle.admit_turn(input("after close"), None, "after close".into()),
@@ -2215,7 +2328,7 @@ fn remove_at_raw_index_terminalizes_real_turn() {
             .admit_turn(input("running"), None, "r1".into())
             .unwrap();
         until(|| backend_reached(&handle)).await;
-        handle.update_policy(policy(false)).unwrap();
+
         let t2 = handle
             .admit_turn(input("queued"), None, "r2".into())
             .unwrap();
