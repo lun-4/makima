@@ -22,10 +22,6 @@ local SEPARATOR = "──────"
 
 local rtk_available
 
-local function shell_quote(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
-
 local function unquote(s)
   local q = s:sub(1, 1)
   if (q == '"' or q == "'") and s:sub(-1) == q then
@@ -112,7 +108,11 @@ local function rtk_rewrite(command, ctx)
   end
 
   if rtk_available == nil then
-    local id = makima.fn.jobstart("rtk --version")
+    local ok, id = pcall(makima.fn.jobstart, { "rtk", "--version" })
+    if not ok then
+      rtk_available = false
+      return nil
+    end
     local result = makima.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
     if result then
       rtk_available = (result.exit_code == 0)
@@ -131,7 +131,7 @@ local function rtk_rewrite(command, ctx)
     return nil
   end
 
-  local id = makima.fn.jobstart("rtk rewrite " .. shell_quote(command))
+  local id = makima.fn.jobstart({ "rtk", "rewrite", command })
   local result = makima.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
   if not result then
     makima.fn.jobstop(id)
