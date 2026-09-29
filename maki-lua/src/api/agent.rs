@@ -2293,6 +2293,53 @@ mod tests {
     }
 
     #[test]
+    fn lua_prompt_runs_consecutive_turns_through_actor_backend() {
+        smol::block_on(async {
+            const FIRST_REPLY: &str = "first answer";
+            const SECOND_REPLY: &str = "second answer";
+            let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
+                canned_reply_with_usage(FIRST_REPLY, FIRST_USAGE),
+                canned_reply_with_usage(SECOND_REPLY, SECOND_USAGE),
+            ]));
+            let (actor, _state, sess, _events) = session_with_provider(provider, None, None);
+            let lua = Lua::new();
+            let userdata = lua.create_userdata(sess).unwrap();
+            let scope = crate::runtime::TaskScope::detached(&lua);
+
+            let (first, first_error) = scope
+                .scope_future(prompt(
+                    lua.clone(),
+                    userdata.borrow().unwrap(),
+                    "first request".into(),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(first_error, None);
+            assert_eq!(first.unwrap().get::<String>("text").unwrap(), FIRST_REPLY);
+
+            let (second, second_error) = scope
+                .scope_future(prompt(
+                    lua.clone(),
+                    userdata.borrow().unwrap(),
+                    "follow-up request".into(),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(second_error, None);
+            let second = second.unwrap();
+            assert_eq!(second.get::<String>("text").unwrap(), SECOND_REPLY);
+            assert_eq!(second.get::<u32>("input_tokens").unwrap(), 150);
+            assert_eq!(second.get::<u32>("output_tokens").unwrap(), 30);
+            let Some(TurnOutcome::Completed { usage, .. }) = actor.snapshot().latest else {
+                panic!("expected completed second turn");
+            };
+            assert_eq!(usage, SECOND_USAGE);
+        });
+    }
+
+    #[test]
     fn prompt_survives_policy_update() {
         smol::block_on(async {
             const MESSAGE: &str = "queued prompt";
