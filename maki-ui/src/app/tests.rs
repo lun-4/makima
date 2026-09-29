@@ -2467,7 +2467,7 @@ fn open_task_picker_refreshes_after_tool_done() {
 }
 
 #[test]
-fn open_task_picker_inserts_new_child_without_changing_selection() {
+fn open_task_picker_appends_new_child_without_changing_selection() {
     let mut app = app_with_subagent();
     open_tasks_picker(&mut app);
     app.update(Msg::Key(key(KeyCode::Down)));
@@ -2478,9 +2478,9 @@ fn open_task_picker_inserts_new_child_without_changing_selection() {
         Some("build"),
     ));
 
-    assert_eq!(app.task_picker.item(1).unwrap().name, "build");
-    assert_eq!(app.task_picker.item(2).unwrap().name, "research");
-    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
+    assert_eq!(app.task_picker.item(1).unwrap().name, "research");
+    assert_eq!(app.task_picker.item(2).unwrap().name, "build");
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "research");
 }
 
 #[test]
@@ -2521,6 +2521,99 @@ fn filtered_task_picker_refresh_preserves_selected_chat_identity() {
 
     assert!(app.task_picker.is_open());
     assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
+}
+
+#[test]
+fn filtered_task_picker_appends_higher_ranked_match_until_query_changes() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "build");
+
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "z".into() },
+        "task3",
+        Some("b"),
+    ));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "build");
+    app.update(Msg::Key(key(KeyCode::Down)));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "b");
+
+    app.update(Msg::Key(key(KeyCode::Backspace)));
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "b");
+    app.update(Msg::Key(key(KeyCode::Down)));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "build");
+}
+
+#[test]
+fn task_picker_reopen_restores_default_status_sorting() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    let first_task = app.task_picker.item(1).unwrap().chat_index;
+    app.chats[first_task].mark_finished(DisplayRole::Assistant, "done");
+    app.sync_task_picker();
+    assert_eq!(app.task_picker.item(1).unwrap().chat_index, first_task);
+
+    app.task_picker.close();
+    open_tasks_picker(&mut app);
+    assert_eq!(app.task_picker.item(1).unwrap().finished, Some(false));
+    assert_eq!(app.task_picker.item(2).unwrap().chat_index, first_task);
+}
+
+#[test]
+fn task_picker_refresh_keeps_existing_order_when_status_changes() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    let initial: Vec<_> = (0..3)
+        .map(|index| app.task_picker.item(index).unwrap().name.clone())
+        .collect();
+
+    finish_subagent(&mut app, "task1", false);
+    finish_subagent(&mut app, "task2", false);
+
+    let refreshed: Vec<_> = (0..3)
+        .map(|index| app.task_picker.item(index).unwrap().name.clone())
+        .collect();
+    assert_eq!(refreshed, initial);
+}
+
+#[test]
+fn task_picker_refresh_removes_missing_rows_and_preserves_selection_by_identity() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    app.task_picker
+        .select_item_by(|entry| entry.name == "build");
+    let removed_index = app.chat_index.remove("task1").unwrap();
+    app.chats[removed_index].subagent_id = None;
+    app.chats[removed_index].agent_id = None;
+    app.sync_task_picker();
+
+    let names: Vec<_> = (0..2)
+        .map(|index| app.task_picker.item(index).unwrap().name.clone())
+        .collect();
+    assert_eq!(names, ["Main", "build"]);
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "build");
 }
 
 #[test]

@@ -68,7 +68,7 @@ use crossterm::event::{
 };
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
+    AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
     SharedMessages, SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
@@ -218,11 +218,20 @@ pub(crate) fn turn_response(message: &Message) -> Option<String> {
     )
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum TaskIdentity {
+    Main,
+    Agent(AgentId),
+    Restored(String),
+    Unidentified(usize),
+}
+
 #[derive(Clone)]
 pub(super) struct TaskEntry {
     name: String,
     finished: Option<bool>,
     chat_index: usize,
+    identity: TaskIdentity,
     /// First `SNIPPET_CHARS` of the subagent chat's last message, shown dimly.
     snippet: String,
     context: String,
@@ -897,6 +906,15 @@ impl App {
                 name: chat.name.clone(),
                 finished: (chat_index > 0).then_some(chat.is_finished()),
                 chat_index,
+                identity: if chat_index == 0 {
+                    TaskIdentity::Main
+                } else if let Some(agent_id) = chat.agent_id {
+                    TaskIdentity::Agent(agent_id)
+                } else if let Some(subagent_id) = &chat.subagent_id {
+                    TaskIdentity::Restored(subagent_id.clone())
+                } else {
+                    TaskIdentity::Unidentified(chat_index)
+                },
                 snippet: if chat_index == 0 {
                     String::new()
                 } else {
@@ -932,12 +950,36 @@ impl App {
         let selected = self
             .task_picker
             .selected_item()
-            .map(|entry| entry.chat_index);
-        self.task_picker.replace_items(self.task_entries());
-        if let Some(chat_index) = selected {
+            .map(|entry| entry.identity.clone());
+        let previous = self
+            .task_picker
+            .items()
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| entry.identity.clone())
+            .collect::<Vec<_>>();
+        self.task_picker.replace_items_preserving_order(
+            Self::reconcile_task_entries(&previous, self.task_entries()),
+            |previous, current| previous.identity == current.identity,
+        );
+        if let Some(identity) = selected {
             self.task_picker
-                .select_item_by(|entry| entry.chat_index == chat_index);
+                .select_item_by(|entry| entry.identity == identity);
         }
+    }
+
+    fn reconcile_task_entries(
+        previous: &[TaskIdentity],
+        mut current: Vec<TaskEntry>,
+    ) -> Vec<TaskEntry> {
+        let mut ordered = Vec::with_capacity(current.len());
+        for identity in previous {
+            if let Some(index) = current.iter().position(|entry| &entry.identity == identity) {
+                ordered.push(current.remove(index));
+            }
+        }
+        ordered.extend(current);
+        ordered
     }
 
     fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
