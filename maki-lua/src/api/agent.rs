@@ -2807,6 +2807,27 @@ mod tests {
     }
 
     #[test]
+    fn prompt_result_preserves_partial_text_with_error() {
+        let lua = Lua::new();
+        let (result, error) = build_prompt_result(
+            &lua,
+            AdapterResult {
+                text: "partial output".into(),
+                captured: None,
+                error: Some("provider failed".into()),
+            },
+            TokenUsage::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.unwrap().get::<String>("text").unwrap(),
+            "partial output"
+        );
+        assert_eq!(error.as_deref(), Some("provider failed"));
+    }
+
+    #[test]
     fn prompt_derives_closed_result_from_outcome_when_presentation_missing() {
         let lua = Lua::new();
         let agent_id = AgentId::generate();

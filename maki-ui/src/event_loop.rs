@@ -4565,6 +4565,27 @@ mod tests {
     }
 
     #[test]
+    fn reserved_mode_change_waits_for_lease_before_updating_actor_config() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let original = actor.effective_config().unwrap();
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let reservation = actor.reserve_config_update().unwrap();
+            let mode = maki_agent::AgentMode::Plan(PathBuf::from("/tmp/test-plan.md"));
+            let config =
+                maki_agent::EffectiveAgentConfig::new(original.settings.clone(), mode.clone());
+            reservation.resolve_config(Ok(config)).unwrap();
+
+            drop(lease);
+            reservation.wait().await.unwrap();
+            assert_eq!(actor.effective_config().unwrap().mode, mode);
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
     fn yolo_toggle_commits_while_turn_holds_lease() {
         smol::block_on(async {
             let runtime = test_runtime(model_named("test-model"));

@@ -752,6 +752,17 @@ fn toggle_mode_emits_change_mode_without_mutating_state() {
     assert_eq!(app.state.mode, Mode::Build);
 }
 
+#[test_case(maki_agent::session_options::FAST_OPTION_ID, "fast applies when this turn finishes" ; "fast")]
+#[test_case(maki_agent::session_options::WORKFLOW_OPTION_ID, "workflow applies when this turn finishes" ; "workflow")]
+fn deferred_policy_toggle_shows_applies_notice(id: &str, expected: &str) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+
+    app.apply_toggled_option(id, true);
+
+    assert_eq!(app.status_bar.flash_text(), Some(expected));
+}
+
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]
 #[test_case(ToolOutput::Diff { path: "/tmp/plans/test.md".into(), before: String::new(), after: String::new(), summary: String::new() }, None, true  ; "edit_matching")]
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/other.rs".into()), Some("/tmp/other.rs".into()), false ; "write_non_matching")]
@@ -4200,7 +4211,7 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert!(app.state.session.meta.input_draft.is_none());
     assert!(!session_has_content(&app.state.session));
 
-    app.update(Msg::Key(key(KeyCode::Tab)));
+    app.set_mode_id("plan".into());
     app.checkpoint();
     assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
     assert!(session_has_content(&app.state.session));
@@ -5740,6 +5751,7 @@ fn plan_app() -> App {
         annotation: None,
         written_path: Some("test-plan.md".into()),
     }))));
+    app.update(done_event());
     app
 }
 
@@ -5871,14 +5883,9 @@ fn plan_submit_mode_disables_auto_open() {
     assert!(!app.state.plan.is_ready());
 }
 
-#[test_case(1, Mode::Build, true,  true  ; "clear_and_implement")]
-#[test_case(2, Mode::Build, false, true  ; "implement_keeps_context")]
-fn plan_form_menu_options(
-    downs: usize,
-    expected_mode: Mode,
-    has_new_session: bool,
-    has_send_message: bool,
-) {
+#[test_case(1, true ; "clear_and_implement")]
+#[test_case(2, false ; "implement_keeps_context")]
+fn plan_form_menu_options(downs: usize, has_new_session: bool) {
     let mut app = plan_app();
     assert!(app.plan_form.is_visible());
 
@@ -5886,16 +5893,9 @@ fn plan_form_menu_options(
         app.update(Msg::Key(key(KeyCode::Down)));
     }
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.plan_form.is_visible(), has_new_session);
-    assert_eq!(
-        app.state.mode,
-        if has_new_session {
-            Mode::Plan
-        } else {
-            expected_mode
-        }
-    );
-    assert_eq!(app.state.plan == PlanState::None, !has_new_session);
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.state.plan.is_ready());
     assert_eq!(
         actions
             .iter()
@@ -5903,10 +5903,12 @@ fn plan_form_menu_options(
         has_new_session
     );
     let expected_msg = implement_msg(PlanForm::new().parallel());
-    let immediate = actions
-        .iter()
-        .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg));
-    assert_eq!(immediate, has_send_message && !has_new_session);
+    assert_eq!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::ImplementPlan(message) if message == &expected_msg)),
+        !has_new_session
+    );
     if has_new_session {
         let Action::ReplaceSession(request) = &actions[0] else {
             panic!("expected replacement request");
@@ -5932,7 +5934,7 @@ fn plan_form_implement_toggled_parallel() {
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
+            .any(|a| matches!(a, Action::ImplementPlan(message) if message == &expected_msg))
     );
 }
 

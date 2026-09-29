@@ -2421,8 +2421,8 @@ impl App {
                 return;
             }
         };
-        if id == maki_agent::session_options::FAST_OPTION_ID && self.status == Status::Streaming {
-            self.flash("fast applies when this turn finishes".into());
+        if self.status == Status::Streaming && matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID) {
+            self.flash(format!("{id} applies when this turn finishes"));
         } else {
             self.flash(message.into());
         }
