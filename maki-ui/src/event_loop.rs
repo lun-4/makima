@@ -1220,8 +1220,13 @@ impl SessionRuntime {
     }
 }
 
+type PrepareProvider = Arc<
+    dyn Fn(Model, Timeouts) -> Result<maki_agent::actor::PreparedModel, Arc<str>> + Send + Sync,
+>;
+
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
+    prepare_provider: PrepareProvider,
     storage: StateDir,
     sessions_dir: PathBuf,
     config: AgentConfig,
@@ -1522,11 +1527,12 @@ impl SpawnCtx {
         {
             return Ok(None);
         }
-        let mut model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
-        let provider = from_model(&mut model, self.timeouts).map_err(|error| error.to_string())?;
+        let model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
+        let prepared =
+            (self.prepare_provider)(model, self.timeouts).map_err(|error| error.to_string())?;
         Ok(Some(PreparedProvider {
-            model,
-            provider: Arc::from(provider),
+            model: prepared.model,
+            provider: prepared.provider,
         }))
     }
 
@@ -2011,6 +2017,7 @@ impl<'t> EventLoop<'t> {
         let (mcp_handle, mcp_config_errors) =
             smol::block_on(mcp::start(&cwd, project_config.clone()));
         let ctx = SpawnCtx {
+            prepare_provider: Arc::new(prepare_provider),
             storage,
             sessions_dir: sessions_dir.clone(),
             config,
@@ -4181,6 +4188,7 @@ impl<'t> EventLoop<'t> {
         let internal_tx = self.internal_tx.clone();
         let timeouts = self.ctx.timeouts;
         let policy = Arc::clone(&self.ctx.model_policy);
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
         smol::spawn(async move {
             let result = match reserved {
                 Ok((ticket, expected)) => {
@@ -4194,7 +4202,7 @@ impl<'t> EventLoop<'t> {
                                 }
                                 let model = Model::from_spec(&requested)
                                     .map_err(|error| error.to_string())?;
-                                prepare_provider(model, timeouts).map_err(|error| error.to_string())
+                                prepare(model, timeouts).map_err(|error| error.to_string())
                             })
                             .await?;
                             Ok(if refresh {
@@ -6143,6 +6151,7 @@ mod tests {
             let storage_writer =
                 Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
             let ctx = SpawnCtx {
+                prepare_provider: Arc::new(prepare_provider),
                 storage,
                 sessions_dir,
                 config: AgentConfig::default(),
@@ -6293,6 +6302,202 @@ mod tests {
         assert_eq!(runtime.coordinator.read().model().as_ref(), FOCUSED_MODEL);
         drop(runtime_slot);
         release_runtime(runtime);
+    }
+
+    #[test]
+    fn live_session_requests_remain_independent_during_changes_and_restore() {
+        use maki_agent::actor::PreparedModel;
+        use maki_providers::{RequestOptions, Role, StopReason, StreamResponse};
+
+        const FIRST: &str = "anthropic/claude-opus-4-6";
+        const SECOND: &str = "openai/gpt-5";
+        const THIRD: &str = "anthropic/claude-sonnet-4-6";
+        const PROMPT: &str = "request isolation";
+        const RESPONSE: &str = "complete";
+
+        struct RecordingProvider {
+            name: &'static str,
+            requests: flume::Sender<(&'static str, String, RequestOptions)>,
+            release: flume::Receiver<()>,
+        }
+
+        impl Provider for RecordingProvider {
+            fn stream_message<'a>(
+                &'a self,
+                model: &'a Model,
+                _messages: &'a [Message],
+                _system: &'a str,
+                _tools: &'a serde_json::Value,
+                _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+                opts: RequestOptions,
+                _session_id: Option<&'a SessionRef>,
+            ) -> maki_providers::provider::BoxFuture<
+                'a,
+                Result<StreamResponse, maki_providers::AgentError>,
+            > {
+                Box::pin(async move {
+                    self.requests.send((self.name, model.spec(), opts)).unwrap();
+                    self.release.recv_async().await.unwrap();
+                    Ok(StreamResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![maki_providers::ContentBlock::Text {
+                                text: RESPONSE.into(),
+                            }],
+                            ..Message::user(String::new())
+                        },
+                        usage: TokenUsage::default(),
+                        stop_reason: Some(StopReason::EndTurn),
+                    })
+                })
+            }
+
+            fn list_models(
+                &self,
+            ) -> maki_providers::provider::BoxFuture<
+                '_,
+                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        fn model(spec: &str) -> Model {
+            let mut model = Model::from_spec(spec).unwrap();
+            model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+            model
+        }
+
+        fn send(event_loop: &mut EventLoop<'_>, index: usize) {
+            event_loop.submit_text(index, PROMPT.into()).unwrap();
+        }
+
+        with_event_loop(|event_loop| {
+            let (requests_tx, requests_rx) = flume::unbounded();
+            let mut releases = Vec::new();
+            for spec in [FIRST, SECOND] {
+                let (release, gate) = flume::unbounded();
+                releases.push(release);
+                let mut session = AppSession::new(spec, &event_loop.session_cwd);
+                session.meta.thinking = Some(DomainThinkingConfig::Off.into());
+                session.meta.fast = spec == FIRST;
+                let runtime = event_loop
+                    .ctx
+                    .spawn_runtime_with_provider(
+                        session,
+                        Some(PreparedProvider {
+                            model: model(spec),
+                            provider: Arc::new(RecordingProvider {
+                                name: spec,
+                                requests: requests_tx.clone(),
+                                release: gate,
+                            }),
+                        }),
+                    )
+                    .unwrap();
+                event_loop.push_runtime(runtime);
+            }
+            let first = event_loop.sessions[1].handles.manager_and_root();
+            let first = first.0.actor(first.1).unwrap();
+            let original = first.effective_config().unwrap();
+            let expected = |spec: &str, fast| {
+                RequestOptions {
+                    thinking: DomainThinkingConfig::Off,
+                    fast,
+                }
+                .clamped(&model(spec))
+            };
+            send(event_loop, 1);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                (FIRST, FIRST.into(), expected(FIRST, true))
+            );
+            send(event_loop, 2);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                (SECOND, SECOND.into(), expected(SECOND, false))
+            );
+
+            let (changed_release, changed_gate) = flume::unbounded();
+            let (restored_release, restored_gate) = flume::unbounded();
+            event_loop.ctx.prepare_provider = Arc::new(move |requested, _| {
+                let spec = requested.spec();
+                let (name, release) = match spec.as_str() {
+                    FIRST => ("changed", changed_gate.clone()),
+                    THIRD => ("restored", restored_gate.clone()),
+                    _ => panic!("unexpected provider preparation: {spec}"),
+                };
+                Ok(PreparedModel {
+                    model: model(&spec),
+                    provider: Arc::new(RecordingProvider {
+                        name,
+                        requests: requests_tx.clone(),
+                        release,
+                    }),
+                })
+            });
+            event_loop.set_focused(1);
+            event_loop.change_model(2, FIRST);
+            let completion = event_loop
+                .internal_rx
+                .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+                .unwrap();
+            assert!(
+                matches!(&completion, InternalEvent::SessionOp { session, result: Ok(()), .. } if *session == event_loop.sessions[2].id())
+            );
+            event_loop.handle_internal(completion);
+            let _ = event_loop.tick();
+            releases[1].send(()).unwrap();
+            send(event_loop, 2);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                ("changed", FIRST.into(), expected(FIRST, false))
+            );
+
+            let mut stored = AppSession::new(THIRD, &event_loop.session_cwd);
+            stored.meta.thinking = Some(DomainThinkingConfig::Off.into());
+            stored.push_message(Message::user(PROMPT.into()));
+            stored.save(&event_loop.ctx.storage).unwrap();
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            event_loop.handle_session_request(
+                SessionRequest::Focus {
+                    id: stored.id.to_string(),
+                },
+                reply_tx,
+            );
+            assert_eq!(
+                reply_rx
+                    .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+                    .unwrap()
+                    .unwrap(),
+                json!(true)
+            );
+            let _ = event_loop.tick();
+            let restored_index = event_loop.position(stored.id).unwrap();
+            assert_eq!(event_loop.focused, restored_index);
+            assert_eq!(event_loop.sessions.len(), 4);
+            assert_eq!(event_loop.sessions[2].app.state.session.model, FIRST);
+            send(event_loop, restored_index);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                ("restored", THIRD.into(), expected(THIRD, false))
+            );
+            assert!(Arc::ptr_eq(&original, &first.effective_config().unwrap()));
+            assert_eq!(
+                event_loop.sessions[1].coordinator.read().model().as_ref(),
+                FIRST
+            );
+            assert_eq!(event_loop.sessions[1].model_slot.load().model.spec(), FIRST);
+            releases[0].send(()).unwrap();
+            send(event_loop, 1);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                (FIRST, FIRST.into(), expected(FIRST, true))
+            );
+            releases[0].send(()).unwrap();
+            changed_release.send(()).unwrap();
+            restored_release.send(()).unwrap();
+        });
     }
 
     #[test]
