@@ -1454,6 +1454,11 @@ enum SessionOpKind {
         id: &'static str,
         committed: Arc<std::sync::Mutex<Option<bool>>>,
     },
+    ModeChanged {
+        id: String,
+        plan: crate::app::mode::PlanState,
+        follow_up: Option<String>,
+    },
     /// `/cd`: apply the canonical path the coordinator resolved, which is not
     /// necessarily the one that was typed.
     DirectoryChanged {
@@ -2950,6 +2955,63 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
+    fn dispatch_mode_change(&self, idx: usize, id: String, follow_up: Option<String>) {
+        let session = self.sessions[idx].id();
+        let mut plan = self.sessions[idx].app.state.plan.clone();
+        if id == "plan" {
+            plan.allocate_path(&self.ctx.storage);
+        }
+        let mode = match id.as_str() {
+            "build" => maki_agent::AgentMode::Build,
+            "plan" => plan
+                .path()
+                .map(|path| maki_agent::AgentMode::Plan(path.to_path_buf()))
+                .unwrap_or_default(),
+            name => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(name))),
+        };
+        let mode_def = self.ctx.lua_event_handle.mode_registry().current(&mode);
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        let reservation = manager
+            .actor(root)
+            .map_err(|error| error.to_string())
+            .and_then(|actor| {
+                let config = actor.effective_config();
+                let reservation = actor
+                    .reserve_config_update()
+                    .map_err(|error| error.to_string())?;
+                Ok((reservation, config))
+            });
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = match reservation {
+                Ok((reservation, Some(current))) => {
+                    let config =
+                        maki_agent::EffectiveAgentConfig::new(current.settings.clone(), mode)
+                            .with_mode_def(Some(mode_def));
+                    match reservation.resolve_config(Ok(config)) {
+                        Ok(()) => reservation.wait().await.map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                Ok((reservation, None)) => {
+                    let _ = reservation.cancel();
+                    Err("actor has no effective agent configuration".to_owned())
+                }
+                Err(error) => Err(error),
+            };
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                kind: SessionOpKind::ModeChanged {
+                    id,
+                    plan,
+                    follow_up,
+                },
+                result,
+            });
+        })
+        .detach();
+    }
+
     /// Lua acts on the focused session, the same target the model picker and
     /// `/thinking` write to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
@@ -3529,6 +3591,10 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
+            Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode, None),
+            Action::ImplementPlan(text) => {
+                self.dispatch_mode_change(idx, "build".into(), Some(text));
+            }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
@@ -3635,7 +3701,8 @@ impl<'t> EventLoop<'t> {
                 .map(Some),
             SessionOpKind::OptionToggled { .. }
             | SessionOpKind::LuaOptionSet { .. }
-            | SessionOpKind::LuaModeSet { .. } => Ok(None),
+            | SessionOpKind::LuaModeSet { .. }
+            | SessionOpKind::ModeChanged { .. } => Ok(None),
         };
         let model_slot = Arc::clone(&self.sessions[idx].model_slot);
         let coordinator = self.sessions[idx].coordinator.clone();
@@ -3723,6 +3790,26 @@ impl<'t> EventLoop<'t> {
                         .take()
                     {
                         self.sessions[idx].app.apply_toggled_option(id, enabled);
+                    }
+                }
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
+            SessionOpKind::ModeChanged {
+                id,
+                plan,
+                follow_up,
+            } => match result {
+                Ok(()) => {
+                    let app = &mut self.sessions[idx].app;
+                    if id == "plan" {
+                        app.state.plan = plan;
+                    } else if id == "build" {
+                        app.state.plan = crate::app::mode::PlanState::None;
+                    }
+                    app.set_mode_id(id);
+                    if let Some(message) = follow_up {
+                        let actions = app.start_plan_implementation(message);
+                        self.dispatch(idx, actions);
                     }
                 }
                 Err(error) => self.sessions[idx].app.flash(error),

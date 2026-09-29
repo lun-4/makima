@@ -743,37 +743,13 @@ fn standalone_compaction_returns_to_idle_without_ending_the_session() {
 }
 
 #[test]
-fn toggle_mode_state_machine() {
-    let tab = |app: &mut App| app.update(Msg::Key(key(KeyCode::Tab)));
-
+fn toggle_mode_emits_change_mode_without_mutating_state() {
     let mut app = test_app();
     assert_eq!(app.state.mode, Mode::Build);
 
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    let first_path = app.state.plan.path().unwrap().to_path_buf();
-    assert!(first_path.to_str().unwrap().contains("plans"));
-
-    tab(&mut app);
+    let actions = app.update(Msg::Key(key(KeyCode::Tab)));
+    assert!(matches!(&actions[..], [Action::ChangeMode(id)] if id == "plan"));
     assert_eq!(app.state.mode, Mode::Build);
-    assert!(!app.state.plan.is_ready());
-
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
-
-    app.state.plan.mark_ready();
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Build);
-    assert!(app.state.plan.is_ready());
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
-
-    app.state.mode = Mode::Build;
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
 }
 
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]

@@ -3281,12 +3281,16 @@ impl App {
             return actions;
         }
 
-        self.plan_form.reset();
-        self.state.plan = PlanState::None;
-        self.state.mode = Mode::Build;
+        let implement_action = Action::ImplementPlan(text);
         if let Some((content, path)) = plan_snapshot {
             self.main_chat().push(DisplayMessage::plan(content, path));
         }
+        vec![implement_action]
+    }
+
+    pub(crate) fn start_plan_implementation(&mut self, text: String) -> Vec<Action> {
+        self.plan_form.reset();
+        self.state.plan = PlanState::None;
         self.start_from_queue(&QueuedMessage {
             text,
             images: vec![],
