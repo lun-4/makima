@@ -2861,125 +2861,22 @@ impl<'t> EventLoop<'t> {
             }
         };
         let session = self.sessions[idx].id();
-        let coordinator = self.sessions[idx].coordinator.clone();
-        let model_slot = Arc::clone(&self.sessions[idx].model_slot);
-        let internal_tx = self.internal_tx.clone();
-        let policy_affecting = matches!(
-            id.as_str(),
-            FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID | "model"
-        );
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
         let mode = agent_mode_for_app(&self.sessions[idx].app);
         let mode_def = self.ctx.lua_event_handle.mode_registry().current(&mode);
-        let reservation = if policy_affecting {
-            let (manager, root) = self.sessions[idx].handles.manager_and_root();
-            manager
-                .actor(root)
-                .map_err(|error| error.to_string())
-                .and_then(|actor| {
-                    actor
-                        .reserve_config_update()
-                        .map_err(|error| error.to_string())
-                })
-                .map(Some)
-        } else {
-            Ok(None)
-        };
-        smol::spawn(async move {
-            let result = match reservation {
-                Ok(reservation) => {
-                    if matches!(
-                        id.as_str(),
-                        FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID
-                    ) {
-                        match coordinator
-                            .prepare_policy_option(id, value, Some(version))
-                            .await
-                        {
-                            Ok(prepared) => {
-                                let config = maki_agent::EffectiveAgentConfig::new(
-                                    policy_from_options(&model_slot, prepared.snapshot()),
-                                    mode,
-                                )
-                                .with_mode_def(Some(mode_def));
-                                match reservation {
-                                    Some(reservation) => {
-                                        match reservation.resolve_config(Ok(config)) {
-                                            Ok(()) => match reservation.wait().await {
-                                                Ok(()) => prepared
-                                                    .commit()
-                                                    .await
-                                                    .map(|_| ())
-                                                    .map_err(|error| error.to_string()),
-                                                Err(error) => Err(abort_policy_option(
-                                                    prepared,
-                                                    error.to_string(),
-                                                )
-                                                .await),
-                                            },
-                                            Err(error) => {
-                                                let _ = reservation.cancel();
-                                                Err(abort_policy_option(
-                                                    prepared,
-                                                    error.to_string(),
-                                                )
-                                                .await)
-                                            }
-                                        }
-                                    }
-                                    None => Err(abort_policy_option(
-                                        prepared,
-                                        "missing actor policy reservation".to_owned(),
-                                    )
-                                    .await),
-                                }
-                            }
-                            Err(error) => {
-                                if let Some(reservation) = reservation {
-                                    let _ = reservation.cancel();
-                                }
-                                Err(error.to_string())
-                            }
-                        }
-                    } else if id.as_str() == "model" {
-                        let result = coordinator
-                            .set_option_if_version(id, value, Some(version))
-                            .await
-                            .map(|_| ())
-                            .map_err(|error| error.to_string());
-                        match (result, reservation) {
-                            (Ok(()), Some(reservation)) => {
-                                reconcile_actor_model_policy(
-                                    reservation,
-                                    &model_slot,
-                                    &coordinator,
-                                    mode,
-                                    mode_def,
-                                )
-                                .await
-                            }
-                            (Err(error), Some(reservation)) => {
-                                let _ = reservation.cancel();
-                                Err(error)
-                            }
-                            (result, None) => result,
-                        }
-                    } else {
-                        coordinator
-                            .set_option_if_version(id, value, Some(version))
-                            .await
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    }
-                }
-                Err(error) => Err(error),
-            };
-            let _ = internal_tx.send(InternalEvent::SessionOp {
-                session,
-                kind: SessionOpKind::LuaOptionSet { reply_tx },
-                result,
-            });
-        })
-        .detach();
+        dispatch_lua_option_set(
+            session,
+            id,
+            value,
+            version,
+            self.sessions[idx].coordinator.clone(),
+            Arc::clone(&self.sessions[idx].model_slot),
+            (manager, root),
+            mode,
+            mode_def,
+            self.internal_tx.clone(),
+            reply_tx,
+        );
     }
 
     fn dispatch_lua_mode_set(
@@ -4262,6 +4159,129 @@ where
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_lua_option_set(
+    session: MakiId,
+    id: String,
+    value: String,
+    version: u64,
+    coordinator: SessionCoordinatorHandle,
+    model_slot: Arc<ProviderSlot>,
+    actor: (maki_agent::AgentManagerHandle, maki_agent::AgentId),
+    mode: maki_agent::AgentMode,
+    mode_def: maki_agent::modes::ModeDef,
+    internal_tx: flume::Sender<InternalEvent>,
+    reply_tx: flume::Sender<UiReply>,
+) {
+    let policy_affecting = matches!(
+        id.as_str(),
+        FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID | "model"
+    );
+    let reservation = if policy_affecting {
+        let (manager, root) = actor;
+        manager
+            .actor(root)
+            .map_err(|error| error.to_string())
+            .and_then(|actor| {
+                actor
+                    .reserve_config_update()
+                    .map_err(|error| error.to_string())
+            })
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    smol::spawn(async move {
+        let result = match reservation {
+            Ok(reservation) => {
+                if matches!(
+                    id.as_str(),
+                    FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID
+                ) {
+                    match coordinator
+                        .prepare_policy_option(id, value, Some(version))
+                        .await
+                    {
+                        Ok(prepared) => {
+                            let config = maki_agent::EffectiveAgentConfig::new(
+                                policy_from_options(&model_slot, prepared.snapshot()),
+                                mode,
+                            )
+                            .with_mode_def(Some(mode_def));
+                            match reservation {
+                                Some(reservation) => match reservation.resolve_config(Ok(config)) {
+                                    Ok(()) => match reservation.wait().await {
+                                        Ok(()) => prepared
+                                            .commit()
+                                            .await
+                                            .map(|_| ())
+                                            .map_err(|error| error.to_string()),
+                                        Err(error) => {
+                                            Err(abort_policy_option(prepared, error.to_string())
+                                                .await)
+                                        }
+                                    },
+                                    Err(error) => {
+                                        let _ = reservation.cancel();
+                                        Err(abort_policy_option(prepared, error.to_string()).await)
+                                    }
+                                },
+                                None => Err(abort_policy_option(
+                                    prepared,
+                                    "missing actor policy reservation".to_owned(),
+                                )
+                                .await),
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(reservation) = reservation {
+                                let _ = reservation.cancel();
+                            }
+                            Err(error.to_string())
+                        }
+                    }
+                } else if id.as_str() == "model" {
+                    let result = coordinator
+                        .set_option_if_version(id, value, Some(version))
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                    match (result, reservation) {
+                        (Ok(()), Some(reservation)) => {
+                            reconcile_actor_model_policy(
+                                reservation,
+                                &model_slot,
+                                &coordinator,
+                                mode,
+                                mode_def,
+                            )
+                            .await
+                        }
+                        (Err(error), Some(reservation)) => {
+                            let _ = reservation.cancel();
+                            Err(error)
+                        }
+                        (result, None) => result,
+                    }
+                } else {
+                    coordinator
+                        .set_option_if_version(id, value, Some(version))
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let _ = internal_tx.send(InternalEvent::SessionOp {
+            session,
+            kind: SessionOpKind::LuaOptionSet { reply_tx },
+            result,
+        });
+    })
+    .detach();
+}
+
 fn dispatch_option_toggle(
     coordinator: SessionCoordinatorHandle,
     model_slot: Arc<ProviderSlot>,
@@ -4540,6 +4560,83 @@ mod tests {
                         String::new(),
                     )
                     .is_ok()
+            );
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn lua_option_set_dispatch_updates_actor_and_replies() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let id = runtime.id();
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let initial = actor.effective_config().unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let request = SessionRequest::SetOption {
+                session: id.to_string(),
+                id: WORKFLOW_OPTION_ID.to_owned(),
+                value: ENABLED_VALUE.to_owned(),
+                version: runtime.coordinator.read().options().version,
+            };
+            let SessionRequest::SetOption {
+                session,
+                id: option_id,
+                value,
+                version,
+            } = request
+            else {
+                unreachable!();
+            };
+            let mode = agent_mode_for_app(&runtime.app);
+            let mode_def = runtime
+                .app
+                .state
+                .mode
+                .def(&runtime.app.lua_event_handle.mode_registry());
+
+            dispatch_lua_option_set(
+                id,
+                option_id,
+                value,
+                version,
+                runtime.coordinator.clone(),
+                Arc::clone(&runtime.model_slot),
+                (manager, root),
+                mode,
+                mode_def,
+                internal_tx,
+                reply_tx,
+            );
+
+            let InternalEvent::SessionOp {
+                session: completed_session,
+                kind: SessionOpKind::LuaOptionSet { reply_tx },
+                result,
+            } = internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected Lua option completion");
+            };
+            assert_eq!(completed_session.to_string(), session);
+            let _ = reply_tx.send(result.map(|()| json!(true)));
+            assert_eq!(reply_rx.recv_async().await.unwrap(), Ok(json!(true)));
+            actor.wait_policy_updates().await.unwrap();
+            assert!(!initial.workflow);
+            assert!(actor.effective_config().unwrap().workflow);
+            assert_eq!(
+                runtime
+                    .coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == WORKFLOW_OPTION_ID)
+                    .unwrap()
+                    .current_value
+                    .as_ref(),
+                ENABLED_VALUE
             );
             release_runtime(runtime);
         });

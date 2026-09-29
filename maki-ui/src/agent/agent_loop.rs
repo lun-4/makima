@@ -25,7 +25,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{FileReadTracker, QuestionMode, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, Envelope, EventSender, History, Instructions, McpCommand, PromptRole, RunSettings,
+    CancelToken, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
     SessionMailbox, ToolOutputLines, TurnId, TurnOutcome,
 };
 use maki_config::ModelPolicy;
@@ -375,61 +375,19 @@ impl TuiActorBackend {
                 return None;
             }
         };
-        let slot = self.model_slot.load();
-        let mut provider =
-            Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>;
-        let mut model = slot.model.clone();
-        let fallback = if context.policy.is_none() {
-            self.session_id.as_ref().and_then(|session| {
-                let (provider, model) = (
-                    Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>,
-                    slot.model.clone(),
-                );
-                let options = maki_agent::session_coordinator::SessionCoordinatorHandle::resolve(
-                    session.id(),
-                )
-                .ok()?
-                .read()
-                .options();
-                let value = |id: &str| {
-                    options
-                        .options
-                        .iter()
-                        .find(|option| option.definition.id.as_ref() == id)
-                        .map(|option| option.current_value.as_ref())
-                };
-                Some(RunSettings {
-                    provider,
-                    model,
-                    fast: value(maki_agent::session_options::FAST_OPTION_ID)
-                        == Some(maki_agent::session_options::ENABLED_VALUE),
-                    workflow: value(maki_agent::session_options::WORKFLOW_OPTION_ID)
-                        == Some(maki_agent::session_options::ENABLED_VALUE),
-                    thinking: value(maki_agent::session_options::THINKING_OPTION_ID)
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or_default(),
-                })
-            })
-        } else {
-            None
+        let Some(policy) = context.policy.as_deref() else {
+            let error = AgentError::Config {
+                message: "turn was admitted without an effective agent configuration".into(),
+            };
+            self.report_setup_failure(run_id, turn_id, "agent turn setup failed", &error);
+            return None;
         };
-        if let Some(settings) = context
-            .policy
-            .as_deref()
-            .map(|config| &config.settings)
-            .or(fallback.as_ref())
-        {
-            provider = Arc::clone(&settings.provider);
-            model = settings.model.clone();
-            input.fast = settings.fast;
-            input.workflow = settings.workflow;
-            input.thinking = settings.thinking;
-        }
-        drop(slot);
-        let mode = context
-            .policy
-            .as_ref()
-            .map_or_else(|| input.mode.clone(), |config| config.mode.clone());
+        let provider = Arc::clone(&policy.settings.provider);
+        let model = policy.settings.model.clone();
+        input.fast = policy.settings.fast;
+        input.workflow = policy.settings.workflow;
+        input.thinking = policy.settings.thinking;
+        let mode = policy.mode.clone();
         input.mode = mode;
         let (system, tools, prompt_slots) = match self
             .prepare_run(&mut input, &model, context.admission.as_ref())
@@ -742,10 +700,16 @@ impl ActorBackend for TuiActorBackend {
             // source and emits `CompactionDone`.
             let run_id = self.current_run_id();
             let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-            let (base_provider, base_model) = compaction_source(
-                context.policy.as_deref().map(|config| &config.settings),
-                &self.model_slot,
-            );
+            let Some(settings) = context.policy.as_deref().map(|config| &config.settings) else {
+                let _ = event_tx.send(AgentEvent::ControlError {
+                    message: "compaction was admitted without an effective agent configuration"
+                        .into(),
+                });
+                let _ = self.drain_tx.try_send(run_id);
+                return BackendResult::CompactDone;
+            };
+            let (base_provider, base_model) = compaction_source(settings);
+
             let (provider, model) = maki_agent::agent::resolve_compaction_model(
                 &base_provider,
                 &base_model,
@@ -800,18 +764,9 @@ impl ActorBackend for TuiActorBackend {
 }
 
 fn compaction_source(
-    policy: Option<&maki_agent::RunSettings>,
-    model_slot: &ProviderSlot,
+    settings: &maki_agent::RunSettings,
 ) -> (Arc<dyn maki_providers::provider::Provider>, Model) {
-    policy
-        .map(|settings| (Arc::clone(&settings.provider), settings.model.clone()))
-        .unwrap_or_else(|| {
-            let slot = model_slot.load();
-            (
-                Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>,
-                slot.model.clone(),
-            )
-        })
+    (Arc::clone(&settings.provider), settings.model.clone())
 }
 
 /// A no-op interrupt source used when the actor provides none (standalone
@@ -881,9 +836,7 @@ mod tests {
     use crate::agent::ProviderSlot;
 
     #[test]
-    fn idle_compaction_source_uses_pinned_policy_over_live_model_slot() {
-        let (live_slot, _change_rx) =
-            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+    fn idle_compaction_source_uses_pinned_policy() {
         let mut pinned_model = crate::components::test_model();
         pinned_model.id = "pinned-model".into();
         let settings = maki_agent::RunSettings {
@@ -894,22 +847,10 @@ mod tests {
             thinking: Default::default(),
         };
 
-        let (provider, model) = compaction_source(Some(&settings), &live_slot);
+        let (provider, model) = compaction_source(&settings);
 
         assert_eq!(model.id, pinned_model.id);
         assert!(Arc::ptr_eq(&provider, &settings.provider));
-    }
-
-    #[test]
-    fn idle_compaction_source_falls_back_to_live_model_slot() {
-        let (live_slot, _change_rx) =
-            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
-        let (provider, model) = compaction_source(None, &live_slot);
-        let snapshot = live_slot.load();
-
-        assert_eq!(model.id, snapshot.model.id);
-        let expected: Arc<dyn maki_providers::provider::Provider> = snapshot.provider.clone();
-        assert!(Arc::ptr_eq(&provider, &expected));
     }
 
     #[test]
@@ -987,7 +928,9 @@ mod tests {
 
     /// Drives one turn through a backend whose setup cannot succeed, and
     /// returns everything the run emitted.
-    fn run_failing_turn() -> (Option<TurnOutcome>, Vec<Envelope>) {
+    fn run_failing_turn(
+        policy: Option<maki_agent::actor::EffectiveAgentConfig>,
+    ) -> (Option<TurnOutcome>, Vec<Envelope>) {
         let (model_slot, _change_rx) =
             ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
         let (agent_tx, agent_rx) = flume::unbounded();
@@ -1049,7 +992,7 @@ mod tests {
             cancel_reason: ReasonedCancelToken::none(),
             correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
             generation: 0,
-            policy: None,
+            policy: policy.map(Arc::new),
             admission: None,
             interrupt: None,
             managed_turn: None,
@@ -1071,8 +1014,27 @@ mod tests {
     /// the backend stays quiet the prompt vanishes with no feedback at all, so
     /// the error has to be emitted here.
     #[test]
+    fn missing_turn_policy_fails_closed() {
+        let (outcome, envelopes) = run_failing_turn(None);
+        assert!(outcome.is_none());
+        assert!(envelopes.iter().any(|envelope| {
+            matches!(&envelope.event, AgentEvent::ControlError { message } if message.contains("without an effective agent configuration"))
+        }));
+    }
+
+    #[test]
     fn a_setup_failure_reaches_the_user() {
-        let (outcome, envelopes) = run_failing_turn();
+        let (outcome, envelopes) =
+            run_failing_turn(Some(maki_agent::actor::EffectiveAgentConfig::new(
+                maki_agent::RunSettings {
+                    provider: Arc::new(StubProvider),
+                    model: crate::components::test_model(),
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+                AgentMode::Build,
+            )));
         assert!(outcome.is_none(), "setup failed, so no run was entered");
         let reported = envelopes.iter().any(|envelope| {
             matches!(&envelope.event, AgentEvent::ControlError { message } if message.contains("MCP not available"))

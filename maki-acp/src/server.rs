@@ -4975,7 +4975,6 @@ mod tests {
             let new_response = out_rx.recv_async().await.unwrap();
             assert_eq!(new_response["id"], 82);
             let session = srv.session.as_ref().unwrap();
-            assert!(maki_agent::ModelSource::current(&session.handle.model).is_none());
             let session_id = session.handle.session_id.to_string();
             handle_request(
                 &mut srv,
