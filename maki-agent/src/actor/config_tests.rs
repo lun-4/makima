@@ -68,6 +68,36 @@ fn admitted_prompt_dependencies_remain_pinned() {
     });
 }
 
+#[test_case::test_case(AgentMode::Build; "build")]
+#[test_case::test_case(AgentMode::Plan("plan.md".into()); "plan")]
+#[test_case::test_case(AgentMode::Custom(crate::modes::ModeId::parse("custom")); "custom")]
+fn mode_change_without_definition_preserves_config(mode: AgentMode) {
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let before = actor.config_snapshot().unwrap();
+        let change = actor.reserve_config_update().unwrap();
+        change
+            .resolve(Ok(ConfigChange::Mode {
+                mode,
+                mode_def: None,
+            }))
+            .unwrap();
+        let Err(ActorError::InvalidConfig(message)) = change.wait().await else {
+            panic!("unresolved mode change must fail")
+        };
+        const MISSING_DEFINITION: &str = "mode change requires a resolved definition";
+        assert_eq!(message, MISSING_DEFINITION);
+        let after = actor.config_snapshot().unwrap();
+        assert_eq!(after.generation, before.generation);
+        assert!(Arc::ptr_eq(&after.config, &before.config));
+        actor.close();
+        task.await;
+    });
+}
+
 #[test]
 fn combined_model_options_and_metadata_refresh() {
     smol::block_on(async {
@@ -455,7 +485,10 @@ fn config_changes_compose_fifo() {
         second
             .resolve(Ok(ConfigChange::Mode {
                 mode: AgentMode::Plan("plan.md".into()),
-                mode_def: None,
+                mode_def: Some(
+                    crate::modes::ModeRegistry::builtin()
+                        .current(&AgentMode::Plan("plan.md".into())),
+                ),
             }))
             .unwrap();
         first

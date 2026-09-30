@@ -54,9 +54,9 @@ impl ConfigChange {
         let mut patch = match self {
             Self::Patch(patch) => patch,
             Self::Mode { mode, mode_def } => {
-                if matches!(mode, AgentMode::Custom(_)) && mode_def.is_none() {
+                if mode_def.is_none() {
                     return Err(ActorError::InvalidConfig(
-                        "custom mode requires a resolved definition".into(),
+                        "mode change requires a resolved definition".into(),
                     ));
                 }
                 config.mode = mode;

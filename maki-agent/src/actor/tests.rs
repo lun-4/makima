@@ -1382,7 +1382,10 @@ fn reserved_policy_orders_admissions_and_failed_updates() {
         reservation
             .resolve(Ok(super::ConfigChange::Mode {
                 mode: AgentMode::Plan("plan.md".into()),
-                mode_def: None,
+                mode_def: Some(
+                    crate::modes::ModeRegistry::builtin()
+                        .current(&AgentMode::Plan("plan.md".into())),
+                ),
             }))
             .unwrap();
         gate.open();
@@ -1444,7 +1447,10 @@ fn compact_uses_fifo_config() {
         reservation
             .resolve(Ok(super::ConfigChange::Mode {
                 mode: AgentMode::Plan("pinned-plan.md".into()),
-                mode_def: None,
+                mode_def: Some(
+                    crate::modes::ModeRegistry::builtin()
+                        .current(&AgentMode::Plan("pinned-plan.md".into())),
+                ),
             }))
             .unwrap();
         reservation.wait().await.unwrap();
@@ -1479,7 +1485,10 @@ fn overlapping_reservations_commit_fifo_and_cancel_preserves_pending_policy() {
         second
             .resolve(Ok(super::ConfigChange::Mode {
                 mode: AgentMode::Plan("plan.md".into()),
-                mode_def: None,
+                mode_def: Some(
+                    crate::modes::ModeRegistry::builtin()
+                        .current(&AgentMode::Plan("plan.md".into())),
+                ),
             }))
             .unwrap();
         assert!(!handle.policy_snapshot().unwrap().fast);
