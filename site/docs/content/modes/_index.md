@@ -24,11 +24,25 @@ Switching to plan mode allocates a plan file under `plans/`. Native write and ed
 
 A mode is not a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and are not restricted to the plan path. Tool selection and native write-target checks do not constrain every effect of a selected plugin.
 
+## Plan approval
+
+The review form shows the current implementation model as a selectable row. The model-picker shortcut or Enter on that row opens the searchable model picker. Selecting a model stages it without changing the session model or saving a preference. Selecting the current model clears the staged selection. When a different model is staged, `Use current model` also clears it.
+
+Escape in the picker returns to the form without changing its selection or parallel setting. Editing, refining, rewriting, or dismissing and reopening the plan preserves the staged model. Leaving Plan mode, resetting the form, or replacing the session clears it.
+
+`Implement plan` keeps the current conversation. `Clear context and implement` prepares a fresh Build session with empty conversation history. Both paths require idle planning work and idle managed descendants. Busy approval reports a retry message without cancelling existing work. Implementation receives the captured approved plan text, so later file edits do not change its instructions.
+
+While approval is preparing, form submission, editing, and model staging are locked. Escape cancels preparation and unlocks the form. Provider construction and prompt readiness finish before approval commits. A preparation failure leaves the original planning session, plan, history, and staged selection available for retry. Fresh-context approval prepares the new runtime and its first admission before replacing the planning runtime.
+
+Successful approval commits the implementation model, normalized options, Build mode, and one implementation turn. The selected model remains the session model. Fresh-context approval displays the approved plan and implementation input in the new session. Cancellation or execution failure after successful approval does not restore the planning session or previous model. Saving follows [Configuration changes](#configuration-changes).
+
+Cancellation releases the approval wait. It does not undo external prompt requests or authentication subprocesses that have already started.
+
 ## Configuration changes
 
 Managed TUI roots and Lua agent sessions own their model, thinking, fast, workflow, and mode configuration. Changes apply in order to later admitted work. An active or already admitted turn retains its provider, settings, resolved mode definition, prompt inputs, and tool bindings. A mode registry change does not replace the definition captured for that turn. Selecting an undefined custom mode fails.
 
-A successful managed setter means the actor committed the change. Session saving runs asynchronously and does not block admission. If saving fails, the committed configuration remains active and a warning reports that the configuration was applied but not saved. The storage writer retains the latest committed snapshot for retry. A successful retry clears the pending-save condition. A crash before saving can lose the latest configuration change.
+A managed setter succeeds when the actor commits the change. The actor publishes the committed configuration to the UI, provider slot, session metadata, and storage writer. Session saving runs asynchronously and does not block admission or the implementation turn. If saving fails, the committed configuration remains active and a warning reports that the configuration was applied but not saved. The storage writer retains the latest committed snapshot for retry. A successful retry clears the pending-save condition. A crash before saving can lose the latest configuration change. A save failure never rolls back an actor commit.
 
 Headless, print, and ACP execution retain their existing frontend-owned initialization and configuration paths. They do not yet use the managed actor execution loop. YOLO and plugin options retain their existing owners; YOLO changes affect permission checks immediately.
 
@@ -115,12 +129,7 @@ maki.setup({
   The directive and the plan reviewer splice
   one shared plan specification, so both always see the exact same document.
 - `plan_submit_tool` is a mode-scoped tool: it prints the finished plan inline
-  as a **display-only** message (kept out of your context) and surfaces the plan
-  review form, with **accept** (hands off to implementation), **refine** (keep
-  planning), or **cancel**. It only exists in plan mode because plan's toolset
-  lists it. While `plan_submit` is in an active mode's toolset, the built-in
-  auto-hooks that open the review form on a plan-file write are skipped; the
-  model calls `plan_submit` explicitly when the plan is ready.
+  as a display-only message (kept out of the model context) and surfaces the plan review form, with accept (hands off to implementation), refine (keep planning), or cancel. It only exists in plan mode because plan's toolset lists it. While `plan_submit` is in an active mode's toolset, the built-in auto-hooks that open the review form on a plan-file write are skipped; the model calls `plan_submit` explicitly when the plan is ready. The review form uses the same approval workflow as a completed plan-file write.
 
 The built-in `task` tool grows a `plan_reviewer` subagent type when the plan
 override is active: a read-only audit that verifies the plan follows the shared

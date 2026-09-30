@@ -203,13 +203,6 @@ pub enum SessionReplacementKind {
 pub struct SessionReplacementRequest {
     pub(crate) session: crate::AppSession,
     pub(crate) kind: SessionReplacementKind,
-    pub(crate) post_commit: Option<ReplacementPostCommit>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReplacementPostCommit {
-    pub(crate) plan: Option<(String, String)>,
-    pub(crate) prompt: String,
 }
 
 use std::path::PathBuf;
@@ -231,7 +224,13 @@ pub enum Action {
     ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
     ChangeMode(String),
-    ImplementPlan(String),
+    ApprovePlan {
+        clear_context: bool,
+        model: Option<String>,
+        parallel: bool,
+        path: PathBuf,
+    },
+    CancelPlanApproval,
     /// A session option toggled from a command. Applied by the event loop
     /// through the coordinator, off the event-loop thread.
     ToggleSessionOption {

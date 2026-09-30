@@ -5822,14 +5822,6 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 
 // --- Plan form integration tests ---
 
-fn implement_msg(parallel: bool) -> String {
-    if parallel {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}")
-    } else {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.")
-    }
-}
-
 fn plan_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -5989,31 +5981,10 @@ fn plan_form_menu_options(downs: usize, has_new_session: bool) {
     assert!(app.plan_form.is_visible());
     assert_eq!(app.state.mode, Mode::Plan);
     assert!(app.state.plan.is_ready());
-    assert_eq!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ReplaceSession(_))),
-        has_new_session
-    );
-    let expected_msg = implement_msg(PlanForm::new().parallel());
-    assert_eq!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ImplementPlan(message) if message == &expected_msg)),
-        !has_new_session
-    );
-    if has_new_session {
-        let Action::ReplaceSession(request) = &actions[0] else {
-            panic!("expected replacement request");
-        };
-        assert_eq!(
-            request
-                .post_commit
-                .as_ref()
-                .map(|post| post.prompt.as_str()),
-            Some(expected_msg.as_str())
-        );
-    }
+    assert!(app.plan_approval_pending);
+    assert!(matches!(actions.as_slice(), [Action::ApprovePlan {
+        clear_context, model: None, parallel: false, path,
+    }] if *clear_context == has_new_session && path == Path::new("test-plan.md")));
 }
 
 #[test]
@@ -6023,12 +5994,228 @@ fn plan_form_implement_toggled_parallel() {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let expected_msg = implement_msg(!PlanForm::new().parallel());
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ApprovePlan {
+            clear_context: false,
+            parallel: true,
+            ..
+        }]
+    ));
+}
+
+#[test_case(false ; "shortcut")]
+#[test_case(true ; "model_row")]
+fn plan_model_picker_stages_without_switching(row: bool) {
+    let (mut app, models) = app_with_model_slot();
+    const MODEL: &str = "zai/glm-5";
+    models.store(Some(Arc::new(vec![MODEL.into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    let original = app.state.model.spec();
+    let persisted_model = maki_storage::model::read_model(&app.storage);
+    let recents = maki_storage::model::read_recents(&app.storage);
+    let prefs = serde_json::to_value(maki_storage::sessions::read_prefs(&app.storage)).unwrap();
+    let actions = if row {
+        for _ in 0..3 {
+            app.update(Msg::Key(key(KeyCode::Down)));
+        }
+        app.update(Msg::Key(key(KeyCode::Enter)))
+    } else {
+        app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()))
+    };
+    assert!(matches!(actions.as_slice(), [Action::RefreshModels]));
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ImplementPlan(message) if message == &expected_msg))
+        app.active_keybind_contexts()
+            .contains(&KeybindContext::ModelPicker)
     );
+    app.route_text_paste(MODEL.split_once('/').unwrap().1);
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty());
+    assert_eq!(app.plan_form.implementation_model(), Some(MODEL));
+    assert_eq!(app.state.model.spec(), original);
+    assert_eq!(
+        maki_storage::model::read_model(&app.storage),
+        persisted_model
+    );
+    assert_eq!(maki_storage::model::read_recents(&app.storage), recents);
+    assert_eq!(
+        serde_json::to_value(maki_storage::sessions::read_prefs(&app.storage)).unwrap(),
+        prefs
+    );
+    assert!(!app.plan_approval_pending);
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(app.plan_form.implementation_model(), Some(MODEL));
+    assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
+}
+
+#[test_case("permission" ; "permission")]
+#[test_case("question" ; "question")]
+#[test_case("help" ; "help")]
+#[test_case("btw" ; "btw")]
+#[test_case("float" ; "float")]
+fn plan_picker_yields_to_blocking_overlay(surface: &str) {
+    const MODEL: &str = "zai/glm-5";
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![MODEL.into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    let (_btw_tx, btw_rx) = flume::bounded(1);
+    let (event_tx, event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    match surface {
+        "permission" => {
+            app.permission_prompt.open(
+                "permission".into(),
+                maki_config::ToolKey::native("bash"),
+                vec!["execute".into()],
+                None,
+            );
+            app.active_input = Some(InputKind::Permission);
+        }
+        "help" => app.help_modal.toggle(),
+        "btw" => app.btw_modal.open("question", btw_rx),
+        _ => {
+            let config = maki_lua::FloatConfig {
+                needs_input: surface == "question",
+                ..maki_lua::FloatConfig::default()
+            };
+            app.float_mgr.open(
+                Arc::new(maki_agent::SharedBuf::new()),
+                config,
+                true,
+                event_tx,
+                cmd_rx,
+            );
+            if surface == "question" {
+                app.active_input = Some(InputKind::Question);
+            }
+        }
+    }
+    let contexts = app.active_keybind_contexts();
+    assert!(!contexts.contains(&KeybindContext::ModelPicker));
+    assert!(!contexts.contains(&KeybindContext::FormInput));
+    assert!(app.update(Msg::Key(key(KeyCode::Char('x')))).is_empty());
+    app.route_text_paste("no-such-model");
+    assert!(app.model_picker.is_open());
+    assert_eq!(app.plan_form.implementation_model(), None);
+    if surface == "question" || surface == "float" {
+        assert!(event_rx.try_recv().is_ok());
+    }
+    app.help_modal.close();
+    app.btw_modal.close();
+    app.permission_prompt.close();
+    app.float_mgr.close_all();
+    app.active_input = None;
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.plan_form.implementation_model(), Some(MODEL));
+}
+
+#[test_case(false ; "help")]
+#[test_case(true ; "btw")]
+fn plan_form_yields_escape_to_blocking_modal(btw: bool) {
+    let mut app = plan_app();
+    let (_tx, rx) = flume::bounded(1);
+    if btw {
+        app.btw_modal.open("question", rx);
+    } else {
+        app.help_modal.toggle();
+    }
+    app.route_text_paste("blocked");
+    assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    assert!(app.plan_form.is_visible());
+    assert!(!app.help_modal.is_open());
+    assert!(!app.btw_modal.is_open());
+}
+
+#[test_case("build" ; "build")]
+#[test_case("custom" ; "custom")]
+fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
+    let mut app = plan_app();
+    app.plan_form
+        .set_implementation_model("zai/glm-5".into(), &app.state.model.spec());
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    app.set_mode_id(mode.into());
+    assert_eq!(app.plan_form.implementation_model(), None);
+    assert!(!app.model_picker.is_open());
+    assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
+}
+
+#[test]
+fn normal_model_picker_still_requests_model_change() {
+    const MODEL: &str = "zai/glm-5";
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![MODEL.into()])));
+    app.run_builtin(BuiltinAction::ModelPicker);
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(actions.as_slice(), [Action::ChangeModel(spec)] if spec == MODEL));
+    assert_eq!(app.plan_form.implementation_model(), None);
+}
+
+#[test]
+fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
+    let mut app = plan_app();
+    app.plan_form
+        .set_implementation_model("zai/glm-5".into(), &app.state.model.spec());
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.plan_approval_pending);
+    assert!(
+        app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()))
+            .is_empty()
+    );
+    assert!(!app.model_picker.is_open());
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    app.route_text_paste("blocked");
+    assert!(matches!(
+        app.update(Msg::Key(key(KeyCode::Esc))).as_slice(),
+        [Action::CancelPlanApproval]
+    ));
+    assert!(app.plan_approval_pending);
+    assert_eq!(app.plan_form.implementation_model(), Some("zai/glm-5"));
+    assert!(app.state.plan.is_ready());
+}
+
+#[test_case(false ; "current")]
+#[test_case(true ; "staged")]
+fn plan_form_renders_effective_implementation_model(staged: bool) {
+    let mut app = plan_app();
+    let initial_height = app.plan_form.height();
+    const MODEL: &str = "zai/glm-5";
+    if !staged {
+        app.state.model = Model::from_spec(MODEL).unwrap();
+    }
+    if staged {
+        app.plan_form
+            .set_implementation_model(MODEL.into(), &app.state.model.spec());
+    }
+    let rows = rendered_area(&mut app).join("\n");
+    let spec = if staged {
+        MODEL.to_owned()
+    } else {
+        app.state.model.spec()
+    };
+    assert!(rows.contains(&format!("Implementation model: {spec}")));
+    assert_eq!(rows.contains("Use current model"), staged);
+    assert_eq!(app.plan_form.height(), initial_height + u16::from(staged));
+    let (_, bottom, _, _, _) = app.layout_geometry(RENDER_AREA);
+    assert_eq!(bottom.height, app.plan_form.height());
+}
+
+#[test]
+fn admitted_plan_run_uses_exact_run_id_without_submitting() {
+    let mut app = plan_app();
+    app.plan_approval_pending = true;
+    app.record_plan_implementation(42, "plan".into(), "test-plan.md".into(), "implement".into());
+    assert_eq!(app.run_id, 42);
+    assert_eq!(app.status, Status::Streaming);
+    assert!(!app.plan_approval_pending);
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(app.state.plan, PlanState::None);
 }
 
 #[test]

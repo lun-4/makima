@@ -201,6 +201,7 @@ impl App {
         self.last_esc = None;
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
+        self.plan_approval_pending = false;
     }
 
     pub(crate) fn restore_display(&mut self) {
@@ -307,7 +308,6 @@ impl App {
             SessionReplacementRequest {
                 session,
                 kind: SessionReplacementKind::Reset { ended_id },
-                post_commit: None,
             },
         ))]
     }
@@ -340,7 +340,6 @@ impl App {
             SessionReplacementRequest {
                 session,
                 kind: SessionReplacementKind::Rewind,
-                post_commit: None,
             },
         ))]
     }
@@ -354,6 +353,9 @@ impl App {
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
+        self.plan_form.reset();
+        self.plan_approval_pending = false;
+        self.close_all_overlays();
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
@@ -371,7 +373,6 @@ impl App {
             SessionReplacementRequest {
                 session,
                 kind: SessionReplacementKind::Load,
-                post_commit: None,
             },
         ))]
     }

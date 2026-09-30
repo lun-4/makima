@@ -84,10 +84,10 @@ use crate::command_runtime::{CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
 use crate::components::{
-    Action, ExitRequest, ReplacementPostCommit, SessionReplacementKind, SessionReplacementRequest,
-    Status,
+    Action, ExitRequest, SessionReplacementKind, SessionReplacementRequest, Status,
 };
 use crate::input::InputReader;
+use crate::plan_approval::PrepareProvider;
 use crate::provider_usage::{
     ProviderIdentity, ProviderUsageCoordinator, ProviderUsageFetch, ProviderUsageFetchId,
     ProviderUsageFetchResult, ProviderUsageInput, ProviderUsageOutput, ProviderUsageRequestKind,
@@ -414,10 +414,15 @@ fn apply_heartbeat_completion(runtime: &mut SessionRuntime, mut completion: Hear
 }
 
 fn complete_runtime_heartbeat(runtime: &mut SessionRuntime) {
-    let Some(SessionLockState::InFlight(completion_rx)) = runtime.session_lock.take() else {
-        return;
+    let completion_rx = match runtime.session_lock.take() {
+        Some(SessionLockState::InFlight(completion_rx)) => completion_rx,
+        state => {
+            runtime.session_lock = state;
+            return;
+        }
     };
-    let Some(completion) = collect_heartbeat(completion_rx, None) else {
+    let Some(completion) = collect_heartbeat(completion_rx.clone(), None) else {
+        runtime.session_lock = Some(SessionLockState::InFlight(completion_rx));
         return;
     };
     apply_heartbeat_completion(runtime, completion);
@@ -573,7 +578,6 @@ fn dispatch_mode_change_op(
     modes: Arc<maki_agent::ModeRegistry>,
     internal_tx: flume::Sender<InternalEvent>,
     id: String,
-    follow_up: Option<String>,
 ) {
     let session = runtime.id();
     let identity = runtime.handles.identity();
@@ -619,11 +623,7 @@ fn dispatch_mode_change_op(
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
-            kind: SessionOpKind::ModeChanged {
-                id,
-                plan,
-                follow_up,
-            },
+            kind: SessionOpKind::ModeChanged { id, plan },
             result,
         });
     })
@@ -747,19 +747,13 @@ fn handle_session_action(
     }
 }
 
-fn complete_mode_change(
-    app: &mut App,
-    id: String,
-    plan: crate::app::mode::PlanState,
-    follow_up: Option<String>,
-) -> Vec<Action> {
+fn complete_mode_change(app: &mut App, id: String, plan: crate::app::mode::PlanState) {
     if id == "plan" {
         app.state.plan = plan;
     } else if id == "build" {
         app.state.plan = crate::app::mode::PlanState::None;
     }
     app.set_mode_id(id);
-    follow_up.map_or_else(Vec::new, |message| app.start_plan_implementation(message))
 }
 
 fn agent_mode_for_app(app: &App) -> maki_agent::AgentMode {
@@ -912,6 +906,7 @@ struct SessionRuntime {
     generation: u64,
     config_commits: flume::Receiver<maki_agent::actor::ConfigCommit>,
     projected_config_generation: u64,
+    config_projected: bool,
     app: App,
     handles: AgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -924,12 +919,56 @@ struct SessionRuntime {
     session_lock: Option<SessionLockState>,
     lock_lost: bool,
     restore_pending: bool,
+    pending_approval: Option<PendingPlanApproval>,
+    approved_turn: Option<(
+        maki_agent::manager::IdleSubtreeGuard,
+        maki_agent::actor::TurnTicket,
+    )>,
+    approval_runner_pending: bool,
+}
+
+struct PendingPlanApproval {
+    identity: Arc<()>,
+    cancel: Option<maki_agent::CancelTrigger>,
+    waiting_for_lock: Option<Box<PreparedPlanApproval>>,
+}
+
+impl Drop for PendingPlanApproval {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+    }
+}
+
+struct PreparedPlanApproval {
+    request: PlanApprovalRequest,
+    plan: crate::plan_approval::ApprovedPlan,
+    operation: maki_agent::actor::PreparedOperationTicket,
+    source: maki_agent::session_coordinator::IdleSessionLease,
+    idle: maki_agent::manager::IdleSubtreeGuard,
+    candidate: Option<PreparedSessionRuntime>,
+    candidate_commit: Option<maki_agent::actor::PreparedCommit>,
+    candidate_idle: Option<maki_agent::manager::IdleSubtreeGuard>,
+    candidate_lock: Option<ClaimedSessionLock>,
+    content_verified: bool,
+}
+
+struct PlanApprovalRequest {
+    identity: Arc<()>,
+    path: PathBuf,
+    model: Option<String>,
+    parallel: bool,
+    clear_context: bool,
+    run_id: u64,
+    yolo: Option<bool>,
+    rules: Vec<maki_storage::sessions::StoredRule>,
+    build_mode: maki_agent::ModeDef,
 }
 
 struct PendingReplacement {
     prepared: PreparedSessionRuntime,
     kind: SessionReplacementKind,
-    post_commit: Option<ReplacementPostCommit>,
 }
 
 #[derive(Clone)]
@@ -1016,6 +1055,7 @@ impl PreparedSessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
             projected_config_generation: 0,
+            config_projected: false,
             app,
             handles,
             model_slot,
@@ -1028,6 +1068,9 @@ impl PreparedSessionRuntime {
             session_lock,
             lock_lost: false,
             restore_pending: resumed,
+            pending_approval: None,
+            approved_turn: None,
+            approval_runner_pending: false,
         };
         project_committed_options(&mut runtime);
         Ok(runtime)
@@ -1076,6 +1119,7 @@ impl PreparedSessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
             projected_config_generation: 0,
+            config_projected: false,
             app,
             handles,
             model_slot,
@@ -1088,6 +1132,9 @@ impl PreparedSessionRuntime {
             session_lock,
             lock_lost: false,
             restore_pending: resumed,
+            pending_approval: None,
+            approved_turn: None,
+            approval_runner_pending: false,
         };
         project_committed_options(&mut runtime);
         Ok(runtime)
@@ -1132,7 +1179,7 @@ fn replace_session_runtime(
             claim_lock(sessions_dir, &target_id).map_err(|error| error.to_string())?,
         ))
     };
-    prepared.seed_storage();
+    let seed_snapshot = prepared.seed_snapshot.clone();
     let mut runtime =
         match prepared.activate_replacing(model_slot, target_lock, &current.coordinator) {
             Ok(runtime) => runtime,
@@ -1145,6 +1192,9 @@ fn replace_session_runtime(
                 return Err(error.to_string());
             }
         };
+    if let Some((writer, session)) = seed_snapshot {
+        writer.seed(session);
+    }
     runtime.app.exit_on_done = exit_on_done;
     runtime
         .app
@@ -1165,11 +1215,12 @@ impl SessionRuntime {
             return false;
         };
         if !Arc::ptr_eq(&actor.identity(), &commit.identity)
-            || commit.generation < self.projected_config_generation
+            || (self.config_projected && commit.generation <= self.projected_config_generation)
         {
             return false;
         }
         self.projected_config_generation = commit.generation;
+        self.config_projected = true;
         project_actor_config(&mut self.app, &commit.config);
         true
     }
@@ -1195,9 +1246,13 @@ impl SessionRuntime {
     }
 
     fn activate_deferred(&mut self) {
+        if self.approval_runner_pending {
+            return;
+        }
         if std::mem::take(&mut self.restore_pending) {
             self.app.restore_resumed_session();
         }
+        self.handles.release_runner();
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -1220,13 +1275,14 @@ impl SessionRuntime {
     }
 }
 
-type PrepareProvider = Arc<
-    dyn Fn(Model, Timeouts) -> Result<maki_agent::actor::PreparedModel, Arc<str>> + Send + Sync,
->;
-
 /// Everything needed to bring up a new session runtime after startup.
+#[cfg(test)]
+type LockPrepareGate = Arc<dyn Fn(MakiId) -> Box<dyn Send> + Send + Sync>;
+
 struct SpawnCtx {
     prepare_provider: PrepareProvider,
+    #[cfg(test)]
+    lock_prepare_gate: Option<LockPrepareGate>,
     storage: StateDir,
     sessions_dir: PathBuf,
     config: AgentConfig,
@@ -1554,10 +1610,21 @@ impl SpawnCtx {
 
     fn prepare_runtime_with_provider_and_permissions(
         &self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+        permissions: &PermissionManager,
+        seed_snapshot: bool,
+    ) -> Result<PreparedSessionRuntime> {
+        self.prepare_runtime_with_config(session, provider, permissions, seed_snapshot, None)
+    }
+
+    fn prepare_runtime_with_config(
+        &self,
         mut session: AppSession,
         provider: Option<PreparedProvider>,
         permissions: &PermissionManager,
         seed_snapshot: bool,
+        effective_config: Option<maki_agent::EffectiveAgentConfig>,
     ) -> Result<PreparedSessionRuntime> {
         let resumed = session_has_content(&session);
         let session_id = session.id;
@@ -1626,7 +1693,7 @@ impl SpawnCtx {
         .with_mode_def(initial_mode_def);
         let handles = AgentHandles::prepare(
             &model_slot,
-            initial_config,
+            effective_config.unwrap_or(initial_config),
             history.clone(),
             self.config.clone(),
             self.ui_config.tool_output_lines,
@@ -1682,13 +1749,19 @@ impl SpawnCtx {
         let prepared = self.prepare_runtime_with_provider(session, provider)?;
         let session_lock = claim_lock(&self.sessions_dir, &id)?;
         prepared.seed_storage();
-        prepared
+        let mut runtime = prepared
             .activate(&self.model_slot, Some(SessionLockState::Held(session_lock)))
-            .map_err(|error| eyre!(error))
+            .map_err(|error| eyre!(error))?;
+        runtime.activate_deferred();
+        Ok(runtime)
     }
 }
 
 enum InternalEvent {
+    ApprovalRunnerReady {
+        session: MakiId,
+        runtime: Arc<()>,
+    },
     ModelCandidate {
         requested_spec: String,
         expected_provider: ProviderIdentity,
@@ -1713,6 +1786,12 @@ enum InternalEvent {
         kind: SessionOpKind,
         result: Result<(), String>,
     },
+    PlanApprovalReady {
+        session: MakiId,
+        runtime: Arc<()>,
+        request: Arc<()>,
+        result: Result<Box<PreparedPlanApproval>, String>,
+    },
     SessionHeartbeat(u64),
 }
 
@@ -1736,7 +1815,6 @@ enum SessionOpKind {
     ModeChanged {
         id: String,
         plan: crate::app::mode::PlanState,
-        follow_up: Option<String>,
     },
     /// `/cd`: apply the canonical path the coordinator resolved, which is not
     /// necessarily the one that was typed.
@@ -2018,6 +2096,8 @@ impl<'t> EventLoop<'t> {
             smol::block_on(mcp::start(&cwd, project_config.clone()));
         let ctx = SpawnCtx {
             prepare_provider: Arc::new(prepare_provider),
+            #[cfg(test)]
+            lock_prepare_gate: None,
             storage,
             sessions_dir: sessions_dir.clone(),
             config,
@@ -2240,6 +2320,31 @@ impl<'t> EventLoop<'t> {
 
     fn handle_internal(&mut self, event: InternalEvent) {
         match event {
+            InternalEvent::ApprovalRunnerReady { session, runtime } => {
+                if let Some(idx) = self
+                    .position(session)
+                    .filter(|idx| Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity()))
+                    && std::mem::take(&mut self.sessions[idx].approval_runner_pending)
+                {
+                    self.sessions[idx].activate_deferred();
+                }
+            }
+            InternalEvent::PlanApprovalReady {
+                session,
+                runtime,
+                request,
+                result,
+            } => {
+                if let Some(idx) = self.position(session).filter(|idx| {
+                    Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity())
+                        && self.sessions[*idx]
+                            .pending_approval
+                            .as_ref()
+                            .is_some_and(|pending| Arc::ptr_eq(&pending.identity, &request))
+                }) {
+                    self.complete_plan_approval(idx, result.map(|prepared| *prepared));
+                }
+            }
             InternalEvent::ModelCandidate {
                 requested_spec,
                 expected_provider,
@@ -2505,7 +2610,19 @@ impl<'t> EventLoop<'t> {
             }
         }
         let mut login_actions: Vec<(usize, Vec<Action>)> = Vec::new();
+        let mut approvals = Vec::new();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
+            if matches!(rt.session_lock, Some(SessionLockState::InFlight(_))) {
+                complete_runtime_heartbeat(rt);
+            }
+            if !matches!(rt.session_lock, Some(SessionLockState::InFlight(_)))
+                && let Some(prepared) = rt
+                    .pending_approval
+                    .as_mut()
+                    .and_then(|pending| pending.waiting_for_lock.take())
+            {
+                approvals.push((i, prepared));
+            }
             while let Ok(commit) = rt.config_commits.try_recv() {
                 if rt.project_config(&commit) {
                     dirty = Dirty::YES;
@@ -2519,6 +2636,10 @@ impl<'t> EventLoop<'t> {
         }
         for (i, actions) in login_actions {
             self.dispatch(i, actions);
+        }
+        for (i, prepared) in approvals {
+            self.complete_plan_approval(i, Ok(*prepared));
+            dirty = Dirty::YES;
         }
         dirty
     }
@@ -2553,6 +2674,18 @@ impl<'t> EventLoop<'t> {
     }
 
     fn drain_channels(&mut self) -> Result<Dirty> {
+        for runtime in &mut self.sessions {
+            if !runtime.app.plan_approval_pending {
+                runtime.pending_approval.take();
+            }
+            if runtime
+                .approved_turn
+                .as_ref()
+                .is_some_and(|(_, ticket)| ticket.peek().is_some())
+            {
+                runtime.approved_turn.take();
+            }
+        }
         let mut dirty = Dirty::NO;
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
@@ -3286,14 +3419,581 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
-    fn dispatch_mode_change(&self, idx: usize, id: String, follow_up: Option<String>) {
+    fn complete_plan_approval(&mut self, idx: usize, result: Result<PreparedPlanApproval, String>) {
+        let runtime = &mut self.sessions[idx];
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                runtime.pending_approval.take();
+                runtime.app.plan_approval_pending = false;
+                runtime.app.flash(error);
+                return;
+            }
+        };
+        if runtime.lock_lost
+            || runtime.session_lock.is_none()
+            || !runtime
+                .app
+                .plan_approval_matches(prepared.request.model.as_deref(), prepared.request.parallel)
+            || !runtime
+                .pending_approval
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(&pending.identity, &prepared.request.identity))
+            || runtime.app.run_id.wrapping_add(1) != prepared.request.run_id
+            || runtime.app.state.plan.path() != Some(prepared.request.path.as_path())
+            || prepared.source.revalidate().is_err()
+        {
+            runtime.pending_approval.take();
+            runtime.app.plan_approval_pending = false;
+            runtime
+                .app
+                .flash(crate::plan_approval::APPROVAL_CHANGED.into());
+            return;
+        }
+        if prepared.request.yolo != runtime.app.permissions.persisted_yolo()
+            || prepared.request.rules
+                != crate::app::session_state::rules_to_stored(
+                    &runtime.app.permissions.session_rules_snapshot(),
+                )
+        {
+            self.complete_plan_approval(idx, Err(crate::plan_approval::APPROVAL_CHANGED.into()));
+            return;
+        }
+        if prepared.request.clear_context && prepared.candidate.is_none() {
+            self.prepare_fresh_plan_approval(idx, prepared);
+            return;
+        }
+        if !prepared.content_verified {
+            self.verify_plan_approval(idx, prepared);
+            return;
+        }
+        if matches!(runtime.session_lock, Some(SessionLockState::InFlight(_))) {
+            if let Some(pending) = runtime.pending_approval.as_mut() {
+                pending.waiting_for_lock = Some(Box::new(prepared));
+            }
+            return;
+        }
+        let PreparedPlanApproval {
+            request,
+            plan,
+            operation,
+            source,
+            idle,
+            candidate,
+            candidate_commit,
+            candidate_idle,
+            candidate_lock,
+            content_verified: _,
+        } = prepared;
+        if let Some(mut candidate) = candidate {
+            let target = candidate.app.session_id();
+            let Some(lock) = candidate_lock else {
+                self.complete_plan_approval(
+                    idx,
+                    Err(crate::plan_approval::APPROVAL_CHANGED.into()),
+                );
+                return;
+            };
+            let Some(commit) = candidate_commit else {
+                self.complete_plan_approval(
+                    idx,
+                    Err(crate::plan_approval::APPROVAL_CHANGED.into()),
+                );
+                return;
+            };
+            let Some(candidate_idle) = candidate_idle else {
+                self.complete_plan_approval(
+                    idx,
+                    Err(crate::plan_approval::APPROVAL_CHANGED.into()),
+                );
+                return;
+            };
+            let Some(ticket) = commit
+                .ticket
+                .as_ref()
+                .filter(|ticket| ticket.peek().is_none())
+            else {
+                self.complete_plan_approval(
+                    idx,
+                    Err(crate::plan_approval::APPROVAL_CHANGED.into()),
+                );
+                return;
+            };
+            if let Err(error) = candidate_idle.allow_turn(ticket) {
+                self.complete_plan_approval(idx, Err(error.to_string()));
+                return;
+            }
+            if let Some((_, session)) = candidate.seed_snapshot.as_mut() {
+                let session = Arc::make_mut(session);
+                session.model = commit.config.config.model.spec();
+                session.meta.mode = Some(maki_storage::sessions::StoredMode::Build);
+                session.meta.thinking = Some(commit.config.config.thinking.into());
+                session.meta.fast = commit.config.config.fast;
+                session.meta.workflow = commit.config.config.workflow;
+                session.meta.plan_path = None;
+                session.meta.plan_written = false;
+            }
+            let seed = candidate.seed_snapshot.clone();
+            let candidate_slot = Arc::clone(&candidate.model_slot);
+            let mut next = match candidate.activate_replacing(
+                &candidate_slot,
+                Some(SessionLockState::Held(lock)),
+                &runtime.coordinator,
+            ) {
+                Ok(next) => next,
+                Err((error, lock)) => {
+                    if let Err(release_error) = release_lock_state(lock) {
+                        warn!(%release_error, "approval candidate lock release failed");
+                    }
+                    self.complete_plan_approval(idx, Err(error.to_string()));
+                    return;
+                }
+            };
+            if let Some((writer, session)) = seed {
+                writer.seed(session);
+            }
+            next.model_slot.project(
+                commit.config.config.model.clone(),
+                Arc::clone(&commit.config.config.settings.provider),
+            );
+            next.project_config(&commit.config);
+            next.app.exit_on_done = runtime.app.exit_on_done;
+            next.app
+                .input_box
+                .replace_history_from(&mut runtime.app.input_box);
+            next.app.record_plan_implementation(
+                request.run_id,
+                plan.content,
+                plan.path.display().to_string(),
+                plan.message,
+            );
+            next.approved_turn = commit.ticket.map(|ticket| (candidate_idle, ticket));
+            next.approval_runner_pending = true;
+            next.app
+                .record_recent_model(&commit.config.config.model.spec());
+            let old = std::mem::replace(runtime, next);
+            let retired_id = old.id();
+            let storage_writer = Arc::clone(&self.ctx.storage_writer);
+            let identity = runtime.handles.identity();
+            let internal_tx = self.internal_tx.clone();
+            smol::spawn(async move {
+                let SessionRuntime {
+                    handles,
+                    coordinator,
+                    session_lock,
+                    ..
+                } = old;
+                handles.shutdown().await;
+                if let Err(error) = smol::unblock(move || release_lock_state(session_lock)).await {
+                    warn!(%error, "outgoing approval session lock release failed");
+                }
+                drop(operation);
+                drop(source);
+                drop(idle);
+                let _ = coordinator.close().await;
+                storage_writer.forget(retired_id);
+                let _ = internal_tx.send(InternalEvent::ApprovalRunnerReady {
+                    session: target,
+                    runtime: identity,
+                });
+            })
+            .detach();
+            return;
+        }
+        match operation.commit() {
+            Ok(commit) => {
+                runtime.project_config(&commit.config);
+                runtime.reset_run_notifications();
+                runtime.app.record_plan_implementation(
+                    request.run_id,
+                    plan.content,
+                    plan.path.display().to_string(),
+                    plan.message,
+                );
+                if let Some(ticket) = commit.ticket {
+                    if let Err(error) = idle.allow_turn(&ticket) {
+                        let (manager, root) = runtime.handles.manager_and_root();
+                        if let Ok(actor) = manager.actor(root) {
+                            let _ = actor.cancel_turn(ticket.turn_id());
+                        }
+                        runtime.app.flash(error.to_string());
+                    }
+                    runtime.approved_turn = Some((idle, ticket));
+                }
+                runtime.pending_approval.take();
+                drop(source);
+                self.sessions[idx]
+                    .app
+                    .record_recent_model(&commit.config.config.model.spec());
+            }
+            Err(error) => {
+                runtime.pending_approval.take();
+                runtime.app.plan_approval_pending = false;
+                runtime.app.flash(error.to_string());
+            }
+        }
+    }
+
+    fn advance_plan_approval(
+        &mut self,
+        idx: usize,
+        prepared: &mut PreparedPlanApproval,
+    ) -> CancelToken {
+        let identity = Arc::new(());
+        let (trigger, cancel) = CancelToken::new();
+        prepared.request.identity = Arc::clone(&identity);
+        self.sessions[idx].pending_approval = Some(PendingPlanApproval {
+            identity,
+            cancel: Some(trigger),
+            waiting_for_lock: None,
+        });
+        cancel
+    }
+
+    fn verify_plan_approval(&mut self, idx: usize, mut prepared: PreparedPlanApproval) {
+        let cancel = self.advance_plan_approval(idx, &mut prepared);
+        let session = self.sessions[idx].id();
+        let runtime = self.sessions[idx].handles.identity();
+        let request = Arc::clone(&prepared.request.identity);
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = cancel
+                .race(bounded_session_op(
+                    async move {
+                        let path = prepared.plan.path.clone();
+                        let content = prepared.plan.content.clone();
+                        smol::unblock(move || crate::plan_approval::verify_plan(&path, &content))
+                            .await?;
+                        prepared.content_verified = true;
+                        Ok(prepared)
+                    },
+                    SESSION_OP_TIMEOUT,
+                ))
+                .await
+                .unwrap_or_else(|_| Err("Implementation preparation cancelled.".into()));
+            let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
+                session,
+                runtime,
+                request,
+                result: result.map(Box::new),
+            });
+        })
+        .detach();
+    }
+
+    fn prepare_fresh_plan_approval(&mut self, idx: usize, mut prepared: PreparedPlanApproval) {
+        let result = (|| -> Result<_, String> {
+            let config = prepared
+                .operation
+                .ready_config()
+                .map_err(|error| error.to_string())?
+                .config;
+            let mut session = AppSession::new(
+                &config.model.spec(),
+                &prepared.source.snapshot().cwd().to_string_lossy(),
+            );
+            session.meta.yolo = prepared.request.yolo;
+            session.meta.session_rules = prepared.request.rules.clone();
+            let provider = PreparedProvider {
+                model: config.model.clone(),
+                provider: Arc::clone(&config.settings.provider),
+            };
+            let candidate = self
+                .ctx
+                .prepare_runtime_with_config(
+                    session,
+                    Some(provider),
+                    &self.sessions[idx].app.permissions,
+                    true,
+                    Some((*config).clone()),
+                )
+                .map_err(|error| error.to_string())?;
+            let (manager, root) = candidate.handles.manager_and_root();
+            let idle = manager
+                .prepare_idle_subtree(root)
+                .map_err(|error| error.to_string())?;
+            let actor = manager.actor(root).map_err(|error| error.to_string())?;
+            let turn = maki_agent::actor::PreparedTurn {
+                input: maki_agent::AgentInput::from_defaults(
+                    prepared.plan.message.clone(),
+                    maki_agent::AgentMode::Build,
+                    Vec::new(),
+                    maki_agent::SessionDefaults::default(),
+                ),
+                event_sender: Some(maki_agent::EventSender::new(
+                    candidate.handles.agent_tx(),
+                    prepared.request.run_id,
+                )),
+                correlation: crate::agent::shared_queue::correlation(prepared.request.run_id),
+            };
+            let operation = actor
+                .reserve_prepared_operation(Some(turn))
+                .map_err(|error| error.to_string())?;
+            let target = candidate.app.session_id();
+            prepared.candidate = Some(candidate);
+            Ok((operation, idle, target))
+        })();
+        let (operation, candidate_idle, target) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.complete_plan_approval(idx, Err(error));
+                return;
+            }
+        };
+        let cancel = self.advance_plan_approval(idx, &mut prepared);
+        let session = self.sessions[idx].id();
+        let runtime = self.sessions[idx].handles.identity();
+        let request = Arc::clone(&prepared.request.identity);
+        let policy = Arc::clone(&self.ctx.model_policy);
+        let provider = Arc::clone(&self.ctx.prepare_provider);
+        let timeouts = self.ctx.timeouts;
+        let mode = prepared.request.build_mode.clone();
+        let sessions_dir = self.ctx.sessions_dir.clone();
+        #[cfg(test)]
+        let lock_prepare_gate = self.ctx.lock_prepare_gate.clone();
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = cancel
+                .race(bounded_session_op(
+                    async move {
+                        let spec = prepared.request.model.clone();
+                        let change = smol::unblock(move || {
+                            crate::plan_approval::prepare_change(
+                                spec, &policy, timeouts, &provider, mode,
+                            )
+                        })
+                        .await?;
+                        operation
+                            .resolve(Ok(Some(change)))
+                            .map_err(|error| error.to_string())?;
+                        operation
+                            .wait_ready()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let commit = operation.commit().map_err(|error| error.to_string())?;
+                        if let Some(ticket) = &commit.ticket {
+                            candidate_idle
+                                .allow_turn(ticket)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        prepared.candidate_commit = Some(commit);
+                        let lock = smol::unblock(move || {
+                            #[cfg(test)]
+                            let guard = lock_prepare_gate.map(|gate| gate(target));
+                            let lock = claim_lock(&sessions_dir, &target)
+                                .map_err(|error| error.to_string());
+                            #[cfg(test)]
+                            {
+                                (lock, guard)
+                            }
+                            #[cfg(not(test))]
+                            {
+                                lock
+                            }
+                        })
+                        .await;
+                        #[cfg(test)]
+                        let (lock, _guard) = lock;
+                        prepared.candidate_lock = Some(lock?);
+                        let path = prepared.plan.path.clone();
+                        let content = prepared.plan.content.clone();
+                        smol::unblock(move || crate::plan_approval::verify_plan(&path, &content))
+                            .await?;
+                        prepared.candidate_idle = Some(candidate_idle);
+                        Ok(prepared)
+                    },
+                    SESSION_OP_TIMEOUT,
+                ))
+                .await
+                .unwrap_or_else(|_| Err("Implementation preparation cancelled.".into()));
+            let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
+                session,
+                runtime,
+                request,
+                result: result.map(Box::new),
+            });
+        })
+        .detach();
+    }
+
+    fn prepare_plan_approval(
+        &mut self,
+        idx: usize,
+        clear_context: bool,
+        model: Option<String>,
+        parallel: bool,
+        path: PathBuf,
+    ) {
+        let runtime = &mut self.sessions[idx];
+        if runtime.pending_approval.is_some() {
+            return;
+        }
+        let (manager, root) = runtime.handles.manager_and_root();
+        let idle = match manager.prepare_idle_subtree(root) {
+            Ok(idle) if !runtime.lock_lost => idle,
+            _ => {
+                runtime.app.plan_approval_pending = false;
+                runtime
+                    .app
+                    .flash(crate::plan_approval::APPROVAL_BUSY.into());
+                return;
+            }
+        };
+        let actor = match manager.actor(root) {
+            Ok(actor) => actor,
+            Err(error) => {
+                runtime.app.plan_approval_pending = false;
+                runtime.app.flash(error.to_string());
+                return;
+            }
+        };
+        let identity = Arc::new(());
+        let request = PlanApprovalRequest {
+            identity: Arc::clone(&identity),
+            path,
+            model,
+            parallel,
+            clear_context,
+            run_id: runtime.app.run_id.wrapping_add(1),
+            yolo: runtime.app.permissions.persisted_yolo(),
+            rules: crate::app::session_state::rules_to_stored(
+                &runtime.app.permissions.session_rules_snapshot(),
+            ),
+            build_mode: self
+                .ctx
+                .lua_event_handle
+                .mode_registry()
+                .current(&maki_agent::AgentMode::Build),
+        };
+        let absolute = if request.path.is_absolute() {
+            request.path.clone()
+        } else {
+            PathBuf::from(&runtime.app.state.session.cwd).join(&request.path)
+        };
+        let turn = (!clear_context).then(|| maki_agent::actor::PreparedTurn {
+            input: maki_agent::AgentInput::from_defaults(
+                String::new(),
+                maki_agent::AgentMode::Build,
+                Vec::new(),
+                maki_agent::SessionDefaults::default(),
+            ),
+            event_sender: Some(maki_agent::EventSender::new(
+                runtime.handles.agent_tx.clone(),
+                request.run_id,
+            )),
+            correlation: crate::agent::shared_queue::correlation(request.run_id),
+        });
+        let operation = match actor.reserve_prepared_operation(turn) {
+            Ok(operation) => operation,
+            Err(error) => {
+                runtime.app.plan_approval_pending = false;
+                runtime.app.flash(error.to_string());
+                return;
+            }
+        };
+        let (trigger, cancel) = CancelToken::new();
+        runtime.pending_approval = Some(PendingPlanApproval {
+            identity: Arc::clone(&identity),
+            cancel: Some(trigger),
+            waiting_for_lock: None,
+        });
+        let session = runtime.id();
+        let runtime_identity = runtime.handles.identity();
+        let coordinator = runtime.coordinator.clone();
+        let mode_def = request.build_mode.clone();
+        let policy = Arc::clone(&self.ctx.model_policy);
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let timeouts = self.ctx.timeouts;
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = cancel
+                .race(bounded_session_op(
+                    async move {
+                        let source = coordinator
+                            .try_acquire_idle_lease()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let path = if request.path.is_absolute() {
+                            request.path.clone()
+                        } else {
+                            source.snapshot().cwd().join(&request.path)
+                        };
+                        if path != absolute {
+                            return Err(crate::plan_approval::APPROVAL_CHANGED.into());
+                        }
+                        let parallel = request.parallel;
+                        let plan =
+                            smol::unblock(move || crate::plan_approval::read_plan(path, parallel))
+                                .await?;
+                        if !request.clear_context {
+                            operation
+                                .replace_turn_input(maki_agent::AgentInput::from_defaults(
+                                    plan.message.clone(),
+                                    maki_agent::AgentMode::Build,
+                                    Vec::new(),
+                                    maki_agent::SessionDefaults::default(),
+                                ))
+                                .map_err(|error| error.to_string())?;
+                        }
+                        let change = if request.clear_context {
+                            None
+                        } else {
+                            let spec = request.model.clone();
+                            Some(
+                                smol::unblock(move || {
+                                    crate::plan_approval::prepare_change(
+                                        spec, &policy, timeouts, &prepare, mode_def,
+                                    )
+                                })
+                                .await?,
+                            )
+                        };
+                        operation
+                            .resolve(Ok(change))
+                            .map_err(|error| error.to_string())?;
+                        operation
+                            .wait_ready()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let plan = smol::unblock(move || {
+                            plan.verify()?;
+                            Ok::<_, String>(plan)
+                        })
+                        .await?;
+                        Ok(PreparedPlanApproval {
+                            request,
+                            plan,
+                            operation,
+                            source,
+                            idle,
+                            candidate: None,
+                            candidate_commit: None,
+                            candidate_idle: None,
+                            candidate_lock: None,
+                            content_verified: false,
+                        })
+                    },
+                    SESSION_OP_TIMEOUT,
+                ))
+                .await
+                .unwrap_or_else(|_| Err("Implementation preparation cancelled.".into()));
+            let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
+                session,
+                runtime: runtime_identity,
+                request: identity,
+                result: result.map(Box::new),
+            });
+        })
+        .detach();
+    }
+
+    fn dispatch_mode_change(&self, idx: usize, id: String) {
         dispatch_mode_change_op(
             &self.sessions[idx],
             &self.ctx.storage,
             self.ctx.lua_event_handle.mode_registry(),
             self.internal_tx.clone(),
             id,
-            follow_up,
         );
     }
 
@@ -3584,11 +4284,7 @@ impl<'t> EventLoop<'t> {
         idx: usize,
         request: SessionReplacementRequest,
     ) -> Result<PendingReplacement, String> {
-        let SessionReplacementRequest {
-            mut session,
-            kind,
-            post_commit,
-        } = request;
+        let SessionReplacementRequest { mut session, kind } = request;
         if session.id == self.sessions[idx].id() {
             apply_options_to_session(
                 &mut session,
@@ -3600,19 +4296,11 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].id(),
             self.sessions[idx].app.permissions.as_ref(),
         )?;
-        Ok(PendingReplacement {
-            prepared,
-            kind,
-            post_commit,
-        })
+        Ok(PendingReplacement { prepared, kind })
     }
 
     fn commit_replacement(&mut self, idx: usize, pending: PendingReplacement) {
-        let PendingReplacement {
-            prepared,
-            kind,
-            post_commit,
-        } = pending;
+        let PendingReplacement { prepared, kind } = pending;
         match self.replace_prepared_runtime(idx, prepared) {
             Ok(()) => {
                 if let SessionReplacementKind::Reset { ended_id } = kind {
@@ -3620,12 +4308,6 @@ impl<'t> EventLoop<'t> {
                         "SessionReset",
                         serde_json::json!({ "session_id": ended_id }),
                     );
-                }
-                if let Some(post_commit) = post_commit {
-                    let actions = self.sessions[idx]
-                        .app
-                        .apply_replacement_post_commit(post_commit);
-                    self.dispatch(idx, actions);
                 }
             }
             Err(error) => self.sessions[idx].app.flash(error),
@@ -3850,9 +4532,18 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
-            Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode, None),
-            Action::ImplementPlan(text) => {
-                self.dispatch_mode_change(idx, "build".into(), Some(text));
+            Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode),
+            Action::ApprovePlan {
+                clear_context,
+                model,
+                parallel,
+                path,
+            } => {
+                self.prepare_plan_approval(idx, clear_context, model, parallel, path);
+            }
+            Action::CancelPlanApproval => {
+                self.sessions[idx].pending_approval.take();
+                self.sessions[idx].app.plan_approval_pending = false;
             }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
@@ -4010,16 +4701,8 @@ impl<'t> EventLoop<'t> {
                 }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
-            SessionOpKind::ModeChanged {
-                id,
-                plan,
-                follow_up,
-            } => match result {
-                Ok(()) => {
-                    let actions =
-                        complete_mode_change(&mut self.sessions[idx].app, id, plan, follow_up);
-                    self.dispatch(idx, actions);
-                }
+            SessionOpKind::ModeChanged { id, plan } => match result {
+                Ok(()) => complete_mode_change(&mut self.sessions[idx].app, id, plan),
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::DirectoryChanged { adopted } => match result {
@@ -4790,6 +5473,7 @@ fn ring_bell() {
 
 #[cfg(test)]
 mod tests {
+    include!("event_loop/approval_tests.rs");
     use super::*;
 
     async fn wait_projected_option(runtime: &SessionRuntime, id: &str, value: &str) {
@@ -4810,6 +5494,8 @@ mod tests {
     use maki_config::PermissionsConfig;
     use maki_providers::TokenUsage;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::fs::{File, FileTimes};
+    use std::time::SystemTime;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -5003,7 +5689,6 @@ mod tests {
                 EventHandle::disconnected_for_test().mode_registry(),
                 internal_tx,
                 "plan".into(),
-                None,
             );
 
             assert_eq!(agent_mode_for_app(&runtime.app), initial_app_mode);
@@ -5013,13 +5698,8 @@ mod tests {
                 panic!("expected mode change completion");
             };
             result.unwrap();
-            if let SessionOpKind::ModeChanged {
-                id,
-                plan,
-                follow_up,
-            } = kind
-            {
-                complete_mode_change(&mut runtime.app, id, plan, follow_up);
+            if let SessionOpKind::ModeChanged { id, plan } = kind {
+                complete_mode_change(&mut runtime.app, id, plan);
             } else {
                 panic!("expected mode change completion");
             }
@@ -5836,6 +6516,7 @@ mod tests {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
             projected_config_generation: 0,
+            config_projected: false,
             app,
             handles,
             model_slot,
@@ -5848,6 +6529,9 @@ mod tests {
             session_lock: None,
             lock_lost: false,
             restore_pending: false,
+            pending_approval: None,
+            approved_turn: None,
+            approval_runner_pending: false,
         }
     }
 
@@ -6152,6 +6836,7 @@ mod tests {
                 Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
             let ctx = SpawnCtx {
                 prepare_provider: Arc::new(prepare_provider),
+                lock_prepare_gate: None,
                 storage,
                 sessions_dir,
                 config: AgentConfig::default(),
@@ -7301,6 +7986,143 @@ mod tests {
         );
         lease.release().unwrap();
         release_runtime(runtime);
+    }
+
+    #[test]
+    fn heartbeat_tick_then_delayed_notification_keeps_lock_held() {
+        with_event_loop(|event_loop| {
+            let id = event_loop.sessions[0].id();
+            event_loop.sessions[0].session_lock = Some(SessionLockState::Held(
+                claim_lock(&event_loop.sessions_dir, &id).unwrap(),
+            ));
+            let generation = event_loop.sessions[0].generation;
+            let (entered, entry) = flume::bounded(1);
+            let (release, gate) = flume::bounded(1);
+            start_runtime_heartbeat_with(
+                &mut event_loop.sessions[0],
+                &event_loop.internal_tx,
+                move |lease| {
+                    entered.send(()).unwrap();
+                    gate.recv().unwrap();
+                    (lease, Ok(session_lock::LockBeat::Held))
+                },
+            );
+            entry.recv_timeout(AGENT_SHUTDOWN_TIMEOUT).unwrap();
+            release.send(()).unwrap();
+            let event = event_loop
+                .internal_rx
+                .recv_timeout(AGENT_SHUTDOWN_TIMEOUT)
+                .unwrap();
+            assert!(matches!(event, InternalEvent::SessionHeartbeat(value) if value == generation));
+            event_loop.last_heartbeat = Instant::now();
+            let _ = event_loop.tick();
+            assert!(matches!(
+                event_loop.sessions[0].session_lock,
+                Some(SessionLockState::Held(_))
+            ));
+            assert!(
+                session_lock::claim(&event_loop.sessions_dir, &id)
+                    .unwrap()
+                    .is_none()
+            );
+            event_loop.handle_internal(event);
+            event_loop.handle_internal(InternalEvent::SessionHeartbeat(generation));
+            assert!(matches!(
+                event_loop.sessions[0].session_lock,
+                Some(SessionLockState::Held(_))
+            ));
+            assert!(!event_loop.sessions[0].lock_lost);
+            assert!(
+                session_lock::claim(&event_loop.sessions_dir, &id)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn heartbeat_renews_backdated_lock_during_pending_approval() {
+        const PENDING_INPUT: &str = "approval waiting for preparation";
+        const STALE_MARGIN: Duration = Duration::from_secs(1);
+        with_event_loop(|event_loop| {
+            let runtime = &mut event_loop.sessions[0];
+            let id = runtime.id();
+            runtime.session_lock = Some(SessionLockState::Held(
+                claim_lock(&event_loop.sessions_dir, &id).unwrap(),
+            ));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let idle = manager.prepare_idle_subtree(root).unwrap();
+            let operation = actor
+                .reserve_prepared_operation(Some(maki_agent::actor::PreparedTurn {
+                    input: maki_agent::AgentInput::from_defaults(
+                        PENDING_INPUT.into(),
+                        maki_agent::AgentMode::Build,
+                        Vec::new(),
+                        maki_agent::SessionDefaults::default(),
+                    ),
+                    event_sender: None,
+                    correlation: PENDING_INPUT.into(),
+                }))
+                .unwrap();
+            let (trigger, _cancel) = CancelToken::new();
+            runtime.app.plan_approval_pending = true;
+            runtime.pending_approval = Some(PendingPlanApproval {
+                identity: Arc::new(()),
+                cancel: Some(trigger),
+                waiting_for_lock: None,
+            });
+            let path = session_lock::lock_path(&event_loop.sessions_dir, &id);
+            let stale_time = SystemTime::now() - session_lock::STALE_AFTER - STALE_MARGIN;
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(stale_time))
+                .unwrap();
+            assert!(
+                SystemTime::now()
+                    .duration_since(std::fs::metadata(&path).unwrap().modified().unwrap())
+                    .unwrap()
+                    > session_lock::STALE_AFTER
+            );
+            event_loop.last_heartbeat = Instant::now() - session_lock::HEARTBEAT_INTERVAL;
+            let _ = event_loop.tick();
+            let event = event_loop
+                .internal_rx
+                .recv_timeout(AGENT_SHUTDOWN_TIMEOUT)
+                .unwrap();
+            assert!(
+                matches!(event, InternalEvent::SessionHeartbeat(value) if value == event_loop.sessions[0].generation)
+            );
+            event_loop.handle_internal(event);
+            assert!(event_loop.sessions[0].pending_approval.is_some());
+            assert!(event_loop.sessions[0].app.plan_approval_pending);
+            assert!(matches!(
+                operation.ready_config(),
+                Err(maki_agent::actor::ActorError::PolicyPending)
+            ));
+            assert!(matches!(
+                event_loop.sessions[0].session_lock,
+                Some(SessionLockState::Held(_))
+            ));
+            assert!(!event_loop.sessions[0].lock_lost);
+            assert!(
+                SystemTime::now()
+                    .duration_since(std::fs::metadata(path).unwrap().modified().unwrap())
+                    .unwrap()
+                    <= session_lock::STALE_AFTER
+            );
+            assert!(
+                session_lock::claim(&event_loop.sessions_dir, &id)
+                    .unwrap()
+                    .is_none()
+            );
+            event_loop.sessions[0].pending_approval.take();
+            event_loop.sessions[0].app.plan_approval_pending = false;
+            drop(operation);
+            drop(idle);
+        });
     }
 
     #[test]

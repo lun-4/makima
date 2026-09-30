@@ -31,6 +31,12 @@ impl MessageQueue {
         self.shared = Some(shared);
     }
 
+    pub(crate) fn set_run_id(&self, run_id: u64) {
+        if let Some(shared) = &self.shared {
+            shared.set_run_id(run_id);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.shared.as_ref().is_none_or(|s| s.is_empty())
@@ -284,7 +290,16 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
-        self.run_id += 1;
+        self.record_run_start(self.run_id + 1);
+        if !display.is_empty() || !input.images.is_empty() {
+            self.main_chat()
+                .show_user_message(display, input.images.clone());
+        }
+        vec![Action::SendMessage(Box::new(input))]
+    }
+
+    pub(super) fn record_run_start(&mut self, run_id: u64) {
+        self.run_id = run_id;
         self.clear_exit_request();
         self.stamped_subagent_outcomes.clear();
         // New work supersedes text held for recovery after an agent error.
@@ -295,10 +310,5 @@ impl App {
         self.run_model = Some(self.state.session.model.clone());
         self.run_context_window = Some(self.state.model.context_window);
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
-        if !display.is_empty() || !input.images.is_empty() {
-            self.main_chat()
-                .show_user_message(display, input.images.clone());
-        }
-        vec![Action::SendMessage(Box::new(input))]
     }
 }

@@ -16,10 +16,16 @@ const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
 } else {
     "Ctrl+T/Esc"
 };
+const MODEL_PICKER_HINT: &str = if cfg!(target_os = "macos") {
+    "⌃M"
+} else {
+    key::MODEL_PICKER.label
+};
 const HINT_PAIRS: &[(&str, &str)] = &[
     ("↑↓", "select"),
     ("Space", "toggle parallel"),
     ("Enter", "confirm"),
+    (MODEL_PICKER_HINT, "choose implementation model"),
     (key::OPEN_EDITOR.label, "edit plan"),
     (DISMISS_KEYS, "dismiss"),
 ];
@@ -46,11 +52,20 @@ const MENU: &[MenuItem] = &[
         desc: "  Keep current context, implement the plan",
         action: || PlanFormAction::Implement,
     },
+    MenuItem {
+        label: "Implementation model",
+        desc: "",
+        action: || PlanFormAction::OpenModelPicker,
+    },
+    MenuItem {
+        label: "Use current model",
+        desc: "  Clear implementation model choice",
+        action: || PlanFormAction::UseCurrentModel,
+    },
 ];
 
-// 2 borders + 1 empty line + 1 hint bar
+const MODEL_ROW: usize = MENU.len() - 2;
 const CHROME_LINES: u16 = 4;
-const FORM_HEIGHT: u16 = MENU.len() as u16 + CHROME_LINES;
 
 #[derive(Debug, PartialEq)]
 pub enum PlanFormAction {
@@ -59,6 +74,8 @@ pub enum PlanFormAction {
     ClearAndImplement,
     Implement,
     OpenEditor,
+    OpenModelPicker,
+    UseCurrentModel,
     Hide,
 }
 
@@ -73,6 +90,7 @@ pub struct PlanForm {
     visibility: Visibility,
     selected: usize,
     parallel: bool,
+    implementation_model: Option<String>,
 }
 
 impl PlanForm {
@@ -81,6 +99,7 @@ impl PlanForm {
             visibility: Visibility::Hidden,
             selected: 0,
             parallel: false,
+            implementation_model: None,
         }
     }
 
@@ -121,6 +140,32 @@ impl PlanForm {
     pub fn reset(&mut self) {
         self.visibility = Visibility::Hidden;
         self.selected = 0;
+        self.implementation_model = None;
+    }
+
+    pub fn implementation_model(&self) -> Option<&str> {
+        self.implementation_model.as_deref()
+    }
+
+    pub fn set_implementation_model(&mut self, spec: String, current_model: &str) {
+        if spec == current_model {
+            self.use_current_model();
+        } else {
+            self.implementation_model = Some(spec);
+        }
+    }
+
+    pub fn use_current_model(&mut self) {
+        self.implementation_model = None;
+        self.selected = MODEL_ROW;
+    }
+
+    fn menu_len(&self) -> usize {
+        if self.implementation_model.is_some() {
+            MENU.len()
+        } else {
+            MODEL_ROW + 1
+        }
     }
 
     pub fn hint_line(&self) -> Option<Line<'static>> {
@@ -136,10 +181,17 @@ impl PlanForm {
     }
 
     pub fn height(&self) -> u16 {
-        if self.is_visible() { FORM_HEIGHT } else { 0 }
+        if self.is_visible() {
+            self.menu_len() as u16 + CHROME_LINES
+        } else {
+            0
+        }
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PlanFormAction {
+        if key::MODEL_PICKER.matches(key_event) {
+            return PlanFormAction::OpenModelPicker;
+        }
         if key::QUIT.matches(key_event)
             || key_event.code == KeyCode::Esc
             || key::PLAN_TOGGLE.matches(key_event)
@@ -155,7 +207,7 @@ impl PlanForm {
                 PlanFormAction::Consumed
             }
             KeyCode::Down => {
-                self.selected = (self.selected + 1).min(MENU.len() - 1);
+                self.selected = (self.selected + 1).min(self.menu_len() - 1);
                 PlanFormAction::Consumed
             }
             KeyCode::Char(' ') => {
@@ -168,23 +220,34 @@ impl PlanForm {
         }
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, current_model: &str) {
         if !self.is_visible() {
             return;
         }
 
         let t = theme::current();
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(MENU.len() + 1);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.menu_len() + 2);
 
-        for (i, item) in MENU.iter().enumerate() {
+        for (i, item) in MENU.iter().take(self.menu_len()).enumerate() {
             let (prefix, style) = selected_prefix(&t, i == self.selected);
-            let mut spans = vec![
-                Span::styled(prefix, t.tool_dim),
-                Span::styled(item.label, style),
-                Span::styled(item.desc, t.tool_dim),
-            ];
-            if self.parallel {
-                spans.push(Span::styled(" (parallel)", t.tool_dim.bold()));
+            let mut spans = vec![Span::styled(prefix, t.tool_dim)];
+            if i == MODEL_ROW {
+                let spec = self.implementation_model().unwrap_or(current_model);
+                spans.push(Span::styled(format!("Implementation model: {spec}"), style));
+                spans.push(Span::styled(
+                    if self.implementation_model.is_some() {
+                        "  selected"
+                    } else {
+                        "  current"
+                    },
+                    t.tool_dim,
+                ));
+            } else {
+                spans.push(Span::styled(item.label, style));
+                spans.push(Span::styled(item.desc, t.tool_dim));
+                if self.parallel && i < MODEL_ROW {
+                    spans.push(Span::styled(" (parallel)", t.tool_dim.bold()));
+                }
             }
             lines.push(Line::from(spans));
         }
@@ -201,7 +264,7 @@ mod tests {
     use crate::components::key;
     use test_case::test_case;
 
-    const LAST: usize = MENU.len() - 1;
+    const LAST: usize = MODEL_ROW;
 
     #[test]
     fn on_plan_ready_shows_and_resets_selected() {
@@ -270,7 +333,7 @@ mod tests {
         let mut form = PlanForm::new();
         assert_eq!(form.height(), 0);
         form.on_plan_ready();
-        assert_eq!(form.height(), FORM_HEIGHT);
+        assert_eq!(form.height(), (MODEL_ROW + 1) as u16 + CHROME_LINES);
         form.hide();
         assert_eq!(form.height(), 0);
     }
@@ -290,11 +353,62 @@ mod tests {
     #[test_case(0, PlanFormAction::Hide              ; "enter_at_0_refine")]
     #[test_case(1, PlanFormAction::ClearAndImplement ; "enter_at_1")]
     #[test_case(2, PlanFormAction::Implement          ; "enter_at_2")]
+    #[test_case(3, PlanFormAction::OpenModelPicker    ; "enter_at_3_model")]
     fn enter_dispatches(selected: usize, expected: PlanFormAction) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         form.selected = selected;
         assert_eq!(form.handle_key(key(KeyCode::Enter)), expected);
+    }
+
+    #[test_case(false ; "current_to_current")]
+    #[test_case(true ; "override_to_current")]
+    fn choosing_current_model_clears_override(staged: bool) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        let height = form.height();
+        if staged {
+            form.set_implementation_model("provider/other".into(), "provider/current");
+            assert_eq!(form.height(), height + 1);
+        }
+        form.set_implementation_model("provider/current".into(), "provider/current");
+        assert_eq!(form.implementation_model(), None);
+        assert_eq!(form.height(), height);
+        assert_eq!(form.selected, MODEL_ROW);
+        form.handle_key(key(KeyCode::Down));
+        assert_eq!(form.selected, MODEL_ROW);
+    }
+
+    #[test]
+    fn staged_model_survives_planning_lifecycle_until_reset() {
+        let mut form = PlanForm::new();
+        form.set_implementation_model("provider/other".into(), "provider/current");
+        form.on_plan_ready();
+        form.hide();
+        form.toggle();
+        form.on_plan_drafting();
+        form.on_plan_ready();
+        assert_eq!(form.implementation_model(), Some("provider/other"));
+        form.selected = MODEL_ROW;
+        form.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            form.handle_key(key(KeyCode::Enter)),
+            PlanFormAction::UseCurrentModel
+        );
+        form.use_current_model();
+        assert_eq!(form.selected, MODEL_ROW);
+        form.set_implementation_model("provider/other".into(), "provider/current");
+        form.reset();
+        assert_eq!(form.implementation_model(), None);
+    }
+
+    #[test]
+    fn model_shortcut_opens_picker() {
+        let mut form = PlanForm::new();
+        assert_eq!(
+            form.handle_key(key::MODEL_PICKER.to_key_event()),
+            PlanFormAction::OpenModelPicker
+        );
     }
 
     #[test]

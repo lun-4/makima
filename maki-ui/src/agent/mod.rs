@@ -257,7 +257,14 @@ pub(crate) struct PreparedAgentHandles {
 }
 
 impl PreparedAgentHandles {
-    #[cfg(test)]
+    pub(crate) fn agent_tx(&self) -> flume::Sender<Envelope> {
+        self.handles
+            .as_ref()
+            .expect("prepared handles")
+            .agent_tx
+            .clone()
+    }
+
     pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, maki_agent::AgentId) {
         let handles = self.handles.as_ref().expect("prepared handles");
         (handles.manager.clone(), handles.root_id)
@@ -310,9 +317,16 @@ pub(crate) struct AgentHandles {
     subagent_cancels: Arc<CancelMap<String>>,
     manager: AgentManagerHandle,
     root_id: maki_agent::AgentId,
+    runner_start: Option<flume::Sender<()>>,
 }
 
 impl AgentHandles {
+    pub(crate) fn release_runner(&mut self) {
+        if let Some(start) = self.runner_start.take() {
+            let _ = start.send(());
+        }
+    }
+
     /// MCP is shared across sessions and agent respawns; the event loop starts it
     /// once and shuts it down at exit. Only the actor task lives here.
     #[cfg(test)]
@@ -344,7 +358,7 @@ impl AgentHandles {
             maki_agent::AgentMode::Build,
         );
         drop(selected);
-        Self::prepare(
+        let mut handles = Self::prepare(
             model_slot,
             initial_config,
             initial_history,
@@ -360,7 +374,9 @@ impl AgentHandles {
             model_policy,
             system_prompt,
         )
-        .activate()
+        .activate();
+        handles.release_runner();
+        handles
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -507,6 +523,7 @@ impl AgentHandles {
         // the last old `QueueSender` alive and the old actor parks on its notify forever.
         self.apply_to_app(app);
         app.flush_restored_queue();
+        self.release_runner();
         // Shut the old actor down after the app and queue are repointed, so
         // its close cannot poison the replacement. Everything the old agent
         // still owns drains through the retained per-tab output channel.
@@ -614,8 +631,9 @@ fn spawn_agent_internal(
         thinking: Default::default(),
     };
     drop(selected);
+    let (runner_start, start_rx) = flume::bounded(1);
     let root = manager
-        .create_root_with_config(
+        .create_root_deferred_with_config(
             Some(initial_config.unwrap_or_else(|| {
                 maki_agent::actor::EffectiveAgentConfig::new(
                     initial_settings,
@@ -650,6 +668,7 @@ fn spawn_agent_internal(
                     Arc::clone(&run_id),
                 )))
             },
+            start_rx,
         )
         .expect("root agent factory");
     let root_id = root.id();
@@ -658,7 +677,6 @@ fn spawn_agent_internal(
 
     spawn_command_router(
         cmd_rx,
-        Arc::clone(&actor),
         manager.clone(),
         root_id,
         Arc::clone(&subagent_cancels),
@@ -703,6 +721,7 @@ fn spawn_agent_internal(
             subagent_cancels,
             manager,
             root_id,
+            runner_start: Some(runner_start),
         }),
         mailbox: prepared_mailbox,
     }

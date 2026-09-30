@@ -53,8 +53,7 @@ use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::{
-    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, ReplacementPostCommit, RetryInfo,
-    Status, is_ctrl,
+    Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
@@ -123,8 +122,6 @@ const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
-const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
-const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 const THEME_APPLIED_PREFIX: &str = "Theme";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
@@ -345,6 +342,13 @@ pub(crate) struct InputDemand {
     perm: Option<PermissionPayload>,
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum ModelPickerPurpose {
+    #[default]
+    Session,
+    PlanImplementation,
+}
+
 pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
@@ -360,6 +364,8 @@ pub struct App {
     pub(super) lua_picker: LuaPicker,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
+    model_picker_purpose: ModelPickerPurpose,
+    pub(crate) plan_approval_pending: bool,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
@@ -527,6 +533,8 @@ impl App {
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
             model_picker: ModelPicker::new(Arc::clone(&available_models)),
+            model_picker_purpose: ModelPickerPurpose::Session,
+            plan_approval_pending: false,
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
@@ -1081,22 +1089,38 @@ impl App {
             return Some(vec![]);
         }
 
+        if self.help_modal.is_open() {
+            self.help_modal.handle_key(key);
+            return Some(vec![]);
+        }
+        if self.btw_modal.is_open() {
+            self.btw_modal.handle_key(key);
+            return Some(vec![]);
+        }
+        if self.float_mgr.is_focused() && self.float_mgr.handle_key(key) {
+            return Some(vec![]);
+        }
+
+        if self.plan_approval_pending {
+            return Some(if key.code == KeyCode::Esc || key::QUIT.matches(key) {
+                vec![Action::CancelPlanApproval]
+            } else {
+                vec![]
+            });
+        }
+
+        if self.model_picker.is_open()
+            && self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
+        {
+            return Some(self.handle_model_picker_key(key));
+        }
+
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
         if self.plan_form_active() {
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));
             }
-        }
-
-        if self.help_modal.is_open() {
-            self.help_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        if self.btw_modal.is_open() {
-            self.btw_modal.handle_key(key);
-            return Some(vec![]);
         }
 
         if self.lua_picker.is_open() {
@@ -1218,19 +1242,7 @@ impl App {
         }
 
         if self.model_picker.is_open() {
-            return Some(match self.model_picker.handle_key(key) {
-                ModelPickerAction::Consumed => vec![],
-                ModelPickerAction::Select(spec) => {
-                    vec![Action::ChangeModel(spec)]
-                }
-                ModelPickerAction::AssignTier(spec, tier) => {
-                    vec![Action::AssignTier(spec, tier)]
-                }
-                ModelPickerAction::UnassignTier(spec, tier) => {
-                    vec![Action::UnassignTier(spec, tier)]
-                }
-                ModelPickerAction::Close => vec![],
-            });
+            return Some(self.handle_model_picker_key(key));
         }
 
         if self.login_picker.is_open() {
@@ -1256,6 +1268,28 @@ impl App {
         }
 
         None
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match self.model_picker.handle_key(key) {
+            ModelPickerAction::Consumed => vec![],
+            ModelPickerAction::Select(spec) => {
+                let purpose = std::mem::take(&mut self.model_picker_purpose);
+                if purpose == ModelPickerPurpose::PlanImplementation {
+                    self.plan_form
+                        .set_implementation_model(spec, &self.state.model.spec());
+                    vec![]
+                } else {
+                    vec![Action::ChangeModel(spec)]
+                }
+            }
+            ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
+            ModelPickerAction::UnassignTier(spec, tier) => vec![Action::UnassignTier(spec, tier)],
+            ModelPickerAction::Close => {
+                self.model_picker_purpose = ModelPickerPurpose::Session;
+                vec![]
+            }
+        }
     }
 
     fn plan_toggle_ready(&self) -> bool {
@@ -1342,6 +1376,7 @@ impl App {
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
             BuiltinAction::ModelPicker => {
+                self.model_picker_purpose = ModelPickerPurpose::Session;
                 self.model_picker.open(&self.state.model.spec());
                 return vec![Action::RefreshModels];
             }
@@ -3035,6 +3070,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        self.model_picker_purpose = ModelPickerPurpose::Session;
         self.close_command_palette();
         self.file_completion.close();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
@@ -3222,10 +3258,27 @@ impl App {
     }
 
     fn route_text_paste(&mut self, text: &str) {
-        if self.plan_form_active() {
+        if self.permission_active() {
+            self.permission_prompt.handle_paste(text);
             return;
         }
-        if self.permission_prompt.handle_paste(text) {
+        if self.help_modal.is_open() || self.btw_modal.is_open() {
+            return;
+        }
+        if self.float_mgr.is_focused() {
+            self.float_mgr.handle_paste(text);
+            return;
+        }
+        if self.plan_approval_pending {
+            return;
+        }
+        if self.model_picker.is_open()
+            && self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
+        {
+            self.model_picker.handle_paste(text);
+            return;
+        }
+        if self.plan_form_active() {
             return;
         }
         if self.lua_picker.handle_paste(text) {
@@ -3265,7 +3318,24 @@ impl App {
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
+        if self.plan_approval_pending {
+            return vec![];
+        }
         match action {
+            PlanFormAction::UseCurrentModel => {
+                self.plan_form.use_current_model();
+                vec![]
+            }
+            PlanFormAction::OpenModelPicker => {
+                self.model_picker_purpose = ModelPickerPurpose::PlanImplementation;
+                let spec = self
+                    .plan_form
+                    .implementation_model()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.state.model.spec());
+                self.model_picker.open(&spec);
+                vec![Action::RefreshModels]
+            }
             PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
             PlanFormAction::Hide => {
                 self.plan_form.hide();
@@ -3284,62 +3354,40 @@ impl App {
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
-        let parallel = self.plan_form.parallel();
-        let plan_snapshot = self.state.plan.path().map(|path| {
-            (
-                std::fs::read_to_string(path).unwrap_or_default(),
-                path.display().to_string(),
-            )
-        });
-        let text = if let Some((_, path)) = &plan_snapshot {
-            if parallel {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path}`. {IMPLEMENT_PARALLEL_HINT}")
-            } else {
-                format!("{IMPLEMENT_MSG_PREFIX} at `{path}`.")
-            }
-        } else {
-            format!("{}.", IMPLEMENT_MSG_PREFIX)
+        let Some(path) = self.state.plan.path().map(Path::to_path_buf) else {
+            self.flash(FLASH_NO_PLAN.into());
+            return vec![];
         };
-        if clear_context {
-            let mut actions = self.reset_session();
-            let Action::ReplaceSession(request) = &mut actions[0] else {
-                unreachable!("reset always returns a replacement request");
-            };
-            request.session.meta.mode = Some(maki_storage::sessions::StoredMode::Build);
-            request.post_commit = Some(ReplacementPostCommit {
-                plan: plan_snapshot,
-                prompt: text,
-            });
-            return actions;
-        }
-
-        let implement_action = Action::ImplementPlan(text);
-        if let Some((content, path)) = plan_snapshot {
-            self.main_chat().push(DisplayMessage::plan(content, path));
-        }
-        vec![implement_action]
+        self.plan_approval_pending = true;
+        vec![Action::ApprovePlan {
+            clear_context,
+            model: self.plan_form.implementation_model().map(str::to_owned),
+            parallel: self.plan_form.parallel(),
+            path,
+        }]
     }
 
-    pub(crate) fn start_plan_implementation(&mut self, text: String) -> Vec<Action> {
+    pub(crate) fn plan_approval_matches(&self, model: Option<&str>, parallel: bool) -> bool {
+        self.plan_approval_pending
+            && self.state.mode == Mode::Plan
+            && self.plan_form.implementation_model() == model
+            && self.plan_form.parallel() == parallel
+    }
+
+    pub(crate) fn record_plan_implementation(
+        &mut self,
+        run_id: u64,
+        content: String,
+        path: String,
+        prompt: String,
+    ) {
+        self.plan_approval_pending = false;
         self.plan_form.reset();
         self.state.plan = PlanState::None;
-        self.start_from_queue(&QueuedMessage {
-            text,
-            images: vec![],
-        })
-    }
-
-    pub(crate) fn apply_replacement_post_commit(
-        &mut self,
-        post_commit: ReplacementPostCommit,
-    ) -> Vec<Action> {
-        if let Some((content, path)) = post_commit.plan {
-            self.main_chat().push(DisplayMessage::plan(content, path));
-        }
-        self.start_from_queue(&QueuedMessage {
-            text: post_commit.prompt,
-            images: vec![],
-        })
+        self.main_chat().push(DisplayMessage::plan(content, path));
+        self.main_chat().show_user_message(prompt, vec![]);
+        self.queue.set_run_id(run_id);
+        self.record_run_start(run_id);
     }
 }
 
