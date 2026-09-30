@@ -26,7 +26,7 @@ use maki_agent::tools::{FileReadTracker, QuestionMode, RequestTools, ToolAudienc
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
-    SessionMailbox, ToolOutputLines, TurnId, TurnOutcome,
+    SessionMailbox, ToolOutputLines, TurnCancellationReason, TurnId, TurnOutcome,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -226,11 +226,14 @@ impl TuiActorBackend {
             self.vars = template::env_vars_for(&prompt.cwd);
             self.instructions = prompt.instructions.clone();
         } else {
-            let old_cwd = self.vars.apply("{cwd}").into_owned();
-            self.vars = template::env_vars_for(&self.cwd.load());
-            if *self.vars.apply("{cwd}") != old_cwd {
-                self.reload_instructions().await;
+            let vars = template::env_vars_for(&self.cwd.load());
+            if vars.apply("{cwd}") != self.vars.apply("{cwd}") {
+                let cwd = vars.apply("{cwd}").into_owned();
+                let instructions =
+                    smol::unblock(move || maki_agent::agent::load_instructions(&cwd)).await;
+                self.instructions = instructions;
             }
+            self.vars = vars;
         }
         self.tools = self.build_tools(model, input.workflow);
         let resolved = if let Some(receiver) = admission
@@ -357,8 +360,24 @@ impl TuiActorBackend {
         });
     }
 
+    fn cancel_setup(&self, context: &TurnContext, turn_id: TurnId, run_id: u64) -> TurnOutcome {
+        let outcome = TurnOutcome::cancelled(
+            context.agent_id,
+            turn_id,
+            Default::default(),
+            0,
+            context
+                .cancel_reason
+                .reason()
+                .unwrap_or(TurnCancellationReason::User),
+        );
+        EventSender::new(self.agent_tx.clone(), run_id)
+            .try_send(AgentEvent::TurnOutcome(outcome.clone()));
+        outcome
+    }
+
     /// The one place an executed turn constructs the transient [`Agent`].
-    /// Returns `Some` outcome when the run entered, `None` when setup failed
+    /// Returns `Some` outcome when the run entered or setup was cancelled, `None` when setup failed
     /// before `Agent::run` (the actor then synthesizes one `Failed` delivery).
     async fn execute_agent(
         &mut self,
@@ -368,36 +387,56 @@ impl TuiActorBackend {
         turn_id: TurnId,
         run_id: u64,
     ) -> Option<TurnOutcome> {
-        let lease = match self.acquire_lease().await {
-            Ok(lease) => lease,
-            Err(error) => {
-                self.report_setup_failure(run_id, turn_id, "session lease unavailable", &error);
-                return None;
-            }
-        };
-        let Some(policy) = context.policy.as_deref() else {
-            let error = AgentError::Config {
-                message: "turn was admitted without an effective agent configuration".into(),
-            };
-            self.report_setup_failure(run_id, turn_id, "agent turn setup failed", &error);
-            return None;
-        };
-        let provider = Arc::clone(&policy.settings.provider);
-        let model = policy.settings.model.clone();
-        input.fast = policy.settings.fast;
-        input.workflow = policy.settings.workflow;
-        input.thinking = policy.settings.thinking;
-        let mode = policy.mode.clone();
-        input.mode = mode;
-        let (system, tools, prompt_slots) = match self
-            .prepare_run(&mut input, &model, context.admission.as_ref())
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.report_setup_failure(run_id, turn_id, "agent turn setup failed", &error);
-                return None;
-            }
+        let setup = context
+            .cancel
+            .race(async {
+                let lease = match self.acquire_lease().await {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        self.report_setup_failure(
+                            run_id,
+                            turn_id,
+                            "session lease unavailable",
+                            &error,
+                        );
+                        return None;
+                    }
+                };
+                let Some(policy) = context.policy.as_deref() else {
+                    let error = AgentError::Config {
+                        message: "turn was admitted without an effective agent configuration"
+                            .into(),
+                    };
+                    self.report_setup_failure(run_id, turn_id, "agent turn setup failed", &error);
+                    return None;
+                };
+                let provider = Arc::clone(&policy.settings.provider);
+                let model = policy.settings.model.clone();
+                input.fast = policy.settings.fast;
+                input.workflow = policy.settings.workflow;
+                input.thinking = policy.settings.thinking;
+                input.mode = policy.mode.clone();
+                let prepared = match self
+                    .prepare_run(&mut input, &model, context.admission.as_ref())
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.report_setup_failure(
+                            run_id,
+                            turn_id,
+                            "agent turn setup failed",
+                            &error,
+                        );
+                        return None;
+                    }
+                };
+                Some((lease, provider, model, prepared))
+            })
+            .await;
+        let (lease, provider, model, (system, tools, prompt_slots)) = match setup {
+            Ok(prepared) => prepared?,
+            Err(_) => return Some(self.cancel_setup(context, turn_id, run_id)),
         };
         self.run_id.store(run_id, Ordering::Relaxed);
         let mut agent = Agent::new(
@@ -607,10 +646,14 @@ impl ActorBackend for TuiActorBackend {
                     agent_id: context.agent_id,
                     turn_id,
                 }
-            } else if !self.initialize().await {
-                BackendResult::SetupFailed {
-                    agent_id: context.agent_id,
-                    turn_id,
+            } else if let Err(_) | Ok(false) = context.cancel.race(self.initialize()).await {
+                if context.cancel.is_cancelled() {
+                    BackendResult::EnteredRun(self.cancel_setup(&context, turn_id, run_id))
+                } else {
+                    BackendResult::SetupFailed {
+                        agent_id: context.agent_id,
+                        turn_id,
+                    }
                 }
             } else {
                 info!(
@@ -832,9 +875,12 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::pin::pin;
 
+    use futures_lite::future::poll_once;
     use maki_agent::{AgentMode, McpPromptRef, ReasonedCancelToken};
     use maki_config::PermissionsConfig;
+    use test_case::test_case;
 
     use super::*;
     use crate::agent::ProviderSlot;
@@ -930,11 +976,7 @@ mod tests {
         assert_eq!(backend.vars.apply("{cwd}"), "/tmp/admitted");
     }
 
-    /// Drives one turn through a backend whose setup cannot succeed, and
-    /// returns everything the run emitted.
-    fn run_failing_turn(
-        policy: Option<maki_agent::actor::EffectiveAgentConfig>,
-    ) -> (Option<TurnOutcome>, Vec<Envelope>) {
+    fn failing_backend() -> (TuiActorBackend, AgentInput, flume::Receiver<Envelope>) {
         let (model_slot, _change_rx) =
             ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
         let (agent_tx, agent_rx) = flume::unbounded();
@@ -989,8 +1031,15 @@ mod tests {
             cancel: None,
             lease_committer: None,
         };
+        (backend, input, agent_rx)
+    }
+
+    fn run_failing_turn(
+        policy: Option<maki_agent::actor::EffectiveAgentConfig>,
+    ) -> (Option<TurnOutcome>, Vec<Envelope>) {
+        let (mut backend, input, agent_rx) = failing_backend();
         let context = TurnContext {
-            agent_id,
+            agent_id: backend.agent_id,
             turn_id: None,
             cancel: CancelToken::none(),
             cancel_reason: ReasonedCancelToken::none(),
@@ -1048,6 +1097,94 @@ mod tests {
             "a turn that dies in setup must say so: {:?}",
             envelopes.iter().map(|e| &e.event).collect::<Vec<_>>()
         );
+    }
+
+    #[test_case(TurnCancellationReason::User; "user")]
+    #[test_case(TurnCancellationReason::Closed; "closed")]
+    #[test_case(TurnCancellationReason::Shutdown; "shutdown")]
+    fn cancelled_prompt_setup_releases_backend(reason: TurnCancellationReason) {
+        smol::block_on(async {
+            let (mut backend, input, events) = failing_backend();
+            let mut admission = backend.admission_preparation().unwrap()(&input, &input.mode, None);
+            let (pending_prompt, receiver) = flume::bounded(1);
+            Arc::make_mut(admission.prompt_inputs.as_mut().unwrap()).resolved = Some(receiver);
+            let policy = Arc::new(maki_agent::actor::EffectiveAgentConfig::new(
+                maki_agent::RunSettings {
+                    provider: Arc::new(StubProvider),
+                    model: crate::components::test_model(),
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+                AgentMode::Build,
+            ));
+            let (trigger, cancel) = CancelToken::new();
+            let (reason_trigger, cancel_reason) = ReasonedCancelToken::new();
+            let turn_id = TurnId::generate();
+            let context = TurnContext {
+                agent_id: backend.agent_id,
+                turn_id: Some(turn_id),
+                cancel,
+                cancel_reason,
+                correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
+                generation: 0,
+                policy: Some(Arc::clone(&policy)),
+                admission: Some(admission),
+                interrupt: None,
+                managed_turn: None,
+            };
+            let mut successor_input = AgentInput::from_defaults(
+                input.message.clone(),
+                input.mode.clone(),
+                Vec::new(),
+                Default::default(),
+            );
+            successor_input.prompt = input.prompt.clone();
+            let mut history = History::new(Vec::new());
+            let outcome = {
+                let mut run = pin!(backend.run_turn(&mut history, context, input, WorkKind::Turn));
+                assert!(poll_once(run.as_mut()).await.is_none());
+                assert!(events.is_empty());
+                reason_trigger.cancel(reason);
+                trigger.cancel();
+                let Some(BackendResult::EnteredRun(outcome)) = poll_once(run.as_mut()).await else {
+                    panic!("cancelled setup must return a terminal outcome");
+                };
+                outcome
+            };
+            assert_eq!(
+                outcome,
+                TurnOutcome::cancelled(backend.agent_id, turn_id, Default::default(), 0, reason)
+            );
+            let emitted = events.drain().collect::<Vec<_>>();
+            assert_eq!(emitted.len(), 1);
+            assert!(
+                matches!(&emitted[0].event, AgentEvent::TurnOutcome(actual) if actual == &outcome)
+            );
+            assert!(pending_prompt.is_disconnected());
+
+            let successor = TurnContext {
+                agent_id: backend.agent_id,
+                turn_id: Some(TurnId::generate()),
+                cancel: CancelToken::none(),
+                cancel_reason: ReasonedCancelToken::none(),
+                correlation: format!("{ROOT_CORRELATION_PREFIX}1"),
+                generation: 1,
+                policy: Some(policy),
+                admission: None,
+                interrupt: None,
+                managed_turn: None,
+            };
+            let result = backend
+                .run_turn(&mut history, successor, successor_input, WorkKind::Turn)
+                .await;
+            assert!(matches!(result, BackendResult::SetupFailed { .. }));
+            assert!(
+                events
+                    .drain()
+                    .any(|event| matches!(event.event, AgentEvent::ControlError { .. }))
+            );
+        });
     }
 
     struct StubProvider;
