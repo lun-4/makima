@@ -612,10 +612,18 @@ fn requeue_save(
     mut save: PendingSave,
 ) -> Result<(), Vec<CheckpointWaiter>> {
     let mut state = lock(pending);
-    if state
-        .config_versions
-        .get(&id)
-        .is_some_and(|version| Some(version) != save.config_version.as_ref())
+    let current_config = state.config_versions.get(&id).copied();
+    let history_retained = save
+        .config_version
+        .zip(current_config)
+        .is_some_and(|(saved, current)| saved.0 == current.0)
+        && matches!(
+            state.entries.get(&id),
+            Some(Entry::Save(newer))
+                if newer.session.history_identity() == save.session.history_identity()
+        );
+    if current_config.is_some_and(|version| Some(version) != save.config_version)
+        && !history_retained
     {
         if let Some(latest) = state.latest.get(&id) {
             fail_waiters(id, mem::take(&mut save.waiters), CHECKPOINT_REPLACED);
@@ -1173,6 +1181,96 @@ mod tests {
         );
         assert_eq!(reopened.model, FAILED_MODEL);
         assert_eq!(reopened.meta.mode, Some(StoredMode::Plan));
+        assert!(lock(&writer.pending).coordinator_pending.is_empty());
+    }
+
+    #[test_case(false, false; "before_first_config_projection")]
+    #[test_case(true, false; "after_config_projection")]
+    #[test_case(true, true; "replacement_history_invalidates_waiter")]
+    fn in_flight_history_retry_handles_config_advancement(
+        initial_config: bool,
+        replace_history: bool,
+    ) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
+        let id = session.id;
+        writer.seed(Arc::new(session));
+        writer.bind_config_runtime(id, 1);
+        let checkpoint = writer.coordinator_checkpoint();
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        if initial_config {
+            let ack = checkpoint.checkpoint(CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: 1,
+                    epoch: 1,
+                },
+                snapshot: Arc::new(config_checkpoint(1, 1)),
+            });
+            disk.flush(&writer.pending);
+            assert!(smol::block_on(ack).is_ok());
+        }
+        let mut history = config_checkpoint(1, 1);
+        history.config = None;
+        history.history = Some(Arc::new(vec![Message::user(COORDINATOR_MSG.into())]));
+        let mut history_ack = checkpoint.checkpoint(CheckpointRequest {
+            session_id: id,
+            version: CheckpointVersion {
+                revision: 2,
+                epoch: 1,
+            },
+            snapshot: Arc::new(history),
+        });
+        let Entry::Save(in_flight) = lock(&writer.pending).entries.remove(&id).unwrap() else {
+            unreachable!()
+        };
+        let mut config = config_checkpoint(1, 2);
+        if replace_history {
+            config.history = Some(Arc::new(vec![Message::user(BASE_MSG.into())]));
+        }
+        let config_ack = checkpoint.checkpoint(CheckpointRequest {
+            session_id: id,
+            version: CheckpointVersion {
+                revision: 3,
+                epoch: 1,
+            },
+            snapshot: Arc::new(config),
+        });
+        assert!(requeue_save(&writer.pending, id, in_flight).is_ok());
+        if !replace_history {
+            assert!(smol::block_on(futures_lite::future::poll_once(&mut history_ack)).is_none());
+        }
+        disk.flush(&writer.pending);
+        if replace_history {
+            let Err(CheckpointError::Save { message, .. }) = smol::block_on(history_ack) else {
+                panic!("replaced history must fail its checkpoint")
+            };
+            assert_eq!(message.as_ref(), CHECKPOINT_REPLACED);
+        } else {
+            assert!(smol::block_on(history_ack).is_ok());
+        }
+        assert!(smol::block_on(config_ack).is_ok());
+        let expected = if replace_history {
+            BASE_MSG
+        } else {
+            COORDINATOR_MSG
+        };
+        assert_eq!(
+            message_texts(&AppSession::load(id, &dir).unwrap()),
+            [expected]
+        );
+        assert_eq!(
+            message_texts(&writer.latest_snapshot(id).unwrap()),
+            [expected]
+        );
         assert!(lock(&writer.pending).coordinator_pending.is_empty());
     }
 
