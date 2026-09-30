@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
-use super::{ScriptedBackend, input, policy, spawn};
-use crate::actor::{ActorError, ConfigChange, ConfigPatch, EffectiveAgentConfig};
+use super::{ScriptedBackend, input, policy, spawn, until};
+use crate::actor::{
+    ActorError, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig, QueueProjection,
+};
+use crate::types::TurnCancellationReason;
 use crate::{AgentMode, EventSender, Instructions, TurnOutcome};
 
 #[test]
@@ -164,6 +167,137 @@ fn empty_snapshot() -> crate::agent::TurnAdmissionSnapshot {
         bindings: Arc::default(),
         mcp_startup_notice: None,
     }
+}
+
+#[test_case::test_case(false; "turn_preparation")]
+#[test_case::test_case(true; "root_preparation")]
+fn control_waits_for_earlier_preparation(root: bool) {
+    const WORK: &str = "work";
+    const CONTROL: &str = "control";
+    smol::block_on(async {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let backend_gate = super::Gate::new();
+        let mut backend = ScriptedBackend::gated(Arc::clone(&backend_gate));
+        let observed = Arc::clone(&backend.state);
+        backend.preparation = Some(Arc::new(move |_, _, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            empty_snapshot()
+        }));
+        let (actor, task) = spawn(backend);
+        if root {
+            actor
+                .rush(crate::RootWork::new(
+                    input(WORK),
+                    1,
+                    false,
+                    WORK.into(),
+                    Vec::new(),
+                    WORK.into(),
+                ))
+                .unwrap();
+        } else {
+            actor.admit_turn(input(WORK), None, WORK.into()).unwrap();
+        }
+        entered_rx.recv_async().await.unwrap();
+        actor
+            .push_control(ControlWork {
+                name: CONTROL.into(),
+                correlation: CONTROL.into(),
+            })
+            .unwrap();
+        assert!(actor.inner.queue.is_empty());
+        let snapshot = actor.snapshot();
+        assert_eq!(snapshot.queue.len(), 2);
+        assert_eq!(snapshot.queue[1], QueueProjection::Control(CONTROL.into()));
+        assert_eq!(snapshot.queued, 1);
+        let (popped, release_pop) = actor.pause_after_next_pop();
+        release_tx.send(()).unwrap();
+        popped.recv_async().await.unwrap();
+        assert_eq!(
+            actor.snapshot().queue,
+            [QueueProjection::Control(CONTROL.into())]
+        );
+        release_pop.send(()).unwrap();
+        until(|| !observed.runs.lock().unwrap().is_empty()).await;
+        assert!(observed.controls.lock().unwrap().is_empty());
+        backend_gate.open();
+        until(|| !observed.controls.lock().unwrap().is_empty()).await;
+        assert_eq!(observed.controls.lock().unwrap().as_slice(), [CONTROL]);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case("remove")]
+#[test_case::test_case("clear")]
+#[test_case::test_case("cancel_existing")]
+#[test_case::test_case("close")]
+#[test_case::test_case("shutdown")]
+#[test_case::test_case("cancel_turn")]
+#[test_case::test_case("cancel_correlation")]
+fn deferred_control_queue_operations(action: &str) {
+    const WORK: &str = "work";
+    const CONTROL: &str = "control";
+    smol::block_on(async {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let mut backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        backend.preparation = Some(Arc::new(move |_, _, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            empty_snapshot()
+        }));
+        let (actor, task) = spawn(backend);
+        let ticket = actor.admit_turn(input(WORK), None, WORK.into()).unwrap();
+        entered_rx.recv_async().await.unwrap();
+        let control = || ControlWork {
+            name: CONTROL.into(),
+            correlation: WORK.into(),
+        };
+        actor.push_control(control()).unwrap();
+        assert!(actor.inner.queue.is_empty());
+        assert_eq!(actor.remove_visible_at(0), None);
+        let (stale_tx, stale_rx) = flume::bounded(1);
+        *actor.inner.stale_preparation.lock().unwrap() = Some(stale_tx);
+        match action {
+            "remove" => {
+                assert_eq!(
+                    actor.remove_at(1),
+                    Some(QueueProjection::Control(CONTROL.into()))
+                );
+                actor.cancel_turn(ticket.turn_id()).unwrap();
+            }
+            "clear" => assert_eq!(actor.clear(), 2),
+            "cancel_existing" => actor.cancel_existing(),
+            "close" => {
+                actor.close();
+                assert_eq!(actor.push_control(control()), Err(ActorError::Closed));
+            }
+            "shutdown" => {
+                actor.shutdown();
+                assert_eq!(actor.push_control(control()), Err(ActorError::Shutdown));
+            }
+            "cancel_turn" => actor.cancel_turn(ticket.turn_id()).unwrap(),
+            "cancel_correlation" => actor.cancel_correlation(WORK, TurnCancellationReason::User),
+            _ => unreachable!(),
+        }
+        assert!(matches!(ticket.wait().await, TurnOutcome::Cancelled { .. }));
+        release_tx.send(()).unwrap();
+        stale_rx.recv_async().await.unwrap();
+        if matches!(action, "cancel_turn" | "cancel_correlation") {
+            until(|| !observed.controls.lock().unwrap().is_empty()).await;
+            assert_eq!(observed.controls.lock().unwrap().as_slice(), [CONTROL]);
+        } else {
+            assert!(observed.controls.lock().unwrap().is_empty());
+        }
+        assert!(actor.snapshot().queue.is_empty());
+        assert!(observed.runs.lock().unwrap().is_empty());
+        actor.close();
+        task.await;
+    });
 }
 
 #[test_case::test_case(false; "config_cannot_overtake_turn_preparation")]

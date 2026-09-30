@@ -115,6 +115,10 @@ struct ConfigOperation {
 
 enum ActorOperation {
     Config(ConfigOperation),
+    Control {
+        id: u64,
+        control: ControlWork,
+    },
     Turn {
         id: u64,
         input: AgentInput,
@@ -138,6 +142,7 @@ impl ActorOperation {
         match self {
             Self::Config(config) => config.id,
             Self::Turn { id: after, .. }
+            | Self::Control { id: after, .. }
             | Self::Root { id: after, .. }
             | Self::Compact { id: after, .. } => *after,
         }
@@ -146,6 +151,7 @@ impl ActorOperation {
     fn projection(&self) -> Option<QueueProjection> {
         match self {
             Self::Config(_) => None,
+            Self::Control { control, .. } => Some(QueueProjection::Control(control.name.clone())),
             Self::Turn { correlation, .. } => Some(QueueProjection::Turn(correlation.clone())),
             Self::Root { root, .. } => Some(root.into()),
             Self::Compact { instructions, .. } => {
@@ -501,6 +507,7 @@ fn materialize(
             generation: state.policy_generation,
             policy: state.policy.clone(),
         }),
+        ActorOperation::Control { control, .. } => inner.queue.push(ActorWork::Control(control)),
         ActorOperation::Config(_) => unreachable!(),
     }
 }
@@ -971,7 +978,17 @@ impl AgentActorHandle {
     }
 
     pub fn push_control(&self, control: ControlWork) -> Result<(), ActorError> {
-        self.push_checked(ActorWork::Control(control))
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        state.next_operation_id = state.next_operation_id.wrapping_add(1);
+        let id = state.next_operation_id;
+        state
+            .operations
+            .push_back(ActorOperation::Control { id, control });
+        drive_operations(&self.inner, &mut state);
+        Ok(())
     }
 
     pub fn push_compact(
@@ -1293,7 +1310,7 @@ impl AgentActorHandle {
         let mut remaining = VecDeque::new();
         while let Some(admission) = state.operations.pop_front() {
             let matches = match &admission {
-                ActorOperation::Config(_) => false,
+                ActorOperation::Config(_) | ActorOperation::Control { .. } => false,
                 ActorOperation::Turn {
                     correlation: key, ..
                 } => key == correlation,
@@ -1425,19 +1442,6 @@ impl AgentActorHandle {
                 .outcome(turn_id)
                 .ok_or(ActorError::UnknownTurn(turn_id)),
         }
-    }
-
-    fn push_checked(&self, work: ActorWork) -> Result<(), ActorError> {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(match state.lifecycle {
-                ActorLifecycle::Closed => ActorError::Closed,
-                ActorLifecycle::Shutdown => ActorError::Shutdown,
-                ActorLifecycle::Open => unreachable!(),
-            });
-        }
-        self.inner.queue.push(work);
-        Ok(())
     }
 
     fn close_internal(&self, lifecycle: ActorLifecycle, reason: TurnCancellationReason) {
