@@ -9,7 +9,10 @@ use tracing::{debug, info, warn};
 
 use super::queue::{ActorQueue, InterruptQueue};
 use super::types::{ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind};
-use super::{ActiveCancel, ActorInner, ActorWork, TurnAdmission, cancelled_outcome, finalize_turn};
+use super::{
+    ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, cancelled_outcome,
+    finalize_turn,
+};
 use crate::types::{TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
 
@@ -108,14 +111,20 @@ impl Runner {
     async fn step(&mut self) -> Step {
         loop {
             let popped = {
-                let state = self
+                let mut state = self
                     .inner
                     .state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                self.queue
-                    .pop()
-                    .map(|work| (work, state.cancellation_generation))
+                let work = if state.idle_reserved {
+                    state
+                        .idle_permission
+                        .and_then(|turn_id| self.queue.remove_turn(turn_id).map(ActorWork::Turn))
+                } else {
+                    self.queue.pop()
+                };
+                state.processing = work.as_ref().map(ProcessingWork::new);
+                work.map(|work| (work, state.cancellation_generation))
             };
             let Some((work, cancellation_generation)) = popped else {
                 break;
@@ -126,6 +135,11 @@ impl Runner {
                 let _ = release.recv_async().await;
             }
             self.process(work, cancellation_generation).await;
+            self.inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .processing = None;
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
 
@@ -229,13 +243,16 @@ impl Runner {
                 self.settle_turn(&admission, outcome, true);
                 return;
             }
-            // A precancelled correlation's mark is retired once its matching
-            // work is consumed, so it cannot poison a later generation.
-            state.cancelled_correlations.remove(&correlation);
-            if let WorkKind::Root { ref earlier, .. } = work {
-                for item in earlier {
-                    state.cancelled_correlations.remove(&item.correlation);
-                }
+            if let Some(reason) = state
+                .processing
+                .as_ref()
+                .and_then(|processing| processing.cancellation_reason)
+            {
+                drop(state);
+                let outcome =
+                    (!admission.root).then(|| cancelled_outcome(agent_id, turn_id, reason));
+                self.settle_turn(&admission, outcome, true);
+                return;
             }
             state.active = Some(active);
             state.status = ActorStatus::Running(turn_id);
@@ -402,10 +419,15 @@ impl Runner {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if state.cancellation_generation != popped_generation {
+            if state.cancellation_generation != popped_generation
+                || state.lifecycle != ActorLifecycle::Open
+                || state
+                    .processing
+                    .as_ref()
+                    .is_some_and(|processing| processing.cancellation_reason.is_some())
+            {
                 return;
             }
-            state.cancelled_correlations.remove(&correlation);
             state.active = Some(active);
         }
         if plain.is_cancelled() {
@@ -453,16 +475,19 @@ impl Runner {
         policy: Option<Arc<super::EffectiveAgentConfig>>,
         popped_generation: u64,
     ) {
-        // Consumed: retire any precancel mark for this run_id's canonical
-        // correlation.
         let correlation = super::run_correlation(run_id);
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.cancellation_generation != popped_generation {
+            if state.cancellation_generation != popped_generation
+                || state.lifecycle != ActorLifecycle::Open
+                || state
+                    .processing
+                    .as_ref()
+                    .is_some_and(|processing| processing.cancellation_reason.is_some())
+            {
                 return;
             }
-            state.cancelled_correlations.remove(&correlation);
             state.active = Some(active);
         }
         if plain.is_cancelled() {
@@ -512,6 +537,7 @@ impl Runner {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active = None;
             state.status = ActorStatus::Idle;
+            state.processing = None;
         }
         if let Some(outcome) = outcome {
             finalize_turn(

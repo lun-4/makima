@@ -17,6 +17,10 @@
 mod actor_error;
 mod config;
 pub use config::{ConfigChange, ConfigCommit, ConfigPatch, PreparedModel};
+mod idle;
+pub use idle::ActorIdleGuard;
+mod prepared;
+pub use prepared::{PreparedCommit, PreparedOperationTicket, PreparedTurn};
 mod queue;
 mod runner;
 mod tickets;
@@ -31,7 +35,8 @@ pub use tickets::TurnTicket;
 pub(crate) use types::ManagedTurnAdmission;
 pub use types::{
     ActorBackend, ActorLifecycle, ActorSnapshot, ActorStatus, AdmissionPreparation, BackendResult,
-    ControlWork, EffectiveAgentConfig, RootWork, TurnAdmission, TurnContext, WorkKind,
+    ControlWork, EffectiveAgentConfig, PreparedReadiness, RootWork, TurnAdmission, TurnContext,
+    WorkKind,
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -76,6 +81,7 @@ pub(crate) struct ActorInner {
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     admission_preparation: Option<AdmissionPreparation>,
+    prepared_readiness: Option<PreparedReadiness>,
     root_preparation_error: Option<Arc<dyn Fn(u64, String) + Send + Sync>>,
     #[cfg(test)]
     pub(crate) after_pop: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
@@ -87,6 +93,43 @@ pub(crate) struct ActorInner {
     stale_preparation: Mutex<Option<flume::Sender<()>>>,
 }
 
+pub(crate) struct ProcessingWork {
+    turn_id: Option<TurnId>,
+    correlations: Vec<String>,
+    cancellation_reason: Option<TurnCancellationReason>,
+}
+
+impl ProcessingWork {
+    fn new(work: &ActorWork) -> Self {
+        let (turn_id, correlations) = match work {
+            ActorWork::Turn(admission) => {
+                (Some(admission.turn_id), vec![admission.correlation.clone()])
+            }
+            ActorWork::Root(root) => {
+                let mut correlations = Vec::with_capacity(root.earlier.len() + 1);
+                correlations.push(root.correlation.clone());
+                correlations.extend(
+                    root.earlier
+                        .iter()
+                        .map(|earlier| earlier.correlation.clone()),
+                );
+                (None, correlations)
+            }
+            ActorWork::Control(control) => (None, vec![control.correlation.clone()]),
+            ActorWork::Compact { run_id, .. } => (None, vec![run_correlation(*run_id)]),
+        };
+        Self {
+            turn_id,
+            correlations,
+            cancellation_reason: None,
+        }
+    }
+
+    fn matches_correlation(&self, correlation: &str) -> bool {
+        self.correlations.iter().any(|key| key == correlation)
+    }
+}
+
 /// Lifecycle, run status, and the active turn's cancellation wiring. One
 /// lock keeps admission/close and lifecycle + status snapshots consistent.
 /// `cancelled_correlations` remembers correlations cancelled before their
@@ -96,6 +139,9 @@ pub(crate) struct ActorState {
     pub(crate) lifecycle: ActorLifecycle,
     pub(crate) status: ActorStatus,
     pub(crate) active: Option<ActiveCancel>,
+    pub(crate) processing: Option<ProcessingWork>,
+    idle_reserved: bool,
+    idle_permission: Option<TurnId>,
     pub(crate) cancelled_correlations: HashMap<String, TurnCancellationReason>,
     pub(crate) cancelled_turns: HashSet<TurnId>,
     pub(crate) cancellation_generation: u64,
@@ -115,6 +161,7 @@ struct ConfigOperation {
 
 enum ActorOperation {
     Config(ConfigOperation),
+    Prepared(Box<prepared::PreparedOperation>),
     Control {
         id: u64,
         control: ControlWork,
@@ -141,6 +188,7 @@ impl ActorOperation {
     fn id(&self) -> u64 {
         match self {
             Self::Config(config) => config.id,
+            Self::Prepared(pending) => pending.id,
             Self::Turn { id: after, .. }
             | Self::Control { id: after, .. }
             | Self::Root { id: after, .. }
@@ -151,6 +199,10 @@ impl ActorOperation {
     fn projection(&self) -> Option<QueueProjection> {
         match self {
             Self::Config(_) => None,
+            Self::Prepared(pending) => pending
+                .turn
+                .as_ref()
+                .map(|turn| QueueProjection::Turn(turn.correlation.clone())),
             Self::Control { control, .. } => Some(QueueProjection::Control(control.name.clone())),
             Self::Turn { correlation, .. } => Some(QueueProjection::Turn(correlation.clone())),
             Self::Root { root, .. } => Some(root.into()),
@@ -261,6 +313,11 @@ fn settle_deferred(
     reason: TurnCancellationReason,
 ) {
     for admission in admissions {
+        if let ActorOperation::Prepared(pending) = admission {
+            pending.fail(ActorError::PolicyCancelled);
+            inner.policy_changed.notify(usize::MAX);
+            continue;
+        }
         if let ActorOperation::Turn {
             input,
             event_sender,
@@ -301,6 +358,10 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
             return;
         }
         state.preparing = None;
+        if matches!(head, ActorOperation::Prepared(_)) {
+            prepared::drive(inner, state);
+            return;
+        }
         if let ActorOperation::Config(pending) = head {
             if pending.result.is_none() {
                 return;
@@ -508,11 +569,21 @@ fn materialize(
             policy: state.policy.clone(),
         }),
         ActorOperation::Control { control, .. } => inner.queue.push(ActorWork::Control(control)),
-        ActorOperation::Config(_) => unreachable!(),
+        ActorOperation::Config(_) | ActorOperation::Prepared(_) => unreachable!(),
     }
 }
 
 impl ActorState {
+    pub(crate) fn active_matches_correlation(&self, correlation: &str) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active.correlation() == Some(correlation)
+                || self
+                    .processing
+                    .as_ref()
+                    .is_some_and(|processing| processing.matches_correlation(correlation))
+        })
+    }
+
     fn pending_config(&mut self, id: u64) -> Option<&mut ConfigOperation> {
         self.operations.iter_mut().find_map(|entry| match entry {
             ActorOperation::Config(pending) if pending.id == id => Some(pending),
@@ -524,7 +595,9 @@ impl ActorState {
         let mut work = Vec::new();
         let mut configs = VecDeque::new();
         for entry in self.operations.drain(..) {
-            if matches!(entry, ActorOperation::Config(_)) {
+            if matches!(entry, ActorOperation::Config(_))
+                || matches!(&entry, ActorOperation::Prepared(pending) if pending.turn.is_none())
+            {
                 configs.push_back(entry);
             } else {
                 work.push(entry);
@@ -539,6 +612,9 @@ impl ActorState {
             lifecycle: ActorLifecycle::Open,
             status: ActorStatus::Idle,
             active: None,
+            processing: None,
+            idle_reserved: false,
+            idle_permission: None,
             cancelled_correlations: HashMap::new(),
             cancelled_turns: HashSet::new(),
             cancellation_generation: 0,
@@ -550,6 +626,13 @@ impl ActorState {
             next_operation_id: 0,
         }
     }
+}
+
+pub(crate) struct CorrelationCancelCut {
+    pub(crate) active_turn: Option<TurnId>,
+    active: Option<ActiveCancel>,
+    deferred: Vec<ActorOperation>,
+    matched: Vec<ActorWork>,
 }
 
 /// Per-turn cancellation wiring: a plain token aborts the run, a reasoned
@@ -671,7 +754,7 @@ pub(crate) fn run_correlation(run_id: u64) -> String {
 /// history, queue, and retained outcomes.
 #[derive(Clone)]
 pub struct AgentActorHandle {
-    inner: Arc<ActorInner>,
+    pub(crate) inner: Arc<ActorInner>,
     wake: Arc<runner::WakeFlag>,
 }
 
@@ -692,6 +775,7 @@ impl AgentActorHandle {
             backend,
             None,
             None,
+            None,
         )
     }
 
@@ -710,6 +794,27 @@ impl AgentActorHandle {
             backend,
             Some(managed_admission),
             initial_config.map(Arc::new),
+            None,
+        )
+    }
+
+    pub(crate) fn spawn_managed_deferred(
+        agent_id: AgentId,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        backend: Box<dyn ActorBackend>,
+        managed_admission: ManagedTurnAdmission,
+        initial_config: Option<EffectiveAgentConfig>,
+        start: flume::Receiver<()>,
+    ) -> (Self, smol::Task<()>) {
+        Self::spawn_inner(
+            agent_id,
+            initial_messages,
+            shared_messages,
+            backend,
+            Some(managed_admission),
+            initial_config.map(Arc::new),
+            Some(start),
         )
     }
 
@@ -720,6 +825,7 @@ impl AgentActorHandle {
         backend: Box<dyn ActorBackend>,
         managed_admission: Option<ManagedTurnAdmission>,
         initial_config: Option<Arc<EffectiveAgentConfig>>,
+        start: Option<flume::Receiver<()>>,
     ) -> (Self, smol::Task<()>) {
         let history = match shared_messages {
             Some(mirror) => History::restored(initial_messages).with_mirror(mirror),
@@ -739,6 +845,7 @@ impl AgentActorHandle {
             tickets: Mutex::new(HashMap::new()),
             managed_admission,
             admission_preparation,
+            prepared_readiness: backend.prepared_readiness(),
             root_preparation_error,
             #[cfg(test)]
             after_pop: Mutex::new(None),
@@ -754,7 +861,36 @@ impl AgentActorHandle {
             inner: Arc::clone(&inner),
             wake: Arc::clone(&wake),
         };
-        let task = smol::spawn(runner::Runner::new(inner, history, backend, wake).run());
+        let deferred_handle = handle.clone();
+        let task = smol::spawn(async move {
+            if let Some(start) = start {
+                let started =
+                    futures_lite::future::or(async { start.recv_async().await.is_ok() }, async {
+                        loop {
+                            let listener = inner.policy_changed.listen();
+                            if inner
+                                .state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .lifecycle
+                                != ActorLifecycle::Open
+                            {
+                                return false;
+                            }
+                            listener.await;
+                        }
+                    })
+                    .await;
+                if !started {
+                    deferred_handle.close();
+                    return;
+                }
+            }
+            drop(deferred_handle);
+            runner::Runner::new(inner, history, backend, wake)
+                .run()
+                .await;
+        });
         (handle, task)
     }
 
@@ -786,7 +922,7 @@ impl AgentActorHandle {
     }
 
     #[cfg(test)]
-    fn pause_after_next_pop(&self) -> (flume::Receiver<()>, flume::Sender<()>) {
+    pub(crate) fn pause_after_next_pop(&self) -> (flume::Receiver<()>, flume::Sender<()>) {
         let (popped_tx, popped_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
         *self
@@ -935,10 +1071,12 @@ impl AgentActorHandle {
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        Ok(state
-            .operations
-            .iter()
-            .any(|entry| matches!(entry, ActorOperation::Config(_))))
+        Ok(state.operations.iter().any(|entry| {
+            matches!(
+                entry,
+                ActorOperation::Config(_) | ActorOperation::Prepared(_)
+            )
+        }))
     }
 
     pub async fn wait_policy_updates(&self) -> Result<(), ActorError> {
@@ -1067,7 +1205,7 @@ impl AgentActorHandle {
                 .operations
                 .iter()
                 .enumerate()
-                .filter(|(_, entry)| !matches!(entry, ActorOperation::Config(_)))
+                .filter(|(_, entry)| entry.projection().is_some())
                 .nth(index - queued)?
                 .0;
             let admission = state.operations.remove(raw)?;
@@ -1159,7 +1297,11 @@ impl AgentActorHandle {
         let deferred = state.drain_work();
         let drained = self.inner.queue.drain_all();
         drive_operations(&self.inner, &mut state);
-        let len = drained.len() + deferred.len();
+        let len = drained.len()
+            + deferred
+                .iter()
+                .filter(|entry| entry.projection().is_some())
+                .count();
         drop(state);
         settle_deferred(&self.inner, deferred, TurnCancellationReason::User);
         terminalize_work(&self.inner, drained, TurnCancellationReason::User);
@@ -1224,8 +1366,11 @@ impl AgentActorHandle {
         if active.is_none()
             && queued.is_none()
             && deferred.is_none()
-            && state.lifecycle == ActorLifecycle::Open
             && state.status == ActorStatus::Idle
+            && state
+                .processing
+                .as_ref()
+                .is_some_and(|processing| processing.turn_id == Some(turn_id))
         {
             state.cancelled_turns.insert(turn_id);
         }
@@ -1284,20 +1429,37 @@ impl AgentActorHandle {
         operation: impl FnOnce(TurnId),
     ) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let matched_active = state
-            .active
-            .as_ref()
-            .is_some_and(|a| a.correlation() == Some(correlation));
+        let cut = self.capture_correlation_cancel(&mut state, correlation, reason);
+        drop(state);
+        if let Some(turn_id) = cut.active_turn {
+            operation(turn_id);
+        }
+        self.settle_correlation_cancel(cut, correlation, reason);
+    }
+
+    pub(crate) fn capture_correlation_cancel(
+        &self,
+        state: &mut ActorState,
+        correlation: &str,
+        reason: TurnCancellationReason,
+    ) -> CorrelationCancelCut {
+        let matched_active = state.active_matches_correlation(correlation);
+        let active_turn = match state.status {
+            ActorStatus::Running(turn_id) if matched_active => Some(turn_id),
+            ActorStatus::Running(_) | ActorStatus::Idle => None,
+        };
         let active = if matched_active {
-            let active = state.active.take();
-            match state.status {
-                ActorStatus::Running(turn_id) => operation(turn_id),
-                ActorStatus::Idle => {}
-            }
-            active
+            state.active.take()
         } else {
             None
         };
+        let matched_processing = state.processing.as_mut().is_some_and(|processing| {
+            if !processing.matches_correlation(correlation) {
+                return false;
+            }
+            processing.cancellation_reason.get_or_insert(reason);
+            true
+        });
         // Scan the queue under the state lock so the request linearizes with
         // admission/close; turn out the matching items.
         let matched: Vec<ActorWork> = self
@@ -1311,6 +1473,10 @@ impl AgentActorHandle {
         while let Some(admission) = state.operations.pop_front() {
             let matches = match &admission {
                 ActorOperation::Config(_) | ActorOperation::Control { .. } => false,
+                ActorOperation::Prepared(pending) => pending
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.correlation == correlation),
                 ActorOperation::Turn {
                     correlation: key, ..
                 } => key == correlation,
@@ -1324,18 +1490,31 @@ impl AgentActorHandle {
             }
         }
         state.operations = remaining;
-        drive_operations(&self.inner, &mut state);
-        if !matched_active && matched.is_empty() && deferred.is_empty() {
+        drive_operations(&self.inner, state);
+        if !matched_active && !matched_processing && matched.is_empty() && deferred.is_empty() {
             // Nothing matched now; precancel any later push with this
             // correlation, remembering the reason to terminalize with.
             state
                 .cancelled_correlations
                 .insert(correlation.to_owned(), reason);
         }
-        drop(state);
-        settle_deferred(&self.inner, deferred, reason);
+        CorrelationCancelCut {
+            active_turn,
+            active,
+            deferred,
+            matched,
+        }
+    }
 
-        for work in matched {
+    pub(crate) fn settle_correlation_cancel(
+        &self,
+        cut: CorrelationCancelCut,
+        correlation: &str,
+        reason: TurnCancellationReason,
+    ) {
+        settle_deferred(&self.inner, cut.deferred, reason);
+
+        for work in cut.matched {
             if let ActorWork::Turn(admission) = work {
                 let outcome = cancelled_outcome(self.inner.agent_id, admission.turn_id, reason);
                 finalize_turn(
@@ -1347,7 +1526,7 @@ impl AgentActorHandle {
                 );
             }
         }
-        if let Some(active) = active {
+        if let Some(active) = cut.active {
             active.fire(reason);
         }
         info!(
@@ -1456,6 +1635,13 @@ impl AgentActorHandle {
             state.lifecycle = lifecycle;
             state.preparing = None;
             for entry in &state.operations {
+                if let ActorOperation::Prepared(pending) = entry {
+                    pending
+                        .completion
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(|| Err(lifecycle_error(lifecycle)));
+                }
                 if let ActorOperation::Config(pending) = entry {
                     pending
                         .completion

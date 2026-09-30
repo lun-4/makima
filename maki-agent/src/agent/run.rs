@@ -101,11 +101,13 @@ pub struct TurnPromptInputs {
     pub instructions: super::instructions::Instructions,
     pub mcp_prompt: Option<crate::mcp::McpPromptBinding>,
     pub resolved: Option<flume::Receiver<Result<ResolvedPromptInputs, String>>>,
+    pub ready: Option<ResolvedPromptInputs>,
 }
 
 #[derive(Clone)]
 pub struct ResolvedPromptInputs {
     pub slots: Arc<crate::prompt::ResolvedSlots>,
+    pub slots_error: Option<String>,
     pub mcp_messages: Option<Vec<Message>>,
 }
 

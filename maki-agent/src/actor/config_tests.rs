@@ -5,7 +5,7 @@ use crate::actor::{
     ActorError, ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig, QueueProjection,
 };
 use crate::types::TurnCancellationReason;
-use crate::{AgentMode, EventSender, Instructions, TurnOutcome};
+use crate::{AgentMode, CancelToken, EventSender, Instructions, TurnOutcome};
 
 #[test]
 fn admitted_prompt_dependencies_remain_pinned() {
@@ -27,6 +27,7 @@ fn admitted_prompt_dependencies_remain_pinned() {
                     },
                     mcp_prompt: None,
                     resolved: Some(resolved_rx.clone()),
+                    ready: None,
                 }));
                 snapshot
             }
@@ -185,6 +186,808 @@ fn cancel_during_preparation_terminalizes_once() {
         assert_eq!(events_rx.drain().count(), 1);
         assert_eq!(actor.inner.outcomes.lock().unwrap().len(), 1);
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn prepared_turn_commit_pins_config_and_allocates_one_ticket() {
+    const WORK: &str = "prepared turn";
+    smol::block_on(async {
+        let gate = super::Gate::new();
+        let (actor, task) = spawn(ScriptedBackend::gated(Arc::clone(&gate)));
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let before = actor.config_snapshot().unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        reservation
+            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .unwrap();
+        reservation.wait_ready().await.unwrap();
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        let (popped, release) = actor.pause_after_next_pop();
+        let committed = reservation.commit().unwrap();
+        assert_eq!(committed.config.generation, before.generation + 1);
+        let ticket = committed.ticket.unwrap();
+        assert_eq!(actor.inner.tickets.lock().unwrap().len(), 1);
+        popped.recv_async().await.unwrap();
+        assert_eq!(
+            actor.config_snapshot().unwrap().generation,
+            committed.config.generation
+        );
+        release.send(()).unwrap();
+        gate.open();
+        ticket.wait().await;
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case("drop")]
+#[test_case::test_case("expire")]
+#[test_case::test_case("remove")]
+#[test_case::test_case("clear")]
+#[test_case::test_case("close")]
+fn prepared_retirement_releases_fifo_without_allocating_turn(action: &str) {
+    const WORK: &str = "uncommitted";
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        let successor = actor.reserve_config_update().unwrap();
+        successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        match action {
+            "drop" => drop(reservation),
+            "expire" => {
+                reservation.expire().unwrap();
+                assert_eq!(
+                    reservation.wait_ready().await,
+                    Err(ActorError::ConfigExpired)
+                );
+            }
+            "remove" => {
+                assert!(actor.remove_at(0).is_some());
+                assert_eq!(
+                    reservation.wait_ready().await,
+                    Err(ActorError::PolicyCancelled)
+                );
+            }
+            "clear" => {
+                assert_eq!(actor.clear(), 1);
+                assert_eq!(
+                    reservation.wait_ready().await,
+                    Err(ActorError::PolicyCancelled)
+                );
+            }
+            "close" => {
+                actor.close();
+                assert_eq!(reservation.wait_ready().await, Err(ActorError::Closed));
+            }
+            _ => unreachable!(),
+        }
+        if action != "close" {
+            successor.wait().await.unwrap();
+        }
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case("resolve"; "input_fixed_before_readiness")]
+#[test_case::test_case("clear"; "clear_preserves_turn_intent")]
+#[test_case::test_case("cancel_existing"; "cancel_preserves_turn_intent")]
+fn prepared_turn_input_replacement_keeps_intent(action: &str) {
+    const PLACEHOLDER: &str = "pending approved content";
+    const APPROVED: &str = "captured approved content";
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(PLACEHOLDER),
+                event_sender: None,
+                correlation: PLACEHOLDER.into(),
+            }))
+            .unwrap();
+        reservation.replace_turn_input(input(APPROVED)).unwrap();
+        {
+            let state = actor.inner.state.lock().unwrap();
+            assert!(
+                matches!(state.operations.front(), Some(super::super::ActorOperation::Prepared(pending)) if pending.turn.as_ref().unwrap().input.message == APPROVED)
+            );
+        }
+        match action {
+            "clear" => {
+                assert_eq!(actor.clear(), 1);
+            }
+            "cancel_existing" => actor.cancel_existing(),
+            "resolve" => {
+                reservation.resolve(Ok(None)).unwrap();
+                assert_eq!(
+                    reservation.replace_turn_input(input(PLACEHOLDER)),
+                    Err(ActorError::PolicyPending)
+                );
+                reservation.wait_ready().await.unwrap();
+                reservation.commit().unwrap().ticket.unwrap().wait().await;
+                actor.close();
+                task.await;
+                return;
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            reservation.replace_turn_input(input(PLACEHOLDER)),
+            Err(ActorError::PolicyCancelled)
+        );
+        let snapshot = actor.reserve_prepared_operation(None).unwrap();
+        assert_eq!(
+            snapshot.replace_turn_input(input(APPROVED)),
+            Err(ActorError::PolicyCancelled)
+        );
+        drop(snapshot);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn prepared_config_waits_for_commit_and_uses_fifo_predecessor() {
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let first = actor.reserve_config_update().unwrap();
+        let prepared = actor.reserve_prepared_operation(None).unwrap();
+        prepared
+            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .unwrap();
+        first.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let predecessor = first.wait().await.unwrap();
+        prepared.wait_ready().await.unwrap();
+        assert_eq!(
+            actor.config_snapshot().unwrap().generation,
+            predecessor.generation
+        );
+        assert_eq!(
+            actor.effective_config().unwrap().workflow,
+            predecessor.config.workflow
+        );
+        let result = prepared.commit().unwrap();
+        assert_ne!(result.config.config.workflow, predecessor.config.workflow);
+        assert_eq!(result.config.generation, predecessor.generation + 1);
+        assert!(result.ticket.is_none());
+        let noop = actor.reserve_prepared_operation(None).unwrap();
+        noop.resolve(Ok(None)).unwrap();
+        noop.wait_ready().await.unwrap();
+        assert_eq!(
+            noop.commit().unwrap().config.generation,
+            result.config.generation
+        );
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "readiness_failure")]
+#[test_case::test_case(true; "cancel_during_readiness")]
+fn prepared_readiness_never_publishes_before_commit(cancel: bool) {
+    const WORK: &str = "prepared";
+    const FAILURE: &str = "readiness failed";
+    smol::block_on(async {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let mut backend = ScriptedBackend::new();
+        backend.preparation = Some(Arc::new(|_, _, _| empty_snapshot()));
+        backend.readiness = Some(Arc::new(move |_| {
+            let entered = entered_tx.clone();
+            let release = release_rx.clone();
+            Box::pin(async move {
+                entered.send(()).unwrap();
+                let _ = release.recv_async().await;
+                Err(ActorError::InvalidConfig(FAILURE.into()))
+            })
+        }));
+        let (actor, task) = spawn(backend);
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let before = actor.config_snapshot().unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        reservation
+            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .unwrap();
+        entered_rx.recv_async().await.unwrap();
+        assert_eq!(actor.snapshot().queued, 1);
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        assert_eq!(
+            actor.config_snapshot().unwrap().generation,
+            before.generation
+        );
+        if cancel {
+            assert!(reservation.cancel().unwrap().is_none());
+        }
+        let _ = release_tx.send(());
+        let error = reservation.wait_ready().await.unwrap_err();
+        assert_eq!(
+            error,
+            if cancel {
+                ActorError::PolicyCancelled
+            } else {
+                ActorError::InvalidConfig(FAILURE.into())
+            }
+        );
+        assert_eq!(
+            actor.config_snapshot().unwrap().generation,
+            before.generation
+        );
+        assert_eq!(actor.snapshot().queued, 0);
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false, "cancel")]
+#[test_case::test_case(true, "cancel")]
+#[test_case::test_case(false, "expire")]
+#[test_case::test_case(true, "expire")]
+#[test_case::test_case(true, "clear")]
+#[test_case::test_case(true, "cancel_existing")]
+#[test_case::test_case(false, "close")]
+#[test_case::test_case(true, "close")]
+#[test_case::test_case(false, "shutdown")]
+#[test_case::test_case(true, "shutdown")]
+fn prepared_ready_retirement_settles_snapshot_and_turn(turn: bool, action: &str) {
+    const WORK: &str = "ready reservation";
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let before = actor.config_snapshot().unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(turn.then(|| crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        reservation
+            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .unwrap();
+        reservation.wait_ready().await.unwrap();
+        assert_eq!(actor.snapshot().queued, usize::from(turn));
+        assert_eq!(actor.snapshot().queue.len(), usize::from(turn));
+        let mut published = false;
+        actor.publish_if_empty(|| published = true);
+        assert!(!published);
+        let candidate = reservation.ready_config().unwrap();
+        assert_eq!(candidate.generation, before.generation);
+        assert_ne!(candidate.config.workflow, before.config.workflow);
+        match action {
+            "cancel" => {
+                reservation.cancel().unwrap();
+            }
+            "expire" => {
+                reservation.expire().unwrap();
+            }
+            "clear" => {
+                assert_eq!(actor.clear(), usize::from(turn));
+            }
+            "cancel_existing" => actor.cancel_existing(),
+            "close" => actor.close(),
+            "shutdown" => actor.shutdown(),
+            _ => unreachable!(),
+        }
+        let expected = match action {
+            "expire" => ActorError::ConfigExpired,
+            "close" => ActorError::Closed,
+            "shutdown" => ActorError::Shutdown,
+            _ => ActorError::PolicyCancelled,
+        };
+        assert_eq!(reservation.wait_ready().await, Err(expected.clone()));
+        assert!(matches!(reservation.ready_config(), Err(error) if error == expected));
+        assert!(matches!(reservation.commit(), Err(error) if error == expected));
+        assert_eq!(
+            actor.config_snapshot().unwrap().generation,
+            before.generation
+        );
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        actor.publish_if_empty(|| published = true);
+        assert!(published);
+        if !matches!(action, "close" | "shutdown") {
+            let next = actor.reserve_prepared_operation(None).unwrap();
+            next.resolve(Ok(None)).unwrap();
+            next.wait_ready().await.unwrap();
+            next.commit().unwrap();
+        }
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false, 0; "clear_unresolved")]
+#[test_case::test_case(false, 1; "clear_preparing")]
+#[test_case::test_case(false, 2; "clear_ready")]
+#[test_case::test_case(true, 0; "cancel_unresolved")]
+#[test_case::test_case(true, 1; "cancel_preparing")]
+#[test_case::test_case(true, 2; "cancel_ready")]
+fn prepared_snapshot_survives_work_cancellation(cancel: bool, phase: u8) {
+    const WORK: &str = "cancelled successor";
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let before = actor.config_snapshot().unwrap();
+        let snapshot = actor.reserve_prepared_operation(None).unwrap();
+        if phase > 0 {
+            snapshot
+                .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+                .unwrap();
+        }
+        if phase == 2 {
+            snapshot.wait_ready().await.unwrap();
+        }
+        let turn = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        let setter = actor.reserve_config_update().unwrap();
+        setter.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        if cancel {
+            actor.cancel_existing();
+        } else {
+            assert_eq!(actor.clear(), 1);
+        }
+        assert_eq!(turn.wait_ready().await, Err(ActorError::PolicyCancelled));
+        assert_eq!(actor.snapshot().queued, 0);
+        assert!(actor.snapshot().queue.is_empty());
+        let mut published = false;
+        actor.publish_if_empty(|| published = true);
+        assert!(!published);
+        assert_eq!(
+            actor.config_snapshot().unwrap().generation,
+            before.generation
+        );
+        if phase == 0 {
+            snapshot
+                .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+                .unwrap();
+        }
+        snapshot.wait_ready().await.unwrap();
+        assert_ne!(
+            snapshot.ready_config().unwrap().config.workflow,
+            before.config.workflow
+        );
+        let committed = snapshot.commit().unwrap();
+        assert_eq!(committed.config.generation, before.generation + 1);
+        let after = setter.wait().await.unwrap();
+        assert_eq!(after.generation, before.generation + 2);
+        assert_eq!(after.config.workflow, before.config.workflow);
+        actor.publish_if_empty(|| published = true);
+        assert!(published);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "cancel_wins")]
+#[test_case::test_case(true; "commit_wins")]
+fn prepared_commit_and_correlation_cancel_are_serialized(commit_first: bool) {
+    const WORK: &str = "racing prepared turn";
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let before = actor.config_snapshot().unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        reservation
+            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .unwrap();
+        reservation.wait_ready().await.unwrap();
+        let (commit_go, commit_wait) = flume::bounded(1);
+        let (cancel_go, cancel_wait) = flume::bounded(1);
+        let (done_tx, done_rx) = flume::bounded(1);
+        let (result_tx, result_rx) = flume::bounded(1);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                commit_wait.recv().unwrap();
+                result_tx.send(reservation.commit()).unwrap();
+            });
+            scope.spawn(|| {
+                cancel_wait.recv().unwrap();
+                actor.cancel_correlation(WORK, TurnCancellationReason::User);
+                done_tx.send(()).unwrap();
+            });
+            let result = if commit_first {
+                commit_go.send(()).unwrap();
+                let result = result_rx.recv().unwrap();
+                cancel_go.send(()).unwrap();
+                done_rx.recv().unwrap();
+                result
+            } else {
+                cancel_go.send(()).unwrap();
+                done_rx.recv().unwrap();
+                commit_go.send(()).unwrap();
+                result_rx.recv().unwrap()
+            };
+            if commit_first {
+                assert_eq!(result.unwrap().config.generation, before.generation + 1);
+            } else {
+                assert!(matches!(result, Err(ActorError::PolicyCancelled)));
+                assert_eq!(
+                    actor.config_snapshot().unwrap().generation,
+                    before.generation
+                );
+                assert!(actor.inner.tickets.lock().unwrap().is_empty());
+            }
+        });
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn prepared_ready_snapshot_drop_releases_fifo() {
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let snapshot = actor.reserve_prepared_operation(None).unwrap();
+        snapshot.resolve(Ok(None)).unwrap();
+        snapshot.wait_ready().await.unwrap();
+        actor.cancel_correlation("snapshot has no correlation", TurnCancellationReason::User);
+        snapshot.wait_ready().await.unwrap();
+        let setter = actor.reserve_config_update().unwrap();
+        setter.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        let before = actor.config_snapshot().unwrap().generation;
+        drop(snapshot);
+        assert_eq!(setter.wait().await.unwrap().generation, before + 1);
+        let mut published = false;
+        actor.publish_if_empty(|| published = true);
+        assert!(published);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn prepared_raw_and_visible_removal_keep_snapshot_reservation() {
+    const WORK: &str = "raw prepared turn";
+    smol::block_on(async {
+        let (actor, task) = spawn(ScriptedBackend::new());
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let snapshot = actor.reserve_prepared_operation(None).unwrap();
+        let turn = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        actor.push_compact(1, None).unwrap();
+        assert_eq!(
+            actor.snapshot().queue,
+            [
+                QueueProjection::Turn(WORK.into()),
+                QueueProjection::Compact(None)
+            ]
+        );
+        assert_eq!(
+            actor.remove_visible_at(0),
+            Some(QueueProjection::Compact(None))
+        );
+        assert_eq!(actor.remove_at(0), Some(QueueProjection::Turn(WORK.into())));
+        assert_eq!(turn.wait_ready().await, Err(ActorError::PolicyCancelled));
+        assert!(actor.remove_at(0).is_none());
+        snapshot.resolve(Ok(None)).unwrap();
+        snapshot.wait_ready().await.unwrap();
+        snapshot.commit().unwrap();
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "blocking_callback")]
+#[test_case::test_case(true; "readiness_callback")]
+fn prepared_callback_panic_settles_and_releases_successor(readiness: bool) {
+    const WORK: &str = "panicking prepared turn";
+    const PANIC: &str = "test preparation panic";
+    smol::block_on(async {
+        let mut backend = ScriptedBackend::new();
+        backend.preparation = Some(Arc::new(move |_, _, _| {
+            assert!(readiness, "{PANIC}");
+            empty_snapshot()
+        }));
+        backend.readiness = Some(Arc::new(|_| Box::pin(async { panic!("{PANIC}") })));
+        let (actor, task) = spawn(backend);
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        let successor = actor.reserve_config_update().unwrap();
+        successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
+        reservation.resolve(Ok(None)).unwrap();
+        assert!(matches!(
+            reservation.wait_ready().await,
+            Err(ActorError::InvalidConfig(_))
+        ));
+        successor.wait().await.unwrap();
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn prepared_late_blocking_result_cannot_replace_successor() {
+    const WORK: &str = "blocked prepared turn";
+    smol::block_on(async {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let (returned_tx, returned_rx) = flume::bounded(1);
+        let mut backend = ScriptedBackend::new();
+        backend.preparation = Some(Arc::new(move |_, _, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            returned_tx.send(()).unwrap();
+            empty_snapshot()
+        }));
+        let (actor, task) = spawn(backend);
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        reservation
+            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .unwrap();
+        entered_rx.recv_async().await.unwrap();
+        reservation.expire().unwrap();
+        assert_eq!(
+            reservation.wait_ready().await,
+            Err(ActorError::ConfigExpired)
+        );
+        let successor = actor.reserve_prepared_operation(None).unwrap();
+        successor.resolve(Ok(None)).unwrap();
+        successor.wait_ready().await.unwrap();
+        let before = successor.ready_config().unwrap();
+        release_tx.send(()).unwrap();
+        returned_rx.recv_async().await.unwrap();
+        let result = successor.commit().unwrap();
+        assert_eq!(result.config.generation, before.generation);
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "cancel")]
+#[test_case::test_case(true; "expire")]
+fn prepared_late_async_readiness_is_disposed_without_replacing_successor(expire: bool) {
+    const WORK: &str = "blocked readiness turn";
+    smol::block_on(async {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let (returned_tx, returned_rx) = flume::bounded(1);
+        let (disposed_tx, disposed_rx) = flume::bounded(1);
+        let mut backend = ScriptedBackend::new();
+        let observed = Arc::clone(&backend.state);
+        backend.preparation = Some(Arc::new(|_, _, _| empty_snapshot()));
+        backend.readiness = Some(Arc::new(move |snapshot| {
+            let entered = entered_tx.clone();
+            let release = release_rx.clone();
+            let returned = returned_tx.clone();
+            let disposed = disposed_tx.clone();
+            let (result_tx, result_rx) = flume::bounded(0);
+            let (readiness_dropped, readiness_disposed) = CancelToken::new();
+            smol::spawn(async move {
+                entered.send(readiness_disposed).unwrap();
+                release.recv_async().await.unwrap();
+                returned.send(()).unwrap();
+                disposed
+                    .send(result_tx.send_async(Ok(snapshot)).await.is_err())
+                    .unwrap();
+            })
+            .detach();
+            Box::pin(async move {
+                let _readiness_dropped = readiness_dropped;
+                result_rx.recv_async().await.unwrap()
+            })
+        }));
+        let (actor, task) = spawn(backend);
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let before = actor.config_snapshot().unwrap();
+        let (events_tx, events_rx) = flume::unbounded();
+        let reservation = actor
+            .reserve_prepared_operation(Some(crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: Some(EventSender::new(events_tx, 0)),
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        let successor = actor.reserve_config_update().unwrap();
+        successor.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
+        reservation
+            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .unwrap();
+        let readiness_disposed = entered_rx.recv_async().await.unwrap();
+        assert_eq!(actor.snapshot().queued, 1);
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        let mut waiting = Box::pin(reservation.wait_ready());
+        assert!(smol::future::poll_once(waiting.as_mut()).await.is_none());
+        let expected = if expire {
+            assert!(reservation.expire().unwrap().is_none());
+            ActorError::ConfigExpired
+        } else {
+            assert!(reservation.cancel().unwrap().is_none());
+            ActorError::PolicyCancelled
+        };
+        assert_eq!(waiting.await, Err(expected.clone()));
+        let committed = successor.wait().await.unwrap();
+        assert_eq!(committed.generation, before.generation + 1);
+        assert_ne!(committed.config.fast, before.config.fast);
+        assert_eq!(committed.config.workflow, before.config.workflow);
+        assert!(returned_rx.try_recv().is_err());
+        readiness_disposed.cancelled().await;
+        release_tx.send(()).unwrap();
+        returned_rx.recv_async().await.unwrap();
+        assert!(disposed_rx.recv_async().await.unwrap());
+        assert_eq!(reservation.wait_ready().await, Err(expected.clone()));
+        assert!(matches!(reservation.ready_config(), Err(error) if error == expected));
+        assert!(matches!(reservation.commit(), Err(error) if error == expected));
+        let after = actor.config_snapshot().unwrap();
+        assert_eq!(after.generation, committed.generation);
+        assert!(Arc::ptr_eq(&after.config, &committed.config));
+        assert_eq!(actor.snapshot().queued, 0);
+        assert!(actor.snapshot().queue.is_empty());
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        assert!(actor.inner.outcomes.lock().unwrap().is_empty());
+        assert!(observed.runs.lock().unwrap().is_empty());
+        assert!(events_rx.try_recv().is_err());
+        let mut published = false;
+        actor.publish_if_empty(|| published = true);
+        assert!(published);
+        actor.close();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "snapshot")]
+#[test_case::test_case(true; "turn")]
+fn prepared_wait_cancellation_does_not_retire_reservation(turn: bool) {
+    const WORK: &str = "prepared after wait cancellation";
+    smol::block_on(async {
+        let gate = super::Gate::new();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let mut backend = ScriptedBackend::gated(Arc::clone(&gate));
+        backend.preparation = Some(Arc::new(|_, _, _| empty_snapshot()));
+        backend.readiness = Some(Arc::new(move |snapshot| {
+            let entered = entered_tx.clone();
+            let release = release_rx.clone();
+            Box::pin(async move {
+                entered.send(()).unwrap();
+                release.recv_async().await.unwrap();
+                Ok(snapshot)
+            })
+        }));
+        let (actor, task) = spawn(backend);
+        actor
+            .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+            .unwrap();
+        let before = actor.config_snapshot().unwrap();
+        let predecessor = actor.reserve_config_update().unwrap();
+        let reservation = actor
+            .reserve_prepared_operation(turn.then(|| crate::actor::PreparedTurn {
+                input: input(WORK),
+                event_sender: None,
+                correlation: WORK.into(),
+            }))
+            .unwrap();
+        reservation
+            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .unwrap();
+        if turn {
+            predecessor.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
+            predecessor.wait().await.unwrap();
+            entered_rx.recv_async().await.unwrap();
+        }
+        let (cancel, token) = CancelToken::new();
+        let mut waiting = Box::pin(token.race(reservation.wait_ready()));
+        assert!(smol::future::poll_once(waiting.as_mut()).await.is_none());
+        cancel.cancel();
+        assert!(waiting.await.is_err());
+        assert!(matches!(
+            reservation.ready_config(),
+            Err(ActorError::PolicyPending)
+        ));
+        assert_eq!(actor.snapshot().queued, usize::from(turn));
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        let mut published = false;
+        actor.publish_if_empty(|| published = true);
+        assert!(!published);
+        if turn {
+            release_tx.send(()).unwrap();
+        } else {
+            predecessor.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
+            predecessor.wait().await.unwrap();
+            assert!(entered_rx.try_recv().is_err());
+        }
+        reservation.wait_ready().await.unwrap();
+        let predecessor_config = actor.config_snapshot().unwrap();
+        assert_eq!(predecessor_config.generation, before.generation + 1);
+        assert_ne!(predecessor_config.config.fast, before.config.fast);
+        assert_eq!(predecessor_config.config.workflow, before.config.workflow);
+        let candidate = reservation.ready_config().unwrap();
+        assert_eq!(candidate.generation, predecessor_config.generation);
+        assert_eq!(candidate.config.fast, predecessor_config.config.fast);
+        assert_ne!(
+            candidate.config.workflow,
+            predecessor_config.config.workflow
+        );
+        assert!(actor.inner.tickets.lock().unwrap().is_empty());
+        let result = reservation.commit().unwrap();
+        assert_eq!(result.config.generation, before.generation + 2);
+        assert_eq!(result.ticket.is_some(), turn);
+        assert_eq!(actor.inner.tickets.lock().unwrap().len(), usize::from(turn));
+        gate.open();
+        if let Some(ticket) = result.ticket {
+            ticket.wait().await;
+        }
         actor.close();
         task.await;
     });

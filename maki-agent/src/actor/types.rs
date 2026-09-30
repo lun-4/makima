@@ -1,6 +1,7 @@
 //! Backend trait and the dependency-neutral work shapes the scheduler moves.
 
 use std::future::Future;
+use std::pin::Pin;
 
 use maki_providers::{ImageSource, TokenUsage};
 use std::sync::Arc;
@@ -242,7 +243,23 @@ pub type AdmissionPreparation = Arc<
         + Sync,
 >;
 
+pub type PreparedReadiness = Arc<
+    dyn Fn(
+            crate::agent::TurnAdmissionSnapshot,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::agent::TurnAdmissionSnapshot, super::ActorError>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 pub trait ActorBackend: Send {
+    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+        None
+    }
+
     fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
         None
     }

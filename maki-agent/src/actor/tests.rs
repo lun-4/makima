@@ -101,6 +101,7 @@ struct ScriptedBackend {
     gate: Option<Arc<Gate>>,
     outcomes: Mutex<Vec<BackendResult>>,
     preparation: Option<super::AdmissionPreparation>,
+    readiness: Option<super::PreparedReadiness>,
     root_preparation_error: Option<Arc<dyn Fn(u64, String) + Send + Sync>>,
 }
 
@@ -143,6 +144,7 @@ impl ScriptedBackend {
             gate: None,
             outcomes: Mutex::new(Vec::new()),
             preparation: None,
+            readiness: None,
             root_preparation_error: None,
         }
     }
@@ -189,6 +191,10 @@ fn default_completed(context: &TurnContext) -> BackendResult {
 impl ActorBackend for ScriptedBackend {
     fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
         self.root_preparation_error.clone()
+    }
+
+    fn prepared_readiness(&self) -> Option<super::PreparedReadiness> {
+        self.readiness.clone()
     }
 
     fn admission_preparation(&self) -> Option<super::AdmissionPreparation> {

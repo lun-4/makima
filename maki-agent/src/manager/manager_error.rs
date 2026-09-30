@@ -40,6 +40,8 @@ pub enum ManagerError {
     },
     #[error("agent factory failed: {0}")]
     Factory(String),
+    #[error("agent {0} or its descendants have pending work")]
+    BusySubtree(AgentId),
     #[error("agent policy update failed: {0}")]
     Policy(String),
 }
