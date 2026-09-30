@@ -115,6 +115,21 @@ fn spawn_with_session_id(
     params: HeadlessParams,
     session_id: MakiId,
 ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
+    spawn_initialized(params, session_id, None)
+}
+
+pub fn spawn_with_provider(
+    params: HeadlessParams,
+    provider: Arc<dyn Provider>,
+) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
+    spawn_initialized(params, MakiId::generate(), Some(provider))
+}
+
+fn spawn_initialized(
+    params: HeadlessParams,
+    session_id: MakiId,
+    initialized_provider: Option<Arc<dyn Provider>>,
+) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = params.input.mode.clone();
     let workflow = params.input.workflow;
@@ -208,23 +223,29 @@ fn spawn_with_session_id(
         async move {
             let event_tx = EventSender::new(raw_tx, 0);
             let mut model = params.model;
-            let provider: Arc<dyn Provider> =
-                match provider::from_model_async(&mut model, params.timeouts).await {
-                    Ok(p) => Arc::from(p),
-                    Err(e) => {
-                        error!(error = %e, "provider error");
-                        let _ = event_tx.send(AgentEvent::ControlError {
-                            message: e.user_message(),
-                        });
-                        let _ = coordinator.close().await;
-                        return;
-                    }
-                };
+            let provider: Arc<dyn Provider> = match async {
+                match initialized_provider {
+                    Some(provider) => Ok(provider),
+                    None => provider::from_model_async(&mut model, params.timeouts)
+                        .await
+                        .map(Arc::from),
+                }
+            }
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(error = %e, "provider error");
+                    let _ = event_tx.send(AgentEvent::ControlError {
+                        message: e.user_message(),
+                    });
+                    let _ = coordinator.close().await;
+                    return;
+                }
+            };
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
-                    settings_source: None,
-                    tool_builder: None,
                     agent_id: AgentId::generate(),
                     provider,
                     model,
@@ -427,8 +448,43 @@ async fn checkpoint_and_forward_terminal(
     result
 }
 
+fn current_interactive_settings(
+    model_source: &impl crate::ModelSource,
+    session_id: MakiId,
+) -> Option<crate::RunSettings> {
+    use crate::session_options::{
+        ENABLED_VALUE, FAST_OPTION_ID, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
+    };
+
+    let (provider, model) = model_source.current()?;
+    let options = SessionCoordinatorHandle::resolve(session_id)
+        .ok()?
+        .read()
+        .options();
+    let enabled = |id: &str| {
+        options
+            .options
+            .iter()
+            .find(|option| option.definition.id.as_ref() == id)
+            .is_some_and(|option| option.current_value.as_ref() == ENABLED_VALUE)
+    };
+    let thinking = options
+        .options
+        .iter()
+        .find(|option| option.definition.id.as_ref() == THINKING_OPTION_ID)
+        .and_then(|option| option.current_value.parse().ok())
+        .unwrap_or_default();
+    Some(crate::RunSettings {
+        provider,
+        model,
+        fast: enabled(FAST_OPTION_ID),
+        workflow: enabled(WORKFLOW_OPTION_ID),
+        thinking,
+    })
+}
+
 enum InteractiveWake {
-    Input(AgentInput),
+    Input(Box<QueuedInput>),
     Control(InteractiveControl),
 }
 
@@ -445,8 +501,25 @@ async fn collect_turn_events(
     None
 }
 
+fn admit_pending_inputs(
+    pending_rx: &Receiver<AgentInput>,
+    admission_sender: &InteractiveInputSender,
+    settings: &crate::RunSettings,
+    ready: &std::sync::Mutex<bool>,
+) {
+    let mut ready = ready.lock().unwrap_or_else(|error| error.into_inner());
+    *admission_sender
+        .fallback_settings
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(settings.clone());
+    while let Ok(input) = pending_rx.try_recv() {
+        let _ = admission_sender.send_with_settings(input, settings.clone());
+    }
+    *ready = true;
+}
+
 async fn receive_wake_and_refresh(
-    input_rx: &Receiver<AgentInput>,
+    input_rx: &Receiver<QueuedInput>,
     control_rx: &Receiver<InteractiveControl>,
     shared_model: &crate::SharedModel,
     provider: &mut Arc<dyn Provider>,
@@ -456,7 +529,12 @@ async fn receive_wake_and_refresh(
         Some(InteractiveWake::Control(control))
     } else {
         future::or(
-            async { input_rx.recv_async().await.map(InteractiveWake::Input) },
+            async {
+                input_rx
+                    .recv_async()
+                    .await
+                    .map(|input| InteractiveWake::Input(Box::new(input)))
+            },
             async { control_rx.recv_async().await.map(InteractiveWake::Control) },
         )
         .await
@@ -464,7 +542,7 @@ async fn receive_wake_and_refresh(
     };
     use crate::ModelSource;
     if let Some((current_provider, current_model)) = shared_model.current()
-        && current_model.spec() != model.spec()
+        && (current_model.spec() != model.spec() || !Arc::ptr_eq(&current_provider, provider))
     {
         *provider = current_provider;
         *model = current_model;
@@ -585,17 +663,158 @@ pub fn interactive_directory_adopter(
     Arc::new(Adopter { control_tx })
 }
 
+struct QueuedInput {
+    input: AgentInput,
+    settings: crate::RunSettings,
+    prepared: (String, RequestTools, agent::Instructions),
+    admission: agent::TurnAdmissionSnapshot,
+}
+
+#[derive(Clone)]
+pub struct InteractiveInputSender {
+    tx: flume::Sender<QueuedInput>,
+    pending_tx: flume::Sender<AgentInput>,
+    ready: Arc<std::sync::Mutex<bool>>,
+    fallback_settings: Arc<std::sync::Mutex<Option<crate::RunSettings>>>,
+    mirror: Option<flume::Sender<AgentInput>>,
+    model: crate::SharedModel,
+    session_id: MakiId,
+    cwd: Arc<std::sync::Mutex<PathBuf>>,
+    config: AgentConfig,
+    excluded_tools: Vec<&'static str>,
+    modes: Arc<crate::ModeRegistry>,
+    prompt_slots: Arc<ResolvedSlots>,
+    system_prompt_override: Option<String>,
+    append_system_prompt: Option<String>,
+    mcp_handle: Option<McpHandle>,
+    local_tools: LocalTools,
+}
+
+impl InteractiveInputSender {
+    pub fn with_input_mirror(mut self, mirror: flume::Sender<AgentInput>) -> Self {
+        self.mirror = Some(mirror);
+        self
+    }
+
+    pub fn send(&self, input: AgentInput) -> Result<(), flume::SendError<Box<AgentInput>>> {
+        if let Some(mirror) = &self.mirror {
+            return mirror
+                .send(input)
+                .map_err(|error| flume::SendError(Box::new(error.0)));
+        }
+        let ready = self.ready.lock().unwrap_or_else(|error| error.into_inner());
+        if !*ready {
+            return self
+                .pending_tx
+                .send(input)
+                .map_err(|error| flume::SendError(Box::new(error.0)));
+        }
+        let Some(settings) =
+            current_interactive_settings(&self.model, self.session_id).or_else(|| {
+                self.fallback_settings
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+            })
+        else {
+            return Err(flume::SendError(Box::new(input)));
+        };
+        self.send_with_settings(input, settings)
+    }
+
+    fn send_with_settings(
+        &self,
+        mut input: AgentInput,
+        settings: crate::RunSettings,
+    ) -> Result<(), flume::SendError<Box<AgentInput>>> {
+        input.fast = settings.fast;
+        input.workflow = settings.workflow;
+        input.thinking = settings.thinking;
+        let cwd = self
+            .cwd
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let vars = template::env_vars_for(&cwd);
+        let instructions = agent::load_instructions(&cwd.to_string_lossy());
+        let tools = RequestTools::build(
+            ToolRegistry::global(),
+            &vars,
+            &settings.model,
+            &self.config,
+            &self.excluded_tools,
+            input.workflow,
+            self.mcp_handle.is_some(),
+        );
+        let mode_def = match &input.mode {
+            AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
+            _ => Some(Arc::new(self.modes.current(&input.mode))),
+        };
+        let mut system = self.system_prompt_override.clone().unwrap_or_else(|| {
+            mode_def.as_ref().map_or_else(
+                || {
+                    agent::build_system_prompt(
+                        &vars,
+                        &self.modes,
+                        &input.mode,
+                        &instructions.text,
+                        &self.prompt_slots,
+                    )
+                },
+                |definition| {
+                    agent::build_system_prompt_with_def(
+                        &vars,
+                        definition,
+                        &input.mode,
+                        &instructions.text,
+                        &self.prompt_slots,
+                    )
+                },
+            )
+        });
+        if let Some(append) = &self.append_system_prompt {
+            system.push('\n');
+            system.push_str(append);
+        }
+        let prepared = (system, tools, instructions);
+        let mcp = self
+            .mcp_handle
+            .clone()
+            .map(|handle| McpSession::new(handle, &[]));
+        let admission = agent::TurnAdmissionSnapshot {
+            mode_def,
+            prompt_inputs: None,
+            bindings: Arc::new(crate::tools::TurnToolBindings::capture(
+                ToolRegistry::global(),
+                &self.local_tools,
+                mcp.as_ref(),
+            )),
+            mcp_startup_notice: mcp.as_ref().and_then(|mcp| {
+                let count = mcp.connecting_count();
+                (count > 0).then_some(count)
+            }),
+        };
+        self.tx
+            .send(QueuedInput {
+                input,
+                settings,
+                prepared,
+                admission,
+            })
+            .map_err(|error| flume::SendError(Box::new(error.0.input)))
+    }
+}
+
 pub struct InteractiveHandle {
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
-    pub input_tx: flume::Sender<AgentInput>,
+    pub input_tx: InteractiveInputSender,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
     pub control_tx: flume::Sender<InteractiveControl>,
-    /// Install a model here to change it. Adoption is a store, so it lands on
-    /// the run's next request rather than waiting for the turn to end, and it
-    /// never blocks a caller behind a running turn.
+    /// Install a model here to change it. A running turn keeps its admitted
+    /// model. The new model applies when the next turn wakes.
     pub model: crate::SharedModel,
     pub session_id: SessionRef,
     pub mailbox: SessionMailbox,
@@ -603,7 +822,32 @@ pub struct InteractiveHandle {
     pub task: smol::Task<()>,
 }
 
+pub type ProviderPreparation = Box<
+    dyn FnOnce(
+            Model,
+            Timeouts,
+        ) -> provider::BoxFuture<
+            'static,
+            Result<(Model, Arc<dyn Provider>), crate::AgentError>,
+        > + Send,
+>;
+
 pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
+    spawn_interactive_with_preparation(
+        params,
+        Box::new(|mut model, timeouts| {
+            Box::pin(async move {
+                let provider = provider::from_model_async(&mut model, timeouts).await?;
+                Ok((model, Arc::from(provider)))
+            })
+        }),
+    )
+}
+
+pub fn spawn_interactive_with_preparation(
+    params: InteractiveParams,
+    prepare: ProviderPreparation,
+) -> InteractiveHandle {
     let initial_tools = RequestTools::build(
         ToolRegistry::global(),
         &template::env_vars(),
@@ -623,7 +867,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let (guard, events) = crate::types::event_stream();
     let raw_tx = guard.tx().clone();
     let event_rx = events.into_receiver();
-    let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
+    let (input_tx, input_rx) = flume::unbounded::<QueuedInput>();
+    let (pending_tx, pending_rx) = flume::unbounded::<AgentInput>();
+    let input_ready = Arc::new(std::sync::Mutex::new(false));
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
@@ -644,6 +890,26 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let handle_model = shared_model.clone();
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
+    let admission_cwd = Arc::new(std::sync::Mutex::new(PathBuf::from(&working_dir)));
+    let input_tx = InteractiveInputSender {
+        tx: input_tx.clone(),
+        pending_tx,
+        ready: Arc::clone(&input_ready),
+        fallback_settings: Arc::new(std::sync::Mutex::new(None)),
+        mirror: None,
+        model: shared_model.clone(),
+        session_id,
+        cwd: Arc::clone(&admission_cwd),
+        config: params.config.clone(),
+        excluded_tools: params.excluded_tools.clone(),
+        modes: Arc::clone(&params.modes),
+        prompt_slots: Arc::clone(&params.prompt_slots),
+        system_prompt_override: params.system_prompt_override.clone(),
+        append_system_prompt: params.append_system_prompt.clone(),
+        mcp_handle: params.mcp_handle.clone(),
+        local_tools: Arc::clone(&params.local_tools),
+    };
+    let admission_sender = input_tx.clone();
     let mut permissions_config = params.permissions_config.clone();
     permissions_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new(
@@ -664,19 +930,24 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         let file_write_locks = Arc::clone(&file_write_locks);
         let _stream_guard = guard;
         async move {
-            let mut model = params.model;
-            let mut provider: Arc<dyn Provider> =
-                match provider::from_model_async(&mut model, params.timeouts).await {
-                    Ok(p) => Arc::from(p),
-                    Err(e) => {
-                        error!(error = %e, "provider error");
-                        let _ = EventSender::new(raw_tx, 0).send(AgentEvent::ControlError {
-                            message: e.user_message(),
-                        });
-                        return;
-                    }
-                };
+            let (mut model, mut provider) = match prepare(params.model, params.timeouts).await {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    error!(error = %e, "provider error");
+                    let _ = EventSender::new(raw_tx, 0).send(AgentEvent::ControlError {
+                        message: e.user_message(),
+                    });
+                    return;
+                }
+            };
             shared_model.install(Arc::clone(&provider), model.clone());
+            let settings = loop {
+                if let Some(settings) = current_interactive_settings(&shared_model, session_id) {
+                    break settings;
+                }
+                smol::future::yield_now().await;
+            };
+            admit_pending_inputs(&pending_rx, &admission_sender, &settings, &input_ready);
 
             let mut history = History::restored(params.initial_history);
             let mut working_dir = PathBuf::from(working_dir);
@@ -702,8 +973,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     )
                     .await
                 };
-                let input = match wake {
-                    Some(InteractiveWake::Input(input)) => input,
+                let queued = match wake {
+                    Some(InteractiveWake::Input(input)) => *input,
                     Some(InteractiveWake::Control(InteractiveControl::ChangeDirectory {
                         path,
                         reply,
@@ -730,6 +1001,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         reply,
                     })) => {
                         working_dir = path.clone();
+                        *admission_cwd
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = path.clone();
                         permissions.set_cwd(path.clone());
                         directory_pending = false;
                         let _ = reply.send(Ok(path));
@@ -831,6 +1105,12 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                     None => break,
                 };
+                let QueuedInput {
+                    mut input,
+                    settings,
+                    prepared,
+                    admission,
+                } = queued;
                 let turn_id = TurnId::generate();
                 let lease_committer = input.lease_committer.clone();
                 let operation_cancel = input.cancel.clone();
@@ -847,13 +1127,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         (Some(task), cancel)
                     }
                 };
-
-                // MCP connects in the background, so a prompt that beats it waits
-                // here instead of shipping a turn without the MCP tools. The wait
-                // is racing cancel: a slow server must not pin the whole session.
-                if let Some(mcp) = &mcp {
-                    let _ = cancel.race(mcp.ready()).await;
-                }
 
                 let (turn_event_tx, turn_event_rx) = flume::unbounded::<Envelope>();
                 let terminal_task = smol::spawn(collect_turn_events(turn_event_rx, raw_tx.clone()));
@@ -901,58 +1174,18 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 }
 
-                let turn_vars = template::env_vars_for(&working_dir);
-                let turn_instructions = agent::load_instructions(&working_dir.to_string_lossy());
-                let has_mcp = mcp.is_some();
-                let tools = RequestTools::build(
-                    ToolRegistry::global(),
-                    &turn_vars,
-                    &model,
-                    &params.config,
-                    &params.excluded_tools,
-                    input.workflow,
-                    has_mcp,
-                );
-                let mut system = params.system_prompt_override.clone().unwrap_or_else(|| {
-                    agent::build_system_prompt(
-                        &turn_vars,
-                        &modes,
-                        &input.mode,
-                        &turn_instructions.text,
-                        &params.prompt_slots,
-                    )
-                });
-                if let Some(append) = &params.append_system_prompt {
-                    system.push('\n');
-                    system.push_str(append);
-                }
+                provider = settings.provider;
+                model = settings.model;
+                input.fast = settings.fast;
+                input.workflow = settings.workflow;
+                input.thinking = settings.thinking;
+
+                let (system, tools, turn_instructions) = prepared;
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
                 let mut agent = Agent::new(
                     AgentParams {
-                        // Session options travel through the coordinator, so
-                        // fast and workflow reach a run in flight the same way
-                        // the model does.
-                        settings_source: Some(Arc::new(crate::SessionRunSettings {
-                            model: Arc::new(shared_model.clone()),
-                            session_id,
-                        })),
-                        // Without this a workflow toggle would flip the flag
-                        // while the interpreter kept the schema built for the
-                        // old one, and a model switch would carry the previous
-                        // model's tool descriptions.
-                        tool_builder: Some({
-                            let vars = turn_vars.clone();
-                            let config = params.config.clone();
-                            let excluded = params.excluded_tools.clone();
-                            let registry = Arc::clone(ToolRegistry::global_arc());
-                            Arc::new(move |model: &Model, workflow: bool| {
-                                RequestTools::build(
-                                    &registry, &vars, model, &config, &excluded, workflow, has_mcp,
-                                )
-                            })
-                        }),
                         agent_id,
                         provider: Arc::clone(&provider),
                         model: model.clone(),
@@ -985,7 +1218,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
                 .with_local_tools(Arc::clone(&params.local_tools))
-                .with_mcp(mcp.clone());
+                .with_mcp(mcp.clone())
+                .with_admission(Some(admission));
 
                 let outcome = agent.run(turn_id, input).await;
                 drop(agent);
@@ -1298,6 +1532,53 @@ mod tests {
         });
     }
 
+    struct RecordingProvider {
+        name: &'static str,
+        requests: flume::Sender<(&'static str, String, String, bool)>,
+    }
+
+    impl Provider for RecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _: &'a [Message],
+            system: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            options: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, crate::AgentError>,
+        > {
+            Box::pin(async move {
+                self.requests
+                    .send((self.name, model.spec(), system.into(), options.fast))
+                    .unwrap();
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![maki_providers::ContentBlock::Text {
+                            text: self.name.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
     struct TestProvider;
 
     impl maki_providers::provider::Provider for TestProvider {
@@ -1595,6 +1876,251 @@ mod tests {
     }
 
     #[test]
+    fn headless_queued_settings_survive_config_change() {
+        const FIRST: &str = "first provider";
+        const SECOND: &str = "second provider";
+        let (requests, received) = flume::unbounded();
+        let params = test_params();
+        let (tx, rx) = flume::unbounded();
+        let (pending_tx, pending_rx) = flume::unbounded();
+        let cwd = Arc::new(std::sync::Mutex::new(params.initial_wd));
+        let sender = InteractiveInputSender {
+            tx,
+            pending_tx: pending_tx.clone(),
+            ready: Arc::new(std::sync::Mutex::new(false)),
+            fallback_settings: Arc::new(std::sync::Mutex::new(None)),
+            mirror: None,
+            model: crate::SharedModel::default(),
+            session_id: MakiId::generate(),
+            cwd: Arc::clone(&cwd),
+            config: params.config,
+            excluded_tools: params.excluded_tools,
+            modes: params.modes,
+            prompt_slots: Arc::new(params.prompt_slots),
+            system_prompt_override: Some("admitted system".into()),
+            append_system_prompt: None,
+            mcp_handle: None,
+            local_tools: Arc::new(Default::default()),
+        };
+        sender.send(test_params().input).unwrap();
+        assert!(rx.is_empty());
+        let pending_input = pending_rx.try_recv().unwrap();
+        assert_eq!(pending_input.message, "hello");
+        let initialized_provider: Arc<dyn Provider> = Arc::new(TestProvider);
+        let initialized_settings = crate::RunSettings {
+            provider: Arc::clone(&initialized_provider),
+            model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+            fast: true,
+            workflow: true,
+            thinking: Default::default(),
+        };
+        sender
+            .fallback_settings
+            .lock()
+            .unwrap()
+            .replace(initialized_settings.clone());
+        pending_tx.send(pending_input).unwrap();
+        admit_pending_inputs(&pending_rx, &sender, &initialized_settings, &sender.ready);
+        sender.send(test_params().input).unwrap();
+        let admitted = rx.recv().unwrap();
+        let ready_admitted = rx.recv().unwrap();
+        assert_eq!(ready_admitted.input.message, "hello");
+        assert!(Arc::ptr_eq(
+            &admitted.settings.provider,
+            &initialized_provider
+        ));
+        assert!(admitted.input.fast && admitted.input.workflow);
+        assert_eq!(admitted.prepared.0, "admitted system");
+        sender
+            .modes
+            .define(crate::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("before".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let first_provider: Arc<dyn Provider> = Arc::new(RecordingProvider {
+            name: FIRST,
+            requests: requests.clone(),
+        });
+        let first_model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let later_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        sender
+            .send_with_settings(
+                test_params().input,
+                crate::RunSettings {
+                    provider: Arc::clone(&first_provider),
+                    model: first_model,
+                    fast: true,
+                    workflow: true,
+                    thinking: Default::default(),
+                },
+            )
+            .unwrap();
+        *cwd.lock().unwrap() = PathBuf::from("/other");
+        sender
+            .modes
+            .define(crate::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("after".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        sender
+            .send_with_settings(
+                test_params().input,
+                crate::RunSettings {
+                    provider: Arc::new(RecordingProvider {
+                        name: SECOND,
+                        requests,
+                    }),
+                    model: later_model,
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+            )
+            .unwrap();
+
+        let first = rx.recv().unwrap();
+        let second = rx.recv().unwrap();
+        assert!(Arc::ptr_eq(&first.settings.provider, &first_provider));
+        assert!(first.input.fast && first.input.workflow);
+        assert!(!second.input.fast && !second.input.workflow);
+        assert_ne!(first.settings.model.spec(), second.settings.model.spec());
+        assert_eq!(
+            first
+                .admission
+                .mode_def
+                .as_ref()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            second
+                .admission
+                .mode_def
+                .as_ref()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("after")
+        );
+        assert_eq!(first.prepared.0, "admitted system");
+        assert_eq!(second.prepared.0, "admitted system");
+        let expected = [
+            (FIRST, first.settings.model.spec(), first.input.fast),
+            (SECOND, second.settings.model.spec(), second.input.fast),
+        ];
+        smol::block_on(async {
+            let params = test_params();
+            let session_id = MakiId::generate();
+            let spec = params.model.spec();
+            let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+                session_id,
+                catalog: Default::default(),
+                definitions: builtin_option_definitions(
+                    Arc::from(spec.as_str()),
+                    [Arc::from(spec.as_str())],
+                    false,
+                    false,
+                    false,
+                    Default::default(),
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(spec.as_str()),
+                cwd: params.initial_wd.clone(),
+                model_policy: Arc::default(),
+                model_adopter: Arc::new(|_| {
+                    Box::pin(async { Ok(()) }) as crate::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path| {
+                    Box::pin(async move { Ok(path) })
+                        as crate::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint: Arc::new(
+                    |request: maki_storage::checkpoint::CheckpointRequest<
+                        crate::session_coordinator::SessionCheckpoint,
+                    >| {
+                        Box::pin(async move {
+                            Ok(maki_storage::checkpoint::CheckpointAck {
+                                session_id: request.session_id,
+                                version: request.version,
+                            })
+                        }) as maki_storage::checkpoint::CheckpointFuture
+                    },
+                ),
+                mailbox: SessionMailbox::new(session_id),
+            })
+            .unwrap();
+            let handle = spawn_interactive_with_preparation(
+                InteractiveParams {
+                    model: params.model,
+                    config: params.config,
+                    permissions_config: params.permissions_config,
+                    timeouts: params.timeouts,
+                    prompt_slots: Arc::new(params.prompt_slots),
+                    excluded_tools: params.excluded_tools,
+                    mcp_handle: None,
+                    initial_wd: params.initial_wd,
+                    session_id: Some(SessionRef::from(session_id)),
+                    initial_history: Vec::new(),
+                    yolo: false,
+                    system_prompt_override: None,
+                    append_system_prompt: None,
+                    defaults: Default::default(),
+                    model_policy: params.model_policy,
+                    modes: params.modes,
+                    question_mode: crate::tools::QuestionMode::Headless,
+                    plugin_rules: params.plugin_rules,
+                    project_config: params.project_config,
+                    local_tools: Default::default(),
+                },
+                Box::new(|model, _| {
+                    Box::pin(
+                        async move { Ok((model, Arc::new(TestProvider) as Arc<dyn Provider>)) },
+                    )
+                }),
+            );
+            handle.input_tx.tx.send(first).unwrap();
+            handle.input_tx.tx.send(second).unwrap();
+            for _ in 0..2 {
+                loop {
+                    let event = smol::future::or(
+                        async { handle.event_rx.recv_async().await.ok() },
+                        async {
+                            smol::Timer::after(std::time::Duration::from_secs(5)).await;
+                            None
+                        },
+                    )
+                    .await
+                    .expect("interactive queued turn did not complete");
+                    match event.event {
+                        AgentEvent::TurnOutcome(outcome) => {
+                            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+                            break;
+                        }
+                        AgentEvent::ControlError { message } => panic!("{message}"),
+                        _ => {}
+                    }
+                }
+            }
+            handle.task.cancel().await;
+            coordinator.close().await.unwrap();
+        });
+        for (name, model, fast) in expected {
+            assert_eq!(
+                received.try_recv().unwrap(),
+                (name, model, "admitted system".into(), fast)
+            );
+        }
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
     fn wake_refreshes_model_after_idle_wait() {
         smol::block_on(async {
             let (_input_tx, input_rx) = flume::unbounded();
@@ -1625,6 +2151,38 @@ mod tests {
 
             assert!(got_control);
             assert_eq!(model.spec(), adopted_model.spec());
+            assert!(Arc::ptr_eq(&provider, &adopted_provider));
+        });
+    }
+
+    #[test]
+    fn wake_refreshes_provider_for_same_model() {
+        smol::block_on(async {
+            let (_input_tx, input_rx) = flume::unbounded();
+            let (control_tx, control_rx) = flume::unbounded();
+            let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+            let adopted_provider: Arc<dyn Provider> = Arc::new(TestProvider);
+            let mut provider: Arc<dyn Provider> = Arc::new(TestProvider);
+            let mut current_model = model.clone();
+            let shared_model = crate::SharedModel::default();
+            shared_model.install(Arc::clone(&adopted_provider), model);
+            control_tx
+                .send(InteractiveControl::Reset(flume::bounded(1).0))
+                .unwrap();
+
+            let wake = receive_wake_and_refresh(
+                &input_rx,
+                &control_rx,
+                &shared_model,
+                &mut provider,
+                &mut current_model,
+            )
+            .await;
+
+            assert!(matches!(
+                wake,
+                Some(InteractiveWake::Control(InteractiveControl::Reset(_)))
+            ));
             assert!(Arc::ptr_eq(&provider, &adopted_provider));
         });
     }

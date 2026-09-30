@@ -40,4 +40,6 @@ pub enum ManagerError {
     },
     #[error("agent factory failed: {0}")]
     Factory(String),
+    #[error("agent policy update failed: {0}")]
+    Policy(String),
 }

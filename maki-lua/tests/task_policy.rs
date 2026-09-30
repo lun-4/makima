@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
-use maki_agent::{AgentMode, ToolOutput};
+use maki_agent::{AgentMode, ModeDef, ModeId, ToolOutput};
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -1122,6 +1122,57 @@ fn despawn_releases_capacity_from_an_active_turn() {
             exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": second_id }));
         assert_eq!(out["ok"], json!(true));
     });
+}
+
+#[test]
+fn task_policy_general_task_runs_in_custom_mode_real_driver() {
+    let provider = Arc::new(common::CannedProvider::new(vec![common::canned_reply(
+        "done",
+    )]));
+    let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    ctx.mode = AgentMode::Custom(ModeId::parse("audit"));
+    ctx.mode_def = Some(Arc::new(ModeDef::default_for(ctx.mode.id())));
+
+    let (reg, _host) = load_real_driver_host("audit");
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["subagent_type"] = json!("general");
+    let out = run_task(&reg, &ctx, input).expect("general task must run in custom mode");
+
+    assert_eq!(out, "done");
+    assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(1));
+    let captured_tools = provider.captured_tools();
+    assert_eq!(captured_tools.len(), 1);
+    assert!(
+        common::tool_names(&captured_tools[0]).is_empty(),
+        "the custom-mode test harness offers no tools to the child"
+    );
+}
+
+#[test]
+fn plan_mode_task_supports_structured_output_real_driver() {
+    let provider = Arc::new(common::CannedProvider::new(vec![
+        common::canned_tool_use(STRUCTURED_OUTPUT_TOOL, json!({ "answer": "42" })),
+        common::canned_reply("done"),
+    ]));
+    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+
+    let (reg, _host) = load_real_driver_host("plan");
+    let mut input = task_input(SCENARIO_HAPPY, Some(answer_schema()));
+    input["subagent_type"] = json!("plan_reviewer");
+    let out = run_task(&reg, &ctx, input).expect("structured plan-mode task failed");
+
+    let parsed: Value = serde_json::from_str(&out).expect("result is not json");
+    assert_eq!(parsed, json!({ "answer": "42" }));
+    assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(1));
+
+    let tools = provider.captured_tools();
+    let structured_output = tools[0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == STRUCTURED_OUTPUT_TOOL)
+        .expect("session tools must include structured_output");
+    assert_eq!(structured_output["input_schema"], answer_schema());
 }
 
 #[test]

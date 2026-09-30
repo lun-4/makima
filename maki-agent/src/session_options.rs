@@ -218,6 +218,16 @@ impl SessionOptions {
         fast: &str,
         thinking: &str,
     ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
+        self.prepare_actor_config(model, fast, thinking, None)
+    }
+
+    pub(crate) fn prepare_actor_config(
+        &self,
+        model: &str,
+        fast: &str,
+        thinking: &str,
+        workflow: Option<&str>,
+    ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
         let state = lock(&self.state);
         let mut candidate = state.clone();
         let definition = candidate
@@ -233,14 +243,15 @@ impl SessionOptions {
             });
             definition.values = choices.into();
         }
-        Self::prepare_set_values_from_state(
-            &candidate,
-            &[
-                (MODEL_OPTION_ID, model),
-                (FAST_OPTION_ID, fast),
-                (THINKING_OPTION_ID, thinking),
-            ],
-        )
+        let mut values = vec![
+            (MODEL_OPTION_ID, model),
+            (FAST_OPTION_ID, fast),
+            (THINKING_OPTION_ID, thinking),
+        ];
+        if let Some(workflow) = workflow {
+            values.push((WORKFLOW_OPTION_ID, workflow));
+        }
+        Self::prepare_set_values_from_state(&candidate, &values)
     }
 
     fn prepare_set_values_from_state(

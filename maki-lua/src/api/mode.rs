@@ -8,7 +8,7 @@ use maki_agent::{ModeDefSpec, ModeError, ModeId, ModeRegistry};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::command::{UiAction, ui_send};
+use crate::api::util::command::{SessionRequest, UiAction, ui_send};
 use crate::api::util::pair::{Pair, err_pair};
 
 const NO_REGISTRY_ERR: &str = "mode registry not available";
@@ -106,23 +106,24 @@ async fn get(_lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
     }
 }
 
-/// Enters a mode by name; fails when it is not defined. The UI owns the
-/// active mode, so this answers `(true, nil)` once the switch is requested.
+/// Enters a mode by name; fails when it is not defined. Success means the actor
+/// committed the mode for subsequent admissions, not that saving has finished.
+/// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param name string Mode id ("build", "plan", or a custom name).
 /// @return (boolean, string|nil) `true` on success, or nil and an error.
 /// @example
 /// maki.api.mode.set("plan")
 #[lua_fn]
-fn set(
-    lua: &Lua,
+async fn set(
+    lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     name: String,
 ) -> LuaResult<Pair<bool>> {
-    set_inner(lua, tx, name)
+    set_inner(&lua, tx, name).await
 }
 
-fn set_inner(
+async fn set_inner(
     lua: &Lua,
     tx: Option<flume::Sender<UiAction>>,
     name: String,
@@ -132,14 +133,23 @@ fn set_inner(
     if !reg.contains(id.key()) {
         return Ok(err_pair(mode_err(ModeError::Unknown(name))));
     }
+    let (reply_tx, reply_rx) = flume::bounded(1);
     match ui_send(
         tx.as_ref(),
-        UiAction::SetMode {
-            id: id.key().to_owned(),
+        UiAction::Session {
+            req: SessionRequest::SetMode {
+                session: None,
+                id: id.key().to_owned(),
+            },
+            reply_tx,
         },
     ) {
-        Ok(()) => Ok((Some(true), None)),
-        Err(e) => Ok(err_pair(e)),
+        Ok(()) => match reply_rx.recv_async().await {
+            Ok(Ok(_)) => Ok((Some(true), None)),
+            Ok(Err(error)) => Ok(err_pair(error)),
+            Err(_) => Ok(err_pair("ui dropped the mode update")),
+        },
+        Err(error) => Ok(err_pair(error)),
     }
 }
 

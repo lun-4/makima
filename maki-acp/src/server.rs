@@ -920,12 +920,10 @@ async fn install_session_with_lock(
             cwd: cwd.clone(),
             model_policy: Arc::clone(&params.model_policy),
             model_adopter: Arc::new({
-                // Installing into the shared source rather than asking the
-                // session loop to adopt: the loop only reads its control
-                // channel between turns, so a round-trip here would wait for
-                // the running turn -- and that turn cannot finish while the
-                // coordinator is blocked on this call. The store also lands on
-                // the run's next request instead of its next turn.
+                // Install into the shared source without waiting for the
+                // running turn. The actor pins model settings at admission, so
+                // this takes effect for later turns while the active turn keeps
+                // its selected model.
                 let shared = handle.model.clone();
                 let timeouts = params.timeouts;
                 move |mut model: Model| {
@@ -2288,6 +2286,50 @@ mod tests {
     const LIFECYCLE_STRESS_ITERATIONS: usize = 64;
     const SPAWN_TEST_SPEC: &str = "ollama/acp-end-turn-test";
 
+    struct RecordingAcpProvider {
+        name: &'static str,
+        requests: Sender<(&'static str, String, bool)>,
+    }
+
+    impl maki_providers::provider::Provider for RecordingAcpProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            events: &'a Sender<maki_providers::ProviderEvent>,
+            options: maki_providers::RequestOptions,
+            session: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_agent::AgentError>,
+        > {
+            self.requests
+                .send((self.name, model.spec(), options.fast))
+                .unwrap();
+            maki_providers::provider::Provider::stream_message(
+                &EndTurnProvider,
+                model,
+                messages,
+                system,
+                tools,
+                events,
+                options,
+                session,
+            )
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
     struct EndTurnProvider;
 
     impl maki_providers::provider::Provider for EndTurnProvider {
@@ -2514,11 +2556,33 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let (input_tx, input_rx) = flume::unbounded();
         let session_id = MakiId::generate();
+        let input_handle = headless::spawn_interactive(InteractiveParams {
+            model: Model::from_spec(OFFLINE_SPEC).unwrap(),
+            config: Default::default(),
+            permissions_config: Default::default(),
+            timeouts: Default::default(),
+            prompt_slots: Arc::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: PathBuf::from("/project"),
+            session_id: Some(SessionRef::from(session_id)),
+            modes: Arc::default(),
+            initial_history: Vec::new(),
+            yolo: false,
+            system_prompt_override: Some(String::new()),
+            append_system_prompt: None,
+            defaults: Default::default(),
+            model_policy: Arc::default(),
+            question_mode: QuestionMode::Headless,
+            plugin_rules: Arc::default(),
+            project_config: ProjectConfig::for_project(Path::new("/project")),
+            local_tools: Default::default(),
+        });
         let handle = InteractiveHandle {
             model: Default::default(),
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
-            input_tx,
+            input_tx: input_handle.input_tx.with_input_mirror(input_tx),
             answer_tx: answer_tx.clone(),
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,
@@ -2688,7 +2752,18 @@ mod tests {
             .unwrap_err();
 
             assert!(!error.is_empty());
-            assert!(input_tx.is_disconnected(), "session task was not cancelled");
+            assert!(
+                input_tx
+                    .send(agent_input(
+                        String::new(),
+                        Vec::new(),
+                        AgentMode::Build,
+                        SessionDefaults::default(),
+                        None,
+                    ))
+                    .is_err(),
+                "session task was not cancelled"
+            );
             assert!(srv.session.is_none());
         });
     }
@@ -4920,6 +4995,198 @@ mod tests {
     }
 
     #[test]
+    fn acp_immediate_prompt_and_option_change() {
+        const SPEC: &str = "anthropic/claude-opus-4-8";
+        const FIRST: &str = "initial provider";
+        const SECOND: &str = "replacement provider";
+        smol::block_on(async {
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let (requests, received) = flume::unbounded();
+            let (release, ready) = flume::bounded(1);
+            let session = srv.session.as_mut().unwrap();
+            let id = session.handle.session_id.clone();
+            session.coordinator.take().unwrap().close().await.unwrap();
+            session.coordinator = Some(test_coordinator_with(
+                id.id(),
+                SPEC,
+                PathBuf::from("/tmp"),
+                Default::default(),
+                successful_checkpoint(),
+            ));
+            let first_requests = requests.clone();
+            let handle = headless::spawn_interactive_with_preparation(
+                InteractiveParams {
+                    model: Model::from_spec(SPEC).unwrap(),
+                    config: Default::default(),
+                    permissions_config: Default::default(),
+                    timeouts: Default::default(),
+                    prompt_slots: Arc::default(),
+                    excluded_tools: Vec::new(),
+                    mcp_handle: None,
+                    initial_wd: PathBuf::from("/tmp"),
+                    session_id: Some(id.clone()),
+                    initial_history: Vec::new(),
+                    yolo: false,
+                    system_prompt_override: Some(String::new()),
+                    append_system_prompt: None,
+                    defaults: Default::default(),
+                    model_policy: Arc::default(),
+                    modes: Arc::default(),
+                    question_mode: QuestionMode::Headless,
+                    plugin_rules: Arc::default(),
+                    project_config: ProjectConfig::for_project(Path::new("/tmp")),
+                    local_tools: Default::default(),
+                },
+                Box::new(move |model, _| {
+                    Box::pin(async move {
+                        ready.recv_async().await.unwrap();
+                        let provider: Arc<dyn maki_providers::provider::Provider> =
+                            Arc::new(RecordingAcpProvider {
+                                name: FIRST,
+                                requests: first_requests,
+                            });
+                        Ok((model, provider))
+                    })
+                }),
+            );
+            let previous = std::mem::replace(&mut session.handle, handle);
+            previous.task.cancel().await;
+            start_event_pump(
+                session.handle.event_rx.clone(),
+                id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&session.pending),
+                false,
+                session.handle.answer_tx.clone(),
+                session.handle.cancel_tx.clone(),
+                session.coordinator.as_ref().unwrap().read(),
+                None,
+                PUMP_TRUSTED,
+                None,
+            );
+            let session_id = id.to_string();
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "immediate", false),
+                &RequestId::Number(91),
+            )
+            .await
+            .unwrap();
+            assert!(received.is_empty());
+            release.send(()).unwrap();
+            loop {
+                let response = smol::future::or(async { out_rx.recv_async().await.ok() }, async {
+                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                    None
+                })
+                .await
+                .expect("immediate ACP prompt did not complete");
+                if response["id"] == 91 {
+                    assert!(response.get("error").is_none(), "{response}");
+                    break;
+                }
+            }
+            assert_eq!(received.try_recv().unwrap(), (FIRST, SPEC.into(), false));
+            handle_set_config(
+                &mut srv,
+                &serde_json::json!({ "params": {
+                    "sessionId": session_id,
+                    "configId": maki_agent::session_options::FAST_OPTION_ID,
+                    "value": maki_agent::session_options::ENABLED_VALUE,
+                }}),
+            )
+            .await
+            .unwrap();
+            srv.session.as_ref().unwrap().handle.model.install(
+                Arc::new(RecordingAcpProvider {
+                    name: SECOND,
+                    requests,
+                }),
+                Model::from_spec(SPEC).unwrap(),
+            );
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, "after option", false),
+                &RequestId::Number(92),
+            )
+            .await
+            .unwrap();
+            loop {
+                let response = smol::future::or(async { out_rx.recv_async().await.ok() }, async {
+                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
+                    None
+                })
+                .await
+                .expect("ACP prompt after option change did not complete");
+                if response["id"] == 92 {
+                    assert!(response.get("error").is_none(), "{response}");
+                    break;
+                }
+            }
+            assert_eq!(received.try_recv().unwrap(), (SECOND, SPEC.into(), true));
+            assert!(received.is_empty());
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn prompt_immediately_after_new_session_is_queued() {
+        smol::block_on(async {
+            let previous_host = std::env::var_os("OLLAMA_HOST");
+            unsafe { std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1") };
+            let temp = TempDir::new().unwrap();
+            let cwd = temp.path().to_path_buf();
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let model = Model::from_spec(SPAWN_TEST_SPEC).unwrap();
+            let params = test_params(model, cwd.clone());
+            let request = serde_json::json!({
+                "params": { "cwd": cwd, "mcpServers": [] }
+            });
+
+            handle_request(
+                &mut srv,
+                "session/new",
+                RequestId::Number(82),
+                &request,
+                &params,
+            )
+            .await;
+            let new_response = out_rx.recv_async().await.unwrap();
+            assert_eq!(new_response["id"], 82);
+            let session = srv.session.as_ref().unwrap();
+            let session_id = session.handle.session_id.to_string();
+            handle_request(
+                &mut srv,
+                "session/prompt",
+                RequestId::Number(83),
+                &prompt_request(&session_id, "immediate prompt", false),
+                &params,
+            )
+            .await;
+
+            let pending = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .operation
+                .is_some();
+            assert!(pending, "immediate prompt must remain queued");
+            assert!(
+                out_rx.try_iter().all(|message| message["id"] != 83),
+                "queued prompt must not return a terminal response"
+            );
+            close_session(&mut srv).await;
+            match previous_host {
+                Some(host) => unsafe { std::env::set_var("OLLAMA_HOST", host) },
+                None => unsafe { std::env::remove_var("OLLAMA_HOST") },
+            }
+        });
+    }
+
+    #[test]
     fn completed_then_cancelled_session_can_be_replaced_and_prompted() {
         smol::block_on(async {
             let previous_host = std::env::var_os("OLLAMA_HOST");
@@ -5030,13 +5297,18 @@ mod tests {
                 Model::from_spec(OFFLINE_SPEC).unwrap(),
             );
 
-            handle_prompt(
+            let prompt_result = handle_prompt(
                 &mut srv,
                 &prompt_request(&new_id, "new primary", false),
                 &RequestId::Number(82),
             )
-            .await
-            .unwrap();
+            .await;
+            assert!(
+                prompt_result.is_ok(),
+                "prompt after provider initialization must be admitted; {}",
+                lifecycle_state(&srv)
+            );
+
             let started = std::time::Instant::now();
             let terminal = smol::future::or(
                 async {

@@ -235,7 +235,34 @@ struct ToolRef {
     transport: Arc<dyn McpTransport>,
 }
 
+#[derive(Clone)]
+pub struct McpPublishedBinding {
+    published: Arc<ArcSwap<McpPublishedState>>,
+    state: Arc<McpPublishedState>,
+}
+
+#[derive(Clone)]
+pub struct McpToolBinding {
+    qualified_name: Arc<str>,
+    raw_name: String,
+    transport: Arc<dyn McpTransport>,
+}
+
+impl McpToolBinding {
+    pub fn qualified_name(&self) -> &Arc<str> {
+        &self.qualified_name
+    }
+}
+
 struct PromptRef {
+    raw_name: String,
+    transport: Arc<dyn McpTransport>,
+    identity: Arc<()>,
+}
+
+#[derive(Clone)]
+pub struct McpPromptBinding {
+    qualified_name: String,
     raw_name: String,
     transport: Arc<dyn McpTransport>,
     identity: Arc<()>,
@@ -462,6 +489,10 @@ impl McpSession {
     /// what's left deferred, so loading tools mid-session can never flip
     /// the remainder into the context.
     pub fn extend_tools(&self, tools: &mut Value) {
+        self.extend_tools_from(&self.handle.published.load(), tools);
+    }
+
+    fn extend_tools_from(&self, state: &McpPublishedState, tools: &mut Value) {
         let Some(arr) = tools.as_array_mut() else {
             debug_assert!(false, "tools must be a JSON array");
             return;
@@ -470,7 +501,6 @@ impl McpSession {
             .iter()
             .filter_map(|t| t["name"].as_str().map(String::from))
             .collect();
-        let state = self.handle.published.load();
         let idx = &state.index;
         let defer =
             idx.descriptors.iter().filter(|d| !d.always_load).count() > self.handle.defer_tools;
@@ -505,6 +535,16 @@ impl McpSession {
     /// request; a nested one only reports the names, which the sandbox can
     /// already call.
     pub fn search_tools(&self, query: &str, origin: CallOrigin) -> Result<String, String> {
+        self.search_tools_from(&self.handle.published.load(), None, query, origin)
+    }
+
+    fn search_tools_from(
+        &self,
+        state: &McpPublishedState,
+        current: Option<&McpPublishedState>,
+        query: &str,
+        origin: CallOrigin,
+    ) -> Result<String, String> {
         let q = query.trim().to_lowercase();
         let tokens: Vec<&str> = q
             .split(|c: char| !c.is_alphanumeric())
@@ -513,12 +553,26 @@ impl McpSession {
         if tokens.is_empty() {
             return Err(SEARCH_EMPTY_QUERY.into());
         }
-        let state = self.handle.published.load();
         let idx = &state.index;
+        let current_tools = current.map(|state| &state.index.tools);
         let mut matches: Vec<(bool, usize, &ToolDescriptor)> = idx
             .descriptors
             .iter()
             .filter(|d| !d.always_load)
+            .filter(|d| {
+                current_tools.is_none_or(|tools| {
+                    tools.get(&d.qualified_name).is_some_and(|tool| {
+                        state
+                            .index
+                            .tools
+                            .get(&d.qualified_name)
+                            .is_some_and(|pinned| {
+                                tool.raw_name == pinned.raw_name
+                                    && Arc::ptr_eq(&tool.transport, &pinned.transport)
+                            })
+                    })
+                })
+            })
             .filter_map(|d| {
                 let name = d.wire_name().to_lowercase();
                 let haystack = build_haystack(&d.definition);
@@ -595,6 +649,74 @@ impl McpSession {
     /// Every published tool's wire name, deferred ones included. Whoever
     /// enumerates callable names has to see past the `tool_search` catalog that
     /// `extend_tools` hides deferred tools behind.
+    pub fn published_binding(&self) -> McpPublishedBinding {
+        McpPublishedBinding {
+            published: Arc::clone(&self.handle.published),
+            state: self.handle.published.load_full(),
+        }
+    }
+
+    pub fn published_is_current(&self, binding: &McpPublishedBinding) -> bool {
+        Arc::ptr_eq(&self.handle.published, &binding.published)
+    }
+
+    pub fn extend_bound_tools(&self, binding: &McpPublishedBinding, tools: &mut Value) {
+        self.extend_tools_from(&binding.state, tools);
+    }
+
+    pub fn search_bound_tools(
+        &self,
+        binding: &McpPublishedBinding,
+        query: &str,
+        origin: CallOrigin,
+    ) -> Result<String, String> {
+        self.search_tools_from(
+            &binding.state,
+            Some(&self.handle.published.load()),
+            query,
+            origin,
+        )
+    }
+
+    pub fn tool_bindings(&self, binding: &McpPublishedBinding) -> Vec<McpToolBinding> {
+        let state = &binding.state;
+        state
+            .index
+            .tools
+            .iter()
+            .map(|(name, tool)| McpToolBinding {
+                qualified_name: Arc::clone(name),
+                raw_name: tool.raw_name.clone(),
+                transport: Arc::clone(&tool.transport),
+            })
+            .collect()
+    }
+
+    pub fn binding_is_current(&self, binding: &McpToolBinding) -> bool {
+        let state = self.handle.published.load();
+        state
+            .index
+            .tools
+            .get(&binding.qualified_name)
+            .is_some_and(|current| {
+                current.raw_name == binding.raw_name
+                    && Arc::ptr_eq(&current.transport, &binding.transport)
+            })
+    }
+
+    pub async fn call_bound_tool(
+        &self,
+        binding: &McpToolBinding,
+        args: &Value,
+    ) -> Result<String, McpError> {
+        if !self.binding_is_current(binding) {
+            return Err(McpError::UnknownTool {
+                name: binding.qualified_name.to_string(),
+            });
+        }
+        transport::call_tool(binding.transport.as_ref(), &binding.raw_name, args).await
+    }
+
     pub fn wire_names(&self) -> Vec<String> {
         self.handle
             .published
@@ -635,6 +757,16 @@ impl McpHandle {
     /// the MCP tools.
     pub async fn ready(&self) {
         let _ = self.ready_rx.recv_async().await;
+    }
+
+    pub fn connecting_count(&self) -> usize {
+        self.published
+            .load()
+            .snapshot
+            .infos
+            .iter()
+            .filter(|info| info.status == McpServerStatus::Connecting)
+            .count()
     }
 
     pub fn reader(&self) -> McpSnapshotReader {
@@ -684,21 +816,54 @@ impl McpHandle {
         transport::call_tool(transport.as_ref(), &raw_name, args).await
     }
 
+    pub fn prompt_binding(&self, qualified_name: &str) -> Option<McpPromptBinding> {
+        let state = self.published.load();
+        let prompt = state.index.prompts.get(qualified_name)?;
+        Some(McpPromptBinding {
+            qualified_name: qualified_name.to_owned(),
+            raw_name: prompt.raw_name.clone(),
+            transport: Arc::clone(&prompt.transport),
+            identity: Arc::clone(&prompt.identity),
+        })
+    }
+
+    pub async fn get_bound_prompt(
+        &self,
+        binding: &McpPromptBinding,
+        arguments: &HashMap<String, String>,
+    ) -> Result<Vec<protocol::PromptMessage>, McpError> {
+        if !self.prompt_is_current(binding) {
+            return Err(McpError::UnknownPrompt {
+                name: binding.qualified_name.clone(),
+            });
+        }
+        transport::get_prompt(binding.transport.as_ref(), &binding.raw_name, arguments).await
+    }
+
+    pub fn prompt_is_current(&self, binding: &McpPromptBinding) -> bool {
+        self.published
+            .load()
+            .index
+            .prompts
+            .get(&binding.qualified_name)
+            .is_some_and(|prompt| {
+                Arc::ptr_eq(&prompt.identity, &binding.identity)
+                    && Arc::ptr_eq(&prompt.transport, &binding.transport)
+                    && prompt.raw_name == binding.raw_name
+            })
+    }
+
     pub async fn get_prompt(
         &self,
         qualified_name: &str,
         arguments: &HashMap<String, String>,
     ) -> Result<Vec<protocol::PromptMessage>, McpError> {
-        let (raw_name, transport) = {
-            let state = self.published.load();
-            let Some(p) = state.index.prompts.get(qualified_name) else {
-                return Err(McpError::UnknownPrompt {
-                    name: qualified_name.into(),
-                });
-            };
-            (p.raw_name.clone(), Arc::clone(&p.transport))
-        };
-        transport::get_prompt(transport.as_ref(), &raw_name, arguments).await
+        let binding =
+            self.prompt_binding(qualified_name)
+                .ok_or_else(|| McpError::UnknownPrompt {
+                    name: qualified_name.to_owned(),
+                })?;
+        self.get_bound_prompt(&binding, arguments).await
     }
 
     pub async fn shutdown(&self) {
@@ -1592,6 +1757,144 @@ mod tests {
     use test_case::test_case;
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+    #[test]
+    fn prompt_binding_rejects_replacement_before_transport_call() {
+        let session = test_support::stub_session(&[]);
+        let identity = Arc::new(());
+        let transport: Arc<dyn McpTransport> = FakeTransport::new();
+        let prompt = || PromptRef {
+            raw_name: "example".into(),
+            transport: Arc::clone(&transport),
+            identity: Arc::clone(&identity),
+        };
+        let mut first = McpPublishedState::default();
+        first.index.prompts.insert("stub.example".into(), prompt());
+        session.handle.published.store(Arc::new(first));
+        let binding = session.prompt_binding("stub.example").unwrap();
+        let mut replacement = McpPublishedState::default();
+        replacement.index.prompts.insert(
+            "stub.example".into(),
+            PromptRef {
+                raw_name: "example".into(),
+                transport,
+                identity: Arc::new(()),
+            },
+        );
+        session.handle.published.store(Arc::new(replacement));
+        assert!(!session.prompt_is_current(&binding));
+        let result = smol::block_on(session.get_bound_prompt(&binding, &HashMap::new()));
+        assert!(matches!(result, Err(McpError::UnknownPrompt { .. })));
+    }
+
+    #[test]
+    fn bound_search_survives_unrelated_publication_change() {
+        let session = test_support::stub_session(&[("stub.pinned", "pinned capability")]);
+        let published = session.published_binding();
+        let pinned = published.state.index.tools.get("stub.pinned").unwrap();
+        let mut replacement = McpPublishedState::default();
+        replacement.index.tools.insert(
+            Arc::from("stub.pinned"),
+            ToolRef {
+                raw_name: pinned.raw_name.clone(),
+                transport: Arc::clone(&pinned.transport),
+            },
+        );
+        replacement.index.tools.insert(
+            Arc::from("other.unrelated"),
+            ToolRef {
+                raw_name: "unrelated".into(),
+                transport: Arc::clone(&pinned.transport),
+            },
+        );
+        replacement.index.descriptors = Arc::from([
+            ToolDescriptor {
+                qualified_name: Arc::from("stub.pinned"),
+                always_load: false,
+                definition: json!({"name": "stub__pinned", "description": "pinned capability"}),
+            },
+            ToolDescriptor {
+                qualified_name: Arc::from("other.unrelated"),
+                always_load: false,
+                definition: json!({"name": "other__unrelated", "description": "unrelated"}),
+            },
+        ]);
+        session.handle.published.store(Arc::new(replacement));
+
+        assert!(session.published_is_current(&published));
+        let result = session
+            .search_bound_tools(&published, "pinned", CallOrigin::Model)
+            .unwrap();
+        assert!(result.contains("stub__pinned"), "got: {result}");
+        assert!(!result.contains("other__unrelated"), "got: {result}");
+
+        let mut replaced = McpPublishedState::default();
+        replaced.index.tools.insert(
+            Arc::from("stub.pinned"),
+            ToolRef {
+                raw_name: "pinned".into(),
+                transport: FakeTransport::new(),
+            },
+        );
+        replaced.index.descriptors = Arc::from([ToolDescriptor {
+            qualified_name: Arc::from("stub.pinned"),
+            always_load: false,
+            definition: json!({"name": "stub__pinned", "description": "pinned capability"}),
+        }]);
+        session.handle.published.store(Arc::new(replaced));
+        let result = session
+            .search_bound_tools(&published, "pinned", CallOrigin::Model)
+            .unwrap();
+        assert!(result.contains(SEARCH_NO_MATCH), "got: {result}");
+    }
+
+    #[test]
+    fn tool_binding_survives_unrelated_server_publication() {
+        smol::block_on(async {
+            let transport = FakeTransport::new();
+            let (mut inner, session) = setup(vec![fake_entry("pinned", transport.clone())]);
+            let published = session.published_binding();
+            let binding = session
+                .tool_bindings(&published)
+                .into_iter()
+                .find(|binding| binding.qualified_name().as_ref() == "pinned.tool")
+                .unwrap();
+
+            inner
+                .entries
+                .push(fake_entry("unrelated", FakeTransport::new()));
+            inner.generation += 1;
+            publish(&inner, &session.handle.published);
+
+            assert!(session.binding_is_current(&binding));
+            assert_eq!(
+                session.call_bound_tool(&binding, &json!({})).await.unwrap(),
+                "ok"
+            );
+        });
+    }
+
+    #[test_case(false ; "removed")]
+    #[test_case(true ; "replaced")]
+    fn published_binding_does_not_rebind(replace: bool) {
+        let session = test_support::stub_session(&[("stub.pinned", "original")]);
+        let published = session.published_binding();
+        let binding = session.tool_bindings(&published).pop().unwrap();
+        assert!(session.binding_is_current(&binding));
+        assert!(session.published_is_current(&published));
+        let replacement = if replace {
+            test_support::stub_session(&[("stub.pinned", "replacement")])
+        } else {
+            test_support::stub_session(&[])
+        };
+        session
+            .handle
+            .published
+            .store(replacement.handle.published.load_full());
+        assert!(!session.binding_is_current(&binding));
+        assert!(session.published_is_current(&published));
+    }
+
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {

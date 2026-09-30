@@ -106,7 +106,7 @@ The rules:
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.match`](#maki-match) | Fuzzy matching via nucleo, the same matcher makima's built-in pickers use. |
 | [`maki.api.mode`](#maki-api-mode) | `maki.api.mode`: define, override, list, and switch agent modes. |
-| [`maki.model`](#maki-model) | The model behind the focused session. |
+| [`maki.model`](#maki-model) | Read a tool context's model without a UI, or the focused session's |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
@@ -3385,8 +3385,9 @@ local mode = maki.api.mode.get()
 maki.api.mode.set({name})
 ```
 
-Enters a mode by name; fails when it is not defined. The UI owns the
-active mode, so this answers `(true, nil)` once the switch is requested.
+Enters a mode by name; fails when it is not defined. Success means the actor
+committed the mode for subsequent admissions, not that saving has finished.
+See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
 
@@ -3444,22 +3445,23 @@ maki.api.mode.reset("plan")
 
 ## maki.model {#maki-model}
 
-The model behind the focused session. Good for a keybind that flips
-between your two go-to models, or lifts thinking for one hard question.
-Without an interactive UI every function returns
-`nil, "no interactive UI attached"`.
+Read a tool context's model without a UI, or the focused session's
+model for a keybind. `available` and `set` require an interactive UI.
 
 ---
 
 ### `maki.model.get()` {#maki-model-get}
 
 ```lua
-maki.model.get()
+maki.model.get({ctx?})
 ```
 
-Reads the focused session's model, thinking level, and fast mode.
-`thinking` comes back in the spelling `set` accepts, so a table from here
-can go straight back in.
+Reads the model for an explicit tool context, or the focused session when
+a UI is attached. `thinking` uses the spelling `set` accepts.
+
+**Parameters:**
+
+- `{ctx?}` (`userdata|nil`) Optional tool handler context.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking, fast,
   supports_thinking, supports_fast}`, or nil and an error.
@@ -3467,7 +3469,7 @@ can go straight back in.
 **Example:**
 
 ```lua
-local m = maki.model.get()
+local m = maki.model.get(ctx)
 if m.spec ~= "anthropic/claude-opus-4-6" then ... end
 ```
 
@@ -3501,7 +3503,10 @@ maki.model.set({opts})
 
 Switches the focused session's model, thinking level, or fast mode. Fields
 you leave out stay as they are, so this doubles as a thinking-only switch.
-Answers with the new state, in the same shape `get` returns.
+Answers with the committed state, in the same shape `get` returns. Changes
+apply to subsequent admissions; saving runs asynchronously after commit.
+See [Configuration changes](/docs/modes/#configuration-changes) for save
+warnings, retry behavior, and crash limitations.
 
 **Parameters:**
 
@@ -3899,8 +3904,10 @@ local snapshot, err = maki.session.options({ session = id })
 maki.session.set_option({id}, {value}, {opts?})
 ```
 
-Sets one option explicitly for a live session. Validation, runtime adoption,
-and persistence complete before success is returned.
+Sets one option explicitly for a live session. Managed model, thinking,
+fast, and workflow changes succeed at actor commit; saving is asynchronous.
+Other options retain their existing owner and persistence behavior.
+See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
 
@@ -3970,6 +3977,8 @@ Sets the focused session's thinking mode. `mode` accepts any value
 `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 the choice is also persisted as the global default for new sessions.
+The active session changes at actor commit and is saved asynchronously.
+See [Configuration changes](/docs/modes/#configuration-changes).
 
 **Parameters:**
 

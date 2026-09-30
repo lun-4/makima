@@ -9,9 +9,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::types::EarlierRoot;
-use super::{ActorWork, RootWork, TurnAdmission};
-use crate::ExtractedCommand;
+use super::{ActorInner, ActorWork, RootWork, TurnAdmission};
 use crate::types::TurnId;
+use crate::{BatchKey, ExtractedCommand};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -87,11 +87,12 @@ impl ActorQueue {
                     return Some(ActorWork::Root(root));
                 }
                 let mut roots = vec![root];
-                while items.front().and_then(|w| match w {
-                    ActorWork::Root(r) => crate::batch_key(&r.input),
-                    _ => None,
-                }) == key
-                {
+                while items.front().is_some_and(|work| {
+                    matches!(work,
+                        ActorWork::Root(next) if next.generation == roots[0].generation
+                            && crate::batch_key(&next.input) == key
+                    )
+                }) {
                     let Some(ActorWork::Root(next)) = items.pop_front() else {
                         break;
                     };
@@ -111,10 +112,22 @@ impl ActorQueue {
                         text: r.text,
                         images: r.images,
                         correlation: r.correlation,
+                        mcp_startup_notice: r
+                            .admission
+                            .as_ref()
+                            .and_then(|admission| admission.mcp_startup_notice),
+                        already_displayed: r.displayed,
                     });
                 }
+                let notice = last
+                    .admission
+                    .as_ref()
+                    .and_then(|admission| admission.mcp_startup_notice);
                 inputs.push(last.input);
                 last.input = crate::merge_inputs(inputs).expect("at least two inputs");
+                if let Some(admission) = &mut last.admission {
+                    admission.mcp_startup_notice = notice;
+                }
                 last.earlier = earlier;
                 Some(ActorWork::Root(last))
             }
@@ -137,12 +150,9 @@ impl ActorQueue {
     }
 
     /// Removes the item at raw `index` (the same index [`snapshot`](Self::snapshot)
-    /// uses) and returns it. `None` when out of bounds.
+    /// uses) and returns it. `None` is returned for out-of-bounds indices.
     pub fn remove_at(&self, index: usize) -> Option<ActorWork> {
         let mut items = lock(&self.items);
-        if index >= items.len() {
-            return None;
-        }
         items.remove(index)
     }
 
@@ -216,8 +226,20 @@ impl ActorQueue {
         lock(&self.items).len()
     }
 
+    pub fn has_work_after_generation(&self, generation: u64) -> bool {
+        lock(&self.items).iter().any(|work| match work {
+            ActorWork::Root(root) => root.generation > generation,
+            ActorWork::Turn(turn) => turn.generation > generation,
+            ActorWork::Compact {
+                generation: queued_generation,
+                ..
+            } => *queued_generation > generation,
+            ActorWork::Control(_) => false,
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        lock(&self.items).is_empty()
     }
 
     /// Removes every item and returns them in FIFO order.
@@ -259,10 +281,22 @@ impl ActorQueue {
     /// fold into the active turn as `Interrupt`; compacts become `Compact`.
     /// Turns and controls are never popped here, so interrupt polling cannot
     /// discard incompatible FIFO entries.
-    pub(crate) fn pop_interrupt(&self) -> Option<ExtractedCommand> {
+    pub(crate) fn pop_interrupt(
+        &self,
+        generation: u64,
+        batch_key: &Option<BatchKey>,
+    ) -> Option<ExtractedCommand> {
         let mut items = lock(&self.items);
+
         match items.front() {
-            Some(ActorWork::Root(_)) | Some(ActorWork::Compact { .. }) => {}
+            Some(ActorWork::Root(root))
+                if batch_key.is_some()
+                    && root.generation == generation
+                    && crate::batch_key(&root.input).as_ref() == batch_key.as_ref() => {}
+            Some(ActorWork::Compact {
+                generation: compact_generation,
+                ..
+            }) if *compact_generation == generation => {}
             _ => return None,
         }
         match items.pop_front()? {
@@ -270,10 +304,12 @@ impl ActorQueue {
                 let key = crate::batch_key(&first.input);
                 let mut inputs = vec![first.input];
                 while key.is_some()
-                    && items.front().and_then(|w| match w {
-                        ActorWork::Root(r) => crate::batch_key(&r.input),
-                        _ => None,
-                    }) == key
+                    && items.front().is_some_and(|work| {
+                        matches!(work,
+                            ActorWork::Root(next) if next.generation == generation
+                                && crate::batch_key(&next.input) == key
+                        )
+                    })
                 {
                     let Some(ActorWork::Root(next)) = items.pop_front() else {
                         break;
@@ -301,18 +337,38 @@ impl Default for ActorQueue {
 /// turn and compacts are handled between model turns.
 #[derive(Clone)]
 pub struct InterruptQueue {
-    queue: Arc<ActorQueue>,
+    inner: Arc<ActorInner>,
+    cancellation_generation: u64,
+    policy_generation: u64,
+    batch_key: Option<BatchKey>,
 }
 
 impl InterruptQueue {
-    pub(crate) fn new(queue: Arc<ActorQueue>) -> Self {
-        Self { queue }
+    pub(crate) fn new(
+        inner: Arc<ActorInner>,
+        cancellation_generation: u64,
+        policy_generation: u64,
+        batch_key: Option<BatchKey>,
+    ) -> Self {
+        Self {
+            inner,
+            cancellation_generation,
+            policy_generation,
+            batch_key,
+        }
     }
 }
 
 impl crate::InterruptSource for InterruptQueue {
     fn poll(&self) -> Option<ExtractedCommand> {
-        self.queue.pop_interrupt()
+        let state = lock(&self.inner.state);
+        (state.cancellation_generation == self.cancellation_generation)
+            .then(|| {
+                self.inner
+                    .queue
+                    .pop_interrupt(self.policy_generation, &self.batch_key)
+            })
+            .flatten()
     }
 }
 
@@ -376,6 +432,105 @@ mod tests {
     }
 
     #[test]
+    fn root_batch_stops_at_generation_boundary() {
+        let queue = ActorQueue::new();
+        let mut old = test_root("old", 1, Vec::new());
+        old.generation = 1;
+        let mut new = test_root("new", 2, Vec::new());
+        new.generation = 2;
+        queue.push(ActorWork::Root(old));
+        queue.push(ActorWork::Root(new));
+
+        let Some(ActorWork::Root(first)) = queue.pop() else {
+            panic!("expected first root");
+        };
+        assert_eq!(first.input.message, "old");
+        assert!(first.earlier.is_empty());
+        let Some(ActorWork::Root(second)) = queue.pop() else {
+            panic!("expected second root");
+        };
+        assert_eq!(second.input.message, "new");
+        assert!(second.earlier.is_empty());
+    }
+
+    #[test]
+    fn interrupt_batch_stops_at_generation_boundary() {
+        let queue = ActorQueue::new();
+        let mut old = test_root("old", 1, Vec::new());
+        old.generation = 1;
+        let mut new = test_root("new", 2, Vec::new());
+        new.generation = 2;
+        queue.push(ActorWork::Root(old));
+        queue.push(ActorWork::Root(new));
+
+        assert!(
+            queue
+                .pop_interrupt(2, &crate::batch_key(&test_input("old")))
+                .is_none()
+        );
+        assert_eq!(queue.len(), 2);
+        let Some(ExtractedCommand::Interrupt(inputs)) =
+            queue.pop_interrupt(1, &crate::batch_key(&test_input("old")))
+        else {
+            panic!("expected interrupt");
+        };
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].message, "old");
+        let Some(ExtractedCommand::Interrupt(inputs)) =
+            queue.pop_interrupt(2, &crate::batch_key(&test_input("old")))
+        else {
+            panic!("expected next interrupt");
+        };
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].message, "new");
+    }
+
+    #[test]
+    fn interrupt_does_not_fold_roots_without_batch_keys() {
+        let queue = ActorQueue::new();
+        let mut active = test_input("active");
+        active.prompt = Some(Box::new(crate::McpPromptRef {
+            qualified_name: "server.prompt".into(),
+            arguments: Default::default(),
+        }));
+        let mut root = test_root("queued", 1, Vec::new());
+        root.input.cancel = Some(crate::CancelToken::new().1);
+        queue.push(ActorWork::Root(root));
+
+        assert!(queue.pop_interrupt(0, &crate::batch_key(&active)).is_none());
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn interrupt_does_not_fold_roots_when_active_batch_key_is_none() {
+        let queue = ActorQueue::new();
+        let mut active = test_input("active");
+        active.prompt = Some(Box::new(crate::McpPromptRef {
+            qualified_name: "server.prompt".into(),
+            arguments: Default::default(),
+        }));
+        queue.push(ActorWork::Root(test_root("plain", 1, Vec::new())));
+
+        assert!(queue.pop_interrupt(0, &crate::batch_key(&active)).is_none());
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn interrupt_rejects_same_generation_different_mode() {
+        let queue = ActorQueue::new();
+        let mut plan = test_root("plan", 1, Vec::new());
+        plan.input.mode = AgentMode::Plan("plan.md".into());
+        queue.push(ActorWork::Root(plan));
+
+        assert!(
+            queue
+                .pop_interrupt(0, &crate::batch_key(&test_input("build")))
+                .is_none()
+        );
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
     fn test_actor_preserves_images_in_condensed_burst() {
         let queue = ActorQueue::new();
         let img1 = test_image();
@@ -410,6 +565,8 @@ mod tests {
         queue.push(ActorWork::Compact {
             run_id: 2,
             instructions: None,
+            generation: 0,
+            policy: None,
         });
         queue.push(ActorWork::Root(test_root("second", 3, Vec::new())));
 

@@ -275,6 +275,17 @@ impl PluginHost {
         fs: Arc<dyn FsBackend>,
         state_dir: Option<PathBuf>,
     ) -> Result<Self, PluginError> {
+        Self::with_session_provider_preparer(registry, command_registry, jit, fs, state_dir, None)
+    }
+
+    pub fn with_session_provider_preparer(
+        registry: Arc<ToolRegistry>,
+        command_registry: CommandRegistry,
+        jit: bool,
+        fs: Arc<dyn FsBackend>,
+        state_dir: Option<PathBuf>,
+        session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
+    ) -> Result<Self, PluginError> {
         let modes = Arc::new(maki_agent::ModeRegistry::builtin());
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let session_options = SessionOptionCatalog::default();
@@ -289,6 +300,7 @@ impl PluginHost {
                 session_options: session_options.clone(),
                 state_dir,
                 fs,
+                session_provider_preparer,
             },
         )?;
         Ok(Self {
@@ -1047,12 +1059,7 @@ impl EventHandle {
     }
 
     pub fn collect_prompt_slots(&self) -> ResolvedSlots {
-        if self.shutdown.load(Ordering::Acquire) {
-            return ResolvedSlots::default();
-        }
-        let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv().unwrap_or_default()
+        self.request_prompt_slots().recv().unwrap_or_default()
     }
 
     /// Gather `@`-completion candidates from every registered source, for the
@@ -1131,13 +1138,19 @@ impl EventHandle {
         rx.recv().unwrap_or_else(|_| Ok(text.to_string()))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
-        if self.shutdown.load(Ordering::Acquire) {
-            return ResolvedSlots::default();
-        }
+    pub fn request_prompt_slots(&self) -> flume::Receiver<ResolvedSlots> {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv_async().await.unwrap_or_default()
+        if !self.shutdown.load(Ordering::Acquire) {
+            let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
+        }
+        rx
+    }
+
+    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+        self.request_prompt_slots()
+            .recv_async()
+            .await
+            .unwrap_or_default()
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
@@ -1925,6 +1938,46 @@ mod tests {
                 .map(|c| c.spec().name.as_ref())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn plugin_replacement_changes_tool_binding() {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        let names = [
+            "read",
+            "glob",
+            "grep",
+            "index",
+            "webfetch",
+            "websearch",
+            "skill",
+            "todo_write",
+            "question",
+            "plan_submit_tool",
+            "task",
+        ];
+        host.load_builtins(&PluginsConfig {
+            enabled: true,
+            names: names.iter().map(|name| (*name).into()).collect(),
+            opts: HashMap::new(),
+        })
+        .unwrap();
+        let original = registry.get("read").unwrap();
+        let unchanged = registry.get("glob").unwrap();
+        host.load_source(
+            "read",
+            r#"maki.api.register_tool({name = "read", description = "probe", schema = {type = "object", properties = {}}, handler = function() return "ok" end})"#,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(
+            &original.tool,
+            &registry.get("read").unwrap().tool
+        ));
+        assert!(Arc::ptr_eq(
+            &unchanged.tool,
+            &registry.get("glob").unwrap().tool
+        ));
     }
 
     #[test]

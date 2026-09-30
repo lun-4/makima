@@ -63,7 +63,7 @@ pub(crate) type BoxFuture<'a, T> =
 /// All methods return a boxed future so the trait stays object-safe; a
 /// backend that performs blocking I/O hops to a thread pool itself
 /// (`RealFs` uses `smol::unblock`).
-pub trait FsBackend: Send + Sync {
+pub trait FsBackend: Send + Sync + std::any::Any {
     fn read(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<String>>;
     fn read_bytes(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<Vec<u8>>>;
     fn stat(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<FsMeta>>;
@@ -460,8 +460,7 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 #[lua_fn(guard = FsWrite)]
 async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
-    let fs = backend(&lua);
-    let result = fs.write(abs, content.into_bytes()).await;
+    let result = backend(&lua).write(abs, content.into_bytes()).await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -478,8 +477,7 @@ async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>>
 #[lua_fn(guard = FsWrite)]
 async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
     let abs = make_absolute(&path)?;
-    let fs = backend(&lua);
-    let result = fs.atomic_write(abs, content.into_bytes()).await;
+    let result = backend(&lua).atomic_write(abs, content.into_bytes()).await;
     Ok(pair(result.map(|()| true)))
 }
 
@@ -698,6 +696,32 @@ mod tests {
         let read: mlua::Function = tbl.get("read").unwrap();
         let result: String = smol::block_on(read.call_async(file.to_str().unwrap())).unwrap();
         assert_eq!(result, "world");
+    }
+
+    #[test]
+    fn writes_dispatch_to_backend_without_restrictive_path_plumbing() {
+        let lua = Lua::new();
+        let fs = std::sync::Arc::new(InMemoryFs::new());
+        lua.set_app_data(FsBackendHandle(fs.clone()));
+        let table = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let write: mlua::Function = table.get("write").unwrap();
+        let atomic_write: mlua::Function = table.get("atomic_write").unwrap();
+        smol::block_on(write.call_async::<Pair<bool>>(("/ordinary.txt", FIRST_CONTENT))).unwrap();
+        smol::block_on(atomic_write.call_async::<Pair<bool>>(("/plan.md", REPLACEMENT_CONTENT)))
+            .unwrap();
+        assert_eq!(
+            fs.files(),
+            vec![
+                (
+                    PathBuf::from("/ordinary.txt"),
+                    FIRST_CONTENT.as_bytes().to_vec()
+                ),
+                (
+                    PathBuf::from("/plan.md"),
+                    REPLACEMENT_CONTENT.as_bytes().to_vec()
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -952,6 +952,8 @@ pub fn run(params: SdkParams) -> Result<()> {
             id: handle.session_id.to_string(),
             cwd: working_dir.clone(),
             model: startup_model.spec(),
+            fast: params.defaults.fast,
+            thinking: maki_agent::ThinkingConfig::from(params.defaults.thinking).to_string(),
         },
         // `set_permission_mode` can flip this mid-run, so read it per call.
         move || match shared_for_mode.lock().unwrap().permission_mode {

@@ -472,7 +472,12 @@ impl App {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
-                context_window: self.state.model.context_window,
+                context_window: if self.status == Status::Streaming {
+                    self.run_context_window
+                        .unwrap_or(self.state.model.context_window)
+                } else {
+                    self.state.model.context_window
+                },
                 show_global: self.chats.len() > 1,
             },
             auto_scroll: chat.auto_scroll(),

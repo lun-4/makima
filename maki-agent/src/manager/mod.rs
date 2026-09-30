@@ -205,6 +205,20 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
+        self.create_root_with_config(None, initial_messages, shared_messages, factory)
+    }
+
+    pub fn create_root_with_config<F, E>(
+        &self,
+        config: Option<crate::actor::EffectiveAgentConfig>,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        factory: F,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
         let agent_id = AgentId::generate();
         let reservation = {
             let mut graph = self.lock_graph();
@@ -252,6 +266,7 @@ impl AgentManagerHandle {
             initial_messages,
             shared_messages,
             backend,
+            config,
         )
     }
 
@@ -280,10 +295,51 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
+        self.validate_active(current)?;
+        let parent_mode = current.mode.clone().ok_or_else(|| {
+            ManagerError::Policy("child delegation requires a parent mode snapshot".into())
+        })?;
+        let inherited_config = current.policy_snapshot().ok_or_else(|| {
+            ManagerError::Policy("child delegation requires a parent policy snapshot".into())
+        })?;
+        let inherited_config = crate::actor::EffectiveAgentConfig::new(
+            (**inherited_config).clone(),
+            parent_mode.clone(),
+        )
+        .with_mode_def(current.mode_def.clone());
+        self.spawn_child_with_config(
+            current,
+            inherited_config,
+            metadata,
+            initial_messages,
+            shared_messages,
+            factory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_child_with_config<F, E>(
+        &self,
+        current: &CurrentManagedTurn,
+        config: crate::actor::EffectiveAgentConfig,
+        metadata: AgentMetadata,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        factory: F,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
+        self.validate_active(current)?;
+        if matches!(config.mode, crate::AgentMode::Custom(_)) && config.mode_def.is_none() {
+            return Err(ManagerError::Policy(
+                "custom mode requires a resolved definition".into(),
+            ));
+        }
         let parent_id = current.agent_id();
         let child_id = AgentId::generate();
         let reservation = {
-            self.validate_manager(current)?;
             let mut graph = self.lock_graph();
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
@@ -384,6 +440,7 @@ impl AgentManagerHandle {
             initial_messages,
             shared_messages,
             backend,
+            Some(config),
         )
     }
 
@@ -591,6 +648,7 @@ impl AgentManagerHandle {
         initial_messages: Vec<Message>,
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
+        config: Option<crate::actor::EffectiveAgentConfig>,
     ) -> Result<AgentRef, ManagerError> {
         let admission = ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id);
         let (actor, task) = AgentActorHandle::spawn_managed(
@@ -599,6 +657,7 @@ impl AgentManagerHandle {
             shared_messages,
             backend,
             admission,
+            config,
         );
         let manager = Arc::downgrade(&self.0);
         let task = smol::spawn(async move {
@@ -754,6 +813,13 @@ impl AgentManagerHandle {
         node.actor
             .clone()
             .ok_or(ManagerError::NonLiveAgent(agent_id))
+    }
+
+    pub fn effective_config(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<Arc<crate::actor::EffectiveAgentConfig>>, ManagerError> {
+        Ok(self.actor(agent_id)?.effective_config())
     }
 
     pub fn node(&self, agent_id: AgentId) -> Result<AgentNodeSnapshot, ManagerError> {
@@ -1446,17 +1512,16 @@ pub(crate) struct ManagedTurnGuard {
 
 impl Drop for ManagedTurnGuard {
     fn drop(&mut self) {
-        self.lease.close();
-        let Some(manager) = self.manager.upgrade() else {
-            return;
-        };
-        let mut graph = manager
-            .graph
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if graph.active_turns.get(&(self.agent_id, self.turn_id)) == Some(&self.nonce) {
-            graph.active_turns.remove(&(self.agent_id, self.turn_id));
+        if let Some(manager) = self.manager.upgrade() {
+            let mut graph = manager
+                .graph
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if graph.active_turns.get(&(self.agent_id, self.turn_id)) == Some(&self.nonce) {
+                graph.active_turns.remove(&(self.agent_id, self.turn_id));
+            }
         }
+        self.lease.close();
     }
 }
 
@@ -1565,8 +1630,8 @@ impl Future for ManagedExecutionFuture<'_> {
 
 impl Drop for ManagedExecutionFuture<'_> {
     fn drop(&mut self) {
-        self.lease.close();
         self.guard.take();
+        self.lease.close();
     }
 }
 
@@ -1643,6 +1708,9 @@ pub(crate) async fn enter_managed_turn(
         lease: TurnPermitLease {
             inner: Arc::clone(&lease),
         },
+        policy: None,
+        mode: None,
+        mode_def: None,
     };
     Ok((
         ManagedTurnGuard {

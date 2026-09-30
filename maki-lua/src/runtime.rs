@@ -205,6 +205,7 @@ pub enum Request {
     CallTool {
         plugin: Arc<str>,
         tool: Arc<str>,
+        generation: u64,
         input: Value,
         ctx: Box<LuaCtx>,
         deadline: Option<Instant>,
@@ -607,7 +608,7 @@ impl TaskCell {
         self
     }
 
-    fn into_handle(self) -> TaskHandle {
+    pub(crate) fn into_handle(self) -> TaskHandle {
         Arc::new(Mutex::new(self))
     }
 
@@ -1071,6 +1072,15 @@ impl TaskScope {
 /// [detached]: TaskScope::detached
 pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
     run_scoped(lua, TaskScope::detached(lua), fut).await
+}
+
+async fn run_callback<F: Future>(lua: &Lua, fut: F) -> F::Output {
+    run_scoped(
+        lua,
+        TaskScope::new(lua, TaskCell::new(CancelToken::none(), None, None)),
+        fut,
+    )
+    .await
 }
 
 /// [`run_detached`] for plugin code a host caller is blocked on, carrying every
@@ -1927,6 +1937,7 @@ async fn drain_barrier(
 }
 
 struct ToolKeys {
+    generation: u64,
     handler: RegistryKey,
     header: Option<RegistryKey>,
     restore: Option<RegistryKey>,
@@ -1938,8 +1949,6 @@ struct ToolKeys {
 
 struct PluginOwner {
     tools: HashMap<Arc<str>, ToolKeys>,
-    /// What this load granted the plugin. Kept past the load so a slot layer
-    /// can be weighed against the authority of each call it filters.
     permissions: PluginPermissions,
 }
 
@@ -3274,6 +3283,7 @@ impl LuaRuntime {
                     kind: t.kind.clone(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
+                    generation,
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
                     permission_scope_kind: t
@@ -3527,6 +3537,7 @@ impl LuaRuntime {
                 (
                     t.name,
                     ToolKeys {
+                        generation,
                         handler: t.handler_key,
                         header: t.header_key,
                         restore: t.restore_key,
@@ -3660,7 +3671,7 @@ impl LuaRuntime {
             return Some(PermissionScopes::force_prompt(input.to_string()));
         }
         let result: LuaValue =
-            match run_detached(&self.lua, func.call_async((lua_input, context))).await {
+            match run_callback(&self.lua, func.call_async((lua_input, context))).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(plugin, tool, error = %e, "permission_scopes callback failed");
@@ -3710,7 +3721,7 @@ impl LuaRuntime {
         let context = self.lua.create_table().ok()?;
         context.set("cwd", cwd.to_string_lossy().as_ref()).ok()?;
         let result: LuaValue =
-            match run_detached(&self.lua, func.call_async((lua_input, context))).await {
+            match run_callback(&self.lua, func.call_async((lua_input, context))).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(plugin, tool, error = %e, "mutable_path callback failed");
@@ -3807,7 +3818,7 @@ async fn compute_header(
         return HeaderResult::plain(tool.to_string());
     };
 
-    let result = run_detached(lua, func.call_async::<LuaValue>(input_lua)).await;
+    let result = run_callback(lua, func.call_async::<LuaValue>(input_lua)).await;
 
     match result {
         Ok(LuaValue::String(s)) => match s.to_str() {
@@ -4271,7 +4282,8 @@ async fn run_tool_start(
     live: LiveCtx,
     ctx: Box<LuaCtx>,
 ) {
-    let scope = TaskScope::new(lua, TaskCell::new(ctx.cancel.clone(), None, Some(live)));
+    let cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
+    let scope = TaskScope::new(lua, cell);
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
         let ctx_ud = lua.create_userdata(*ctx)?;
@@ -4290,6 +4302,7 @@ async fn run_tool_call(
     lua: Lua,
     plugin: Arc<str>,
     tool: Arc<str>,
+    generation: u64,
     input: Value,
     mut ctx: Box<LuaCtx>,
     deadline: Option<Instant>,
@@ -4307,8 +4320,11 @@ async fn run_tool_call(
         let Some(tool_keys) = owner.tools.get(&*tool) else {
             return ToolCallReply::err(format!("tool not found: {tool}"));
         };
+        if tool_keys.generation != generation {
+            return ToolCallReply::err(format!("tool binding changed: {tool}"));
+        }
         match lua.registry_value(&tool_keys.handler) {
-            Ok(f) => f,
+            Ok(handler) => handler,
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
         }
     };
@@ -4507,6 +4523,7 @@ pub struct SpawnConfig {
     pub plugin_rules: Arc<PluginRuleStore>,
     pub state_dir: Option<PathBuf>,
     pub fs: Arc<dyn FsBackend>,
+    pub session_provider_preparer: Option<crate::api::agent::SessionProviderPreparer>,
 }
 
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
@@ -4521,6 +4538,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
         plugin_rules,
         state_dir,
         fs,
+        session_provider_preparer,
     } = config;
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
@@ -4582,6 +4600,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                 fs,
             ) {
                 Ok(r) => {
+                    if let Some(prepare) = session_provider_preparer {
+                        r.lua.set_app_data(prepare);
+                    }
                     let _ = init_tx.send(Ok(()));
                     r
                 }
@@ -4743,6 +4764,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::CallTool {
                             plugin,
                             tool,
+                            generation,
                             input,
                             ctx,
                             deadline,
@@ -4775,6 +4797,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         lua.clone(),
                                         plugin,
                                         tool,
+                                        generation,
                                         input,
                                         ctx,
                                         deadline,
@@ -5131,8 +5154,8 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         } => {
                             let func = {
                                 let plugins = rt.plugins.borrow();
-                                plugins
-                                    .get(&*plugin)
+                                let owner = plugins.get(&*plugin);
+                                owner
                                     .and_then(|p| p.tools.get(&*tool))
                                     .and_then(|tk| tk.start.as_ref())
                                     .and_then(|key| rt.lua.registry_value::<Function>(key).ok())
@@ -5148,8 +5171,18 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     true => None,
                                     false => Some(g.acquire().await),
                                 };
-                                covered(slot, run_tool_start(&lua, func, &tool, input, live, ctx))
-                                    .await;
+                                covered(
+                                    slot,
+                                    run_tool_start(
+                                        &lua,
+                                        func,
+                                        &tool,
+                                        input,
+                                        live,
+                                        ctx,
+                                    ),
+                                )
+                                .await;
                                 let _ = reply.send(());
                             })
                             .detach();

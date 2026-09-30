@@ -85,6 +85,12 @@ impl AgentRef {
         self.manager.node(self.agent_id)
     }
 
+    pub fn effective_config(
+        &self,
+    ) -> Result<Option<Arc<crate::actor::EffectiveAgentConfig>>, super::ManagerError> {
+        self.manager.effective_config(self.agent_id)
+    }
+
     pub fn cancel(&self) -> Result<(), super::ManagerError> {
         self.manager.cancel_agent(self.agent_id)
     }
@@ -104,6 +110,9 @@ pub struct ShutdownReport {
 pub struct CurrentManagedTurn {
     pub(crate) token: ManagedTurnToken,
     pub(crate) lease: TurnPermitLease,
+    pub(crate) policy: Option<Arc<crate::RunSettings>>,
+    pub(crate) mode: Option<crate::AgentMode>,
+    pub(crate) mode_def: Option<crate::ModeDef>,
 }
 
 impl CurrentManagedTurn {
@@ -113,6 +122,14 @@ impl CurrentManagedTurn {
 
     pub fn turn_id(&self) -> TurnId {
         self.token.turn_id
+    }
+
+    pub fn policy_snapshot(&self) -> Option<&Arc<crate::RunSettings>> {
+        self.policy.as_ref()
+    }
+
+    pub fn mode_definition(&self) -> Option<&crate::ModeDef> {
+        self.mode_def.as_ref()
     }
 
     pub fn node_snapshot(&self) -> Result<AgentNodeSnapshot, super::ManagerError> {
@@ -129,6 +146,24 @@ impl CurrentManagedTurn {
         self.token
             .manager
             .spawn_child(self, metadata, initial_messages, shared_messages, backend)
+    }
+
+    pub fn spawn_child_with_config(
+        &self,
+        config: crate::actor::EffectiveAgentConfig,
+        metadata: AgentMetadata,
+        initial_messages: Vec<maki_providers::Message>,
+        shared_messages: Option<crate::SharedMessages>,
+        backend: Box<dyn crate::ActorBackend>,
+    ) -> Result<AgentRef, super::ManagerError> {
+        self.token.manager.spawn_child_with_config(
+            self,
+            config,
+            metadata,
+            initial_messages,
+            shared_messages,
+            |_| Ok::<_, String>(backend),
+        )
     }
 
     pub fn lease(&self) -> TurnPermitLease {

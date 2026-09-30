@@ -161,7 +161,7 @@ impl QueueSender {
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).len(),
-            QueueBackend::Actor(actor) => actor.snapshot().queued,
+            QueueBackend::Actor(actor) => actor.snapshot().queue.len(),
         }
     }
 

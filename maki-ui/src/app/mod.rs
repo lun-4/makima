@@ -68,7 +68,7 @@ use crossterm::event::{
 };
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
+    AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
     SharedMessages, SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
@@ -118,7 +118,6 @@ const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
 const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
 const FAST_UNSUPPORTED_MSG: &str = maki_agent::command::FAST_UNSUPPORTED;
-pub(crate) const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
@@ -219,11 +218,20 @@ pub(crate) fn turn_response(message: &Message) -> Option<String> {
     )
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum TaskIdentity {
+    Main,
+    Agent(AgentId),
+    Restored(String),
+    Unidentified(usize),
+}
+
 #[derive(Clone)]
 pub(super) struct TaskEntry {
     name: String,
     finished: Option<bool>,
     chat_index: usize,
+    identity: TaskIdentity,
     /// First `SNIPPET_CHARS` of the subagent chat's last message, shown dimly.
     snippet: String,
     context: String,
@@ -379,6 +387,7 @@ pub struct App {
     /// turn; this is what lets the status bar say so instead of showing a name
     /// the running turn is not using.
     pub(crate) run_model: Option<String>,
+    pub(crate) run_context_window: Option<u32>,
     pub(super) retry_info: Option<RetryInfo>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
@@ -541,6 +550,7 @@ impl App {
             pending_input: PendingInput::None,
             run_id: 0,
             run_model: None,
+            run_context_window: None,
             retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
@@ -694,15 +704,6 @@ impl App {
         }
         self.state.set_fast(fast);
         Ok(())
-    }
-
-    pub(crate) fn model_state(&self) -> serde_json::Value {
-        let model = &self.state.model;
-        serde_json::json!({
-            "spec": model.spec(), "id": model.id, "provider": model.provider.to_string(),
-            "thinking": self.state.thinking.to_string(), "fast": self.state.fast,
-            "supports_thinking": model.supports_thinking(), "supports_fast": model.supports_fast(),
-        })
     }
 
     pub(crate) fn attention(&self) -> Option<Notification> {
@@ -905,6 +906,15 @@ impl App {
                 name: chat.name.clone(),
                 finished: (chat_index > 0).then_some(chat.is_finished()),
                 chat_index,
+                identity: if chat_index == 0 {
+                    TaskIdentity::Main
+                } else if let Some(agent_id) = chat.agent_id {
+                    TaskIdentity::Agent(agent_id)
+                } else if let Some(subagent_id) = &chat.subagent_id {
+                    TaskIdentity::Restored(subagent_id.clone())
+                } else {
+                    TaskIdentity::Unidentified(chat_index)
+                },
                 snippet: if chat_index == 0 {
                     String::new()
                 } else {
@@ -940,12 +950,36 @@ impl App {
         let selected = self
             .task_picker
             .selected_item()
-            .map(|entry| entry.chat_index);
-        self.task_picker.replace_items(self.task_entries());
-        if let Some(chat_index) = selected {
+            .map(|entry| entry.identity.clone());
+        let previous = self
+            .task_picker
+            .items()
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| entry.identity.clone())
+            .collect::<Vec<_>>();
+        self.task_picker.replace_items_preserving_order(
+            Self::reconcile_task_entries(&previous, self.task_entries()),
+            |previous, current| previous.identity == current.identity,
+        );
+        if let Some(identity) = selected {
             self.task_picker
-                .select_item_by(|entry| entry.chat_index == chat_index);
+                .select_item_by(|entry| entry.identity == identity);
         }
+    }
+
+    fn reconcile_task_entries(
+        previous: &[TaskIdentity],
+        mut current: Vec<TaskEntry>,
+    ) -> Vec<TaskEntry> {
+        let mut ordered = Vec::with_capacity(current.len());
+        for identity in previous {
+            if let Some(index) = current.iter().position(|entry| &entry.identity == identity) {
+                ordered.push(current.remove(index));
+            }
+        }
+        ordered.extend(current);
+        ordered
     }
 
     fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
@@ -1844,6 +1878,9 @@ impl App {
             && let AgentEvent::ModelSwitched { spec } = &envelope.event
         {
             self.run_model = Some(spec.clone());
+            if let Ok(model) = maki_providers::Model::from_spec(spec) {
+                self.run_context_window = Some(model.context_window);
+            }
             return vec![];
         }
 
@@ -2094,9 +2131,23 @@ impl App {
         };
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
 
-        if let ChatEventResult::QueueItemConsumed { text, images } = result {
+        if let ChatEventResult::QueueItemConsumed {
+            text,
+            images,
+            mcp_startup_notice,
+            already_displayed,
+        } = result
+        {
             if chat_idx == 0 {
-                self.on_queue_item_consumed(text, images);
+                let notice = mcp_startup_notice.map(|count| {
+                    format!("{count} MCP servers are not ready; no MCP tools exposed")
+                });
+                if !already_displayed {
+                    self.chats[chat_idx].show_user_message_with_notice(text, images, notice);
+                } else if let Some(notice) = notice {
+                    self.chats[chat_idx].annotate_last_user_message(notice);
+                }
+                self.status = Status::Streaming;
             }
             return vec![];
         }
@@ -2402,7 +2453,11 @@ impl App {
                 return;
             }
         };
-        self.flash(message.into());
+        if self.status == Status::Streaming && matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID) {
+            self.flash(format!("{id} applies when this turn finishes"));
+        } else {
+            self.flash(message.into());
+        }
     }
 
     pub(crate) fn execute_host_request(
@@ -3258,12 +3313,16 @@ impl App {
             return actions;
         }
 
-        self.plan_form.reset();
-        self.state.plan = PlanState::None;
-        self.state.mode = Mode::Build;
+        let implement_action = Action::ImplementPlan(text);
         if let Some((content, path)) = plan_snapshot {
             self.main_chat().push(DisplayMessage::plan(content, path));
         }
+        vec![implement_action]
+    }
+
+    pub(crate) fn start_plan_implementation(&mut self, text: String) -> Vec<Action> {
+        self.plan_form.reset();
+        self.state.plan = PlanState::None;
         self.start_from_queue(&QueuedMessage {
             text,
             images: vec![],

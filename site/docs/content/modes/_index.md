@@ -17,11 +17,20 @@ modes do, and how a Lua plugin defines a new mode or overrides a built-in one.
 Tab toggles between them (build is the default).
 
 - **build `[BUILD]`** - the default. Full toolset, no restrictions.
-- **plan `[PLAN]`** - analyse and plan. Writes are locked to a single plan
-  file, and the model gets a directive telling it never to touch anything else.
+- **plan `[PLAN]`** - analyse and plan. The mode names one plan file as its
+  intended write target, and the model gets a directive not to change other files.
 
-Switching to plan mode allocates a plan file under `plans/`. The `write` and
-`edit` tools only allow edits to that file while in plan mode.
+Switching to plan mode allocates a plan file under `plans/`. Native write and edit tools can change only the designated plan file. The host checks normalized target paths, including arguments changed by input hooks. A custom mode can explicitly offer third-party local tools; tool origin does not determine whether a mode offers them. MCP execution and deferred MCP search remain unavailable in write-restricted modes, even with YOLO enabled.
+
+A mode is not a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and are not restricted to the plan path. Tool selection and native write-target checks do not constrain every effect of a selected plugin.
+
+## Configuration changes
+
+Managed TUI roots and Lua agent sessions own their model, thinking, fast, workflow, and mode configuration. Changes apply in order to later admitted work. An active or already admitted turn retains its provider, settings, resolved mode definition, prompt inputs, and tool bindings. A mode registry change does not replace the definition captured for that turn. Selecting an undefined custom mode fails.
+
+A successful managed setter means the actor committed the change. Session saving runs asynchronously and does not block admission. If saving fails, the committed configuration remains active and a warning reports that the configuration was applied but not saved. The storage writer retains the latest committed snapshot for retry. A successful retry clears the pending-save condition. A crash before saving can lose the latest configuration change.
+
+Headless, print, and ACP execution retain their existing frontend-owned initialization and configuration paths. They do not yet use the managed actor execution loop. YOLO and plugin options retain their existing owners; YOLO changes affect permission checks immediately.
 
 ## What a mode is
 
@@ -30,8 +39,7 @@ Under the hood a mode is a definition in a shared registry:
 - **name** (`"build"`, `"plan"`, or a custom id) and a **label** for the badge.
 - **system_prompt** - a snippet appended to the system prompt, like the plan
   directive. `{plan_path}` and the other prompt variables are filled in.
-- **restrict_write_to** (optional) - when set, every non-matching write is
-  blocked, exactly like the plan-file-only rule.
+- **restrict_write_to** (optional) - names the only write target for bundled native write and edit tools. The host compares normalized path keys before allowing those tools to write. Lua filesystem writes are not restricted to this path; they require the plugin's `fs_write` permission.
 - **tools** (optional) - when set, the model sees *only* this exact toolset for
   that mode. When absent, the mode inherits the default (build) set. This is how
   a tool like `plan_submit` exists only while you are in plan mode.
@@ -102,9 +110,9 @@ maki.setup({
 - `mode_plan_override` replaces the built-in `plan` mode with a verbatim clone
   of polytoken's plan directive (via the `plan` plugin override). It focuses
   the model on producing a reviewable artifact, restricts writes to the plan
-  file, swaps the toolset to read tools plus `webfetch`,
-  `write`/`edit`/`plan_submit`, and adds
-  `/plan` and `/build` slash commands. The directive and the plan reviewer splice
+  file, swaps the toolset to `read`, `grep`, `glob`, `webfetch`, `write`,
+  `edit`, `plan_submit`, and `task`, and adds `/plan` and `/build` slash commands.
+  The directive and the plan reviewer splice
   one shared plan specification, so both always see the exact same document.
 - `plan_submit_tool` is a mode-scoped tool: it prints the finished plan inline
   as a **display-only** message (kept out of your context) and surfaces the plan

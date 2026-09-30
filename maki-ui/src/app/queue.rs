@@ -1,6 +1,6 @@
 //! Queue for messages typed while the agent is busy.
 
-use maki_agent::{AgentInput, ImageSource};
+use maki_agent::AgentInput;
 
 use super::{Action, App, Status};
 
@@ -261,11 +261,6 @@ impl App {
     /// queue items start runs without `start_run`, so this is where the app
     /// learns the agent is busy. Immediate-dispatch items skip this event,
     /// so no dedup needed.
-    pub(super) fn on_queue_item_consumed(&mut self, text: String, images: Vec<ImageSource>) {
-        self.status = Status::Streaming;
-        self.main_chat().show_user_message(text, images);
-    }
-
     /// Immediate path: kick off the agent and draw the bubble in the same
     /// frame, so the user sees their message land where it will stay.
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
@@ -298,6 +293,7 @@ impl App {
         // The turn runs on whatever the model is now; a change after this
         // point lands on the next turn.
         self.run_model = Some(self.state.session.model.clone());
+        self.run_context_window = Some(self.state.model.context_window);
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()

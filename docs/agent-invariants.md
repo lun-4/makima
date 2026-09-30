@@ -32,7 +32,7 @@ This checklist describes current correctness requirements. A change that intenti
 20. Root input folded by `InterruptSource` belongs to the active turn. It must not create another ticket, retained outcome, or terminal event.
 21. Controls and compaction are not turns. They have no `TurnId`, no managed turn admission, and no retained `TurnOutcome`.
 22. `AgentInput` has one ownership transfer from queue to backend. Do not clone input payloads to avoid fixing ownership or lifetime design.
-23. Each actor has one FIFO scheduling queue. UI queue projections and interrupt extraction must read and mutate that same queue, not a shadow deque.
+23. Each actor orders configuration and admission through one operation FIFO and executes materialized work through its execution queue. UI queue projections and interrupt extraction must use actor-owned work, not a shadow deque.
 24. Queue-empty publication must linearize with concurrent push so `QueueDrained` cannot race ahead of newly accepted work.
 
 ## Cancellation and closure

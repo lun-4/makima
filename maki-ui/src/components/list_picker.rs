@@ -452,6 +452,40 @@ impl<T: PickerItem> ListPicker<T> {
         }
     }
 
+    pub fn replace_items_preserving_order(
+        &mut self,
+        items: Vec<T>,
+        same_item: impl Fn(&T, &T) -> bool,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let previous_visible = state.filtered().to_vec();
+        let previous_items = mem::replace(&mut state.items, items);
+        let query = state.search.value();
+        let filtered = state.build_filter(&query);
+        let mut matches: Vec<_> = filtered
+            .filtered
+            .into_iter()
+            .zip(filtered.match_indices)
+            .collect();
+        matches.sort_by_key(|(index, _)| {
+            previous_visible
+                .iter()
+                .position(|previous| same_item(&previous_items[*previous], &state.items[*index]))
+                .unwrap_or(usize::MAX)
+        });
+        let (filtered, match_indices) = matches.into_iter().unzip();
+        state.publication.commit_sync(
+            query,
+            FilteredItems {
+                filtered,
+                match_indices,
+            },
+        );
+        state.clamp_selection();
+    }
+
     pub fn replace_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>) {
         if let Some(s) = self.state.as_mut() {
             s.enabled = Some(enabled);
@@ -620,6 +654,10 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn item(&self, idx: usize) -> Option<&T> {
         self.state.as_ref().and_then(|s| s.items.get(idx))
+    }
+
+    pub fn items(&self) -> Option<&[T]> {
+        self.state.as_ref().map(|s| s.items.as_slice())
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
@@ -1273,6 +1311,34 @@ mod tests {
         p.open(entries(&["axxapp", "apple"]), " Test ");
         set_query(&mut p, "app");
         assert_eq!(ready_state(&p).filtered(), vec![1, 0]);
+    }
+
+    #[test_case(false, &[1, 0]; "default_refresh_reranks")]
+    #[test_case(true, &[0, 1]; "stable_refresh_appends")]
+    fn refresh_ordering_is_opt_in(preserve_order: bool, expected: &[usize]) {
+        let mut picker = ListPicker::new();
+        picker.open(entries(&["apple"]), " Test ");
+        set_query(&mut picker, "app");
+        let replacement = entries(&["apple", "app"]);
+        if preserve_order {
+            picker.replace_items_preserving_order(replacement, |a, b| a.label == b.label);
+        } else {
+            picker.replace_items(replacement);
+        }
+        assert_eq!(ready_state(&picker).filtered(), expected);
+    }
+
+    #[test]
+    fn stable_refresh_remaps_survivors_after_source_removal() {
+        let mut picker = ListPicker::new();
+        picker.open(entries(&["apple", "app", "application"]), " Test ");
+        set_query(&mut picker, "app");
+        picker.replace_items_preserving_order(
+            entries(&["application", "apple", "appended"]),
+            |a, b| a.label == b.label,
+        );
+        assert_eq!(ready_state(&picker).filtered(), &[1, 0, 2]);
+        assert_eq!(picker.selected_item().unwrap().label, "apple");
     }
 
     #[test]

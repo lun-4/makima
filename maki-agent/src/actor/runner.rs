@@ -70,7 +70,6 @@ pub(super) struct Runner {
     queue: Arc<ActorQueue>,
     notify: flume::Receiver<()>,
     wake: Arc<WakeFlag>,
-    interrupt: Arc<dyn InterruptSource>,
 }
 
 impl Runner {
@@ -82,8 +81,6 @@ impl Runner {
     ) -> Self {
         let queue = Arc::clone(&inner.queue);
         let notify = queue.take_notify_rx();
-        let interrupt: Arc<dyn InterruptSource> =
-            Arc::new(InterruptQueue::new(Arc::clone(&inner.queue)));
         Self {
             inner,
             history,
@@ -91,7 +88,6 @@ impl Runner {
             queue,
             notify,
             wake,
-            interrupt,
         }
     }
 
@@ -164,9 +160,17 @@ impl Runner {
             ActorWork::Compact {
                 run_id,
                 instructions,
+                generation,
+                policy,
             } => {
-                self.run_compact(run_id, instructions.as_deref(), cancellation_generation)
-                    .await
+                self.run_compact(
+                    run_id,
+                    instructions.as_deref(),
+                    generation,
+                    policy,
+                    cancellation_generation,
+                )
+                .await
             }
         }
     }
@@ -261,7 +265,18 @@ impl Runner {
             )
             .await
             {
-                Ok((guard, current)) => (Some(guard), Some(current)),
+                Ok((guard, mut current)) => {
+                    current.policy = admission
+                        .policy
+                        .as_ref()
+                        .map(|config| Arc::new(config.settings.clone()));
+                    current.mode = admission.policy.as_ref().map(|config| config.mode.clone());
+                    current.mode_def = admission
+                        .policy
+                        .as_ref()
+                        .and_then(|config| config.mode_def.clone());
+                    (Some(guard), Some(current))
+                }
                 Err(reason) => {
                     if admission.root {
                         self.settle_turn(&admission, None, false);
@@ -282,8 +297,16 @@ impl Runner {
                 cancel: plain,
                 cancel_reason: reasoned.clone(),
                 correlation: admission.correlation.clone(),
-                interrupt: Some(Arc::clone(&self.interrupt)),
+                generation: admission.generation,
+                policy: admission.policy.clone(),
+                interrupt: Some(Arc::new(InterruptQueue::new(
+                    Arc::clone(&self.inner),
+                    popped_generation,
+                    admission.generation,
+                    admission.input.as_ref().and_then(crate::batch_key),
+                )) as Arc<dyn InterruptSource>),
                 managed_turn: managed_turn.clone(),
+                admission: admission.admission.clone(),
             },
             admission.input.take().expect("turn input taken once"),
             work,
@@ -337,12 +360,19 @@ impl Runner {
     /// idle: a root popped during an active turn is folded by the interrupt
     /// source into the active run, so no orphan [`TurnId`] exists here.
     async fn run_root(&mut self, root: RootWork, cancellation_generation: u64) {
+        let mcp_startup_notice = root
+            .admission
+            .as_ref()
+            .and_then(|admission| admission.mcp_startup_notice);
         let admission = TurnAdmission {
             turn_id: TurnId::generate(),
             input: Some(root.input),
             event_sender: None,
             correlation: root.correlation,
             root: true,
+            generation: root.generation,
+            policy: root.policy,
+            admission: root.admission,
             ticket: super::tickets::TurnTicket::new_anonymous(Arc::clone(&self.inner.identity)),
         };
         self.run_turn(
@@ -353,6 +383,8 @@ impl Runner {
                 text: root.text,
                 images: root.images,
                 earlier: root.earlier,
+                mcp_startup_notice,
+                already_displayed: root.displayed,
             },
             cancellation_generation,
         )
@@ -391,8 +423,11 @@ impl Runner {
                     cancel: plain,
                     cancel_reason: reasoned,
                     correlation: control.correlation.clone(),
+                    generation: 0,
+                    policy: None,
                     interrupt: None,
                     managed_turn: None,
+                    admission: None,
                 },
                 &control,
             )
@@ -414,6 +449,8 @@ impl Runner {
         &mut self,
         run_id: u64,
         instructions: Option<&str>,
+        policy_generation: u64,
+        policy: Option<Arc<super::EffectiveAgentConfig>>,
         popped_generation: u64,
     ) {
         // Consumed: retire any precancel mark for this run_id's canonical
@@ -443,8 +480,11 @@ impl Runner {
                     cancel: plain,
                     cancel_reason: reasoned,
                     correlation: correlation.clone(),
+                    generation: policy_generation,
+                    policy,
                     interrupt: None,
                     managed_turn: None,
+                    admission: None,
                 },
                 instructions,
             )

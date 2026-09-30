@@ -38,6 +38,8 @@ pub enum ChatEventResult {
     QueueItemConsumed {
         text: String,
         images: Vec<ImageSource>,
+        mcp_startup_notice: Option<usize>,
+        already_displayed: bool,
     },
     Error(String),
     PermissionRequest {
@@ -161,8 +163,18 @@ impl Chat {
             AgentEvent::CompactionDone { .. } => {
                 self.messages_panel.flush();
             }
-            AgentEvent::QueueItemConsumed { text, images } => {
-                return ChatEventResult::QueueItemConsumed { text, images };
+            AgentEvent::QueueItemConsumed {
+                text,
+                images,
+                mcp_startup_notice,
+                already_displayed,
+            } => {
+                return ChatEventResult::QueueItemConsumed {
+                    text,
+                    images,
+                    mcp_startup_notice,
+                    already_displayed,
+                };
             }
             // The app tracks the running model to show a queued switch; the
             // chat panel has nothing to render for it.
@@ -446,12 +458,23 @@ impl Chat {
     /// Flush, push, and re-pin scroll in one shot to avoid
     /// the one-frame hop where the bubble briefly lands in the wrong row.
     pub fn show_user_message(&mut self, text: impl Into<String>, images: Vec<ImageSource>) {
+        self.show_user_message_with_notice(text, images, None);
+    }
+
+    pub fn annotate_last_user_message(&mut self, notice: String) {
+        self.messages_panel.annotate_last_user_message(notice);
+    }
+
+    pub fn show_user_message_with_notice(
+        &mut self,
+        text: impl Into<String>,
+        images: Vec<ImageSource>,
+        notice: Option<String>,
+    ) {
         self.flush();
-        self.messages_panel.push(DisplayMessage::with_images(
-            DisplayRole::User,
-            text.into(),
-            images,
-        ));
+        let mut message = DisplayMessage::with_images(DisplayRole::User, text.into(), images);
+        message.annotation = notice;
+        self.messages_panel.push(message);
         self.enable_auto_scroll();
     }
 
@@ -847,10 +870,12 @@ mod tests {
             AgentEvent::QueueItemConsumed {
                 text: String::new(),
                 images: vec![image()],
+                mcp_startup_notice: None,
+                already_displayed: false,
             },
             None,
         );
-        let ChatEventResult::QueueItemConsumed { text, images } = result else {
+        let ChatEventResult::QueueItemConsumed { text, images, .. } = result else {
             panic!("{EXPECTED_QUEUE_DELIVERY}");
         };
         chat.show_user_message(text, images);

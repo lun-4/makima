@@ -374,14 +374,38 @@ async fn options(
         Ok(coordinator) => coordinator,
         Err(error) => return Ok(err_pair(error)),
     };
-    Ok((
-        Some(snapshot_table(&lua, &coordinator.read().options())?),
-        None,
-    ))
+    let snapshot = snapshot_table(&lua, &coordinator.read().options())?;
+    if let Some(tx) = tx {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        if let Err(error) = tx.send(UiAction::Session {
+            req: SessionRequest::Options {
+                session: coordinator.session_id().to_string(),
+            },
+            reply_tx,
+        }) {
+            return Ok(err_pair(error));
+        }
+        let values = match reply_rx.recv_async().await {
+            Ok(Ok(values)) => values,
+            Ok(Err(error)) => return Ok(err_pair(error)),
+            Err(error) => return Ok(err_pair(error)),
+        };
+        let options: Table = snapshot.get("options")?;
+        for option in options.sequence_values::<Table>() {
+            let option = option?;
+            let id: String = option.get("id")?;
+            if let Some(value) = values.get(&id).and_then(serde_json::Value::as_str) {
+                option.set("current_value", value)?;
+            }
+        }
+    }
+    Ok((Some(snapshot), None))
 }
 
-/// Sets one option explicitly for a live session. Validation, runtime adoption,
-/// and persistence complete before success is returned.
+/// Sets one option explicitly for a live session. Managed model, thinking,
+/// fast, and workflow changes succeed at actor commit; saving is asynchronous.
+/// Other options retain their existing owner and persistence behavior.
+/// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param id string Stable option id.
 /// @param value string Selectable value id.
@@ -412,6 +436,25 @@ async fn set_option(
         && let Err(error) = validate_option_value(&lua, option, &value)
     {
         return Ok(err_pair(error));
+    }
+    if let Some(tx) = tx {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        if let Err(error) = tx.send(UiAction::Session {
+            req: SessionRequest::SetOption {
+                session: coordinator.session_id().to_string(),
+                id,
+                value,
+                version: snapshot.version,
+            },
+            reply_tx,
+        }) {
+            return Ok(err_pair(error));
+        }
+        return match reply_rx.recv_async().await {
+            Ok(Ok(_)) => Ok((Some(true), None)),
+            Ok(Err(error)) => Ok(err_pair(error)),
+            Err(_) => Ok(err_pair("ui dropped the option update")),
+        };
     }
     match coordinator
         .set_option_if_version(id, value, Some(snapshot.version))
@@ -457,6 +500,8 @@ async fn thinking(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 /// `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 /// level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 /// the choice is also persisted as the global default for new sessions.
+/// The active session changes at actor commit and is saved asynchronously.
+/// See [Configuration changes](/docs/modes/#configuration-changes).
 ///
 /// @param opts table Required fields: mode (string) the thinking setting;
 ///   set_default (boolean) also persist as the default for new sessions.
@@ -674,17 +719,38 @@ mod tests {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let session_id = id.to_string();
+        let responder_coordinator = coordinator.clone();
         let responder = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let Ok(UiAction::Session {
-                    req: SessionRequest::Current,
-                    reply_tx,
-                }) = rx.recv()
-                else {
-                    panic!("expected current-session request");
-                };
-                reply_tx.send(Ok(json!(session_id))).unwrap();
-            }
+            let Ok(UiAction::Session {
+                req: SessionRequest::Current,
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected current-session request");
+            };
+            reply_tx.send(Ok(json!(session_id))).unwrap();
+            let Ok(UiAction::Session {
+                req:
+                    SessionRequest::SetOption {
+                        session: target,
+                        id,
+                        value,
+                        version,
+                    },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected option update request");
+            };
+            assert_eq!(target, session_id);
+            let result = smol::block_on(responder_coordinator.set_option_if_version(
+                id,
+                value,
+                Some(version),
+            ))
+            .map(|_| json!(true))
+            .map_err(|error| error.to_string());
+            reply_tx.send(result).unwrap();
         });
 
         let (ok, error): (bool, Option<String>) = smol::block_on(
@@ -695,15 +761,15 @@ mod tests {
         assert!(ok);
         assert_eq!(error, None);
 
-        let (snapshot, error): (Table, Option<String>) =
-            smol::block_on(lua.load("return session.options()").eval_async()).unwrap();
-        assert_eq!(error, None);
-        let yolo = snapshot
-            .get::<Table>("options")
-            .unwrap()
-            .get::<Table>(2)
-            .unwrap();
-        assert_eq!(yolo.get::<String>("current_value").unwrap(), "enabled");
+        assert!(
+            coordinator
+                .read()
+                .options()
+                .options
+                .iter()
+                .any(|option| option.definition.id.as_ref() == "yolo"
+                    && option.current_value.as_ref() == "enabled")
+        );
         responder.join().unwrap();
         smol::block_on(coordinator.close()).unwrap();
     }

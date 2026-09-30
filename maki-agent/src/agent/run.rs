@@ -22,6 +22,7 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{
     Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
+    TurnToolBindings,
 };
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentId, AgentInput, AgentMode, DoneReason, EventSender,
@@ -86,12 +87,30 @@ fn filter_tools(all: &Value, allowed: &[String]) -> Value {
     )
 }
 
-/// Rebuilds a run's base tool schema for a model and workflow flag. The
-/// schema belongs to the frontend, so a run that can be reconfigured has to be
-/// handed the means to rebuild it.
-pub type ToolBuilder = Arc<dyn Fn(&Model, bool) -> RequestTools + Send + Sync>;
+#[derive(Clone)]
+pub struct TurnAdmissionSnapshot {
+    pub mode_def: Option<Arc<crate::ModeDef>>,
+    pub bindings: Arc<TurnToolBindings>,
+    pub prompt_inputs: Option<Arc<TurnPromptInputs>>,
+    pub mcp_startup_notice: Option<usize>,
+}
 
-/// What a run should use from its next request onward.
+#[derive(Clone)]
+pub struct TurnPromptInputs {
+    pub cwd: PathBuf,
+    pub instructions: super::instructions::Instructions,
+    pub mcp_prompt: Option<crate::mcp::McpPromptBinding>,
+    pub resolved: Option<flume::Receiver<Result<ResolvedPromptInputs, String>>>,
+}
+
+#[derive(Clone)]
+pub struct ResolvedPromptInputs {
+    pub slots: Arc<crate::prompt::ResolvedSlots>,
+    pub mcp_messages: Option<Vec<Message>>,
+}
+
+/// The settings captured at the start of a run.
+#[derive(Clone)]
 pub struct RunSettings {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
@@ -100,61 +119,7 @@ pub struct RunSettings {
     pub thinking: ThinkingConfig,
 }
 
-/// Supplies [`RunSettings`] between requests. A frontend that lets a session
-/// be reconfigured while a run is in flight provides one, so a change lands on
-/// the next inference rather than the next turn.
-pub trait RunSettingsSource: Send + Sync {
-    /// `None` while the source cannot answer yet, which reads as "no change".
-    fn current(&self) -> Option<RunSettings>;
-}
-
-/// Layers a session's option values over a [`ModelSource`]. The coordinator
-/// owns `fast` and `workflow`, so reading them here keeps one authority rather
-/// than mirroring them into a second place.
-pub struct SessionRunSettings {
-    pub model: Arc<dyn ModelSource>,
-    pub session_id: maki_storage::id::MakiId,
-}
-
-impl RunSettingsSource for SessionRunSettings {
-    fn current(&self) -> Option<RunSettings> {
-        use crate::session_options::{
-            ENABLED_VALUE, FAST_OPTION_ID, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
-        };
-
-        let (provider, model) = self.model.current()?;
-        let options =
-            crate::session_coordinator::SessionCoordinatorHandle::resolve(self.session_id)
-                .ok()?
-                .read()
-                .options();
-        let enabled = |id: &str| {
-            options
-                .options
-                .iter()
-                .find(|option| option.definition.id.as_ref() == id)
-                .is_some_and(|option| option.current_value.as_ref() == ENABLED_VALUE)
-        };
-        let thinking = options
-            .options
-            .iter()
-            .find(|option| option.definition.id.as_ref() == THINKING_OPTION_ID)
-            .and_then(|option| option.current_value.parse().ok())
-            .unwrap_or_default();
-        Some(RunSettings {
-            provider,
-            model,
-            fast: enabled(FAST_OPTION_ID),
-            workflow: enabled(WORKFLOW_OPTION_ID),
-            thinking,
-        })
-    }
-}
-
-/// The provider and model a run should use from its next request onward.
-/// A frontend that can change the model while a run is in flight supplies one
-/// of these; the agent polls it between requests so a change lands on the next
-/// inference rather than waiting for the whole turn to finish.
+/// The provider and model available when a run begins.
 pub trait ModelSource: Send + Sync {
     /// `None` while the source has nothing to offer yet, which reads as "no
     /// change" rather than forcing a caller to invent a placeholder provider.
@@ -162,9 +127,7 @@ pub trait ModelSource: Send + Sync {
 }
 
 /// A [`ModelSource`] a frontend can install into. Adoption is a store rather
-/// than a round-trip to whatever loop owns the run, so a model can be changed
-/// while a turn is in flight without waiting for the turn to end -- and
-/// without a coordinator operation blocking on that wait.
+/// than a round-trip to whatever loop owns the run.
 #[derive(Clone, Default)]
 pub struct SharedModel(Arc<arc_swap::ArcSwapOption<(Arc<dyn Provider>, Model)>>);
 
@@ -188,11 +151,6 @@ pub struct AgentParams {
     pub agent_id: AgentId,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
-    /// `None` for a run whose settings cannot change once it starts, such as a
-    /// single print-mode invocation.
-    pub settings_source: Option<Arc<dyn RunSettingsSource>>,
-    /// Rebuilds the base tool schema when the model or workflow changes.
-    pub tool_builder: Option<ToolBuilder>,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
@@ -225,13 +183,12 @@ pub struct Agent<'h> {
     agent_id: AgentId,
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
-    settings_source: Option<Arc<dyn RunSettingsSource>>,
-    tool_builder: Option<ToolBuilder>,
     history: &'h mut History,
     system: String,
     event_tx: EventSender,
     tools: RequestTools,
     mode: AgentMode,
+    mode_def: Option<Arc<crate::ModeDef>>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
@@ -261,9 +218,11 @@ pub struct Agent<'h> {
     question_mode: crate::tools::QuestionMode,
     workflow: bool,
     local_tools: LocalTools,
+    turn_bindings: Arc<TurnToolBindings>,
     model_policy: Arc<ModelPolicy>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
     managed_turn: Option<crate::CurrentManagedTurn>,
+    admission: Option<TurnAdmissionSnapshot>,
 }
 
 impl<'h> Agent<'h> {
@@ -272,8 +231,6 @@ impl<'h> Agent<'h> {
             agent_id: params.agent_id,
             provider: params.provider,
             model: Arc::new(params.model),
-            settings_source: params.settings_source,
-            tool_builder: params.tool_builder,
             config: params.config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
@@ -283,6 +240,7 @@ impl<'h> Agent<'h> {
             event_tx: run.event_tx,
             tools: run.tools,
             mode: AgentMode::default(),
+            mode_def: None,
             user_response_rx: None,
             interrupt_source: None,
             cancel: CancelToken::none(),
@@ -308,9 +266,11 @@ impl<'h> Agent<'h> {
             question_mode: params.question_mode,
             workflow: false,
             local_tools: LocalTools::default(),
+            turn_bindings: Arc::new(TurnToolBindings::default()),
             model_policy: params.model_policy,
             file_write_locks: params.file_write_locks,
             managed_turn: params.managed_turn,
+            admission: None,
         }
     }
 
@@ -359,6 +319,11 @@ impl<'h> Agent<'h> {
     ///
     /// Exactly one terminal event delivery is attempted. A closed event channel
     /// does not change the returned outcome and is never retried.
+    pub fn with_admission(mut self, admission: Option<TurnAdmissionSnapshot>) -> Self {
+        self.admission = admission;
+        self
+    }
+
     pub async fn run(&mut self, turn_id: TurnId, input: AgentInput) -> TurnOutcome {
         self.num_turns = 0;
         self.reauth_attempts = 0;
@@ -379,13 +344,48 @@ impl<'h> Agent<'h> {
         } = input;
         self.push_input_context(preamble);
         if !message.trim().is_empty() || !images.is_empty() {
-            self.history
-                .push(Message::user_with_images(message.clone(), images));
+            let mut user_message = Message::user_with_images(message.clone(), images);
+            if let Some(count) = self
+                .admission
+                .as_ref()
+                .and_then(|snapshot| snapshot.mcp_startup_notice)
+            {
+                let notice = format!(
+                    "[system: {count} MCP servers are not ready; MCP tools are unavailable for this turn]"
+                );
+                user_message.content.push(ContentBlock::Text {
+                    text: notice.clone(),
+                });
+                user_message.display_text = Some(if message.is_empty() {
+                    format!("{IMAGE_PLACEHOLDER}\n{notice}")
+                } else {
+                    format!("{message}\n{notice}")
+                });
+            }
+            self.history.push(user_message);
         }
         self.mode = mode;
+        self.mode_def = self
+            .admission
+            .as_ref()
+            .map(|snapshot| snapshot.mode_def.clone())
+            .unwrap_or_else(|| match &self.mode {
+                AgentMode::Custom(id) => self.modes.get(id).map(Arc::new),
+                _ => Some(Arc::new(self.modes.current(&self.mode))),
+            });
         self.workflow = workflow;
+        self.turn_bindings = self
+            .admission
+            .as_ref()
+            .map(|snapshot| Arc::clone(&snapshot.bindings))
+            .unwrap_or_else(|| {
+                Arc::new(TurnToolBindings::capture(
+                    &self.registry,
+                    &self.local_tools,
+                    self.mcp.as_ref(),
+                ))
+            });
         self.opts = RequestOptions { thinking, fast };
-
         info!(
             agent_id = %self.agent_id,
             %turn_id,
@@ -472,83 +472,38 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// `self.tools` holds base tools only; the MCP part is recomputed here
-    /// every turn so `tool_search` loads and late-connecting servers take
-    /// effect on the next request.
-    /// Picks up a model changed while this run was in flight. Called at the
-    /// top of a request, where every tool call already has its result in
-    /// history, so a change to the advertised tool set cannot orphan one that
-    /// is still outstanding. Everything derived from the model -- the tool
-    /// schema, thinking clamps, cost attribution -- is recomputed per request,
-    /// so swapping the two fields is the whole change.
-    fn adopt_pending_settings(&mut self) {
-        let Some(source) = &self.settings_source else {
-            return;
-        };
-        let Some(settings) = source.current() else {
-            return;
-        };
-        let provider_changed = !Arc::ptr_eq(&self.provider, &settings.provider);
-        let model_changed = settings.model.spec() != self.model.spec();
-        let workflow_changed = settings.workflow != self.workflow;
-        if !provider_changed
-            && !model_changed
-            && !workflow_changed
-            && settings.fast == self.opts.fast
-            && settings.thinking == self.opts.thinking
-        {
-            return;
-        }
-        if model_changed {
-            info!(
-                from = %self.model.spec(),
-                to = %settings.model.spec(),
-                self.num_turns,
-                "adopting a model changed mid-run"
-            );
-            let _ = self.event_tx.send(AgentEvent::ModelSwitched {
-                spec: settings.model.spec(),
-            });
-        }
-        self.provider = settings.provider;
-        self.model = Arc::new(settings.model);
-        self.workflow = settings.workflow;
-        self.opts.fast = settings.fast;
-        self.opts.thinking = settings.thinking;
-        // The base schema is built per model and workflow, so it is stale
-        // whenever either moves. Without this the request would reach a new
-        // model carrying the previous one's tool descriptions, and a workflow
-        // toggle would change subagent behaviour while the interpreter kept
-        // its old tool set.
-        if (model_changed || workflow_changed)
-            && let Some(build) = &self.tool_builder
-        {
-            self.tools = build(&self.model, self.workflow);
-        }
-    }
-
-    fn request_tools(&self) -> Cow<'_, Value> {
-        let def = self.modes.current(&self.mode);
-        let base = match &def.tools {
-            Some(names) => Cow::Owned(filter_tools(self.tools.definitions(), names)),
-            None => Cow::Borrowed(self.tools.definitions()),
-        };
-        match &self.mcp {
+    fn request_tools(&self) -> Result<Cow<'_, Value>, AgentError> {
+        let def = self.mode_def.as_ref().ok_or_else(|| AgentError::Config {
+            message: format!("mode '{}' is not defined", self.mode.id().key()),
+        })?;
+        let mut tools = match &self.mcp {
             Some(mcp) => {
-                let mut tools = base.into_owned();
-                mcp.extend_tools(&mut tools);
+                let mut tools = self.tools.definitions().clone();
+                self.turn_bindings.extend_mcp_tools(mcp, &mut tools);
                 Cow::Owned(tools)
             }
-            None => base,
+            None => Cow::Borrowed(self.tools.definitions()),
+        };
+        if let Some(names) = &def.tools {
+            tools = Cow::Owned(filter_tools(&tools, names));
         }
+        let ctx = self.tool_context();
+        if let Some(definitions) = tools.to_mut().as_array_mut() {
+            definitions.retain(|definition| {
+                definition
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| tool_dispatch::authorize_advertised(&ctx, name))
+            });
+        }
+        Ok(tools)
     }
 
     async fn turn(&mut self) -> Result<TurnProgress, AgentError> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        self.adopt_pending_settings();
-        let tools = self.request_tools();
+        let tools = self.request_tools()?;
         let response = match stream_with_retry(
             &*self.provider,
             &self.model,
@@ -759,6 +714,7 @@ impl<'h> Agent<'h> {
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
+            mode_def: self.mode_def.clone(),
             question_mode: self.question_mode,
             session_id: self.session_id.clone(),
             cwd,
@@ -783,6 +739,7 @@ impl<'h> Agent<'h> {
             workflow: self.workflow,
             audience: self.audience,
             local_tools: Arc::clone(&self.local_tools),
+            turn_bindings: Arc::clone(&self.turn_bindings),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             file_write_locks: Arc::clone(&self.file_write_locks),
@@ -865,9 +822,10 @@ impl<'h> Agent<'h> {
                     self.event_tx.send(AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
                         images: input.images.clone(),
+                        mcp_startup_notice: None,
+                        already_displayed: true,
                     })?;
                     self.push_input_context(input.preamble);
-                    self.mode = input.mode;
                     let wrapped = format!(
                         "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
                         input.message
@@ -981,6 +939,46 @@ mod tests {
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    struct MutatingModeProvider {
+        modes: Arc<crate::ModeRegistry>,
+        advertised: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl Provider for MutatingModeProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            tools: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let mut advertised = self.advertised.lock().unwrap();
+                advertised.push(tools.clone());
+                if advertised.len() == 1 {
+                    self.modes
+                        .define(crate::ModeDefSpec {
+                            name: "audit".into(),
+                            restrict_write_to: Some(PathBuf::from("/tmp/new-policy")),
+                            tools: Some(vec!["write".into()]),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    Ok(text_response(StopReason::MaxTokens))
+                } else {
+                    Ok(text_response(StopReason::EndTurn))
+                }
             })
         }
 
@@ -1107,136 +1105,20 @@ mod tests {
         make_agent_with_sender(provider, history, raw_tx, event_rx)
     }
 
-    /// A source that hands back whatever it is told to, so a test can change a
-    /// run's settings between requests the way a user would.
-    struct StubSettings(std::sync::Mutex<RunSettings>);
-
-    impl RunSettingsSource for StubSettings {
-        fn current(&self) -> Option<RunSettings> {
-            let settings = self.0.lock().unwrap();
-            Some(RunSettings {
-                provider: Arc::clone(&settings.provider),
-                model: settings.model.clone(),
-                fast: settings.fast,
-                workflow: settings.workflow,
-                thinking: settings.thinking,
-            })
-        }
-    }
-
-    /// A workflow toggle has to reach a run in flight, and the tool schema is
-    /// built per model and workflow, so adopting the flag without rebuilding
-    /// the schema would change subagent behaviour while the interpreter kept
-    /// its old tool set.
     #[test]
-    fn adopting_settings_rebuilds_the_tool_schema() {
+    fn run_uses_input_options_without_settings_snapshot() {
         let mut history = History::new(Vec::new());
-        let (raw_tx, event_rx) = flume::unbounded();
-        let (mut agent, _rx) =
-            make_agent_with_sender(MockProvider::new(vec![]), &mut history, raw_tx, event_rx);
-
-        let source = Arc::new(StubSettings(std::sync::Mutex::new(RunSettings {
-            provider: Arc::clone(&agent.provider),
-            model: default_model(),
-            fast: false,
-            workflow: true,
-            thinking: ThinkingConfig::Off,
-        })));
-        agent.settings_source = Some(Arc::clone(&source) as Arc<dyn RunSettingsSource>);
-        agent.tool_builder = Some(Arc::new(|_model: &Model, workflow: bool| {
-            RequestTools::assembled(
-                serde_json::json!([{ "name": if workflow { "with-workflow" } else { "without" } }]),
-                &AgentConfig::default(),
-                &Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
-            )
-        }));
-        agent.workflow = false;
-        agent.tools = RequestTools::assembled(
-            serde_json::json!([{ "name": "without" }]),
-            &AgentConfig::default(),
-            &Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+        let (mut agent, _rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
         );
-
-        agent.adopt_pending_settings();
-
-        assert!(agent.workflow, "the flag is adopted");
-        assert_eq!(
-            agent.tools.definitions(),
-            &serde_json::json!([{ "name": "with-workflow" }]),
-            "the schema is rebuilt for the new flag"
-        );
-    }
-
-    #[test]
-    fn adopting_settings_takes_provider_swap_for_the_same_model() {
-        let mut history = History::new(Vec::new());
-        let (raw_tx, event_rx) = flume::unbounded();
-        let (mut agent, _rx) =
-            make_agent_with_sender(MockProvider::new(vec![]), &mut history, raw_tx, event_rx);
-        let replacement: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![]));
-        let source = Arc::new(StubSettings(std::sync::Mutex::new(RunSettings {
-            provider: Arc::clone(&replacement),
-            model: default_model(),
-            fast: false,
-            workflow: false,
-            thinking: ThinkingConfig::Off,
-        })));
-        agent.settings_source = Some(source as Arc<dyn RunSettingsSource>);
-
-        agent.adopt_pending_settings();
-
-        assert!(Arc::ptr_eq(&agent.provider, &replacement));
-    }
-
-    /// `/thinking` mid-turn used to sit unread until the next turn, because
-    /// thinking had no session-level owner. It has one now, so it lands on the
-    /// next request like the model does.
-    #[test]
-    fn adopting_settings_takes_thinking() {
-        let mut history = History::new(Vec::new());
-        let (raw_tx, event_rx) = flume::unbounded();
-        let (mut agent, _rx) =
-            make_agent_with_sender(MockProvider::new(vec![]), &mut history, raw_tx, event_rx);
-
-        let source = Arc::new(StubSettings(std::sync::Mutex::new(RunSettings {
-            provider: Arc::clone(&agent.provider),
-            model: default_model(),
-            fast: false,
-            workflow: false,
-            thinking: ThinkingConfig::Budget(8192),
-        })));
-        agent.settings_source = Some(source as Arc<dyn RunSettingsSource>);
-        agent.opts.thinking = ThinkingConfig::Off;
-
-        agent.adopt_pending_settings();
-
+        let mut input = default_input();
+        input.workflow = true;
+        input.fast = true;
+        input.thinking = ThinkingConfig::Budget(8192);
+        smol::block_on(agent.run(TurnId::generate(), input));
+        assert!(agent.workflow && agent.opts.fast);
         assert_eq!(agent.opts.thinking, ThinkingConfig::Budget(8192));
-    }
-
-    /// Nothing changed means nothing is rebuilt, so a run does not pay for a
-    /// schema build on every request.
-    #[test]
-    fn adopting_settings_is_a_no_op_when_nothing_moved() {
-        let mut history = History::new(Vec::new());
-        let (raw_tx, event_rx) = flume::unbounded();
-        let (mut agent, _rx) =
-            make_agent_with_sender(MockProvider::new(vec![]), &mut history, raw_tx, event_rx);
-
-        let source = Arc::new(StubSettings(std::sync::Mutex::new(RunSettings {
-            provider: Arc::clone(&agent.provider),
-            model: default_model(),
-            fast: false,
-            workflow: false,
-            thinking: ThinkingConfig::Off,
-        })));
-        agent.settings_source = Some(source as Arc<dyn RunSettingsSource>);
-        agent.tool_builder = Some(Arc::new(|_model: &Model, _workflow: bool| {
-            panic!("the schema must not be rebuilt when nothing changed")
-        }));
-        agent.workflow = false;
-        agent.opts.fast = false;
-
-        agent.adopt_pending_settings();
     }
 
     fn make_agent_with_sender(
@@ -1247,8 +1129,6 @@ mod tests {
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let agent = Agent::new(
             AgentParams {
-                settings_source: None,
-                tool_builder: None,
                 agent_id: AgentId::generate(),
                 provider: Arc::new(provider),
                 model: default_model(),
@@ -1305,6 +1185,38 @@ mod tests {
     }
 
     #[test]
+    fn startup_notice_is_appended_to_user_turn_for_model_and_display() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.admission = Some(TurnAdmissionSnapshot {
+                mode_def: None,
+                bindings: Arc::default(),
+                prompt_inputs: None,
+                mcp_startup_notice: Some(2),
+            });
+
+            agent.run(TurnId::generate(), default_input()).await;
+            drop(agent);
+
+            let message = history.as_slice().last().unwrap();
+            assert_eq!(
+                message.user_text(),
+                Some(
+                    "hello\n[system: 2 MCP servers are not ready; MCP tools are unavailable for this turn]"
+                )
+            );
+            assert!(matches!(
+                message.content.last(),
+                Some(ContentBlock::Text { text }) if text == "[system: 2 MCP servers are not ready; MCP tools are unavailable for this turn]"
+            ));
+        });
+    }
+
+    #[test]
     fn run_ingests_preamble_then_mailbox_then_user_message() {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
@@ -1335,6 +1247,7 @@ mod tests {
             let mailbox = SessionMailbox::new(id);
             mailbox.push("mailbox".into(), false);
             let mut input = default_input();
+            input.mode = AgentMode::Plan(PathBuf::from("/tmp/queued-plan"));
             input.preamble = vec![Message::observation("preamble".into())];
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
             let mut history = History::new(Vec::new());
@@ -1342,7 +1255,9 @@ mod tests {
             agent.mailbox = Some(mailbox);
             let mut agent = agent.with_interrupt_source(source);
 
+            agent.mode = AgentMode::Build;
             assert!(agent.handle_queued_command().await.unwrap());
+            assert!(matches!(agent.mode, AgentMode::Build));
             drop(agent);
 
             let text = history
@@ -2033,6 +1948,156 @@ mod tests {
             .filter_map(|d| d["name"].as_str())
             .collect();
         assert_eq!(names, ["read", "grep"]);
+    }
+
+    #[test]
+    fn missing_custom_mode_fails_closed() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        agent.mode = AgentMode::Custom(crate::ModeId::Custom("removed".into()));
+        assert!(matches!(
+            agent.request_tools(),
+            Err(AgentError::Config { .. })
+        ));
+        let outcome = smol::block_on(agent.run(
+            TurnId::generate(),
+            AgentInput {
+                mode: AgentMode::Custom(crate::ModeId::Custom("removed".into())),
+                ..default_input()
+            },
+        ));
+        assert!(matches!(outcome, TurnOutcome::Failed { num_turns: 0, .. }));
+        assert!(agent.mode_def.is_none());
+    }
+
+    #[test]
+    fn mode_policy_stays_pinned_across_continuation_and_context_clones() {
+        let mut history = History::new(Vec::new());
+        let modes = Arc::new(crate::ModeRegistry::builtin());
+        modes
+            .define(crate::ModeDefSpec {
+                name: "audit".into(),
+                tools: Some(vec!["read".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+        let advertised = Arc::new(Mutex::new(Vec::new()));
+        let provider = MutatingModeProvider {
+            modes: Arc::clone(&modes),
+            advertised: Arc::clone(&advertised),
+        };
+        let (mut agent, _rx) = make_agent(provider, &mut history);
+        agent.modes = Arc::clone(&modes);
+        for name in ["read", "write"] {
+            agent
+                .registry
+                .register(
+                    crate::tools::test_support::mock_tool(name, ToolAudience::MAIN),
+                    crate::tools::registry::ToolSource::Lua {
+                        plugin: name.into(),
+                    },
+                )
+                .unwrap();
+        }
+        agent.tools = RequestTools::assembled(
+            serde_json::json!([{"name": "read"}, {"name": "write"}]),
+            &AgentConfig::default(),
+            &default_model(),
+        );
+        let outcome = smol::block_on(agent.run(
+            TurnId::generate(),
+            AgentInput {
+                mode: AgentMode::Custom(crate::ModeId::Custom("audit".into())),
+                ..default_input()
+            },
+        ));
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Completed { num_turns: 2, .. }
+        ));
+        let context = agent.tool_context();
+        assert_eq!(context.clone().restrict_write_to(), None);
+        assert_eq!(
+            context.mode_def.as_ref().unwrap().tools.as_ref().unwrap(),
+            &["read"]
+        );
+        assert_eq!(
+            modes.current(&context.mode).tools.as_ref().unwrap(),
+            &["write"]
+        );
+        assert!(modes.restrict_write_to(&context.mode).is_some());
+        assert_eq!(
+            *advertised.lock().unwrap(),
+            vec![serde_json::json!([{"name": "read"}]); 2]
+        );
+    }
+
+    #[test]
+    fn mode_allowlist_filters_mcp_tools() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        agent
+            .modes
+            .define(crate::ModeDefSpec {
+                name: "audit".into(),
+                tools: Some(vec!["srv__probe".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+        agent.mode = AgentMode::Custom(crate::ModeId::Custom("audit".into()));
+        agent.mode_def = Some(Arc::new(agent.modes.current(&agent.mode)));
+        agent.mcp = Some(crate::mcp::test_support::stub_session(&[(
+            "srv.probe",
+            "probe",
+        )]));
+        assert_eq!(agent.mcp.as_ref().unwrap().wire_names(), ["srv__probe"]);
+        agent.turn_bindings = Arc::new(TurnToolBindings::capture(
+            &agent.registry,
+            &agent.local_tools,
+            agent.mcp.as_ref(),
+        ));
+        assert!(tool_dispatch::authorize_advertised(
+            &agent.tool_context(),
+            "srv__probe"
+        ));
+        agent
+            .mcp
+            .as_ref()
+            .unwrap()
+            .search_tools("probe", crate::tools::CallOrigin::Model)
+            .unwrap();
+        let tools = agent.request_tools().unwrap();
+        let names: Vec<&str> = tools
+            .as_ref()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|definition| definition.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, ["srv__probe"]);
+    }
+
+    #[test]
+    fn plan_mode_hides_mcp_tools() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _rx) = make_agent(MockProvider::new(vec![]), &mut history);
+        agent.mode = AgentMode::Plan(PathBuf::from("/tmp/plan"));
+        agent.mode_def = Some(Arc::new(agent.modes.current(&agent.mode)));
+        agent.mcp = Some(crate::mcp::test_support::stub_session(&[(
+            "srv.probe",
+            "probe",
+        )]));
+        let names: Vec<String> = agent
+            .request_tools()
+            .unwrap()
+            .as_ref()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|definition| definition.get("name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        assert!(!names.contains(&"srv__probe".to_owned()));
     }
 
     #[test]

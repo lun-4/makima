@@ -3,16 +3,48 @@
 use std::future::Future;
 
 use maki_providers::{ImageSource, TokenUsage};
+use std::sync::Arc;
 
-use crate::InterruptSource;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::manager::{CurrentManagedTurn, ManagerInner};
 use crate::types::{AgentId, TurnId, TurnOutcome};
+use crate::{AgentMode, InterruptSource, RunSettings};
 
 #[derive(Clone)]
 pub(crate) struct ManagedTurnAdmission {
     pub(crate) manager: std::sync::Weak<ManagerInner>,
     pub(crate) agent_id: AgentId,
+}
+
+/// The actor's immutable per-admission configuration snapshot.
+#[derive(Clone)]
+pub struct EffectiveAgentConfig {
+    pub settings: RunSettings,
+    pub mode: AgentMode,
+    pub mode_def: Option<crate::ModeDef>,
+}
+
+impl EffectiveAgentConfig {
+    pub fn new(settings: RunSettings, mode: AgentMode) -> Self {
+        Self {
+            settings,
+            mode,
+            mode_def: None,
+        }
+    }
+
+    pub fn with_mode_def(mut self, mode_def: Option<crate::ModeDef>) -> Self {
+        self.mode_def = mode_def;
+        self
+    }
+}
+
+impl std::ops::Deref for EffectiveAgentConfig {
+    type Target = RunSettings;
+
+    fn deref(&self) -> &Self::Target {
+        &self.settings
+    }
 }
 
 impl ManagedTurnAdmission {
@@ -28,6 +60,8 @@ pub struct EarlierRoot {
     pub text: String,
     pub images: Vec<ImageSource>,
     pub correlation: String,
+    pub mcp_startup_notice: Option<usize>,
+    pub already_displayed: bool,
 }
 
 /// What category of work the backend is asked to execute. Controls and
@@ -44,7 +78,10 @@ pub enum WorkKind {
         text: String,
         images: Vec<ImageSource>,
         earlier: Vec<EarlierRoot>,
+        mcp_startup_notice: Option<usize>,
+        already_displayed: bool,
     },
+
     Control,
     Compact,
 }
@@ -63,10 +100,13 @@ pub struct TurnContext {
     pub cancel_reason: ReasonedCancelToken,
     /// Adapter-local correlation (the sink's run id or the control's key).
     pub correlation: String,
+    pub generation: u64,
+    pub policy: Option<Arc<EffectiveAgentConfig>>,
     /// Extracts root/compact work out of the actor's queue while the run is
     /// active, so it can fold them instead of waiting for the turn to end.
     pub interrupt: Option<std::sync::Arc<dyn InterruptSource>>,
     pub managed_turn: Option<CurrentManagedTurn>,
+    pub admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
 
 /// The terminal result of one backend execution. `EnteredRun` is the only
@@ -101,6 +141,9 @@ pub struct RootWork {
     pub images: Vec<ImageSource>,
     pub correlation: String,
     pub earlier: Vec<EarlierRoot>,
+    pub generation: u64,
+    pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
+    pub(crate) admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
 
 impl RootWork {
@@ -120,6 +163,9 @@ impl RootWork {
             images,
             correlation,
             earlier: Vec::new(),
+            generation: 0,
+            policy: None,
+            admission: None,
         }
     }
 }
@@ -144,7 +190,10 @@ pub struct TurnAdmission {
     /// A root-started turn that is cancelled before entering produces no
     /// retained outcome and no terminal delivery.
     pub(crate) root: bool,
+    pub(crate) generation: u64,
+    pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     pub(crate) ticket: super::TurnTicket,
+    pub(crate) admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
 
 /// The actor's lifecycle. `Closed` and `Shutdown` are terminal and reject
@@ -166,8 +215,8 @@ pub enum ActorStatus {
 }
 
 /// A point-in-time projection of every actor lens: lifecycle, status, active
-/// turn id, queued count and (for the TUI) the queue's neutral messages, the
-/// latest retained outcome, and cumulative usage.
+/// turn id, queued user work count and (for the TUI) the queue's neutral
+/// messages, the latest retained outcome, and cumulative usage.
 #[derive(Debug, Clone)]
 pub struct ActorSnapshot {
     pub lifecycle: ActorLifecycle,
@@ -179,10 +228,29 @@ pub struct ActorSnapshot {
     pub cumulative_usage: TokenUsage,
 }
 
-/// The adapter owns its mutable configuration and executes work against the
-/// actor's shared history. Object-safe: every execution method returns a
-/// boxed future, so the TUI and Lua can share one `Box<dyn ActorBackend>`.
+/// Captures external admission dependencies on the blocking pool, without the
+/// actor state lock. The supplied configuration is the committed FIFO predecessor;
+/// implementations must use its resolved mode definition when present. Cancellation
+/// can retire the admission before this callback returns.
+pub type AdmissionPreparation = Arc<
+    dyn Fn(
+            &crate::AgentInput,
+            &AgentMode,
+            Option<&EffectiveAgentConfig>,
+        ) -> crate::agent::TurnAdmissionSnapshot
+        + Send
+        + Sync,
+>;
+
 pub trait ActorBackend: Send {
+    fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
+        None
+    }
+
+    fn admission_preparation(&self) -> Option<AdmissionPreparation> {
+        None
+    }
+
     /// Executes one accepted turn or a started root. `turn_id` is `Some`;
     /// `work` distinguishes `Turn` from `Root`. Returns `EnteredRun` with
     /// the authoritative outcome, or `SetupFailed` for a turn that never

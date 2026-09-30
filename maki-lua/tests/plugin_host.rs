@@ -11,7 +11,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
     ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
-    ToolSource, timeout_annotation,
+    ToolSource, TurnToolBindings, timeout_annotation,
 };
 use maki_agent::{AgentMode, SharedBuf, ToolOutput};
 use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
@@ -228,6 +228,11 @@ fn exec_output_in(
     if let Some(r) = registry_override {
         ctx.registry = r;
     }
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
     smol::block_on(async { inv.execute(&ctx).await }).output
 }
 
@@ -246,6 +251,39 @@ maki.api.register_tool({
     end
 })
 "#;
+
+const SESSION_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "whoami",
+    description = "reports the calling session",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function(_, ctx)
+        local id, err = ctx:session_id()
+        if err then
+            return "err:" .. err
+        end
+        return "id:" .. tostring(id)
+    end,
+})
+"#;
+
+fn exec_with_ctx(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<String, String> {
+    let entry = reg
+        .get(name)
+        .unwrap_or_else(|| panic!("tool {name} not registered"));
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    smol::block_on(async { inv.execute(ctx).await })
+        .output
+        .map(|out| match out {
+            maki_agent::ToolOutput::Plain(s) => s.text,
+            other => panic!("unexpected output: {other:?}"),
+        })
+}
 
 const MINIMAL_SCHEMA: &str =
     r#"{ type = "object", properties = {}, additionalProperties = false }"#;
@@ -355,39 +393,6 @@ fn register_echo_tool() {
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
     assert_eq!(out, "hello");
-}
-
-const SESSION_PLUGIN: &str = r#"
-maki.api.register_tool({
-    name = "whoami",
-    description = "reports the calling session",
-    schema = { type = "object", properties = {}, additionalProperties = false },
-    handler = function(_, ctx)
-        local id, err = ctx:session_id()
-        if err then
-            return "err:" .. err
-        end
-        return "id:" .. tostring(id)
-    end,
-})
-"#;
-
-fn exec_with_ctx(
-    reg: &ToolRegistry,
-    name: &str,
-    input: serde_json::Value,
-    ctx: &ToolContext,
-) -> Result<String, String> {
-    let entry = reg
-        .get(name)
-        .unwrap_or_else(|| panic!("tool {name} not registered"));
-    let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
-        .output
-        .map(|out| match out {
-            maki_agent::ToolOutput::Plain(s) => s.text,
-            other => panic!("unexpected output: {other:?}"),
-        })
 }
 
 /// The point of the whole thing: a handler learns who called it without
@@ -4845,30 +4850,6 @@ maki.api.register_tool({{
     (reg, host)
 }
 
-/// `start` is awaited to completion, so the returned receiver already holds
-/// everything the hook emitted.
-fn run_start(
-    reg: &ToolRegistry,
-    name: &str,
-    input: serde_json::Value,
-) -> flume::Receiver<maki_agent::Envelope> {
-    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
-    let ctx = maki_agent::tools::test_support::stub_ctx_with(
-        &maki_agent::AgentMode::Build,
-        Some(&event_tx),
-        Some(START_TOOL_USE_ID),
-    );
-    let inv = reg
-        .get(name)
-        .unwrap_or_else(|| panic!("tool {name} not registered"))
-        .tool
-        .parse(&input)
-        .expect("parse failed");
-    smol::block_on(inv.start(&ctx));
-    rx
-}
-
 fn recv_live_buf(
     rx: &flume::Receiver<maki_agent::Envelope>,
     id: &str,
@@ -4899,6 +4880,38 @@ fn start_annotation_timeout_happy_path() {
         .parse(&serde_json::json!({"timeout": 90}))
         .expect("parse failed");
     assert_eq!(inv.start_annotation(), Some(timeout_annotation(90)));
+}
+/// `start` is awaited to completion, so the returned receiver already holds
+/// everything the hook emitted.
+fn run_start(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+) -> flume::Receiver<maki_agent::Envelope> {
+    run_start_in_mode(reg, name, input, &maki_agent::AgentMode::Build)
+}
+
+fn run_start_in_mode(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    mode: &maki_agent::AgentMode,
+) -> flume::Receiver<maki_agent::Envelope> {
+    let (tx, rx) = flume::unbounded::<maki_agent::Envelope>();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let ctx = maki_agent::tools::test_support::stub_ctx_with(
+        mode,
+        Some(&event_tx),
+        Some(START_TOOL_USE_ID),
+    );
+    let inv = reg
+        .get(name)
+        .unwrap_or_else(|| panic!("tool {name} not registered"))
+        .tool
+        .parse(&input)
+        .expect("parse failed");
+    smol::block_on(inv.start(&ctx));
+    rx
 }
 
 #[test]
@@ -5491,6 +5504,11 @@ fn interpreter_bridge_flattens_image_with_visibility_note() {
 
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
     let out = smol::block_on(maki_agent::tools::interpreter_bridge::dispatch(
         &ctx,
         "img_probe",
@@ -6465,6 +6483,25 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     host.load_source("session_option_e2e", SESSION_OPTION_PLUGIN)
         .unwrap();
     let session_id = session.read().session_id().to_string();
+    let actions = host.ui_action_rx();
+    let responder_session = session.clone();
+    let responder = std::thread::spawn(move || {
+        let action = actions.recv_timeout(Duration::from_secs(5)).unwrap();
+        if let maki_lua::UiAction::Session {
+            req:
+                maki_lua::SessionRequest::SetOption {
+                    id, value, version, ..
+                },
+            reply_tx,
+        } = action
+        {
+            let result =
+                smol::block_on(responder_session.set_option_if_version(id, value, Some(version)))
+                    .map(|_| json!(true))
+                    .map_err(|error| error.to_string());
+            reply_tx.send(result).unwrap();
+        }
+    });
 
     let (value, _) = plugin_option_state(&session);
     assert_eq!(value, "a");
@@ -6493,4 +6530,6 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     let (value, version) = plugin_option_state(&session);
     assert_eq!(value, "b");
     assert_eq!(version, set_version);
+    responder.join().unwrap();
+    smol::block_on(session.close()).unwrap();
 }

@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::actor::{
-    ActorBackend, ActorLifecycle, ActorStatus, BackendResult, TurnContext, WorkKind,
+    ActorBackend, ActorLifecycle, ActorStatus, BackendResult, EffectiveAgentConfig, TurnContext,
+    WorkKind,
 };
 use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
@@ -24,7 +25,8 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams,
     AgentRunParams, EMPTY_RESPONSE_MARKER, Envelope, EventSender, History, McpSession, RunLedger,
-    SubagentCancel, SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId, TurnOutcome,
+    RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent, TurnCancellationReason, TurnId,
+    TurnOutcome,
 };
 use maki_config::ToolKey;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
@@ -48,8 +50,12 @@ use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::CANCELLED_MSG;
 
+const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admitted configuration";
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
+
+pub type SessionProviderPreparer =
+    Arc<dyn Fn(Model) -> Result<(Model, Arc<dyn provider::Provider>), String> + Send + Sync>;
 
 /// Build the `(model, provider)` pair that backs a `maki.agent.session` spawn.
 /// `inherit_provider` (or an absent `model_spec`) reuses the parent model and
@@ -60,6 +66,7 @@ async fn build_session_provider(
     model_spec: &Option<String>,
     inherit_provider: bool,
     agent_ctx: &AgentContext,
+    prepare: Option<SessionProviderPreparer>,
 ) -> Result<(Model, Arc<dyn provider::Provider>), String> {
     if inherit_provider || model_spec.is_none() {
         Ok((
@@ -70,6 +77,9 @@ async fn build_session_provider(
         let spec = model_spec.as_deref().expect("model_spec present");
         let mut m = Model::from_spec_with_policy(spec, &agent_ctx.model_policy)
             .map_err(|e| e.to_string())?;
+        if let Some(prepare) = prepare {
+            return prepare(m);
+        }
         let p = provider::from_model_async(&mut m, agent_ctx.timeouts)
             .await
             .map_err(|e| e.to_string())?;
@@ -101,6 +111,8 @@ struct LuaActorState {
     system: String,
     tools: RequestTools,
     opts: RequestOptions,
+    mode: AgentMode,
+    mode_def: Option<Arc<maki_agent::ModeDef>>,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
     child_cancel: CancelToken,
@@ -269,11 +281,41 @@ impl Drop for LuaActorBackend {
 }
 
 impl ActorBackend for LuaActorBackend {
+    fn admission_preparation(&self) -> Option<maki_agent::actor::AdmissionPreparation> {
+        let state = Arc::clone(&self.state);
+        Some(Arc::new(move |_input, mode, config| {
+            let params = state
+                .params
+                .get()
+                .expect("session parameters initialized before admission");
+            let mode_def = if let Some(config) = config {
+                config.mode_def.clone().map(Arc::new)
+            } else if *mode == state.mode {
+                state.mode_def.clone().or_else(|| match mode {
+                    AgentMode::Custom(id) => params.modes.get(id).map(Arc::new),
+                    _ => Some(Arc::new(params.modes.current(mode))),
+                })
+            } else {
+                None
+            };
+            maki_agent::agent::TurnAdmissionSnapshot {
+                mode_def,
+                prompt_inputs: None,
+                bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
+                    &params.registry,
+                    &state.local_tools,
+                    state.mcp.as_ref(),
+                )),
+                mcp_startup_notice: None,
+            }
+        }))
+    }
+
     fn run_turn<'a>(
         &'a mut self,
         history: &'a mut History,
         context: TurnContext,
-        input: AgentInput,
+        mut input: AgentInput,
         _work: WorkKind,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
@@ -285,6 +327,20 @@ impl ActorBackend for LuaActorBackend {
             // keeping `sub_tx` alive, and `Agent::run` emits through it.
             let event_tx = state.chip_event_tx.clone();
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
+            if context.managed_turn.is_some() && context.policy.is_none() {
+                state.present_result(
+                    turn_id,
+                    AdapterResult {
+                        text: String::new(),
+                        captured: None,
+                        error: Some(MANAGED_POLICY_MISSING_ERR.to_owned()),
+                    },
+                );
+                return BackendResult::SetupFailed {
+                    agent_id: context.agent_id,
+                    turn_id,
+                };
+            }
             state.init_subagent_info(&input.message);
             info!(
                 agent_id = %context.agent_id,
@@ -334,6 +390,14 @@ impl ActorBackend for LuaActorBackend {
                 .get()
                 .expect("session parameters must be initialized before admission")
                 .clone();
+            if let Some(config) = &context.policy {
+                params.provider = Arc::clone(&config.provider);
+                params.model = config.model.clone();
+                input.mode = config.mode.clone();
+                input.thinking = config.thinking;
+                input.fast = config.fast;
+                input.workflow = config.workflow;
+            }
             params.managed_turn = context.managed_turn.clone();
             let mut agent = Agent::new(
                 params,
@@ -348,7 +412,8 @@ impl ActorBackend for LuaActorBackend {
             .with_cancel(context.cancel.clone())
             .with_cancel_reason_source(context.cancel_reason.clone())
             .with_mcp(state.mcp.clone())
-            .with_local_tools(Arc::clone(&state.local_tools));
+            .with_local_tools(Arc::clone(&state.local_tools))
+            .with_admission(context.admission.clone());
             let outcome = agent.run(turn_id, input).await;
             drop(agent);
             drop(permit);
@@ -924,6 +989,8 @@ async fn session(
     opts: Table,
 ) -> LuaResult<Pair<mlua::AnyUserData>> {
     let agent_ctx = try_pair!(dispatch_ctx(&ctx, "session")).clone();
+    let parent_mode = agent_ctx.mode.clone();
+    let restrictive_parent = agent_ctx.restrict_write_to().is_some();
     let managed_turn = match (
         &agent_ctx.managed_turn,
         crate::runtime::current_managed_turn(&lua),
@@ -955,7 +1022,7 @@ async fn session(
     let fast: bool = opts
         .get::<Option<bool>>("fast")?
         .unwrap_or(agent_ctx.opts.fast);
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true) && !restrictive_parent;
     let silent: bool = opts.get::<Option<bool>>("silent")?.unwrap_or(false);
     let auto_deliver: bool = opts.get::<Option<bool>>("auto_deliver")?.unwrap_or(true);
     let parent_agent_id = managed_turn.as_ref().map(|current| current.agent_id());
@@ -975,8 +1042,11 @@ async fn session(
             .transpose()?
     };
 
+    let prepare = lua
+        .app_data_ref::<SessionProviderPreparer>()
+        .map(|p| Arc::clone(&p));
     let (model, provider): (Model, Arc<dyn provider::Provider>) =
-        try_pair!(build_session_provider(&model_spec, inherit_provider, &agent_ctx).await);
+        try_pair!(build_session_provider(&model_spec, inherit_provider, &agent_ctx, prepare).await);
     if let Some(current) = &managed_turn {
         try_pair!(current.validate_active());
     }
@@ -1086,11 +1156,48 @@ async fn session(
     // The array is the caller's, and the filter comes out of it, so whatever
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
+    let initial_tools = RequestTools::assembled(tools_json.clone(), &agent_ctx.config, &model);
+    let inherit_parent_mode = restrictive_parent || matches!(&parent_mode, AgentMode::Custom(_));
+    let child_mode = if inherit_parent_mode {
+        let mut child_ctx = agent_ctx.to_tool_context();
+        child_ctx.audience = audience;
+        child_ctx.tool_filter = Arc::clone(initial_tools.filter());
+        let mut allowed: std::collections::HashSet<_> = tool_dispatch::callable(&child_ctx)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        allowed.extend(local_map.keys().cloned());
+        tools_json
+            .as_array_mut()
+            .expect("request tools are an array")
+            .retain(|definition| {
+                definition
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|name| allowed.contains(name))
+            });
+        parent_mode
+    } else {
+        AgentMode::Build
+    };
     let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
+    let initial_config = EffectiveAgentConfig::new(
+        RunSettings {
+            provider: Arc::clone(&provider),
+            model: model.clone(),
+            thinking: opts.thinking,
+            fast: opts.fast,
+            workflow: false,
+        },
+        child_mode.clone(),
+    )
+    .with_mode_def(if inherit_parent_mode {
+        agent_ctx.mode_def.as_deref().cloned()
+    } else {
+        Some(agent_ctx.modes.current(&child_mode))
+    });
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let build_params = |agent_id| AgentParams {
-        settings_source: None,
-        tool_builder: None,
         agent_id,
         provider,
         model,
@@ -1126,6 +1233,10 @@ async fn session(
         system: system.unwrap_or_default(),
         tools,
         opts,
+        mode: child_mode,
+        mode_def: inherit_parent_mode
+            .then(|| agent_ctx.mode_def.clone())
+            .flatten(),
         mcp: agent_ctx
             .mcp
             .as_ref()
@@ -1156,7 +1267,8 @@ async fn session(
         presentation: Mutex::new(HashMap::new()),
     });
     let (actor, control) = if let Some(current) = &managed_turn {
-        let child = try_pair!(current.spawn_child(
+        let child = try_pair!(current.spawn_child_with_config(
+            initial_config,
             maki_agent::AgentMetadata {
                 label: (!name.is_empty()).then_some(name.clone()),
                 spawned_by_tool_use_id: agent_ctx.tool_use_id.clone(),
@@ -1254,12 +1366,13 @@ async fn session(
     // Tab submits go through the actor's admission, exactly like `send`.
     {
         let actor = actor.clone();
+        let mode = state.mode.clone();
         smol::spawn(async move {
             while let Ok(message) = ui_input_rx.recv_async().await {
                 let _ = actor.admit_turn(
                     AgentInput {
                         message,
-                        mode: AgentMode::Build,
+                        mode: mode.clone(),
                         images: Vec::new(),
                         preamble: Vec::new(),
                         thinking: opts.thinking,
@@ -1511,7 +1624,7 @@ async fn prompt(
     drop(this);
     let input = AgentInput {
         message,
-        mode: AgentMode::Build,
+        mode: state.mode.clone(),
         images: Vec::new(),
         preamble: Vec::new(),
         thinking: state.opts.thinking,
@@ -1658,7 +1771,7 @@ async fn send(
     match actor.admit_turn(
         AgentInput {
             message,
-            mode: AgentMode::Build,
+            mode: state.mode.clone(),
             images: Vec::new(),
             preamble: Vec::new(),
             thinking: state.opts.thinking,
@@ -1888,6 +2001,7 @@ mod tests {
             &Some("anthropic/claude-opus-4-20250514".into()),
             true,
             &agent,
+            None,
         ))
         .unwrap();
 
@@ -1904,7 +2018,8 @@ mod tests {
         let parent_provider = Arc::clone(&ctx.provider);
         let agent = AgentContext::from(&ctx);
 
-        let (_, provider) = smol::block_on(build_session_provider(&None, false, &agent)).unwrap();
+        let (_, provider) =
+            smol::block_on(build_session_provider(&None, false, &agent, None)).unwrap();
         assert!(Arc::ptr_eq(&provider, &parent_provider));
     }
 
@@ -2090,8 +2205,6 @@ mod tests {
         let (child_trigger, child_cancel) = CancelToken::new();
         let ctx = AgentContext::from(&stub_ctx(&AgentMode::Build));
         let params = AgentParams {
-            settings_source: None,
-            tool_builder: None,
             agent_id,
             provider,
             model: ctx.model.as_ref().clone(),
@@ -2125,6 +2238,8 @@ mod tests {
                 thinking: ThinkingConfig::Off,
                 fast: false,
             },
+            mode: AgentMode::Build,
+            mode_def: None,
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx, RUN_ID),
             child_cancel,
@@ -2202,6 +2317,187 @@ mod tests {
                 String::new(),
             )
             .unwrap()
+    }
+
+    struct MissingPolicyBackend(LuaActorBackend);
+
+    impl ActorBackend for MissingPolicyBackend {
+        fn run_turn<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            mut context: TurnContext,
+            input: AgentInput,
+            work: WorkKind,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+        {
+            assert!(context.managed_turn.is_some());
+            context.policy = None;
+            self.0.run_turn(history, context, input, work)
+        }
+
+        fn run_control<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            context: TurnContext,
+            control: &'a maki_agent::ControlWork,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+        {
+            self.0.run_control(history, context, control)
+        }
+
+        fn run_compact<'a>(
+            &'a mut self,
+            history: &'a mut History,
+            context: TurnContext,
+            instructions: Option<&'a str>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
+        {
+            self.0.run_compact(history, context, instructions)
+        }
+    }
+
+    #[test]
+    fn managed_missing_policy_returns_visible_failure_without_provider_request() {
+        smol::block_on(async {
+            let provider: Arc<dyn Provider> = Arc::new(HangingProvider);
+            let (_unused_actor, state, _session, _events) =
+                session_with_provider(provider, None, None);
+            let params = state.params.get().unwrap();
+            let config = EffectiveAgentConfig::new(
+                RunSettings {
+                    provider: Arc::clone(&params.provider),
+                    model: params.model.clone(),
+                    thinking: ThinkingConfig::Off,
+                    fast: false,
+                    workflow: false,
+                },
+                AgentMode::Build,
+            );
+            let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+            let root = manager
+                .create_root_with_config(Some(config), Vec::new(), None, |_| {
+                    Ok::<_, String>(Box::new(MissingPolicyBackend(LuaActorBackend::new(
+                        Arc::clone(&state),
+                    ))) as Box<dyn ActorBackend>)
+                })
+                .unwrap();
+            let ticket = admit(&state, &root.actor().unwrap(), "missing policy");
+            let outcome = ticket.wait().await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            let result = state
+                .presentation
+                .lock()
+                .unwrap()
+                .remove(&ticket.turn_id())
+                .unwrap();
+            assert_eq!(result.error.as_deref(), Some(MANAGED_POLICY_MISSING_ERR));
+            manager.shutdown(Duration::from_secs(1)).await;
+        });
+    }
+
+    #[test]
+    fn send_returns_during_policy_update() {
+        smol::block_on(async {
+            const MESSAGE: &str = "queued";
+            const REPLY: &str = "accepted";
+            let provider: Arc<dyn Provider> =
+                Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
+            let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
+            let reservation = actor.reserve_config_update().unwrap();
+            let lua = Lua::new();
+            let userdata = lua.create_userdata(sess).unwrap();
+            assert_eq!(
+                send(lua.clone(), userdata.borrow().unwrap(), MESSAGE.into())
+                    .await
+                    .unwrap(),
+                (Some(true), None)
+            );
+            drop(reservation);
+            while actor.snapshot().latest.is_none() {
+                smol::future::yield_now().await;
+            }
+            assert!(matches!(
+                actor.snapshot().latest,
+                Some(TurnOutcome::Completed { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn lua_prompt_runs_consecutive_turns_through_actor_backend() {
+        smol::block_on(async {
+            const FIRST_REPLY: &str = "first answer";
+            const SECOND_REPLY: &str = "second answer";
+            let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
+                canned_reply_with_usage(FIRST_REPLY, FIRST_USAGE),
+                canned_reply_with_usage(SECOND_REPLY, SECOND_USAGE),
+            ]));
+            let (actor, _state, sess, _events) = session_with_provider(provider, None, None);
+            let lua = Lua::new();
+            let userdata = lua.create_userdata(sess).unwrap();
+            let scope = crate::runtime::TaskScope::detached(&lua);
+
+            let (first, first_error) = scope
+                .scope_future(prompt(
+                    lua.clone(),
+                    userdata.borrow().unwrap(),
+                    "first request".into(),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(first_error, None);
+            assert_eq!(first.unwrap().get::<String>("text").unwrap(), FIRST_REPLY);
+
+            let (second, second_error) = scope
+                .scope_future(prompt(
+                    lua.clone(),
+                    userdata.borrow().unwrap(),
+                    "follow-up request".into(),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(second_error, None);
+            let second = second.unwrap();
+            assert_eq!(second.get::<String>("text").unwrap(), SECOND_REPLY);
+            assert_eq!(second.get::<u32>("input_tokens").unwrap(), 150);
+            assert_eq!(second.get::<u32>("output_tokens").unwrap(), 30);
+            let Some(TurnOutcome::Completed { usage, .. }) = actor.snapshot().latest else {
+                panic!("expected completed second turn");
+            };
+            assert_eq!(usage, SECOND_USAGE);
+        });
+    }
+
+    #[test]
+    fn prompt_survives_policy_update() {
+        smol::block_on(async {
+            const MESSAGE: &str = "queued prompt";
+            const REPLY: &str = "accepted";
+            let provider: Arc<dyn Provider> =
+                Arc::new(StreamOnceProvider::new_replies(vec![canned_reply(REPLY)]));
+            let (actor, _state, sess, _rx) = session_with_provider(provider, None, None);
+            let reservation = actor.reserve_config_update().unwrap();
+            let lua = Lua::new();
+            let userdata = lua.create_userdata(sess).unwrap();
+            let scope = crate::runtime::TaskScope::detached(&lua);
+            let mut pending = Box::pin(scope.scope_future(prompt(
+                lua.clone(),
+                userdata.borrow().unwrap(),
+                MESSAGE.into(),
+                None,
+            )));
+            assert!(
+                futures_lite::future::poll_once(&mut pending)
+                    .await
+                    .is_none()
+            );
+            drop(reservation);
+            let (result, error) = pending.await.unwrap();
+            assert_eq!(error, None);
+            assert_eq!(result.unwrap().get::<String>("text").unwrap(), REPLY);
+        });
     }
 
     #[test]
@@ -2575,6 +2871,69 @@ mod tests {
     }
 
     #[test]
+    fn lua_backend_prepares_mode_at_admission() {
+        let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![]));
+        let (actor, state, session, _events) = session_with_provider(provider, None, None);
+        let modes = &state.params.get().unwrap().modes;
+        modes
+            .define(maki_agent::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("before".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let backend = LuaActorBackend::new(Arc::clone(&state));
+        let prepare = backend.admission_preparation().unwrap();
+        let input = AgentInput::from_defaults(
+            "queued".into(),
+            AgentMode::Build,
+            Vec::new(),
+            Default::default(),
+        );
+        let admitted = prepare(&input, &input.mode, None);
+        let params = state.params.get().unwrap();
+        let config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::clone(&params.provider),
+                model: params.model.clone(),
+                thinking: ThinkingConfig::Off,
+                fast: false,
+                workflow: false,
+            },
+            AgentMode::Build,
+        )
+        .with_mode_def(admitted.mode_def.as_deref().cloned());
+        modes
+            .define(maki_agent::ModeDefSpec {
+                name: "build".into(),
+                system_prompt: Some("after".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            prepare(&input, &input.mode, Some(&config))
+                .mode_def
+                .as_deref(),
+            admitted.mode_def.as_deref(),
+        );
+        assert_eq!(
+            admitted.mode_def.as_ref().unwrap().system_prompt.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            prepare(&input, &input.mode, None)
+                .mode_def
+                .as_ref()
+                .unwrap()
+                .system_prompt
+                .as_deref(),
+            Some("after")
+        );
+        drop(session);
+        actor.shutdown();
+    }
+
+    #[test]
     fn failed_turn_keeps_session_open_for_later_turn() {
         let fail = Arc::new(FailOnceProvider::default());
         let provider: Arc<dyn Provider> = fail.clone();
@@ -2641,6 +3000,27 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.get::<u32>("input_tokens").unwrap(), 150);
         assert_eq!(result.get::<u32>("output_tokens").unwrap(), 30);
+    }
+
+    #[test]
+    fn prompt_result_preserves_partial_text_with_error() {
+        let lua = Lua::new();
+        let (result, error) = build_prompt_result(
+            &lua,
+            AdapterResult {
+                text: "partial output".into(),
+                captured: None,
+                error: Some("provider failed".into()),
+            },
+            TokenUsage::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.unwrap().get::<String>("text").unwrap(),
+            "partial output"
+        );
+        assert_eq!(error.as_deref(), Some("provider failed"));
     }
 
     #[test]

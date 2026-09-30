@@ -36,7 +36,8 @@ use maki_agent::session_options::{
     WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
 };
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
+    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
+    McpSnapshotReader, RunSettings, mcp,
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -101,6 +102,8 @@ use crate::theme::ThemesProvider;
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_OP_TIMEOUT_ERR: &str = "session operation timed out";
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
@@ -539,6 +542,318 @@ fn project_committed_options(runtime: &mut SessionRuntime) {
     project_committed_options_for_app(&mut runtime.app, &snapshot);
 }
 
+fn handle_toggle_session_option(
+    runtime: &mut SessionRuntime,
+    id: &'static str,
+    internal_tx: flume::Sender<InternalEvent>,
+) {
+    if SessionStatus::of(&runtime.app) != SessionStatus::Idle {
+        match id {
+            FAST_OPTION_ID => runtime
+                .app
+                .flash("fast applies when this turn finishes".into()),
+            WORKFLOW_OPTION_ID => runtime
+                .app
+                .flash("workflow applies when this turn finishes".into()),
+            _ => {}
+        }
+    }
+    dispatch_option_toggle(
+        runtime.coordinator.clone(),
+        Arc::clone(&runtime.model_slot),
+        runtime.handles.manager_and_root(),
+        (runtime.id(), id),
+        &internal_tx,
+    );
+}
+
+fn dispatch_mode_change_op(
+    runtime: &SessionRuntime,
+    storage: &StateDir,
+    modes: Arc<maki_agent::ModeRegistry>,
+    internal_tx: flume::Sender<InternalEvent>,
+    id: String,
+    follow_up: Option<String>,
+) {
+    let session = runtime.id();
+    let identity = runtime.handles.identity();
+    let mut plan = runtime.app.state.plan.clone();
+    if id == "plan" {
+        plan.allocate_path(storage);
+    }
+    let mode = match id.as_str() {
+        "build" => maki_agent::AgentMode::Build,
+        "plan" => plan
+            .path()
+            .map(|path| maki_agent::AgentMode::Plan(path.to_path_buf()))
+            .unwrap_or_default(),
+        name => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(name))),
+    };
+    let mode_def = modes.current(&mode);
+    let (manager, root) = runtime.handles.manager_and_root();
+    let reservation = manager
+        .actor(root)
+        .map_err(|error| error.to_string())
+        .and_then(|actor| {
+            actor
+                .reserve_config_update()
+                .map_err(|error| error.to_string())
+        });
+    smol::spawn(async move {
+        let result = match reservation {
+            Ok(reservation) => {
+                match reservation.resolve(Ok(maki_agent::actor::ConfigChange::Mode {
+                    mode,
+                    mode_def: Some(mode_def),
+                })) {
+                    Ok(()) => reservation
+                        .wait()
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let _ = internal_tx.send(InternalEvent::SessionOp {
+            session,
+            runtime: identity,
+            kind: SessionOpKind::ModeChanged {
+                id,
+                plan,
+                follow_up,
+            },
+            result,
+        });
+    })
+    .detach();
+}
+
+fn dispatch_thinking_change(
+    runtime: &SessionRuntime,
+    set_default: bool,
+    thinking: &str,
+    reply_tx: flume::Sender<UiReply>,
+    internal_tx: flume::Sender<InternalEvent>,
+) {
+    let change = match thinking_change(thinking) {
+        Ok(change) => change,
+        Err(error) => {
+            let _ = reply_tx.send(Err(error.into()));
+            return;
+        }
+    };
+    let session = runtime.id();
+    let identity = runtime.handles.identity();
+    let (manager, root) = runtime.handles.manager_and_root();
+    let reservation = manager
+        .actor(root)
+        .map_err(|error| error.to_string())
+        .and_then(|actor| {
+            actor
+                .reserve_config_update()
+                .map_err(|error| error.to_string())
+        });
+    smol::spawn(async move {
+        let mut committed = None;
+        let result = match reservation {
+            Ok(ticket) => match ticket.resolve(Ok(change)) {
+                Ok(()) => ticket
+                    .wait()
+                    .await
+                    .map(|commit| {
+                        committed = Some(commit);
+                    })
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error),
+        };
+        let _ = internal_tx.send(InternalEvent::SessionOp {
+            session,
+            runtime: identity,
+            kind: SessionOpKind::ThinkingSet {
+                commit: committed,
+                set_default,
+                reply_tx,
+            },
+            result,
+        });
+    })
+    .detach();
+}
+
+fn thinking_reply(commit: &maki_agent::actor::ConfigCommit) -> serde_json::Value {
+    json!({ "mode": commit.config.thinking.to_string() })
+}
+
+fn thinking_change(input: &str) -> Result<maki_agent::actor::ConfigChange, &'static str> {
+    if input.trim().is_empty() {
+        Ok(maki_agent::actor::ConfigChange::ToggleThinking)
+    } else {
+        Ok(maki_agent::actor::ConfigChange::Patch(
+            maki_agent::actor::ConfigPatch {
+                thinking: Some(DomainThinkingConfig::parse(
+                    input.trim(),
+                    DomainThinkingConfig::default(),
+                )?),
+                ..Default::default()
+            },
+        ))
+    }
+}
+
+fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::Value {
+    json!({ "spec": config.model.spec(), "id": config.model.id,
+        "provider": config.model.provider.to_string(), "thinking": config.thinking.to_string(),
+        "fast": config.fast, "supports_thinking": config.model.supports_thinking(),
+        "supports_fast": config.model.supports_fast() })
+}
+
+fn project_actor_config(app: &mut App, config: &maki_agent::EffectiveAgentConfig) {
+    app.update_model(&config.model);
+    app.state.thinking = config.thinking;
+    app.state.fast = config.fast;
+    app.state.workflow = config.workflow;
+    let mode = match &config.mode {
+        maki_agent::AgentMode::Build => {
+            app.state.plan = crate::app::mode::PlanState::None;
+            "build".to_owned()
+        }
+        maki_agent::AgentMode::Plan(path) => {
+            if app.state.plan.path() != Some(path.as_path()) {
+                app.state.plan = crate::app::mode::PlanState::Drafting(path.clone());
+            }
+            "plan".to_owned()
+        }
+        maki_agent::AgentMode::Custom(id) => id.to_string(),
+    };
+    app.set_mode_id(mode);
+}
+
+fn complete_option_toggle(app: &mut App, id: &'static str, enabled: bool) {
+    app.apply_toggled_option(id, enabled);
+}
+
+#[cfg(test)]
+fn handle_session_action(
+    runtime: &mut SessionRuntime,
+    action: Action,
+    internal_tx: flume::Sender<InternalEvent>,
+) {
+    if let Action::ToggleSessionOption { id } = action {
+        handle_toggle_session_option(runtime, id, internal_tx);
+    }
+}
+
+fn complete_mode_change(
+    app: &mut App,
+    id: String,
+    plan: crate::app::mode::PlanState,
+    follow_up: Option<String>,
+) -> Vec<Action> {
+    if id == "plan" {
+        app.state.plan = plan;
+    } else if id == "build" {
+        app.state.plan = crate::app::mode::PlanState::None;
+    }
+    app.set_mode_id(id);
+    follow_up.map_or_else(Vec::new, |message| app.start_plan_implementation(message))
+}
+
+fn agent_mode_for_app(app: &App) -> maki_agent::AgentMode {
+    match app.state.mode.id_key().as_str() {
+        "build" => maki_agent::AgentMode::Build,
+        "plan" => app
+            .state
+            .plan
+            .path()
+            .map(|path| maki_agent::AgentMode::Plan(path.to_path_buf()))
+            .unwrap_or_default(),
+        id => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(id))),
+    }
+}
+
+fn reserve_refined_model_updates(
+    sessions: &[SessionRuntime],
+    requested_spec: &str,
+    expected_provider: ProviderIdentity,
+) -> Vec<(MakiId, Result<maki_agent::ConfigUpdateTicket, String>)> {
+    sessions
+        .iter()
+        .filter_map(|runtime| {
+            let current = runtime.model_slot.load();
+            let matches = current.model.spec() == requested_spec
+                && current.provider.identity() == expected_provider;
+            drop(current);
+            if !matches {
+                return None;
+            }
+            let (manager, root) = runtime.handles.manager_and_root();
+            let reservation = manager
+                .actor(root)
+                .map_err(|error| error.to_string())
+                .and_then(|actor| {
+                    actor
+                        .reserve_config_update()
+                        .map_err(|error| error.to_string())
+                });
+            Some((runtime.id(), reservation))
+        })
+        .collect()
+}
+
+fn observe_config_commits(
+    handles: &AgentHandles,
+    model_slot: Arc<ProviderSlot>,
+    coordinator: SessionCoordinatorHandle,
+) -> flume::Receiver<maki_agent::actor::ConfigCommit> {
+    let (manager, root) = handles.manager_and_root();
+    let (ui_tx, ui_rx) = flume::unbounded();
+    if let Ok(actor) = manager.actor(root) {
+        let commits = actor.subscribe_config_commits();
+        let (projection_tx, projection_rx) = flume::unbounded::<maki_agent::actor::ConfigCommit>();
+        if let Some(initial) = actor.config_snapshot() {
+            let _ = projection_tx.send(initial);
+        }
+        smol::spawn(async move {
+            while let Ok(commit) = projection_rx.recv_async().await {
+                match coordinator
+                    .project_committed_config(commit.identity, commit.generation, commit.config)
+                    .await
+                {
+                    Ok(observer) => {
+                        smol::spawn(async move {
+                            let _ = observer.wait().await;
+                        })
+                        .detach();
+                    }
+                    Err(error) => warn!(%error, "configuration projection failed"),
+                }
+            }
+        })
+        .detach();
+        smol::spawn(async move {
+            let mut projected_generation = 0;
+            while let Ok(commit) = commits.recv_async().await {
+                if commit.generation <= projected_generation {
+                    continue;
+                }
+                projected_generation = commit.generation;
+                model_slot.project(
+                    commit.config.model.clone(),
+                    Arc::clone(&commit.config.provider),
+                );
+                let _ = projection_tx.send(commit.clone());
+                let _ = ui_tx.send(commit);
+            }
+        })
+        .detach();
+    }
+    ui_rx
+}
+
 fn apply_options_to_session(session: &mut AppSession, snapshot: &SessionOptionsSnapshot) {
     for option in snapshot.options.iter() {
         let id = option.definition.id.as_ref();
@@ -595,6 +910,8 @@ impl Drop for CoordinatorRetirement {
 
 struct SessionRuntime {
     generation: u64,
+    config_commits: flume::Receiver<maki_agent::actor::ConfigCommit>,
+    projected_config_generation: u64,
     app: App,
     handles: AgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -622,6 +939,7 @@ struct PreparedProvider {
 }
 
 struct PreparedSessionRuntime {
+    storage_writer: Arc<StorageWriter>,
     app: PreparedApp,
     handles: PreparedAgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -664,6 +982,7 @@ impl PreparedSessionRuntime {
         mut session_lock: Option<SessionLockState>,
     ) -> Result<SessionRuntime, SessionCoordinatorError> {
         let Self {
+            storage_writer,
             app,
             handles,
             model_slot,
@@ -683,6 +1002,7 @@ impl PreparedSessionRuntime {
                 return Err(error);
             }
         };
+        storage_writer.bind_config_runtime(coordinator.session_id(), coordinator.runtime_epoch());
         if let Some(provider) = provider {
             startup_model_slot.install(provider.model, provider.provider);
         }
@@ -690,8 +1010,12 @@ impl PreparedSessionRuntime {
         let mut app = app.activate();
         handles.apply_to_app(&mut app);
         app.coordinator = Some(coordinator.clone());
-        Ok(SessionRuntime {
+        let config_commits =
+            observe_config_commits(&handles, Arc::clone(&model_slot), coordinator.clone());
+        let mut runtime = SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
+            config_commits,
+            projected_config_generation: 0,
             app,
             handles,
             model_slot,
@@ -704,7 +1028,9 @@ impl PreparedSessionRuntime {
             session_lock,
             lock_lost: false,
             restore_pending: resumed,
-        })
+        };
+        project_committed_options(&mut runtime);
+        Ok(runtime)
     }
 
     fn activate_replacing(
@@ -715,6 +1041,7 @@ impl PreparedSessionRuntime {
     ) -> std::result::Result<SessionRuntime, (SessionCoordinatorError, Option<SessionLockState>)>
     {
         let Self {
+            storage_writer,
             app,
             handles,
             model_slot,
@@ -735,6 +1062,7 @@ impl PreparedSessionRuntime {
             Ok(coordinator) => coordinator,
             Err(error) => return Err((error, session_lock)),
         };
+        storage_writer.bind_config_runtime(coordinator.session_id(), coordinator.runtime_epoch());
         if let Some(provider) = provider {
             startup_model_slot.install(provider.model, provider.provider);
         }
@@ -742,8 +1070,12 @@ impl PreparedSessionRuntime {
         let mut app = app.activate();
         handles.apply_to_app(&mut app);
         app.coordinator = Some(coordinator.clone());
-        Ok(SessionRuntime {
+        let config_commits =
+            observe_config_commits(&handles, Arc::clone(&model_slot), coordinator.clone());
+        let mut runtime = SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
+            config_commits,
+            projected_config_generation: 0,
             app,
             handles,
             model_slot,
@@ -756,7 +1088,9 @@ impl PreparedSessionRuntime {
             session_lock,
             lock_lost: false,
             restore_pending: resumed,
-        })
+        };
+        project_committed_options(&mut runtime);
+        Ok(runtime)
     }
 }
 
@@ -825,6 +1159,26 @@ fn replace_session_runtime(
 }
 
 impl SessionRuntime {
+    fn project_config(&mut self, commit: &maki_agent::actor::ConfigCommit) -> bool {
+        let (manager, root) = self.handles.manager_and_root();
+        let Ok(actor) = manager.actor(root) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&actor.identity(), &commit.identity)
+            || commit.generation < self.projected_config_generation
+        {
+            return false;
+        }
+        self.projected_config_generation = commit.generation;
+        project_actor_config(&mut self.app, &commit.config);
+        true
+    }
+
+    fn config(&self) -> Option<Arc<maki_agent::EffectiveAgentConfig>> {
+        let (manager, root) = self.handles.manager_and_root();
+        manager.actor(root).ok()?.effective_config()
+    }
+
     fn id(&self) -> MakiId {
         self.app.state.session.id
     }
@@ -866,8 +1220,13 @@ impl SessionRuntime {
     }
 }
 
+type PrepareProvider = Arc<
+    dyn Fn(Model, Timeouts) -> Result<maki_agent::actor::PreparedModel, Arc<str>> + Send + Sync,
+>;
+
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
+    prepare_provider: PrepareProvider,
     storage: StateDir,
     sessions_dir: PathBuf,
     config: AgentConfig,
@@ -1045,12 +1404,11 @@ fn prepare_coordinator_with_mailbox<H: CoordinatorHandles>(
         model_adopter: Arc::new({
             let model_slot = Arc::clone(model_slot);
             let timeouts = deps.timeouts;
-            move |mut model: Model| {
+            move |model: Model| {
                 let model_slot = Arc::clone(&model_slot);
                 Box::pin(async move {
-                    let provider = from_model(&mut model, timeouts)
-                        .map_err(|error| Arc::from(error.to_string()))?;
-                    model_slot.install(model, Arc::from(provider));
+                    let prepared = prepare_provider(model, timeouts)?;
+                    model_slot.install(prepared.model, prepared.provider);
                     Ok(())
                 }) as ModelAdoptionFuture
             }
@@ -1169,11 +1527,12 @@ impl SpawnCtx {
         {
             return Ok(None);
         }
-        let mut model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
-        let provider = from_model(&mut model, self.timeouts).map_err(|error| error.to_string())?;
+        let model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
+        let prepared =
+            (self.prepare_provider)(model, self.timeouts).map_err(|error| error.to_string())?;
         Ok(Some(PreparedProvider {
-            model,
-            provider: Arc::from(provider),
+            model: prepared.model,
+            provider: prepared.provider,
         }))
     }
 
@@ -1223,8 +1582,51 @@ impl SpawnCtx {
         let permissions = Arc::new(permissions.fork());
         permissions.set_session_yolo(session.meta.yolo);
         permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
+        let mut app = App::prepare(
+            &model,
+            session.clone(),
+            self.storage.clone(),
+            Arc::clone(&self.available_models),
+            self.mcp_handle
+                .as_ref()
+                .map(McpHandle::reader)
+                .unwrap_or_else(McpSnapshotReader::empty),
+            self.mcp_config_errors.clone(),
+            self.keymap_reader.clone(),
+            self.hint_reader.clone(),
+            self.status_content_reader.clone(),
+            Arc::clone(&self.storage_writer),
+            self.ui_config.clone(),
+            self.input_history_size,
+            Arc::clone(&permissions),
+            self.lua_event_handle.clone(),
+            Arc::clone(&self.model_policy),
+            crate::theme::default_provider().clone(),
+            Arc::clone(&self.command_runtime),
+        );
+        let initial_mode = agent_mode_for_app(&app.app);
+        let initial_mode_def = self
+            .lua_event_handle
+            .mode_registry()
+            .get(&initial_mode.id());
+        let initial_config = maki_agent::EffectiveAgentConfig::new(
+            RunSettings {
+                provider: Arc::clone(&model_slot.load().provider) as Arc<dyn Provider>,
+                model: model.clone(),
+                thinking: crate::app::session_state::resolve_thinking(
+                    &session,
+                    &model,
+                    &self.storage,
+                ),
+                fast: session.meta.fast && model.supports_fast(),
+                workflow: session.meta.workflow,
+            },
+            initial_mode,
+        )
+        .with_mode_def(initial_mode_def);
         let handles = AgentHandles::prepare(
             &model_slot,
+            initial_config,
             history.clone(),
             self.config.clone(),
             self.ui_config.tool_output_lines,
@@ -1250,28 +1652,10 @@ impl SpawnCtx {
         )?;
         let seed_snapshot =
             seed_snapshot.then(|| (Arc::clone(&self.storage_writer), Arc::new(session.clone())));
-        let mut app = App::prepare(
-            &model,
-            session,
-            self.storage.clone(),
-            Arc::clone(&self.available_models),
-            handles.mcp_reader(),
-            self.mcp_config_errors.clone(),
-            self.keymap_reader.clone(),
-            self.hint_reader.clone(),
-            self.status_content_reader.clone(),
-            Arc::clone(&self.storage_writer),
-            self.ui_config.clone(),
-            self.input_history_size,
-            permissions,
-            self.lua_event_handle.clone(),
-            Arc::clone(&self.model_policy),
-            crate::theme::default_provider().clone(),
-            Arc::clone(&self.command_runtime),
-        );
         app.app.trust_question = self.trust_question.clone();
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         Ok(PreparedSessionRuntime {
+            storage_writer: Arc::clone(&self.storage_writer),
             app,
             handles,
             model_slot,
@@ -1311,6 +1695,11 @@ enum InternalEvent {
         model: Model,
         provider: Arc<dyn Provider>,
     },
+    ModelCandidateReconciled {
+        session: MakiId,
+        runtime: Arc<()>,
+        result: Result<(), String>,
+    },
     ProviderUsageFetched {
         fetch_id: ProviderUsageFetchId,
         provider: ProviderIdentity,
@@ -1320,6 +1709,7 @@ enum InternalEvent {
     /// finished. See [`SessionOpKind`] for why they cannot run inline.
     SessionOp {
         session: MakiId,
+        runtime: Arc<()>,
         kind: SessionOpKind,
         result: Result<(), String>,
     },
@@ -1336,10 +1726,17 @@ enum InternalEvent {
 enum SessionOpKind {
     /// `/model` from a keybinding or command: apply the adopted model.
     ModelChanged { spec: String },
+    /// OAuth refresh rebuilt the focused model's provider without changing its spec.
+    ProviderRefreshed,
     /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
     OptionToggled {
         id: &'static str,
         committed: Arc<std::sync::Mutex<Option<bool>>>,
+    },
+    ModeChanged {
+        id: String,
+        plan: crate::app::mode::PlanState,
+        follow_up: Option<String>,
     },
     /// `/cd`: apply the canonical path the coordinator resolved, which is not
     /// necessarily the one that was typed.
@@ -1348,15 +1745,22 @@ enum SessionOpKind {
     },
     /// `maki.session.set_thinking` from Lua, which owes its caller a reply.
     ThinkingSet {
-        thinking: DomainThinkingConfig,
+        commit: Option<maki_agent::actor::ConfigCommit>,
         set_default: bool,
         reply_tx: flume::Sender<UiReply>,
     },
     /// `maki.model.set` from Lua, which owes its caller a reply.
     ModelSet {
+        commit: Option<maki_agent::actor::ConfigCommit>,
         spec: Option<String>,
-        thinking: Option<DomainThinkingConfig>,
-        fast: Option<bool>,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    /// Lua session option mutation and its reply.
+    LuaOptionSet { reply_tx: flume::Sender<UiReply> },
+    /// Lua mode transition, committed to the app after the actor accepts it.
+    LuaModeSet {
+        id: String,
+        plan_path: Option<PathBuf>,
         reply_tx: flume::Sender<UiReply>,
     },
 }
@@ -1613,6 +2017,7 @@ impl<'t> EventLoop<'t> {
         let (mcp_handle, mcp_config_errors) =
             smol::block_on(mcp::start(&cwd, project_config.clone()));
         let ctx = SpawnCtx {
+            prepare_provider: Arc::new(prepare_provider),
             storage,
             sessions_dir: sessions_dir.clone(),
             config,
@@ -1846,25 +2251,117 @@ impl<'t> EventLoop<'t> {
                     && current.provider.identity() == expected_provider;
                 drop(current);
                 if still_current {
+                    // Reserve first: otherwise an actor can admit a turn with
+                    // the old policy after its provider slot has been refined.
+                    let updates = reserve_refined_model_updates(
+                        &self.sessions,
+                        &requested_spec,
+                        expected_provider,
+                    );
                     self.ctx
                         .model_slot
                         .install(model.clone(), Arc::clone(&provider));
-                    // Sessions spawned before the fetch resolved copied the
-                    // unrefined startup model; hand them the resolved one so
-                    // context windows and capabilities are not left stale.
-                    for rt in &mut self.sessions {
-                        if rt.model_slot.load().model.spec() == requested_spec {
-                            rt.model_slot.install(model.clone(), Arc::clone(&provider));
-                            rt.app.update_model(&model);
+                    for (session, reservation) in updates {
+                        let Some(idx) = self.position(session) else {
+                            continue;
+                        };
+                        match reservation {
+                            Ok(reservation) => {
+                                let rt = &self.sessions[idx];
+                                let identity = rt.handles.identity();
+                                let (manager, root) = rt.handles.manager_and_root();
+                                let Some(expected) = manager
+                                    .actor(root)
+                                    .ok()
+                                    .and_then(|actor| actor.effective_config())
+                                else {
+                                    let _ = reservation.cancel();
+                                    continue;
+                                };
+                                let change = maki_agent::actor::ConfigChange::Refresh {
+                                    expected: maki_agent::actor::PreparedModel {
+                                        provider: Arc::clone(&expected.provider),
+                                        model: expected.model.clone(),
+                                    },
+                                    replacement: maki_agent::actor::PreparedModel {
+                                        provider: Arc::clone(&provider),
+                                        model: model.clone(),
+                                    },
+                                };
+                                let internal_tx = self.internal_tx.clone();
+                                smol::spawn(async move {
+                                    let result = reservation
+                                        .resolve(Ok(change))
+                                        .map_err(|error| error.to_string());
+                                    let result = match result {
+                                        Ok(()) => reservation
+                                            .wait()
+                                            .await
+                                            .map(|_| ())
+                                            .map_err(|error| error.to_string()),
+                                        Err(error) => Err(error),
+                                    };
+                                    let _ =
+                                        internal_tx.send(InternalEvent::ModelCandidateReconciled {
+                                            session,
+                                            runtime: identity,
+                                            result,
+                                        });
+                                })
+                                .detach();
+                            }
+                            Err(error) => {
+                                let _ = self.internal_tx.send(
+                                    InternalEvent::ModelCandidateReconciled {
+                                        session,
+                                        runtime: self.sessions[idx].handles.identity(),
+                                        result: Err(error),
+                                    },
+                                );
+                            }
                         }
                     }
                 }
             }
+            InternalEvent::ModelCandidateReconciled {
+                session,
+                runtime,
+                result,
+            } => {
+                if let Err(error) = result {
+                    if let Some(idx) = self.position(session).filter(|idx| {
+                        Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity())
+                    }) {
+                        self.sessions[idx]
+                            .app
+                            .flash(format!("failed to reconcile refined model policy: {error}"));
+                    }
+                    warn!(%session, %error, "failed to reconcile refined model policy");
+                }
+            }
             InternalEvent::SessionOp {
                 session,
+                runtime,
                 kind,
                 result,
-            } => self.handle_session_op(session, kind, result),
+            } => {
+                let current = self.position(session).is_some_and(|idx| {
+                    Arc::ptr_eq(&runtime, &self.sessions[idx].handles.identity())
+                });
+                if current {
+                    self.handle_session_op(session, kind, result);
+                } else {
+                    match kind {
+                        SessionOpKind::ModelSet { reply_tx, .. }
+                        | SessionOpKind::ThinkingSet { reply_tx, .. }
+                        | SessionOpKind::LuaOptionSet { reply_tx }
+                        | SessionOpKind::LuaModeSet { reply_tx, .. } => {
+                            let _ = reply_tx.send(Err(NOT_LIVE_ERR.into()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             InternalEvent::ProviderUsageFetched {
                 fetch_id,
                 provider,
@@ -2009,6 +2506,11 @@ impl<'t> EventLoop<'t> {
         }
         let mut login_actions: Vec<(usize, Vec<Action>)> = Vec::new();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
+            while let Ok(commit) = rt.config_commits.try_recv() {
+                if rt.project_config(&commit) {
+                    dirty = Dirty::YES;
+                }
+            }
             let (session_dirty, actions) = tick_session(&mut rt.app, i == self.focused, now);
             dirty |= session_dirty;
             if !actions.is_empty() {
@@ -2094,7 +2596,15 @@ impl<'t> EventLoop<'t> {
     fn handle_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::SetMode { id } => {
-                self.focused_app().set_mode_id(id);
+                if id == self.focused_app().state.mode.id_key() {
+                    return;
+                }
+                let idx = self.focused;
+                self.dispatch_lua_mode_set(
+                    Some(self.sessions[idx].id().to_string()),
+                    id,
+                    flume::bounded(1).0,
+                );
             }
             UiAction::GetMode { reply_tx } => {
                 let id = self.focused_app().state.mode.id_key();
@@ -2489,6 +2999,17 @@ impl<'t> EventLoop<'t> {
     /// loop, which owns the live runtimes.
     fn handle_session_request(&mut self, req: SessionRequest, reply_tx: flume::Sender<UiReply>) {
         match req {
+            SessionRequest::SetOption {
+                session,
+                id,
+                value,
+                version,
+            } => {
+                self.dispatch_lua_option_set(session, id, value, version, reply_tx);
+            }
+            SessionRequest::SetMode { session, id } => {
+                self.dispatch_lua_mode_set(session, id, reply_tx);
+            }
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
                 let cwd = self.session_cwd.clone();
@@ -2627,14 +3148,27 @@ impl<'t> EventLoop<'t> {
                 })();
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::Options { session } => {
+                let reply = self.resolve_session_index(Some(&session)).and_then(|idx| {
+                    let config = self.sessions[idx].config().ok_or(NOT_LIVE_ERR)?;
+                    Ok(json!({ "model": config.model.spec(), "thinking": config.thinking.to_string(),
+                        "fast": if config.fast { "enabled" } else { "disabled" },
+                        "workflow": if config.workflow { "enabled" } else { "disabled" } }))
+                });
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::GetThinking => {
-                let app = &self.sessions[self.focused].app;
                 let options = maki_domain::THINKING_OPTIONS.to_vec();
-                let reply = Ok(json!({
-                    "mode": app.state.thinking.to_string(),
-                    "supports_thinking": app.state.model.supports_thinking(),
-                    "options": options,
-                }));
+                let reply = self.sessions[self.focused]
+                    .config()
+                    .map(|config| {
+                        json!({
+                            "mode": config.thinking.to_string(),
+                            "supports_thinking": config.model.supports_thinking(),
+                            "options": options,
+                        })
+                    })
+                    .ok_or_else(|| NOT_LIVE_ERR.to_owned());
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::SetThinking {
@@ -2644,11 +3178,133 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    fn dispatch_lua_option_set(
+        &self,
+        session: String,
+        id: String,
+        value: String,
+        version: u64,
+        reply_tx: flume::Sender<UiReply>,
+    ) {
+        let idx = match parse_session_id(&session).and_then(|id| {
+            self.position(id)
+                .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
+        }) {
+            Ok(idx) => idx,
+            Err(error) => {
+                let _ = reply_tx.send(Err(error));
+                return;
+            }
+        };
+        let session = self.sessions[idx].id();
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        dispatch_lua_option_set(
+            session,
+            id,
+            value,
+            version,
+            self.sessions[idx].coordinator.clone(),
+            self.ctx.timeouts,
+            (manager, root),
+            Arc::clone(&self.ctx.model_policy),
+            self.internal_tx.clone(),
+            reply_tx,
+        );
+    }
+
+    fn dispatch_lua_mode_set(
+        &self,
+        session: Option<String>,
+        id: String,
+        reply_tx: flume::Sender<UiReply>,
+    ) {
+        let idx = match self.resolve_session_index(session.as_deref()) {
+            Ok(idx) => idx,
+            Err(error) => {
+                let _ = reply_tx.send(Err(error));
+                return;
+            }
+        };
+        let mode = match id.as_str() {
+            "build" => maki_agent::AgentMode::Build,
+            "plan" => {
+                let mut plan = self.sessions[idx].app.state.plan.clone();
+                plan.allocate_path(&self.ctx.storage);
+                plan.path()
+                    .map(|path| maki_agent::AgentMode::Plan(path.to_path_buf()))
+                    .unwrap_or_default()
+            }
+            name => maki_agent::AgentMode::Custom(maki_agent::ModeId::Custom(Arc::from(name))),
+        };
+        let mode_def = self.ctx.lua_event_handle.mode_registry().current(&mode);
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        let reservation = manager
+            .actor(root)
+            .map_err(|error| error.to_string())
+            .and_then(|actor| {
+                actor
+                    .reserve_config_update()
+                    .map_err(|error| error.to_string())
+            });
+        let session = self.sessions[idx].id();
+        let identity = self.sessions[idx].handles.identity();
+        let internal_tx = self.internal_tx.clone();
+        let plan_path = if id == "plan" {
+            mode.plan_path().map(PathBuf::from)
+        } else {
+            None
+        };
+        let plan_path_for_state = plan_path.clone();
+        smol::spawn(async move {
+            let result = match reservation {
+                Ok(reservation) => {
+                    match reservation.resolve(Ok(maki_agent::actor::ConfigChange::Mode {
+                        mode,
+                        mode_def: Some(mode_def),
+                    })) {
+                        Ok(()) => reservation
+                            .wait()
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                runtime: identity,
+                kind: SessionOpKind::LuaModeSet {
+                    id,
+                    plan_path: plan_path_for_state,
+                    reply_tx,
+                },
+                result,
+            });
+        })
+        .detach();
+    }
+
+    fn dispatch_mode_change(&self, idx: usize, id: String, follow_up: Option<String>) {
+        dispatch_mode_change_op(
+            &self.sessions[idx],
+            &self.ctx.storage,
+            self.ctx.lua_event_handle.mode_registry(),
+            self.internal_tx.clone(),
+            id,
+            follow_up,
+        );
+    }
+
     /// Lua acts on the focused session, the same target the model picker and
     /// `/thinking` write to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
         match req {
-            ModelRequest::Get => Ok(self.focused_app().model_state()),
+            ModelRequest::Get => self.sessions[self.focused]
+                .config()
+                .map(|config| config_model_state(&config))
+                .ok_or_else(|| NOT_LIVE_ERR.into()),
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
@@ -2660,47 +3316,18 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// `maki.session.set_thinking`: the coordinator owns thinking, so the value
-    /// is resolved here -- empty input toggles, which only the current value
-    /// can answer -- and committed there before any of it reaches the app.
     fn dispatch_thinking_set(
         &mut self,
         set_default: bool,
         thinking: &str,
         reply_tx: flume::Sender<UiReply>,
     ) {
-        let idx = self.focused;
-        let app = &self.sessions[idx].app;
-        if !app.state.model.supports_thinking() {
-            let _ = reply_tx.send(Err(crate::app::THINKING_UNSUPPORTED_MSG.to_owned()));
-            return;
-        }
-        let resolved = match DomainThinkingConfig::parse(thinking.trim(), app.state.thinking) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = reply_tx.send(Err(error.to_owned()));
-                return;
-            }
-        };
-        let coordinator = self.sessions[idx].coordinator.clone();
-        let value = resolved.to_string();
-        self.dispatch_session_op(
-            idx,
-            SessionOpKind::ThinkingSet {
-                thinking: resolved,
-                set_default,
-                reply_tx,
-            },
-            async move {
-                coordinator
-                    .set_option(
-                        maki_agent::session_options::THINKING_OPTION_ID,
-                        value.as_str(),
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            },
+        dispatch_thinking_change(
+            &self.sessions[self.focused],
+            set_default,
+            thinking,
+            reply_tx,
+            self.internal_tx.clone(),
         );
     }
 
@@ -2714,13 +3341,12 @@ impl<'t> EventLoop<'t> {
         reply_tx: flume::Sender<UiReply>,
     ) {
         let idx = self.focused;
-        // Relative input ("" toggles) can only be read against the value the
-        // session is on, so it is resolved here and the coordinator is handed
-        // a concrete setting.
+        let toggle_thinking = thinking
+            .as_ref()
+            .is_some_and(|input| input.trim().is_empty());
         let thinking = match thinking
-            .map(|input| {
-                DomainThinkingConfig::parse(input.trim(), self.sessions[idx].app.state.thinking)
-            })
+            .filter(|_| !toggle_thinking)
+            .map(|input| DomainThinkingConfig::parse(input.trim(), DomainThinkingConfig::default()))
             .transpose()
         {
             Ok(thinking) => thinking,
@@ -2729,24 +3355,78 @@ impl<'t> EventLoop<'t> {
                 return;
             }
         };
-        let coordinator = self.sessions[idx].coordinator.clone();
-        let op_spec = spec.as_deref().map(Arc::from);
-        self.dispatch_session_op(
-            idx,
-            SessionOpKind::ModelSet {
-                spec,
-                thinking,
-                fast,
-                reply_tx,
-            },
-            async move {
-                coordinator
-                    .set_model(op_spec, fast, thinking)
-                    .await
-                    .map(|_| ())
+        if spec.is_some() {
+            self.note_if_deferred(idx, "model");
+        }
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        let reservation = manager
+            .actor(root)
+            .map_err(|error| error.to_string())
+            .and_then(|actor| {
+                actor
+                    .reserve_config_update()
                     .map_err(|error| error.to_string())
-            },
-        );
+            });
+        let session = self.sessions[idx].id();
+        let identity = self.sessions[idx].handles.identity();
+        let internal_tx = self.internal_tx.clone();
+        let policy = Arc::clone(&self.ctx.model_policy);
+        let timeouts = self.ctx.timeouts;
+        smol::spawn(async move {
+            let mut committed = None;
+            let result = match reservation {
+                Ok(reservation) => {
+                    let requested_spec = spec.clone();
+                    prepare_config_change(
+                        reservation,
+                        async move {
+                            let model = smol::unblock(move || {
+                                requested_spec
+                                    .map(|spec| {
+                                        if !policy.allows(&spec) {
+                                            return Err(format!("model is not allowed: {spec}"));
+                                        }
+                                        let model = Model::from_spec(&spec)
+                                            .map_err(|error| error.to_string())?;
+                                        prepare_provider(model, timeouts)
+                                            .map_err(|error| error.to_string())
+                                    })
+                                    .transpose()
+                            })
+                            .await?;
+                            Ok(maki_agent::actor::ConfigChange::Patch(
+                                maki_agent::actor::ConfigPatch {
+                                    model,
+                                    thinking,
+                                    toggle_thinking,
+                                    fast,
+                                    ..Default::default()
+                                },
+                            ))
+                        },
+                        async {
+                            smol::Timer::after(SESSION_OP_TIMEOUT).await;
+                        },
+                    )
+                    .await
+                    .map(|commit| {
+                        committed = Some(commit);
+                    })
+                }
+                Err(error) => Err(error),
+            };
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                runtime: identity,
+                kind: SessionOpKind::ModelSet {
+                    commit: committed,
+                    spec,
+                    reply_tx,
+                },
+                result,
+            });
+        })
+        .detach();
     }
 
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
@@ -2784,6 +3464,8 @@ impl<'t> EventLoop<'t> {
             cwd: app.state.session.cwd.clone(),
             title: Some(app.state.session.title.clone()),
             model: app.state.model.spec(),
+            fast: app.state.fast,
+            thinking: app.state.thinking.to_string(),
             mode: if app.state.mode == crate::app::mode::Mode::Plan {
                 MODE_PLAN
             } else {
@@ -2800,7 +3482,15 @@ impl<'t> EventLoop<'t> {
             context_window: app.state.model.context_window,
             cost: app.state.cost,
         };
-        serde_json::to_value(snapshot).unwrap_or_default()
+        let mut value = serde_json::to_value(snapshot).unwrap_or_default();
+        if let Some(config) = rt.config() {
+            value["model"] = json!(config.model.spec());
+            value["fast"] = json!(config.fast);
+            value["thinking"] = json!(config.thinking.to_string());
+            value["mode"] = json!(config.mode.id().to_string());
+            value["context_window"] = json!(config.model.context_window);
+        }
+        value
     }
 
     /// The single place that removes a runtime: keeps `focused` pointing at
@@ -3138,12 +3828,9 @@ impl<'t> EventLoop<'t> {
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
-            Action::ToggleSessionOption { id } => dispatch_option_toggle(
-                self.sessions[idx].coordinator.clone(),
-                self.sessions[idx].id(),
-                id,
-                &self.internal_tx,
-            ),
+            Action::ToggleSessionOption { id } => {
+                handle_toggle_session_option(&mut self.sessions[idx], id, self.internal_tx.clone());
+            }
             Action::ChangeDirectory(path) => {
                 self.note_if_deferred(idx, "cd");
                 let coordinator = self.sessions[idx].coordinator.clone();
@@ -3163,6 +3850,10 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
+            Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode, None),
+            Action::ImplementPlan(text) => {
+                self.dispatch_mode_change(idx, "build".into(), Some(text));
+            }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
@@ -3249,11 +3940,13 @@ impl<'t> EventLoop<'t> {
         F: std::future::Future<Output = Result<(), String>> + Send + 'static,
     {
         let session = self.sessions[idx].id();
+        let identity = self.sessions[idx].handles.identity();
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
             let result = op.await;
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
+                runtime: identity,
                 kind,
                 result,
             });
@@ -3282,7 +3975,9 @@ impl<'t> EventLoop<'t> {
         let Some(idx) = self.position(session) else {
             match kind {
                 SessionOpKind::ModelSet { reply_tx, .. }
-                | SessionOpKind::ThinkingSet { reply_tx, .. } => {
+                | SessionOpKind::ThinkingSet { reply_tx, .. }
+                | SessionOpKind::LuaOptionSet { reply_tx }
+                | SessionOpKind::LuaModeSet { reply_tx, .. } => {
                     let _ = reply_tx.send(Err(NOT_LIVE_ERR.to_owned()));
                 }
                 _ => {}
@@ -3292,17 +3987,38 @@ impl<'t> EventLoop<'t> {
         match kind {
             SessionOpKind::ModelChanged { spec } => match result {
                 Ok(()) => self.apply_model_change(idx, &spec),
-                Err(error) => self.sessions[idx].app.flash(error),
+                Err(error) => {
+                    let model = self.sessions[idx].model_slot.load().model.clone();
+                    self.sessions[idx].app.update_model(&model);
+                    self.sessions[idx].app.flash(error);
+                }
             },
+            SessionOpKind::ProviderRefreshed => {
+                if let Err(error) = result {
+                    self.sessions[idx].app.flash(error);
+                }
+            }
             SessionOpKind::OptionToggled { id, committed } => match result {
                 Ok(()) => {
-                    let enabled = committed
+                    if let Some(enabled) = committed
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
-                        .take();
-                    if let Some(enabled) = enabled {
-                        self.sessions[idx].app.apply_toggled_option(id, enabled);
+                        .take()
+                    {
+                        complete_option_toggle(&mut self.sessions[idx].app, id, enabled);
                     }
+                }
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
+            SessionOpKind::ModeChanged {
+                id,
+                plan,
+                follow_up,
+            } => match result {
+                Ok(()) => {
+                    let actions =
+                        complete_mode_change(&mut self.sessions[idx].app, id, plan, follow_up);
+                    self.dispatch(idx, actions);
                 }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
@@ -3316,11 +4032,14 @@ impl<'t> EventLoop<'t> {
                 Err(error) => self.sessions[idx].app.flash(format!("cd: {error}")),
             },
             SessionOpKind::ThinkingSet {
-                thinking,
+                commit,
                 set_default,
                 reply_tx,
             } => {
                 let reply = result.and_then(|()| {
+                    let commit = commit.ok_or("missing committed thinking configuration")?;
+                    let thinking = commit.config.thinking;
+                    self.sessions[idx].project_config(&commit);
                     if set_default {
                         write_prefs(
                             &self.ctx.storage,
@@ -3331,33 +4050,62 @@ impl<'t> EventLoop<'t> {
                         .map_err(|error| error.to_string())?;
                     }
                     let app = &mut self.sessions[idx].app;
-                    app.state.thinking = thinking;
                     let mode = thinking.to_string();
-                    app.flash(format!("Thinking: {mode}"));
-                    Ok(json!({ "mode": mode }))
+                    if SessionStatus::of(app) == SessionStatus::Idle {
+                        app.flash(format!("Thinking: {mode}"));
+                    } else {
+                        app.flash("thinking applies when this turn finishes".into());
+                    }
+                    Ok(thinking_reply(&commit))
                 });
                 let _ = reply_tx.send(reply);
             }
             SessionOpKind::ModelSet {
+                commit,
                 spec,
-                thinking,
-                fast,
                 reply_tx,
             } => {
                 let reply = result.and_then(|()| {
-                    if let Some(spec) = &spec {
-                        self.apply_model_change(idx, spec);
-                    }
-                    if let Some(thinking) = thinking {
-                        self.sessions[idx].app.state.thinking = thinking;
-                    }
-                    if let Some(fast) = fast {
-                        self.sessions[idx].app.set_fast(fast)?;
-                    }
-                    Ok(self.sessions[idx].app.model_state())
+                    let commit = commit.ok_or("missing committed model configuration")?;
+                    let rt = &mut self.sessions[idx];
+                    rt.project_config(&commit);
+                    if let Some(spec) = &spec { rt.app.record_recent_model(spec); }
+                    let config = &commit.config;
+                    Ok(json!({
+                        "spec": config.model.spec(), "id": config.model.id,
+                        "provider": config.model.provider.to_string(), "thinking": config.thinking.to_string(),
+                        "fast": config.fast, "supports_thinking": config.model.supports_thinking(),
+                        "supports_fast": config.model.supports_fast(),
+                    }))
                 });
                 let _ = reply_tx.send(reply);
             }
+            SessionOpKind::LuaOptionSet { reply_tx } => {
+                let _ = reply_tx.send(result.map(|()| json!(true)));
+            }
+            SessionOpKind::LuaModeSet {
+                id,
+                plan_path,
+                reply_tx,
+            } => {
+                let reply = result.map(|()| {
+                    let app = &mut self.sessions[idx].app;
+                    if let Some(path) = plan_path {
+                        app.state.plan = crate::app::mode::PlanState::Drafting(path);
+                    }
+                    app.set_mode_id(id);
+                    json!(true)
+                });
+                let _ = reply_tx.send(reply);
+            }
+        }
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        if let Some(commit) = manager
+            .actor(root)
+            .ok()
+            .and_then(|actor| actor.config_snapshot())
+        {
+            self.sessions[idx].project_config(&commit);
         }
     }
 
@@ -3419,16 +4167,83 @@ impl<'t> EventLoop<'t> {
     }
 
     fn change_model(&mut self, idx: usize, spec: &str) {
-        let coordinator = self.sessions[idx].coordinator.clone();
-        let spec = spec.to_owned();
-        let op_spec = spec.clone();
-        self.dispatch_session_op(idx, SessionOpKind::ModelChanged { spec }, async move {
-            coordinator
-                .set_option("model", op_spec.as_str())
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
+        self.note_if_deferred(idx, "model");
+        self.dispatch_prepared_model(idx, spec.to_owned(), false);
+    }
+
+    fn dispatch_prepared_model(&self, idx: usize, spec: String, refresh: bool) {
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        let actor = manager.actor(root).map_err(|error| error.to_string());
+        let reserved = actor.and_then(|actor| {
+            let expected = actor
+                .effective_config()
+                .ok_or("missing actor configuration")?;
+            let ticket = actor
+                .reserve_config_update()
+                .map_err(|error| error.to_string())?;
+            Ok((ticket, expected))
         });
+        let session = self.sessions[idx].id();
+        let identity = self.sessions[idx].handles.identity();
+        let internal_tx = self.internal_tx.clone();
+        let timeouts = self.ctx.timeouts;
+        let policy = Arc::clone(&self.ctx.model_policy);
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        smol::spawn(async move {
+            let result = match reserved {
+                Ok((ticket, expected)) => {
+                    let requested = spec.clone();
+                    prepare_config_change(
+                        ticket,
+                        async move {
+                            let replacement = smol::unblock(move || {
+                                if !policy.allows(&requested) {
+                                    return Err(format!("model is not allowed: {requested}"));
+                                }
+                                let model = Model::from_spec(&requested)
+                                    .map_err(|error| error.to_string())?;
+                                prepare(model, timeouts).map_err(|error| error.to_string())
+                            })
+                            .await?;
+                            Ok(if refresh {
+                                maki_agent::actor::ConfigChange::Refresh {
+                                    expected: maki_agent::actor::PreparedModel {
+                                        provider: Arc::clone(&expected.provider),
+                                        model: expected.model.clone(),
+                                    },
+                                    replacement,
+                                }
+                            } else {
+                                maki_agent::actor::ConfigChange::Patch(
+                                    maki_agent::actor::ConfigPatch {
+                                        model: Some(replacement),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                        },
+                        async {
+                            smol::Timer::after(SESSION_OP_TIMEOUT).await;
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                }
+                Err(error) => Err(error),
+            };
+            let kind = if refresh {
+                SessionOpKind::ProviderRefreshed
+            } else {
+                SessionOpKind::ModelChanged { spec }
+            };
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                runtime: identity,
+                kind,
+                result,
+            });
+        })
+        .detach();
     }
 
     fn refresh_models(&self) {
@@ -3448,14 +4263,11 @@ impl<'t> EventLoop<'t> {
     }
 
     fn refresh_provider(&mut self, slug: String) {
+        let idx = self.focused;
         let slot = Arc::clone(self.focused_model_slot());
-        let mut model = slot.load().model.clone();
+        let model = slot.load().model.clone();
         if model.provider.to_string() == slug {
-            if let Ok(provider) =
-                maki_providers::provider::from_model(&mut model, self.ctx.timeouts)
-            {
-                slot.install(model, Arc::from(provider));
-            }
+            self.dispatch_prepared_model(idx, model.spec(), true);
         } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
             self.change_model(self.focused, builtin.default_model);
         }
@@ -3640,6 +4452,48 @@ fn provider_usage_limit(limit: maki_providers::UsageLimit) -> ProviderUsageLimit
     }
 }
 
+async fn prepare_config_change<F, E>(
+    ticket: maki_agent::ConfigUpdateTicket,
+    prepare: F,
+    expiry: E,
+) -> Result<maki_agent::actor::ConfigCommit, String>
+where
+    F: std::future::Future<Output = Result<maki_agent::actor::ConfigChange, String>>,
+    E: std::future::Future<Output = ()>,
+{
+    futures_lite::future::or(
+        async {
+            let change = prepare.await.inspect_err(|_| {
+                let _ = ticket.cancel();
+            })?;
+            ticket
+                .resolve(Ok(change))
+                .map_err(|error| error.to_string())?;
+            ticket.wait().await.map_err(|error| error.to_string())
+        },
+        async {
+            expiry.await;
+            match ticket.expire().map_err(|error| error.to_string())? {
+                Some(commit) => Ok(commit),
+                None => Err(maki_agent::ActorError::ConfigExpired.to_string()),
+            }
+        },
+    )
+    .await
+}
+
+fn prepare_provider(
+    mut model: Model,
+    timeouts: Timeouts,
+) -> Result<maki_agent::actor::PreparedModel, Arc<str>> {
+    let provider =
+        from_model(&mut model, timeouts).map_err(|error| Arc::from(error.to_string()))?;
+    Ok(maki_agent::actor::PreparedModel {
+        provider: Arc::from(provider),
+        model,
+    })
+}
+
 fn command_target_index(
     targets: impl IntoIterator<Item = maki_commands::InvocationTargetId>,
     target: maki_commands::InvocationTargetId,
@@ -3657,25 +4511,269 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+async fn bounded_session_op<T, F>(op: F, timeout: Duration) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    futures_lite::future::or(op, async move {
+        smol::Timer::after(timeout).await;
+        Err(SESSION_OP_TIMEOUT_ERR.to_owned())
+    })
+    .await
+}
+
+#[cfg(test)]
+async fn bounded_reserved_session_op<T, F>(
+    reservation: &maki_agent::ConfigUpdateTicket,
+    op: F,
+    timeout: Duration,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let result = bounded_session_op(op, timeout).await;
+    if result.is_err() {
+        let _ = reservation.cancel();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_lua_option_set(
+    session: MakiId,
+    id: String,
+    value: String,
+    version: u64,
+    coordinator: SessionCoordinatorHandle,
+    timeouts: Timeouts,
+    actor: (maki_agent::AgentManagerHandle, maki_agent::AgentId),
+    model_policy: Arc<ModelPolicy>,
+    internal_tx: flume::Sender<InternalEvent>,
+    reply_tx: flume::Sender<UiReply>,
+) {
+    let identity = actor
+        .0
+        .actor(actor.1)
+        .map(|actor| actor.identity())
+        .unwrap_or_default();
+    let policy_affecting = matches!(
+        id.as_str(),
+        FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID | "model"
+    );
+    let reservation = if policy_affecting {
+        let (manager, root) = actor;
+        manager
+            .actor(root)
+            .map_err(|error| error.to_string())
+            .and_then(|actor| {
+                actor
+                    .reserve_config_update()
+                    .map_err(|error| error.to_string())
+            })
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    smol::spawn(async move {
+        let result = match reservation {
+            Ok(reservation) => {
+                if matches!(
+                    id.as_str(),
+                    FAST_OPTION_ID | WORKFLOW_OPTION_ID | THINKING_OPTION_ID
+                ) {
+                    let patch = (|| {
+                        if coordinator.read().options().version != version {
+                            return Err(
+                                "session option snapshot changed during validation".to_owned()
+                            );
+                        }
+                        let mut patch = maki_agent::actor::ConfigPatch::default();
+                        match id.as_str() {
+                            THINKING_OPTION_ID => {
+                                patch.thinking = Some(
+                                    value
+                                        .parse::<DomainThinkingConfig>()
+                                        .map_err(|error| error.to_string())?,
+                                )
+                            }
+                            FAST_OPTION_ID | WORKFLOW_OPTION_ID => {
+                                let enabled = match value.as_str() {
+                                    ENABLED_VALUE => true,
+                                    "disabled" => false,
+                                    _ => {
+                                        return Err(format!(
+                                            "invalid value for session option {id}: {value}"
+                                        ));
+                                    }
+                                };
+                                if id == FAST_OPTION_ID {
+                                    patch.fast = Some(enabled);
+                                } else {
+                                    patch.workflow = Some(enabled);
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                        Ok(patch)
+                    })();
+                    match (reservation, patch) {
+                        (Some(reservation), Ok(patch)) => {
+                            match reservation
+                                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(patch)))
+                            {
+                                Ok(()) => reservation
+                                    .wait()
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|error| error.to_string()),
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        (Some(reservation), Err(error)) => {
+                            let _ = reservation.cancel();
+                            Err(error)
+                        }
+                        (None, _) => Err("missing actor configuration reservation".to_owned()),
+                    }
+                } else if id.as_str() == "model" {
+                    match reservation {
+                        Some(ticket) => prepare_config_change(
+                            ticket,
+                            async move {
+                                let model = smol::unblock(move || {
+                                    if coordinator.read().options().version != version {
+                                        return Err(
+                                            "session option snapshot changed during validation"
+                                                .to_owned(),
+                                        );
+                                    }
+                                    if !model_policy.allows(&value) {
+                                        return Err(format!("model is not allowed: {value}"));
+                                    }
+                                    let model = Model::from_spec(&value)
+                                        .map_err(|error| error.to_string())?;
+                                    prepare_provider(model, timeouts)
+                                        .map_err(|error| error.to_string())
+                                })
+                                .await?;
+                                Ok(maki_agent::actor::ConfigChange::Patch(
+                                    maki_agent::actor::ConfigPatch {
+                                        model: Some(model),
+                                        ..Default::default()
+                                    },
+                                ))
+                            },
+                            async {
+                                smol::Timer::after(SESSION_OP_TIMEOUT).await;
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                        None => Err("missing actor configuration reservation".into()),
+                    }
+                } else {
+                    coordinator
+                        .set_option_if_version(id, value, Some(version))
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let _ = internal_tx.send(InternalEvent::SessionOp {
+            session,
+            runtime: identity,
+            kind: SessionOpKind::LuaOptionSet { reply_tx },
+            result,
+        });
+    })
+    .detach();
+}
+
 fn dispatch_option_toggle(
     coordinator: SessionCoordinatorHandle,
-    session: MakiId,
-    id: &'static str,
+    _model_slot: Arc<ProviderSlot>,
+    actor: (maki_agent::AgentManagerHandle, maki_agent::AgentId),
+    session_option: (MakiId, &'static str),
     internal_tx: &flume::Sender<InternalEvent>,
 ) {
+    let (session, id) = session_option;
+    let identity = actor
+        .0
+        .actor(actor.1)
+        .map(|actor| actor.identity())
+        .unwrap_or_default();
     let committed: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
     let slot = Arc::clone(&committed);
     let internal_tx = internal_tx.clone();
-    smol::spawn(async move {
-        let result = coordinator
-            .toggle_boolean_option(id)
-            .await
-            .map(|(enabled, _)| {
-                *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
+    let reservation = if matches!(id, FAST_OPTION_ID | WORKFLOW_OPTION_ID) {
+        actor
+            .0
+            .actor(actor.1)
+            .map_err(|error| error.to_string())
+            .and_then(|actor| {
+                actor
+                    .reserve_config_update()
+                    .map_err(|error| error.to_string())
             })
-            .map_err(|error| error.to_string());
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    smol::spawn(async move {
+        let result = match reservation {
+            Ok(Some(reservation)) => {
+                let change = match id {
+                    FAST_OPTION_ID => maki_agent::actor::ConfigChange::ToggleFast,
+                    WORKFLOW_OPTION_ID => maki_agent::actor::ConfigChange::ToggleWorkflow,
+                    _ => {
+                        let _ = reservation.cancel();
+                        let _ = internal_tx.send(InternalEvent::SessionOp {
+                            session,
+                            runtime: identity,
+                            kind: SessionOpKind::OptionToggled { id, committed },
+                            result: Err(format!("unknown boolean configuration option: {id}")),
+                        });
+                        return;
+                    }
+                };
+                match reservation.resolve(Ok(change)) {
+                    Ok(()) => reservation
+                        .wait()
+                        .await
+                        .map(|commit| {
+                            let enabled = match id {
+                                FAST_OPTION_ID => commit.config.fast,
+                                _ => commit.config.workflow,
+                            };
+                            *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
+                        })
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Ok(None) => {
+                bounded_session_op(
+                    async {
+                        coordinator
+                            .toggle_boolean_option(id)
+                            .await
+                            .map(|(enabled, _)| {
+                                *slot.lock().unwrap_or_else(|error| error.into_inner()) =
+                                    Some(enabled);
+                            })
+                            .map_err(|error| error.to_string())
+                    },
+                    SESSION_OP_TIMEOUT,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
+            runtime: identity,
             kind: SessionOpKind::OptionToggled { id, committed },
             result,
         });
@@ -3693,6 +4791,19 @@ fn ring_bell() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn wait_projected_option(runtime: &SessionRuntime, id: &str, value: &str) {
+        let read = runtime.coordinator.read();
+        let mut subscription = read.subscribe();
+        loop {
+            if read.options().options.iter().any(|option| {
+                option.definition.id.as_ref() == id && option.current_value.as_ref() == value
+            }) {
+                return;
+            }
+            subscription.changed().await;
+        }
+    }
     use crate::selection::SelectionZone;
     use crossterm::event::KeyModifiers;
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
@@ -3705,22 +4816,879 @@ mod tests {
     const OBSERVATION: &str = "failed";
 
     #[test]
+    fn ui_queue_and_mode_model_projection() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let initial = actor.effective_config().unwrap();
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            dispatch_option_toggle(
+                runtime.coordinator.clone(),
+                Arc::clone(&runtime.model_slot),
+                (manager, root),
+                (runtime.id(), WORKFLOW_OPTION_ID),
+                &internal_tx,
+            );
+            runtime.handles.queue.push(QueueItem::Message {
+                text: "after barrier".into(),
+                image_count: 0,
+                input: maki_agent::AgentInput {
+                    message: "after barrier".into(),
+                    mode: Default::default(),
+                    images: Vec::new(),
+                    preamble: Vec::new(),
+                    thinking: Default::default(),
+                    fast: false,
+                    workflow: false,
+                    prompt: None,
+                    cancel: None,
+                    lease_committer: None,
+                },
+                run_id: 1,
+                displayed: false,
+            });
+            assert_eq!(runtime.handles.queue.text_messages(), vec!["after barrier"]);
+            drop(lease);
+            let InternalEvent::SessionOp { result, .. } = internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected option completion");
+            };
+            result.unwrap();
+            actor.wait_policy_updates().await.unwrap();
+            let selected = actor.effective_config().unwrap();
+            assert!(!initial.workflow);
+            assert!(selected.workflow);
+            assert_eq!(selected.model.id, runtime.model_slot.load().model.id);
+            assert_eq!(runtime.app.state.session.model, selected.model.spec());
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn workflow_toggle_completion_does_not_mutate_another_runtime() {
+        smol::block_on(async {
+            let mut changed = test_runtime(model_named("changed"));
+            let untouched = test_runtime(model_named("untouched"));
+            let (changed_manager, changed_root) = changed.handles.manager_and_root();
+            let changed_actor = changed_manager.actor(changed_root).unwrap();
+            let (untouched_manager, untouched_root) = untouched.handles.manager_and_root();
+            let untouched_actor = untouched_manager.actor(untouched_root).unwrap();
+            let initial_actor_config = untouched_actor.effective_config().unwrap();
+            let initial_actor_model = initial_actor_config.settings.model.spec();
+            let initial_actor_mode = initial_actor_config.mode.clone();
+            let initial_actor_workflow = initial_actor_config.settings.workflow;
+            wait_projected_option(&untouched, "model", &initial_actor_config.model.spec()).await;
+            let initial_options = untouched.coordinator.read().options();
+            let initial_app_model = untouched.app.state.session.model.clone();
+            let (internal_tx, internal_rx) = flume::unbounded();
+
+            dispatch_option_toggle(
+                changed.coordinator.clone(),
+                Arc::clone(&changed.model_slot),
+                (changed_manager, changed_root),
+                (changed.id(), WORKFLOW_OPTION_ID),
+                &internal_tx,
+            );
+
+            let InternalEvent::SessionOp { kind, result, .. } =
+                internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected option toggle completion");
+            };
+            result.unwrap();
+            let SessionOpKind::OptionToggled { id, committed } = kind else {
+                panic!("expected workflow option completion");
+            };
+            assert_eq!(id, WORKFLOW_OPTION_ID);
+            let Some(enabled) = committed.lock().unwrap().take() else {
+                panic!("expected committed workflow state");
+            };
+            complete_option_toggle(&mut changed.app, id, enabled);
+            changed_actor.wait_policy_updates().await.unwrap();
+
+            assert!(changed.app.state.workflow);
+            assert!(changed_actor.effective_config().unwrap().workflow);
+            assert!(!untouched.app.state.workflow);
+            assert_eq!(untouched.app.state.session.model, initial_app_model);
+            let untouched_config = untouched_actor.effective_config().unwrap();
+            assert_eq!(untouched_config.settings.model.spec(), initial_actor_model);
+            assert_eq!(untouched_config.mode, initial_actor_mode);
+            assert_eq!(untouched_config.settings.workflow, initial_actor_workflow);
+            let values = |snapshot: SessionOptionsSnapshot| {
+                snapshot
+                    .options
+                    .iter()
+                    .map(|option| (option.definition.id.clone(), option.current_value.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                values(untouched.coordinator.read().options()),
+                values(initial_options)
+            );
+
+            release_runtime(changed);
+            release_runtime(untouched);
+        });
+    }
+
+    #[test]
+    fn workflow_toggle_during_turn_reports_deferred_notice() {
+        smol::block_on(async {
+            let mut runtime = test_runtime(model_named("test-model"));
+            runtime.app.status = Status::Streaming;
+            runtime.app.coordinator = Some(runtime.coordinator.clone());
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+
+            let (response, actions) = runtime
+                .app
+                .execute_host_request(maki_commands::HostRequest::Builtin(
+                    maki_commands::BuiltinOperation::ToggleWorkflow,
+                ))
+                .unwrap();
+            assert_eq!(response, maki_commands::HostResponse::Completed);
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::ToggleSessionOption {
+                    id: WORKFLOW_OPTION_ID
+                }]
+            ));
+            handle_session_action(
+                &mut runtime,
+                actions.into_iter().next().unwrap(),
+                internal_tx,
+            );
+            assert_eq!(
+                runtime.app.status_bar.flash_text(),
+                Some("workflow applies when this turn finishes")
+            );
+            assert!(!runtime.app.state.workflow);
+            drop(lease);
+            let InternalEvent::SessionOp { kind, result, .. } =
+                internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected option toggle completion");
+            };
+            result.unwrap();
+            if let SessionOpKind::OptionToggled { id, committed } = kind {
+                assert_eq!(id, WORKFLOW_OPTION_ID);
+                let Some(enabled) = committed.lock().unwrap().take() else {
+                    panic!("expected committed workflow state");
+                };
+                complete_option_toggle(&mut runtime.app, id, enabled);
+            } else {
+                panic!("expected workflow option completion");
+            }
+            assert!(runtime.app.state.workflow);
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn reserved_mode_change_waits_for_lease_before_projecting_app_mode() {
+        smol::block_on(async {
+            let mut runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let initial_app_mode = agent_mode_for_app(&runtime.app);
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let storage = StateDir::from_path(temp_dir.path().to_path_buf());
+            dispatch_mode_change_op(
+                &runtime,
+                &storage,
+                EventHandle::disconnected_for_test().mode_registry(),
+                internal_tx,
+                "plan".into(),
+                None,
+            );
+
+            assert_eq!(agent_mode_for_app(&runtime.app), initial_app_mode);
+            let InternalEvent::SessionOp { kind, result, .. } =
+                internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected mode change completion");
+            };
+            result.unwrap();
+            if let SessionOpKind::ModeChanged {
+                id,
+                plan,
+                follow_up,
+            } = kind
+            {
+                complete_mode_change(&mut runtime.app, id, plan, follow_up);
+            } else {
+                panic!("expected mode change completion");
+            }
+            assert_eq!(
+                agent_mode_for_app(&runtime.app),
+                actor.effective_config().unwrap().mode
+            );
+            drop(lease);
+            drop(temp_dir);
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn yolo_toggle_commits_while_turn_holds_lease() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let id = runtime.id();
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            let (manager, root) = runtime.handles.manager_and_root();
+
+            dispatch_option_toggle(
+                runtime.coordinator.clone(),
+                Arc::clone(&runtime.model_slot),
+                (manager, root),
+                (id, YOLO_OPTION_ID),
+                &internal_tx,
+            );
+
+            let InternalEvent::SessionOp {
+                kind: SessionOpKind::OptionToggled { committed, .. },
+                result,
+                ..
+            } = internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected option toggle completion");
+            };
+            result.unwrap();
+            assert_eq!(committed.lock().unwrap().take(), Some(true));
+            assert_eq!(
+                runtime
+                    .coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == YOLO_OPTION_ID)
+                    .unwrap()
+                    .current_value
+                    .as_ref(),
+                ENABLED_VALUE
+            );
+            drop(lease);
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn combined_model_thinking_toggle_uses_predecessor_atomically() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let predecessor = actor.reserve_config_update().unwrap();
+            let combined = actor.reserve_config_update().unwrap();
+            let mut model = model_named("replacement");
+            model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
+            combined
+                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                    maki_agent::actor::ConfigPatch {
+                        model: Some(maki_agent::actor::PreparedModel {
+                            provider: Arc::new(StubProvider),
+                            model,
+                        }),
+                        toggle_thinking: true,
+                        ..Default::default()
+                    },
+                )))
+                .unwrap();
+            predecessor
+                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                    maki_agent::actor::ConfigPatch {
+                        workflow: Some(true),
+                        ..Default::default()
+                    },
+                )))
+                .unwrap();
+            predecessor.wait().await.unwrap();
+            let commit = combined.wait().await.unwrap();
+            assert!(commit.config.workflow);
+            assert!(commit.config.thinking.enabled());
+            assert_eq!(commit.config.model.id, "replacement");
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn thinking_dispatch_reply_uses_required_model_commit() {
+        smol::block_on(async {
+            let mut unsupported = model_named("test-model");
+            unsupported.thinking_override = Some(maki_providers::ThinkingSupport::No);
+            let runtime = test_runtime(unsupported);
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let model_ticket = actor.reserve_config_update().unwrap();
+            let (events, rx) = flume::unbounded();
+            let (reply, _) = flume::bounded(1);
+            dispatch_thinking_change(&runtime, true, "off", reply, events);
+            let mut required = model_named("required");
+            required.thinking_override = Some(maki_providers::ThinkingSupport::Required);
+            model_ticket
+                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                    maki_agent::actor::ConfigPatch {
+                        model: Some(maki_agent::actor::PreparedModel {
+                            provider: Arc::new(StubProvider),
+                            model: required,
+                        }),
+                        ..Default::default()
+                    },
+                )))
+                .unwrap();
+            let InternalEvent::SessionOp {
+                kind:
+                    SessionOpKind::ThinkingSet {
+                        commit,
+                        set_default,
+                        ..
+                    },
+                result,
+                ..
+            } = rx.recv_async().await.unwrap()
+            else {
+                panic!("expected thinking completion");
+            };
+            result.unwrap();
+            let commit = commit.unwrap();
+            assert!(set_default);
+            assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
+            let later = actor.reserve_config_update().unwrap();
+            later
+                .resolve(
+                    thinking_change("high")
+                        .map_err(|error| maki_agent::ActorError::InvalidConfig(error.into())),
+                )
+                .unwrap();
+            later.wait().await.unwrap();
+            assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn thinking_dispatch_toggles_against_fifo_predecessor() {
+        smol::block_on(async {
+            let mut model = model_named("test-model");
+            model.thinking_override = Some(maki_providers::ThinkingSupport::Yes);
+            let runtime = test_runtime(model);
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let gate = actor.reserve_config_update().unwrap();
+            let (events, rx) = flume::unbounded();
+            for _ in 0..2 {
+                let (reply, _) = flume::bounded(1);
+                dispatch_thinking_change(&runtime, false, "", reply, events.clone());
+            }
+            gate.resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                Default::default(),
+            )))
+            .unwrap();
+            gate.wait().await.unwrap();
+            let mut values = Vec::new();
+            for _ in 0..2 {
+                let InternalEvent::SessionOp {
+                    kind: SessionOpKind::ThinkingSet { commit, .. },
+                    result,
+                    ..
+                } = rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected thinking completion");
+                };
+                result.unwrap();
+                let commit = commit.unwrap();
+                values.push((commit.generation, commit.config.thinking.enabled()));
+            }
+            values.sort();
+            assert_eq!(
+                values
+                    .iter()
+                    .map(|(_, enabled)| *enabled)
+                    .collect::<Vec<_>>(),
+                vec![true, false]
+            );
+            assert!(!actor.effective_config().unwrap().thinking.enabled());
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn managed_read_observes_commit_before_ui_projection() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let (tx, rx) = flume::unbounded();
+            dispatch_option_toggle(
+                runtime.coordinator.clone(),
+                Arc::clone(&runtime.model_slot),
+                runtime.handles.manager_and_root(),
+                (runtime.id(), WORKFLOW_OPTION_ID),
+                &tx,
+            );
+            let InternalEvent::SessionOp { result, .. } = rx.recv_async().await.unwrap() else {
+                panic!("expected option completion");
+            };
+            result.unwrap();
+            assert!(!runtime.app.state.workflow);
+            assert!(runtime.config().unwrap().workflow);
+            let model = config_model_state(&runtime.config().unwrap());
+            assert_eq!(model["spec"], runtime.config().unwrap().model.spec());
+            drop(lease);
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn expired_provider_preparation_releases_successors() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let ticket = actor.reserve_config_update().unwrap();
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let (finished_tx, finished_rx) = flume::bounded(1);
+            let (expire_tx, expire_rx) = flume::bounded(1);
+            let pending = smol::spawn(prepare_config_change(
+                ticket,
+                async move {
+                    smol::unblock(move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        finished_tx.send(()).unwrap();
+                        Ok(maki_agent::actor::ConfigChange::ToggleWorkflow)
+                    })
+                    .await
+                },
+                async move {
+                    expire_rx.recv_async().await.unwrap();
+                },
+            ));
+            started_rx.recv_async().await.unwrap();
+            let successor = actor.reserve_config_update().unwrap();
+            successor
+                .resolve(Ok(maki_agent::actor::ConfigChange::ToggleWorkflow))
+                .unwrap();
+            expire_tx.send(()).unwrap();
+            assert_eq!(
+                pending.await.err().unwrap(),
+                maki_agent::ActorError::ConfigExpired.to_string()
+            );
+            assert!(successor.wait().await.unwrap().config.workflow);
+            release_tx.send(()).unwrap();
+            finished_rx.recv_async().await.unwrap();
+            assert!(actor.effective_config().unwrap().workflow);
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn timed_out_setter_releases_ticket_and_reports_failure() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let ticket = actor.reserve_config_update().unwrap();
+            let (_gate_tx, gate_rx) = flume::bounded::<()>(0);
+            let result = bounded_reserved_session_op(
+                &ticket,
+                async move {
+                    gate_rx.recv_async().await.unwrap();
+                    Ok(())
+                },
+                Duration::from_millis(1),
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), SESSION_OP_TIMEOUT_ERR);
+            actor.wait_policy_updates().await.unwrap();
+            assert!(
+                actor
+                    .admit_turn(
+                        maki_agent::AgentInput {
+                            message: "after timeout".into(),
+                            mode: Default::default(),
+                            images: Vec::new(),
+                            preamble: Vec::new(),
+                            thinking: Default::default(),
+                            fast: false,
+                            workflow: false,
+                            prompt: None,
+                            cancel: None,
+                            lease_committer: None,
+                        },
+                        None,
+                        String::new(),
+                    )
+                    .is_ok()
+            );
+            release_runtime(runtime);
+        });
+    }
+
+    #[test_case::test_case(false; "successful_completion")]
+    #[test_case::test_case(true; "failed_completion")]
+    fn completion_snapshot_cannot_be_regressed_by_queued_commit(failed: bool) {
+        with_event_loop(|event_loop| {
+            smol::block_on(async {
+                const FAILURE: &str = "configuration operation failed";
+                let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+                let actor = manager.actor(root).unwrap();
+                let (queued_tx, queued_rx) = flume::unbounded();
+                let observer =
+                    std::mem::replace(&mut event_loop.sessions[0].config_commits, queued_rx);
+                let ticket = actor.reserve_config_update().unwrap();
+                ticket
+                    .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                        maki_agent::actor::ConfigPatch {
+                            workflow: Some(true),
+                            ..Default::default()
+                        },
+                    )))
+                    .unwrap();
+                let older = ticket.wait().await.unwrap();
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                event_loop.handle_session_request(
+                    SessionRequest::SetMode {
+                        session: None,
+                        id: "plan".into(),
+                    },
+                    reply_tx,
+                );
+                let mut completion = event_loop.internal_rx.recv_async().await.unwrap();
+                if failed {
+                    let InternalEvent::SessionOp { result, .. } = &mut completion else {
+                        panic!("session operation");
+                    };
+                    *result = Err(FAILURE.into());
+                }
+                let latest = actor.config_snapshot().unwrap();
+                assert!(latest.generation > older.generation);
+                event_loop.handle_internal(completion);
+                let reply = reply_rx.recv_async().await.unwrap();
+                if failed {
+                    assert_eq!(reply.unwrap_err(), FAILURE);
+                } else {
+                    reply.unwrap();
+                }
+                assert_eq!(
+                    event_loop.sessions[0].projected_config_generation,
+                    latest.generation
+                );
+                assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
+                queued_tx.send(older).unwrap();
+                let _ = event_loop.tick();
+                assert_eq!(
+                    event_loop.sessions[0].projected_config_generation,
+                    latest.generation
+                );
+                assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
+                assert!(event_loop.sessions[0].app.state.workflow);
+                drop(observer);
+            })
+        });
+    }
+
+    #[test_case::test_case("model")]
+    #[test_case::test_case("thinking")]
+    #[test_case::test_case("mode")]
+    fn retired_runtime_completion_and_projection_are_ignored(operation: &str) {
+        with_event_loop(|event_loop| {
+            smol::block_on(async {
+                let old = &event_loop.sessions[0];
+                let session = old.id();
+                let identity = old.handles.identity();
+                let (manager, root) = old.handles.manager_and_root();
+                let actor = manager.actor(root).unwrap();
+                let ticket = actor.reserve_config_update().unwrap();
+                ticket
+                    .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                        maki_agent::actor::ConfigPatch {
+                            model: Some(maki_agent::actor::PreparedModel {
+                                model: model_named("retired-model"),
+                                provider: Arc::new(StubProvider),
+                            }),
+                            workflow: Some(true),
+                            ..Default::default()
+                        },
+                    )))
+                    .unwrap();
+                let commit = ticket.wait().await.unwrap();
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                let completion = match operation {
+                    "mode" => {
+                        event_loop.handle_session_request(
+                            SessionRequest::SetMode {
+                                session: None,
+                                id: "plan".into(),
+                            },
+                            reply_tx,
+                        );
+                        event_loop.internal_rx.recv_async().await.unwrap()
+                    }
+                    "thinking" => {
+                        event_loop.handle_session_request(
+                            SessionRequest::SetThinking {
+                                set_default: false,
+                                thinking: "off".into(),
+                            },
+                            reply_tx,
+                        );
+                        event_loop.internal_rx.recv_async().await.unwrap()
+                    }
+                    _ => InternalEvent::SessionOp {
+                        session,
+                        runtime: identity,
+                        kind: SessionOpKind::ModelSet {
+                            commit: Some(commit.clone()),
+                            spec: Some(commit.config.model.spec()),
+                            reply_tx,
+                        },
+                        result: Ok(()),
+                    },
+                };
+                let mut replacement = test_runtime(model_named("replacement-model"));
+                let replacement_thinking = replacement.app.state.thinking;
+                let (replacement_manager, replacement_root) =
+                    replacement.handles.manager_and_root();
+                let replacement_actor = replacement_manager.actor(replacement_root).unwrap();
+                let initial_config = replacement_actor.config_snapshot().unwrap();
+                Arc::make_mut(&mut replacement.app.state.session).id = session;
+                let (queued_tx, queued_rx) = flume::unbounded();
+                replacement.config_commits = queued_rx;
+                let old = std::mem::replace(&mut event_loop.sessions[0], replacement);
+                event_loop.handle_internal(completion);
+                assert_eq!(
+                    reply_rx.recv_async().await.unwrap().unwrap_err(),
+                    NOT_LIVE_ERR
+                );
+                queued_tx.send(commit).unwrap();
+                let _ = event_loop.tick();
+                let app = &event_loop.sessions[0].app;
+                assert_eq!(
+                    app.state.session.model,
+                    model_named("replacement-model").spec()
+                );
+                assert_eq!(app.state.mode.id_key(), "build");
+                assert_eq!(app.state.thinking, replacement_thinking);
+                assert!(!app.state.workflow);
+                assert_eq!(event_loop.sessions[0].projected_config_generation, 0);
+                let final_config = replacement_actor.config_snapshot().unwrap();
+                assert_eq!(final_config.generation, initial_config.generation);
+                assert!(Arc::ptr_eq(
+                    &final_config.identity,
+                    &initial_config.identity
+                ));
+                assert!(Arc::ptr_eq(&final_config.config, &initial_config.config));
+                release_runtime(old);
+            })
+        });
+    }
+
+    #[test]
+    fn lua_option_set_dispatch_updates_actor_and_replies() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let id = runtime.id();
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let initial = actor.effective_config().unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let request = SessionRequest::SetOption {
+                session: id.to_string(),
+                id: WORKFLOW_OPTION_ID.to_owned(),
+                value: ENABLED_VALUE.to_owned(),
+                version: runtime.coordinator.read().options().version,
+            };
+            let SessionRequest::SetOption {
+                session,
+                id: option_id,
+                value,
+                version,
+            } = request
+            else {
+                unreachable!();
+            };
+            dispatch_lua_option_set(
+                id,
+                option_id,
+                value,
+                version,
+                runtime.coordinator.clone(),
+                Timeouts::default(),
+                (manager, root),
+                Arc::default(),
+                internal_tx,
+                reply_tx,
+            );
+
+            let InternalEvent::SessionOp {
+                session: completed_session,
+                kind: SessionOpKind::LuaOptionSet { reply_tx },
+                result,
+                ..
+            } = internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected Lua option completion");
+            };
+            assert_eq!(completed_session.to_string(), session);
+            let _ = reply_tx.send(result.map(|()| json!(true)));
+            assert_eq!(reply_rx.recv_async().await.unwrap(), Ok(json!(true)));
+            actor.wait_policy_updates().await.unwrap();
+            assert!(!initial.workflow);
+            assert!(actor.effective_config().unwrap().workflow);
+            wait_projected_option(&runtime, WORKFLOW_OPTION_ID, ENABLED_VALUE).await;
+            assert_eq!(
+                runtime
+                    .coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == WORKFLOW_OPTION_ID)
+                    .unwrap()
+                    .current_value
+                    .as_ref(),
+                ENABLED_VALUE
+            );
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn lua_model_option_updates_actor_policy() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let reservation = actor.reserve_config_update().unwrap();
+            let coordinator = runtime.coordinator.clone();
+            let target_model = model_named("test-model");
+            let version = coordinator.read().options().version;
+            coordinator
+                .set_option_if_version("model", target_model.spec(), Some(version))
+                .await
+                .unwrap();
+            reservation
+                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                    maki_agent::actor::ConfigPatch {
+                        model: Some(maki_agent::actor::PreparedModel {
+                            provider: Arc::new(StubProvider),
+                            model: target_model.clone(),
+                        }),
+                        ..Default::default()
+                    },
+                )))
+                .unwrap();
+            reservation.wait().await.unwrap();
+            runtime.config_commits.recv_async().await.unwrap();
+            assert_eq!(
+                actor.effective_config().unwrap().model.spec(),
+                target_model.spec()
+            );
+            assert_eq!(
+                runtime.coordinator.read().model().as_ref(),
+                target_model.spec()
+            );
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn reserved_option_change_precedes_root_admission() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let lease = runtime.coordinator.acquire_lease().await.unwrap();
+            let (internal_tx, internal_rx) = flume::unbounded();
+            dispatch_option_toggle(
+                runtime.coordinator.clone(),
+                Arc::clone(&runtime.model_slot),
+                (manager, root),
+                (runtime.id(), WORKFLOW_OPTION_ID),
+                &internal_tx,
+            );
+            runtime.handles.queue.push(QueueItem::Message {
+                text: "queued root".into(),
+                image_count: 0,
+                input: maki_agent::AgentInput {
+                    message: "queued root".into(),
+                    mode: Default::default(),
+                    images: Vec::new(),
+                    preamble: Vec::new(),
+                    thinking: Default::default(),
+                    fast: false,
+                    workflow: false,
+                    prompt: None,
+                    cancel: None,
+                    lease_committer: None,
+                },
+                run_id: 1,
+                displayed: false,
+            });
+            assert!(!runtime.handles.queue.is_empty());
+            drop(lease);
+            let InternalEvent::SessionOp { result, .. } = internal_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected option completion");
+            };
+            result.unwrap();
+            actor.wait_policy_updates().await.unwrap();
+            assert!(
+                runtime
+                    .handles
+                    .manager_and_root()
+                    .0
+                    .effective_config(root)
+                    .unwrap()
+                    .unwrap()
+                    .workflow
+            );
+            wait_projected_option(&runtime, WORKFLOW_OPTION_ID, ENABLED_VALUE).await;
+            assert!(
+                runtime
+                    .coordinator
+                    .read()
+                    .options()
+                    .options
+                    .iter()
+                    .any(|option| {
+                        option.definition.id.as_ref() == WORKFLOW_OPTION_ID
+                            && option.current_value.as_ref() == ENABLED_VALUE
+                    })
+            );
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
     fn rapid_double_toggle_preserves_both_intents() {
         smol::block_on(async {
-            let id = MakiId::generate();
-            let coordinator = test_coordinator(id);
+            let runtime = test_runtime(model_named("test-model"));
+            let id = runtime.id();
+            let coordinator = runtime.coordinator.clone();
+            let (manager, root) = runtime.handles.manager_and_root();
             let (internal_tx, internal_rx) = flume::unbounded();
 
             dispatch_option_toggle(
                 coordinator.clone(),
-                id,
-                maki_agent::session_options::YOLO_OPTION_ID,
+                Arc::clone(&runtime.model_slot),
+                (manager.clone(), root),
+                (id, maki_agent::session_options::YOLO_OPTION_ID),
                 &internal_tx,
             );
             dispatch_option_toggle(
                 coordinator.clone(),
-                id,
-                maki_agent::session_options::YOLO_OPTION_ID,
+                Arc::clone(&runtime.model_slot),
+                (manager, root),
+                (id, maki_agent::session_options::YOLO_OPTION_ID),
                 &internal_tx,
             );
 
@@ -3733,6 +5701,7 @@ mod tests {
                             committed: value, ..
                         },
                     result,
+                    ..
                 } = internal_rx.recv_async().await.unwrap()
                 else {
                     panic!("expected option toggle completion");
@@ -3741,7 +5710,6 @@ mod tests {
                 result.unwrap();
                 committed.push(value.lock().unwrap().take().unwrap());
             }
-
             assert_eq!(committed, [true, false]);
             let yolo = coordinator
                 .read()
@@ -3755,8 +5723,77 @@ mod tests {
                 .current_value
                 .clone();
             assert_eq!(yolo.as_ref(), maki_agent::session_options::DISABLED_VALUE);
-            coordinator.close().await.unwrap();
+            release_runtime(runtime);
         });
+    }
+
+    #[test]
+    fn refined_model_reservations_precede_provider_slot_installation() {
+        smol::block_on(async {
+            let runtime = test_runtime(model_named("test-model"));
+            let current = runtime.model_slot.load();
+            let original_provider = current.provider.identity();
+            let requested_spec = current.model.spec();
+            drop(current);
+            let updates = reserve_refined_model_updates(
+                std::slice::from_ref(&runtime),
+                &requested_spec,
+                original_provider,
+            );
+            assert_eq!(updates.len(), 1);
+            let (_, reservation) = updates.into_iter().next().unwrap();
+            let reservation = reservation.unwrap();
+            let refined = model_named("test-model");
+            runtime
+                .model_slot
+                .install(refined.clone(), Arc::new(FocusedProvider));
+            assert_eq!(runtime.model_slot.load().model.spec(), refined.spec());
+            let policy = runtime
+                .handles
+                .manager_and_root()
+                .0
+                .effective_config(runtime.handles.manager_and_root().1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(policy.model.spec(), requested_spec);
+            reservation
+                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                    maki_agent::actor::ConfigPatch {
+                        model: Some(maki_agent::actor::PreparedModel {
+                            provider: Arc::clone(&runtime.model_slot.load().provider)
+                                as Arc<dyn Provider>,
+                            model: runtime.model_slot.load().model.clone(),
+                        }),
+                        ..Default::default()
+                    },
+                )))
+                .unwrap();
+            reservation.wait().await.unwrap();
+            release_runtime(runtime);
+        });
+    }
+
+    #[test]
+    fn refined_model_reservation_skips_distinct_provider_identity() {
+        let runtime = test_runtime(model_named("test-model"));
+        let (other_slot, _) =
+            ProviderSlot::new(model_named("test-model"), Arc::new(FocusedProvider));
+        let mut other = test_runtime(model_named("test-model"));
+        other.model_slot = other_slot;
+        let current = runtime.model_slot.load();
+        let expected_provider = current.provider.identity();
+        let requested_spec = current.model.spec();
+        drop(current);
+        assert_ne!(
+            other.model_slot.load().provider.identity(),
+            expected_provider
+        );
+
+        let updates =
+            reserve_refined_model_updates(&[runtime, other], &requested_spec, expected_provider);
+
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].1.is_ok());
     }
 
     fn model_named(id: &str) -> Model {
@@ -3793,8 +5830,12 @@ mod tests {
         );
         let coordinator = test_coordinator(app.state.session.id);
         let (shell_tx, shell_rx) = flume::unbounded();
+        let config_commits =
+            observe_config_commits(&handles, Arc::clone(&model_slot), coordinator.clone());
         SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
+            config_commits,
+            projected_config_generation: 0,
             app,
             handles,
             model_slot,
@@ -4030,6 +6071,54 @@ mod tests {
     const SHELL_RESULT: &str = "command finished";
     const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+    fn with_event_loop(test: impl FnOnce(&mut EventLoop<'_>)) {
+        let mut harness = RuntimeHarness::new();
+        let runtime = test_runtime(model_named("test-model"));
+        let ctx = harness.ctx.take().unwrap();
+        let initial_provider = ctx.model_slot.load().provider.identity();
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (warn_tx, warn_rx) = flume::unbounded();
+        let mut event_loop = EventLoop {
+            terminal: &mut terminal,
+            sessions: vec![runtime],
+            focused: 0,
+            session_picker: false,
+            last_focused: None,
+            terminal_focused: true,
+            notifier: None,
+            sessions_dir: ctx.sessions_dir.clone(),
+            session_cwd: harness._temp_dir.path().to_string_lossy().into_owned(),
+            ctx,
+            last_heartbeat: Instant::now(),
+            input: InputReader::disconnected(),
+            warn_rx,
+            warn_tx,
+            ui_action_rx: flume::unbounded().1,
+            command_rx: flume::unbounded().1,
+            provider_change_rx: flume::unbounded().1,
+            provider_usage: ProviderUsageCoordinator::new(initial_provider),
+            next_status_invalidation: 0,
+            pending_status_invalidation: None,
+            published_model_specs: None,
+            internal_tx,
+            internal_rx,
+            _model_fetch_task: smol::spawn(async {}),
+        };
+        test(&mut event_loop);
+        for runtime in event_loop.sessions.drain(..) {
+            release_runtime(runtime);
+        }
+        harness.ctx = Some(event_loop.ctx);
+    }
+
     struct RuntimeHarness {
         _temp_dir: TempDir,
         ctx: Option<SpawnCtx>,
@@ -4062,6 +6151,7 @@ mod tests {
             let storage_writer =
                 Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
             let ctx = SpawnCtx {
+                prepare_provider: Arc::new(prepare_provider),
                 storage,
                 sessions_dir,
                 config: AgentConfig::default(),
@@ -4215,6 +6305,202 @@ mod tests {
     }
 
     #[test]
+    fn live_session_requests_remain_independent_during_changes_and_restore() {
+        use maki_agent::actor::PreparedModel;
+        use maki_providers::{RequestOptions, Role, StopReason, StreamResponse};
+
+        const FIRST: &str = "anthropic/claude-opus-4-6";
+        const SECOND: &str = "openai/gpt-5";
+        const THIRD: &str = "anthropic/claude-sonnet-4-6";
+        const PROMPT: &str = "request isolation";
+        const RESPONSE: &str = "complete";
+
+        struct RecordingProvider {
+            name: &'static str,
+            requests: flume::Sender<(&'static str, String, RequestOptions)>,
+            release: flume::Receiver<()>,
+        }
+
+        impl Provider for RecordingProvider {
+            fn stream_message<'a>(
+                &'a self,
+                model: &'a Model,
+                _messages: &'a [Message],
+                _system: &'a str,
+                _tools: &'a serde_json::Value,
+                _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+                opts: RequestOptions,
+                _session_id: Option<&'a SessionRef>,
+            ) -> maki_providers::provider::BoxFuture<
+                'a,
+                Result<StreamResponse, maki_providers::AgentError>,
+            > {
+                Box::pin(async move {
+                    self.requests.send((self.name, model.spec(), opts)).unwrap();
+                    self.release.recv_async().await.unwrap();
+                    Ok(StreamResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![maki_providers::ContentBlock::Text {
+                                text: RESPONSE.into(),
+                            }],
+                            ..Message::user(String::new())
+                        },
+                        usage: TokenUsage::default(),
+                        stop_reason: Some(StopReason::EndTurn),
+                    })
+                })
+            }
+
+            fn list_models(
+                &self,
+            ) -> maki_providers::provider::BoxFuture<
+                '_,
+                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        fn model(spec: &str) -> Model {
+            let mut model = Model::from_spec(spec).unwrap();
+            model.supports_fast_override = Some(maki_providers::model::FastSupport::Supported);
+            model
+        }
+
+        fn send(event_loop: &mut EventLoop<'_>, index: usize) {
+            event_loop.submit_text(index, PROMPT.into()).unwrap();
+        }
+
+        with_event_loop(|event_loop| {
+            let (requests_tx, requests_rx) = flume::unbounded();
+            let mut releases = Vec::new();
+            for spec in [FIRST, SECOND] {
+                let (release, gate) = flume::unbounded();
+                releases.push(release);
+                let mut session = AppSession::new(spec, &event_loop.session_cwd);
+                session.meta.thinking = Some(DomainThinkingConfig::Off.into());
+                session.meta.fast = spec == FIRST;
+                let runtime = event_loop
+                    .ctx
+                    .spawn_runtime_with_provider(
+                        session,
+                        Some(PreparedProvider {
+                            model: model(spec),
+                            provider: Arc::new(RecordingProvider {
+                                name: spec,
+                                requests: requests_tx.clone(),
+                                release: gate,
+                            }),
+                        }),
+                    )
+                    .unwrap();
+                event_loop.push_runtime(runtime);
+            }
+            let first = event_loop.sessions[1].handles.manager_and_root();
+            let first = first.0.actor(first.1).unwrap();
+            let original = first.effective_config().unwrap();
+            let expected = |spec: &str, fast| {
+                RequestOptions {
+                    thinking: DomainThinkingConfig::Off,
+                    fast,
+                }
+                .clamped(&model(spec))
+            };
+            send(event_loop, 1);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                (FIRST, FIRST.into(), expected(FIRST, true))
+            );
+            send(event_loop, 2);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                (SECOND, SECOND.into(), expected(SECOND, false))
+            );
+
+            let (changed_release, changed_gate) = flume::unbounded();
+            let (restored_release, restored_gate) = flume::unbounded();
+            event_loop.ctx.prepare_provider = Arc::new(move |requested, _| {
+                let spec = requested.spec();
+                let (name, release) = match spec.as_str() {
+                    FIRST => ("changed", changed_gate.clone()),
+                    THIRD => ("restored", restored_gate.clone()),
+                    _ => panic!("unexpected provider preparation: {spec}"),
+                };
+                Ok(PreparedModel {
+                    model: model(&spec),
+                    provider: Arc::new(RecordingProvider {
+                        name,
+                        requests: requests_tx.clone(),
+                        release,
+                    }),
+                })
+            });
+            event_loop.set_focused(1);
+            event_loop.change_model(2, FIRST);
+            let completion = event_loop
+                .internal_rx
+                .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+                .unwrap();
+            assert!(
+                matches!(&completion, InternalEvent::SessionOp { session, result: Ok(()), .. } if *session == event_loop.sessions[2].id())
+            );
+            event_loop.handle_internal(completion);
+            let _ = event_loop.tick();
+            releases[1].send(()).unwrap();
+            send(event_loop, 2);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                ("changed", FIRST.into(), expected(FIRST, false))
+            );
+
+            let mut stored = AppSession::new(THIRD, &event_loop.session_cwd);
+            stored.meta.thinking = Some(DomainThinkingConfig::Off.into());
+            stored.push_message(Message::user(PROMPT.into()));
+            stored.save(&event_loop.ctx.storage).unwrap();
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            event_loop.handle_session_request(
+                SessionRequest::Focus {
+                    id: stored.id.to_string(),
+                },
+                reply_tx,
+            );
+            assert_eq!(
+                reply_rx
+                    .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+                    .unwrap()
+                    .unwrap(),
+                json!(true)
+            );
+            let _ = event_loop.tick();
+            let restored_index = event_loop.position(stored.id).unwrap();
+            assert_eq!(event_loop.focused, restored_index);
+            assert_eq!(event_loop.sessions.len(), 4);
+            assert_eq!(event_loop.sessions[2].app.state.session.model, FIRST);
+            send(event_loop, restored_index);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                ("restored", THIRD.into(), expected(THIRD, false))
+            );
+            assert!(Arc::ptr_eq(&original, &first.effective_config().unwrap()));
+            assert_eq!(
+                event_loop.sessions[1].coordinator.read().model().as_ref(),
+                FIRST
+            );
+            assert_eq!(event_loop.sessions[1].model_slot.load().model.spec(), FIRST);
+            releases[0].send(()).unwrap();
+            send(event_loop, 1);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                (FIRST, FIRST.into(), expected(FIRST, true))
+            );
+            releases[0].send(()).unwrap();
+            changed_release.send(()).unwrap();
+            restored_release.send(()).unwrap();
+        });
+    }
+
+    #[test]
     fn resumed_session_uses_its_stored_model_and_provider() {
         const STORED_MODEL: &str = "openai/gpt-5";
 
@@ -4261,6 +6547,51 @@ mod tests {
         release_runtime(runtime);
     }
 
+    #[test_case(false ; "absent_plan_path")]
+    #[test_case(true ; "missing_plan_file")]
+    fn restored_plan_uses_one_path_for_app_and_actor(missing_file: bool) {
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.meta.mode = Some(maki_storage::sessions::StoredMode::Plan);
+        session.meta.plan_path = missing_file.then(|| "/nonexistent/maki-plan-test.md".to_owned());
+        let runtime = harness.runtime(session);
+        let config = runtime.config().unwrap();
+        assert!(matches!(config.mode, maki_agent::AgentMode::Plan(_)));
+        assert_eq!(config.mode, agent_mode_for_app(&runtime.app));
+        assert_eq!(config.mode.plan_path(), runtime.app.state.plan.path());
+        assert_ne!(
+            config.mode.plan_path(),
+            Some(std::path::Path::new("/nonexistent/maki-plan-test.md"))
+        );
+        smol::block_on(async {
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let ticket = actor.reserve_config_update().unwrap();
+            ticket
+                .resolve(Ok(maki_agent::actor::ConfigChange::ToggleWorkflow))
+                .unwrap();
+            let commit = ticket.wait().await.unwrap();
+            runtime
+                .coordinator
+                .project_committed_config(commit.identity, commit.generation, commit.config)
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+        });
+        let saved = AppSession::load(runtime.id(), &harness.ctx().storage).unwrap();
+        assert_eq!(
+            saved.meta.mode,
+            Some(maki_storage::sessions::StoredMode::Plan)
+        );
+        assert_eq!(
+            saved.meta.plan_path.as_deref().map(std::path::Path::new),
+            config.mode.plan_path()
+        );
+        release_runtime(runtime);
+    }
+
     #[test]
     fn direct_option_changes_project_into_tui_and_reload_state() {
         let harness = RuntimeHarness::new();
@@ -4271,16 +6602,31 @@ mod tests {
                 .set_option(YOLO_OPTION_ID, ENABLED_VALUE),
         )
         .unwrap();
-        smol::block_on(
-            runtime
-                .coordinator
-                .set_option(WORKFLOW_OPTION_ID, ENABLED_VALUE),
-        )
-        .unwrap();
+        smol::block_on(async {
+            let (tx, rx) = flume::unbounded();
+            dispatch_option_toggle(
+                runtime.coordinator.clone(),
+                Arc::clone(&runtime.model_slot),
+                runtime.handles.manager_and_root(),
+                (runtime.id(), WORKFLOW_OPTION_ID),
+                &tx,
+            );
+            let InternalEvent::SessionOp { result, .. } = rx.recv_async().await.unwrap() else {
+                panic!("expected option completion");
+            };
+            result.unwrap();
+            wait_projected_option(&runtime, WORKFLOW_OPTION_ID, ENABLED_VALUE).await;
+        });
 
         project_committed_options(&mut runtime);
+
         assert!(runtime.app.permissions.is_yolo());
         assert!(runtime.app.state.workflow);
+        let (manager, root) = runtime.handles.manager_and_root();
+        let policy = manager.effective_config(root).unwrap().unwrap();
+        assert_eq!(policy.model.spec(), runtime.model_slot.load().model.spec());
+        assert!(policy.workflow);
+        assert!(!policy.fast);
 
         let snapshot = runtime.coordinator.read().options();
         let mut reload = Arc::unwrap_or_clone(Arc::clone(&runtime.app.state.session));
@@ -4343,6 +6689,7 @@ mod tests {
         assert_eq!(runtime.app.command_target.id(), target_id);
         assert_eq!(active_manager.generation(), manager.generation());
         assert_eq!(active_root_id, root_id);
+        assert!(runtime.handles.queue.is_empty());
         assert!(SessionMailbox::notify(session_id, "ready".into(), false).is_ok());
 
         drop(runtime);

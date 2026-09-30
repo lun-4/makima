@@ -31,6 +31,15 @@ pub(crate) struct InputReader {
 }
 
 impl InputReader {
+    #[cfg(test)]
+    pub(crate) fn disconnected() -> Self {
+        Self {
+            rx: flume::unbounded().1,
+            ctl_tx: flume::unbounded().0,
+            join: None,
+        }
+    }
+
     pub(crate) fn spawn() -> Self {
         let (tx, rx) = flume::unbounded::<Event>();
         let (ctl_tx, ctl_rx) = flume::unbounded::<Ctl>();

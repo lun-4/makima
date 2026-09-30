@@ -371,6 +371,8 @@ pub fn run(
                 id: session_id.to_string(),
                 cwd: cwd.clone(),
                 model: model.spec(),
+                fast: false,
+                thinking: String::new(),
             },
             // `maki -p` always runs the agent in build mode
             // (`headless::spawn` hardcodes `AgentMode::Build`).
@@ -610,6 +612,93 @@ mod tests {
             cancel: None,
             lease_committer: None,
         }
+    }
+
+    struct RecordingPrintProvider(flume::Sender<(String, String, bool)>);
+
+    impl maki_providers::provider::Provider for RecordingPrintProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _: &'a [maki_providers::Message],
+            system: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            options: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_agent::AgentError>,
+        > {
+            Box::pin(async move {
+                self.0
+                    .send((model.spec(), system.to_owned(), options.fast))
+                    .unwrap();
+                Ok(maki_providers::StreamResponse {
+                    message: maki_providers::Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![maki_providers::ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn print_turn_uses_initialized_config() {
+        const SPEC: &str = "anthropic/claude-opus-4-8";
+        const SYSTEM: &str = "print initialized system";
+        let registry = CommandRegistry::new();
+        let target = target(&registry);
+        let (requests, received) = flume::unbounded();
+        let mut literal = input("print request");
+        literal.fast = true;
+        drive_print(&registry, &target, &CommandTurnMarker, literal, |input| {
+            let cwd = std::env::temp_dir();
+            let handle = maki_agent::headless::spawn_with_provider(
+                HeadlessParams {
+                    model: Model::from_spec(SPEC).unwrap(),
+                    config: AgentConfig::default(),
+                    permissions_config: PermissionsConfig::default(),
+                    timeouts: Default::default(),
+                    input,
+                    prompt_slots: Default::default(),
+                    excluded_tools: Vec::new(),
+                    mcp_handle: None,
+                    initial_wd: cwd.clone(),
+                    system_prompt_override: Some(SYSTEM.into()),
+                    append_system_prompt: None,
+                    model_policy: Arc::default(),
+                    plugin_rules: Arc::default(),
+                    project_config: ProjectConfig::for_project(&cwd),
+                    modes: Arc::default(),
+                    session_options: Default::default(),
+                },
+                Arc::new(RecordingPrintProvider(requests)),
+            )?;
+            smol::block_on(handle.task);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            received.try_recv().unwrap(),
+            (SPEC.into(), SYSTEM.into(), true)
+        );
+        assert!(received.try_recv().is_err());
     }
 
     fn target(registry: &CommandRegistry) -> maki_commands::TargetHandle {

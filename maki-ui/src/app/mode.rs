@@ -151,8 +151,7 @@ impl App {
             Some(i) => &modes[(i + 1) % modes.len()],
             None => &modes[0],
         };
-        self.set_mode_id(next.id.key().to_owned());
-        vec![]
+        vec![super::Action::ChangeMode(next.id.key().to_owned())]
     }
 
     /// Applies a mode switch, guarding plan-mode invariants (plan path).

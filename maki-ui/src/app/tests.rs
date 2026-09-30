@@ -743,37 +743,24 @@ fn standalone_compaction_returns_to_idle_without_ending_the_session() {
 }
 
 #[test]
-fn toggle_mode_state_machine() {
-    let tab = |app: &mut App| app.update(Msg::Key(key(KeyCode::Tab)));
-
+fn toggle_mode_emits_change_mode_without_mutating_state() {
     let mut app = test_app();
     assert_eq!(app.state.mode, Mode::Build);
 
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    let first_path = app.state.plan.path().unwrap().to_path_buf();
-    assert!(first_path.to_str().unwrap().contains("plans"));
-
-    tab(&mut app);
+    let actions = app.update(Msg::Key(key(KeyCode::Tab)));
+    assert!(matches!(&actions[..], [Action::ChangeMode(id)] if id == "plan"));
     assert_eq!(app.state.mode, Mode::Build);
-    assert!(!app.state.plan.is_ready());
+}
 
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
-
-    app.state.plan.mark_ready();
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Build);
-    assert!(app.state.plan.is_ready());
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
-
-    app.state.mode = Mode::Build;
+#[test_case(maki_agent::session_options::FAST_OPTION_ID, "fast applies when this turn finishes" ; "fast")]
+#[test_case(maki_agent::session_options::WORKFLOW_OPTION_ID, "workflow applies when this turn finishes" ; "workflow")]
+fn deferred_policy_toggle_shows_applies_notice(id: &str, expected: &str) {
+    let mut app = test_app();
     app.status = Status::Streaming;
-    app.run_id = 1;
-    tab(&mut app);
-    assert_eq!(app.state.mode, Mode::Plan);
-    assert_eq!(app.state.plan.path().unwrap(), first_path);
+
+    app.apply_toggled_option(id, true);
+
+    assert_eq!(app.status_bar.flash_text(), Some(expected));
 }
 
 #[test_case(ToolOutput::Plain("wrote 100 bytes to /tmp/plans/test.md".into()), Some("/tmp/plans/test.md".into()), true  ; "write_matching")]
@@ -894,6 +881,8 @@ fn queue_item_consumed_pushes_deferred_user_message() {
         AgentEvent::QueueItemConsumed {
             text: "queued".into(),
             images: Vec::new(),
+            mcp_startup_notice: None,
+            already_displayed: false,
         },
         app.run_id,
     ));
@@ -903,6 +892,27 @@ fn queue_item_consumed_pushes_deferred_user_message() {
     assert_eq!(
         app.main_chat().last_message_role(),
         Some(&DisplayRole::User),
+    );
+}
+
+#[test]
+fn queue_item_consumed_shows_mcp_startup_notice() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "first");
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "queued".into(),
+            images: Vec::new(),
+            mcp_startup_notice: Some(2),
+            already_displayed: false,
+        },
+        app.run_id,
+    ));
+
+    assert_eq!(
+        app.main_chat().message_at(1).unwrap().annotation.as_deref(),
+        Some("2 MCP servers are not ready; no MCP tools exposed")
     );
 }
 
@@ -918,6 +928,8 @@ fn queue_item_consumed_marks_agent_streaming() {
         AgentEvent::QueueItemConsumed {
             text: "restored".into(),
             images: Vec::new(),
+            mcp_startup_notice: None,
+            already_displayed: false,
         },
         app.run_id,
     ));
@@ -2455,7 +2467,7 @@ fn open_task_picker_refreshes_after_tool_done() {
 }
 
 #[test]
-fn open_task_picker_inserts_new_child_without_changing_selection() {
+fn open_task_picker_appends_new_child_without_changing_selection() {
     let mut app = app_with_subagent();
     open_tasks_picker(&mut app);
     app.update(Msg::Key(key(KeyCode::Down)));
@@ -2466,9 +2478,9 @@ fn open_task_picker_inserts_new_child_without_changing_selection() {
         Some("build"),
     ));
 
-    assert_eq!(app.task_picker.item(1).unwrap().name, "build");
-    assert_eq!(app.task_picker.item(2).unwrap().name, "research");
-    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
+    assert_eq!(app.task_picker.item(1).unwrap().name, "research");
+    assert_eq!(app.task_picker.item(2).unwrap().name, "build");
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "research");
 }
 
 #[test]
@@ -2509,6 +2521,99 @@ fn filtered_task_picker_refresh_preserves_selected_chat_identity() {
 
     assert!(app.task_picker.is_open());
     assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
+}
+
+#[test]
+fn filtered_task_picker_appends_higher_ranked_match_until_query_changes() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "build");
+
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "z".into() },
+        "task3",
+        Some("b"),
+    ));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "build");
+    app.update(Msg::Key(key(KeyCode::Down)));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "b");
+
+    app.update(Msg::Key(key(KeyCode::Backspace)));
+    app.update(Msg::Key(key(KeyCode::Char('b'))));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "b");
+    app.update(Msg::Key(key(KeyCode::Down)));
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "build");
+}
+
+#[test]
+fn task_picker_reopen_restores_default_status_sorting() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    let first_task = app.task_picker.item(1).unwrap().chat_index;
+    app.chats[first_task].mark_finished(DisplayRole::Assistant, "done");
+    app.sync_task_picker();
+    assert_eq!(app.task_picker.item(1).unwrap().chat_index, first_task);
+
+    app.task_picker.close();
+    open_tasks_picker(&mut app);
+    assert_eq!(app.task_picker.item(1).unwrap().finished, Some(false));
+    assert_eq!(app.task_picker.item(2).unwrap().chat_index, first_task);
+}
+
+#[test]
+fn task_picker_refresh_keeps_existing_order_when_status_changes() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    let initial: Vec<_> = (0..3)
+        .map(|index| app.task_picker.item(index).unwrap().name.clone())
+        .collect();
+
+    finish_subagent(&mut app, "task1", false);
+    finish_subagent(&mut app, "task2", false);
+
+    let refreshed: Vec<_> = (0..3)
+        .map(|index| app.task_picker.item(index).unwrap().name.clone())
+        .collect();
+    assert_eq!(refreshed, initial);
+}
+
+#[test]
+fn task_picker_refresh_removes_missing_rows_and_preserves_selection_by_identity() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    open_tasks_picker(&mut app);
+    app.task_picker
+        .select_item_by(|entry| entry.name == "build");
+    let removed_index = app.chat_index.remove("task1").unwrap();
+    app.chats[removed_index].subagent_id = None;
+    app.chats[removed_index].agent_id = None;
+    app.sync_task_picker();
+
+    let names: Vec<_> = (0..2)
+        .map(|index| app.task_picker.item(index).unwrap().name.clone())
+        .collect();
+    assert_eq!(names, ["Main", "build"]);
+    assert_eq!(app.task_picker.selected_item().unwrap().name, "build");
 }
 
 #[test]
@@ -4199,7 +4304,7 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert!(app.state.session.meta.input_draft.is_none());
     assert!(!session_has_content(&app.state.session));
 
-    app.update(Msg::Key(key(KeyCode::Tab)));
+    app.set_mode_id("plan".into());
     app.checkpoint();
     assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
     assert!(session_has_content(&app.state.session));
@@ -5739,6 +5844,7 @@ fn plan_app() -> App {
         annotation: None,
         written_path: Some("test-plan.md".into()),
     }))));
+    app.update(done_event());
     app
 }
 
@@ -5870,14 +5976,9 @@ fn plan_submit_mode_disables_auto_open() {
     assert!(!app.state.plan.is_ready());
 }
 
-#[test_case(1, Mode::Build, true,  true  ; "clear_and_implement")]
-#[test_case(2, Mode::Build, false, true  ; "implement_keeps_context")]
-fn plan_form_menu_options(
-    downs: usize,
-    expected_mode: Mode,
-    has_new_session: bool,
-    has_send_message: bool,
-) {
+#[test_case(1, true ; "clear_and_implement")]
+#[test_case(2, false ; "implement_keeps_context")]
+fn plan_form_menu_options(downs: usize, has_new_session: bool) {
     let mut app = plan_app();
     assert!(app.plan_form.is_visible());
 
@@ -5885,16 +5986,9 @@ fn plan_form_menu_options(
         app.update(Msg::Key(key(KeyCode::Down)));
     }
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.plan_form.is_visible(), has_new_session);
-    assert_eq!(
-        app.state.mode,
-        if has_new_session {
-            Mode::Plan
-        } else {
-            expected_mode
-        }
-    );
-    assert_eq!(app.state.plan == PlanState::None, !has_new_session);
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.state.plan.is_ready());
     assert_eq!(
         actions
             .iter()
@@ -5902,10 +5996,12 @@ fn plan_form_menu_options(
         has_new_session
     );
     let expected_msg = implement_msg(PlanForm::new().parallel());
-    let immediate = actions
-        .iter()
-        .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg));
-    assert_eq!(immediate, has_send_message && !has_new_session);
+    assert_eq!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::ImplementPlan(message) if message == &expected_msg)),
+        !has_new_session
+    );
     if has_new_session {
         let Action::ReplaceSession(request) = &actions[0] else {
             panic!("expected replacement request");
@@ -5931,7 +6027,7 @@ fn plan_form_implement_toggled_parallel() {
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
+            .any(|a| matches!(a, Action::ImplementPlan(message) if message == &expected_msg))
     );
 }
 
@@ -6234,6 +6330,19 @@ fn set_opus_model(app: &mut App) {
 }
 
 #[test]
+fn deferred_fast_toggle_flash_says_when_it_applies() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+
+    app.apply_toggled_option(maki_agent::session_options::FAST_OPTION_ID, true);
+
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some("fast applies when this turn finishes")
+    );
+}
+
+#[test]
 fn fast_toggle_on_off_on_opus() {
     let mut app = test_app();
     set_opus_model(&mut app);
@@ -6272,6 +6381,45 @@ fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
     assert_eq!(app.state.fast, !cancel);
     assert!(!app.state.pending_fast);
     assert_eq!(app.build_meta().fast, !cancel);
+}
+
+#[test]
+fn streaming_status_uses_context_window_of_active_run() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_context_window = Some(123_456);
+    app.state.model.context_window = 987_654;
+
+    let status = rendered_rows(&mut app, 120, 24).pop().expect("status row");
+
+    assert!(status.contains(&maki_providers::format_tokens(123_456)));
+    assert!(!status.contains(&maki_providers::format_tokens(987_654)));
+}
+
+#[test]
+fn model_switch_updates_active_run_status() {
+    const SWITCHED_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+    const INITIAL_CONTEXT_WINDOW: u32 = 123_456;
+
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_context_window = Some(INITIAL_CONTEXT_WINDOW);
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ModelSwitched {
+            spec: SWITCHED_MODEL_SPEC.into(),
+        },
+        app.run_id,
+    ));
+
+    let expected_context_window = maki_providers::Model::from_spec(SWITCHED_MODEL_SPEC)
+        .unwrap()
+        .context_window;
+    let status = rendered_rows(&mut app, 120, 24).pop().expect("status row");
+
+    assert!(status.contains(SWITCHED_MODEL_SPEC));
+    assert!(status.contains(&maki_providers::format_tokens(expected_context_window)));
+    assert!(!status.contains(&maki_providers::format_tokens(INITIAL_CONTEXT_WINDOW)));
 }
 
 #[test]

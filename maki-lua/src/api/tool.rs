@@ -237,6 +237,7 @@ pub(crate) struct LuaTool {
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
+    pub(crate) generation: u64,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
@@ -324,6 +325,7 @@ impl Tool for LuaTool {
         Ok(Box::new(LuaToolInvocation {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
+            generation: self.generation,
             has_header_fn: self.has_header_fn,
             has_start_fn: self.has_start_fn,
             input: validated,
@@ -345,6 +347,7 @@ enum PermissionState {
 struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
+    generation: u64,
     has_header_fn: bool,
     has_start_fn: bool,
     input: Value,
@@ -498,6 +501,7 @@ impl ToolInvocation for LuaToolInvocation {
         let deadline = ctx.deadline;
         let plugin = self.plugin;
         let tool = self.tool;
+        let generation = self.generation;
         let input = self.input;
         let tx = self.tx;
         let tool_timeout = self.timeout;
@@ -528,6 +532,7 @@ impl ToolInvocation for LuaToolInvocation {
                 .send_async(Request::CallTool {
                     plugin: Arc::clone(&plugin),
                     tool: Arc::clone(&tool),
+                    generation,
                     input,
                     ctx: Box::new(lua_ctx),
                     deadline: match deadline {
@@ -2544,6 +2549,7 @@ mod tests {
         LuaToolInvocation {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
+            generation: 1,
             has_header_fn: false,
             input,
             tx,
@@ -2601,6 +2607,7 @@ mod tests {
             kind: None,
             tx,
             plugin: Arc::from("test"),
+            generation: 1,
             has_header_fn: false,
             permission_scope_kind,
             permission: None,
@@ -2704,6 +2711,7 @@ mod tests {
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
+            generation: 1,
             has_header_fn: false,
             input: serde_json::json!({"command": "ls"}),
             tx,
@@ -2723,6 +2731,7 @@ mod tests {
         let inv2 = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
+            generation: 1,
             has_header_fn: false,
             input: serde_json::json!({"command": "echo hi"}),
             tx: tx2,
@@ -2748,6 +2757,7 @@ mod tests {
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
+            generation: 1,
             has_header_fn: false,
             input: serde_json::json!({"command": "cargo test"}),
             tx,

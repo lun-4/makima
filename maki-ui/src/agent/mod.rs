@@ -13,8 +13,8 @@ use arc_swap::{ArcSwap, Guard};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
-    McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, PreparedSessionMailbox,
-    SessionMailbox, SharedMessages, ToolOutputLines,
+    McpCommand, McpConfigErrors, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages,
+    ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -189,6 +189,20 @@ impl ProviderSlot {
         self.change_tx.clone()
     }
 
+    pub(crate) fn project(&self, model: Model, provider: Arc<dyn Provider>) {
+        let current = self.load();
+        let tracked = Arc::clone(&current.provider) as Arc<dyn Provider>;
+        if Arc::ptr_eq(&tracked, &provider) || Arc::ptr_eq(&current.provider.inner, &provider) {
+            self.current.store(Arc::new(ProviderSnapshot {
+                model,
+                provider: Arc::clone(&current.provider),
+            }));
+        } else {
+            drop(current);
+            self.install(model, provider);
+        }
+    }
+
     pub(crate) fn install(&self, model: Model, provider: Arc<dyn Provider>) -> ProviderIdentity {
         let instance = next_provider_instance();
         let tracked = Arc::new(TrackedProvider::new(
@@ -247,13 +261,6 @@ impl PreparedAgentHandles {
     pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, maki_agent::AgentId) {
         let handles = self.handles.as_ref().expect("prepared handles");
         (handles.manager.clone(), handles.root_id)
-    }
-
-    pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
-        self.handles
-            .as_ref()
-            .expect("prepared handles")
-            .mcp_reader()
     }
 
     pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
@@ -325,8 +332,21 @@ impl AgentHandles {
         model_policy: Arc<ModelPolicy>,
         system_prompt: SystemPromptOverride,
     ) -> Self {
+        let selected = model_slot.load();
+        let initial_config = maki_agent::EffectiveAgentConfig::new(
+            maki_agent::RunSettings {
+                provider: Arc::clone(&selected.provider) as Arc<dyn Provider>,
+                model: selected.model.clone(),
+                fast: false,
+                workflow: false,
+                thinking: Default::default(),
+            },
+            maki_agent::AgentMode::Build,
+        );
+        drop(selected);
         Self::prepare(
             model_slot,
+            initial_config,
             initial_history,
             config,
             tool_output_lines,
@@ -346,6 +366,7 @@ impl AgentHandles {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         model_slot: &Arc<ProviderSlot>,
+        initial_config: maki_agent::EffectiveAgentConfig,
         initial_history: Vec<Message>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
@@ -362,6 +383,7 @@ impl AgentHandles {
         spawn_agent_internal(
             flume::unbounded(),
             model_slot,
+            Some(initial_config),
             initial_history,
             config,
             tool_output_lines,
@@ -391,16 +413,15 @@ impl AgentHandles {
         self.mailbox = Some(mailbox);
     }
 
-    #[cfg(test)]
     pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, maki_agent::AgentId) {
         (self.manager.clone(), self.root_id)
     }
 
-    pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
-        self.mcp_handle
-            .as_ref()
-            .map(McpHandle::reader)
-            .unwrap_or_else(McpSnapshotReader::empty)
+    pub(crate) fn identity(&self) -> Arc<()> {
+        self.manager
+            .actor(self.root_id)
+            .expect("live runtime actor")
+            .identity()
     }
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
@@ -465,6 +486,7 @@ impl AgentHandles {
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
+            None,
             history,
             config,
             tool_output_lines,
@@ -533,6 +555,7 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
 fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ProviderSlot>,
+    initial_config: Option<maki_agent::EffectiveAgentConfig>,
     initial_history: Vec<Message>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
@@ -582,8 +605,23 @@ fn spawn_agent_internal(
         max_live_agents: config.max_live_agents,
     };
     let manager = AgentManagerHandle::new(limits).expect("validated agent limits");
+    let selected = model_slot.load();
+    let initial_settings = maki_agent::RunSettings {
+        provider: Arc::clone(&selected.provider) as Arc<dyn Provider>,
+        model: selected.model.clone(),
+        fast: false,
+        workflow: false,
+        thinking: Default::default(),
+    };
+    drop(selected);
     let root = manager
-        .create_root_with(
+        .create_root_with_config(
+            Some(initial_config.unwrap_or_else(|| {
+                maki_agent::actor::EffectiveAgentConfig::new(
+                    initial_settings,
+                    maki_agent::AgentMode::Build,
+                )
+            })),
             initial_history.clone(),
             Some(Arc::clone(&shared_history)),
             |agent_id| {

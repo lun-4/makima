@@ -33,15 +33,17 @@ deny rule matches?  ── yes ──►  blocked. no exceptions
     │ no
 allow rule matches? ── yes ──►  runs
     │ no
-YOLO active?        ── yes ──►  runs
+plan-file write?    ── yes ──►  runs
     │ no
-plan file write?    ── yes ──►  runs
+YOLO active?        ── yes ──►  runs
     │ no
     ▼
 default: prompt / allow / deny
 ```
 
-Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO. Mode tool selection and native write-target restrictions also apply before permission approval. A custom write-restricted mode can explicitly offer a third-party local tool. Native mutation tools must match the permitted normalized target, including after an input hook changes their arguments. MCP execution and deferred MCP search remain blocked in write-restricted modes. Approval and YOLO do not bypass these restrictions. `default` resolves per-tool first, then global. The built-in default is `"prompt"`.
+
+Mode restrictions do not provide a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and have no plan-path restriction. See [Modes](/docs/modes/#configuration-changes) for configuration ownership, admission snapshots, and asynchronous saving. If a pinned MCP prompt disappears before execution, setup fails rather than using a replacement.
 
 ## Builtin Defaults
 
