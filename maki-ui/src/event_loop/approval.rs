@@ -7,16 +7,13 @@ use maki_agent::actor::{
 use maki_agent::manager::IdleSubtreeGuard;
 use maki_agent::session_coordinator::IdleSessionLease;
 use maki_agent::{AgentInput, AgentMode, CancelToken, EventSender, ModeDef, SessionDefaults};
-use maki_storage::id::MakiId;
 use maki_storage::session_lock::ClaimedSessionLock;
 use maki_storage::sessions::{StoredMode, StoredRule};
 use tracing::warn;
 
-#[cfg(test)]
-use super::LockPrepareGate;
 use super::{
     EventLoop, InternalEvent, PreparedProvider, PreparedSessionRuntime, SESSION_OP_TIMEOUT,
-    SessionLockState, SessionRuntime, SpawnCtx, bounded_session_op, claim_lock, release_lock_state,
+    SessionLockState, SessionRuntime, bounded_session_op, claim_lock, release_lock_state,
     swap_session_runtime,
 };
 use crate::AppSession;
@@ -75,46 +72,6 @@ pub(super) struct FreshPlanApproval {
     ticket: TurnTicket,
     idle: IdleSubtreeGuard,
     lock: ClaimedSessionLock,
-}
-
-struct TargetLockClaim {
-    sessions_dir: PathBuf,
-    #[cfg(test)]
-    gate: Option<LockPrepareGate>,
-}
-
-impl TargetLockClaim {
-    /// Under test, the gate's guard is returned alongside the lock so a
-    /// cancelled claim drops the lock before the guard observes it.
-    async fn claim(self, target: MakiId) -> Result<ClaimedSessionLock, String> {
-        let claimed = smol::unblock(move || {
-            #[cfg(test)]
-            let guard = self.gate.map(|gate| gate(target));
-            let lock = claim_lock(&self.sessions_dir, &target).map_err(|error| error.to_string());
-            #[cfg(test)]
-            {
-                (lock, guard)
-            }
-            #[cfg(not(test))]
-            {
-                lock
-            }
-        })
-        .await;
-        #[cfg(test)]
-        let (claimed, _guard) = claimed;
-        claimed
-    }
-}
-
-impl SpawnCtx {
-    fn target_lock_claim(&self) -> TargetLockClaim {
-        TargetLockClaim {
-            sessions_dir: self.sessions_dir.clone(),
-            #[cfg(test)]
-            gate: self.lock_prepare_gate.clone(),
-        }
-    }
 }
 
 struct PlanApprovalRequest {
@@ -403,7 +360,7 @@ impl EventLoop<'_> {
         let timeouts = self.ctx.timeouts;
         let spec = source.request.model.clone();
         let mode = source.request.build_mode.clone();
-        let lock_claim = self.ctx.target_lock_claim();
+        let sessions_dir = self.ctx.sessions_dir.clone();
         self.spawn_approval_step(idx, async move {
             let change =
                 smol::unblock(move || prepare_change(spec, &policy, timeouts, &provider, mode))
@@ -419,7 +376,9 @@ impl EventLoop<'_> {
                 operation.commit().map_err(|error| error.to_string())?;
             let ticket = ticket.ok_or_else(|| APPROVAL_CHANGED.to_string())?;
             idle.allow_turn(&ticket).map_err(idle_error_message)?;
-            let lock = lock_claim.claim(target).await?;
+            let lock = smol::unblock(move || claim_lock(&sessions_dir, &target))
+                .await
+                .map_err(|error| error.to_string())?;
             Ok(ApprovalStep::Fresh(Box::new(FreshPlanApproval {
                 source,
                 candidate,

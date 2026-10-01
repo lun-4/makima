@@ -1254,13 +1254,8 @@ impl SessionRuntime {
 }
 
 /// Everything needed to bring up a new session runtime after startup.
-#[cfg(test)]
-type LockPrepareGate = Arc<dyn Fn(MakiId) -> Box<dyn Send> + Send + Sync>;
-
 struct SpawnCtx {
     prepare_provider: PrepareProvider,
-    #[cfg(test)]
-    lock_prepare_gate: Option<LockPrepareGate>,
     storage: StateDir,
     sessions_dir: PathBuf,
     config: AgentConfig,
@@ -2074,8 +2069,6 @@ impl<'t> EventLoop<'t> {
             smol::block_on(mcp::start(&cwd, project_config.clone()));
         let ctx = SpawnCtx {
             prepare_provider: Arc::new(prepare_provider),
-            #[cfg(test)]
-            lock_prepare_gate: None,
             storage,
             sessions_dir: sessions_dir.clone(),
             config,
@@ -6259,7 +6252,6 @@ mod tests {
                 Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
             let ctx = SpawnCtx {
                 prepare_provider: Arc::new(prepare_provider),
-                lock_prepare_gate: None,
                 storage,
                 sessions_dir,
                 config: AgentConfig::default(),

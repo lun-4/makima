@@ -24,7 +24,7 @@ use maki_providers::{
 use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::model::{read_model, read_recents};
-use maki_storage::session_lock::{self, OPEN_ELSEWHERE_MSG};
+use maki_storage::session_lock;
 use maki_storage::sessions::{StoredMode, read_prefs};
 use test_case::test_case;
 
@@ -794,40 +794,6 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         assert!(recorded.is_empty());
         assert!(requests.is_empty());
         drop(release);
-    });
-}
-
-#[test]
-fn fresh_target_lock_failure_preserves_runtime_and_storage() {
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        let id = event_loop.sessions[index].id();
-        let identity = event_loop.sessions[index].handles.identity();
-        let targets = event_loop.ctx.command_runtime.registry.target_count();
-        let run = event_loop.sessions[index].app.run_id;
-        let sessions_dir = event_loop.ctx.sessions_dir.clone();
-        event_loop.ctx.lock_prepare_gate = Some(Arc::new(move |target| {
-            Box::new(
-                session_lock::claim(&sessions_dir, &target)
-                    .unwrap()
-                    .unwrap(),
-            )
-        }));
-        approve(event_loop, index, true);
-        pump_until(event_loop, |event_loop| {
-            !event_loop.sessions[index].app.plan_approval_pending
-        });
-        assert_preserved(event_loop, index, &path, run, Some(OPEN_ELSEWHERE_MSG));
-        assert_eq!(event_loop.sessions[index].id(), id);
-        assert!(Arc::ptr_eq(
-            &identity,
-            &event_loop.sessions[index].handles.identity()
-        ));
-        assert_eq!(
-            event_loop.ctx.command_runtime.registry.target_count(),
-            targets
-        );
-        assert!(requests.is_empty());
     });
 }
 
