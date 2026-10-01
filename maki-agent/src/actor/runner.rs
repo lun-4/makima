@@ -11,7 +11,7 @@ use super::queue::{ActorQueue, InterruptQueue};
 use super::types::{ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind};
 use super::{
     ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, cancelled_outcome,
-    finalize_turn,
+    settle_and_finalize_turn,
 };
 use crate::types::{TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
@@ -517,30 +517,24 @@ impl Runner {
         }
     }
 
-    /// Retains (and optionally delivers once) the turn's outcome, then clears
-    /// the active-turn slot and wakes the next runner step. Always clears
-    /// state even when no outcome exists, so a misbehaving backend cannot
-    /// strand the actor in a running state.
+    /// Clears the active-turn slot together with retaining the turn's outcome,
+    /// then delivers it at most once and wakes the next runner step. Always
+    /// clears state even when no outcome exists, so a misbehaving backend
+    /// cannot strand the actor in a running state.
     fn settle_turn(
         &mut self,
         admission: &TurnAdmission,
         outcome: Option<TurnOutcome>,
         deliver: bool,
     ) {
-        {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.active = None;
-            state.status = ActorStatus::Idle;
-            state.processing = None;
-        }
-        if let Some(outcome) = outcome {
-            finalize_turn(
-                &self.inner,
-                admission.turn_id,
-                outcome,
-                Some(admission),
-                deliver,
-            );
+        match outcome {
+            Some(outcome) => settle_and_finalize_turn(&self.inner, admission, outcome, deliver),
+            None => self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .settle_runner(),
         }
         self.wake.wake();
     }

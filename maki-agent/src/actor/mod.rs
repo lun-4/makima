@@ -77,8 +77,6 @@ pub(crate) struct ActorInner {
     policy_changed: Event,
     pub(crate) queue: Arc<ActorQueue>,
     pub(crate) outcomes: Mutex<HashMap<TurnId, TurnOutcome>>,
-    pub(crate) latest: Mutex<Option<TurnOutcome>>,
-    pub(crate) usage: Mutex<TokenUsage>,
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     admission_preparation: Option<AdmissionPreparation>,
@@ -131,8 +129,9 @@ impl ProcessingWork {
     }
 }
 
-/// Lifecycle, run status, and the active turn's cancellation wiring. One
-/// lock keeps admission/close and lifecycle + status snapshots consistent.
+/// Lifecycle, run status, retained totals, and the active turn's
+/// cancellation wiring. One lock keeps admission/close and snapshots of
+/// lifecycle, status, queue, and latest outcome consistent.
 /// `cancelled_correlations` remembers correlations cancelled before their
 /// work was pushed (precancel), so a later matching push is dropped or
 /// terminalized immediately.
@@ -147,6 +146,8 @@ pub(crate) struct ActorState {
     pub(crate) cancellation_generation: u64,
     pub(crate) policy_generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
+    latest: Option<TurnOutcome>,
+    usage: TokenUsage,
     operations: VecDeque<ActorOperation>,
     preparing: Option<u64>,
     config_observers: Vec<flume::Sender<ConfigCommit>>,
@@ -607,6 +608,12 @@ impl ActorState {
         work
     }
 
+    pub(crate) fn settle_runner(&mut self) {
+        self.active = None;
+        self.status = ActorStatus::Idle;
+        self.processing = None;
+    }
+
     fn idle(policy: Option<Arc<EffectiveAgentConfig>>) -> Self {
         Self {
             lifecycle: ActorLifecycle::Open,
@@ -619,6 +626,8 @@ impl ActorState {
             cancellation_generation: 0,
             policy_generation: 0,
             policy,
+            latest: None,
+            usage: TokenUsage::default(),
             operations: VecDeque::new(),
             preparing: None,
             config_observers: Vec::new(),
@@ -672,24 +681,32 @@ impl ActiveCancel {
 
 /// Retains one outcome and retires its cancellation and ticket registration.
 /// The first call wins; terminal registration is gone before any waiter or
-/// event recipient can observe the outcome.
-pub(crate) fn retire_turn(inner: &ActorInner, turn_id: TurnId, outcome: &TurnOutcome) -> bool {
+/// event recipient can observe the outcome. When `settle_runner` is set, the
+/// runner's active slot clears in the same critical section, so no snapshot
+/// pairs a running or idle status with the wrong latest outcome.
+fn retire_turn(
+    inner: &ActorInner,
+    turn_id: TurnId,
+    outcome: &TurnOutcome,
+    settle_runner: bool,
+) -> bool {
     let mut outcomes = inner.outcomes.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    if settle_runner {
+        state.settle_runner();
+    }
     let std::collections::hash_map::Entry::Vacant(vacant) = outcomes.entry(turn_id) else {
         return false;
     };
-    let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
     let mut tickets = inner.tickets.lock().unwrap_or_else(|e| e.into_inner());
     vacant.insert(outcome.clone());
     state.cancelled_turns.remove(&turn_id);
     if state.release_idle_permission(turn_id) {
         inner.queue.notify();
     }
+    state.latest = Some(outcome.clone());
+    state.usage += outcome.usage();
     tickets.remove(&turn_id);
-    drop(tickets);
-    drop(state);
-    *inner.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome.clone());
-    *inner.usage.lock().unwrap_or_else(|e| e.into_inner()) += outcome.usage();
     true
 }
 
@@ -712,7 +729,36 @@ pub(crate) fn finalize_turn(
     admission: Option<&TurnAdmission>,
     deliver: bool,
 ) {
-    if retire_turn(inner, turn_id, &outcome) {
+    retire_and_publish(inner, turn_id, outcome, admission, deliver, false);
+}
+
+/// Finalizes the runner's own turn, clearing its active slot atomically
+/// with retaining the outcome.
+pub(crate) fn settle_and_finalize_turn(
+    inner: &ActorInner,
+    admission: &TurnAdmission,
+    outcome: TurnOutcome,
+    deliver: bool,
+) {
+    retire_and_publish(
+        inner,
+        admission.turn_id,
+        outcome,
+        Some(admission),
+        deliver,
+        true,
+    );
+}
+
+fn retire_and_publish(
+    inner: &ActorInner,
+    turn_id: TurnId,
+    outcome: TurnOutcome,
+    admission: Option<&TurnAdmission>,
+    deliver: bool,
+    settle_runner: bool,
+) {
+    if retire_turn(inner, turn_id, &outcome, settle_runner) {
         #[cfg(test)]
         if let Some((retired, release)) = inner
             .after_finalization_retire
@@ -842,8 +888,6 @@ impl AgentActorHandle {
             policy_changed: Event::new(),
             queue: Arc::new(ActorQueue::new()),
             outcomes: Mutex::new(HashMap::new()),
-            latest: Mutex::new(None),
-            usage: Mutex::new(TokenUsage::default()),
             tickets: Mutex::new(HashMap::new()),
             managed_admission,
             admission_preparation,
@@ -1575,7 +1619,6 @@ impl AgentActorHandle {
                 .iter()
                 .filter_map(ActorOperation::projection),
         );
-        drop(state);
         ActorSnapshot {
             lifecycle,
             status,
@@ -1585,13 +1628,8 @@ impl AgentActorHandle {
                 .filter(|item| !matches!(item, QueueProjection::Control(_)))
                 .count(),
             queue,
-            latest: self
-                .inner
-                .latest
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-            cumulative_usage: *self.inner.usage.lock().unwrap_or_else(|e| e.into_inner()),
+            latest: state.latest.clone(),
+            cumulative_usage: state.usage,
         }
     }
 
