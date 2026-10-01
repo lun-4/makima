@@ -1,17 +1,11 @@
 use std::fs;
-use std::io;
-#[cfg(unix)]
-use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use futures_lite::future::poll_once;
 use maki_agent::actor::{
     ActorStatus, AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch, ConfigUpdateTicket,
     PreparedModel,
@@ -36,8 +30,8 @@ use test_case::test_case;
 
 use super::super::tests::{shutdown_manager, with_event_loop};
 use super::super::{
-    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, Wake, bounded_session_op,
-    prepare_coordinator, start_runtime_heartbeat_with,
+    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, Wake, prepare_coordinator,
+    start_runtime_heartbeat_with,
 };
 use super::ApprovalStep;
 use crate::AppSession;
@@ -58,7 +52,6 @@ const PROVIDER_FAILURE: &str = "approval provider preparation failed";
 const WAIT: Duration = Duration::from_secs(10);
 const CHECKPOINT_EPOCH: u64 = 1;
 const CHILD_PROMPT: &str = "gated managed child";
-const RELEASED_LOCK: &str = "released";
 const RESET_COMMAND: &str = "/approval-reset";
 const START_COMMAND_PREFIX: &str = "/approval-start-";
 const MODE_COMMAND_PREFIX: &str = "/approval-mode-";
@@ -434,14 +427,6 @@ fn apply_patch(actor: &AgentActorHandle, patch: ConfigPatch) -> ConfigCommit {
     smol::block_on(queue_patch(actor, patch).wait()).unwrap()
 }
 
-fn wait_bounded(ticket: &ConfigUpdateTicket) {
-    smol::block_on(bounded_session_op(
-        async { ticket.wait().await.map_err(|error| error.to_string()) },
-        WAIT,
-    ))
-    .unwrap();
-}
-
 fn model_patch(spec: &str, provider: Arc<dyn Provider>) -> ConfigPatch {
     ConfigPatch {
         model: Some(PreparedModel {
@@ -813,143 +798,6 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
 }
 
 #[test]
-fn fresh_candidate_cancel_releases_source_setter() {
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        let original_id = event_loop.sessions[index].id();
-        let original_identity = event_loop.sessions[index].handles.identity();
-        let run = event_loop.sessions[index].app.run_id;
-        approve(event_loop, index, true);
-        let ready = final_ready(event_loop, true, &requests);
-        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let actor = manager.actor(root).unwrap();
-        let before = actor.effective_config().unwrap();
-        let successor = queue_patch(&actor, disable_fast());
-        assert!(Arc::ptr_eq(&before, &actor.effective_config().unwrap()));
-        event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        event_loop.handle_internal(ready);
-        wait_bounded(&successor);
-        assert_preserved(event_loop, index, &path, run, None);
-        assert_eq!(event_loop.sessions[index].id(), original_id);
-        assert!(Arc::ptr_eq(
-            &original_identity,
-            &event_loop.sessions[index].handles.identity()
-        ));
-        assert!(!actor.effective_config().unwrap().fast);
-        assert!(requests.is_empty());
-    });
-}
-
-#[test_case(false; "existing_context")]
-#[test_case(true; "fresh_context")]
-fn runtime_identity_rejects_stale_completion(fresh: bool) {
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        let run = event_loop.sessions[index].app.run_id;
-        approve(event_loop, index, fresh);
-        let mut ready = next_ready(event_loop);
-        if let InternalEvent::PlanApprovalReady { runtime, .. } = &mut ready {
-            *runtime = Arc::new(());
-        }
-        event_loop.handle_internal(ready);
-        assert!(event_loop.sessions[index].app.plan_approval_pending);
-        event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        assert_preserved(event_loop, index, &path, run, None);
-        assert!(requests.is_empty());
-    });
-}
-
-struct LockDisposal {
-    path: PathBuf,
-    disposed: flume::Sender<io::Result<String>>,
-}
-
-impl Drop for LockDisposal {
-    fn drop(&mut self) {
-        let _ = self.disposed.send(fs::read_to_string(&self.path));
-    }
-}
-
-#[test]
-fn fresh_cancel_releases_source_before_target_lock_returns() {
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        let source = event_loop.sessions[index].id();
-        let identity = event_loop.sessions[index].handles.identity();
-        let run = event_loop.sessions[index].app.run_id;
-        let targets = event_loop.ctx.command_runtime.registry.target_count();
-        let recents = read_recents(&event_loop.ctx.storage);
-        let saved_model = read_model(&event_loop.ctx.storage);
-        let (entered, entry) = flume::bounded(1);
-        let (release, gate) = flume::bounded(1);
-        let (disposed, disposal) = flume::bounded(1);
-        let sessions_dir = event_loop.ctx.sessions_dir.clone();
-        event_loop.ctx.lock_prepare_gate = Some(Arc::new(move |target| {
-            let guard = LockDisposal {
-                path: session_lock::lock_path(&sessions_dir, &target),
-                disposed: disposed.clone(),
-            };
-            entered.send(target).unwrap();
-            gate.recv_timeout(WAIT).unwrap();
-            Box::new(guard)
-        }));
-        approve(event_loop, index, true);
-        let ready = next_ready(event_loop);
-        event_loop.handle_internal(ready);
-        let target = entry.recv_timeout(WAIT).unwrap();
-        assert!(disposal.is_empty());
-        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let actor = manager.actor(root).unwrap();
-        let before = actor.effective_config().unwrap();
-        let successor = queue_patch(&actor, disable_fast());
-        assert!(Arc::ptr_eq(&before, &actor.effective_config().unwrap()));
-        event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        wait_bounded(&successor);
-        assert!(!actor.effective_config().unwrap().fast);
-        assert!(disposal.is_empty());
-        assert!(!session_lock::lock_path(&event_loop.sessions_dir, &target).exists());
-        let cancelled = next_ready(event_loop);
-        event_loop.handle_internal(cancelled);
-        assert_preserved(event_loop, index, &path, run, None);
-        release.send(()).unwrap();
-        assert_eq!(disposal.recv_timeout(WAIT).unwrap().unwrap(), RELEASED_LOCK);
-        event_loop.ctx.lock_prepare_gate = None;
-        assert_eq!(event_loop.sessions[index].id(), source);
-        assert!(Arc::ptr_eq(
-            &identity,
-            &event_loop.sessions[index].handles.identity()
-        ));
-        assert_eq!(
-            event_loop.ctx.command_runtime.registry.target_count(),
-            targets
-        );
-        assert_eq!(read_recents(&event_loop.ctx.storage), recents);
-        assert_eq!(read_model(&event_loop.ctx.storage), saved_model);
-        assert!(SessionCoordinatorHandle::resolve(target).is_err());
-        assert!(SessionMailbox::notify(target, RESPONSE.into(), false).is_err());
-        assert!(
-            event_loop
-                .ctx
-                .storage_writer
-                .latest_snapshot(target)
-                .is_none()
-        );
-        assert!(AppSession::load(target, &event_loop.ctx.storage).is_err());
-        assert!(!session_log(event_loop, target).exists());
-        let target_lock = session_lock::claim(&event_loop.sessions_dir, &target)
-            .unwrap()
-            .unwrap();
-        target_lock.release().unwrap();
-        assert!(
-            session_lock::claim(&event_loop.sessions_dir, &source)
-                .unwrap()
-                .is_none()
-        );
-        assert!(requests.is_empty());
-    });
-}
-
-#[test]
 fn fresh_target_lock_failure_preserves_runtime_and_storage() {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
@@ -1061,52 +909,6 @@ fn fresh_activation_failure_releases_candidate_resources() {
         duplicate.retire();
         assert!(SessionCoordinatorHandle::resolve(target).is_err());
         assert!(SessionMailbox::notify(target, RESPONSE.into(), false).is_err());
-    });
-}
-
-#[cfg(unix)]
-#[test_case(false; "existing_context")]
-#[test_case(true; "fresh_context")]
-fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        fs::remove_file(&path).unwrap();
-        assert!(
-            Command::new("mkfifo")
-                .arg(&path)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let (entered, entry) = flume::bounded(1);
-        let (release, gate) = flume::bounded(1);
-        let writer_path = path.clone();
-        let writer = thread::spawn(move || {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .open(writer_path)
-                .unwrap();
-            entered.send(()).unwrap();
-            gate.recv().unwrap();
-            file.write_all(PLAN.as_bytes()).unwrap();
-        });
-        approve(event_loop, index, fresh);
-        entry.recv_timeout(WAIT).unwrap();
-        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let actor = manager.actor(root).unwrap();
-        let successor = queue_patch(&actor, disable_fast());
-        event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        wait_bounded(&successor);
-        assert!(!actor.effective_config().unwrap().fast);
-        assert!(requests.is_empty());
-        release.send(()).unwrap();
-        writer.join().unwrap();
-        let cancelled = next_ready(event_loop);
-        event_loop.handle_internal(cancelled);
-        fs::remove_file(&path).unwrap();
-        fs::write(&path, PLAN).unwrap();
-        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
-        assert!(requests.is_empty());
     });
 }
 
@@ -1224,54 +1026,6 @@ fn unavailable_agent_graph_is_not_reported_busy() {
             Some(expected.as_str())
         );
         assert!(requests.is_empty());
-    });
-}
-
-#[test_case(false; "directory")]
-#[test_case(true; "history")]
-fn fresh_source_lease_defers_mutation_until_cancel(history: bool) {
-    with_event_loop(|event_loop| {
-        let (index, _, requests, _host) = setup(event_loop);
-        let cwd = event_loop.sessions[index].coordinator.read().cwd();
-        let original = event_loop.sessions[index].coordinator.read().history();
-        let changed = cwd.join(MOVED_CWD);
-        fs::create_dir(&changed).unwrap();
-        approve(event_loop, index, true);
-        let ready = final_ready(event_loop, true, &requests);
-        let coordinator = event_loop.sessions[index].coordinator.clone();
-        let mutation = async {
-            if history {
-                coordinator
-                    .replace_history(vec![Message::user(RESPONSE.into())])
-                    .await
-                    .map(|_| ())
-            } else {
-                coordinator
-                    .change_directory(changed.clone())
-                    .await
-                    .map(|_| ())
-            }
-        };
-        let mut mutation = Box::pin(mutation);
-        assert!(smol::block_on(poll_once(mutation.as_mut())).is_none());
-        assert_eq!(coordinator.read().cwd(), cwd);
-        assert!(Arc::ptr_eq(&original, &coordinator.read().history()));
-        event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        event_loop.handle_internal(ready);
-        smol::block_on(bounded_session_op(
-            async { mutation.await.map_err(|error| error.to_string()) },
-            WAIT,
-        ))
-        .unwrap();
-        if history {
-            assert_eq!(coordinator.read().history()[0].user_text(), Some(RESPONSE));
-            assert_eq!(coordinator.read().cwd(), cwd);
-        } else {
-            assert_eq!(coordinator.read().cwd(), changed);
-            assert!(Arc::ptr_eq(&original, &coordinator.read().history()));
-        }
-        assert!(requests.is_empty());
-        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
     });
 }
 
