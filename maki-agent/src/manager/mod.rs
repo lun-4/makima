@@ -89,17 +89,6 @@ impl AgentManagerHandle {
             .actor
             .as_ref()
             .ok_or(ManagerError::NonLiveAgent(agent_id))?;
-        #[cfg(test)]
-        if let Some(gate) = self
-            .0
-            .idle_acquire_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            gate.entered.send(()).unwrap();
-            gate.release.recv().unwrap();
-        }
         let root = actor.prepare_idle().map_err(|error| match error {
             ActorError::Closed | ActorError::Shutdown => ManagerError::NonLiveAgent(agent_id),
             _ => ManagerError::BusySubtree(agent_id),
@@ -209,8 +198,6 @@ pub(crate) struct ManagerInner {
     #[cfg(test)]
     managed_acquire_gate: Mutex<Option<TestGate>>,
     #[cfg(test)]
-    idle_acquire_gate: Mutex<Option<TestGate>>,
-    #[cfg(test)]
     managed_registration_rejected: Mutex<Option<flume::Sender<()>>>,
 }
 
@@ -252,8 +239,6 @@ impl AgentManagerHandle {
             descendant_cut_gate: Mutex::new(None),
             #[cfg(test)]
             managed_acquire_gate: Mutex::new(None),
-            #[cfg(test)]
-            idle_acquire_gate: Mutex::new(None),
             #[cfg(test)]
             managed_registration_rejected: Mutex::new(None),
         })))

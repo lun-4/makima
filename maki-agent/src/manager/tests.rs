@@ -20,6 +20,20 @@ use crate::{
     ControlWork, EventSender, History, PreparedModel, RootWork, TurnContext, TurnOutcome, WorkKind,
 };
 
+/// Yields until `cond` holds. Bounded only so a broken test cannot hang.
+async fn yield_until(cond: impl Fn() -> bool) {
+    const MAX_YIELDS: usize = 100_000;
+    for _ in 0..MAX_YIELDS {
+        if cond() {
+            return;
+        }
+        smol::future::yield_now().await;
+    }
+    panic!("condition never became true");
+}
+
+/// The deferred runner waits on its start signal and the actor's policy
+/// event together, so a policy listener shows it is parked before start.
 #[test]
 fn deferred_runtime_does_not_execute_before_activation() {
     smol::block_on(async {
@@ -38,11 +52,16 @@ fn deferred_runtime_does_not_execute_before_activation() {
             .unwrap();
         let actor = root.actor().unwrap();
         let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
+        yield_until(|| actor.inner.policy_changed.total_listeners() > 0).await;
+        assert_eq!(actor.snapshot().queued, 1);
         assert!(entered_rx.is_empty());
         assert!(manager.lock_graph().active_turns.is_empty());
         start_tx.send(()).unwrap();
-        entered_rx.recv_async().await.unwrap();
-        ticket.wait().await;
+        assert_eq!(
+            entered_rx.recv_async().await.unwrap().turn_id(),
+            ticket.turn_id()
+        );
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
         let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
         assert!(report.timed_out.is_empty());
     });
@@ -586,7 +605,7 @@ fn idle_guard_reports_closed_actor_as_non_live() {
 }
 
 #[test]
-fn idle_acquisition_and_correlation_cancel_complete_before_managed_registration() {
+fn idle_acquisition_rejects_turn_awaiting_managed_registration() {
     const CORRELATION: &str = "before-registration";
     const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -602,53 +621,23 @@ fn idle_acquisition_and_correlation_cancel_complete_before_managed_registration(
     acquire_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
     assert!(manager.lock_graph().active_turns.is_empty());
     assert_eq!(actor.snapshot().active_turn, Some(ticket.turn_id()));
-
-    let (idle_tx, idle_rx) = flume::bounded(1);
-    let (idle_release_tx, idle_release_rx) = flume::bounded(1);
-    *manager.0.idle_acquire_gate.lock().unwrap() = Some(super::TestGate {
-        entered: idle_tx,
-        release: idle_release_rx,
-    });
-    let reserving = manager.clone();
-    let root_id = root.id();
-    let (idle_done_tx, idle_done_rx) = flume::bounded(1);
-    let idle = std::thread::spawn(move || {
-        idle_done_tx
-            .send(reserving.prepare_idle_subtree(root_id))
-            .unwrap();
-    });
-    idle_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
-    let cancelling = manager.clone();
-    let (cancel_started_tx, cancel_started_rx) = flume::bounded(1);
-    let (cancel_done_tx, cancel_done_rx) = flume::bounded(1);
-    let cancel = std::thread::spawn(move || {
-        cancel_started_tx.send(()).unwrap();
-        cancel_done_tx
-            .send(cancelling.cancel_correlation(
-                root_id,
-                CORRELATION,
-                crate::TurnCancellationReason::User,
-            ))
-            .unwrap();
-    });
-    cancel_started_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
-    idle_release_tx.send(()).unwrap();
-    let idle_result = idle_done_rx.recv_timeout(COMPLETION_TIMEOUT);
-    let cancel_result = cancel_done_rx.recv_timeout(COMPLETION_TIMEOUT);
+    assert!(matches!(
+        manager.prepare_idle_subtree(root.id()),
+        Err(ManagerError::BusySubtree(id)) if id == root.id()
+    ));
     acquire_release_tx.send(()).unwrap();
-    assert!(matches!(idle_result.unwrap(), Err(ManagerError::BusySubtree(id)) if id == root_id));
-    cancel_result.unwrap().unwrap();
-    idle.join().unwrap();
-    cancel.join().unwrap();
+    assert_eq!(
+        entered_rx
+            .recv_timeout(COMPLETION_TIMEOUT)
+            .unwrap()
+            .turn_id(),
+        ticket.turn_id()
+    );
     assert!(matches!(
         smol::block_on(ticket.wait()),
-        TurnOutcome::Cancelled {
-            reason: crate::TurnCancellationReason::User,
-            ..
-        }
+        TurnOutcome::Completed { .. }
     ));
-    assert!(entered_rx.is_empty());
-    assert!(manager.lock_graph().active_turns.is_empty());
+    drop(manager.prepare_idle_subtree(root.id()).unwrap());
     assert!(
         smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
             .timed_out

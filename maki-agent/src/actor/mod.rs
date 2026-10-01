@@ -74,7 +74,7 @@ pub(crate) struct ActorInner {
     pub(crate) agent_id: AgentId,
     pub(crate) identity: Arc<()>,
     pub(crate) state: Mutex<ActorState>,
-    policy_changed: Event,
+    pub(crate) policy_changed: Event,
     pub(crate) queue: Arc<ActorQueue>,
     pub(crate) outcomes: Mutex<HashMap<TurnId, TurnOutcome>>,
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
