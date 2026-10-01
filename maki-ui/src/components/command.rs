@@ -532,9 +532,14 @@ impl CommandPalette {
             .unwrap_or(0);
     }
 
+    /// Whether Enter would act on the final selection now: a pending
+    /// publication keeps the previous query's items, and an unfinished request
+    /// can still reorder or restamp them.
     #[cfg(test)]
     pub(crate) fn has_argument_selectable(&self) -> bool {
-        !self.argument_publication.is_pending() && !self.argument_items.is_empty()
+        !self.argument_publication.is_pending()
+            && self.pending_arguments.is_none()
+            && !self.argument_items.is_empty()
     }
 
     #[cfg(test)]
