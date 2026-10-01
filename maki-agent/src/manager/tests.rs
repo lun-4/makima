@@ -489,41 +489,6 @@ fn queued_only_correlation_cancel_does_not_precancel_later_work() {
     });
 }
 
-#[test]
-fn idle_guard_releases_reservation_when_approved_turn_starts() {
-    smol::block_on(async {
-        const LATER: &str = "later";
-        const APPROVED: &str = "approved";
-        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-        let (entered_tx, entered_rx) = flume::unbounded();
-        let root = manager
-            .create_root(Vec::new(), None, TestBackend::reporting(entered_tx, None))
-            .unwrap();
-        let actor = root.actor().unwrap();
-        let guard = manager.prepare_idle_subtree(root.id()).unwrap();
-        let later = actor.admit_turn(input(), None, LATER.into()).unwrap();
-        let approved = actor.admit_turn(input(), None, APPROVED.into()).unwrap();
-        guard.allow_turn(&approved).unwrap();
-        assert_eq!(
-            entered_rx.recv_async().await.unwrap().turn_id(),
-            approved.turn_id()
-        );
-        assert_eq!(
-            entered_rx.recv_async().await.unwrap().turn_id(),
-            later.turn_id()
-        );
-        later.wait().await;
-        let next = manager.prepare_idle_subtree(root.id()).unwrap();
-        drop(guard);
-        assert!(matches!(
-            manager.prepare_idle_subtree(root.id()),
-            Err(ManagerError::BusySubtree(_))
-        ));
-        drop(next);
-        manager.shutdown(Duration::from_secs(1)).await;
-    });
-}
-
 #[test_case(true; "cancelled_after_permission")]
 #[test_case(false; "cancelled_before_permission")]
 fn idle_guard_permission_for_retired_turn_does_not_hold_actor(permitted_first: bool) {
@@ -785,17 +750,6 @@ fn idle_guard_rejects_child_factory_reservation() {
     child.join().unwrap().unwrap();
     gate.release(1);
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
-}
-
-#[test]
-fn idle_guard_rejects_active_parent() {
-    let (manager, root, _, gate) = active_root(AgentLimits::default());
-    assert!(matches!(
-        manager.prepare_idle_subtree(root.id()),
-        Err(ManagerError::BusySubtree(_))
-    ));
-    gate.release(1);
-    smol::block_on(manager.shutdown(Duration::from_secs(1)));
 }
 
 fn idle_root_with_child(

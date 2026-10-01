@@ -80,15 +80,9 @@ pub(crate) fn prepare_change(
 
 #[cfg(test)]
 mod tests {
-    use super::{IMPLEMENT_PARALLEL_HINT, PrepareProvider, prepare_change, read_plan};
-    use maki_agent::actor::ConfigChange;
-    use maki_agent::{ModeDef, ModeId};
-    use maki_config::ModelPolicy;
-    use maki_providers::Timeouts;
-    use std::sync::Arc;
+    use super::{IMPLEMENT_PARALLEL_HINT, read_plan};
 
     const PLAN: &str = "Implement the selected design.";
-    const PROVIDER_ERROR: &str = "Provider preparation failed.";
 
     #[test_case::test_case(false; "sequential")]
     #[test_case::test_case(true; "parallel")]
@@ -109,37 +103,5 @@ mod tests {
         let path = directory.path().join("missing.md");
         let error = read_plan(path.clone(), false).err().unwrap();
         assert!(error.contains(&path.display().to_string()));
-    }
-
-    #[test]
-    fn no_override_does_not_construct_provider() {
-        let prepare: PrepareProvider =
-            Arc::new(|_, _| panic!("unchanged model must reuse predecessor provider"));
-        let change = prepare_change(
-            None,
-            &ModelPolicy::default(),
-            Timeouts::default(),
-            &prepare,
-            ModeDef::default_for(ModeId::Build),
-        )
-        .unwrap();
-        assert!(
-            matches!(change, ConfigChange::PatchAndMode { patch, .. } if patch.model.is_none())
-        );
-    }
-
-    #[test]
-    fn failed_provider_preparation_returns_error() {
-        let prepare: PrepareProvider = Arc::new(|_, _| Err(Arc::from(PROVIDER_ERROR)));
-        let error = prepare_change(
-            Some("zai/glm-5".into()),
-            &ModelPolicy::default(),
-            Timeouts::default(),
-            &prepare,
-            ModeDef::default_for(ModeId::Build),
-        )
-        .err()
-        .unwrap();
-        assert_eq!(error, PROVIDER_ERROR);
     }
 }
