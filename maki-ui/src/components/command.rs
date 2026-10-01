@@ -1992,12 +1992,13 @@ mod tests {
             ])
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
-        (
-            CommandPalette::new(registry, target),
-            started_rx,
-            release_tx,
-            events,
-        )
+        let mut palette = CommandPalette::new(registry, target);
+        let timeout = u64::try_from(MATCHER_SETTLE_TIMEOUT.as_millis()).unwrap();
+        assert!(
+            !palette.nucleo.tick(timeout).running,
+            "command matcher did not settle"
+        );
+        (palette, started_rx, release_tx, events)
     }
 
     #[test_case("/cd missing ", "/cd missing ".len(); "trailing_space")]
