@@ -31,7 +31,7 @@ use maki_storage::sessions::StoredMode;
 
 use crate::AppSession;
 
-const SAVE_FAILED_PREFIX: &str = "Session save failed";
+pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const CHECKPOINT_REPLACED: &str = "checkpoint payload superseded by authoritative session state";
 #[cfg(not(test))]

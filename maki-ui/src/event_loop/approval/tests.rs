@@ -1,3 +1,4 @@
+use std::fs::{self, OpenOptions};
 use std::io;
 #[cfg(unix)]
 use std::io::Write;
@@ -6,25 +7,31 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use maki_agent::SessionMailbox;
+use futures_lite::future::poll_once;
 use maki_agent::actor::{
-    AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch, ConfigUpdateTicket, PreparedModel,
+    ActorStatus, AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch, ConfigUpdateTicket,
+    PreparedModel,
 };
 use maki_agent::manager::ManagerError;
 use maki_agent::session_coordinator::{SessionCoordinatorError, SessionCoordinatorHandle};
 use maki_agent::tools::ToolRegistry;
+use maki_agent::{AgentMode, SessionMailbox};
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role,
+    StopReason, StreamResponse, TokenUsage,
 };
 use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::model::{read_model, read_recents};
 use maki_storage::session_lock::{self, OPEN_ELSEWHERE_MSG};
+use maki_storage::sessions::{StoredMode, read_prefs};
 use test_case::test_case;
 
 use super::super::tests::{shutdown_manager, with_event_loop};
@@ -34,10 +41,13 @@ use super::super::{
 };
 use super::ApprovalStep;
 use crate::AppSession;
+use crate::app::mode::{Mode, PlanState};
 use crate::components::keybindings::key;
 use crate::components::{self, Action, Status};
-use crate::plan_approval::{APPROVAL_BUSY, APPROVAL_CHANGED, idle_error_message};
-use crate::storage_writer::StorageWriter;
+use crate::plan_approval::{
+    APPROVAL_BUSY, APPROVAL_CHANGED, IMPLEMENT_PARALLEL_HINT, idle_error_message,
+};
+use crate::storage_writer::{SAVE_FAILED_PREFIX, StorageWriter};
 
 const SOURCE_MODEL: &str = "anthropic/claude-opus-4-6";
 const TARGET_MODEL: &str = "openai/gpt-5";
@@ -49,44 +59,66 @@ const WAIT: Duration = Duration::from_secs(10);
 const CHECKPOINT_EPOCH: u64 = 1;
 const CHILD_PROMPT: &str = "gated managed child";
 const RELEASED_LOCK: &str = "released";
-const CHILD_TOOL: &str = r#"
-    local sessions = {}
-    maki.api.register_tool({
-        name = "approval_child", description = "start test child", kind = "read",
-        schema = { type = "object", properties = {} },
-        audiences = { "main" },
-        handler = function(_, ctx)
-            local child, err = maki.agent.session(ctx, { name = "approval child", system = "child", tools = maki.json.decode('[]'), inherit_provider = true, auto_deliver = false })
-            if err then return { llm_output = err, is_error = true } end
-            sessions[#sessions + 1] = child
-            local ok, send_err = child:send("gated managed child")
-            if send_err then return { llm_output = send_err, is_error = true } end
-            return "child started"
-        end,
-    })
-"#;
-const AUTOCMD: &str = r#"
-    local starts = 0
-    maki.api.create_autocmd("TurnStart", { callback = function()
-        starts = starts + 1
-        maki.api.register_command({ name = "/approval-start-" .. tostring(starts), description = "observed", tui_only = false, handler = function() end })
-    end })
-    local modes = 0
-    maki.api.create_autocmd("ModeChanged", { callback = function()
-        modes = modes + 1
-        maki.api.register_command({ name = "/approval-mode-" .. tostring(modes), description = "observed", tui_only = false, handler = function() end })
-    end })
-    maki.api.create_autocmd("SessionReset", { callback = function(ev)
-        maki.api.register_command({ name = "/approval-reset", description = ev.data.session_id, tui_only = false, handler = function() end })
-    end })
-"#;
 const RESET_COMMAND: &str = "/approval-reset";
+const START_COMMAND_PREFIX: &str = "/approval-start-";
+const MODE_COMMAND_PREFIX: &str = "/approval-mode-";
+const CHILD_TOOL_NAME: &str = "approval_child";
+const CHILD_CALL_ID: &str = "approval-child-call";
+const CHILD_PLUGIN: &str = "approval-child";
+const OBSERVER_PLUGIN: &str = "approval-observer";
+const PLAN_FILE: &str = "approval-plan.md";
+const RELATIVE_PLAN_FILE: &str = "relative-plan.md";
+const MUTATED_PLAN: &str = "# Late edit\nDo not implement this changed revision.\n";
+const MOVED_CWD: &str = "moved-cwd";
+const SESSION_LOG_EXTENSION: &str = "jsonl";
+const SESSION_LOG_BACKUP_EXTENSION: &str = "approval-backup";
 const DRAFT: &str = "draft typed before approval";
 const CLEAR_AND_IMPLEMENT_ROW: usize = 1;
 const IMPLEMENT_ROW: usize = 2;
 const USE_CURRENT_ROW: usize = 4;
 
 type RecordedRequest = (String, RequestOptions, Vec<Message>, String);
+
+fn child_tool() -> String {
+    format!(
+        r#"
+    local sessions = {{}}
+    maki.api.register_tool({{
+        name = "{CHILD_TOOL_NAME}", description = "start test child", kind = "read",
+        schema = {{ type = "object", properties = {{}} }},
+        audiences = {{ "main" }},
+        handler = function(_, ctx)
+            local child, err = maki.agent.session(ctx, {{ name = "approval child", system = "child", tools = maki.json.decode('[]'), inherit_provider = true, auto_deliver = false }})
+            if err then return {{ llm_output = err, is_error = true }} end
+            sessions[#sessions + 1] = child
+            local ok, send_err = child:send("{CHILD_PROMPT}")
+            if send_err then return {{ llm_output = send_err, is_error = true }} end
+            return "child started"
+        end,
+    }})
+"#
+    )
+}
+
+fn observer() -> String {
+    format!(
+        r#"
+    local starts = 0
+    maki.api.create_autocmd("TurnStart", {{ callback = function()
+        starts = starts + 1
+        maki.api.register_command({{ name = "{START_COMMAND_PREFIX}" .. tostring(starts), description = "observed", tui_only = false, handler = function() end }})
+    end }})
+    local modes = 0
+    maki.api.create_autocmd("ModeChanged", {{ callback = function()
+        modes = modes + 1
+        maki.api.register_command({{ name = "{MODE_COMMAND_PREFIX}" .. tostring(modes), description = "observed", tui_only = false, handler = function() end }})
+    end }})
+    maki.api.create_autocmd("SessionReset", {{ callback = function(ev)
+        maki.api.register_command({{ name = "{RESET_COMMAND}", description = ev.data.session_id, tui_only = false, handler = function() end }})
+    end }})
+"#
+    )
+}
 
 struct RecordingProvider {
     requests: flume::Sender<RecordedRequest>,
@@ -100,10 +132,10 @@ impl Provider for RecordingProvider {
         messages: &'a [Message],
         system: &'a str,
         _tools: &'a serde_json::Value,
-        _events: &'a flume::Sender<maki_providers::ProviderEvent>,
+        _events: &'a flume::Sender<ProviderEvent>,
         options: RequestOptions,
         _session: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             self.requests
                 .send((model.spec(), options, messages.to_vec(), system.into()))
@@ -125,9 +157,7 @@ impl Provider for RecordingProvider {
         })
     }
 
-    fn list_models(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -145,10 +175,10 @@ impl Provider for ChildProvider {
         messages: &'a [Message],
         _system: &'a str,
         _tools: &'a serde_json::Value,
-        _events: &'a flume::Sender<maki_providers::ProviderEvent>,
+        _events: &'a flume::Sender<ProviderEvent>,
         _options: RequestOptions,
         _session: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let child = messages
                 .iter()
@@ -161,8 +191,8 @@ impl Provider for ChildProvider {
                 }
             } else if self.root_requests.fetch_add(1, Ordering::SeqCst) == 0 {
                 ContentBlock::ToolUse {
-                    id: "approval-child-call".into(),
-                    name: "approval_child".into(),
+                    id: CHILD_CALL_ID.into(),
+                    name: CHILD_TOOL_NAME.into(),
                     input: serde_json::json!({}),
                     thought_signature: None,
                 }
@@ -187,9 +217,7 @@ impl Provider for ChildProvider {
         })
     }
 
-    fn list_models(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -199,7 +227,7 @@ fn rejects_active_managed_child_without_cancelling_it() {
     with_event_loop(|event_loop| {
         let (index, path, requests, host) =
             setup_with_registry(event_loop, Arc::clone(ToolRegistry::global_arc()));
-        host.load_source("approval-child", CHILD_TOOL).unwrap();
+        host.load_source(CHILD_PLUGIN, &child_tool()).unwrap();
         event_loop.sessions[index]
             .app
             .permissions
@@ -218,7 +246,7 @@ fn rejects_active_managed_child_without_cancelling_it() {
         pump_until(event_loop, |_| !entry.is_empty());
         entry.recv_timeout(WAIT).unwrap();
         pump_until(event_loop, |event_loop| {
-            actor.snapshot().status == maki_agent::actor::ActorStatus::Idle
+            actor.snapshot().status == ActorStatus::Idle
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         let children: Vec<_> = manager
@@ -229,13 +257,10 @@ fn rejects_active_managed_child_without_cancelling_it() {
         assert_eq!(children.len(), 1);
         let child = manager.actor(children[0].agent_id).unwrap();
         let child_before = child.snapshot();
-        assert!(matches!(
-            child_before.status,
-            maki_agent::actor::ActorStatus::Running(_)
-        ));
+        assert!(matches!(child_before.status, ActorStatus::Running(_)));
         let history = event_loop.sessions[index].coordinator.read().history();
-        let recent = maki_storage::model::read_recents(&event_loop.ctx.storage);
-        let saved_model = maki_storage::model::read_model(&event_loop.ctx.storage);
+        let recent = read_recents(&event_loop.ctx.storage);
+        let saved_model = read_model(&event_loop.ctx.storage);
         let run = event_loop.sessions[index].app.run_id;
         let config = actor.effective_config().unwrap();
         approve(event_loop, index, true);
@@ -253,18 +278,9 @@ fn rejects_active_managed_child_without_cancelling_it() {
             &history,
             &event_loop.sessions[index].coordinator.read().history()
         ));
-        assert_eq!(
-            maki_storage::model::read_recents(&event_loop.ctx.storage),
-            recent
-        );
-        assert_eq!(
-            maki_storage::model::read_model(&event_loop.ctx.storage),
-            saved_model
-        );
-        assert_eq!(
-            event_loop.sessions[index].app.state.mode,
-            crate::app::mode::Mode::Plan
-        );
+        assert_eq!(read_recents(&event_loop.ctx.storage), recent);
+        assert_eq!(read_model(&event_loop.ctx.storage), saved_model);
+        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
         assert_eq!(
             event_loop.sessions[index].app.state.plan.path(),
             Some(path.as_path())
@@ -273,7 +289,7 @@ fn rejects_active_managed_child_without_cancelling_it() {
         release.send(()).unwrap();
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.status == Status::Idle
-                && child.snapshot().status == maki_agent::actor::ActorStatus::Idle
+                && child.snapshot().status == ActorStatus::Idle
         });
         assert!(child.snapshot().latest.is_some());
         shutdown_manager(&manager);
@@ -296,13 +312,13 @@ fn setup_with_registry(
         false,
     )
     .unwrap();
-    host.load_source("approval-observer", AUTOCMD).unwrap();
+    host.load_source(OBSERVER_PLUGIN, &observer()).unwrap();
     event_loop.ctx.lua_event_handle = host.event_handle();
-    let path = PathBuf::from(&event_loop.session_cwd).join("approval-plan.md");
-    std::fs::write(&path, PLAN).unwrap();
+    let path = PathBuf::from(&event_loop.session_cwd).join(PLAN_FILE);
+    fs::write(&path, PLAN).unwrap();
     let (requests, receiver) = flume::unbounded();
     let mut session = AppSession::new(SOURCE_MODEL, &event_loop.session_cwd);
-    session.meta.mode = Some(maki_storage::sessions::StoredMode::Plan);
+    session.meta.mode = Some(StoredMode::Plan);
     session.meta.plan_path = Some(path.display().to_string());
     session.meta.plan_written = true;
     session.meta.thinking = Some(DomainThinkingConfig::Off.into());
@@ -404,7 +420,7 @@ fn pump_until(event_loop: &mut EventLoop<'_>, mut done: impl FnMut(&EventLoop<'_
             Instant::now() < deadline,
             "approval event processing timed out"
         );
-        std::thread::yield_now();
+        thread::yield_now();
     }
 }
 
@@ -443,6 +459,12 @@ fn disable_fast() -> ConfigPatch {
     }
 }
 
+fn session_log(event_loop: &EventLoop<'_>, id: MakiId) -> PathBuf {
+    event_loop
+        .sessions_dir
+        .join(format!("{id}.{SESSION_LOG_EXTENSION}"))
+}
+
 fn checkpoint(event_loop: &EventLoop<'_>, index: usize) {
     let runtime = &event_loop.sessions[index];
     smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
@@ -466,7 +488,7 @@ fn assert_preserved(
     let app = &event_loop.sessions[index].app;
     assert_eq!(app.status_bar.flash_text(), flash);
     assert_eq!(app.state.model.spec(), SOURCE_MODEL);
-    assert_eq!(app.state.mode, crate::app::mode::Mode::Plan);
+    assert_eq!(app.state.mode, Mode::Plan);
     assert_eq!(app.state.plan.path(), Some(path));
     assert_eq!(app.plan_form.implementation_model(), Some(TARGET_MODEL));
     assert_eq!(app.run_id, run_id);
@@ -479,64 +501,54 @@ fn assert_preserved(
     );
     assert!(!app.plan_approval_pending);
     assert_eq!(app.state.session.messages().len(), 1);
+    assert!(observed(event_loop, index, START_COMMAND_PREFIX).is_empty());
+}
+
+/// Names and descriptions of the commands the observer plugin registered
+/// under `prefix`.
+fn observed(event_loop: &EventLoop<'_>, index: usize, prefix: &str) -> Vec<(String, String)> {
+    let app = &event_loop.sessions[index].app;
     smol::block_on(app.lua_event_handle.collect_prompt_slots_async());
-    let commands = event_loop
+    event_loop
         .ctx
         .command_runtime
         .registry
         .snapshot_for(&app.command_target)
-        .unwrap();
-    assert!(
-        commands
-            .commands()
-            .iter()
-            .all(|command| !command.spec().name.starts_with("/approval-start-"))
-    );
+        .unwrap()
+        .commands()
+        .iter()
+        .map(|command| command.spec())
+        .filter(|spec| spec.name.starts_with(prefix))
+        .map(|spec| (spec.name.to_string(), spec.docs.summary.to_string()))
+        .collect()
 }
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
 fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, host) = setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let original_id = event_loop.sessions[index].id();
         let original_run = event_loop.sessions[index].app.run_id;
-        let prefs =
-            serde_json::to_value(maki_storage::sessions::read_prefs(&event_loop.ctx.storage))
-                .unwrap();
-        let stored_model = maki_storage::model::read_model(&event_loop.ctx.storage);
-        let recents = maki_storage::model::read_recents(&event_loop.ctx.storage);
+        let prefs = serde_json::to_value(read_prefs(&event_loop.ctx.storage)).unwrap();
+        let stored_model = read_model(&event_loop.ctx.storage);
+        let recents = read_recents(&event_loop.ctx.storage);
         approve(event_loop, index, fresh);
         approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         assert!(requests.is_empty());
         assert_eq!(event_loop.sessions[index].id(), original_id);
+        assert_eq!(read_recents(&event_loop.ctx.storage), recents);
+        assert_eq!(read_model(&event_loop.ctx.storage), stored_model);
         assert_eq!(
-            maki_storage::model::read_recents(&event_loop.ctx.storage),
-            recents
-        );
-        assert_eq!(
-            maki_storage::model::read_model(&event_loop.ctx.storage),
-            stored_model
-        );
-        assert_eq!(
-            serde_json::to_value(maki_storage::sessions::read_prefs(&event_loop.ctx.storage))
-                .unwrap(),
+            serde_json::to_value(read_prefs(&event_loop.ctx.storage)).unwrap(),
             prefs
         );
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
             SOURCE_MODEL
         );
-        smol::block_on(host.event_handle().collect_prompt_slots_async());
-        assert!(
-            host.command_registry()
-                .snapshot_for(&event_loop.sessions[index].app.command_target)
-                .unwrap()
-                .commands()
-                .iter()
-                .all(|command| !command.spec().name.starts_with("/approval-start-"))
-        );
+        assert!(observed(event_loop, index, START_COMMAND_PREFIX).is_empty());
         event_loop.handle_internal(ready);
         pump_until(event_loop, |event_loop| {
             let app = &event_loop.sessions[index].app;
@@ -544,31 +556,23 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
                 && app.status == Status::Idle
                 && !app.plan_approval_pending
         });
-        smol::block_on(host.event_handle().collect_prompt_slots_async());
-        let commands = host
-            .command_registry()
-            .snapshot_for(&event_loop.sessions[index].app.command_target)
-            .unwrap();
-        let starts: Vec<_> = commands
-            .commands()
-            .iter()
-            .filter(|command| command.spec().name.starts_with("/approval-start-"))
+        let starts: Vec<_> = observed(event_loop, index, START_COMMAND_PREFIX)
+            .into_iter()
+            .map(|(name, _)| name)
             .collect();
-        assert_eq!(starts.len(), 1, "TurnStart observations: {commands:?}");
-        assert_eq!(starts[0].spec().name.as_ref(), "/approval-start-1");
+        assert_eq!(starts, [format!("{START_COMMAND_PREFIX}1")]);
         assert_eq!(
-            maki_storage::model::read_recents(&event_loop.ctx.storage)
+            read_recents(&event_loop.ctx.storage)
                 .first()
                 .map(String::as_str),
             Some(TARGET_MODEL)
         );
         assert_eq!(
-            maki_storage::model::read_model(&event_loop.ctx.storage).as_deref(),
+            read_model(&event_loop.ctx.storage).as_deref(),
             Some(TARGET_MODEL)
         );
         assert_eq!(
-            serde_json::to_value(maki_storage::sessions::read_prefs(&event_loop.ctx.storage))
-                .unwrap(),
+            serde_json::to_value(read_prefs(&event_loop.ctx.storage)).unwrap(),
             prefs
         );
         let (model, options, messages, _) = requests.recv_timeout(WAIT).unwrap();
@@ -593,11 +597,11 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
             .next_back()
             .unwrap();
         assert!(instruction.contains(&path.display().to_string()));
-        assert!(instruction.contains("batch+task"));
+        assert!(instruction.contains(IMPLEMENT_PARALLEL_HINT));
         assert!(requests.is_empty());
         let runtime = &mut event_loop.sessions[index];
         assert_eq!(runtime.id() != original_id, fresh);
-        assert_eq!(runtime.app.state.mode, crate::app::mode::Mode::Build);
+        assert_eq!(runtime.app.state.mode, Mode::Build);
         assert_eq!(runtime.app.state.model.spec(), TARGET_MODEL);
         assert_eq!(runtime.app.plan_form.implementation_model(), None);
         let (manager, root) = runtime.handles.manager_and_root();
@@ -608,17 +612,14 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
                 .effective_config()
                 .unwrap()
                 .mode,
-            maki_agent::AgentMode::Build
+            AgentMode::Build
         );
         runtime.app.checkpoint_now();
         let id = runtime.id();
         checkpoint(event_loop, index);
         let restored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
         assert_eq!(restored.model, TARGET_MODEL);
-        assert_eq!(
-            restored.meta.mode,
-            Some(maki_storage::sessions::StoredMode::Build)
-        );
+        assert_eq!(restored.meta.mode, Some(StoredMode::Build));
         assert_eq!(restored.meta.thinking, Some(options.thinking.into()));
         assert_eq!(restored.meta.fast, options.fast);
         assert_eq!(
@@ -660,40 +661,31 @@ fn final_ready(
     }
 }
 
-fn mode_events(event_loop: &EventLoop<'_>, index: usize) -> usize {
-    let app = &event_loop.sessions[index].app;
-    smol::block_on(app.lua_event_handle.collect_prompt_slots_async());
-    event_loop
-        .ctx
-        .command_runtime
-        .registry
-        .snapshot_for(&app.command_target)
-        .unwrap()
-        .commands()
-        .iter()
-        .filter(|command| command.spec().name.starts_with("/approval-mode-"))
-        .count()
-}
-
 #[test]
 fn mode_transition_emits_once_and_config_only_emits_none() {
     with_event_loop(|event_loop| {
         let (index, _, requests, _host) = setup(event_loop);
-        let before = mode_events(event_loop, index);
+        let before = observed(event_loop, index, MODE_COMMAND_PREFIX).len();
         approve(event_loop, index, false);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
+            event_loop.sessions[index].app.state.mode == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         requests.recv_timeout(WAIT).unwrap();
         let _ = event_loop.tick();
-        assert_eq!(mode_events(event_loop, index), before + 1);
+        assert_eq!(
+            observed(event_loop, index, MODE_COMMAND_PREFIX).len(),
+            before + 1
+        );
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let commit = apply_patch(&actor, disable_fast());
         event_loop.sessions[index].project_config(&commit);
         let _ = event_loop.tick();
-        assert_eq!(mode_events(event_loop, index), before + 1);
+        assert_eq!(
+            observed(event_loop, index, MODE_COMMAND_PREFIX).len(),
+            before + 1
+        );
     });
 }
 
@@ -713,7 +705,7 @@ fn fresh_forgets_retired_cache_but_preserves_saved_source() {
         );
         approve(event_loop, index, true);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
+            event_loop.sessions[index].app.state.mode == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         requests.recv_timeout(WAIT).unwrap();
@@ -753,24 +745,14 @@ fn fresh_retires_outgoing_session_like_a_reset() {
             .release()
             .unwrap();
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
+            event_loop.sessions[index].app.state.mode == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         requests.recv_timeout(WAIT).unwrap();
-        let app = &event_loop.sessions[index].app;
-        smol::block_on(app.lua_event_handle.collect_prompt_slots_async());
-        let commands = event_loop
-            .ctx
-            .command_runtime
-            .registry
-            .snapshot_for(&app.command_target)
-            .unwrap();
-        let reset = commands
-            .commands()
-            .iter()
-            .find(|command| command.spec().name.as_ref() == RESET_COMMAND)
-            .expect("SessionReset did not fire for the retired session");
-        assert_eq!(reset.spec().docs.summary.as_ref(), source.to_string());
+        assert_eq!(
+            observed(event_loop, index, RESET_COMMAND),
+            [(RESET_COMMAND.to_string(), source.to_string())]
+        );
         pump_until(event_loop, |event_loop| {
             AppSession::load(source, &event_loop.ctx.storage)
                 .ok()
@@ -800,8 +782,7 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         });
         approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
-                && !recorded.is_empty()
+            event_loop.sessions[index].app.state.mode == Mode::Build && !recorded.is_empty()
         });
         let (model, _, _, _) = recorded.recv_timeout(WAIT).unwrap();
         assert_eq!(model, TARGET_MODEL);
@@ -818,10 +799,7 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
             &identity,
             &event_loop.sessions[index].handles.identity()
         ));
-        assert_eq!(
-            event_loop.sessions[index].app.state.mode,
-            crate::app::mode::Mode::Build
-        );
+        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Build);
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
             TARGET_MODEL
@@ -888,7 +866,7 @@ struct LockDisposal {
 
 impl Drop for LockDisposal {
     fn drop(&mut self) {
-        let _ = self.disposed.send(std::fs::read_to_string(&self.path));
+        let _ = self.disposed.send(fs::read_to_string(&self.path));
     }
 }
 
@@ -900,8 +878,8 @@ fn fresh_cancel_releases_source_before_target_lock_returns() {
         let identity = event_loop.sessions[index].handles.identity();
         let run = event_loop.sessions[index].app.run_id;
         let targets = event_loop.ctx.command_runtime.registry.target_count();
-        let recents = maki_storage::model::read_recents(&event_loop.ctx.storage);
-        let saved_model = maki_storage::model::read_model(&event_loop.ctx.storage);
+        let recents = read_recents(&event_loop.ctx.storage);
+        let saved_model = read_model(&event_loop.ctx.storage);
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         let (disposed, disposal) = flume::bounded(1);
@@ -945,14 +923,8 @@ fn fresh_cancel_releases_source_before_target_lock_returns() {
             event_loop.ctx.command_runtime.registry.target_count(),
             targets
         );
-        assert_eq!(
-            maki_storage::model::read_recents(&event_loop.ctx.storage),
-            recents
-        );
-        assert_eq!(
-            maki_storage::model::read_model(&event_loop.ctx.storage),
-            saved_model
-        );
+        assert_eq!(read_recents(&event_loop.ctx.storage), recents);
+        assert_eq!(read_model(&event_loop.ctx.storage), saved_model);
         assert!(SessionCoordinatorHandle::resolve(target).is_err());
         assert!(SessionMailbox::notify(target, RESPONSE.into(), false).is_err());
         assert!(
@@ -963,12 +935,7 @@ fn fresh_cancel_releases_source_before_target_lock_returns() {
                 .is_none()
         );
         assert!(AppSession::load(target, &event_loop.ctx.storage).is_err());
-        assert!(
-            !event_loop
-                .sessions_dir
-                .join(format!("{target}.jsonl"))
-                .exists()
-        );
+        assert!(!session_log(event_loop, target).exists());
         let target_lock = session_lock::claim(&event_loop.sessions_dir, &target)
             .unwrap()
             .unwrap();
@@ -1072,12 +1039,7 @@ fn fresh_activation_failure_releases_candidate_resources() {
         pump_until(event_loop, |_| {
             ticket.peek().is_some() && manager.runner_finished(root).unwrap()
         });
-        assert!(
-            !event_loop
-                .sessions_dir
-                .join(format!("{target}.jsonl"))
-                .exists()
-        );
+        assert!(!session_log(event_loop, target).exists());
         assert!(
             event_loop
                 .ctx
@@ -1108,7 +1070,7 @@ fn fresh_activation_failure_releases_candidate_resources() {
 fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
-        std::fs::remove_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
         assert!(
             Command::new("mkfifo")
                 .arg(&path)
@@ -1119,11 +1081,8 @@ fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         let writer_path = path.clone();
-        let writer = std::thread::spawn(move || {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(writer_path)
-                .unwrap();
+        let writer = thread::spawn(move || {
+            let mut file = OpenOptions::new().write(true).open(writer_path).unwrap();
             entered.send(()).unwrap();
             gate.recv().unwrap();
             file.write_all(PLAN.as_bytes()).unwrap();
@@ -1141,12 +1100,9 @@ fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
         writer.join().unwrap();
         let cancelled = next_ready(event_loop);
         event_loop.handle_internal(cancelled);
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, PLAN).unwrap();
-        assert_eq!(
-            event_loop.sessions[index].app.state.mode,
-            crate::app::mode::Mode::Plan
-        );
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, PLAN).unwrap();
+        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
         assert!(requests.is_empty());
     });
 }
@@ -1158,11 +1114,10 @@ fn captured_plan_survives_later_edits(fresh: bool) {
         let (index, path, requests, _host) = setup(event_loop);
         approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
-        const MUTATED: &str = "# Late edit\nDo not implement this changed revision.\n";
-        std::fs::write(&path, MUTATED).unwrap();
+        fs::write(&path, MUTATED_PLAN).unwrap();
         event_loop.handle_internal(ready);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
+            event_loop.sessions[index].app.state.mode == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         let (_, _, messages, system) = requests.recv_timeout(WAIT).unwrap();
@@ -1179,7 +1134,7 @@ fn captured_plan_survives_later_edits(fresh: bool) {
             input.contains(PLAN.trim()),
             "approved content missing from implementation input"
         );
-        assert!(!input.contains(MUTATED.trim()));
+        assert!(!input.contains(MUTATED_PLAN.trim()));
         assert!(requests.is_empty());
     });
 }
@@ -1206,11 +1161,11 @@ fn inflight_heartbeat_does_not_abort(fresh: bool) {
         event_loop.handle_internal(ready);
         assert!(
             event_loop.sessions[index].app.plan_approval_pending
-                || event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
+                || event_loop.sessions[index].app.state.mode == Mode::Build
         );
         release.send(()).unwrap();
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
+            event_loop.sessions[index].app.state.mode == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         requests.recv_timeout(WAIT).unwrap();
@@ -1276,8 +1231,8 @@ fn fresh_source_lease_defers_mutation_until_cancel(history: bool) {
         let (index, _, requests, _host) = setup(event_loop);
         let cwd = event_loop.sessions[index].coordinator.read().cwd();
         let original = event_loop.sessions[index].coordinator.read().history();
-        let changed = cwd.join("approved-directory");
-        std::fs::create_dir(&changed).unwrap();
+        let changed = cwd.join(MOVED_CWD);
+        fs::create_dir(&changed).unwrap();
         approve(event_loop, index, true);
         let ready = final_ready(event_loop, true, &requests);
         let coordinator = event_loop.sessions[index].coordinator.clone();
@@ -1295,7 +1250,7 @@ fn fresh_source_lease_defers_mutation_until_cancel(history: bool) {
             }
         };
         let mut mutation = Box::pin(mutation);
-        assert!(smol::block_on(futures_lite::future::poll_once(mutation.as_mut())).is_none());
+        assert!(smol::block_on(poll_once(mutation.as_mut())).is_none());
         assert_eq!(coordinator.read().cwd(), cwd);
         assert!(Arc::ptr_eq(&original, &coordinator.read().history()));
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
@@ -1313,10 +1268,7 @@ fn fresh_source_lease_defers_mutation_until_cancel(history: bool) {
             assert!(Arc::ptr_eq(&original, &coordinator.read().history()));
         }
         assert!(requests.is_empty());
-        assert_eq!(
-            event_loop.sessions[index].app.state.mode,
-            crate::app::mode::Mode::Plan
-        );
+        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
     });
 }
 
@@ -1325,20 +1277,19 @@ fn fresh_uses_finalized_history_and_captured_absolute_path() {
     with_event_loop(|event_loop| {
         let (index, original_path, requests, _host) = setup(event_loop);
         let coordinator = event_loop.sessions[index].coordinator.clone();
-        let cwd = coordinator.read().cwd().join("source-directory");
-        std::fs::create_dir(&cwd).unwrap();
+        let cwd = coordinator.read().cwd().join(MOVED_CWD);
+        fs::create_dir(&cwd).unwrap();
         smol::block_on(coordinator.change_directory(cwd.clone())).unwrap();
         let lease = smol::block_on(coordinator.acquire_lease()).unwrap();
         let committer = lease.committer().unwrap();
         smol::block_on(committer.commit_history(vec![Message::user(RESPONSE.into())])).unwrap();
         drop(lease);
-        let relative = PathBuf::from("relative-plan.md");
+        let relative = PathBuf::from(RELATIVE_PLAN_FILE);
         let absolute = cwd.join(&relative);
-        std::fs::rename(original_path, &absolute).unwrap();
+        fs::rename(original_path, &absolute).unwrap();
         Arc::make_mut(&mut event_loop.sessions[index].app.state.session).cwd =
             cwd.display().to_string();
-        event_loop.sessions[index].app.state.plan =
-            crate::app::mode::PlanState::Ready(relative.clone());
+        event_loop.sessions[index].app.state.plan = PlanState::Ready(relative.clone());
         approve(event_loop, index, true);
         let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {
@@ -1357,7 +1308,7 @@ fn fresh_uses_finalized_history_and_captured_absolute_path() {
         }
         event_loop.handle_internal(ready);
         pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
+            event_loop.sessions[index].app.state.mode == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
         let (_, _, messages, _) = requests.recv_timeout(WAIT).unwrap();
@@ -1384,12 +1335,11 @@ fn fresh_stale_cwd_rejects_relative_path() {
         let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
         let coordinator = event_loop.sessions[index].coordinator.clone();
-        let cwd = coordinator.read().cwd().join("changed-directory");
-        std::fs::create_dir(&cwd).unwrap();
+        let cwd = coordinator.read().cwd().join(MOVED_CWD);
+        fs::create_dir(&cwd).unwrap();
         smol::block_on(coordinator.change_directory(cwd)).unwrap();
         let relative = PathBuf::from(path.file_name().unwrap());
-        event_loop.sessions[index].app.state.plan =
-            crate::app::mode::PlanState::Ready(relative.clone());
+        event_loop.sessions[index].app.state.plan = PlanState::Ready(relative.clone());
         approve(event_loop, index, true);
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
@@ -1500,15 +1450,15 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
             let app = &event_loop.sessions[index].app;
-            app.state.mode == crate::app::mode::Mode::Build && app.status == Status::Idle
+            app.state.mode == Mode::Build && app.status == Status::Idle
         });
         requests.recv_timeout(WAIT).unwrap();
         let id = event_loop.sessions[index].id();
         checkpoint(event_loop, index);
-        let log = event_loop.sessions_dir.join(format!("{id}.jsonl"));
-        let moved = log.with_extension("approval-backup");
-        std::fs::rename(&log, &moved).unwrap();
-        std::fs::create_dir(&log).unwrap();
+        let log = session_log(event_loop, id);
+        let moved = log.with_extension(SESSION_LOG_BACKUP_EXTENSION);
+        fs::rename(&log, &moved).unwrap();
+        fs::create_dir(&log).unwrap();
         event_loop.sessions[index].app.state.session = Arc::new({
             let mut session = (*event_loop.sessions[index].app.state.session).clone();
             session.set_title(RESPONSE.into());
@@ -1516,18 +1466,15 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         });
         event_loop.sessions[index].app.checkpoint_now();
         let warning = warning_rx.recv_timeout(WAIT).unwrap();
-        assert!(warning.starts_with("Session save failed"), "{warning}");
+        assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
         assert_eq!(event_loop.sessions[index].id(), id);
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
             TARGET_MODEL
         );
-        assert_eq!(
-            event_loop.sessions[index].app.state.mode,
-            crate::app::mode::Mode::Build
-        );
-        std::fs::remove_dir(&log).unwrap();
-        std::fs::rename(&moved, &log).unwrap();
+        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Build);
+        fs::remove_dir(&log).unwrap();
+        fs::rename(&moved, &log).unwrap();
         event_loop.sessions[index].app.checkpoint_now();
         checkpoint(event_loop, index);
         assert_eq!(
@@ -1631,10 +1578,7 @@ fn busy_rejection_preserves_active_turn() {
         approve(event_loop, index, false);
         assert_eq!(event_loop.sessions[index].app.run_id, run);
         assert_eq!(event_loop.sessions[index].app.status, Status::Streaming);
-        assert_eq!(
-            event_loop.sessions[index].app.state.mode,
-            crate::app::mode::Mode::Plan
-        );
+        assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
         assert_eq!(
             event_loop.sessions[index].app.state.plan.path(),
             Some(path.as_path())

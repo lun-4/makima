@@ -18,6 +18,7 @@ pub(crate) const APPROVAL_CANCELLED: &str = "Implementation preparation cancelle
 pub(crate) const APPROVAL_LOCK_LOST: &str =
     "The session lock was lost to another process. Implementation cannot start.";
 const APPROVAL_UNAVAILABLE: &str = "Implementation cannot start";
+pub(crate) const IMPLEMENT_PARALLEL_HINT: &str = " Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
 pub(crate) fn idle_error_message(error: ManagerError) -> String {
     match error {
@@ -36,7 +37,7 @@ pub(crate) fn read_plan(path: PathBuf, parallel: bool) -> Result<ApprovedPlan, S
     let content = std::fs::read_to_string(&path)
         .map_err(|error| format!("Could not read plan {}: {error}", path.display()))?;
     let parallel = if parallel {
-        " Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference."
+        IMPLEMENT_PARALLEL_HINT
     } else {
         ""
     };
@@ -79,7 +80,7 @@ pub(crate) fn prepare_change(
 
 #[cfg(test)]
 mod tests {
-    use super::{PrepareProvider, prepare_change, read_plan};
+    use super::{IMPLEMENT_PARALLEL_HINT, PrepareProvider, prepare_change, read_plan};
     use maki_agent::actor::ConfigChange;
     use maki_agent::{ModeDef, ModeId};
     use maki_config::ModelPolicy;
@@ -99,7 +100,7 @@ mod tests {
         assert_eq!(plan.content, PLAN);
         assert_eq!(plan.path, path);
         assert!(plan.message.contains(&path.display().to_string()));
-        assert_eq!(plan.message.contains("batch+task"), parallel);
+        assert_eq!(plan.message.contains(IMPLEMENT_PARALLEL_HINT), parallel);
     }
 
     #[test]
