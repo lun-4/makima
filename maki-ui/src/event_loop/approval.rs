@@ -23,7 +23,8 @@ use crate::AppSession;
 use crate::agent::shared_queue::correlation;
 use crate::app::session_state::rules_to_stored;
 use crate::plan_approval::{
-    APPROVAL_BUSY, APPROVAL_CANCELLED, APPROVAL_CHANGED, ApprovedPlan, prepare_change, read_plan,
+    APPROVAL_CANCELLED, APPROVAL_CHANGED, APPROVAL_LOCK_LOST, ApprovedPlan, idle_error_message,
+    prepare_change, read_plan,
 };
 
 #[cfg(test)]
@@ -128,16 +129,19 @@ struct PlanApprovalRequest {
 }
 
 impl SessionRuntime {
-    fn abort_plan_approval(&mut self, message: String) {
+    pub(super) fn end_plan_approval(&mut self) {
         self.pending_approval.take();
         self.app.plan_approval_pending = false;
+    }
+
+    fn abort_plan_approval(&mut self, message: String) {
+        self.end_plan_approval();
         self.app.flash(message);
     }
 
     fn check_plan_approval(&self, prepared: &PreparedPlanApproval) -> Result<(), String> {
         let request = &prepared.request;
-        let unchanged = !self.lock_lost
-            && self.session_lock.is_some()
+        let unchanged = self.session_lock.is_some()
             && self
                 .app
                 .plan_approval_matches(request.model.as_deref(), request.parallel)
@@ -178,6 +182,10 @@ impl EventLoop<'_> {
         result: Result<ApprovalStep, String>,
     ) {
         let runtime = &mut self.sessions[idx];
+        if runtime.lock_lost {
+            // Losing the lock already flashed why the session is stopping.
+            return runtime.end_plan_approval();
+        }
         let step = match result.and_then(|step| {
             runtime.check_plan_approval(step.prepared())?;
             Ok(step)
@@ -226,7 +234,7 @@ impl EventLoop<'_> {
                 if let Ok(actor) = manager.actor(root) {
                     let _ = actor.cancel_turn(ticket.turn_id());
                 }
-                runtime.app.flash(error.to_string());
+                runtime.app.flash(idle_error_message(error));
             }
             runtime.approved_turn = Some((idle, ticket));
         }
@@ -373,7 +381,7 @@ impl EventLoop<'_> {
             let (manager, root) = candidate.handles.manager_and_root();
             let idle = manager
                 .prepare_idle_subtree(root)
-                .map_err(|error| error.to_string())?;
+                .map_err(idle_error_message)?;
             let actor = manager.actor(root).map_err(|error| error.to_string())?;
             let turn = implementation_turn(
                 source.plan.message.clone(),
@@ -410,8 +418,7 @@ impl EventLoop<'_> {
             let PreparedCommit { config, ticket } =
                 operation.commit().map_err(|error| error.to_string())?;
             let ticket = ticket.ok_or_else(|| APPROVAL_CHANGED.to_string())?;
-            idle.allow_turn(&ticket)
-                .map_err(|error| error.to_string())?;
+            idle.allow_turn(&ticket).map_err(idle_error_message)?;
             let lock = lock_claim.claim(target).await?;
             Ok(ApprovalStep::Fresh(Box::new(FreshPlanApproval {
                 source,
@@ -436,10 +443,13 @@ impl EventLoop<'_> {
         if runtime.pending_approval.is_some() {
             return;
         }
+        if runtime.lock_lost {
+            return runtime.abort_plan_approval(APPROVAL_LOCK_LOST.into());
+        }
         let (manager, root) = runtime.handles.manager_and_root();
         let idle = match manager.prepare_idle_subtree(root) {
-            Ok(idle) if !runtime.lock_lost => idle,
-            _ => return runtime.abort_plan_approval(APPROVAL_BUSY.into()),
+            Ok(idle) => idle,
+            Err(error) => return runtime.abort_plan_approval(idle_error_message(error)),
         };
         let actor = match manager.actor(root) {
             Ok(actor) => actor,

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::actor::{ConfigChange, ConfigPatch, PreparedModel};
+use maki_agent::manager::ManagerError;
 use maki_agent::{AgentMode, ModeDef};
 use maki_config::ModelPolicy;
 use maki_providers::{Model, Timeouts};
@@ -14,6 +15,16 @@ pub(crate) const APPROVAL_BUSY: &str =
 pub(crate) const APPROVAL_CHANGED: &str =
     "The plan or session changed while preparing implementation. Retry approval.";
 pub(crate) const APPROVAL_CANCELLED: &str = "Implementation preparation cancelled.";
+pub(crate) const APPROVAL_LOCK_LOST: &str =
+    "The session lock was lost to another process. Implementation cannot start.";
+const APPROVAL_UNAVAILABLE: &str = "Implementation cannot start";
+
+pub(crate) fn idle_error_message(error: ManagerError) -> String {
+    match error {
+        ManagerError::BusySubtree(_) => APPROVAL_BUSY.into(),
+        error => format!("{APPROVAL_UNAVAILABLE}: {error}."),
+    }
+}
 
 pub(crate) struct ApprovedPlan {
     pub(crate) path: PathBuf,

@@ -112,6 +112,7 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
 const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
     "session lock ownership is unavailable; replacement is disabled";
@@ -394,9 +395,7 @@ impl Drop for HeartbeatCompletion {
 fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
     runtime.session_lock = None;
     runtime.lock_lost = true;
-    runtime
-        .app
-        .flash("Session lock lost to another process; stopping without saving".into());
+    runtime.app.flash(LOCK_LOST_MSG.into());
     runtime.app.exit_request = ExitRequest::Error;
     let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);
     warn!(id = %runtime.id(), "session lock lost to another process; stopping without saving");
@@ -3969,10 +3968,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 self.prepare_plan_approval(idx, clear_context, model, parallel, path);
             }
-            Action::CancelPlanApproval => {
-                self.sessions[idx].pending_approval.take();
-                self.sessions[idx].app.plan_approval_pending = false;
-            }
+            Action::CancelPlanApproval => self.sessions[idx].end_plan_approval(),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);

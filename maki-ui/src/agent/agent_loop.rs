@@ -40,6 +40,8 @@ use super::SystemPromptOverride;
 /// Correlation prefix stamped on TUI root/turn admissions. Parsed back into a
 /// run id for event envelope correlation.
 pub(crate) const ROOT_CORRELATION_PREFIX: &str = "r";
+const PROMPT_SLOTS_CLOSED: &str = "the Lua plugin runtime stopped before returning prompt slots";
+const PROMPT_INPUTS_CLOSED: &str = "prompt input preparation stopped before it finished";
 
 /// Parses an actor correlation string back into the TUI run id.
 pub(crate) fn correlation_to_run_id(correlation: &str) -> u64 {
@@ -548,7 +550,7 @@ async fn resolve_prompt_slots(
 ) -> (Arc<maki_agent::prompt::ResolvedSlots>, Option<String>) {
     match receiver.recv_async().await {
         Ok(slots) => (Arc::new(slots), None),
-        Err(error) => (Arc::default(), Some(format!("prompt slots: {error}"))),
+        Err(_) => (Arc::default(), Some(PROMPT_SLOTS_CLOSED.into())),
     }
 }
 
@@ -564,8 +566,8 @@ async fn prepare_prompt_inputs(
                 receiver
                     .recv_async()
                     .await
-                    .map_err(|error| {
-                        maki_agent::actor::ActorError::InvalidConfig(error.to_string())
+                    .map_err(|_| {
+                        maki_agent::actor::ActorError::InvalidConfig(PROMPT_INPUTS_CLOSED.into())
                     })?
                     .map_err(maki_agent::actor::ActorError::InvalidConfig)?,
             );
@@ -1065,9 +1067,9 @@ mod tests {
             panic!("prompt readiness must fail");
         };
         let expected = if mcp_error {
-            MCP_ERROR.to_owned()
+            MCP_ERROR
         } else {
-            flume::RecvError::Disconnected.to_string()
+            PROMPT_INPUTS_CLOSED
         };
         assert_eq!(message, expected);
     }
@@ -1081,8 +1083,7 @@ mod tests {
             let (slot_tx, slot_rx) = flume::bounded(1);
             drop(slot_tx);
             let (slots, slots_error) = resolve_prompt_slots(slot_rx).await;
-            let expected = format!("prompt slots: {}", flume::RecvError::Disconnected);
-            assert_eq!(slots_error.as_deref(), Some(expected.as_str()));
+            assert_eq!(slots_error.as_deref(), Some(PROMPT_SLOTS_CLOSED));
             let (tx, rx) = flume::bounded(1);
             Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap()).resolved = Some(rx);
             tx.send(Ok(maki_agent::agent::ResolvedPromptInputs {
@@ -1097,10 +1098,10 @@ mod tests {
             else {
                 panic!("closed slot channel must fail readiness");
             };
-            assert_eq!(message, expected);
+            assert_eq!(message, PROMPT_SLOTS_CLOSED);
             tx.send(Ok(maki_agent::agent::ResolvedPromptInputs {
                 slots: Arc::default(),
-                slots_error: Some(expected),
+                slots_error: Some(PROMPT_SLOTS_CLOSED.into()),
                 mcp_messages: None,
             }))
             .unwrap();

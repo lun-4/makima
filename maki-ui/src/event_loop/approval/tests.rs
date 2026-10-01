@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::SessionMailbox;
 use maki_agent::actor::PreparedModel;
+use maki_agent::manager::ManagerError;
 use maki_agent::session_coordinator::SessionCoordinatorHandle;
 use maki_agent::tools::ToolRegistry;
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
@@ -26,12 +27,13 @@ use test_case::test_case;
 
 use super::super::tests::{shutdown_manager, with_event_loop};
 use super::super::{
-    EventLoop, InternalEvent, PreparedProvider, Wake, bounded_session_op, prepare_coordinator,
-    start_runtime_heartbeat_with,
+    EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, Wake, bounded_session_op,
+    prepare_coordinator, start_runtime_heartbeat_with,
 };
 use super::ApprovalStep;
 use crate::AppSession;
 use crate::components::{Action, Status};
+use crate::plan_approval::{APPROVAL_BUSY, idle_error_message};
 use crate::storage_writer::StorageWriter;
 
 const SOURCE_MODEL: &str = "anthropic/claude-opus-4-6";
@@ -1222,6 +1224,57 @@ fn inflight_heartbeat_does_not_abort(fresh: bool) {
     });
 }
 
+#[test_case(false; "existing_context")]
+#[test_case(true; "fresh_context")]
+fn lock_lost_while_waiting_keeps_lock_lost_message(fresh: bool) {
+    with_event_loop(|event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        let (entered, entry) = flume::bounded(1);
+        let (release, gate) = flume::bounded(1);
+        start_runtime_heartbeat_with(
+            &mut event_loop.sessions[index],
+            &event_loop.internal_tx,
+            move |lease| {
+                entered.send(()).unwrap();
+                gate.recv().unwrap();
+                (lease, Ok(session_lock::LockBeat::Lost))
+            },
+        );
+        entry.recv_timeout(WAIT).unwrap();
+        approve(event_loop, index, &path, fresh);
+        let ready = final_ready(event_loop, fresh, &requests);
+        event_loop.handle_internal(ready);
+        assert!(event_loop.sessions[index].app.plan_approval_pending);
+        release.send(()).unwrap();
+        pump_until(event_loop, |event_loop| {
+            !event_loop.sessions[index].app.plan_approval_pending
+        });
+        assert_eq!(
+            event_loop.sessions[index].app.status_bar.flash_text(),
+            Some(LOCK_LOST_MSG)
+        );
+        assert!(requests.is_empty());
+    });
+}
+
+#[test]
+fn unavailable_agent_graph_is_not_reported_busy() {
+    with_event_loop(|event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        let (manager, _) = event_loop.sessions[index].handles.manager_and_root();
+        shutdown_manager(&manager);
+        approve(event_loop, index, &path, false);
+        let expected = idle_error_message(ManagerError::GraphShutdown);
+        assert_ne!(expected, APPROVAL_BUSY);
+        assert!(!event_loop.sessions[index].app.plan_approval_pending);
+        assert_eq!(
+            event_loop.sessions[index].app.status_bar.flash_text(),
+            Some(expected.as_str())
+        );
+        assert!(requests.is_empty());
+    });
+}
+
 #[test_case(false; "directory")]
 #[test_case(true; "history")]
 fn fresh_source_lease_defers_mutation_until_cancel(history: bool) {
@@ -1624,6 +1677,10 @@ fn busy_rejection_preserves_active_turn() {
             Some(TARGET_MODEL)
         );
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
+        assert_eq!(
+            event_loop.sessions[index].app.status_bar.flash_text(),
+            Some(APPROVAL_BUSY)
+        );
         assert!(Arc::ptr_eq(&config, &actor.effective_config().unwrap()));
         assert!(requests.is_empty());
         release.send(()).unwrap();
