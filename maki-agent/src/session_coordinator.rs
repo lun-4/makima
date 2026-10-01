@@ -208,6 +208,10 @@ impl IdleSessionLease {
     }
 }
 
+/// Wraps an operation so it is rejected up front (rather than queued behind
+/// the coordinator) while a source reservation is live. The immediate
+/// `SessionBusy` a caller can observe without a coordinator roundtrip is
+/// what justifies the plumbing over a coordinator-side flag.
 struct SourceReservation(Arc<Mutex<usize>>);
 
 impl Drop for SourceReservation {
