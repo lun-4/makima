@@ -153,12 +153,20 @@ impl PlanForm {
         self.selected = MODEL_ROW;
     }
 
-    fn menu_len(&self) -> usize {
-        if self.implementation_model.is_some() {
-            MENU.len()
-        } else {
-            MODEL_ROW + 1
+    pub fn clear_model_if_current(&mut self, current_model: &str) {
+        if self.implementation_model() == Some(current_model) {
+            self.implementation_model = None;
+            self.selected = self.selected.min(MODEL_ROW);
         }
+    }
+
+    fn staged_model(&self, current_model: &str) -> Option<&str> {
+        self.implementation_model()
+            .filter(|spec| *spec != current_model)
+    }
+
+    fn menu_len(staged: bool) -> usize {
+        if staged { MENU.len() } else { MODEL_ROW + 1 }
     }
 
     pub fn hint_line(&self) -> Option<Line<'static>> {
@@ -200,7 +208,8 @@ impl PlanForm {
                 PlanFormAction::Consumed
             }
             KeyCode::Down => {
-                self.selected = (self.selected + 1).min(self.menu_len() - 1);
+                self.selected = (self.selected + 1)
+                    .min(Self::menu_len(self.implementation_model.is_some()) - 1);
                 PlanFormAction::Consumed
             }
             KeyCode::Char(' ') => {
@@ -230,16 +239,18 @@ impl PlanForm {
 
     fn lines(&self, current_model: &str) -> Vec<Line<'static>> {
         let t = theme::current();
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.menu_len() + 2);
+        let staged = self.staged_model(current_model);
+        let menu_len = Self::menu_len(staged.is_some());
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(menu_len + 2);
 
-        for (i, item) in MENU.iter().take(self.menu_len()).enumerate() {
+        for (i, item) in MENU.iter().take(menu_len).enumerate() {
             let (prefix, style) = selected_prefix(&t, i == self.selected);
             let mut spans = vec![Span::styled(prefix, t.tool_dim)];
             if i == MODEL_ROW {
-                let spec = self.implementation_model().unwrap_or(current_model);
+                let spec = staged.unwrap_or(current_model);
                 spans.push(Span::styled(format!("Implementation model: {spec}"), style));
                 spans.push(Span::styled(
-                    if self.implementation_model.is_some() {
+                    if staged.is_some() {
                         "  selected"
                     } else {
                         "  current"
@@ -277,11 +288,11 @@ mod tests {
     const HINT_TAIL: &str = "dismiss";
     const USE_CURRENT_ROW: usize = MENU.len() - 1;
 
-    fn render(form: &PlanForm, width: u16) -> String {
-        let height = form.height(width, CURRENT_MODEL);
+    fn render(form: &PlanForm, width: u16, current_model: &str) -> String {
+        let height = form.height(width, current_model);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| form.view(frame, frame.area(), CURRENT_MODEL))
+            .draw(|frame| form.view(frame, frame.area(), current_model))
             .unwrap();
         buffer_text(terminal.backend().buffer())
     }
@@ -374,7 +385,7 @@ mod tests {
             form.set_implementation_model(spec.into(), CURRENT_MODEL);
         }
         form.selected = selected;
-        let text = render(&form, width);
+        let text = render(&form, width, CURRENT_MODEL);
         assert!(text.contains(HINT_TAIL));
         assert!(text.contains(&format!("▸ {row_label}")));
     }
@@ -441,6 +452,22 @@ mod tests {
         form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
         form.reset();
         assert_eq!(form.implementation_model(), None);
+    }
+
+    #[test]
+    fn staged_model_matching_session_model_is_no_override() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        let unstaged_height = form.height(WIDE, OTHER_MODEL);
+        form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
+        form.selected = USE_CURRENT_ROW;
+        let text = render(&form, WIDE, OTHER_MODEL);
+        assert!(text.contains(&format!("Implementation model: {OTHER_MODEL}  current")));
+        assert!(!text.contains("Use current model"));
+        assert_eq!(form.height(WIDE, OTHER_MODEL), unstaged_height);
+        form.clear_model_if_current(OTHER_MODEL);
+        assert_eq!(form.implementation_model(), None);
+        assert_eq!(form.selected, MODEL_ROW);
     }
 
     #[test]

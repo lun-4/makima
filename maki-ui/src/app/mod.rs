@@ -1098,6 +1098,8 @@ impl App {
 
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
         if self.plan_form_active() {
+            self.plan_form
+                .clear_model_if_current(&self.state.model.spec());
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));

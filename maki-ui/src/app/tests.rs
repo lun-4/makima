@@ -6252,6 +6252,24 @@ fn plan_form_renders_effective_implementation_model(staged: bool) {
 }
 
 #[test]
+fn staged_model_matching_session_model_approves_without_override() {
+    let mut app = plan_app();
+    app.plan_form
+        .set_implementation_model(LATE_MODEL_SPEC.into(), &app.state.model.spec());
+    app.state.model = Model::from_spec(LATE_MODEL_SPEC).unwrap();
+    let rows = rendered_area(&mut app).join("\n");
+    assert!(rows.contains(&format!("Implementation model: {LATE_MODEL_SPEC}  current")));
+    assert!(!rows.contains("Use current model"));
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Down)));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ApprovePlan { model: None, .. }]
+    ));
+}
+
+#[test]
 fn admitted_plan_run_uses_exact_run_id_without_submitting() {
     let mut app = plan_app();
     app.plan_approval_pending = true;
