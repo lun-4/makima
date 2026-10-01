@@ -136,7 +136,9 @@ impl PreparedOperationTicket {
             .ok_or(ActorError::PolicyPending)
     }
 
-    pub fn cancel(&self) {
+    /// The only production cancel path is `Drop`; `pub(crate)` exists for
+    /// same-crate tests that need to cancel without dropping.
+    pub(crate) fn cancel(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.failure().is_some() {
             return;
