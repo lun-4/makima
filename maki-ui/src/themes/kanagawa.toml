@@ -106,6 +106,7 @@ old_white        = "#c8c093"
 mode_plan        = "#7fb4ca"
 
 [ui]
+user_bg            = { bg = "current_line" }
 user               = { fg = "blue" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "purple" }

@@ -118,6 +118,7 @@ panel_border       = { fg = "cyan" }
 panel_title        = { fg = "cyan", modifiers = ["bold"] }
 cursor             = { fg = "background", bg = "foreground" }
 keybind_key        = { fg = "frost_light", modifiers = ["bold"] }
+user_bg            = { bg = "current_line" }
 user               = { fg = "frost_light" }
 assistant          = { fg = "foreground" }
 thinking           = { fg = "comment", modifiers = ["italic"] }

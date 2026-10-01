@@ -110,6 +110,7 @@ yellow            = "#f6c177"
 mode_plan         = "#ebbcba"
 
 [ui]
+user_bg           = { bg = "current_line" }
 user              = { fg = "rose" }
 assistant_prefix  = { fg = "iris" }
 assistant         = { fg = "foreground" }

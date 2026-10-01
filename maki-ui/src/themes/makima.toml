@@ -104,6 +104,7 @@ current_line = "#241818"
 selection    = "#331d1d"
 
 [ui]
+user_bg            = { bg = "current_line" }
 user               = { fg = "rose" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "red" }
