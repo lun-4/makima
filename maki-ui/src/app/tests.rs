@@ -4630,16 +4630,25 @@ fn copy_tui_fixture() -> CopyTuiFixture {
     }
 }
 
+/// Every provider publish bumps the completion revision and `accept` refuses
+/// a stale candidate, so Enter only lands once the request has finished, not
+/// as soon as the visible labels look right.
+fn poll_settled_copy_completion(app: &mut App, mut ready: impl FnMut(&App) -> bool, what: &str) {
+    wait_for(
+        || {
+            let _ = app.tick();
+            app.command_palette.cadence() != Cadence::PENDING && ready(app)
+        },
+        what,
+    );
+}
+
 fn poll_copy_completion(app: &mut App) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let _ = app.tick();
-        if app.command_palette.has_argument_selectable() {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    panic!("copy completion popup never offered a selectable item");
+    poll_settled_copy_completion(
+        app,
+        |app| app.command_palette.has_argument_selectable(),
+        "copy completion popup never offered a selectable item",
+    );
 }
 
 fn copy_candidate_labels(app: &App) -> Vec<String> {
@@ -4651,21 +4660,15 @@ fn copy_candidate_labels(app: &App) -> Vec<String> {
 }
 
 fn poll_copy_candidates(app: &mut App, expected: &[&str]) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let _ = app.tick();
-        if copy_candidate_labels(app)
-            .iter()
-            .map(String::as_str)
-            .eq(expected.iter().copied())
-        {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    panic!(
-        "copy completion candidates did not settle: expected {expected:?}, got {:?}",
-        copy_candidate_labels(app)
+    poll_settled_copy_completion(
+        app,
+        |app| {
+            copy_candidate_labels(app)
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied())
+        },
+        &format!("copy completion candidates did not settle on {expected:?}"),
     );
 }
 
