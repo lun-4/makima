@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::SessionMailbox;
 use maki_agent::actor::PreparedModel;
 use maki_agent::manager::ManagerError;
-use maki_agent::session_coordinator::SessionCoordinatorHandle;
+use maki_agent::session_coordinator::{SessionCoordinatorError, SessionCoordinatorHandle};
 use maki_agent::tools::ToolRegistry;
 use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::PluginHost;
@@ -22,7 +22,7 @@ use maki_providers::{
 };
 use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
 use maki_storage::id::SessionRef;
-use maki_storage::session_lock;
+use maki_storage::session_lock::{self, OPEN_ELSEWHERE_MSG};
 use test_case::test_case;
 
 use super::super::tests::{shutdown_manager, with_event_loop};
@@ -33,7 +33,7 @@ use super::super::{
 use super::ApprovalStep;
 use crate::AppSession;
 use crate::components::{Action, Status};
-use crate::plan_approval::{APPROVAL_BUSY, idle_error_message};
+use crate::plan_approval::{APPROVAL_BUSY, APPROVAL_CHANGED, idle_error_message};
 use crate::storage_writer::StorageWriter;
 
 const SOURCE_MODEL: &str = "anthropic/claude-opus-4-6";
@@ -255,6 +255,10 @@ fn rejects_active_managed_child_without_cancelling_it() {
         let config = actor.effective_config().unwrap();
         approve(event_loop, index, &path, true);
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
+        assert_eq!(
+            event_loop.sessions[index].app.status_bar.flash_text(),
+            Some(APPROVAL_BUSY)
+        );
         assert_eq!(event_loop.sessions[index].app.run_id, run);
         assert!(Arc::ptr_eq(&config, &actor.effective_config().unwrap()));
         assert_eq!(child.snapshot().status, child_before.status);
@@ -409,8 +413,15 @@ fn pump_until(event_loop: &mut EventLoop<'_>, mut done: impl FnMut(&EventLoop<'_
     }
 }
 
-fn assert_preserved(event_loop: &EventLoop<'_>, index: usize, path: &Path, run_id: u64) {
+fn assert_preserved(
+    event_loop: &EventLoop<'_>,
+    index: usize,
+    path: &Path,
+    run_id: u64,
+    flash: Option<&str>,
+) {
     let app = &event_loop.sessions[index].app;
+    assert_eq!(app.status_bar.flash_text(), flash);
     assert_eq!(app.state.model.spec(), SOURCE_MODEL);
     assert_eq!(app.state.mode, crate::app::mode::Mode::Plan);
     assert_eq!(app.state.plan.path(), Some(path));
@@ -836,7 +847,7 @@ fn fresh_candidate_cancel_releases_source_setter() {
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         event_loop.handle_internal(ready);
         smol::block_on(successor.wait()).unwrap();
-        assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run, None);
         assert_eq!(event_loop.sessions[index].id(), original_id);
         assert!(Arc::ptr_eq(
             &original_identity,
@@ -861,7 +872,7 @@ fn runtime_identity_rejects_stale_completion(fresh: bool) {
         event_loop.handle_internal(ready);
         assert!(event_loop.sessions[index].app.plan_approval_pending);
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run, None);
         assert!(requests.is_empty());
     });
 }
@@ -929,7 +940,7 @@ fn fresh_cancel_releases_source_before_target_lock_returns() {
         assert!(!session_lock::lock_path(&event_loop.sessions_dir, &target).exists());
         let cancelled = next_ready(event_loop);
         event_loop.handle_internal(cancelled);
-        assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run, None);
         release.send(()).unwrap();
         assert_eq!(disposal.recv_timeout(WAIT).unwrap().unwrap(), RELEASED_LOCK);
         event_loop.ctx.lock_prepare_gate = None;
@@ -987,17 +998,19 @@ fn fresh_target_lock_failure_preserves_runtime_and_storage() {
         let identity = event_loop.sessions[index].handles.identity();
         let targets = event_loop.ctx.command_runtime.registry.target_count();
         let run = event_loop.sessions[index].app.run_id;
+        let sessions_dir = event_loop.ctx.sessions_dir.clone();
+        event_loop.ctx.lock_prepare_gate = Some(Arc::new(move |target| {
+            Box::new(
+                session_lock::claim(&sessions_dir, &target)
+                    .unwrap()
+                    .unwrap(),
+            )
+        }));
         approve(event_loop, index, &path, true);
-        let ready = next_ready(event_loop);
-        let blocked = PathBuf::from(&event_loop.session_cwd).join("approval-lock-file");
-        std::fs::write(&blocked, []).unwrap();
-        let sessions = std::mem::replace(&mut event_loop.ctx.sessions_dir, blocked);
-        event_loop.handle_internal(ready);
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        event_loop.ctx.sessions_dir = sessions;
-        assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run, Some(OPEN_ELSEWHERE_MSG));
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(Arc::ptr_eq(
             &identity,
@@ -1048,7 +1061,13 @@ fn fresh_activation_failure_releases_candidate_resources() {
         .activate()
         .unwrap();
         event_loop.handle_internal(ready);
-        assert_preserved(event_loop, index, &path, run);
+        assert_preserved(
+            event_loop,
+            index,
+            &path,
+            run,
+            Some(&SessionCoordinatorError::DuplicateSession(target).to_string()),
+        );
         assert_eq!(event_loop.sessions[index].id(), source_id);
         assert!(Arc::ptr_eq(
             &source_identity,
@@ -1400,7 +1419,7 @@ fn fresh_stale_cwd_rejects_relative_path() {
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        assert_preserved(event_loop, index, &relative, run);
+        assert_preserved(event_loop, index, &relative, run, Some(APPROVAL_CHANGED));
         assert!(requests.is_empty());
     });
 }
@@ -1415,7 +1434,7 @@ fn fresh_permission_change_before_activation_preserves_source() {
         let ready = final_ready(event_loop, true, &requests);
         event_loop.sessions[index].app.permissions.toggle_yolo();
         event_loop.handle_internal(ready);
-        assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run, Some(APPROVAL_CHANGED));
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(requests.is_empty());
     });
@@ -1433,7 +1452,7 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run, Some(PROVIDER_FAILURE));
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(requests.is_empty());
     });
@@ -1465,9 +1484,15 @@ fn cancel_during_provider_preparation_ignores_late_result() {
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         let cancelled = next_ready(event_loop);
         event_loop.handle_internal(cancelled);
+        assert_preserved(event_loop, index, &path, run, None);
         release.send(()).unwrap();
         completion.recv_timeout(WAIT).unwrap();
-        assert_preserved(event_loop, index, &path, run);
+        event_loop.submit_text(index, RESPONSE.into()).unwrap();
+        let (model, _, _, _) = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(model, SOURCE_MODEL);
+        pump_until(event_loop, |event_loop| {
+            event_loop.sessions[index].app.status == Status::Idle
+        });
         assert!(requests.is_empty());
         assert!(late_requests.is_empty());
     });
@@ -1484,7 +1509,7 @@ fn cancel_before_ready_preserves_plan(fresh: bool) {
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         event_loop.handle_internal(ready);
         let _ = event_loop.tick();
-        assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run, None);
         assert!(requests.is_empty());
     });
 }
