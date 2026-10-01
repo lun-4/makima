@@ -1198,6 +1198,7 @@ impl SessionRuntime {
         }
         self.projected_config_generation = Some(commit.generation);
         project_actor_config(&mut self.app, &commit.config);
+        self.settle_plan_approval();
         true
     }
 
@@ -2644,9 +2645,6 @@ impl<'t> EventLoop<'t> {
 
     fn drain_channels(&mut self) -> Result<Dirty> {
         for runtime in &mut self.sessions {
-            if !runtime.app.plan_approval_pending {
-                runtime.pending_approval.take();
-            }
             if runtime
                 .approved_turn
                 .as_ref()
@@ -4117,7 +4115,11 @@ impl<'t> EventLoop<'t> {
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::ModeChanged { id, plan } => match result {
-                Ok(()) => complete_mode_change(&mut self.sessions[idx].app, id, plan),
+                Ok(()) => {
+                    let rt = &mut self.sessions[idx];
+                    complete_mode_change(&mut rt.app, id, plan);
+                    rt.settle_plan_approval();
+                }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::DirectoryChanged { adopted } => match result {
@@ -4187,11 +4189,12 @@ impl<'t> EventLoop<'t> {
                 reply_tx,
             } => {
                 let reply = result.map(|()| {
-                    let app = &mut self.sessions[idx].app;
+                    let rt = &mut self.sessions[idx];
                     if let Some(path) = plan_path {
-                        app.state.plan = crate::app::mode::PlanState::Drafting(path);
+                        rt.app.state.plan = crate::app::mode::PlanState::Drafting(path);
                     }
-                    app.set_mode_id(id);
+                    rt.app.set_mode_id(id);
+                    rt.settle_plan_approval();
                     json!(true)
                 });
                 let _ = reply_tx.send(reply);

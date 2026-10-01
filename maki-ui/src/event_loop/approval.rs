@@ -85,9 +85,26 @@ struct PlanApprovalRequest {
 }
 
 impl SessionRuntime {
+    /// The one place a staged approval is installed: it owns both the
+    /// runtime-side state and the App gate flag that blocks input.
+    pub(super) fn begin_plan_approval(&mut self, pending: PendingPlanApproval) {
+        self.pending_approval = Some(pending);
+        self.app.plan_approval_pending = true;
+    }
+
+    /// The one place a staged approval is torn down.
     pub(super) fn end_plan_approval(&mut self) {
         self.pending_approval.take();
         self.app.plan_approval_pending = false;
+    }
+
+    /// Drops a staged approval whose App gate flag was cleared without the
+    /// runtime's knowledge (a mode switch or an actor config projection
+    /// leaving plan mode). Runs wherever `App::set_mode_id` can fire.
+    pub(super) fn settle_plan_approval(&mut self) {
+        if !self.app.plan_approval_pending {
+            self.pending_approval = None;
+        }
     }
 
     fn abort_plan_approval(&mut self, message: String) {
@@ -285,7 +302,7 @@ impl EventLoop<'_> {
         let runtime = &mut self.sessions[idx];
         let identity = Arc::new(());
         let (trigger, cancel) = CancelToken::new();
-        runtime.pending_approval = Some(PendingPlanApproval {
+        runtime.begin_plan_approval(PendingPlanApproval {
             identity: Arc::clone(&identity),
             cancel: Some(trigger),
             waiting_for_lock: None,
