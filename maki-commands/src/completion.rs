@@ -48,6 +48,17 @@ struct CurrentCompletionRequest {
     sink: Option<CompletionSnapshotSink>,
 }
 
+impl CurrentCompletionRequest {
+    /// A newer snapshot that offers the identical candidate (same item,
+    /// provider, provenance and navigation) does not make it stale, so a key
+    /// pressed between a provider's publish and its finish still lands.
+    fn offers(&self, candidate: &CompletionCandidate) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.candidates.contains(candidate))
+    }
+}
+
 #[derive(Clone)]
 struct RequestProvider {
     provider: Arc<dyn CommandCompletion>,
@@ -316,7 +327,6 @@ pub struct CompletionCandidate {
     item: CompletionItem,
     session_id: CompletionSessionId,
     request_id: u64,
-    revision: u64,
     provider_index: usize,
     source: CompletionSource,
     navigation: CompletionItemNavigation,
@@ -478,7 +488,6 @@ fn build_snapshot(
                 item,
                 session_id: core.id,
                 request_id,
-                revision,
                 provider_index,
                 navigation,
                 source,
@@ -818,17 +827,7 @@ impl CompletionSession {
                 .current_request
                 .as_ref()
                 .ok_or(CompletionError::StaleRequest)?;
-            if current.context.target_id != state.target_id
-                || current.id != candidate.request_id
-                || state.revision != candidate.revision
-            {
-                return Err(CompletionError::StaleRequest);
-            }
-            let provider = current
-                .providers
-                .get(candidate.provider_index)
-                .ok_or(CompletionError::StaleRequest)?;
-            if provider.items.iter().all(|item| item != &candidate.item) {
+            if current.context.target_id != state.target_id || !current.offers(candidate) {
                 return Err(CompletionError::StaleRequest);
             }
             (
@@ -873,19 +872,11 @@ impl CompletionSession {
             if state.closed || candidate.session_id != self.owner.core.id {
                 return Err(CompletionError::StaleSession);
             }
-            let mut current = state
+            let current = state
                 .current_request
                 .take()
                 .ok_or(CompletionError::StaleRequest)?;
-            if current.id != candidate.request_id || state.revision != candidate.revision {
-                state.current_request = Some(current);
-                return Err(CompletionError::StaleRequest);
-            }
-            let selected = current
-                .providers
-                .get_mut(candidate.provider_index)
-                .ok_or(CompletionError::StaleRequest)?;
-            if selected.items.iter().all(|item| item != &candidate.item) {
+            if !current.offers(&candidate) {
                 state.current_request = Some(current);
                 return Err(CompletionError::StaleRequest);
             }
@@ -947,16 +938,13 @@ impl CompletionSession {
                 .current_request
                 .as_ref()
                 .ok_or(CompletionError::StaleRequest)?;
-            if current.id != candidate.request_id || state.revision != candidate.revision {
+            if !current.offers(candidate) {
                 return Err(CompletionError::StaleRequest);
             }
             let provider = current
                 .providers
                 .get(candidate.provider_index)
                 .ok_or(CompletionError::StaleRequest)?;
-            if provider.items.iter().all(|item| item != &candidate.item) {
-                return Err(CompletionError::StaleRequest);
-            }
             CompletionCallback {
                 providers: vec![(Arc::clone(&provider.provider), event)],
                 context: current.context.clone(),
