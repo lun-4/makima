@@ -534,7 +534,8 @@ fn idle_guard_permission_for_retired_turn_does_not_hold_actor(permitted_first: b
             actor.cancel_turn(approved.turn_id()).unwrap();
             assert!(matches!(
                 guard.allow_turn(&approved),
-                Err(ManagerError::Policy(_))
+                Err(ManagerError::IdleTurnRejected { agent_id, turn_id })
+                    if agent_id == root.id() && turn_id == approved.turn_id()
             ));
             drop(guard);
         }
@@ -548,6 +549,38 @@ fn idle_guard_permission_for_retired_turn_does_not_hold_actor(permitted_first: b
             approved.wait().await,
             TurnOutcome::Cancelled { .. }
         ));
+        manager.shutdown(Duration::from_secs(1)).await;
+    });
+}
+
+#[test]
+fn idle_guard_reports_closed_actor_as_non_live() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (start_tx, start_rx) = flume::bounded(1);
+        let root = manager
+            .create_root_deferred_with_config(
+                None,
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::boxed()),
+                start_rx,
+            )
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let guard = manager.prepare_idle_subtree(root.id()).unwrap();
+        let approved = actor.admit_turn(input(), None, "approved".into()).unwrap();
+        actor.close();
+        assert!(matches!(
+            guard.allow_turn(&approved),
+            Err(ManagerError::NonLiveAgent(id)) if id == root.id()
+        ));
+        drop(guard);
+        assert!(matches!(
+            manager.prepare_idle_subtree(root.id()),
+            Err(ManagerError::NonLiveAgent(id)) if id == root.id()
+        ));
+        drop(start_tx);
         manager.shutdown(Duration::from_secs(1)).await;
     });
 }

@@ -42,6 +42,8 @@ pub enum ManagerError {
     Factory(String),
     #[error("agent {0} or its descendants have pending work")]
     BusySubtree(AgentId),
+    #[error("turn {turn_id} is not eligible for agent {agent_id}'s idle reservation")]
+    IdleTurnRejected { agent_id: AgentId, turn_id: TurnId },
     #[error("agent policy update failed: {0}")]
     Policy(String),
 }

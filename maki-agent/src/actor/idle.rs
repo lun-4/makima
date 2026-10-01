@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::{
     ActorError, ActorLifecycle, ActorOperation, ActorQueue, ActorState, ActorStatus, ActorWork,
-    AgentActorHandle, TurnTicket,
+    AgentActorHandle, TurnTicket, lifecycle_error,
 };
 use crate::TurnId;
 
@@ -36,7 +36,10 @@ impl ActorIdleGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&ticket.turn_id());
-        if state.lifecycle != ActorLifecycle::Open || retired {
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        if retired {
             return Err(ActorError::PolicyCancelled);
         }
         let reservation = state
@@ -121,10 +124,10 @@ impl AgentActorHandle {
 
     pub fn prepare_idle(&self) -> Result<ActorIdleGuard, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open
-            || state.idle.is_some()
-            || state.has_pending_work(&self.inner.queue)
-        {
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        if state.idle.is_some() || state.has_pending_work(&self.inner.queue) {
             return Err(ActorError::PolicyPending);
         }
         let owner = Arc::new(());

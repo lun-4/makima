@@ -33,8 +33,8 @@ use tracing::{info, warn};
 
 use crate::actor::{ActorIdleGuard, ManagedTurnAdmission, TurnTicket};
 use crate::{
-    ActorBackend, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId, SharedMessages,
-    TurnCancellationReason, TurnId,
+    ActorBackend, ActorError, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
+    SharedMessages, TurnCancellationReason, TurnId,
 };
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -44,14 +44,19 @@ static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 type RunnerTask = smol::Task<()>;
 
 pub struct IdleSubtreeGuard {
+    agent_id: AgentId,
     root: ActorIdleGuard,
 }
 
 impl IdleSubtreeGuard {
     pub fn allow_turn(&self, ticket: &TurnTicket) -> Result<(), ManagerError> {
-        self.root
-            .allow_turn(ticket)
-            .map_err(|error| ManagerError::Policy(error.to_string()))
+        self.root.allow_turn(ticket).map_err(|error| match error {
+            ActorError::Closed | ActorError::Shutdown => ManagerError::NonLiveAgent(self.agent_id),
+            _ => ManagerError::IdleTurnRejected {
+                agent_id: self.agent_id,
+                turn_id: ticket.turn_id(),
+            },
+        })
     }
 }
 
@@ -95,10 +100,11 @@ impl AgentManagerHandle {
             gate.entered.send(()).unwrap();
             gate.release.recv().unwrap();
         }
-        let root = actor
-            .prepare_idle()
-            .map_err(|_| ManagerError::BusySubtree(agent_id))?;
-        Ok(IdleSubtreeGuard { root })
+        let root = actor.prepare_idle().map_err(|error| match error {
+            ActorError::Closed | ActorError::Shutdown => ManagerError::NonLiveAgent(agent_id),
+            _ => ManagerError::BusySubtree(agent_id),
+        })?;
+        Ok(IdleSubtreeGuard { agent_id, root })
     }
 
     /// Live descendants stay registered after their turn (e.g. background
