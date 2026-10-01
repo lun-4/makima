@@ -116,13 +116,7 @@ impl Runner {
                     .state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                let work = if state.idle_reserved {
-                    state
-                        .idle_permission
-                        .and_then(|turn_id| self.queue.remove_turn(turn_id).map(ActorWork::Turn))
-                } else {
-                    self.queue.pop()
-                };
+                let work = state.pop_work(&self.queue);
                 state.processing = work.as_ref().map(ProcessingWork::new);
                 work.map(|work| (work, state.cancellation_generation))
             };

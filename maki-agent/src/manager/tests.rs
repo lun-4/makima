@@ -471,7 +471,7 @@ fn queued_only_correlation_cancel_does_not_precancel_later_work() {
 }
 
 #[test]
-fn idle_guard_allows_only_approved_turn_until_drop() {
+fn idle_guard_releases_reservation_when_approved_turn_starts() {
     smol::block_on(async {
         const LATER: &str = "later";
         const APPROVED: &str = "approved";
@@ -489,15 +489,66 @@ fn idle_guard_allows_only_approved_turn_until_drop() {
             entered_rx.recv_async().await.unwrap().turn_id(),
             approved.turn_id()
         );
-        approved.wait().await;
-        assert!(entered_rx.is_empty());
-        drop(guard);
         assert_eq!(
             entered_rx.recv_async().await.unwrap().turn_id(),
             later.turn_id()
         );
         later.wait().await;
-        manager.shutdown(std::time::Duration::from_secs(1)).await;
+        let next = manager.prepare_idle_subtree(root.id()).unwrap();
+        drop(guard);
+        assert!(matches!(
+            manager.prepare_idle_subtree(root.id()),
+            Err(ManagerError::BusySubtree(_))
+        ));
+        drop(next);
+        manager.shutdown(Duration::from_secs(1)).await;
+    });
+}
+
+#[test_case(true; "cancelled_after_permission")]
+#[test_case(false; "cancelled_before_permission")]
+fn idle_guard_permission_for_retired_turn_does_not_hold_actor(permitted_first: bool) {
+    smol::block_on(async {
+        const LATER: &str = "later";
+        const APPROVED: &str = "approved";
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (start_tx, start_rx) = flume::bounded(1);
+        let (entered_tx, entered_rx) = flume::unbounded();
+        let root = manager
+            .create_root_deferred_with_config(
+                None,
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::reporting(entered_tx, None)),
+                start_rx,
+            )
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let guard = manager.prepare_idle_subtree(root.id()).unwrap();
+        let approved = actor.admit_turn(input(), None, APPROVED.into()).unwrap();
+        let later = actor.admit_turn(input(), None, LATER.into()).unwrap();
+        if permitted_first {
+            guard.allow_turn(&approved).unwrap();
+            actor.cancel_turn(approved.turn_id()).unwrap();
+        } else {
+            actor.cancel_turn(approved.turn_id()).unwrap();
+            assert!(matches!(
+                guard.allow_turn(&approved),
+                Err(ManagerError::Policy(_))
+            ));
+            drop(guard);
+        }
+        start_tx.send(()).unwrap();
+        assert_eq!(
+            entered_rx.recv_async().await.unwrap().turn_id(),
+            later.turn_id()
+        );
+        later.wait().await;
+        assert!(matches!(
+            approved.wait().await,
+            TurnOutcome::Cancelled { .. }
+        ));
+        manager.shutdown(Duration::from_secs(1)).await;
     });
 }
 

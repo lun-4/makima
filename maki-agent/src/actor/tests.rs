@@ -1111,6 +1111,63 @@ fn root_folds_into_active_turn_with_no_orphan() {
 }
 
 #[test]
+fn permitted_idle_turn_folds_interrupts_like_any_turn() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let guard = handle.prepare_idle().unwrap();
+        let approved = handle
+            .admit_turn(input("approved"), None, "approved".into())
+            .unwrap();
+        guard.allow_turn(&approved).unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) > 0).await;
+        handle
+            .rush(RootWork::new(
+                input("fold-me"),
+                1,
+                false,
+                "fold-me".into(),
+                Vec::new(),
+                "r1".into(),
+            ))
+            .unwrap();
+        gate.open();
+        approved.wait().await;
+        assert_eq!(state.folds.lock().unwrap().as_slice(), ["fold-me"]);
+        assert_eq!(state.runs.lock().unwrap().len(), 1);
+        drop(guard);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn permitted_idle_turn_without_outcome_does_not_hold_actor() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        *backend.outcomes.lock().unwrap() = vec![BackendResult::ControlDone];
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let guard = handle.prepare_idle().unwrap();
+        let approved = handle
+            .admit_turn(input("approved"), None, "approved".into())
+            .unwrap();
+        let later = handle
+            .admit_turn(input("later"), None, "later".into())
+            .unwrap();
+        guard.allow_turn(&approved).unwrap();
+        assert!(matches!(later.wait().await, TurnOutcome::Completed { .. }));
+        assert!(approved.peek().is_none());
+        assert_eq!(state.entered.load(Ordering::SeqCst), 2);
+        drop(guard);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn idle_root_start_preserves_metadata_to_backend() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();

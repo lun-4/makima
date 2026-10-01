@@ -19,6 +19,7 @@ mod config;
 pub use config::{ConfigChange, ConfigCommit, ConfigPatch, PreparedModel};
 mod idle;
 pub use idle::ActorIdleGuard;
+use idle::IdleReservation;
 mod prepared;
 pub use prepared::{PreparedCommit, PreparedOperationTicket, PreparedTurn};
 mod queue;
@@ -140,8 +141,7 @@ pub(crate) struct ActorState {
     pub(crate) status: ActorStatus,
     pub(crate) active: Option<ActiveCancel>,
     pub(crate) processing: Option<ProcessingWork>,
-    idle_reserved: bool,
-    idle_permission: Option<TurnId>,
+    idle: Option<IdleReservation>,
     pub(crate) cancelled_correlations: HashMap<String, TurnCancellationReason>,
     pub(crate) cancelled_turns: HashSet<TurnId>,
     pub(crate) cancellation_generation: u64,
@@ -613,8 +613,7 @@ impl ActorState {
             status: ActorStatus::Idle,
             active: None,
             processing: None,
-            idle_reserved: false,
-            idle_permission: None,
+            idle: None,
             cancelled_correlations: HashMap::new(),
             cancelled_turns: HashSet::new(),
             cancellation_generation: 0,
@@ -683,6 +682,9 @@ pub(crate) fn retire_turn(inner: &ActorInner, turn_id: TurnId, outcome: &TurnOut
     let mut tickets = inner.tickets.lock().unwrap_or_else(|e| e.into_inner());
     vacant.insert(outcome.clone());
     state.cancelled_turns.remove(&turn_id);
+    if state.release_idle_permission(turn_id) {
+        inner.queue.notify();
+    }
     tickets.remove(&turn_id);
     drop(tickets);
     drop(state);

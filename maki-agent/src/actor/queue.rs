@@ -362,7 +362,7 @@ impl InterruptQueue {
 impl crate::InterruptSource for InterruptQueue {
     fn poll(&self) -> Option<ExtractedCommand> {
         let state = lock(&self.inner.state);
-        (!state.idle_reserved && state.cancellation_generation == self.cancellation_generation)
+        (state.cancellation_generation == self.cancellation_generation)
             .then(|| {
                 self.inner
                     .queue
