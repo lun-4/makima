@@ -663,7 +663,11 @@ fn correlation_cancel_cut_prevents_late_managed_registration_before_trigger(
 ) {
     const CORRELATION: &str = "cancel-before-registration";
     const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
-    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let manager = AgentManagerHandle::new(AgentLimits {
+        max_concurrent_agent_turns: 1,
+        ..AgentLimits::default()
+    })
+    .unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
     let root = manager
         .create_root(Vec::new(), None, TestBackend::reporting(entered_tx, None))
@@ -688,6 +692,7 @@ fn correlation_cancel_cut_prevents_late_managed_registration_before_trigger(
     *manager.0.managed_registration_rejected.lock().unwrap() = Some(rejected_tx);
     acquire_release_tx.send(()).unwrap();
     let rejected = rejected_rx.recv_timeout(COMPLETION_TIMEOUT);
+    assert!(manager.0.limiter.try_acquire().is_some());
     assert!(actor.inner.state.try_lock().is_ok());
     assert!(manager.0.graph.try_lock().is_ok());
     assert!(ticket.peek().is_none());

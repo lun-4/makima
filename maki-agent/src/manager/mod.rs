@@ -1859,6 +1859,7 @@ pub(crate) async fn enter_managed_turn(
         registered
     };
     if !registered {
+        drop(permit);
         #[cfg(test)]
         if let Some(rejected) = inner
             .managed_registration_rejected
