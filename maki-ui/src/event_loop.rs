@@ -101,7 +101,7 @@ use crate::theme::ThemesProvider;
 
 mod approval;
 
-use approval::{PendingPlanApproval, PreparedPlanApproval};
+use approval::{ApprovalStep, PendingPlanApproval};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
@@ -1755,7 +1755,7 @@ enum InternalEvent {
         session: MakiId,
         runtime: Arc<()>,
         request: Arc<()>,
-        result: Result<Box<PreparedPlanApproval>, String>,
+        result: Result<ApprovalStep, String>,
     },
     SessionHeartbeat(u64),
 }
@@ -2307,7 +2307,7 @@ impl<'t> EventLoop<'t> {
                             .as_ref()
                             .is_some_and(|pending| Arc::ptr_eq(&pending.identity, &request))
                 }) {
-                    self.complete_plan_approval(idx, result.map(|prepared| *prepared));
+                    self.complete_plan_approval(idx, result);
                 }
             }
             InternalEvent::ModelCandidate {
@@ -2581,12 +2581,12 @@ impl<'t> EventLoop<'t> {
                 complete_runtime_heartbeat(rt);
             }
             if !matches!(rt.session_lock, Some(SessionLockState::InFlight(_)))
-                && let Some(prepared) = rt
+                && let Some(step) = rt
                     .pending_approval
                     .as_mut()
                     .and_then(|pending| pending.waiting_for_lock.take())
             {
-                approvals.push((i, prepared));
+                approvals.push((i, step));
             }
             while let Ok(commit) = rt.config_commits.try_recv() {
                 if rt.project_config(&commit) {
@@ -2602,8 +2602,8 @@ impl<'t> EventLoop<'t> {
         for (i, actions) in login_actions {
             self.dispatch(i, actions);
         }
-        for (i, prepared) in approvals {
-            self.complete_plan_approval(i, Ok(*prepared));
+        for (i, step) in approvals {
+            self.complete_plan_approval(i, Ok(step));
             dirty = Dirty::YES;
         }
         dirty

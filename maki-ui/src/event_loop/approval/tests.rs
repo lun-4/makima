@@ -29,6 +29,7 @@ use super::super::{
     EventLoop, InternalEvent, PreparedProvider, Wake, bounded_session_op, prepare_coordinator,
     start_runtime_heartbeat_with,
 };
+use super::ApprovalStep;
 use crate::AppSession;
 use crate::components::{Action, Status};
 use crate::storage_writer::StorageWriter;
@@ -593,9 +594,8 @@ fn final_ready(
         assert!(requests.is_empty());
         match &ready {
             InternalEvent::PlanApprovalReady {
-                result: Ok(prepared),
-                ..
-            } if !fresh || prepared.candidate.is_some() => {
+                result: Ok(step), ..
+            } if !fresh || matches!(step, ApprovalStep::Fresh(_)) => {
                 return ready;
             }
             InternalEvent::PlanApprovalReady {
@@ -963,23 +963,18 @@ fn fresh_activation_failure_releases_candidate_resources() {
         approve(event_loop, index, &path, true);
         let ready = final_ready(event_loop, true, &requests);
         let InternalEvent::PlanApprovalReady {
-            result: Ok(prepared),
-            ..
+            result: Ok(step), ..
         } = &ready
         else {
             panic!("expected prepared candidate");
         };
-        let candidate = prepared.candidate.as_ref().unwrap();
+        let ApprovalStep::Fresh(fresh) = step else {
+            panic!("expected fresh step");
+        };
+        let candidate = &fresh.candidate;
         let target = candidate.app.session_id();
         let (manager, root) = candidate.handles.manager_and_root();
-        let ticket = prepared
-            .candidate_commit
-            .as_ref()
-            .unwrap()
-            .ticket
-            .as_ref()
-            .unwrap()
-            .clone();
+        let ticket = fresh.ticket.clone();
         let duplicate = prepare_coordinator(
             &event_loop.ctx.coordinator_deps(),
             &candidate.app.app.state.session,
@@ -1243,9 +1238,9 @@ fn fresh_uses_finalized_history_and_captured_absolute_path() {
         approve(event_loop, index, &relative, true);
         let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {
-            result: Ok(prepared),
-            ..
+            result: Ok(step), ..
         } = &ready
+            && let ApprovalStep::Captured(prepared) = step
         {
             assert_eq!(prepared.source.snapshot().cwd(), cwd);
             assert_eq!(

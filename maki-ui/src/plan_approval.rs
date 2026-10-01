@@ -13,6 +13,7 @@ pub(crate) const APPROVAL_BUSY: &str =
     "Planning work is still running or queued. Retry approval when it finishes.";
 pub(crate) const APPROVAL_CHANGED: &str =
     "The plan or session changed while preparing implementation. Retry approval.";
+pub(crate) const APPROVAL_CANCELLED: &str = "Implementation preparation cancelled.";
 
 pub(crate) struct ApprovedPlan {
     pub(crate) path: PathBuf,
