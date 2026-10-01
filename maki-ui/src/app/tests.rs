@@ -6074,12 +6074,20 @@ fn open_session_model_picker_keeps_keys_when_plan_form_appears() {
     assert!(app.plan_form.is_visible());
 }
 
-#[test_case("permission" ; "permission")]
-#[test_case("question" ; "question")]
-#[test_case("help" ; "help")]
-#[test_case("btw" ; "btw")]
-#[test_case("float" ; "float")]
-fn plan_picker_yields_to_blocking_overlay(surface: &str) {
+enum BlockingSurface {
+    Permission,
+    Question,
+    Help,
+    Btw,
+    Float,
+}
+
+#[test_case(BlockingSurface::Permission ; "permission")]
+#[test_case(BlockingSurface::Question ; "question")]
+#[test_case(BlockingSurface::Help ; "help")]
+#[test_case(BlockingSurface::Btw ; "btw")]
+#[test_case(BlockingSurface::Float ; "float")]
+fn plan_picker_yields_to_blocking_overlay(surface: BlockingSurface) {
     const MODEL: &str = "zai/glm-5";
     let (mut app, models) = app_with_model_slot();
     models.store(Some(Arc::new(vec![MODEL.into()])));
@@ -6090,8 +6098,9 @@ fn plan_picker_yields_to_blocking_overlay(surface: &str) {
     let (_btw_tx, btw_rx) = flume::bounded(1);
     let (event_tx, event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
     let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let forwards_to_float = matches!(surface, BlockingSurface::Question | BlockingSurface::Float);
     match surface {
-        "permission" => {
+        BlockingSurface::Permission => {
             app.permission_prompt.open(
                 "permission".into(),
                 maki_config::ToolKey::native("bash"),
@@ -6100,11 +6109,12 @@ fn plan_picker_yields_to_blocking_overlay(surface: &str) {
             );
             app.active_input = Some(InputKind::Permission);
         }
-        "help" => app.help_modal.toggle(),
-        "btw" => app.btw_modal.open("question", btw_rx),
-        _ => {
+        BlockingSurface::Help => app.help_modal.toggle(),
+        BlockingSurface::Btw => app.btw_modal.open("question", btw_rx),
+        BlockingSurface::Question | BlockingSurface::Float => {
+            let question = matches!(surface, BlockingSurface::Question);
             let config = maki_lua::FloatConfig {
-                needs_input: surface == "question",
+                needs_input: question,
                 ..maki_lua::FloatConfig::default()
             };
             app.float_mgr.open(
@@ -6114,7 +6124,7 @@ fn plan_picker_yields_to_blocking_overlay(surface: &str) {
                 event_tx,
                 cmd_rx,
             );
-            if surface == "question" {
+            if question {
                 app.active_input = Some(InputKind::Question);
             }
         }
@@ -6126,7 +6136,7 @@ fn plan_picker_yields_to_blocking_overlay(surface: &str) {
     app.route_paste("no-such-model");
     assert!(app.model_picker.is_open());
     assert_eq!(app.plan_form.implementation_model(), None);
-    if surface == "question" || surface == "float" {
+    if forwards_to_float {
         assert!(event_rx.try_recv().is_ok());
     }
     app.help_modal.close();
@@ -6249,6 +6259,21 @@ fn plan_form_renders_effective_implementation_model(staged: bool) {
     assert_eq!(height, initial_height + u16::from(staged));
     let (_, bottom, _, _, _) = app.layout_geometry(RENDER_AREA);
     assert_eq!(bottom.height, height);
+}
+
+#[test]
+fn use_current_model_row_clears_staged_model() {
+    let mut app = plan_app();
+    app.plan_form
+        .set_implementation_model(LATE_MODEL_SPEC.into(), &app.state.model.spec());
+    for _ in 0..4 {
+        app.update(Msg::Key(key(KeyCode::Down)));
+    }
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert_eq!(app.plan_form.implementation_model(), None);
+    let rows = rendered_area(&mut app).join("\n");
+    assert!(rows.contains("▸ Implementation model:"));
+    assert!(!rows.contains("Use current model"));
 }
 
 #[test]

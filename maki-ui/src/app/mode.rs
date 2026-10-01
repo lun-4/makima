@@ -10,7 +10,7 @@ use maki_storage::StateDir;
 use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
 
-use super::App;
+use super::{App, ModelPickerPurpose};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -160,9 +160,9 @@ impl App {
         if self.state.mode == Mode::Plan && id != "plan" {
             self.plan_form.reset();
             self.plan_approval_pending = false;
-            if self.model_picker_purpose == super::ModelPickerPurpose::PlanImplementation {
+            if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
                 self.model_picker.close();
-                self.model_picker_purpose = super::ModelPickerPurpose::Session;
+                self.model_picker_purpose = ModelPickerPurpose::Session;
             }
         }
         self.file_completion.close();
