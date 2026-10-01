@@ -107,6 +107,29 @@ impl SessionRuntime {
         }
     }
 
+    /// Shared tail of both approval commit paths: record the implementation
+    /// run, install the approved turn under its idle guard, and remember the
+    /// committed model.
+    fn record_approved_implementation(
+        &mut self,
+        request: &PlanApprovalRequest,
+        plan: ApprovedPlan,
+        idle: ActorIdleGuard,
+        ticket: Option<TurnTicket>,
+        model: &str,
+    ) {
+        self.app.record_plan_implementation(
+            request.run_id,
+            plan.content,
+            plan.path.display().to_string(),
+            plan.message,
+        );
+        if let Some(ticket) = ticket {
+            self.approved_turn = Some((idle, ticket));
+        }
+        self.app.record_recent_model(model);
+    }
+
     fn abort_plan_approval(&mut self, message: String) {
         self.end_plan_approval();
         self.app.flash(message);
@@ -195,27 +218,24 @@ impl EventLoop<'_> {
         };
         runtime.project_config(&commit.config);
         runtime.reset_run_notifications();
-        runtime.app.record_plan_implementation(
-            request.run_id,
-            plan.content,
-            plan.path.display().to_string(),
-            plan.message,
-        );
-        if let Some(ticket) = commit.ticket {
-            if let Err(error) = idle.allow_turn(&ticket) {
-                let (manager, root) = runtime.handles.manager_and_root();
-                if let Ok(actor) = manager.actor(root) {
-                    let _ = actor.cancel_turn(ticket.turn_id());
-                }
-                runtime.app.flash(unavailable_message(error));
+        if let Some(ticket) = &commit.ticket
+            && let Err(error) = idle.allow_turn(ticket)
+        {
+            let (manager, root) = runtime.handles.manager_and_root();
+            if let Ok(actor) = manager.actor(root) {
+                let _ = actor.cancel_turn(ticket.turn_id());
             }
-            runtime.approved_turn = Some((idle, ticket));
+            runtime.app.flash(unavailable_message(error));
         }
+        runtime.record_approved_implementation(
+            &request,
+            plan,
+            idle,
+            commit.ticket,
+            &commit.config.config.model.spec(),
+        );
         runtime.pending_approval.take();
         drop(source);
-        runtime
-            .app
-            .record_recent_model(&commit.config.config.model.spec());
     }
 
     fn activate_fresh_plan_approval(&mut self, idx: usize, fresh: FreshPlanApproval) {
@@ -273,14 +293,13 @@ impl EventLoop<'_> {
             Arc::clone(&config.config.settings.provider),
         );
         next.project_config(&config);
-        next.app.record_plan_implementation(
-            request.run_id,
-            plan.content,
-            plan.path.display().to_string(),
-            plan.message,
+        next.record_approved_implementation(
+            &request,
+            plan,
+            idle,
+            Some(ticket),
+            &config.config.model.spec(),
         );
-        next.approved_turn = Some((idle, ticket));
-        next.app.record_recent_model(&config.config.model.spec());
         let identity = next.handles.identity();
         let retire = self.retire_runtime(idx, old, (operation, source, source_idle));
         let internal_tx = self.internal_tx.clone();
