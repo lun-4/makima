@@ -38,6 +38,8 @@ The `Implementation model` row shows the model that will do the work. It starts 
 
 Approval needs planning work to be finished. If the agent or one of its subagents is still running, Makima asks you to try again later and leaves that work running. While approval is getting ready, the form is locked. Esc cancels it and gives you the form back as it was.
 
+Approval is strict about the handoff turn's setup. If collecting prompt slots fails, say because a plugin stopped, the implementation cannot start and you get the form back. A turn you send yourself in that situation keeps going with default slots and a warning in the log, because planning should not lose its turn to a broken plugin.
+
 After approval, the picked model becomes the session model and the agent starts implementing. The agent gets the plan text as it was at approval, so later edits to the file do not change the task. Cancelling from here stops the implementation like any other turn. It does not bring back the planning session or the old model.
 
 ## Configuration changes

@@ -557,6 +557,12 @@ async fn resolve_prompt_slots(
 async fn prepare_prompt_inputs(
     mut snapshot: maki_agent::agent::TurnAdmissionSnapshot,
 ) -> Result<maki_agent::agent::TurnAdmissionSnapshot, maki_agent::actor::ActorError> {
+    // Only prepared (approval) admissions run through this readiness check,
+    // and they fail fast on prompt-slot errors. Ordinary turns instead fall
+    // back to default slots with a warning in `prepare_run`, because a
+    // planning session should not lose its turn to a broken Lua plugin, while
+    // an implementation handoff must not silently start with wrong prompt
+    // slots.
     if let Some(prompt) = snapshot.prompt_inputs.as_mut() {
         let prompt = Arc::make_mut(prompt);
         if prompt.ready.is_none()
