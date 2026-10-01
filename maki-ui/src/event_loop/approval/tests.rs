@@ -70,7 +70,12 @@ const AUTOCMD: &str = r#"
         modes = modes + 1
         maki.api.register_command({ name = "/approval-mode-" .. tostring(modes), description = "observed", tui_only = false, handler = function() end })
     end })
+    maki.api.create_autocmd("SessionReset", { callback = function(ev)
+        maki.api.register_command({ name = "/approval-reset", description = ev.data.session_id, tui_only = false, handler = function() end })
+    end })
 "#;
+const RESET_COMMAND: &str = "/approval-reset";
+const DRAFT: &str = "draft typed before approval";
 
 type RecordedRequest = (String, RequestOptions, Vec<Message>, String);
 
@@ -696,6 +701,58 @@ fn fresh_forgets_retired_cache_but_preserves_saved_source() {
                 .any(|message| message.user_text() == Some(HISTORY))
         );
         assert_eq!(restored.model, SOURCE_MODEL);
+    });
+}
+
+#[test]
+fn fresh_retires_outgoing_session_like_a_reset() {
+    with_event_loop(|event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        let source = event_loop.sessions[index].id();
+        event_loop.sessions[index]
+            .app
+            .input_box
+            .set_input(DRAFT.into());
+        approve(event_loop, index, &path, true);
+        let ready = final_ready(event_loop, true, &requests);
+        event_loop.handle_internal(ready);
+        session_lock::claim(&event_loop.sessions_dir, &source)
+            .unwrap()
+            .expect("outgoing lock is released at the swap")
+            .release()
+            .unwrap();
+        pump_until(event_loop, |event_loop| {
+            event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
+                && event_loop.sessions[index].app.status == Status::Idle
+        });
+        requests.recv_timeout(WAIT).unwrap();
+        let app = &event_loop.sessions[index].app;
+        smol::block_on(app.lua_event_handle.collect_prompt_slots_async());
+        let commands = event_loop
+            .ctx
+            .command_runtime
+            .registry
+            .snapshot_for(&app.command_target)
+            .unwrap();
+        let reset = commands
+            .commands()
+            .iter()
+            .find(|command| command.spec().name.as_ref() == RESET_COMMAND)
+            .expect("SessionReset did not fire for the retired session");
+        assert_eq!(reset.spec().docs.summary.as_ref(), source.to_string());
+        let deadline = Instant::now() + WAIT;
+        while AppSession::load(source, &event_loop.ctx.storage)
+            .ok()
+            .and_then(|session| session.meta.input_draft)
+            .as_deref()
+            != Some(DRAFT)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "outgoing draft was not checkpointed"
+            );
+            std::thread::yield_now();
+        }
     });
 }
 

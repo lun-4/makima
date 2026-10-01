@@ -1119,6 +1119,37 @@ fn ensure_replacement_lock_available(
     }
 }
 
+/// Activates `prepared` in place of `current` and hands back the outgoing
+/// runtime. A deferred runner stays parked until the caller releases it. On
+/// failure `current` is untouched and the target lock is returned.
+fn swap_session_runtime(
+    current: &mut SessionRuntime,
+    prepared: PreparedSessionRuntime,
+    target_lock: Option<SessionLockState>,
+    model_slot: &ProviderSlot,
+    defer_runner: bool,
+) -> std::result::Result<SessionRuntime, (String, Option<SessionLockState>)> {
+    let seed_snapshot = prepared.seed_snapshot.clone();
+    let mut runtime = prepared
+        .activate_replacing(model_slot, target_lock, &current.coordinator)
+        .map_err(|(error, target_lock)| (error.to_string(), target_lock))?;
+    if let Some((writer, session)) = seed_snapshot {
+        writer.seed(session);
+    }
+    runtime.app.exit_on_done = current.app.exit_on_done;
+    runtime
+        .app
+        .input_box
+        .replace_history_from(&mut current.app.input_box);
+    runtime.approval_runner_pending = defer_runner;
+    let old = std::mem::replace(current, runtime);
+    old.app
+        .command_runtime
+        .finish_theme_preview(old.app.command_target.id(), false);
+    current.activate_deferred();
+    Ok(old)
+}
+
 fn replace_session_runtime(
     current: &mut SessionRuntime,
     prepared: PreparedSessionRuntime,
@@ -1126,7 +1157,6 @@ fn replace_session_runtime(
     model_slot: &ProviderSlot,
 ) -> Result<SessionRuntime, String> {
     let target_id = prepared.app.session_id();
-    let exit_on_done = current.app.exit_on_done;
     let same_id = current.id() == target_id;
     if current.lock_lost {
         return Err(LOCK_LOST_REPLACEMENT_ERR.into());
@@ -1144,33 +1174,17 @@ fn replace_session_runtime(
             claim_lock(sessions_dir, &target_id).map_err(|error| error.to_string())?,
         ))
     };
-    let seed_snapshot = prepared.seed_snapshot.clone();
-    let mut runtime =
-        match prepared.activate_replacing(model_slot, target_lock, &current.coordinator) {
-            Ok(runtime) => runtime,
-            Err((error, target_lock)) => {
-                if same_id {
-                    current.session_lock = target_lock;
-                } else if let Err(release_error) = release_lock_state(target_lock) {
-                    warn!(%release_error, "replacement lock release failed after activation error");
-                }
-                return Err(error.to_string());
+    match swap_session_runtime(current, prepared, target_lock, model_slot, false) {
+        Ok(old) => Ok(old),
+        Err((error, target_lock)) => {
+            if same_id {
+                current.session_lock = target_lock;
+            } else if let Err(release_error) = release_lock_state(target_lock) {
+                warn!(%release_error, "replacement lock release failed after activation error");
             }
-        };
-    if let Some((writer, session)) = seed_snapshot {
-        writer.seed(session);
+            Err(error)
+        }
     }
-    runtime.app.exit_on_done = exit_on_done;
-    runtime
-        .app
-        .input_box
-        .replace_history_from(&mut current.app.input_box);
-    let old = std::mem::replace(current, runtime);
-    old.app
-        .command_runtime
-        .finish_theme_preview(old.app.command_target.id(), false);
-    current.activate_deferred();
-    Ok(old)
 }
 
 impl SessionRuntime {
@@ -3651,6 +3665,19 @@ impl<'t> EventLoop<'t> {
                 return Err(error);
             }
         };
+        smol::spawn(self.retire_runtime(idx, old, ())).detach();
+        Ok(())
+    }
+
+    /// Releases the outgoing session's lock now. The returned future shuts
+    /// its agents down, then drops `held`, then closes a replaced session's
+    /// coordinator and forgets its cached snapshot.
+    fn retire_runtime(
+        &self,
+        idx: usize,
+        old: SessionRuntime,
+        held: impl Send + 'static,
+    ) -> impl Future<Output = ()> + Send + 'static {
         let SessionRuntime {
             app,
             handles,
@@ -3664,16 +3691,23 @@ impl<'t> EventLoop<'t> {
             warn!(%error, "old session lock release failed");
         }
         drop(app);
-        handles.shutdown().detach();
-        if replaced_session {
-            let storage_writer = Arc::clone(&self.ctx.storage_writer);
-            smol::spawn(async move {
+        let shutdown = handles.shutdown();
+        let storage_writer = Arc::clone(&self.ctx.storage_writer);
+        async move {
+            shutdown.await;
+            drop(held);
+            if replaced_session {
                 let _ = coordinator.close().await;
                 storage_writer.forget(retired_id);
-            })
-            .detach();
+            }
         }
-        Ok(())
+    }
+
+    fn fire_session_reset(&self, idx: usize, ended_id: MakiId) {
+        self.sessions[idx]
+            .app
+            .lua_event_handle
+            .fire_autocmd("SessionReset", json!({ "session_id": ended_id }));
     }
 
     fn prepare_replacement(
@@ -3701,10 +3735,7 @@ impl<'t> EventLoop<'t> {
         match self.replace_prepared_runtime(idx, prepared) {
             Ok(()) => {
                 if let SessionReplacementKind::Reset { ended_id } = kind {
-                    self.sessions[idx].app.lua_event_handle.fire_autocmd(
-                        "SessionReset",
-                        serde_json::json!({ "session_id": ended_id }),
-                    );
+                    self.fire_session_reset(idx, ended_id);
                 }
             }
             Err(error) => self.sessions[idx].app.flash(error),

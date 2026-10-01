@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,6 +17,7 @@ use super::LockPrepareGate;
 use super::{
     EventLoop, InternalEvent, PreparedProvider, PreparedSessionRuntime, SESSION_OP_TIMEOUT,
     SessionLockState, SessionRuntime, SpawnCtx, bounded_session_op, claim_lock, release_lock_state,
+    swap_session_runtime,
 };
 use crate::AppSession;
 use crate::agent::shared_queue::correlation;
@@ -246,10 +246,10 @@ impl EventLoop<'_> {
             idle,
             lock,
         } = fresh;
-        if ticket.peek().is_some() {
-            return self.sessions[idx].abort_plan_approval(APPROVAL_CHANGED.into());
-        }
         let runtime = &mut self.sessions[idx];
+        if ticket.peek().is_some() {
+            return runtime.abort_plan_approval(APPROVAL_CHANGED.into());
+        }
         let target = candidate.app.session_id();
         if let Some((_, session)) = candidate.seed_snapshot.as_mut() {
             let session = Arc::make_mut(session);
@@ -261,33 +261,24 @@ impl EventLoop<'_> {
             session.meta.plan_path = None;
             session.meta.plan_written = false;
         }
-        let seed = candidate.seed_snapshot.clone();
+        runtime.app.checkpoint_now();
         let candidate_slot = Arc::clone(&candidate.model_slot);
-        let mut next = match candidate.activate_replacing(
-            &candidate_slot,
+        let old = match swap_session_runtime(
+            runtime,
+            candidate,
             Some(SessionLockState::Held(lock)),
-            &runtime.coordinator,
+            &candidate_slot,
+            true,
         ) {
-            Ok(next) => next,
+            Ok(old) => old,
             Err((error, lock)) => {
                 if let Err(release_error) = release_lock_state(lock) {
                     warn!(%release_error, "approval candidate lock release failed");
                 }
-                return runtime.abort_plan_approval(error.to_string());
+                return runtime.abort_plan_approval(error);
             }
         };
-        if let Some((writer, session)) = seed {
-            writer.seed(session);
-        }
-        next.model_slot.project(
-            config.config.model.clone(),
-            Arc::clone(&config.config.settings.provider),
-        );
-        next.project_config(&config);
-        next.app.exit_on_done = runtime.app.exit_on_done;
-        next.app
-            .input_box
-            .replace_history_from(&mut runtime.app.input_box);
+        let ended_id = old.id();
         let PreparedPlanApproval {
             request,
             plan,
@@ -295,6 +286,12 @@ impl EventLoop<'_> {
             source,
             idle: source_idle,
         } = source;
+        let next = &mut self.sessions[idx];
+        next.model_slot.project(
+            config.config.model.clone(),
+            Arc::clone(&config.config.settings.provider),
+        );
+        next.project_config(&config);
         next.app.record_plan_implementation(
             request.run_id,
             plan.content,
@@ -302,35 +299,19 @@ impl EventLoop<'_> {
             plan.message,
         );
         next.approved_turn = Some((idle, ticket));
-        next.approval_runner_pending = true;
         next.app.record_recent_model(&config.config.model.spec());
-        let old = std::mem::replace(runtime, next);
-        let retired_id = old.id();
-        let storage_writer = Arc::clone(&self.ctx.storage_writer);
-        let identity = runtime.handles.identity();
+        let identity = next.handles.identity();
+        let retire = self.retire_runtime(idx, old, (operation, source, source_idle));
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
-            let SessionRuntime {
-                handles,
-                coordinator,
-                session_lock,
-                ..
-            } = old;
-            handles.shutdown().await;
-            if let Err(error) = smol::unblock(move || release_lock_state(session_lock)).await {
-                warn!(%error, "outgoing approval session lock release failed");
-            }
-            drop(operation);
-            drop(source);
-            drop(source_idle);
-            let _ = coordinator.close().await;
-            storage_writer.forget(retired_id);
+            retire.await;
             let _ = internal_tx.send(InternalEvent::ApprovalRunnerReady {
                 session: target,
                 runtime: identity,
             });
         })
         .detach();
+        self.fire_session_reset(idx, ended_id);
     }
 
     fn spawn_approval_step<F>(&mut self, idx: usize, step: F)
