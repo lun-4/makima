@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::actor::{ConfigChange, ConfigPatch, PreparedModel};
@@ -39,21 +39,6 @@ pub(crate) fn read_plan(path: PathBuf, parallel: bool) -> Result<ApprovedPlan, S
     })
 }
 
-impl ApprovedPlan {
-    pub(crate) fn verify(&self) -> Result<(), String> {
-        verify_plan(&self.path, &self.content)
-    }
-}
-
-pub(crate) fn verify_plan(path: &Path, approved: &str) -> Result<(), String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|error| format!("Could not reread plan {}: {error}", path.display()))?;
-    if content != approved {
-        return Err(APPROVAL_CHANGED.into());
-    }
-    Ok(())
-}
-
 pub(crate) fn prepare_change(
     spec: Option<String>,
     policy: &ModelPolicy,
@@ -82,7 +67,7 @@ pub(crate) fn prepare_change(
 
 #[cfg(test)]
 mod tests {
-    use super::{APPROVAL_CHANGED, PrepareProvider, prepare_change, read_plan};
+    use super::{PrepareProvider, prepare_change, read_plan};
     use maki_agent::actor::ConfigChange;
     use maki_agent::{ModeDef, ModeId};
     use maki_config::ModelPolicy;
@@ -90,12 +75,11 @@ mod tests {
     use std::sync::Arc;
 
     const PLAN: &str = "Implement the selected design.";
-    const CHANGED_PLAN: &str = "The operator revised the design.";
     const PROVIDER_ERROR: &str = "Provider preparation failed.";
 
     #[test_case::test_case(false; "sequential")]
     #[test_case::test_case(true; "parallel")]
-    fn captures_absolute_plan_content_and_checks_revision(parallel: bool) {
+    fn captures_absolute_plan_content(parallel: bool) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("plan.md");
         std::fs::write(&path, PLAN).unwrap();
@@ -104,9 +88,6 @@ mod tests {
         assert_eq!(plan.path, path);
         assert!(plan.message.contains(&path.display().to_string()));
         assert_eq!(plan.message.contains("batch+task"), parallel);
-        plan.verify().unwrap();
-        std::fs::write(path, CHANGED_PLAN).unwrap();
-        assert_eq!(plan.verify().unwrap_err(), APPROVAL_CHANGED);
     }
 
     #[test]

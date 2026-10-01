@@ -595,7 +595,7 @@ fn final_ready(
             InternalEvent::PlanApprovalReady {
                 result: Ok(prepared),
                 ..
-            } if prepared.content_verified && (!fresh || prepared.candidate.is_some()) => {
+            } if !fresh || prepared.candidate.is_some() => {
                 return ready;
             }
             InternalEvent::PlanApprovalReady {
@@ -1045,15 +1045,9 @@ fn fresh_activation_failure_releases_candidate_resources() {
 #[cfg(unix)]
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn cancel_releases_setter_before_final_read_returns(fresh: bool) {
+fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
-        approve(event_loop, index, &path, fresh);
-        let mut ready = next_ready(event_loop);
-        if fresh {
-            event_loop.handle_internal(ready);
-            ready = next_ready(event_loop);
-        }
         std::fs::remove_file(&path).unwrap();
         assert!(
             Command::new("mkfifo")
@@ -1074,7 +1068,7 @@ fn cancel_releases_setter_before_final_read_returns(fresh: bool) {
             gate.recv().unwrap();
             file.write_all(PLAN.as_bytes()).unwrap();
         });
-        event_loop.handle_internal(ready);
+        approve(event_loop, index, &path, fresh);
         entry.recv_timeout(WAIT).unwrap();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
@@ -1111,11 +1105,11 @@ fn cancel_releases_setter_before_final_read_returns(fresh: bool) {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn final_event_preserves_immutable_plan_input(fresh: bool) {
+fn captured_plan_survives_later_edits(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
         approve(event_loop, index, &path, fresh);
-        let ready = final_ready(event_loop, fresh, &requests);
+        let ready = next_ready(event_loop);
         const MUTATED: &str = "# Late edit\nDo not implement this changed revision.\n";
         std::fs::write(&path, MUTATED).unwrap();
         event_loop.handle_internal(ready);
@@ -1585,23 +1579,5 @@ fn busy_rejection_preserves_active_turn() {
             event_loop.sessions[index].app.status == Status::Idle
         });
         assert!(active_rx.is_empty());
-    });
-}
-
-#[test_case(false; "existing_context")]
-#[test_case(true; "fresh_context")]
-fn changed_plan_before_commit_preserves_session(fresh: bool) {
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        let run = event_loop.sessions[index].app.run_id;
-        approve(event_loop, index, &path, fresh);
-        let ready = next_ready(event_loop);
-        std::fs::write(&path, "# Changed plan\nDo not approve the old contents.\n").unwrap();
-        event_loop.handle_internal(ready);
-        pump_until(event_loop, |event_loop| {
-            !event_loop.sessions[index].app.plan_approval_pending
-        });
-        assert_preserved(event_loop, index, &path, run);
-        assert!(requests.is_empty());
     });
 }

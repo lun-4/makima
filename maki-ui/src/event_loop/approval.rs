@@ -38,7 +38,6 @@ pub(super) struct PreparedPlanApproval {
     candidate_commit: Option<maki_agent::actor::PreparedCommit>,
     candidate_idle: Option<maki_agent::manager::IdleSubtreeGuard>,
     candidate_lock: Option<ClaimedSessionLock>,
-    content_verified: bool,
 }
 
 struct PlanApprovalRequest {
@@ -102,10 +101,6 @@ impl EventLoop<'_> {
             self.prepare_fresh_plan_approval(idx, prepared);
             return;
         }
-        if !prepared.content_verified {
-            self.verify_plan_approval(idx, prepared);
-            return;
-        }
         if matches!(runtime.session_lock, Some(SessionLockState::InFlight(_))) {
             if let Some(pending) = runtime.pending_approval.as_mut() {
                 pending.waiting_for_lock = Some(Box::new(prepared));
@@ -122,7 +117,6 @@ impl EventLoop<'_> {
             candidate_commit,
             candidate_idle,
             candidate_lock,
-            content_verified: _,
         } = prepared;
         if let Some(mut candidate) = candidate {
             let target = candidate.app.session_id();
@@ -147,19 +141,15 @@ impl EventLoop<'_> {
                 );
                 return;
             };
-            let Some(ticket) = commit
+            if commit
                 .ticket
                 .as_ref()
-                .filter(|ticket| ticket.peek().is_none())
-            else {
+                .is_none_or(|ticket| ticket.peek().is_some())
+            {
                 self.complete_plan_approval(
                     idx,
                     Err(crate::plan_approval::APPROVAL_CHANGED.into()),
                 );
-                return;
-            };
-            if let Err(error) = candidate_idle.allow_turn(ticket) {
-                self.complete_plan_approval(idx, Err(error.to_string()));
                 return;
             }
             if let Some((_, session)) = candidate.seed_snapshot.as_mut() {
@@ -289,37 +279,6 @@ impl EventLoop<'_> {
         cancel
     }
 
-    fn verify_plan_approval(&mut self, idx: usize, mut prepared: PreparedPlanApproval) {
-        let cancel = self.advance_plan_approval(idx, &mut prepared);
-        let session = self.sessions[idx].id();
-        let runtime = self.sessions[idx].handles.identity();
-        let request = Arc::clone(&prepared.request.identity);
-        let internal_tx = self.internal_tx.clone();
-        smol::spawn(async move {
-            let result = cancel
-                .race(bounded_session_op(
-                    async move {
-                        let path = prepared.plan.path.clone();
-                        let content = prepared.plan.content.clone();
-                        smol::unblock(move || crate::plan_approval::verify_plan(&path, &content))
-                            .await?;
-                        prepared.content_verified = true;
-                        Ok(prepared)
-                    },
-                    SESSION_OP_TIMEOUT,
-                ))
-                .await
-                .unwrap_or_else(|_| Err("Implementation preparation cancelled.".into()));
-            let _ = internal_tx.send(InternalEvent::PlanApprovalReady {
-                session,
-                runtime,
-                request,
-                result: result.map(Box::new),
-            });
-        })
-        .detach();
-    }
-
     fn prepare_fresh_plan_approval(&mut self, idx: usize, mut prepared: PreparedPlanApproval) {
         let result = (|| -> Result<_, String> {
             let config = prepared
@@ -433,10 +392,6 @@ impl EventLoop<'_> {
                         #[cfg(test)]
                         let (lock, _guard) = lock;
                         prepared.candidate_lock = Some(lock?);
-                        let path = prepared.plan.path.clone();
-                        let content = prepared.plan.content.clone();
-                        smol::unblock(move || crate::plan_approval::verify_plan(&path, &content))
-                            .await?;
                         prepared.candidate_idle = Some(candidate_idle);
                         Ok(prepared)
                     },
@@ -593,11 +548,6 @@ impl EventLoop<'_> {
                             .wait_ready()
                             .await
                             .map_err(|error| error.to_string())?;
-                        let plan = smol::unblock(move || {
-                            plan.verify()?;
-                            Ok::<_, String>(plan)
-                        })
-                        .await?;
                         Ok(PreparedPlanApproval {
                             request,
                             plan,
@@ -608,7 +558,6 @@ impl EventLoop<'_> {
                             candidate_commit: None,
                             candidate_idle: None,
                             candidate_lock: None,
-                            content_verified: false,
                         })
                     },
                     SESSION_OP_TIMEOUT,
