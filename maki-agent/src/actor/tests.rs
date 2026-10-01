@@ -1168,6 +1168,37 @@ fn permitted_idle_turn_without_outcome_does_not_hold_actor() {
 }
 
 #[test]
+fn permitted_idle_turn_runs_ahead_of_earlier_queued_turn() {
+    smol::block_on(async {
+        const EARLIER: &str = "earlier";
+        const APPROVED: &str = "approved";
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let guard = handle.prepare_idle().unwrap();
+        let earlier = handle
+            .admit_turn(input(EARLIER), None, EARLIER.into())
+            .unwrap();
+        let approved = handle
+            .admit_turn(input(APPROVED), None, APPROVED.into())
+            .unwrap();
+        guard.allow_turn(&approved).unwrap();
+        earlier.wait().await;
+        let order: Vec<_> = state
+            .policies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(message, _, _)| message.clone())
+            .collect();
+        assert_eq!(order, [APPROVED, EARLIER]);
+        drop(guard);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn idle_root_start_preserves_metadata_to_backend() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
