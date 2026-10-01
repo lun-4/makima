@@ -18,7 +18,6 @@ pub struct PreparedTurn {
     pub correlation: String,
 }
 
-#[derive(Clone)]
 pub struct PreparedCommit {
     pub config: ConfigCommit,
     pub ticket: Option<TurnTicket>,
@@ -27,9 +26,9 @@ pub struct PreparedCommit {
 pub(super) struct PreparedOperation {
     pub id: u64,
     pub turn: Option<PreparedTurn>,
-    change: Option<Result<Option<ConfigChange>, ActorError>>,
+    change: Option<Option<ConfigChange>>,
     ready: Option<(Arc<EffectiveAgentConfig>, Option<TurnAdmissionSnapshot>)>,
-    pub(super) completion: Arc<Mutex<Option<Result<PreparedCommit, ActorError>>>>,
+    pub(super) failure: Arc<Mutex<Option<ActorError>>>,
     cancel: CancelToken,
     _trigger: CancelTrigger,
 }
@@ -37,7 +36,7 @@ pub(super) struct PreparedOperation {
 pub struct PreparedOperationTicket {
     inner: Arc<ActorInner>,
     id: u64,
-    completion: Arc<Mutex<Option<Result<PreparedCommit, ActorError>>>>,
+    failure: Arc<Mutex<Option<ActorError>>>,
 }
 
 impl AgentActorHandle {
@@ -57,7 +56,7 @@ impl AgentActorHandle {
         }
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let id = state.next_operation_id;
-        let completion = Arc::new(Mutex::new(None));
+        let failure = Arc::new(Mutex::new(None));
         let (trigger, cancel) = CancelToken::new();
         state
             .operations
@@ -66,14 +65,14 @@ impl AgentActorHandle {
                 turn,
                 change: None,
                 ready: None,
-                completion: Arc::clone(&completion),
+                failure: Arc::clone(&failure),
                 cancel,
                 _trigger: trigger,
             })));
         Ok(PreparedOperationTicket {
             inner: Arc::clone(&self.inner),
             id,
-            completion,
+            failure,
         })
     }
 }
@@ -87,10 +86,7 @@ impl PreparedOperationTicket {
         Ok(())
     }
 
-    pub fn resolve(
-        &self,
-        change: Result<Option<ConfigChange>, ActorError>,
-    ) -> Result<(), ActorError> {
+    pub fn resolve(&self, change: Option<ConfigChange>) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         self.unresolved(&mut state)?.change = Some(change);
         drive_operations(&self.inner, &mut state);
@@ -102,13 +98,8 @@ impl PreparedOperationTicket {
             let listener = self.inner.policy_changed.listen();
             {
                 let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(result) = self
-                    .completion
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-                {
-                    return result.map(|_| ());
+                if let Some(error) = self.failure() {
+                    return Err(error);
                 }
                 if state
                     .pending_prepared(self.id)
@@ -123,13 +114,8 @@ impl PreparedOperationTicket {
 
     pub fn ready_config(&self) -> Result<Arc<EffectiveAgentConfig>, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(result) = self
-            .completion
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return result.map(|commit| commit.config.config);
+        if let Some(error) = self.failure() {
+            return Err(error);
         }
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -141,22 +127,10 @@ impl PreparedOperationTicket {
             .ok_or(ActorError::PolicyPending)
     }
 
-    pub fn cancel(&self) -> Result<Option<PreparedCommit>, ActorError> {
-        self.retire(ActorError::PolicyCancelled)
-    }
-    pub fn expire(&self) -> Result<Option<PreparedCommit>, ActorError> {
-        self.retire(ActorError::ConfigExpired)
-    }
-
-    fn retire(&self, error: ActorError) -> Result<Option<PreparedCommit>, ActorError> {
+    pub fn cancel(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(result) = self
-            .completion
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return result.map(Some);
+        if self.failure().is_some() {
+            return;
         }
         if let Some(index) = state
             .operations
@@ -164,12 +138,11 @@ impl PreparedOperationTicket {
             .position(|entry| entry.id() == self.id)
         {
             if let Some(ActorOperation::Prepared(pending)) = state.operations.remove(index) {
-                pending.fail(error);
+                pending.fail(ActorError::PolicyCancelled);
             }
             drive_operations(&self.inner, &mut state);
             self.inner.policy_changed.notify(usize::MAX);
         }
-        Ok(None)
     }
 
     pub fn commit(self) -> Result<PreparedCommit, ActorError> {
@@ -177,13 +150,8 @@ impl PreparedOperationTicket {
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        if let Some(result) = self
-            .completion
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return result;
+        if let Some(error) = self.failure() {
+            return Err(error);
         }
         if !state.prepared_head_ready(self.id) {
             return Err(ActorError::PolicyPending);
@@ -231,7 +199,6 @@ impl PreparedOperationTicket {
             config: commit.clone(),
             ticket,
         };
-        *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(result.clone()));
         if changed {
             state
                 .config_observers
@@ -244,6 +211,13 @@ impl PreparedOperationTicket {
 }
 
 impl PreparedOperationTicket {
+    fn failure(&self) -> Option<ActorError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// The pending operation, while it still accepts its turn input or change.
     fn unresolved<'a>(
         &self,
@@ -283,16 +257,16 @@ impl ActorState {
 
 impl Drop for PreparedOperationTicket {
     fn drop(&mut self) {
-        let _ = self.cancel();
+        self.cancel();
     }
 }
 
 impl PreparedOperation {
     pub(super) fn fail(self, error: ActorError) {
-        self.completion
+        self.failure
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert(Err(error));
+            .get_or_insert(error);
     }
 }
 
@@ -306,15 +280,16 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
     let Some(change) = pending.change.take() else {
         return;
     };
-    let config = change.and_then(|change| {
-        let current = state.policy.as_ref().ok_or_else(|| {
-            ActorError::InvalidConfig("actor configuration is not initialized".into())
-        })?;
-        change.map_or_else(
-            || Ok(Arc::clone(current)),
-            |change| change.apply(current).map(Arc::new),
-        )
-    });
+    let config = state
+        .policy
+        .as_ref()
+        .ok_or_else(|| ActorError::InvalidConfig("actor configuration is not initialized".into()))
+        .and_then(|current| {
+            change.map_or_else(
+                || Ok(Arc::clone(current)),
+                |change| change.apply(current).map(Arc::new),
+            )
+        });
     let config = match config {
         Ok(config) => config,
         Err(error) => {

@@ -908,8 +908,7 @@ impl Drop for CoordinatorRetirement {
 struct SessionRuntime {
     generation: u64,
     config_commits: flume::Receiver<maki_agent::actor::ConfigCommit>,
-    projected_config_generation: u64,
-    config_projected: bool,
+    projected_config_generation: Option<u64>,
     app: App,
     handles: AgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -1018,8 +1017,7 @@ impl PreparedSessionRuntime {
         let mut runtime = SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: 0,
-            config_projected: false,
+            projected_config_generation: None,
             app,
             handles,
             model_slot,
@@ -1082,8 +1080,7 @@ impl PreparedSessionRuntime {
         let mut runtime = SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: 0,
-            config_projected: false,
+            projected_config_generation: None,
             app,
             handles,
             model_slot,
@@ -1193,12 +1190,13 @@ impl SessionRuntime {
             return false;
         };
         if !Arc::ptr_eq(&actor.identity(), &commit.identity)
-            || (self.config_projected && commit.generation <= self.projected_config_generation)
+            || self
+                .projected_config_generation
+                .is_some_and(|projected| commit.generation <= projected)
         {
             return false;
         }
-        self.projected_config_generation = commit.generation;
-        self.config_projected = true;
+        self.projected_config_generation = Some(commit.generation);
         project_actor_config(&mut self.app, &commit.config);
         true
     }
@@ -5474,14 +5472,14 @@ mod tests {
                 }
                 assert_eq!(
                     event_loop.sessions[0].projected_config_generation,
-                    latest.generation
+                    Some(latest.generation)
                 );
                 assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
                 queued_tx.send(older).unwrap();
                 let _ = event_loop.tick();
                 assert_eq!(
                     event_loop.sessions[0].projected_config_generation,
-                    latest.generation
+                    Some(latest.generation)
                 );
                 assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
                 assert!(event_loop.sessions[0].app.state.workflow);
@@ -5573,7 +5571,7 @@ mod tests {
                 assert_eq!(app.state.mode.id_key(), "build");
                 assert_eq!(app.state.thinking, replacement_thinking);
                 assert!(!app.state.workflow);
-                assert_eq!(event_loop.sessions[0].projected_config_generation, 0);
+                assert_eq!(event_loop.sessions[0].projected_config_generation, None);
                 let final_config = replacement_actor.config_snapshot().unwrap();
                 assert_eq!(final_config.generation, initial_config.generation);
                 assert!(Arc::ptr_eq(
@@ -5931,8 +5929,7 @@ mod tests {
         SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: 0,
-            config_projected: false,
+            projected_config_generation: None,
             app,
             handles,
             model_slot,

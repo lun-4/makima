@@ -185,10 +185,6 @@ impl SessionSourceSnapshot {
     pub fn history(&self) -> &Arc<Vec<Message>> {
         &self.history
     }
-
-    pub fn history_revision(&self) -> u64 {
-        self.history_revision
-    }
 }
 
 impl IdleSessionLease {
@@ -2287,7 +2283,7 @@ mod tests {
             let original = coordinator.read().history();
             assert!(Arc::ptr_eq(lease.snapshot().history(), &original));
             assert_eq!(lease.snapshot().cwd(), Path::new("/project"));
-            assert_eq!(lease.snapshot().history_revision(), 0);
+            assert_eq!(lease.snapshot().history_revision, 0);
             let (reply, response) = flume::bounded(1);
             coordinator
                 .send_source_operation(
@@ -2328,7 +2324,7 @@ mod tests {
                 .unwrap();
             let lease = coordinator.try_acquire_idle_lease().await.unwrap();
             assert_eq!(lease.snapshot().cwd(), Path::new("/changed"));
-            assert_eq!(lease.snapshot().history_revision(), 1);
+            assert_eq!(lease.snapshot().history_revision, 1);
             assert!(!Arc::ptr_eq(lease.snapshot().history(), &original));
             drop(lease);
             coordinator.close().await.unwrap();

@@ -237,7 +237,7 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
                         correlation: CORRELATION.into(),
                     }))
                     .unwrap();
-                operation.resolve(Ok(None)).unwrap();
+                operation.resolve(None).unwrap();
                 operation.wait_ready().await.unwrap();
                 operation.commit().unwrap().ticket
             }
@@ -270,7 +270,7 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
                         correlation: CORRELATION.into(),
                     }))
                     .unwrap();
-                operation.resolve(Ok(None)).unwrap();
+                operation.resolve(None).unwrap();
                 operation.wait_ready().await.unwrap();
                 (None, Some(operation))
             }

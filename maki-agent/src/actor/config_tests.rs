@@ -209,7 +209,7 @@ fn prepared_turn_commit_pins_config_and_allocates_one_ticket() {
             }))
             .unwrap();
         reservation
-            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
         reservation.wait_ready().await.unwrap();
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
@@ -232,7 +232,6 @@ fn prepared_turn_commit_pins_config_and_allocates_one_ticket() {
 }
 
 #[test_case::test_case("drop")]
-#[test_case::test_case("expire")]
 #[test_case::test_case("remove")]
 #[test_case::test_case("clear")]
 #[test_case::test_case("close")]
@@ -254,13 +253,6 @@ fn prepared_retirement_releases_fifo_without_allocating_turn(action: &str) {
         successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
         match action {
             "drop" => drop(reservation),
-            "expire" => {
-                reservation.expire().unwrap();
-                assert_eq!(
-                    reservation.wait_ready().await,
-                    Err(ActorError::ConfigExpired)
-                );
-            }
             "remove" => {
                 assert!(actor.remove_at(0).is_some());
                 assert_eq!(
@@ -321,7 +313,7 @@ fn prepared_turn_input_replacement_keeps_intent(action: &str) {
             }
             "cancel_existing" => actor.cancel_existing(),
             "resolve" => {
-                reservation.resolve(Ok(None)).unwrap();
+                reservation.resolve(None).unwrap();
                 assert_eq!(
                     reservation.replace_turn_input(input(PLACEHOLDER)),
                     Err(ActorError::PolicyPending)
@@ -359,7 +351,7 @@ fn prepared_config_waits_for_commit_and_uses_fifo_predecessor() {
         let first = actor.reserve_config_update().unwrap();
         let prepared = actor.reserve_prepared_operation(None).unwrap();
         prepared
-            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
         first.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
         let predecessor = first.wait().await.unwrap();
@@ -377,7 +369,7 @@ fn prepared_config_waits_for_commit_and_uses_fifo_predecessor() {
         assert_eq!(result.config.generation, predecessor.generation + 1);
         assert!(result.ticket.is_none());
         let noop = actor.reserve_prepared_operation(None).unwrap();
-        noop.resolve(Ok(None)).unwrap();
+        noop.resolve(None).unwrap();
         noop.wait_ready().await.unwrap();
         assert_eq!(
             noop.commit().unwrap().config.generation,
@@ -420,7 +412,7 @@ fn prepared_readiness_never_publishes_before_commit(cancel: bool) {
             }))
             .unwrap();
         reservation
-            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
         entered_rx.recv_async().await.unwrap();
         assert_eq!(actor.snapshot().queued, 1);
@@ -430,7 +422,7 @@ fn prepared_readiness_never_publishes_before_commit(cancel: bool) {
             before.generation
         );
         if cancel {
-            assert!(reservation.cancel().unwrap().is_none());
+            reservation.cancel();
         }
         let _ = release_tx.send(());
         let error = reservation.wait_ready().await.unwrap_err();
@@ -455,8 +447,6 @@ fn prepared_readiness_never_publishes_before_commit(cancel: bool) {
 
 #[test_case::test_case(false, "cancel")]
 #[test_case::test_case(true, "cancel")]
-#[test_case::test_case(false, "expire")]
-#[test_case::test_case(true, "expire")]
 #[test_case::test_case(true, "clear")]
 #[test_case::test_case(true, "cancel_existing")]
 #[test_case::test_case(false, "close")]
@@ -481,7 +471,7 @@ fn prepared_ready_retirement_settles_snapshot_and_turn(turn: bool, action: &str)
             }))
             .unwrap();
         reservation
-            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
         reservation.wait_ready().await.unwrap();
         assert_eq!(actor.snapshot().queued, usize::from(turn));
@@ -499,12 +489,7 @@ fn prepared_ready_retirement_settles_snapshot_and_turn(turn: bool, action: &str)
             drop(reservation);
         } else {
             match action {
-                "cancel" => {
-                    reservation.cancel().unwrap();
-                }
-                "expire" => {
-                    reservation.expire().unwrap();
-                }
+                "cancel" => reservation.cancel(),
                 "clear" => {
                     assert_eq!(actor.clear(), usize::from(turn));
                 }
@@ -514,7 +499,6 @@ fn prepared_ready_retirement_settles_snapshot_and_turn(turn: bool, action: &str)
                 _ => unreachable!(),
             }
             let expected = match action {
-                "expire" => ActorError::ConfigExpired,
                 "close" => ActorError::Closed,
                 "shutdown" => ActorError::Shutdown,
                 _ => ActorError::PolicyCancelled,
@@ -533,7 +517,7 @@ fn prepared_ready_retirement_settles_snapshot_and_turn(turn: bool, action: &str)
         assert!(published);
         if !matches!(action, "close" | "shutdown") {
             let next = actor.reserve_prepared_operation(None).unwrap();
-            next.resolve(Ok(None)).unwrap();
+            next.resolve(None).unwrap();
             next.wait_ready().await.unwrap();
             next.commit().unwrap();
         }
@@ -559,7 +543,7 @@ fn prepared_snapshot_survives_work_cancellation(cancel: bool, phase: u8) {
         let snapshot = actor.reserve_prepared_operation(None).unwrap();
         if phase > 0 {
             snapshot
-                .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+                .resolve(Some(ConfigChange::ToggleWorkflow))
                 .unwrap();
         }
         if phase == 2 {
@@ -591,7 +575,7 @@ fn prepared_snapshot_survives_work_cancellation(cancel: bool, phase: u8) {
         );
         if phase == 0 {
             snapshot
-                .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+                .resolve(Some(ConfigChange::ToggleWorkflow))
                 .unwrap();
         }
         snapshot.wait_ready().await.unwrap();
@@ -629,7 +613,7 @@ fn prepared_commit_and_correlation_cancel_are_serialized(commit_first: bool) {
             }))
             .unwrap();
         reservation
-            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
         reservation.wait_ready().await.unwrap();
         let (commit_go, commit_wait) = flume::bounded(1);
@@ -705,7 +689,7 @@ fn prepared_raw_and_visible_removal_keep_snapshot_reservation() {
         assert_eq!(actor.remove_at(0), Some(QueueProjection::Turn(WORK.into())));
         assert_eq!(turn.wait_ready().await, Err(ActorError::PolicyCancelled));
         assert!(actor.remove_at(0).is_none());
-        snapshot.resolve(Ok(None)).unwrap();
+        snapshot.resolve(None).unwrap();
         snapshot.wait_ready().await.unwrap();
         snapshot.commit().unwrap();
         actor.close();
@@ -738,7 +722,7 @@ fn prepared_callback_panic_settles_and_releases_successor(readiness: bool) {
             .unwrap();
         let successor = actor.reserve_config_update().unwrap();
         successor.resolve(Ok(ConfigChange::ToggleWorkflow)).unwrap();
-        reservation.resolve(Ok(None)).unwrap();
+        reservation.resolve(None).unwrap();
         assert!(matches!(
             reservation.wait_ready().await,
             Err(ActorError::InvalidConfig(_))
@@ -750,9 +734,8 @@ fn prepared_callback_panic_settles_and_releases_successor(readiness: bool) {
     });
 }
 
-#[test_case::test_case(false; "cancel")]
-#[test_case::test_case(true; "expire")]
-fn prepared_late_async_readiness_is_disposed_without_replacing_successor(expire: bool) {
+#[test]
+fn prepared_late_async_readiness_is_disposed_without_replacing_successor() {
     const WORK: &str = "blocked readiness turn";
     smol::block_on(async {
         let (entered_tx, entered_rx) = flume::bounded(1);
@@ -799,20 +782,15 @@ fn prepared_late_async_readiness_is_disposed_without_replacing_successor(expire:
         let successor = actor.reserve_config_update().unwrap();
         successor.resolve(Ok(ConfigChange::ToggleFast)).unwrap();
         reservation
-            .resolve(Ok(Some(ConfigChange::ToggleWorkflow)))
+            .resolve(Some(ConfigChange::ToggleWorkflow))
             .unwrap();
         let readiness_disposed = entered_rx.recv_async().await.unwrap();
         assert_eq!(actor.snapshot().queued, 1);
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
         let mut waiting = Box::pin(reservation.wait_ready());
         assert!(smol::future::poll_once(waiting.as_mut()).await.is_none());
-        let expected = if expire {
-            assert!(reservation.expire().unwrap().is_none());
-            ActorError::ConfigExpired
-        } else {
-            assert!(reservation.cancel().unwrap().is_none());
-            ActorError::PolicyCancelled
-        };
+        reservation.cancel();
+        let expected = ActorError::PolicyCancelled;
         assert_eq!(waiting.await, Err(expected.clone()));
         let committed = successor.wait().await.unwrap();
         assert_eq!(committed.generation, before.generation + 1);

@@ -1648,10 +1648,10 @@ impl AgentActorHandle {
             for entry in &state.operations {
                 if let ActorOperation::Prepared(pending) = entry {
                     pending
-                        .completion
+                        .failure
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .get_or_insert_with(|| Err(lifecycle_error(lifecycle)));
+                        .get_or_insert_with(|| lifecycle_error(lifecycle));
                 }
                 if let ActorOperation::Config(pending) = entry {
                     pending

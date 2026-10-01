@@ -366,7 +366,7 @@ impl EventLoop<'_> {
                 smol::unblock(move || prepare_change(spec, &policy, timeouts, &provider, mode))
                     .await?;
             operation
-                .resolve(Ok(Some(change)))
+                .resolve(Some(change))
                 .map_err(|error| error.to_string())?;
             operation
                 .wait_ready()
@@ -477,7 +477,7 @@ impl EventLoop<'_> {
                 )
             };
             operation
-                .resolve(Ok(change))
+                .resolve(change)
                 .map_err(|error| error.to_string())?;
             operation
                 .wait_ready()
