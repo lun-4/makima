@@ -1253,6 +1253,26 @@ impl App {
         None
     }
 
+    fn open_model_picker(&mut self, purpose: ModelPickerPurpose) {
+        let spec = match purpose {
+            ModelPickerPurpose::PlanImplementation => self
+                .plan_form
+                .implementation_model()
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.state.model.spec()),
+            ModelPickerPurpose::Session => self.state.model.spec(),
+        };
+        self.model_picker_purpose = purpose;
+        self.model_picker.open(&spec);
+    }
+
+    /// Closes the picker and retires its purpose together, so the open state
+    /// and the purpose can never disagree.
+    fn close_model_picker(&mut self) {
+        self.model_picker.close();
+        self.model_picker_purpose = ModelPickerPurpose::Session;
+    }
+
     fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
         match self.model_picker.handle_key(key) {
             ModelPickerAction::Consumed => vec![],
@@ -1269,7 +1289,7 @@ impl App {
             ModelPickerAction::AssignTier(spec, tier) => vec![Action::AssignTier(spec, tier)],
             ModelPickerAction::UnassignTier(spec, tier) => vec![Action::UnassignTier(spec, tier)],
             ModelPickerAction::Close => {
-                self.model_picker_purpose = ModelPickerPurpose::Session;
+                self.close_model_picker();
                 vec![]
             }
         }
@@ -1359,8 +1379,7 @@ impl App {
                 self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
             }
             BuiltinAction::ModelPicker => {
-                self.model_picker_purpose = ModelPickerPurpose::Session;
-                self.model_picker.open(&self.state.model.spec());
+                self.open_model_picker(ModelPickerPurpose::Session);
                 return vec![Action::RefreshModels];
             }
         }
@@ -3053,7 +3072,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
-        self.model_picker_purpose = ModelPickerPurpose::Session;
+        self.close_model_picker();
         self.close_command_palette();
         self.file_completion.close();
         self.overlays_mut().iter_mut().for_each(|o| o.close());
@@ -3329,13 +3348,7 @@ impl App {
                 vec![]
             }
             PlanFormAction::OpenModelPicker => {
-                self.model_picker_purpose = ModelPickerPurpose::PlanImplementation;
-                let spec = self
-                    .plan_form
-                    .implementation_model()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| self.state.model.spec());
-                self.model_picker.open(&spec);
+                self.open_model_picker(ModelPickerPurpose::PlanImplementation);
                 vec![Action::RefreshModels]
             }
             PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],

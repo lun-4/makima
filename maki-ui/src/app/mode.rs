@@ -161,8 +161,7 @@ impl App {
             self.plan_form.reset();
             self.plan_approval_pending = false;
             if self.model_picker_purpose == ModelPickerPurpose::PlanImplementation {
-                self.model_picker.close();
-                self.model_picker_purpose = ModelPickerPurpose::Session;
+                self.close_model_picker();
             }
         }
         self.file_completion.close();
