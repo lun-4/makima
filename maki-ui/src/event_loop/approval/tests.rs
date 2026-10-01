@@ -1553,8 +1553,9 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
     });
 }
 
-#[test]
-fn busy_rejection_preserves_active_turn() {
+#[test_case(false; "existing_context")]
+#[test_case(true; "fresh_context")]
+fn busy_rejection_preserves_active_turn(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
         let (active_requests, active_rx) = flume::unbounded();
@@ -1573,9 +1574,11 @@ fn busy_rejection_preserves_active_turn() {
         );
         event_loop.submit_text(index, HISTORY.into()).unwrap();
         active_rx.recv_timeout(WAIT).unwrap();
+        let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
         let config = actor.effective_config().unwrap();
-        approve(event_loop, index, false);
+        approve(event_loop, index, fresh);
+        assert_eq!(event_loop.sessions[index].id(), id);
         assert_eq!(event_loop.sessions[index].app.run_id, run);
         assert_eq!(event_loop.sessions[index].app.status, Status::Streaming);
         assert_eq!(event_loop.sessions[index].app.state.mode, Mode::Plan);
