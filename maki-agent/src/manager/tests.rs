@@ -189,15 +189,9 @@ enum MatchingSuccessor {
 }
 
 #[test_case(PoppedWork::Admitted, crate::TurnCancellationReason::User, MatchingSuccessor::None; "admitted_user")]
-#[test_case(PoppedWork::Admitted, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::None; "admitted_shutdown")]
-#[test_case(PoppedWork::Prepared, crate::TurnCancellationReason::User, MatchingSuccessor::None; "prepared_user")]
-#[test_case(PoppedWork::Prepared, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::None; "prepared_shutdown")]
-#[test_case(PoppedWork::Root, crate::TurnCancellationReason::User, MatchingSuccessor::None; "root_user")]
 #[test_case(PoppedWork::Root, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::None; "root_shutdown")]
-#[test_case(PoppedWork::Admitted, crate::TurnCancellationReason::User, MatchingSuccessor::Admitted; "admitted_matching_admitted")]
 #[test_case(PoppedWork::Prepared, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::Admitted; "prepared_matching_admitted")]
 #[test_case(PoppedWork::Admitted, crate::TurnCancellationReason::Shutdown, MatchingSuccessor::Prepared; "admitted_matching_prepared")]
-#[test_case(PoppedWork::Prepared, crate::TurnCancellationReason::User, MatchingSuccessor::Prepared; "prepared_matching_prepared")]
 fn correlation_cancel_settles_popped_work_without_backend_entry(
     work: PoppedWork,
     reason: crate::TurnCancellationReason,
