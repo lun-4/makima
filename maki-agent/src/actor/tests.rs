@@ -2296,6 +2296,32 @@ fn targeted_cancel_matching_active_run() {
 }
 
 #[test]
+fn started_run_retires_superseded_precancel_marks() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let (handle, task) = spawn(backend);
+        // Cancel r2 while nothing with that correlation exists, so its mark
+        // only shields later pushes with r2.
+        handle.cancel_correlation("r2", TurnCancellationReason::User);
+        let first = handle
+            .admit_turn(input("first"), None, "r1".into())
+            .unwrap();
+        assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
+        // Starting r1 retires the r2 mark: run-id pushes always stamp the
+        // latest run, so the mark could never match again.
+        let retried = handle
+            .admit_turn(input("retried"), None, "r2".into())
+            .unwrap();
+        assert!(matches!(
+            retried.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn precancel_marks_match_and_do_not_poison() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();

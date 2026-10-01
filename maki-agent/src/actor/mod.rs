@@ -69,6 +69,20 @@ pub enum ActorWork {
     },
 }
 
+impl ActorWork {
+    /// The correlation targeted cancels carry for this work, when it carries
+    /// one at all. Compacts re-derive theirs from the run id, so they only
+    /// participate in cancellation, not in mark retirement.
+    fn correlation(&self) -> Option<&str> {
+        match self {
+            Self::Turn(admission) => Some(&admission.correlation),
+            Self::Root(root) => Some(&root.correlation),
+            Self::Control(control) => Some(&control.correlation),
+            Self::Compact { .. } => None,
+        }
+    }
+}
+
 /// The mutable half of an actor, shared with every clone of the handle.
 pub(crate) struct ActorInner {
     pub(crate) agent_id: AgentId,
@@ -134,7 +148,9 @@ impl ProcessingWork {
 /// lifecycle, status, queue, and latest outcome consistent.
 /// `cancelled_correlations` remembers correlations cancelled before their
 /// work was pushed (precancel), so a later matching push is dropped or
-/// terminalized immediately.
+/// terminalized immediately. Marks for run correlations are retired once a
+/// run starts; runs always push with the latest run id, so an older mark can
+/// never match again.
 pub(crate) struct ActorState {
     pub(crate) lifecycle: ActorLifecycle,
     pub(crate) status: ActorStatus,
@@ -614,6 +630,18 @@ impl ActorState {
         self.processing = None;
     }
 
+    /// A started run supersedes every precancel mark it could match: pushes
+    /// stamp the latest run id, and no mark can exist for a run that is
+    /// starting (its own pushes already matched). Non-run correlations keep
+    /// their marks; nothing here knows when their pushes stop.
+    fn retire_superseded_precancels(&mut self, correlation: Option<&str>) {
+        if correlation.is_none_or(|correlation| correlation_run_id(correlation).is_none()) {
+            return;
+        }
+        self.cancelled_correlations
+            .retain(|marked, _| correlation_run_id(marked).is_none());
+    }
+
     fn idle(policy: Option<Arc<EffectiveAgentConfig>>) -> Self {
         Self {
             lifecycle: ActorLifecycle::Open,
@@ -796,6 +824,10 @@ pub(super) fn cancelled_outcome(
 /// view must use this same encoding or targeted cancels miss.
 pub(crate) fn run_correlation(run_id: u64) -> String {
     format!("r{run_id}")
+}
+
+pub(crate) fn correlation_run_id(correlation: &str) -> Option<u64> {
+    correlation.strip_prefix('r')?.parse().ok()
 }
 
 /// Stable handle to one actor task. Cloneable; every clone shares the same
@@ -1030,8 +1062,9 @@ impl AgentActorHandle {
 
     /// Queues a root input. It has no [`TurnId`]: the scheduler assigns one
     /// when it starts it, and an active run folds it instead. A root whose
-    /// correlation was precancelled is dropped. Precancel marks last until
-    /// the actor closes.
+    /// correlation was precancelled is dropped. Precancel marks last until a
+    /// run starts or the actor closes; run-id pushes always stamp the latest
+    /// run, so a started run retires every mark it could ever match.
     pub fn rush(&self, root: RootWork) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
