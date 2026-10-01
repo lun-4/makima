@@ -1,5 +1,6 @@
 use super::{
-    ActorError, ActorLifecycle, ActorOperation, ActorStatus, AgentActorHandle, TurnTicket,
+    ActorError, ActorLifecycle, ActorOperation, ActorQueue, ActorState, ActorStatus,
+    AgentActorHandle, TurnTicket,
 };
 
 pub struct ActorIdleGuard {
@@ -44,19 +45,33 @@ impl Drop for ActorIdleGuard {
     }
 }
 
-impl AgentActorHandle {
-    pub fn prepare_idle(&self) -> Result<ActorIdleGuard, ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open
-            || state.status != ActorStatus::Idle
-            || state.active.is_some()
-            || state.processing.is_some()
-            || state.idle_reserved
-            || state
+impl ActorState {
+    fn has_pending_work(&self, queue: &ActorQueue) -> bool {
+        self.status != ActorStatus::Idle
+            || self.active.is_some()
+            || self.processing.is_some()
+            || self
                 .operations
                 .iter()
                 .any(|operation| !matches!(operation, ActorOperation::Config(_)))
-            || !self.inner.queue.is_empty()
+            || !queue.is_empty()
+    }
+}
+
+impl AgentActorHandle {
+    pub(crate) fn has_pending_work(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_pending_work(&self.inner.queue)
+    }
+
+    pub fn prepare_idle(&self) -> Result<ActorIdleGuard, ActorError> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open
+            || state.idle_reserved
+            || state.has_pending_work(&self.inner.queue)
         {
             return Err(ActorError::PolicyPending);
         }

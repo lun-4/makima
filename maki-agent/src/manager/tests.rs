@@ -735,7 +735,19 @@ fn idle_guard_rejects_child_factory_reservation() {
 }
 
 #[test]
-fn idle_guard_rejects_active_parent_and_child() {
+fn idle_guard_rejects_active_parent() {
+    let (manager, root, _, gate) = active_root(AgentLimits::default());
+    assert!(matches!(
+        manager.prepare_idle_subtree(root.id()),
+        Err(ManagerError::BusySubtree(_))
+    ));
+    gate.release(1);
+    smol::block_on(manager.shutdown(Duration::from_secs(1)));
+}
+
+fn idle_root_with_child(
+    child_backend: Box<dyn ActorBackend>,
+) -> (AgentManagerHandle, super::AgentRef, super::AgentRef) {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let child = manager
         .spawn_child(
@@ -743,20 +755,61 @@ fn idle_guard_rejects_active_parent_and_child() {
             AgentMetadata::default(),
             Vec::new(),
             None,
-            TestBackend::boxed(),
+            child_backend,
         )
         .unwrap();
-    assert!(matches!(
-        manager.prepare_idle_subtree(root.id()),
-        Err(ManagerError::BusySubtree(_))
+    gate.release(1);
+    smol::block_on(root.actor().unwrap().wait_outcome(current.turn_id())).unwrap();
+    assert_eq!(
+        child.snapshot().unwrap().graph_lifecycle,
+        GraphLifecycle::Live
+    );
+    (manager, root, child)
+}
+
+#[test]
+fn idle_guard_allows_idle_live_child() {
+    let (manager, root, _) = idle_root_with_child(TestBackend::boxed());
+    drop(manager.prepare_idle_subtree(root.id()).unwrap());
+    smol::block_on(manager.shutdown(Duration::from_secs(1)));
+}
+
+enum ChildWork {
+    Popped,
+    Running,
+}
+
+#[test_case(ChildWork::Popped; "popped")]
+#[test_case(ChildWork::Running; "running")]
+fn idle_guard_rejects_busy_child(work: ChildWork) {
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+    let (entered_tx, entered_rx) = flume::unbounded();
+    let child_gate = Gate::new();
+    let (manager, root, child) = idle_root_with_child(TestBackend::reporting(
+        entered_tx,
+        Some(Arc::clone(&child_gate)),
     ));
-    child
-        .actor()
-        .unwrap()
+    let child_actor = child.actor().unwrap();
+    let (popped, release) = child_actor.pause_after_next_pop();
+    let ticket = child_actor
         .admit_turn(input(), None, "child".into())
         .unwrap();
-    gate.release(1);
-    smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    popped.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    if matches!(work, ChildWork::Running) {
+        release.send(()).unwrap();
+        entered_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    }
+    assert!(matches!(
+        manager.prepare_idle_subtree(root.id()),
+        Err(ManagerError::BusySubtree(id)) if id == root.id()
+    ));
+    if matches!(work, ChildWork::Popped) {
+        release.send(()).unwrap();
+    }
+    child_gate.release(1);
+    smol::block_on(ticket.wait());
+    drop(manager.prepare_idle_subtree(root.id()).unwrap());
+    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
 }
 
 struct Gate {

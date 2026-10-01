@@ -76,7 +76,7 @@ impl AgentManagerHandle {
             || ids
                 .iter()
                 .skip(1)
-                .any(|id| graph.nodes[id].lifecycle.consumes_capacity())
+                .any(|id| Self::descendant_busy(&graph.nodes[id]))
         {
             return Err(ManagerError::BusySubtree(agent_id));
         }
@@ -99,6 +99,18 @@ impl AgentManagerHandle {
             .prepare_idle()
             .map_err(|_| ManagerError::BusySubtree(agent_id))?;
         Ok(IdleSubtreeGuard { root })
+    }
+
+    /// Live descendants stay registered after their turn (e.g. background
+    /// tasks awaiting despawn), so only their actor's work makes them busy.
+    fn descendant_busy(node: &Node) -> bool {
+        match node.lifecycle {
+            GraphLifecycle::Live => node
+                .actor
+                .as_ref()
+                .is_none_or(AgentActorHandle::has_pending_work),
+            lifecycle => lifecycle.consumes_capacity(),
+        }
     }
 }
 
