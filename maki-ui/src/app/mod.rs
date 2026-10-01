@@ -3317,9 +3317,6 @@ impl App {
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
-        if self.plan_approval_pending {
-            return vec![];
-        }
         match action {
             PlanFormAction::UseCurrentModel => {
                 self.plan_form.use_current_model();

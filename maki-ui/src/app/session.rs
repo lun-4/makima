@@ -353,9 +353,6 @@ impl App {
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
-        self.plan_form.reset();
-        self.plan_approval_pending = false;
-        self.close_all_overlays();
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
