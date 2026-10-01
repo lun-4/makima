@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::actor::{
-    ConfigCommit, PreparedCommit, PreparedOperationTicket, PreparedTurn, TurnTicket,
+    ActorIdleGuard, ConfigCommit, PreparedCommit, PreparedOperationTicket, PreparedTurn, TurnTicket,
 };
-use maki_agent::manager::IdleSubtreeGuard;
 use maki_agent::session_coordinator::IdleSessionLease;
 use maki_agent::{AgentInput, AgentMode, CancelToken, EventSender, ModeDef, SessionDefaults};
 use maki_storage::session_lock::ClaimedSessionLock;
@@ -21,7 +20,7 @@ use crate::agent::shared_queue::correlation;
 use crate::app::session_state::rules_to_stored;
 use crate::plan_approval::{
     APPROVAL_CANCELLED, APPROVAL_CHANGED, APPROVAL_LOCK_LOST, ApprovedPlan, idle_error_message,
-    prepare_change, read_plan,
+    prepare_change, read_plan, unavailable_message,
 };
 
 #[cfg(test)]
@@ -60,7 +59,7 @@ pub(super) struct PreparedPlanApproval {
     plan: ApprovedPlan,
     operation: PreparedOperationTicket,
     source: IdleSessionLease,
-    idle: IdleSubtreeGuard,
+    idle: ActorIdleGuard,
 }
 
 /// The source stays prepared until the swap so its config, history and
@@ -70,7 +69,7 @@ pub(super) struct FreshPlanApproval {
     candidate: PreparedSessionRuntime,
     config: ConfigCommit,
     ticket: TurnTicket,
-    idle: IdleSubtreeGuard,
+    idle: ActorIdleGuard,
     lock: ClaimedSessionLock,
 }
 
@@ -191,7 +190,7 @@ impl EventLoop<'_> {
                 if let Ok(actor) = manager.actor(root) {
                     let _ = actor.cancel_turn(ticket.turn_id());
                 }
-                runtime.app.flash(idle_error_message(error));
+                runtime.app.flash(unavailable_message(error));
             }
             runtime.approved_turn = Some((idle, ticket));
         }
@@ -375,7 +374,7 @@ impl EventLoop<'_> {
             let PreparedCommit { config, ticket } =
                 operation.commit().map_err(|error| error.to_string())?;
             let ticket = ticket.ok_or_else(|| APPROVAL_CHANGED.to_string())?;
-            idle.allow_turn(&ticket).map_err(idle_error_message)?;
+            idle.allow_turn(&ticket).map_err(unavailable_message)?;
             let lock = smol::unblock(move || claim_lock(&sessions_dir, &target))
                 .await
                 .map_err(|error| error.to_string())?;

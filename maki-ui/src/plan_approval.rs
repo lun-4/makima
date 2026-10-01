@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,8 +24,12 @@ pub(crate) const IMPLEMENT_PARALLEL_HINT: &str = " Use batch+task to parallelize
 pub(crate) fn idle_error_message(error: ManagerError) -> String {
     match error {
         ManagerError::BusySubtree(_) => APPROVAL_BUSY.into(),
-        error => format!("{APPROVAL_UNAVAILABLE}: {error}."),
+        error => unavailable_message(error),
     }
+}
+
+pub(crate) fn unavailable_message(error: impl Display) -> String {
+    format!("{APPROVAL_UNAVAILABLE}: {error}.")
 }
 
 pub(crate) struct ApprovedPlan {

@@ -16,8 +16,9 @@ use serde_json::Value;
 use super::{AgentLimits, AgentManagerHandle, AgentMetadata, GraphLifecycle, ManagerError};
 use crate::actor::PreparedTurn;
 use crate::{
-    ActorBackend, AgentEvent, AgentInput, AgentMode, BackendResult, ConfigChange, ConfigPatch,
-    ControlWork, EventSender, History, PreparedModel, RootWork, TurnContext, TurnOutcome, WorkKind,
+    ActorBackend, ActorError, AgentEvent, AgentInput, AgentMode, BackendResult, ConfigChange,
+    ConfigPatch, ControlWork, EventSender, History, PreparedModel, RootWork, TurnContext,
+    TurnOutcome, WorkKind,
 };
 
 /// Yields until `cond` holds. Bounded only so a broken test cannot hang.
@@ -104,7 +105,7 @@ fn deferred_runtime_drop_settles_admissions() {
         assert_eq!(actor.outcome(ticket.turn_id()), Some(outcome));
         assert!(matches!(
             actor.admit_turn(input(), None, CORRELATION.into()),
-            Err(crate::ActorError::Closed)
+            Err(ActorError::Closed)
         ));
         assert!(entered_rx.is_empty());
         assert!(manager.lock_graph().active_turns.is_empty());
@@ -287,7 +288,7 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
         if let Some(successor) = successor_operation {
             assert!(matches!(
                 successor.commit(),
-                Err(crate::ActorError::PolicyCancelled)
+                Err(ActorError::PolicyCancelled)
             ));
         }
         release.send(()).unwrap();
@@ -518,8 +519,7 @@ fn idle_guard_permission_for_retired_turn_does_not_hold_actor(permitted_first: b
             actor.cancel_turn(approved.turn_id()).unwrap();
             assert!(matches!(
                 guard.allow_turn(&approved),
-                Err(ManagerError::IdleTurnRejected { agent_id, turn_id })
-                    if agent_id == root.id() && turn_id == approved.turn_id()
+                Err(ActorError::PolicyCancelled)
             ));
             drop(guard);
         }
@@ -557,7 +557,7 @@ fn idle_guard_reports_closed_actor_as_non_live() {
         actor.close();
         assert!(matches!(
             guard.allow_turn(&approved),
-            Err(ManagerError::NonLiveAgent(id)) if id == root.id()
+            Err(ActorError::Closed)
         ));
         drop(guard);
         assert!(matches!(

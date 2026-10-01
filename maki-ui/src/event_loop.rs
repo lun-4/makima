@@ -923,7 +923,7 @@ struct SessionRuntime {
     restore_pending: bool,
     pending_approval: Option<PendingPlanApproval>,
     approved_turn: Option<(
-        maki_agent::manager::IdleSubtreeGuard,
+        maki_agent::actor::ActorIdleGuard,
         maki_agent::actor::TurnTicket,
     )>,
     approval_runner_pending: bool,

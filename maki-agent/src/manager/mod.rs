@@ -31,7 +31,7 @@ use event_listener::Event;
 use maki_providers::Message;
 use tracing::{info, warn};
 
-use crate::actor::{ActorIdleGuard, ManagedTurnAdmission, TurnTicket};
+use crate::actor::{ActorIdleGuard, ManagedTurnAdmission};
 use crate::{
     ActorBackend, ActorError, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
     SharedMessages, TurnCancellationReason, TurnId,
@@ -43,28 +43,8 @@ static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 type RunnerTask = smol::Task<()>;
 
-pub struct IdleSubtreeGuard {
-    agent_id: AgentId,
-    root: ActorIdleGuard,
-}
-
-impl IdleSubtreeGuard {
-    pub fn allow_turn(&self, ticket: &TurnTicket) -> Result<(), ManagerError> {
-        self.root.allow_turn(ticket).map_err(|error| match error {
-            ActorError::Closed | ActorError::Shutdown => ManagerError::NonLiveAgent(self.agent_id),
-            _ => ManagerError::IdleTurnRejected {
-                agent_id: self.agent_id,
-                turn_id: ticket.turn_id(),
-            },
-        })
-    }
-}
-
 impl AgentManagerHandle {
-    pub fn prepare_idle_subtree(
-        &self,
-        agent_id: AgentId,
-    ) -> Result<IdleSubtreeGuard, ManagerError> {
+    pub fn prepare_idle_subtree(&self, agent_id: AgentId) -> Result<ActorIdleGuard, ManagerError> {
         let graph = self.lock_graph();
         if graph.shutting_down {
             return Err(ManagerError::GraphShutdown);
@@ -89,11 +69,10 @@ impl AgentManagerHandle {
             .actor
             .as_ref()
             .ok_or(ManagerError::NonLiveAgent(agent_id))?;
-        let root = actor.prepare_idle().map_err(|error| match error {
+        actor.prepare_idle().map_err(|error| match error {
             ActorError::Closed | ActorError::Shutdown => ManagerError::NonLiveAgent(agent_id),
             _ => ManagerError::BusySubtree(agent_id),
-        })?;
-        Ok(IdleSubtreeGuard { agent_id, root })
+        })
     }
 
     /// Live descendants stay registered after their turn (e.g. background
