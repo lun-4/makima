@@ -34,6 +34,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // Codex models match by their `-codex` substring in
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
+    "gpt-6.1-sol",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -601,6 +602,7 @@ mod tests {
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
     #[test_case("gpt-5.6-sol")]
+    #[test_case("gpt-6.1-sol")]
     #[test_case("gpt-6-astra")]
     #[test_case("gpt-6-sol")]
     #[test_case("gpt-6-luna")]
@@ -611,6 +613,7 @@ mod tests {
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]
+    #[test_case("gpt-6.1-sol", Some(272_000))]
     #[test_case("gpt-6-astra", Some(272_000))]
     #[test_case("gpt-6-sol", Some(272_000))]
     #[test_case("gpt-6-luna", Some(272_000))]

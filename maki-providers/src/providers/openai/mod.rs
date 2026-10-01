@@ -25,6 +25,22 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
+            prefixes: &["gpt-6.1-sol"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 10.00,
+                cache_write: 2.50,
+                cache_read: 0.10,
+                fast: None,
+            },
+            max_output_tokens: Some(GPT_5_6_MAX_OUTPUT_TOKENS),
+            context_window: GPT_6_CONTEXT_WINDOW,
+        },
+        ModelEntry {
             prefixes: &["gpt-6-astra"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gpt,
@@ -379,6 +395,15 @@ mod tests {
         6.25,
         30.0,
         GPT_5_6_CONTEXT_WINDOW
+    )]
+    #[test_case(
+        "gpt-6.1-sol",
+        ModelTier::Medium,
+        2.0,
+        0.1,
+        2.5,
+        10.0,
+        GPT_6_CONTEXT_WINDOW
     )]
     #[test_case(
         "gpt-6-astra",
