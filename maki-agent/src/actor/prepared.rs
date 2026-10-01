@@ -149,7 +149,7 @@ impl PreparedOperationTicket {
         }
     }
 
-    pub fn ready_config(&self) -> Result<ConfigCommit, ActorError> {
+    pub fn ready_config(&self) -> Result<Arc<EffectiveAgentConfig>, ActorError> {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = self
             .completion
@@ -157,12 +157,12 @@ impl PreparedOperationTicket {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
         {
-            return result.map(|commit| commit.config);
+            return result.map(|commit| commit.config.config);
         }
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        let config = state
+        state
             .operations
             .iter()
             .find_map(|entry| match entry {
@@ -171,12 +171,7 @@ impl PreparedOperationTicket {
                 }
                 _ => None,
             })
-            .ok_or(ActorError::PolicyPending)?;
-        Ok(ConfigCommit {
-            identity: Arc::clone(&self.inner.identity),
-            generation: state.policy_generation,
-            config,
-        })
+            .ok_or(ActorError::PolicyPending)
     }
 
     pub fn cancel(&self) -> Result<Option<PreparedCommit>, ActorError> {

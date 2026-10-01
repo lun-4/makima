@@ -3686,8 +3686,7 @@ impl<'t> EventLoop<'t> {
             let config = prepared
                 .operation
                 .ready_config()
-                .map_err(|error| error.to_string())?
-                .config;
+                .map_err(|error| error.to_string())?;
             let mut session = AppSession::new(
                 &config.model.spec(),
                 &prepared.source.snapshot().cwd().to_string_lossy(),

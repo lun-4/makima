@@ -488,8 +488,11 @@ fn prepared_ready_retirement_settles_snapshot_and_turn(turn: bool, action: &str)
         actor.publish_if_empty(|| published = true);
         assert!(!published);
         let candidate = reservation.ready_config().unwrap();
-        assert_eq!(candidate.generation, before.generation);
-        assert_ne!(candidate.config.workflow, before.config.workflow);
+        assert_eq!(
+            actor.config_snapshot().unwrap().generation,
+            before.generation
+        );
+        assert_ne!(candidate.workflow, before.config.workflow);
         match action {
             "cancel" => {
                 reservation.cancel().unwrap();
@@ -586,7 +589,7 @@ fn prepared_snapshot_survives_work_cancellation(cancel: bool, phase: u8) {
         }
         snapshot.wait_ready().await.unwrap();
         assert_ne!(
-            snapshot.ready_config().unwrap().config.workflow,
+            snapshot.ready_config().unwrap().workflow,
             before.config.workflow
         );
         let committed = snapshot.commit().unwrap();
@@ -802,7 +805,11 @@ fn prepared_late_blocking_result_cannot_replace_successor() {
         let successor = actor.reserve_prepared_operation(None).unwrap();
         successor.resolve(Ok(None)).unwrap();
         successor.wait_ready().await.unwrap();
-        let before = successor.ready_config().unwrap();
+        let before = actor.config_snapshot().unwrap();
+        assert!(Arc::ptr_eq(
+            &successor.ready_config().unwrap(),
+            &before.config
+        ));
         release_tx.send(()).unwrap();
         returned_rx.recv_async().await.unwrap();
         let result = successor.commit().unwrap();
@@ -973,12 +980,8 @@ fn prepared_wait_cancellation_does_not_retire_reservation(turn: bool) {
         assert_ne!(predecessor_config.config.fast, before.config.fast);
         assert_eq!(predecessor_config.config.workflow, before.config.workflow);
         let candidate = reservation.ready_config().unwrap();
-        assert_eq!(candidate.generation, predecessor_config.generation);
-        assert_eq!(candidate.config.fast, predecessor_config.config.fast);
-        assert_ne!(
-            candidate.config.workflow,
-            predecessor_config.config.workflow
-        );
+        assert_eq!(candidate.fast, predecessor_config.config.fast);
+        assert_ne!(candidate.workflow, predecessor_config.config.workflow);
         assert!(actor.inner.tickets.lock().unwrap().is_empty());
         let result = reservation.commit().unwrap();
         assert_eq!(result.config.generation, before.generation + 2);

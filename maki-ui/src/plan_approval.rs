@@ -76,7 +76,7 @@ pub(crate) fn prepare_change(
             ..Default::default()
         },
         mode: AgentMode::Build,
-        mode_def: Some(mode_def),
+        mode_def,
     })
 }
 
@@ -130,7 +130,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(change, ConfigChange::PatchAndMode { patch, mode_def: Some(_), .. } if patch.model.is_none())
+            matches!(change, ConfigChange::PatchAndMode { patch, .. } if patch.model.is_none())
         );
     }
 

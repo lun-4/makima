@@ -28,7 +28,7 @@ pub enum ConfigChange {
     PatchAndMode {
         patch: ConfigPatch,
         mode: AgentMode,
-        mode_def: Option<ModeDef>,
+        mode_def: ModeDef,
     },
     Mode {
         mode: AgentMode,
@@ -63,7 +63,11 @@ impl ConfigChange {
                 mode,
                 mode_def,
             } => {
-                let config = Self::Mode { mode, mode_def }.apply(current)?;
+                let config = Self::Mode {
+                    mode,
+                    mode_def: Some(mode_def),
+                }
+                .apply(current)?;
                 return Self::Patch(patch).apply(&config);
             }
             Self::Mode { mode, mode_def } => {
