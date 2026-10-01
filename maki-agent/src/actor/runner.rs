@@ -118,7 +118,7 @@ impl Runner {
                     .unwrap_or_else(|error| error.into_inner());
                 let work = state.pop_work(&self.queue);
                 if let Some(work) = &work {
-                    state.retire_superseded_precancels(work.correlation());
+                    state.retire_superseded_precancels(work);
                 }
                 state.processing = work.as_ref().map(ProcessingWork::new);
                 work.map(|work| (work, state.cancellation_generation))

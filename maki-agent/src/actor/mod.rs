@@ -70,15 +70,25 @@ pub enum ActorWork {
 }
 
 impl ActorWork {
-    /// The correlation targeted cancels carry for this work, when it carries
-    /// one at all. Compacts re-derive theirs from the run id, so they only
-    /// participate in cancellation, not in mark retirement.
-    fn correlation(&self) -> Option<&str> {
+    /// Every correlation targeted cancels can match this work by. Compacts
+    /// re-derive theirs from the run id (see [`run_correlation`]), so they
+    /// match cancels like run work but never retire precancel marks; see
+    /// `ActorState::retire_superseded_precancels`.
+    fn correlations(&self) -> Vec<String> {
         match self {
-            Self::Turn(admission) => Some(&admission.correlation),
-            Self::Root(root) => Some(&root.correlation),
-            Self::Control(control) => Some(&control.correlation),
-            Self::Compact { .. } => None,
+            Self::Turn(admission) => vec![admission.correlation.clone()],
+            Self::Root(root) => {
+                let mut correlations = Vec::with_capacity(root.earlier.len() + 1);
+                correlations.push(root.correlation.clone());
+                correlations.extend(
+                    root.earlier
+                        .iter()
+                        .map(|earlier| earlier.correlation.clone()),
+                );
+                correlations
+            }
+            Self::Control(control) => vec![control.correlation.clone()],
+            Self::Compact { run_id, .. } => vec![run_correlation(*run_id)],
         }
     }
 }
@@ -114,26 +124,13 @@ pub(crate) struct ProcessingWork {
 
 impl ProcessingWork {
     fn new(work: &ActorWork) -> Self {
-        let (turn_id, correlations) = match work {
-            ActorWork::Turn(admission) => {
-                (Some(admission.turn_id), vec![admission.correlation.clone()])
-            }
-            ActorWork::Root(root) => {
-                let mut correlations = Vec::with_capacity(root.earlier.len() + 1);
-                correlations.push(root.correlation.clone());
-                correlations.extend(
-                    root.earlier
-                        .iter()
-                        .map(|earlier| earlier.correlation.clone()),
-                );
-                (None, correlations)
-            }
-            ActorWork::Control(control) => (None, vec![control.correlation.clone()]),
-            ActorWork::Compact { run_id, .. } => (None, vec![run_correlation(*run_id)]),
+        let turn_id = match work {
+            ActorWork::Turn(admission) => Some(admission.turn_id),
+            _ => None,
         };
         Self {
             turn_id,
-            correlations,
+            correlations: work.correlations(),
             cancellation_reason: None,
         }
     }
@@ -634,8 +631,17 @@ impl ActorState {
     /// stamp the latest run id, and no mark can exist for a run that is
     /// starting (its own pushes already matched). Non-run correlations keep
     /// their marks; nothing here knows when their pushes stop.
-    fn retire_superseded_precancels(&mut self, correlation: Option<&str>) {
-        if correlation.is_none_or(|correlation| correlation_run_id(correlation).is_none()) {
+    fn retire_superseded_precancels(&mut self, work: &ActorWork) {
+        let correlation = match work {
+            // A compact starts under a run that already started, so its own
+            // pushes already matched; surviving marks still guard later
+            // pushes into that run.
+            ActorWork::Compact { .. } => return,
+            ActorWork::Turn(admission) => &admission.correlation,
+            ActorWork::Root(root) => &root.correlation,
+            ActorWork::Control(control) => &control.correlation,
+        };
+        if correlation_run_id(correlation).is_none() {
             return;
         }
         self.cancelled_correlations
