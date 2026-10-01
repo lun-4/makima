@@ -42,11 +42,13 @@ After approval, the picked model becomes the session model and the agent starts 
 
 ## Configuration changes
 
-Managed TUI roots and Lua agent sessions own their model, thinking, fast, workflow, and mode configuration. Changes apply in order to later admitted work. An active or already admitted turn retains its provider, settings, resolved mode definition, prompt inputs, and tool bindings. A mode registry change does not replace the definition captured for that turn. Selecting an undefined custom mode fails.
+The model, thinking, fast, workflow, and mode settings belong to the session. You change them with `/model`, `/thinking`, `/fast`, `/workflow`, Tab, a plan approval, or a plugin. Makima shows the new value as soon as it accepts the change. When you pick a model that does not support thinking or fast, those turn off.
 
-A managed setter succeeds when the actor commits the change. The actor publishes the committed configuration to the UI, provider slot, session metadata, and storage writer. Session saving runs asynchronously and does not block admission or the implementation turn. If saving fails, the committed configuration remains active and a warning reports that the configuration was applied but not saved. The storage writer retains the latest committed snapshot for retry. A successful retry clears the pending-save condition. A crash before saving can lose the latest configuration change. A save failure never rolls back an actor commit.
+A change never touches a turn that has already started. The running turn finishes with the model, settings, mode, and tools it started with. A message you send while the agent works usually joins the running turn, but not after a change: then it waits for the running turn to finish and starts its own turn with the new settings. Messages that were already in the queue keep the settings they were queued with. The same is true when a plugin redefines a mode: running and queued turns keep the old definition.
 
-Headless, print, and ACP execution retain their existing frontend-owned initialization and configuration paths. They do not yet use the managed actor execution loop. YOLO and plugin options retain their existing owners; YOLO changes affect permission checks immediately.
+Makima saves the change with the session in the background, so you never wait on the disk. If saving fails, the change still applies, and a warning says the configuration was applied but not saved. Makima keeps retrying and tells you when the save recovers. If Makima crashes before the save lands, the session comes back with the older settings.
+
+All of this is how the TUI and Lua agent sessions work. Headless, print, and ACP runs set these options their own way. YOLO and plugin options sit outside it, and a YOLO change applies to permission checks right away.
 
 ## What a mode is
 
