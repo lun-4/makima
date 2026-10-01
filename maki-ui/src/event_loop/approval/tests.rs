@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use maki_agent::SessionMailbox;
-use maki_agent::actor::PreparedModel;
+use maki_agent::actor::{
+    AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch, ConfigUpdateTicket, PreparedModel,
+};
 use maki_agent::manager::ManagerError;
 use maki_agent::session_coordinator::{SessionCoordinatorError, SessionCoordinatorHandle};
 use maki_agent::tools::ToolRegistry;
@@ -44,6 +46,7 @@ const PLAN: &str = "# Implementation\n\nImplement the regression tests.\n";
 const RESPONSE: &str = "implementation finished";
 const PROVIDER_FAILURE: &str = "approval provider preparation failed";
 const WAIT: Duration = Duration::from_secs(10);
+const CHECKPOINT_EPOCH: u64 = 1;
 const CHILD_PROMPT: &str = "gated managed child";
 const RELEASED_LOCK: &str = "released";
 const CHILD_TOOL: &str = r#"
@@ -133,7 +136,6 @@ struct ChildProvider {
     entered: flume::Sender<()>,
     release: flume::Receiver<()>,
     root_requests: AtomicUsize,
-    requests: flume::Sender<Vec<Message>>,
 }
 
 impl Provider for ChildProvider {
@@ -148,7 +150,6 @@ impl Provider for ChildProvider {
         _session: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async move {
-            self.requests.send(messages.to_vec()).unwrap();
             let child = messages
                 .iter()
                 .any(|message| message.user_text() == Some(CHILD_PROMPT));
@@ -207,34 +208,14 @@ fn rejects_active_managed_child_without_cancelling_it() {
         let (release, gate) = flume::bounded(1);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
-        let (record, recorded) = flume::unbounded();
         let provider = Arc::new(ChildProvider {
             entered,
             release: gate,
             root_requests: AtomicUsize::new(0),
-            requests: record,
         });
-        let setter = actor.reserve_config_update().unwrap();
-        setter
-            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
-                maki_agent::actor::ConfigPatch {
-                    model: Some(PreparedModel {
-                        model: Model::from_spec(SOURCE_MODEL).unwrap(),
-                        provider: provider.clone(),
-                    }),
-                    ..Default::default()
-                },
-            )))
-            .unwrap();
-        smol::block_on(setter.wait()).unwrap();
+        apply_patch(&actor, model_patch(SOURCE_MODEL, provider));
         event_loop.submit_text(index, HISTORY.into()).unwrap();
         pump_until(event_loop, |_| !entry.is_empty());
-        assert!(
-            !entry.is_empty(),
-            "child did not run after {} root requests; history: {}",
-            provider.root_requests.load(Ordering::SeqCst),
-            serde_json::to_string(&recorded.drain().collect::<Vec<_>>()).unwrap()
-        );
         entry.recv_timeout(WAIT).unwrap();
         pump_until(event_loop, |event_loop| {
             actor.snapshot().status == maki_agent::actor::ActorStatus::Idle
@@ -427,6 +408,54 @@ fn pump_until(event_loop: &mut EventLoop<'_>, mut done: impl FnMut(&EventLoop<'_
     }
 }
 
+fn queue_patch(actor: &AgentActorHandle, patch: ConfigPatch) -> ConfigUpdateTicket {
+    let ticket = actor.reserve_config_update().unwrap();
+    ticket.resolve(Ok(ConfigChange::Patch(patch))).unwrap();
+    ticket
+}
+
+fn apply_patch(actor: &AgentActorHandle, patch: ConfigPatch) -> ConfigCommit {
+    smol::block_on(queue_patch(actor, patch).wait()).unwrap()
+}
+
+fn wait_bounded(ticket: &ConfigUpdateTicket) {
+    smol::block_on(bounded_session_op(
+        async { ticket.wait().await.map_err(|error| error.to_string()) },
+        WAIT,
+    ))
+    .unwrap();
+}
+
+fn model_patch(spec: &str, provider: Arc<dyn Provider>) -> ConfigPatch {
+    ConfigPatch {
+        model: Some(PreparedModel {
+            model: Model::from_spec(spec).unwrap(),
+            provider,
+        }),
+        ..Default::default()
+    }
+}
+
+fn disable_fast() -> ConfigPatch {
+    ConfigPatch {
+        fast: Some(false),
+        ..Default::default()
+    }
+}
+
+fn checkpoint(event_loop: &EventLoop<'_>, index: usize) {
+    let runtime = &event_loop.sessions[index];
+    smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
+        session_id: runtime.id(),
+        version: CheckpointVersion {
+            revision: runtime.app.state.session.revision(),
+            epoch: CHECKPOINT_EPOCH,
+        },
+        snapshot: Arc::clone(&runtime.app.state.session),
+    }))
+    .unwrap();
+}
+
 fn assert_preserved(
     event_loop: &EventLoop<'_>,
     index: usize,
@@ -582,16 +611,9 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
             maki_agent::AgentMode::Build
         );
         runtime.app.checkpoint_now();
-        smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
-            session_id: runtime.id(),
-            version: CheckpointVersion {
-                revision: runtime.app.state.session.revision(),
-                epoch: 1,
-            },
-            snapshot: Arc::clone(&runtime.app.state.session),
-        }))
-        .unwrap();
-        let restored = AppSession::load(runtime.id(), &event_loop.ctx.storage).unwrap();
+        let id = runtime.id();
+        checkpoint(event_loop, index);
+        let restored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
         assert_eq!(restored.model, TARGET_MODEL);
         assert_eq!(
             restored.meta.mode,
@@ -668,16 +690,7 @@ fn mode_transition_emits_once_and_config_only_emits_none() {
         assert_eq!(mode_events(event_loop, index), before + 1);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
-        let setter = actor.reserve_config_update().unwrap();
-        setter
-            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
-                maki_agent::actor::ConfigPatch {
-                    fast: Some(false),
-                    ..Default::default()
-                },
-            )))
-            .unwrap();
-        let commit = smol::block_on(setter.wait()).unwrap();
+        let commit = apply_patch(&actor, disable_fast());
         event_loop.sessions[index].project_config(&commit);
         let _ = event_loop.tick();
         assert_eq!(mode_events(event_loop, index), before + 1);
@@ -690,16 +703,7 @@ fn fresh_forgets_retired_cache_but_preserves_saved_source() {
         let (index, _, requests, _host) = setup(event_loop);
         let source = event_loop.sessions[index].id();
         event_loop.sessions[index].app.checkpoint_now();
-        let snapshot = Arc::clone(&event_loop.sessions[index].app.state.session);
-        smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
-            session_id: source,
-            version: CheckpointVersion {
-                revision: snapshot.revision(),
-                epoch: 1,
-            },
-            snapshot,
-        }))
-        .unwrap();
+        checkpoint(event_loop, index);
         assert!(
             event_loop
                 .ctx
@@ -767,19 +771,13 @@ fn fresh_retires_outgoing_session_like_a_reset() {
             .find(|command| command.spec().name.as_ref() == RESET_COMMAND)
             .expect("SessionReset did not fire for the retired session");
         assert_eq!(reset.spec().docs.summary.as_ref(), source.to_string());
-        let deadline = Instant::now() + WAIT;
-        while AppSession::load(source, &event_loop.ctx.storage)
-            .ok()
-            .and_then(|session| session.meta.input_draft)
-            .as_deref()
-            != Some(DRAFT)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "outgoing draft was not checkpointed"
-            );
-            std::thread::yield_now();
-        }
+        pump_until(event_loop, |event_loop| {
+            AppSession::load(source, &event_loop.ctx.storage)
+                .ok()
+                .and_then(|session| session.meta.input_draft)
+                .as_deref()
+                == Some(DRAFT)
+        });
     });
 }
 
@@ -848,19 +846,11 @@ fn fresh_candidate_cancel_releases_source_setter() {
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let before = actor.effective_config().unwrap();
-        let successor = actor.reserve_config_update().unwrap();
-        successor
-            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
-                maki_agent::actor::ConfigPatch {
-                    fast: Some(false),
-                    ..Default::default()
-                },
-            )))
-            .unwrap();
+        let successor = queue_patch(&actor, disable_fast());
         assert!(Arc::ptr_eq(&before, &actor.effective_config().unwrap()));
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         event_loop.handle_internal(ready);
-        smol::block_on(successor.wait()).unwrap();
+        wait_bounded(&successor);
         assert_preserved(event_loop, index, &path, run, None);
         assert_eq!(event_loop.sessions[index].id(), original_id);
         assert!(Arc::ptr_eq(
@@ -933,22 +923,10 @@ fn fresh_cancel_releases_source_before_target_lock_returns() {
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let before = actor.effective_config().unwrap();
-        let successor = actor.reserve_config_update().unwrap();
-        successor
-            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
-                maki_agent::actor::ConfigPatch {
-                    fast: Some(false),
-                    ..Default::default()
-                },
-            )))
-            .unwrap();
+        let successor = queue_patch(&actor, disable_fast());
         assert!(Arc::ptr_eq(&before, &actor.effective_config().unwrap()));
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        smol::block_on(bounded_session_op(
-            async { successor.wait().await.map_err(|error| error.to_string()) },
-            WAIT,
-        ))
-        .unwrap();
+        wait_bounded(&successor);
         assert!(!actor.effective_config().unwrap().fast);
         assert!(disposal.is_empty());
         assert!(!session_lock::lock_path(&event_loop.sessions_dir, &target).exists());
@@ -1091,14 +1069,9 @@ fn fresh_activation_failure_releases_candidate_resources() {
             event_loop.ctx.command_runtime.registry.target_count(),
             targets
         );
-        let deadline = Instant::now() + WAIT;
-        while ticket.peek().is_none() || !manager.runner_finished(root).unwrap() {
-            assert!(
-                Instant::now() < deadline,
-                "failed candidate runner did not shut down"
-            );
-            std::thread::yield_now();
-        }
+        pump_until(event_loop, |_| {
+            ticket.peek().is_some() && manager.runner_finished(root).unwrap()
+        });
         assert!(
             !event_loop
                 .sessions_dir
@@ -1159,21 +1132,9 @@ fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
         entry.recv_timeout(WAIT).unwrap();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
-        let successor = actor.reserve_config_update().unwrap();
-        successor
-            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
-                maki_agent::actor::ConfigPatch {
-                    fast: Some(false),
-                    ..Default::default()
-                },
-            )))
-            .unwrap();
+        let successor = queue_patch(&actor, disable_fast());
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        smol::block_on(bounded_session_op(
-            async { successor.wait().await.map_err(|error| error.to_string()) },
-            WAIT,
-        ))
-        .unwrap();
+        wait_bounded(&successor);
         assert!(!actor.effective_config().unwrap().fast);
         assert!(requests.is_empty());
         release.send(()).unwrap();
@@ -1543,16 +1504,7 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         });
         requests.recv_timeout(WAIT).unwrap();
         let id = event_loop.sessions[index].id();
-        let runtime = &event_loop.sessions[index];
-        smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
-            session_id: id,
-            version: CheckpointVersion {
-                revision: runtime.app.state.session.revision(),
-                epoch: 1,
-            },
-            snapshot: Arc::clone(&runtime.app.state.session),
-        }))
-        .unwrap();
+        checkpoint(event_loop, index);
         let log = event_loop.sessions_dir.join(format!("{id}.jsonl"));
         let moved = log.with_extension("approval-backup");
         std::fs::rename(&log, &moved).unwrap();
@@ -1577,16 +1529,7 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         std::fs::remove_dir(&log).unwrap();
         std::fs::rename(&moved, &log).unwrap();
         event_loop.sessions[index].app.checkpoint_now();
-        let runtime = &event_loop.sessions[index];
-        smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
-            session_id: id,
-            version: CheckpointVersion {
-                revision: runtime.app.state.session.revision(),
-                epoch: 1,
-            },
-            snapshot: Arc::clone(&runtime.app.state.session),
-        }))
-        .unwrap();
+        checkpoint(event_loop, index);
         assert_eq!(
             AppSession::load(id, &event_loop.ctx.storage).unwrap().model,
             TARGET_MODEL
@@ -1603,24 +1546,20 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
         let (record, recorded) = flume::unbounded();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
-        let predecessor = actor.reserve_config_update().unwrap();
-        predecessor
-            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
-                maki_agent::actor::ConfigPatch {
-                    model: Some(PreparedModel {
-                        model: Model::from_spec(TARGET_MODEL).unwrap(),
-                        provider: Arc::new(RecordingProvider {
-                            requests: record,
-                            release: None,
-                        }),
+        apply_patch(
+            &actor,
+            ConfigPatch {
+                thinking: Some(DomainThinkingConfig::Off),
+                fast: Some(false),
+                ..model_patch(
+                    TARGET_MODEL,
+                    Arc::new(RecordingProvider {
+                        requests: record,
+                        release: None,
                     }),
-                    thinking: Some(DomainThinkingConfig::Off),
-                    fast: Some(false),
-                    ..Default::default()
-                },
-            )))
-            .unwrap();
-        smol::block_on(predecessor.wait()).unwrap();
+                )
+            },
+        );
         drop(smol::block_on(event_loop.sessions[index].coordinator.acquire_lease()).unwrap());
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
@@ -1675,22 +1614,16 @@ fn busy_rejection_preserves_active_turn() {
         let (release, gate) = flume::bounded(1);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
-        let change = actor.reserve_config_update().unwrap();
-        change
-            .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
-                maki_agent::actor::ConfigPatch {
-                    model: Some(PreparedModel {
-                        model: Model::from_spec(SOURCE_MODEL).unwrap(),
-                        provider: Arc::new(RecordingProvider {
-                            requests: active_requests,
-                            release: Some(gate),
-                        }),
-                    }),
-                    ..Default::default()
-                },
-            )))
-            .unwrap();
-        smol::block_on(change.wait()).unwrap();
+        apply_patch(
+            &actor,
+            model_patch(
+                SOURCE_MODEL,
+                Arc::new(RecordingProvider {
+                    requests: active_requests,
+                    release: Some(gate),
+                }),
+            ),
+        );
         event_loop.submit_text(index, HISTORY.into()).unwrap();
         active_rx.recv_timeout(WAIT).unwrap();
         let run = event_loop.sessions[index].app.run_id;
