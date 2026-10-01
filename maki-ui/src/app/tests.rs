@@ -467,11 +467,16 @@ fn app_without_splash() -> App {
 /// Hands back the slot providers publish their model lists into, since the app
 /// keeps no handle to it once the picker owns it.
 fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
-    let models = Arc::new(ArcSwapOption::empty());
     let mut app = test_app();
+    let models = install_model_slot(&mut app);
+    (app, models)
+}
+
+fn install_model_slot(app: &mut App) -> Arc<ArcSwapOption<Vec<String>>> {
+    let models = Arc::new(ArcSwapOption::empty());
     app.model_picker = ModelPicker::new(Arc::clone(&models));
     app.available_models = Arc::clone(&models);
-    (app, models)
+    models
 }
 
 /// Hands back the end a plugin publishes hints through. That is the Lua thread
@@ -6011,7 +6016,10 @@ fn plan_form_implement_toggled_parallel() {
 #[test_case(false ; "shortcut")]
 #[test_case(true ; "model_row")]
 fn plan_model_picker_stages_without_switching(row: bool) {
-    let (mut app, models) = app_with_model_slot();
+    // `test_app` shares `$TMPDIR` as its state dir with every other test
+    // process, which rewrite the model, recents and prefs this test pins.
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let models = install_model_slot(&mut app);
     const MODEL: &str = "zai/glm-5";
     models.store(Some(Arc::new(vec![MODEL.into()])));
     app.state.mode = Mode::Plan;
