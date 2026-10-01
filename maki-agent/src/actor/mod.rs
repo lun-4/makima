@@ -1465,21 +1465,9 @@ impl AgentActorHandle {
     /// so a later push with it is precancelled. Unrelated work is untouched,
     /// and the actor stays open and reusable.
     pub fn cancel_correlation(&self, correlation: &str, reason: TurnCancellationReason) {
-        self.cancel_correlation_with_active(correlation, reason, |_| {});
-    }
-
-    pub fn cancel_correlation_with_active(
-        &self,
-        correlation: &str,
-        reason: TurnCancellationReason,
-        operation: impl FnOnce(TurnId),
-    ) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let cut = self.capture_correlation_cancel(&mut state, correlation, reason);
         drop(state);
-        if let Some(turn_id) = cut.active_turn {
-            operation(turn_id);
-        }
         self.settle_correlation_cancel(cut, correlation, reason);
     }
 

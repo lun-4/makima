@@ -1070,25 +1070,6 @@ impl AgentManagerHandle {
         Ok(())
     }
 
-    pub fn close_descendants_for_turn(
-        &self,
-        agent_id: AgentId,
-        turn_id: TurnId,
-    ) -> Result<(), ManagerError> {
-        let actors = {
-            let mut graph = self.lock_graph();
-            let actors = Self::capture_subtree_locked(&mut graph, agent_id, false)?;
-            graph.active_turns.remove(&(agent_id, turn_id));
-            actors
-        };
-        #[cfg(test)]
-        self.wait_at_descendant_cut_gate();
-        for actor in actors {
-            actor.close();
-        }
-        Ok(())
-    }
-
     pub async fn shutdown(&self, timeout: Duration) -> ShutdownReport {
         let (ids, actors, finished_tombstone_tasks) = {
             let mut graph = self.lock_graph();

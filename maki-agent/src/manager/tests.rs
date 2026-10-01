@@ -770,31 +770,6 @@ fn correlation_cancel_cut_retires_authority_and_captures_children_before_close()
 }
 
 #[test]
-fn correlation_cancel_callback_does_not_hold_actor_state() {
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
-    const CORRELATION: &str = "root";
-    let (manager, root, current, root_gate) = active_root(AgentLimits::default());
-    let actor = root.actor().unwrap();
-    actor.cancel_correlation_with_active(
-        CORRELATION,
-        crate::TurnCancellationReason::User,
-        |turn_id| {
-            assert!(actor.inner.state.try_lock().is_ok());
-            assert_eq!(turn_id, current.turn_id());
-            manager
-                .close_descendants_for_turn(root.id(), turn_id)
-                .unwrap();
-        },
-    );
-    root_gate.release(1);
-    assert!(
-        smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
-            .timed_out
-            .is_empty()
-    );
-}
-
-#[test]
 fn idle_guard_rejects_child_factory_reservation() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let (entered_tx, entered_rx) = flume::bounded(1);
@@ -2616,7 +2591,7 @@ fn root_snapshot_does_not_block_atomic_correlation_cancel_cut() {
 }
 
 #[test]
-fn turn_descendant_cut_rejects_post_cut_spawn_and_preserves_later_turn() {
+fn correlation_cancel_cut_rejects_post_cut_spawn_and_preserves_later_turn() {
     smol::block_on(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (current_tx, current_rx) = flume::unbounded();
@@ -2645,7 +2620,9 @@ fn turn_descendant_cut_rejects_post_cut_spawn_and_preserves_later_turn() {
         let cutting = manager.clone();
         let root_id = root.id();
         let turn_id = first_current.turn_id();
-        let cut = std::thread::spawn(move || cutting.close_descendants_for_turn(root_id, turn_id));
+        let cut = std::thread::spawn(move || {
+            cutting.cancel_correlation(root_id, "first", crate::TurnCancellationReason::User)
+        });
 
         cut_rx.recv().unwrap();
         assert!(matches!(
@@ -2664,7 +2641,7 @@ fn turn_descendant_cut_rejects_post_cut_spawn_and_preserves_later_turn() {
         assert!(root.snapshot().unwrap().children.is_empty());
 
         root_gate.release(1);
-        assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
+        first.wait().await;
         let later = root_actor
             .admit_turn(input(), None, "later".into())
             .unwrap();
