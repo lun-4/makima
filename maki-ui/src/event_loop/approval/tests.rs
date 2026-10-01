@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::io::Write;
@@ -1082,7 +1082,10 @@ fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
         let (release, gate) = flume::bounded(1);
         let writer_path = path.clone();
         let writer = thread::spawn(move || {
-            let mut file = OpenOptions::new().write(true).open(writer_path).unwrap();
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(writer_path)
+                .unwrap();
             entered.send(()).unwrap();
             gate.recv().unwrap();
             file.write_all(PLAN.as_bytes()).unwrap();
