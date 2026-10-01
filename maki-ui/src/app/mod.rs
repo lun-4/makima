@@ -3288,7 +3288,11 @@ impl App {
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
-            self.input_box.handle_paste(text);
+            // Empty paste means "attach from clipboard"; other chats never
+            // take images, so it does nothing there.
+            if !text.is_empty() {
+                self.input_box.handle_paste(text);
+            }
             return;
         }
         if self.attach_pasted_images(text) {
