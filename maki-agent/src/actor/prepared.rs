@@ -78,6 +78,11 @@ impl AgentActorHandle {
 }
 
 impl PreparedOperationTicket {
+    /// Swaps in a new turn input while the operation still accepts one.
+    /// Fails with [`ActorError::PolicyCancelled`] when the operation was
+    /// cancelled, closed, or carries no turn, and
+    /// [`ActorError::PolicyPending`] once a change was already resolved and
+    /// preparation is under way.
     pub fn replace_turn_input(&self, input: AgentInput) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let pending = self.unresolved(&mut state)?;
@@ -86,6 +91,10 @@ impl PreparedOperationTicket {
         Ok(())
     }
 
+    /// Resolves the configuration change the prepared operation commits.
+    /// `None` keeps the actor's current configuration. Fails with
+    /// [`ActorError::PolicyPending`] when the change or turn input was
+    /// already resolved.
     pub fn resolve(&self, change: Option<ConfigChange>) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         self.unresolved(&mut state)?.change = Some(change);
@@ -160,10 +169,12 @@ impl PreparedOperationTicket {
             unreachable!()
         };
         let (config, snapshot) = pending.ready.take().unwrap();
-        let changed = state
-            .policy
-            .as_ref()
-            .is_none_or(|current| !config::equivalent(current, &config));
+        let (config, changed) = match state.policy.as_ref() {
+            Some(current) if config::equivalent(current, &config) => (Arc::clone(current), false),
+            // No current policy means the actor never initialized one; the
+            // committed candidate is the first.
+            _ => (Arc::clone(&config), true),
+        };
         if changed {
             state.policy_generation = state.policy_generation.wrapping_add(1);
             state.policy = Some(Arc::clone(&config));
@@ -171,7 +182,7 @@ impl PreparedOperationTicket {
         let commit = ConfigCommit {
             identity: Arc::clone(&self.inner.identity),
             generation: state.policy_generation,
-            config: state.policy.clone().unwrap(),
+            config,
         };
         let ticket = pending.turn.take().map(|turn| {
             let turn_id = TurnId::generate();
