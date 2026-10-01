@@ -203,9 +203,7 @@ fn approval_rejects_active_managed_child_without_cancelling_it() {
         event_loop
             .submit_text(index, APPROVAL_HISTORY.into())
             .unwrap();
-        approval_pump_until(event_loop, |event_loop| {
-            !entry.is_empty() || event_loop.sessions[index].app.status == Status::Idle
-        });
+        approval_pump_until(event_loop, |_| !entry.is_empty());
         assert!(
             !entry.is_empty(),
             "child did not run after {} root requests; history: {}",
