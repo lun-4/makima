@@ -646,6 +646,7 @@ impl App {
             || self.help_modal.is_open()
             || self.btw_modal.is_open()
             || self.float_mgr.is_focused()
+            || self.plan_approval_pending
         {
             return contexts;
         }

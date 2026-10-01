@@ -1092,9 +1092,7 @@ impl App {
             });
         }
 
-        if self.model_picker.is_open()
-            && self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
-        {
+        if self.model_picker.is_open() && self.plan_form_active() {
             return Some(self.handle_model_picker_key(key));
         }
 
@@ -3255,9 +3253,7 @@ impl App {
         if self.plan_approval_pending {
             return;
         }
-        if self.model_picker.is_open()
-            && self.model_picker_purpose == ModelPickerPurpose::PlanImplementation
-        {
+        if self.model_picker.is_open() && self.plan_form_active() {
             self.model_picker.handle_paste(text);
             return;
         }

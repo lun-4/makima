@@ -6052,6 +6052,28 @@ fn plan_model_picker_stages_without_switching(row: bool) {
     assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
 }
 
+#[test]
+fn open_session_model_picker_keeps_keys_when_plan_form_appears() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+    app.state.mode = Mode::Plan;
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    let contexts = app.active_keybind_contexts();
+    assert!(contexts.contains(&KeybindContext::ModelPicker));
+    assert!(!contexts.contains(&KeybindContext::FormInput));
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
+    app.update(Msg::Paste(
+        LATE_MODEL_SPEC.split_once('/').unwrap().1.into(),
+    ));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(actions.as_slice(), [Action::ChangeModel(spec)] if spec == LATE_MODEL_SPEC));
+    assert_eq!(app.plan_form.implementation_model(), None);
+    assert!(app.plan_form.is_visible());
+}
+
 #[test_case("permission" ; "permission")]
 #[test_case("question" ; "question")]
 #[test_case("help" ; "help")]
