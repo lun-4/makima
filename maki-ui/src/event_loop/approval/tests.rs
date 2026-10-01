@@ -1,30 +1,48 @@
-use crossterm::event::{KeyCode, KeyEvent};
-use maki_agent::actor::PreparedModel;
-use maki_agent::tools::ToolRegistry;
-use maki_lua::PluginHost;
-use maki_providers::provider::BoxFuture as ApprovalFuture;
-use maki_providers::{
-    ContentBlock as ApprovalContentBlock, RequestOptions as ApprovalOptions, Role as ApprovalRole,
-    StopReason as ApprovalStopReason, StreamResponse as ApprovalResponse,
-};
-use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
+use std::io;
 #[cfg(unix)]
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
-use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-const APPROVAL_SOURCE_MODEL: &str = "anthropic/claude-opus-4-6";
-const APPROVAL_TARGET_MODEL: &str = "openai/gpt-5";
-const APPROVAL_HISTORY: &str = "existing planning conversation";
-const APPROVAL_PLAN: &str = "# Implementation\n\nImplement the regression tests.\n";
-const APPROVAL_RESPONSE: &str = "implementation finished";
-const APPROVAL_PROVIDER_FAILURE: &str = "approval provider preparation failed";
-const APPROVAL_WAIT: Duration = Duration::from_secs(10);
-const APPROVAL_CHILD_PROMPT: &str = "gated managed child";
-const APPROVAL_RELEASED_LOCK: &str = "released";
-const APPROVAL_CHILD_TOOL: &str = r#"
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use maki_agent::SessionMailbox;
+use maki_agent::actor::PreparedModel;
+use maki_agent::session_coordinator::SessionCoordinatorHandle;
+use maki_agent::tools::ToolRegistry;
+use maki_domain::ThinkingConfig as DomainThinkingConfig;
+use maki_lua::PluginHost;
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+};
+use maki_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
+use maki_storage::id::SessionRef;
+use maki_storage::session_lock;
+use test_case::test_case;
+
+use super::super::tests::{shutdown_manager, with_event_loop};
+use super::super::{
+    EventLoop, InternalEvent, PreparedProvider, Wake, bounded_session_op, prepare_coordinator,
+    start_runtime_heartbeat_with,
+};
+use crate::AppSession;
+use crate::components::{Action, Status};
+use crate::storage_writer::StorageWriter;
+
+const SOURCE_MODEL: &str = "anthropic/claude-opus-4-6";
+const TARGET_MODEL: &str = "openai/gpt-5";
+const HISTORY: &str = "existing planning conversation";
+const PLAN: &str = "# Implementation\n\nImplement the regression tests.\n";
+const RESPONSE: &str = "implementation finished";
+const PROVIDER_FAILURE: &str = "approval provider preparation failed";
+const WAIT: Duration = Duration::from_secs(10);
+const CHILD_PROMPT: &str = "gated managed child";
+const RELEASED_LOCK: &str = "released";
+const CHILD_TOOL: &str = r#"
     local sessions = {}
     maki.api.register_tool({
         name = "approval_child", description = "start test child", kind = "read",
@@ -40,7 +58,7 @@ const APPROVAL_CHILD_TOOL: &str = r#"
         end,
     })
 "#;
-const APPROVAL_AUTOCMD: &str = r#"
+const AUTOCMD: &str = r#"
     local starts = 0
     maki.api.create_autocmd("TurnStart", { callback = function()
         starts = starts + 1
@@ -53,14 +71,14 @@ const APPROVAL_AUTOCMD: &str = r#"
     end })
 "#;
 
-type ApprovalRequest = (String, ApprovalOptions, Vec<Message>, String);
+type RecordedRequest = (String, RequestOptions, Vec<Message>, String);
 
-struct ApprovalRecordingProvider {
-    requests: flume::Sender<ApprovalRequest>,
+struct RecordingProvider {
+    requests: flume::Sender<RecordedRequest>,
     release: Option<flume::Receiver<()>>,
 }
 
-impl Provider for ApprovalRecordingProvider {
+impl Provider for RecordingProvider {
     fn stream_message<'a>(
         &'a self,
         model: &'a Model,
@@ -68,9 +86,9 @@ impl Provider for ApprovalRecordingProvider {
         system: &'a str,
         _tools: &'a serde_json::Value,
         _events: &'a flume::Sender<maki_providers::ProviderEvent>,
-        options: ApprovalOptions,
+        options: RequestOptions,
         _session: Option<&'a SessionRef>,
-    ) -> ApprovalFuture<'a, Result<ApprovalResponse, maki_providers::AgentError>> {
+    ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async move {
             self.requests
                 .send((model.spec(), options, messages.to_vec(), system.into()))
@@ -78,36 +96,35 @@ impl Provider for ApprovalRecordingProvider {
             if let Some(release) = &self.release {
                 release.recv_async().await.unwrap();
             }
-            Ok(ApprovalResponse {
+            Ok(StreamResponse {
                 message: Message {
-                    role: ApprovalRole::Assistant,
-                    content: vec![ApprovalContentBlock::Text {
-                        text: APPROVAL_RESPONSE.into(),
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: RESPONSE.into(),
                     }],
                     ..Message::user(String::new())
                 },
                 usage: TokenUsage::default(),
-                stop_reason: Some(ApprovalStopReason::EndTurn),
+                stop_reason: Some(StopReason::EndTurn),
             })
         })
     }
 
     fn list_models(
         &self,
-    ) -> ApprovalFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>>
-    {
+    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
 
-struct ApprovalChildProvider {
+struct ChildProvider {
     entered: flume::Sender<()>,
     release: flume::Receiver<()>,
     root_requests: AtomicUsize,
     requests: flume::Sender<Vec<Message>>,
 }
 
-impl Provider for ApprovalChildProvider {
+impl Provider for ChildProvider {
     fn stream_message<'a>(
         &'a self,
         _model: &'a Model,
@@ -115,43 +132,43 @@ impl Provider for ApprovalChildProvider {
         _system: &'a str,
         _tools: &'a serde_json::Value,
         _events: &'a flume::Sender<maki_providers::ProviderEvent>,
-        _options: ApprovalOptions,
+        _options: RequestOptions,
         _session: Option<&'a SessionRef>,
-    ) -> ApprovalFuture<'a, Result<ApprovalResponse, maki_providers::AgentError>> {
+    ) -> BoxFuture<'a, Result<StreamResponse, maki_providers::AgentError>> {
         Box::pin(async move {
             self.requests.send(messages.to_vec()).unwrap();
             let child = messages
                 .iter()
-                .any(|message| message.user_text() == Some(APPROVAL_CHILD_PROMPT));
+                .any(|message| message.user_text() == Some(CHILD_PROMPT));
             let content = if child {
                 self.entered.send(()).unwrap();
                 self.release.recv_async().await.unwrap();
-                ApprovalContentBlock::Text {
-                    text: APPROVAL_RESPONSE.into(),
+                ContentBlock::Text {
+                    text: RESPONSE.into(),
                 }
             } else if self.root_requests.fetch_add(1, Ordering::SeqCst) == 0 {
-                ApprovalContentBlock::ToolUse {
+                ContentBlock::ToolUse {
                     id: "approval-child-call".into(),
                     name: "approval_child".into(),
                     input: serde_json::json!({}),
                     thought_signature: None,
                 }
             } else {
-                ApprovalContentBlock::Text {
-                    text: APPROVAL_RESPONSE.into(),
+                ContentBlock::Text {
+                    text: RESPONSE.into(),
                 }
             };
-            Ok(ApprovalResponse {
+            Ok(StreamResponse {
                 message: Message {
-                    role: ApprovalRole::Assistant,
+                    role: Role::Assistant,
                     content: vec![content],
                     ..Message::user(String::new())
                 },
                 usage: TokenUsage::default(),
                 stop_reason: Some(if child || self.root_requests.load(Ordering::SeqCst) > 1 {
-                    ApprovalStopReason::EndTurn
+                    StopReason::EndTurn
                 } else {
-                    ApprovalStopReason::ToolUse
+                    StopReason::ToolUse
                 }),
             })
         })
@@ -159,19 +176,17 @@ impl Provider for ApprovalChildProvider {
 
     fn list_models(
         &self,
-    ) -> ApprovalFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>>
-    {
+    ) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
 
 #[test]
-fn approval_rejects_active_managed_child_without_cancelling_it() {
+fn rejects_active_managed_child_without_cancelling_it() {
     with_event_loop(|event_loop| {
         let (index, path, requests, host) =
-            approval_setup_with_registry(event_loop, Arc::clone(ToolRegistry::global_arc()));
-        host.load_source("approval-child", APPROVAL_CHILD_TOOL)
-            .unwrap();
+            setup_with_registry(event_loop, Arc::clone(ToolRegistry::global_arc()));
+        host.load_source("approval-child", CHILD_TOOL).unwrap();
         event_loop.sessions[index]
             .app
             .permissions
@@ -181,7 +196,7 @@ fn approval_rejects_active_managed_child_without_cancelling_it() {
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let (record, recorded) = flume::unbounded();
-        let provider = Arc::new(ApprovalChildProvider {
+        let provider = Arc::new(ChildProvider {
             entered,
             release: gate,
             root_requests: AtomicUsize::new(0),
@@ -192,7 +207,7 @@ fn approval_rejects_active_managed_child_without_cancelling_it() {
             .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
                 maki_agent::actor::ConfigPatch {
                     model: Some(PreparedModel {
-                        model: Model::from_spec(APPROVAL_SOURCE_MODEL).unwrap(),
+                        model: Model::from_spec(SOURCE_MODEL).unwrap(),
                         provider: provider.clone(),
                     }),
                     ..Default::default()
@@ -200,18 +215,16 @@ fn approval_rejects_active_managed_child_without_cancelling_it() {
             )))
             .unwrap();
         smol::block_on(setter.wait()).unwrap();
-        event_loop
-            .submit_text(index, APPROVAL_HISTORY.into())
-            .unwrap();
-        approval_pump_until(event_loop, |_| !entry.is_empty());
+        event_loop.submit_text(index, HISTORY.into()).unwrap();
+        pump_until(event_loop, |_| !entry.is_empty());
         assert!(
             !entry.is_empty(),
             "child did not run after {} root requests; history: {}",
             provider.root_requests.load(Ordering::SeqCst),
             serde_json::to_string(&recorded.drain().collect::<Vec<_>>()).unwrap()
         );
-        entry.recv_timeout(APPROVAL_WAIT).unwrap();
-        approval_pump_until(event_loop, |event_loop| {
+        entry.recv_timeout(WAIT).unwrap();
+        pump_until(event_loop, |event_loop| {
             actor.snapshot().status == maki_agent::actor::ActorStatus::Idle
                 && event_loop.sessions[index].app.status == Status::Idle
         });
@@ -232,7 +245,7 @@ fn approval_rejects_active_managed_child_without_cancelling_it() {
         let saved_model = maki_storage::model::read_model(&event_loop.ctx.storage);
         let run = event_loop.sessions[index].app.run_id;
         let config = actor.effective_config().unwrap();
-        approval_dispatch(event_loop, index, &path, true);
+        approve(event_loop, index, &path, true);
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
         assert_eq!(event_loop.sessions[index].app.run_id, run);
         assert!(Arc::ptr_eq(&config, &actor.effective_config().unwrap()));
@@ -261,7 +274,7 @@ fn approval_rejects_active_managed_child_without_cancelling_it() {
         );
         assert!(requests.is_empty());
         release.send(()).unwrap();
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.status == Status::Idle
                 && child.snapshot().status == maki_agent::actor::ActorStatus::Idle
         });
@@ -270,42 +283,41 @@ fn approval_rejects_active_managed_child_without_cancelling_it() {
     });
 }
 
-fn approval_setup(
+fn setup(
     event_loop: &mut EventLoop<'_>,
-) -> (usize, PathBuf, flume::Receiver<ApprovalRequest>, PluginHost) {
-    approval_setup_with_registry(event_loop, Arc::new(ToolRegistry::new()))
+) -> (usize, PathBuf, flume::Receiver<RecordedRequest>, PluginHost) {
+    setup_with_registry(event_loop, Arc::new(ToolRegistry::new()))
 }
 
-fn approval_setup_with_registry(
+fn setup_with_registry(
     event_loop: &mut EventLoop<'_>,
     registry: Arc<ToolRegistry>,
-) -> (usize, PathBuf, flume::Receiver<ApprovalRequest>, PluginHost) {
+) -> (usize, PathBuf, flume::Receiver<RecordedRequest>, PluginHost) {
     let host = PluginHost::with_command_registry(
         registry,
         event_loop.ctx.command_runtime.registry.clone(),
         false,
     )
     .unwrap();
-    host.load_source("approval-observer", APPROVAL_AUTOCMD)
-        .unwrap();
+    host.load_source("approval-observer", AUTOCMD).unwrap();
     event_loop.ctx.lua_event_handle = host.event_handle();
     let path = PathBuf::from(&event_loop.session_cwd).join("approval-plan.md");
-    std::fs::write(&path, APPROVAL_PLAN).unwrap();
+    std::fs::write(&path, PLAN).unwrap();
     let (requests, receiver) = flume::unbounded();
-    let mut session = AppSession::new(APPROVAL_SOURCE_MODEL, &event_loop.session_cwd);
+    let mut session = AppSession::new(SOURCE_MODEL, &event_loop.session_cwd);
     session.meta.mode = Some(maki_storage::sessions::StoredMode::Plan);
     session.meta.plan_path = Some(path.display().to_string());
     session.meta.plan_written = true;
     session.meta.thinking = Some(DomainThinkingConfig::Off.into());
     session.meta.fast = true;
-    session.push_message(Message::user(APPROVAL_HISTORY.into()));
+    session.push_message(Message::user(HISTORY.into()));
     let runtime = event_loop
         .ctx
         .spawn_runtime_with_provider(
             session,
             Some(PreparedProvider {
-                model: Model::from_spec(APPROVAL_SOURCE_MODEL).unwrap(),
-                provider: Arc::new(ApprovalRecordingProvider {
+                model: Model::from_spec(SOURCE_MODEL).unwrap(),
+                provider: Arc::new(RecordingProvider {
                     requests: requests.clone(),
                     release: None,
                 }),
@@ -317,11 +329,11 @@ fn approval_setup_with_registry(
     event_loop.sessions[index]
         .app
         .plan_form
-        .set_implementation_model(APPROVAL_TARGET_MODEL.into(), APPROVAL_SOURCE_MODEL);
+        .set_implementation_model(TARGET_MODEL.into(), SOURCE_MODEL);
     event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
         Ok(PreparedModel {
             model: model.clone(),
-            provider: Arc::new(ApprovalRecordingProvider {
+            provider: Arc::new(RecordingProvider {
                 requests: requests.clone(),
                 release: None,
             }),
@@ -330,7 +342,7 @@ fn approval_setup_with_registry(
     (index, path, receiver, host)
 }
 
-fn approval_dispatch(event_loop: &mut EventLoop<'_>, index: usize, path: &Path, fresh: bool) {
+fn approve(event_loop: &mut EventLoop<'_>, index: usize, path: &Path, fresh: bool) {
     if !event_loop.sessions[index].app.plan_form.parallel() {
         event_loop.sessions[index]
             .app
@@ -342,15 +354,15 @@ fn approval_dispatch(event_loop: &mut EventLoop<'_>, index: usize, path: &Path, 
         index,
         vec![Action::ApprovePlan {
             clear_context: fresh,
-            model: Some(APPROVAL_TARGET_MODEL.into()),
+            model: Some(TARGET_MODEL.into()),
             parallel: true,
             path: path.to_path_buf(),
         }],
     );
 }
 
-fn approval_ready(event_loop: &mut EventLoop<'_>) -> InternalEvent {
-    let deadline = Instant::now() + APPROVAL_WAIT;
+fn next_ready(event_loop: &mut EventLoop<'_>) -> InternalEvent {
+    let deadline = Instant::now() + WAIT;
     loop {
         let event = event_loop
             .internal_rx
@@ -363,11 +375,8 @@ fn approval_ready(event_loop: &mut EventLoop<'_>) -> InternalEvent {
     }
 }
 
-fn approval_pump_until(
-    event_loop: &mut EventLoop<'_>,
-    mut done: impl FnMut(&EventLoop<'_>) -> bool,
-) {
-    let deadline = Instant::now() + APPROVAL_WAIT;
+fn pump_until(event_loop: &mut EventLoop<'_>, mut done: impl FnMut(&EventLoop<'_>) -> bool) {
+    let deadline = Instant::now() + WAIT;
     loop {
         while let Ok(event) = event_loop.internal_rx.try_recv() {
             event_loop.handle_internal(event);
@@ -392,22 +401,19 @@ fn approval_pump_until(
     }
 }
 
-fn approval_assert_preserved(event_loop: &EventLoop<'_>, index: usize, path: &Path, run_id: u64) {
+fn assert_preserved(event_loop: &EventLoop<'_>, index: usize, path: &Path, run_id: u64) {
     let app = &event_loop.sessions[index].app;
-    assert_eq!(app.state.model.spec(), APPROVAL_SOURCE_MODEL);
+    assert_eq!(app.state.model.spec(), SOURCE_MODEL);
     assert_eq!(app.state.mode, crate::app::mode::Mode::Plan);
     assert_eq!(app.state.plan.path(), Some(path));
-    assert_eq!(
-        app.plan_form.implementation_model(),
-        Some(APPROVAL_TARGET_MODEL)
-    );
+    assert_eq!(app.plan_form.implementation_model(), Some(TARGET_MODEL));
     assert_eq!(app.run_id, run_id);
     assert!(
         app.state
             .session
             .messages()
             .iter()
-            .any(|message| message.user_text() == Some(APPROVAL_HISTORY))
+            .any(|message| message.user_text() == Some(HISTORY))
     );
     assert!(!app.plan_approval_pending);
     assert_eq!(app.state.session.messages().len(), 1);
@@ -428,9 +434,9 @@ fn approval_assert_preserved(event_loop: &EventLoop<'_>, index: usize, path: &Pa
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
+fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, host) = approval_setup(event_loop);
+        let (index, path, requests, host) = setup(event_loop);
         let original_id = event_loop.sessions[index].id();
         let original_run = event_loop.sessions[index].app.run_id;
         let prefs =
@@ -438,9 +444,9 @@ fn approval_dispatch_uses_selected_provider_and_persists_completion(fresh: bool)
                 .unwrap();
         let stored_model = maki_storage::model::read_model(&event_loop.ctx.storage);
         let recents = maki_storage::model::read_recents(&event_loop.ctx.storage);
-        approval_dispatch(event_loop, index, &path, fresh);
-        approval_dispatch(event_loop, index, &path, fresh);
-        let ready = approval_ready(event_loop);
+        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, &path, fresh);
+        let ready = next_ready(event_loop);
         assert!(requests.is_empty());
         assert_eq!(event_loop.sessions[index].id(), original_id);
         assert_eq!(
@@ -458,7 +464,7 @@ fn approval_dispatch_uses_selected_provider_and_persists_completion(fresh: bool)
         );
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
-            APPROVAL_SOURCE_MODEL
+            SOURCE_MODEL
         );
         smol::block_on(host.event_handle().collect_prompt_slots_async());
         assert!(
@@ -470,7 +476,7 @@ fn approval_dispatch_uses_selected_provider_and_persists_completion(fresh: bool)
                 .all(|command| !command.spec().name.starts_with("/approval-start-"))
         );
         event_loop.handle_internal(ready);
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             let app = &event_loop.sessions[index].app;
             app.run_id == original_run.wrapping_add(1)
                 && app.status == Status::Idle
@@ -492,31 +498,31 @@ fn approval_dispatch_uses_selected_provider_and_persists_completion(fresh: bool)
             maki_storage::model::read_recents(&event_loop.ctx.storage)
                 .first()
                 .map(String::as_str),
-            Some(APPROVAL_TARGET_MODEL)
+            Some(TARGET_MODEL)
         );
         assert_eq!(
             maki_storage::model::read_model(&event_loop.ctx.storage).as_deref(),
-            Some(APPROVAL_TARGET_MODEL)
+            Some(TARGET_MODEL)
         );
         assert_eq!(
             serde_json::to_value(maki_storage::sessions::read_prefs(&event_loop.ctx.storage))
                 .unwrap(),
             prefs
         );
-        let (model, options, messages, _) = requests.recv_timeout(APPROVAL_WAIT).unwrap();
-        assert_eq!(model, APPROVAL_TARGET_MODEL);
+        let (model, options, messages, _) = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(model, TARGET_MODEL);
         assert_eq!(
             options,
-            ApprovalOptions {
+            RequestOptions {
                 thinking: DomainThinkingConfig::Off,
                 fast: true
             }
-            .clamped(&Model::from_spec(APPROVAL_TARGET_MODEL).unwrap())
+            .clamped(&Model::from_spec(TARGET_MODEL).unwrap())
         );
         assert_eq!(
             messages
                 .iter()
-                .any(|message| message.user_text() == Some(APPROVAL_HISTORY)),
+                .any(|message| message.user_text() == Some(HISTORY)),
             !fresh
         );
         let instruction = messages
@@ -530,7 +536,7 @@ fn approval_dispatch_uses_selected_provider_and_persists_completion(fresh: bool)
         let runtime = &mut event_loop.sessions[index];
         assert_eq!(runtime.id() != original_id, fresh);
         assert_eq!(runtime.app.state.mode, crate::app::mode::Mode::Build);
-        assert_eq!(runtime.app.state.model.spec(), APPROVAL_TARGET_MODEL);
+        assert_eq!(runtime.app.state.model.spec(), TARGET_MODEL);
         assert_eq!(runtime.app.plan_form.implementation_model(), None);
         let (manager, root) = runtime.handles.manager_and_root();
         assert_eq!(
@@ -553,7 +559,7 @@ fn approval_dispatch_uses_selected_provider_and_persists_completion(fresh: bool)
         }))
         .unwrap();
         let restored = AppSession::load(runtime.id(), &event_loop.ctx.storage).unwrap();
-        assert_eq!(restored.model, APPROVAL_TARGET_MODEL);
+        assert_eq!(restored.model, TARGET_MODEL);
         assert_eq!(
             restored.meta.mode,
             Some(maki_storage::sessions::StoredMode::Build)
@@ -564,21 +570,26 @@ fn approval_dispatch_uses_selected_provider_and_persists_completion(fresh: bool)
             restored
                 .messages()
                 .iter()
-                .any(|message| message.user_text() == Some(APPROVAL_HISTORY)),
+                .any(|message| message.user_text() == Some(HISTORY)),
             !fresh
         );
-        assert!(restored.messages().iter().any(|message| message.content.iter().any(|block| matches!(block, ApprovalContentBlock::Text { text } if text == APPROVAL_RESPONSE))));
+        assert!(restored.messages().iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == RESPONSE))
+        }));
         assert!(requests.is_empty());
     });
 }
 
-fn approval_final_ready(
+fn final_ready(
     event_loop: &mut EventLoop<'_>,
     fresh: bool,
-    requests: &flume::Receiver<ApprovalRequest>,
+    requests: &flume::Receiver<RecordedRequest>,
 ) -> InternalEvent {
     loop {
-        let ready = approval_ready(event_loop);
+        let ready = next_ready(event_loop);
         assert!(requests.is_empty());
         match &ready {
             InternalEvent::PlanApprovalReady {
@@ -595,7 +606,7 @@ fn approval_final_ready(
     }
 }
 
-fn approval_mode_events(event_loop: &EventLoop<'_>, index: usize) -> usize {
+fn mode_events(event_loop: &EventLoop<'_>, index: usize) -> usize {
     let app = &event_loop.sessions[index].app;
     smol::block_on(app.lua_event_handle.collect_prompt_slots_async());
     event_loop
@@ -611,18 +622,18 @@ fn approval_mode_events(event_loop: &EventLoop<'_>, index: usize) -> usize {
 }
 
 #[test]
-fn approval_mode_transition_emits_once_and_config_only_emits_none() {
+fn mode_transition_emits_once_and_config_only_emits_none() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
-        let before = approval_mode_events(event_loop, index);
-        approval_dispatch(event_loop, index, &path, false);
-        approval_pump_until(event_loop, |event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        let before = mode_events(event_loop, index);
+        approve(event_loop, index, &path, false);
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
-        requests.recv_timeout(APPROVAL_WAIT).unwrap();
+        requests.recv_timeout(WAIT).unwrap();
         let _ = event_loop.tick();
-        assert_eq!(approval_mode_events(event_loop, index), before + 1);
+        assert_eq!(mode_events(event_loop, index), before + 1);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let setter = actor.reserve_config_update().unwrap();
@@ -637,14 +648,14 @@ fn approval_mode_transition_emits_once_and_config_only_emits_none() {
         let commit = smol::block_on(setter.wait()).unwrap();
         event_loop.sessions[index].project_config(&commit);
         let _ = event_loop.tick();
-        assert_eq!(approval_mode_events(event_loop, index), before + 1);
+        assert_eq!(mode_events(event_loop, index), before + 1);
     });
 }
 
 #[test]
-fn approval_fresh_forgets_retired_cache_but_preserves_saved_source() {
+fn fresh_forgets_retired_cache_but_preserves_saved_source() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let source = event_loop.sessions[index].id();
         event_loop.sessions[index].app.checkpoint_now();
         let snapshot = Arc::clone(&event_loop.sessions[index].app.state.session);
@@ -664,12 +675,12 @@ fn approval_fresh_forgets_retired_cache_but_preserves_saved_source() {
                 .latest_snapshot(source)
                 .is_some()
         );
-        approval_dispatch(event_loop, index, &path, true);
-        approval_pump_until(event_loop, |event_loop| {
+        approve(event_loop, index, &path, true);
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
-        requests.recv_timeout(APPROVAL_WAIT).unwrap();
+        requests.recv_timeout(WAIT).unwrap();
         assert!(
             event_loop
                 .ctx
@@ -682,42 +693,42 @@ fn approval_fresh_forgets_retired_cache_but_preserves_saved_source() {
             restored
                 .messages()
                 .iter()
-                .any(|message| message.user_text() == Some(APPROVAL_HISTORY))
+                .any(|message| message.user_text() == Some(HISTORY))
         );
-        assert_eq!(restored.model, APPROVAL_SOURCE_MODEL);
+        assert_eq!(restored.model, SOURCE_MODEL);
     });
 }
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
+fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let source_id = event_loop.sessions[index].id();
         let (record, recorded) = flume::unbounded();
         let (release, gate) = flume::bounded(1);
         event_loop.ctx.prepare_provider = Arc::new(move |model, _| {
             Ok(PreparedModel {
                 model,
-                provider: Arc::new(ApprovalRecordingProvider {
+                provider: Arc::new(RecordingProvider {
                     requests: record.clone(),
                     release: Some(gate.clone()),
                 }),
             })
         });
-        approval_dispatch(event_loop, index, &path, fresh);
-        approval_pump_until(event_loop, |event_loop| {
+        approve(event_loop, index, &path, fresh);
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && !recorded.is_empty()
         });
-        let (model, _, _, _) = recorded.recv_timeout(APPROVAL_WAIT).unwrap();
-        assert_eq!(model, APPROVAL_TARGET_MODEL);
+        let (model, _, _, _) = recorded.recv_timeout(WAIT).unwrap();
+        assert_eq!(model, TARGET_MODEL);
         let id = event_loop.sessions[index].id();
         let identity = event_loop.sessions[index].handles.identity();
         assert_eq!(id != source_id, fresh);
         let run = event_loop.sessions[index].app.run_id;
         event_loop.dispatch(index, vec![Action::CancelAgent { run_id: run }]);
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.status == Status::Idle
         });
         assert_eq!(event_loop.sessions[index].id(), id);
@@ -731,7 +742,7 @@ fn approval_postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         );
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
-            APPROVAL_TARGET_MODEL
+            TARGET_MODEL
         );
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
         assert!(event_loop.sessions[index].app.state.plan.path().is_none());
@@ -742,14 +753,14 @@ fn approval_postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
 }
 
 #[test]
-fn approval_fresh_candidate_cancel_releases_source_setter() {
+fn fresh_candidate_cancel_releases_source_setter() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let original_id = event_loop.sessions[index].id();
         let original_identity = event_loop.sessions[index].handles.identity();
         let run = event_loop.sessions[index].app.run_id;
-        approval_dispatch(event_loop, index, &path, true);
-        let ready = approval_final_ready(event_loop, true, &requests);
+        approve(event_loop, index, &path, true);
+        let ready = final_ready(event_loop, true, &requests);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let before = actor.effective_config().unwrap();
@@ -766,7 +777,7 @@ fn approval_fresh_candidate_cancel_releases_source_setter() {
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         event_loop.handle_internal(ready);
         smol::block_on(successor.wait()).unwrap();
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         assert_eq!(event_loop.sessions[index].id(), original_id);
         assert!(Arc::ptr_eq(
             &original_identity,
@@ -779,38 +790,38 @@ fn approval_fresh_candidate_cancel_releases_source_setter() {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_runtime_identity_rejects_stale_completion(fresh: bool) {
+fn runtime_identity_rejects_stale_completion(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
-        approval_dispatch(event_loop, index, &path, fresh);
-        let mut ready = approval_ready(event_loop);
+        approve(event_loop, index, &path, fresh);
+        let mut ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady { runtime, .. } = &mut ready {
             *runtime = Arc::new(());
         }
         event_loop.handle_internal(ready);
         assert!(event_loop.sessions[index].app.plan_approval_pending);
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         assert!(requests.is_empty());
     });
 }
 
-struct ApprovalLockDisposal {
+struct LockDisposal {
     path: PathBuf,
     disposed: flume::Sender<io::Result<String>>,
 }
 
-impl Drop for ApprovalLockDisposal {
+impl Drop for LockDisposal {
     fn drop(&mut self) {
         let _ = self.disposed.send(std::fs::read_to_string(&self.path));
     }
 }
 
 #[test]
-fn approval_fresh_cancel_releases_source_before_target_lock_returns() {
+fn fresh_cancel_releases_source_before_target_lock_returns() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let source = event_loop.sessions[index].id();
         let identity = event_loop.sessions[index].handles.identity();
         let run = event_loop.sessions[index].app.run_id;
@@ -822,18 +833,18 @@ fn approval_fresh_cancel_releases_source_before_target_lock_returns() {
         let (disposed, disposal) = flume::bounded(1);
         let sessions_dir = event_loop.ctx.sessions_dir.clone();
         event_loop.ctx.lock_prepare_gate = Some(Arc::new(move |target| {
-            let guard = ApprovalLockDisposal {
+            let guard = LockDisposal {
                 path: session_lock::lock_path(&sessions_dir, &target),
                 disposed: disposed.clone(),
             };
             entered.send(target).unwrap();
-            gate.recv_timeout(APPROVAL_WAIT).unwrap();
+            gate.recv_timeout(WAIT).unwrap();
             Box::new(guard)
         }));
-        approval_dispatch(event_loop, index, &path, true);
-        let ready = approval_ready(event_loop);
+        approve(event_loop, index, &path, true);
+        let ready = next_ready(event_loop);
         event_loop.handle_internal(ready);
-        let target = entry.recv_timeout(APPROVAL_WAIT).unwrap();
+        let target = entry.recv_timeout(WAIT).unwrap();
         assert!(disposal.is_empty());
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
@@ -851,20 +862,17 @@ fn approval_fresh_cancel_releases_source_before_target_lock_returns() {
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         smol::block_on(bounded_session_op(
             async { successor.wait().await.map_err(|error| error.to_string()) },
-            APPROVAL_WAIT,
+            WAIT,
         ))
         .unwrap();
         assert!(!actor.effective_config().unwrap().fast);
         assert!(disposal.is_empty());
         assert!(!session_lock::lock_path(&event_loop.sessions_dir, &target).exists());
-        let cancelled = approval_ready(event_loop);
+        let cancelled = next_ready(event_loop);
         event_loop.handle_internal(cancelled);
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         release.send(()).unwrap();
-        assert_eq!(
-            disposal.recv_timeout(APPROVAL_WAIT).unwrap().unwrap(),
-            APPROVAL_RELEASED_LOCK
-        );
+        assert_eq!(disposal.recv_timeout(WAIT).unwrap().unwrap(), RELEASED_LOCK);
         event_loop.ctx.lock_prepare_gate = None;
         assert_eq!(event_loop.sessions[index].id(), source);
         assert!(Arc::ptr_eq(
@@ -884,7 +892,7 @@ fn approval_fresh_cancel_releases_source_before_target_lock_returns() {
             saved_model
         );
         assert!(SessionCoordinatorHandle::resolve(target).is_err());
-        assert!(SessionMailbox::notify(target, APPROVAL_RESPONSE.into(), false).is_err());
+        assert!(SessionMailbox::notify(target, RESPONSE.into(), false).is_err());
         assert!(
             event_loop
                 .ctx
@@ -913,24 +921,24 @@ fn approval_fresh_cancel_releases_source_before_target_lock_returns() {
 }
 
 #[test]
-fn approval_fresh_target_lock_failure_preserves_runtime_and_storage() {
+fn fresh_target_lock_failure_preserves_runtime_and_storage() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let id = event_loop.sessions[index].id();
         let identity = event_loop.sessions[index].handles.identity();
         let targets = event_loop.ctx.command_runtime.registry.target_count();
         let run = event_loop.sessions[index].app.run_id;
-        approval_dispatch(event_loop, index, &path, true);
-        let ready = approval_ready(event_loop);
+        approve(event_loop, index, &path, true);
+        let ready = next_ready(event_loop);
         let blocked = PathBuf::from(&event_loop.session_cwd).join("approval-lock-file");
         std::fs::write(&blocked, []).unwrap();
         let sessions = std::mem::replace(&mut event_loop.ctx.sessions_dir, blocked);
         event_loop.handle_internal(ready);
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
         event_loop.ctx.sessions_dir = sessions;
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(Arc::ptr_eq(
             &identity,
@@ -945,15 +953,15 @@ fn approval_fresh_target_lock_failure_preserves_runtime_and_storage() {
 }
 
 #[test]
-fn approval_fresh_activation_failure_releases_candidate_resources() {
+fn fresh_activation_failure_releases_candidate_resources() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let source_id = event_loop.sessions[index].id();
         let source_identity = event_loop.sessions[index].handles.identity();
         let targets = event_loop.ctx.command_runtime.registry.target_count();
         let run = event_loop.sessions[index].app.run_id;
-        approval_dispatch(event_loop, index, &path, true);
-        let ready = approval_final_ready(event_loop, true, &requests);
+        approve(event_loop, index, &path, true);
+        let ready = final_ready(event_loop, true, &requests);
         let InternalEvent::PlanApprovalReady {
             result: Ok(prepared),
             ..
@@ -986,7 +994,7 @@ fn approval_fresh_activation_failure_releases_candidate_resources() {
         .activate()
         .unwrap();
         event_loop.handle_internal(ready);
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         assert_eq!(event_loop.sessions[index].id(), source_id);
         assert!(Arc::ptr_eq(
             &source_identity,
@@ -996,7 +1004,7 @@ fn approval_fresh_activation_failure_releases_candidate_resources() {
             event_loop.ctx.command_runtime.registry.target_count(),
             targets
         );
-        let deadline = Instant::now() + APPROVAL_WAIT;
+        let deadline = Instant::now() + WAIT;
         while ticket.peek().is_none() || !manager.runner_finished(root).unwrap() {
             assert!(
                 Instant::now() < deadline,
@@ -1030,21 +1038,21 @@ fn approval_fresh_activation_failure_releases_candidate_resources() {
         assert!(requests.is_empty());
         duplicate.retire();
         assert!(SessionCoordinatorHandle::resolve(target).is_err());
-        assert!(SessionMailbox::notify(target, APPROVAL_RESPONSE.into(), false).is_err());
+        assert!(SessionMailbox::notify(target, RESPONSE.into(), false).is_err());
     });
 }
 
 #[cfg(unix)]
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_cancel_releases_setter_before_final_read_returns(fresh: bool) {
+fn cancel_releases_setter_before_final_read_returns(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
-        approval_dispatch(event_loop, index, &path, fresh);
-        let mut ready = approval_ready(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
+        approve(event_loop, index, &path, fresh);
+        let mut ready = next_ready(event_loop);
         if fresh {
             event_loop.handle_internal(ready);
-            ready = approval_ready(event_loop);
+            ready = next_ready(event_loop);
         }
         std::fs::remove_file(&path).unwrap();
         assert!(
@@ -1064,10 +1072,10 @@ fn approval_cancel_releases_setter_before_final_read_returns(fresh: bool) {
                 .unwrap();
             entered.send(()).unwrap();
             gate.recv().unwrap();
-            file.write_all(APPROVAL_PLAN.as_bytes()).unwrap();
+            file.write_all(PLAN.as_bytes()).unwrap();
         });
         event_loop.handle_internal(ready);
-        entry.recv_timeout(APPROVAL_WAIT).unwrap();
+        entry.recv_timeout(WAIT).unwrap();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let successor = actor.reserve_config_update().unwrap();
@@ -1082,17 +1090,17 @@ fn approval_cancel_releases_setter_before_final_read_returns(fresh: bool) {
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         smol::block_on(bounded_session_op(
             async { successor.wait().await.map_err(|error| error.to_string()) },
-            APPROVAL_WAIT,
+            WAIT,
         ))
         .unwrap();
         assert!(!actor.effective_config().unwrap().fast);
         assert!(requests.is_empty());
         release.send(()).unwrap();
         writer.join().unwrap();
-        let cancelled = approval_ready(event_loop);
+        let cancelled = next_ready(event_loop);
         event_loop.handle_internal(cancelled);
         std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, APPROVAL_PLAN).unwrap();
+        std::fs::write(&path, PLAN).unwrap();
         assert_eq!(
             event_loop.sessions[index].app.state.mode,
             crate::app::mode::Mode::Plan
@@ -1103,19 +1111,19 @@ fn approval_cancel_releases_setter_before_final_read_returns(fresh: bool) {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_final_event_preserves_immutable_plan_input(fresh: bool) {
+fn final_event_preserves_immutable_plan_input(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
-        approval_dispatch(event_loop, index, &path, fresh);
-        let ready = approval_final_ready(event_loop, fresh, &requests);
+        let (index, path, requests, _host) = setup(event_loop);
+        approve(event_loop, index, &path, fresh);
+        let ready = final_ready(event_loop, fresh, &requests);
         const MUTATED: &str = "# Late edit\nDo not implement this changed revision.\n";
         std::fs::write(&path, MUTATED).unwrap();
         event_loop.handle_internal(ready);
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
-        let (_, _, messages, system) = requests.recv_timeout(APPROVAL_WAIT).unwrap();
+        let (_, _, messages, system) = requests.recv_timeout(WAIT).unwrap();
         let input = format!(
             "{}\n{}",
             system,
@@ -1126,7 +1134,7 @@ fn approval_final_event_preserves_immutable_plan_input(fresh: bool) {
                 .join("\n")
         );
         assert!(
-            input.contains(APPROVAL_PLAN.trim()),
+            input.contains(PLAN.trim()),
             "approved content missing from implementation input"
         );
         assert!(!input.contains(MUTATED.trim()));
@@ -1136,9 +1144,9 @@ fn approval_final_event_preserves_immutable_plan_input(fresh: bool) {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_inflight_heartbeat_does_not_abort(fresh: bool) {
+fn inflight_heartbeat_does_not_abort(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         start_runtime_heartbeat_with(
@@ -1150,40 +1158,40 @@ fn approval_inflight_heartbeat_does_not_abort(fresh: bool) {
                 (lease, Ok(session_lock::LockBeat::Held))
             },
         );
-        entry.recv_timeout(APPROVAL_WAIT).unwrap();
-        approval_dispatch(event_loop, index, &path, fresh);
-        let ready = approval_final_ready(event_loop, fresh, &requests);
+        entry.recv_timeout(WAIT).unwrap();
+        approve(event_loop, index, &path, fresh);
+        let ready = final_ready(event_loop, fresh, &requests);
         event_loop.handle_internal(ready);
         assert!(
             event_loop.sessions[index].app.plan_approval_pending
                 || event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
         );
         release.send(()).unwrap();
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
-        requests.recv_timeout(APPROVAL_WAIT).unwrap();
+        requests.recv_timeout(WAIT).unwrap();
         assert!(requests.is_empty());
     });
 }
 
 #[test_case(false; "directory")]
 #[test_case(true; "history")]
-fn approval_fresh_source_lease_defers_mutation_until_cancel(history: bool) {
+fn fresh_source_lease_defers_mutation_until_cancel(history: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let cwd = event_loop.sessions[index].coordinator.read().cwd();
         let original = event_loop.sessions[index].coordinator.read().history();
         let changed = cwd.join("approved-directory");
         std::fs::create_dir(&changed).unwrap();
-        approval_dispatch(event_loop, index, &path, true);
-        let ready = approval_final_ready(event_loop, true, &requests);
+        approve(event_loop, index, &path, true);
+        let ready = final_ready(event_loop, true, &requests);
         let coordinator = event_loop.sessions[index].coordinator.clone();
         let mutation = async {
             if history {
                 coordinator
-                    .replace_history(vec![Message::user(APPROVAL_RESPONSE.into())])
+                    .replace_history(vec![Message::user(RESPONSE.into())])
                     .await
                     .map(|_| ())
             } else {
@@ -1201,14 +1209,11 @@ fn approval_fresh_source_lease_defers_mutation_until_cancel(history: bool) {
         event_loop.handle_internal(ready);
         smol::block_on(bounded_session_op(
             async { mutation.await.map_err(|error| error.to_string()) },
-            APPROVAL_WAIT,
+            WAIT,
         ))
         .unwrap();
         if history {
-            assert_eq!(
-                coordinator.read().history()[0].user_text(),
-                Some(APPROVAL_RESPONSE)
-            );
+            assert_eq!(coordinator.read().history()[0].user_text(), Some(RESPONSE));
             assert_eq!(coordinator.read().cwd(), cwd);
         } else {
             assert_eq!(coordinator.read().cwd(), changed);
@@ -1223,17 +1228,16 @@ fn approval_fresh_source_lease_defers_mutation_until_cancel(history: bool) {
 }
 
 #[test]
-fn approval_fresh_uses_finalized_history_and_captured_absolute_path() {
+fn fresh_uses_finalized_history_and_captured_absolute_path() {
     with_event_loop(|event_loop| {
-        let (index, original_path, requests, _host) = approval_setup(event_loop);
+        let (index, original_path, requests, _host) = setup(event_loop);
         let coordinator = event_loop.sessions[index].coordinator.clone();
         let cwd = coordinator.read().cwd().join("source-directory");
         std::fs::create_dir(&cwd).unwrap();
         smol::block_on(coordinator.change_directory(cwd.clone())).unwrap();
         let lease = smol::block_on(coordinator.acquire_lease()).unwrap();
         let committer = lease.committer().unwrap();
-        smol::block_on(committer.commit_history(vec![Message::user(APPROVAL_RESPONSE.into())]))
-            .unwrap();
+        smol::block_on(committer.commit_history(vec![Message::user(RESPONSE.into())])).unwrap();
         drop(lease);
         let relative = PathBuf::from("relative-plan.md");
         let absolute = cwd.join(&relative);
@@ -1242,8 +1246,8 @@ fn approval_fresh_uses_finalized_history_and_captured_absolute_path() {
             cwd.display().to_string();
         event_loop.sessions[index].app.state.plan =
             crate::app::mode::PlanState::Ready(relative.clone());
-        approval_dispatch(event_loop, index, &relative, true);
-        let ready = approval_ready(event_loop);
+        approve(event_loop, index, &relative, true);
+        let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {
             result: Ok(prepared),
             ..
@@ -1252,23 +1256,23 @@ fn approval_fresh_uses_finalized_history_and_captured_absolute_path() {
             assert_eq!(prepared.source.snapshot().cwd(), cwd);
             assert_eq!(
                 prepared.source.snapshot().history()[0].user_text(),
-                Some(APPROVAL_RESPONSE)
+                Some(RESPONSE)
             );
             assert_eq!(prepared.plan.path, absolute);
         } else {
             panic!("fresh source capture failed");
         }
         event_loop.handle_internal(ready);
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
         });
-        let (_, _, messages, _) = requests.recv_timeout(APPROVAL_WAIT).unwrap();
+        let (_, _, messages, _) = requests.recv_timeout(WAIT).unwrap();
         assert!(
             !messages
                 .iter()
-                .any(|message| message.user_text() == Some(APPROVAL_HISTORY)
-                    || message.user_text() == Some(APPROVAL_RESPONSE))
+                .any(|message| message.user_text() == Some(HISTORY)
+                    || message.user_text() == Some(RESPONSE))
         );
         assert!(
             messages
@@ -1282,9 +1286,9 @@ fn approval_fresh_uses_finalized_history_and_captured_absolute_path() {
 }
 
 #[test]
-fn approval_fresh_stale_cwd_rejects_relative_path() {
+fn fresh_stale_cwd_rejects_relative_path() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
         let coordinator = event_loop.sessions[index].coordinator.clone();
         let cwd = coordinator.read().cwd().join("changed-directory");
@@ -1293,26 +1297,26 @@ fn approval_fresh_stale_cwd_rejects_relative_path() {
         let relative = PathBuf::from(path.file_name().unwrap());
         event_loop.sessions[index].app.state.plan =
             crate::app::mode::PlanState::Ready(relative.clone());
-        approval_dispatch(event_loop, index, &relative, true);
-        approval_pump_until(event_loop, |event_loop| {
+        approve(event_loop, index, &relative, true);
+        pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        approval_assert_preserved(event_loop, index, &relative, run);
+        assert_preserved(event_loop, index, &relative, run);
         assert!(requests.is_empty());
     });
 }
 
 #[test]
-fn approval_fresh_permission_change_before_activation_preserves_source() {
+fn fresh_permission_change_before_activation_preserves_source() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
-        approval_dispatch(event_loop, index, &path, true);
-        let ready = approval_final_ready(event_loop, true, &requests);
+        approve(event_loop, index, &path, true);
+        let ready = final_ready(event_loop, true, &requests);
         event_loop.sessions[index].app.permissions.toggle_yolo();
         event_loop.handle_internal(ready);
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(requests.is_empty());
     });
@@ -1320,26 +1324,26 @@ fn approval_fresh_permission_change_before_activation_preserves_source() {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_provider_preparation_failure_preserves_plan(fresh: bool) {
+fn provider_preparation_failure_preserves_plan(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
-        event_loop.ctx.prepare_provider = Arc::new(|_, _| Err(APPROVAL_PROVIDER_FAILURE.into()));
-        approval_dispatch(event_loop, index, &path, fresh);
-        approval_pump_until(event_loop, |event_loop| {
+        event_loop.ctx.prepare_provider = Arc::new(|_, _| Err(PROVIDER_FAILURE.into()));
+        approve(event_loop, index, &path, fresh);
+        pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(requests.is_empty());
     });
 }
 
 #[test]
-fn approval_cancel_during_provider_preparation_ignores_late_result() {
+fn cancel_during_provider_preparation_ignores_late_result() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
@@ -1351,20 +1355,20 @@ fn approval_cancel_during_provider_preparation_ignores_late_result() {
             completed.send(()).unwrap();
             Ok(PreparedModel {
                 model,
-                provider: Arc::new(ApprovalRecordingProvider {
+                provider: Arc::new(RecordingProvider {
                     requests: record.clone(),
                     release: None,
                 }),
             })
         });
-        approval_dispatch(event_loop, index, &path, false);
-        entry.recv_timeout(APPROVAL_WAIT).unwrap();
+        approve(event_loop, index, &path, false);
+        entry.recv_timeout(WAIT).unwrap();
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
-        let cancelled = approval_ready(event_loop);
+        let cancelled = next_ready(event_loop);
         event_loop.handle_internal(cancelled);
         release.send(()).unwrap();
-        completion.recv_timeout(APPROVAL_WAIT).unwrap();
-        approval_assert_preserved(event_loop, index, &path, run);
+        completion.recv_timeout(WAIT).unwrap();
+        assert_preserved(event_loop, index, &path, run);
         assert!(requests.is_empty());
         assert!(late_requests.is_empty());
     });
@@ -1372,34 +1376,34 @@ fn approval_cancel_during_provider_preparation_ignores_late_result() {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_cancel_before_ready_preserves_plan(fresh: bool) {
+fn cancel_before_ready_preserves_plan(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
-        approval_dispatch(event_loop, index, &path, fresh);
-        let ready = approval_ready(event_loop);
+        approve(event_loop, index, &path, fresh);
+        let ready = next_ready(event_loop);
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         event_loop.handle_internal(ready);
         let _ = event_loop.tick();
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         assert!(requests.is_empty());
     });
 }
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_save_failure_retains_committed_selection(fresh: bool) {
+fn save_failure_retains_committed_selection(fresh: bool) {
     with_event_loop(|event_loop| {
         let (warnings, warning_rx) = flume::unbounded();
         event_loop.ctx.storage_writer =
             Arc::new(StorageWriter::new(event_loop.ctx.storage.clone(), warnings));
-        let (index, path, requests, _host) = approval_setup(event_loop);
-        approval_dispatch(event_loop, index, &path, fresh);
-        approval_pump_until(event_loop, |event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        approve(event_loop, index, &path, fresh);
+        pump_until(event_loop, |event_loop| {
             let app = &event_loop.sessions[index].app;
             app.state.mode == crate::app::mode::Mode::Build && app.status == Status::Idle
         });
-        requests.recv_timeout(APPROVAL_WAIT).unwrap();
+        requests.recv_timeout(WAIT).unwrap();
         let id = event_loop.sessions[index].id();
         let runtime = &event_loop.sessions[index];
         smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
@@ -1417,16 +1421,16 @@ fn approval_save_failure_retains_committed_selection(fresh: bool) {
         std::fs::create_dir(&log).unwrap();
         event_loop.sessions[index].app.state.session = Arc::new({
             let mut session = (*event_loop.sessions[index].app.state.session).clone();
-            session.set_title(APPROVAL_RESPONSE.into());
+            session.set_title(RESPONSE.into());
             session
         });
         event_loop.sessions[index].app.checkpoint_now();
-        let warning = warning_rx.recv_timeout(APPROVAL_WAIT).unwrap();
+        let warning = warning_rx.recv_timeout(WAIT).unwrap();
         assert!(warning.starts_with("Session save failed"), "{warning}");
         assert_eq!(event_loop.sessions[index].id(), id);
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
-            APPROVAL_TARGET_MODEL
+            TARGET_MODEL
         );
         assert_eq!(
             event_loop.sessions[index].app.state.mode,
@@ -1447,7 +1451,7 @@ fn approval_save_failure_retains_committed_selection(fresh: bool) {
         .unwrap();
         assert_eq!(
             AppSession::load(id, &event_loop.ctx.storage).unwrap().model,
-            APPROVAL_TARGET_MODEL
+            TARGET_MODEL
         );
         assert!(requests.is_empty());
     });
@@ -1455,9 +1459,9 @@ fn approval_save_failure_retains_committed_selection(fresh: bool) {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_without_override_uses_actor_predecessor(fresh: bool) {
+fn without_override_uses_actor_predecessor(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let (record, recorded) = flume::unbounded();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
@@ -1466,8 +1470,8 @@ fn approval_without_override_uses_actor_predecessor(fresh: bool) {
             .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
                 maki_agent::actor::ConfigPatch {
                     model: Some(PreparedModel {
-                        model: Model::from_spec(APPROVAL_TARGET_MODEL).unwrap(),
-                        provider: Arc::new(ApprovalRecordingProvider {
+                        model: Model::from_spec(TARGET_MODEL).unwrap(),
+                        provider: Arc::new(RecordingProvider {
                             requests: record,
                             release: None,
                         }),
@@ -1482,7 +1486,7 @@ fn approval_without_override_uses_actor_predecessor(fresh: bool) {
         drop(smol::block_on(event_loop.sessions[index].coordinator.acquire_lease()).unwrap());
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
-            APPROVAL_SOURCE_MODEL
+            SOURCE_MODEL
         );
         event_loop.ctx.prepare_provider =
             Arc::new(|_, _| panic!("no-override approval must reuse actor provider"));
@@ -1497,7 +1501,7 @@ fn approval_without_override_uses_actor_predecessor(fresh: bool) {
                 path,
             }],
         );
-        let ready = approval_ready(event_loop);
+        let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {
             result: Err(error), ..
         } = &ready
@@ -1505,15 +1509,15 @@ fn approval_without_override_uses_actor_predecessor(fresh: bool) {
             panic!("no-override preparation failed: {error}");
         }
         event_loop.handle_internal(ready);
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             let app = &event_loop.sessions[index].app;
             !app.plan_approval_pending && app.status == Status::Idle
         });
-        let (model, options, _, _) = recorded.recv_timeout(APPROVAL_WAIT).unwrap();
-        assert_eq!(model, APPROVAL_TARGET_MODEL);
+        let (model, options, _, _) = recorded.recv_timeout(WAIT).unwrap();
+        assert_eq!(model, TARGET_MODEL);
         assert_eq!(
             options,
-            ApprovalOptions {
+            RequestOptions {
                 thinking: DomainThinkingConfig::Off,
                 fast: false
             }
@@ -1522,15 +1526,15 @@ fn approval_without_override_uses_actor_predecessor(fresh: bool) {
         assert!(requests.is_empty());
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
-            APPROVAL_TARGET_MODEL
+            TARGET_MODEL
         );
     });
 }
 
 #[test]
-fn approval_busy_rejection_preserves_active_turn() {
+fn busy_rejection_preserves_active_turn() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let (active_requests, active_rx) = flume::unbounded();
         let (release, gate) = flume::bounded(1);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
@@ -1540,8 +1544,8 @@ fn approval_busy_rejection_preserves_active_turn() {
             .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
                 maki_agent::actor::ConfigPatch {
                     model: Some(PreparedModel {
-                        model: Model::from_spec(APPROVAL_SOURCE_MODEL).unwrap(),
-                        provider: Arc::new(ApprovalRecordingProvider {
+                        model: Model::from_spec(SOURCE_MODEL).unwrap(),
+                        provider: Arc::new(RecordingProvider {
                             requests: active_requests,
                             release: Some(gate),
                         }),
@@ -1551,13 +1555,11 @@ fn approval_busy_rejection_preserves_active_turn() {
             )))
             .unwrap();
         smol::block_on(change.wait()).unwrap();
-        event_loop
-            .submit_text(index, APPROVAL_HISTORY.into())
-            .unwrap();
-        active_rx.recv_timeout(APPROVAL_WAIT).unwrap();
+        event_loop.submit_text(index, HISTORY.into()).unwrap();
+        active_rx.recv_timeout(WAIT).unwrap();
         let run = event_loop.sessions[index].app.run_id;
         let config = actor.effective_config().unwrap();
-        approval_dispatch(event_loop, index, &path, false);
+        approve(event_loop, index, &path, false);
         assert_eq!(event_loop.sessions[index].app.run_id, run);
         assert_eq!(event_loop.sessions[index].app.status, Status::Streaming);
         assert_eq!(
@@ -1573,13 +1575,13 @@ fn approval_busy_rejection_preserves_active_turn() {
                 .app
                 .plan_form
                 .implementation_model(),
-            Some(APPROVAL_TARGET_MODEL)
+            Some(TARGET_MODEL)
         );
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
         assert!(Arc::ptr_eq(&config, &actor.effective_config().unwrap()));
         assert!(requests.is_empty());
         release.send(()).unwrap();
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.status == Status::Idle
         });
         assert!(active_rx.is_empty());
@@ -1588,18 +1590,18 @@ fn approval_busy_rejection_preserves_active_turn() {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn approval_changed_plan_before_commit_preserves_session(fresh: bool) {
+fn changed_plan_before_commit_preserves_session(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = approval_setup(event_loop);
+        let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
-        approval_dispatch(event_loop, index, &path, fresh);
-        let ready = approval_ready(event_loop);
+        approve(event_loop, index, &path, fresh);
+        let ready = next_ready(event_loop);
         std::fs::write(&path, "# Changed plan\nDo not approve the old contents.\n").unwrap();
         event_loop.handle_internal(ready);
-        approval_pump_until(event_loop, |event_loop| {
+        pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
-        approval_assert_preserved(event_loop, index, &path, run);
+        assert_preserved(event_loop, index, &path, run);
         assert!(requests.is_empty());
     });
 }
