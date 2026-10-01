@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use maki_agent::SessionMailbox;
 use maki_agent::actor::PreparedModel;
 use maki_agent::manager::ManagerError;
@@ -32,7 +32,8 @@ use super::super::{
 };
 use super::ApprovalStep;
 use crate::AppSession;
-use crate::components::{Action, Status};
+use crate::components::keybindings::key;
+use crate::components::{self, Action, Status};
 use crate::plan_approval::{APPROVAL_BUSY, APPROVAL_CHANGED, idle_error_message};
 use crate::storage_writer::StorageWriter;
 
@@ -78,6 +79,9 @@ const AUTOCMD: &str = r#"
 "#;
 const RESET_COMMAND: &str = "/approval-reset";
 const DRAFT: &str = "draft typed before approval";
+const CLEAR_AND_IMPLEMENT_ROW: usize = 1;
+const IMPLEMENT_ROW: usize = 2;
+const USE_CURRENT_ROW: usize = 4;
 
 type RecordedRequest = (String, RequestOptions, Vec<Message>, String);
 
@@ -253,7 +257,7 @@ fn rejects_active_managed_child_without_cancelling_it() {
         let saved_model = maki_storage::model::read_model(&event_loop.ctx.storage);
         let run = event_loop.sessions[index].app.run_id;
         let config = actor.effective_config().unwrap();
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
         assert_eq!(
             event_loop.sessions[index].app.status_bar.flash_text(),
@@ -354,23 +358,33 @@ fn setup_with_registry(
     (index, path, receiver, host)
 }
 
-fn approve(event_loop: &mut EventLoop<'_>, index: usize, path: &Path, fresh: bool) {
-    if !event_loop.sessions[index].app.plan_form.parallel() {
-        event_loop.sessions[index]
-            .app
-            .plan_form
-            .handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+fn press(event_loop: &mut EventLoop<'_>, key_event: KeyEvent) {
+    event_loop.handle_input(Event::Key(key_event));
+}
+
+/// Reopening the form resets its selection to the first row.
+fn choose_form_row(event_loop: &mut EventLoop<'_>, index: usize, row: usize, parallel: bool) {
+    event_loop.set_focused(index);
+    if event_loop.sessions[index].app.plan_form.is_visible() {
+        press(event_loop, key::PLAN_TOGGLE.to_key_event());
     }
-    event_loop.sessions[index].app.plan_approval_pending = true;
-    event_loop.dispatch(
-        index,
-        vec![Action::ApprovePlan {
-            clear_context: fresh,
-            model: Some(TARGET_MODEL.into()),
-            parallel: true,
-            path: path.to_path_buf(),
-        }],
-    );
+    press(event_loop, key::PLAN_TOGGLE.to_key_event());
+    if event_loop.sessions[index].app.plan_form.parallel() != parallel {
+        press(event_loop, components::key(KeyCode::Char(' ')));
+    }
+    for _ in 0..row {
+        press(event_loop, components::key(KeyCode::Down));
+    }
+    press(event_loop, components::key(KeyCode::Enter));
+}
+
+fn approve(event_loop: &mut EventLoop<'_>, index: usize, fresh: bool) {
+    let row = if fresh {
+        CLEAR_AND_IMPLEMENT_ROW
+    } else {
+        IMPLEMENT_ROW
+    };
+    choose_form_row(event_loop, index, row, true);
 }
 
 fn next_ready(event_loop: &mut EventLoop<'_>) -> InternalEvent {
@@ -463,8 +477,8 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool) {
                 .unwrap();
         let stored_model = maki_storage::model::read_model(&event_loop.ctx.storage);
         let recents = maki_storage::model::read_recents(&event_loop.ctx.storage);
-        approve(event_loop, index, &path, fresh);
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
+        approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         assert!(requests.is_empty());
         assert_eq!(event_loop.sessions[index].id(), original_id);
@@ -642,9 +656,9 @@ fn mode_events(event_loop: &EventLoop<'_>, index: usize) -> usize {
 #[test]
 fn mode_transition_emits_once_and_config_only_emits_none() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let before = mode_events(event_loop, index);
-        approve(event_loop, index, &path, false);
+        approve(event_loop, index, false);
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
@@ -673,7 +687,7 @@ fn mode_transition_emits_once_and_config_only_emits_none() {
 #[test]
 fn fresh_forgets_retired_cache_but_preserves_saved_source() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let source = event_loop.sessions[index].id();
         event_loop.sessions[index].app.checkpoint_now();
         let snapshot = Arc::clone(&event_loop.sessions[index].app.state.session);
@@ -693,7 +707,7 @@ fn fresh_forgets_retired_cache_but_preserves_saved_source() {
                 .latest_snapshot(source)
                 .is_some()
         );
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
@@ -720,13 +734,13 @@ fn fresh_forgets_retired_cache_but_preserves_saved_source() {
 #[test]
 fn fresh_retires_outgoing_session_like_a_reset() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let source = event_loop.sessions[index].id();
         event_loop.sessions[index]
             .app
             .input_box
             .set_input(DRAFT.into());
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         let ready = final_ready(event_loop, true, &requests);
         event_loop.handle_internal(ready);
         session_lock::claim(&event_loop.sessions_dir, &source)
@@ -773,7 +787,7 @@ fn fresh_retires_outgoing_session_like_a_reset() {
 #[test_case(true; "fresh_context")]
 fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let source_id = event_loop.sessions[index].id();
         let (record, recorded) = flume::unbounded();
         let (release, gate) = flume::bounded(1);
@@ -786,7 +800,7 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
                 }),
             })
         });
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.state.mode == crate::app::mode::Mode::Build
                 && !recorded.is_empty()
@@ -829,7 +843,7 @@ fn fresh_candidate_cancel_releases_source_setter() {
         let original_id = event_loop.sessions[index].id();
         let original_identity = event_loop.sessions[index].handles.identity();
         let run = event_loop.sessions[index].app.run_id;
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         let ready = final_ready(event_loop, true, &requests);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
@@ -864,7 +878,7 @@ fn runtime_identity_rejects_stale_completion(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
         let mut ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady { runtime, .. } = &mut ready {
             *runtime = Arc::new(());
@@ -911,7 +925,7 @@ fn fresh_cancel_releases_source_before_target_lock_returns() {
             gate.recv_timeout(WAIT).unwrap();
             Box::new(guard)
         }));
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         let ready = next_ready(event_loop);
         event_loop.handle_internal(ready);
         let target = entry.recv_timeout(WAIT).unwrap();
@@ -1006,7 +1020,7 @@ fn fresh_target_lock_failure_preserves_runtime_and_storage() {
                     .unwrap(),
             )
         }));
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
@@ -1032,7 +1046,7 @@ fn fresh_activation_failure_releases_candidate_resources() {
         let source_identity = event_loop.sessions[index].handles.identity();
         let targets = event_loop.ctx.command_runtime.registry.target_count();
         let run = event_loop.sessions[index].app.run_id;
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         let ready = final_ready(event_loop, true, &requests);
         let InternalEvent::PlanApprovalReady {
             result: Ok(step), ..
@@ -1141,7 +1155,7 @@ fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
             gate.recv().unwrap();
             file.write_all(PLAN.as_bytes()).unwrap();
         });
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
         entry.recv_timeout(WAIT).unwrap();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
@@ -1181,7 +1195,7 @@ fn cancel_releases_setter_before_plan_read_returns(fresh: bool) {
 fn captured_plan_survives_later_edits(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         const MUTATED: &str = "# Late edit\nDo not implement this changed revision.\n";
         std::fs::write(&path, MUTATED).unwrap();
@@ -1213,7 +1227,7 @@ fn captured_plan_survives_later_edits(fresh: bool) {
 #[test_case(true; "fresh_context")]
 fn inflight_heartbeat_does_not_abort(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         start_runtime_heartbeat_with(
@@ -1226,7 +1240,7 @@ fn inflight_heartbeat_does_not_abort(fresh: bool) {
             },
         );
         entry.recv_timeout(WAIT).unwrap();
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
         let ready = final_ready(event_loop, fresh, &requests);
         event_loop.handle_internal(ready);
         assert!(
@@ -1247,7 +1261,7 @@ fn inflight_heartbeat_does_not_abort(fresh: bool) {
 #[test_case(true; "fresh_context")]
 fn lock_lost_while_waiting_keeps_lock_lost_message(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         start_runtime_heartbeat_with(
@@ -1260,7 +1274,7 @@ fn lock_lost_while_waiting_keeps_lock_lost_message(fresh: bool) {
             },
         );
         entry.recv_timeout(WAIT).unwrap();
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
         let ready = final_ready(event_loop, fresh, &requests);
         event_loop.handle_internal(ready);
         assert!(event_loop.sessions[index].app.plan_approval_pending);
@@ -1279,10 +1293,10 @@ fn lock_lost_while_waiting_keeps_lock_lost_message(fresh: bool) {
 #[test]
 fn unavailable_agent_graph_is_not_reported_busy() {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let (manager, _) = event_loop.sessions[index].handles.manager_and_root();
         shutdown_manager(&manager);
-        approve(event_loop, index, &path, false);
+        approve(event_loop, index, false);
         let expected = idle_error_message(ManagerError::GraphShutdown);
         assert_ne!(expected, APPROVAL_BUSY);
         assert!(!event_loop.sessions[index].app.plan_approval_pending);
@@ -1298,12 +1312,12 @@ fn unavailable_agent_graph_is_not_reported_busy() {
 #[test_case(true; "history")]
 fn fresh_source_lease_defers_mutation_until_cancel(history: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let cwd = event_loop.sessions[index].coordinator.read().cwd();
         let original = event_loop.sessions[index].coordinator.read().history();
         let changed = cwd.join("approved-directory");
         std::fs::create_dir(&changed).unwrap();
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         let ready = final_ready(event_loop, true, &requests);
         let coordinator = event_loop.sessions[index].coordinator.clone();
         let mutation = async {
@@ -1364,7 +1378,7 @@ fn fresh_uses_finalized_history_and_captured_absolute_path() {
             cwd.display().to_string();
         event_loop.sessions[index].app.state.plan =
             crate::app::mode::PlanState::Ready(relative.clone());
-        approve(event_loop, index, &relative, true);
+        approve(event_loop, index, true);
         let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {
             result: Ok(step), ..
@@ -1415,7 +1429,7 @@ fn fresh_stale_cwd_rejects_relative_path() {
         let relative = PathBuf::from(path.file_name().unwrap());
         event_loop.sessions[index].app.state.plan =
             crate::app::mode::PlanState::Ready(relative.clone());
-        approve(event_loop, index, &relative, true);
+        approve(event_loop, index, true);
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
@@ -1430,7 +1444,7 @@ fn fresh_permission_change_before_activation_preserves_source() {
         let (index, path, requests, _host) = setup(event_loop);
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
-        approve(event_loop, index, &path, true);
+        approve(event_loop, index, true);
         let ready = final_ready(event_loop, true, &requests);
         event_loop.sessions[index].app.permissions.toggle_yolo();
         event_loop.handle_internal(ready);
@@ -1448,7 +1462,7 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
         event_loop.ctx.prepare_provider = Arc::new(|_, _| Err(PROVIDER_FAILURE.into()));
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
             !event_loop.sessions[index].app.plan_approval_pending
         });
@@ -1479,7 +1493,7 @@ fn cancel_during_provider_preparation_ignores_late_result() {
                 }),
             })
         });
-        approve(event_loop, index, &path, false);
+        approve(event_loop, index, false);
         entry.recv_timeout(WAIT).unwrap();
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         let cancelled = next_ready(event_loop);
@@ -1504,7 +1518,7 @@ fn cancel_before_ready_preserves_plan(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
-        approve(event_loop, index, &path, fresh);
+        approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         event_loop.handle_internal(ready);
@@ -1521,8 +1535,8 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         let (warnings, warning_rx) = flume::unbounded();
         event_loop.ctx.storage_writer =
             Arc::new(StorageWriter::new(event_loop.ctx.storage.clone(), warnings));
-        let (index, path, requests, _host) = setup(event_loop);
-        approve(event_loop, index, &path, fresh);
+        let (index, _, requests, _host) = setup(event_loop);
+        approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
             let app = &event_loop.sessions[index].app;
             app.state.mode == crate::app::mode::Mode::Build && app.status == Status::Idle
@@ -1585,7 +1599,7 @@ fn save_failure_retains_committed_selection(fresh: bool) {
 #[test_case(true; "fresh_context")]
 fn without_override_uses_actor_predecessor(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
+        let (index, _, requests, _host) = setup(event_loop);
         let (record, recorded) = flume::unbounded();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
@@ -1614,17 +1628,15 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
         );
         event_loop.ctx.prepare_provider =
             Arc::new(|_, _| panic!("no-override approval must reuse actor provider"));
-        event_loop.sessions[index].app.plan_form.use_current_model();
-        event_loop.sessions[index].app.plan_approval_pending = true;
-        event_loop.dispatch(
-            index,
-            vec![Action::ApprovePlan {
-                clear_context: fresh,
-                model: None,
-                parallel: false,
-                path,
-            }],
+        choose_form_row(event_loop, index, USE_CURRENT_ROW, false);
+        assert_eq!(
+            event_loop.sessions[index]
+                .app
+                .plan_form
+                .implementation_model(),
+            None
         );
+        approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         if let InternalEvent::PlanApprovalReady {
             result: Err(error), ..
@@ -1683,7 +1695,7 @@ fn busy_rejection_preserves_active_turn() {
         active_rx.recv_timeout(WAIT).unwrap();
         let run = event_loop.sessions[index].app.run_id;
         let config = actor.effective_config().unwrap();
-        approve(event_loop, index, &path, false);
+        approve(event_loop, index, false);
         assert_eq!(event_loop.sessions[index].app.run_id, run);
         assert_eq!(event_loop.sessions[index].app.status, Status::Streaming);
         assert_eq!(
