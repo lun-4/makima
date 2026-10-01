@@ -1002,11 +1002,11 @@ fn fresh_uses_finalized_history_and_captured_absolute_path() {
         let coordinator = event_loop.sessions[index].coordinator.clone();
         let cwd = coordinator.read().cwd().join(MOVED_CWD);
         fs::create_dir(&cwd).unwrap();
-        smol::block_on(coordinator.change_directory(cwd.clone())).unwrap();
         let lease = smol::block_on(coordinator.acquire_lease()).unwrap();
         let committer = lease.committer().unwrap();
         smol::block_on(committer.commit_history(vec![Message::user(RESPONSE.into())])).unwrap();
         drop(lease);
+        smol::block_on(coordinator.change_directory(cwd.clone())).unwrap();
         let relative = PathBuf::from(RELATIVE_PLAN_FILE);
         let absolute = cwd.join(&relative);
         fs::rename(original_path, &absolute).unwrap();
@@ -1230,7 +1230,6 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
                 )
             },
         );
-        drop(smol::block_on(event_loop.sessions[index].coordinator.acquire_lease()).unwrap());
         assert_eq!(
             event_loop.sessions[index].app.state.model.spec(),
             SOURCE_MODEL

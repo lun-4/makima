@@ -1231,7 +1231,13 @@ fn reject_operation(operation: Operation, session_id: MakiId) {
     }
 }
 
-async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> ControlFlow<()> {
+/// A reserved operation releases its reservation before replying, so a caller
+/// that has its answer never sees the session busy on its account.
+async fn handle_operation(
+    ctx: &CoordinatorCtx,
+    operation: Operation,
+    reservation: Option<SourceReservation>,
+) -> ControlFlow<()> {
     match operation {
         Operation::AcquireLease { .. } | Operation::Reserved { .. } => {
             // Held leases are driven by `run`; a nested one cannot happen.
@@ -1289,11 +1295,13 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
         }
         Operation::ReplaceHistory { history, reply } => {
             let result = replace_history(&ctx.read, &*ctx.checkpoint, history).await;
+            drop(reservation);
             let _ = reply.send(result);
         }
         Operation::ChangeDirectory { path, reply } => {
             let result =
                 change_directory(&ctx.read, &*ctx.directory_adopter, &*ctx.checkpoint, path).await;
+            drop(reservation);
             let _ = reply.send(result);
         }
         Operation::UpdateModelValues { specs, reply } => {
@@ -1411,7 +1419,7 @@ async fn run(
                 Err(_) => break,
             },
         };
-        let (operation, _reservation) = match operation {
+        let (operation, reservation) = match operation {
             Operation::Reserved {
                 operation,
                 reservation,
@@ -1437,7 +1445,7 @@ async fn run(
                 }
             }
             other => {
-                if handle_operation(&ctx, other).await.is_break() {
+                if handle_operation(&ctx, other, reservation).await.is_break() {
                     for operation in deferred.drain(..).chain(rx.try_iter()) {
                         reject_operation(operation, ctx.session_id);
                     }
@@ -1501,7 +1509,7 @@ async fn hold_lease(
                         let result = finish_history_checkpoint(&ctx.read, pending).await;
                         let _ = reply.send(result);
                     }
-                    let _ = handle_operation(ctx, operation).await;
+                    let _ = handle_operation(ctx, operation, None).await;
                     return ControlFlow::Break(());
                 } else if let Operation::PreparePluginOptions { prepared, .. } = operation {
                     let _ =
@@ -1509,7 +1517,7 @@ async fn hold_lease(
                 } else if defers_behind_lease(&operation) {
                     deferred.push_back(operation);
                 } else {
-                    let _ = handle_operation(ctx, operation).await;
+                    let _ = handle_operation(ctx, operation, None).await;
                 }
             }
             // The last handle is gone; nothing more will arrive.
@@ -1614,7 +1622,7 @@ async fn finish_history_commit(
                 } else if defers_behind_lease(&operation) {
                     deferred.push_back(operation);
                 } else {
-                    let _ = handle_operation(ctx, operation).await;
+                    let _ = handle_operation(ctx, operation, None).await;
                 }
             }
             CommitEvent::Incoming(Err(_)) => closing = true,
