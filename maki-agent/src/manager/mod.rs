@@ -385,15 +385,17 @@ impl AgentManagerHandle {
                 return Err(ManagerError::Factory("agent factory panicked".into()));
             }
         };
-        self.commit_actor(
-            agent_id,
-            reservation,
-            initial_messages,
-            shared_messages,
-            backend,
-            config,
-            start,
-        )
+        self.commit_actor(agent_id, reservation, |admission| {
+            AgentActorHandle::spawn_managed(
+                agent_id,
+                initial_messages,
+                shared_messages,
+                backend,
+                admission,
+                config,
+                start,
+            )
+        })
     }
 
     pub fn spawn_child(
@@ -560,15 +562,17 @@ impl AgentManagerHandle {
                 return Err(ManagerError::Factory("agent factory panicked".into()));
             }
         };
-        self.commit_actor(
-            child_id,
-            reservation,
-            initial_messages,
-            shared_messages,
-            backend,
-            Some(config),
-            None,
-        )
+        self.commit_actor(child_id, reservation, |admission| {
+            AgentActorHandle::spawn_managed(
+                child_id,
+                initial_messages,
+                shared_messages,
+                backend,
+                admission,
+                Some(config),
+                None,
+            )
+        })
     }
 
     fn validate_manager(&self, current: &CurrentManagedTurn) -> Result<(), ManagerError> {
@@ -768,37 +772,13 @@ impl AgentManagerHandle {
         warn!(manager_generation = self.0.generation, %agent_id, revision = graph.revision, "agent reservation rolled back");
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn commit_actor(
         &self,
         agent_id: AgentId,
         reservation: u64,
-        initial_messages: Vec<Message>,
-        shared_messages: Option<SharedMessages>,
-        backend: Box<dyn ActorBackend>,
-        config: Option<crate::actor::EffectiveAgentConfig>,
-        start: Option<flume::Receiver<()>>,
+        spawn: impl FnOnce(ManagedTurnAdmission) -> (AgentActorHandle, RunnerTask),
     ) -> Result<AgentRef, ManagerError> {
-        let admission = ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id);
-        let (actor, task) = match start {
-            Some(start) => AgentActorHandle::spawn_managed_deferred(
-                agent_id,
-                initial_messages,
-                shared_messages,
-                backend,
-                admission,
-                config,
-                start,
-            ),
-            None => AgentActorHandle::spawn_managed(
-                agent_id,
-                initial_messages,
-                shared_messages,
-                backend,
-                admission,
-                config,
-            ),
-        };
+        let (actor, task) = spawn(ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id));
         let manager = Arc::downgrade(&self.0);
         let task = smol::spawn(async move {
             task.await;

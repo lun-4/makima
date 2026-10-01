@@ -827,6 +827,8 @@ impl AgentActorHandle {
         )
     }
 
+    /// Spawns a manager-owned actor. With `start`, the runner waits for that
+    /// signal before consuming any work.
     pub(crate) fn spawn_managed(
         agent_id: AgentId,
         initial_messages: Vec<Message>,
@@ -834,6 +836,7 @@ impl AgentActorHandle {
         backend: Box<dyn ActorBackend>,
         managed_admission: ManagedTurnAdmission,
         initial_config: Option<EffectiveAgentConfig>,
+        start: Option<flume::Receiver<()>>,
     ) -> (Self, smol::Task<()>) {
         Self::spawn_inner(
             agent_id,
@@ -842,27 +845,7 @@ impl AgentActorHandle {
             backend,
             Some(managed_admission),
             initial_config.map(Arc::new),
-            None,
-        )
-    }
-
-    pub(crate) fn spawn_managed_deferred(
-        agent_id: AgentId,
-        initial_messages: Vec<Message>,
-        shared_messages: Option<SharedMessages>,
-        backend: Box<dyn ActorBackend>,
-        managed_admission: ManagedTurnAdmission,
-        initial_config: Option<EffectiveAgentConfig>,
-        start: flume::Receiver<()>,
-    ) -> (Self, smol::Task<()>) {
-        Self::spawn_inner(
-            agent_id,
-            initial_messages,
-            shared_messages,
-            backend,
-            Some(managed_admission),
-            initial_config.map(Arc::new),
-            Some(start),
+            start,
         )
     }
 
