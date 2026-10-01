@@ -51,6 +51,7 @@ const MISSING_DIR: &str = "gone";
 const CD_ERROR_PREFIX: &str = "cd:";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_IMAGE_DATA: &str = "dGVzdA==";
+const IMAGE_PATH_PASTE: &str = "file:///tmp/nonexistent.png";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
     "command failed: local commands cannot include non-text content";
 const FAST_UNSUPPORTED_COMMAND_ERROR: &str = "command failed: Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
@@ -845,7 +846,7 @@ fn paste_normalizes_line_endings(input: &str, expected: &str) {
 #[test]
 fn paste_file_path_triggers_image_load() {
     let mut app = test_app();
-    app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
+    app.update(Msg::Paste(IMAGE_PATH_PASTE.into()));
     assert!(!app.image_paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
 }
@@ -6030,7 +6031,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
         app.active_keybind_contexts()
             .contains(&KeybindContext::ModelPicker)
     );
-    app.route_text_paste(MODEL.split_once('/').unwrap().1);
+    app.route_paste(MODEL.split_once('/').unwrap().1);
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(actions.is_empty());
     assert_eq!(app.plan_form.implementation_model(), Some(MODEL));
@@ -6100,7 +6101,7 @@ fn plan_picker_yields_to_blocking_overlay(surface: &str) {
     assert!(!contexts.contains(&KeybindContext::ModelPicker));
     assert!(!contexts.contains(&KeybindContext::FormInput));
     assert!(app.update(Msg::Key(key(KeyCode::Char('x')))).is_empty());
-    app.route_text_paste("no-such-model");
+    app.route_paste("no-such-model");
     assert!(app.model_picker.is_open());
     assert_eq!(app.plan_form.implementation_model(), None);
     if surface == "question" || surface == "float" {
@@ -6125,7 +6126,7 @@ fn plan_form_yields_escape_to_blocking_modal(btw: bool) {
     } else {
         app.help_modal.toggle();
     }
-    app.route_text_paste("blocked");
+    app.route_paste("blocked");
     assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
     assert!(app.plan_form.is_visible());
     assert!(!app.help_modal.is_open());
@@ -6170,7 +6171,7 @@ fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
     );
     assert!(!app.model_picker.is_open());
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
-    app.route_text_paste("blocked");
+    app.route_paste("blocked");
     assert!(matches!(
         app.update(Msg::Key(key(KeyCode::Esc))).as_slice(),
         [Action::CancelPlanApproval]
@@ -6178,6 +6179,23 @@ fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
     assert!(app.plan_approval_pending);
     assert_eq!(app.plan_form.implementation_model(), Some("zai/glm-5"));
     assert!(app.state.plan.is_ready());
+}
+
+#[test_case(false ; "plan_model_picker")]
+#[test_case(true ; "approval_pending")]
+fn image_path_paste_follows_plan_ownership(approval_pending: bool) {
+    let mut app = plan_app();
+    if approval_pending {
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.plan_approval_pending);
+    } else {
+        app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+        assert!(app.model_picker.is_open());
+    }
+    app.update(Msg::Paste(IMAGE_PATH_PASTE.into()));
+    assert!(app.image_paste_rx.is_empty());
+    assert_eq!(app.input_box.buffer.value(), "");
 }
 
 #[test_case(false ; "current")]

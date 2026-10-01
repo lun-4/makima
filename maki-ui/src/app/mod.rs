@@ -807,24 +807,7 @@ impl App {
             Msg::Paste(text) => {
                 self.last_input = Some(Instant::now());
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                if text.is_empty() {
-                    if self.is_main_chat() && self.image_paste_rx.is_empty() {
-                        self.start_image_paste();
-                    }
-                } else {
-                    let mut any_image = false;
-                    if self.is_main_chat() {
-                        for line in text.lines() {
-                            if let Some((path, mt)) = image::try_parse_image_path(line) {
-                                self.start_file_image_paste(path, mt);
-                                any_image = true;
-                            }
-                        }
-                    }
-                    if !any_image {
-                        self.route_text_paste(&text);
-                    }
-                }
+                self.route_paste(&text);
                 vec![]
             }
             Msg::Mouse(event) => {
@@ -3257,7 +3240,7 @@ impl App {
         }
     }
 
-    fn route_text_paste(&mut self, text: &str) {
+    fn route_paste(&mut self, text: &str) {
         if self.permission_active() {
             self.permission_prompt.handle_paste(text);
             return;
@@ -3310,11 +3293,31 @@ impl App {
             self.input_box.handle_paste(text);
             return;
         }
+        if self.attach_pasted_images(text) {
+            return;
+        }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
             self.pending_dirty |= self.command_palette.sync(&val);
             self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
             self.sync_file_completion();
         }
+    }
+
+    fn attach_pasted_images(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            if self.image_paste_rx.is_empty() {
+                self.start_image_paste();
+            }
+            return true;
+        }
+        let mut any_image = false;
+        for line in text.lines() {
+            if let Some((path, media_type)) = image::try_parse_image_path(line) {
+                self.start_file_image_paste(path, media_type);
+                any_image = true;
+            }
+        }
+        any_image
     }
 
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
