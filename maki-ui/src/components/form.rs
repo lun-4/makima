@@ -6,6 +6,8 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
+const BORDER_LINES: u16 = 2;
+
 pub(crate) fn render_form(
     t: &Theme,
     title: &str,
@@ -28,6 +30,13 @@ pub(crate) fn render_form(
         .scroll(scroll);
 
     frame.render_widget(paragraph, area);
+}
+
+pub(crate) fn form_height(lines: Vec<Line<'static>>, width: u16) -> u16 {
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .line_count(width.saturating_sub(BORDER_LINES)) as u16
+        + BORDER_LINES
 }
 
 pub(crate) fn selected_prefix(t: &Theme, is_selected: bool) -> (&'static str, Style) {

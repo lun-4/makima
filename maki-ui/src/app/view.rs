@@ -122,7 +122,9 @@ impl App {
         } else if below_active {
             0
         } else if form_visible {
-            self.plan_form.height().min(max_bottom)
+            self.plan_form
+                .height(inner.width, &self.state.model.spec())
+                .min(max_bottom)
         } else if self.is_main_chat() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())

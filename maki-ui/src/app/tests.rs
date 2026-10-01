@@ -6202,7 +6202,9 @@ fn image_path_paste_follows_plan_ownership(approval_pending: bool) {
 #[test_case(true ; "staged")]
 fn plan_form_renders_effective_implementation_model(staged: bool) {
     let mut app = plan_app();
-    let initial_height = app.plan_form.height();
+    let initial_height = app
+        .plan_form
+        .height(RENDER_AREA.width, &app.state.model.spec());
     const MODEL: &str = "zai/glm-5";
     if !staged {
         app.state.model = Model::from_spec(MODEL).unwrap();
@@ -6219,9 +6221,12 @@ fn plan_form_renders_effective_implementation_model(staged: bool) {
     };
     assert!(rows.contains(&format!("Implementation model: {spec}")));
     assert_eq!(rows.contains("Use current model"), staged);
-    assert_eq!(app.plan_form.height(), initial_height + u16::from(staged));
+    let height = app
+        .plan_form
+        .height(RENDER_AREA.width, &app.state.model.spec());
+    assert_eq!(height, initial_height + u16::from(staged));
     let (_, bottom, _, _, _) = app.layout_geometry(RENDER_AREA);
-    assert_eq!(bottom.height, app.plan_form.height());
+    assert_eq!(bottom.height, height);
 }
 
 #[test]

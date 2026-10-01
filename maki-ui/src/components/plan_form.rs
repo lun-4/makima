@@ -1,4 +1,4 @@
-use crate::components::form::{render_form, selected_prefix};
+use crate::components::form::{form_height, render_form, selected_prefix};
 use crate::components::hint_line;
 use crate::components::keybindings::key;
 use crate::theme;
@@ -16,16 +16,10 @@ const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
 } else {
     "Ctrl+T/Esc"
 };
-const MODEL_PICKER_HINT: &str = if cfg!(target_os = "macos") {
-    "⌃M"
-} else {
-    key::MODEL_PICKER.label
-};
 const HINT_PAIRS: &[(&str, &str)] = &[
     ("↑↓", "select"),
     ("Space", "toggle parallel"),
     ("Enter", "confirm"),
-    (MODEL_PICKER_HINT, "choose implementation model"),
     (key::OPEN_EDITOR.label, "edit plan"),
     (DISMISS_KEYS, "dismiss"),
 ];
@@ -65,7 +59,6 @@ const MENU: &[MenuItem] = &[
 ];
 
 const MODEL_ROW: usize = MENU.len() - 2;
-const CHROME_LINES: u16 = 4;
 
 #[derive(Debug, PartialEq)]
 pub enum PlanFormAction {
@@ -180,9 +173,9 @@ impl PlanForm {
         ]))
     }
 
-    pub fn height(&self) -> u16 {
+    pub fn height(&self, width: u16, current_model: &str) -> u16 {
         if self.is_visible() {
-            self.menu_len() as u16 + CHROME_LINES
+            form_height(self.lines(current_model), width)
         } else {
             0
         }
@@ -224,7 +217,18 @@ impl PlanForm {
         if !self.is_visible() {
             return;
         }
+        let t = theme::current();
+        render_form(
+            &t,
+            FORM_LABEL,
+            frame,
+            area,
+            self.lines(current_model),
+            (0, 0),
+        );
+    }
 
+    fn lines(&self, current_model: &str) -> Vec<Line<'static>> {
         let t = theme::current();
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.menu_len() + 2);
 
@@ -253,18 +257,34 @@ impl PlanForm {
         }
         lines.push(Line::default());
         lines.push(hint_line(HINT_PAIRS));
-
-        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
+        lines
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::key;
+    use crate::components::{buffer_text, key};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use test_case::test_case;
 
     const LAST: usize = MODEL_ROW;
+    const CURRENT_MODEL: &str = "provider/current";
+    const OTHER_MODEL: &str = "provider/other";
+    const LONG_MODEL: &str = "openrouter/vendor/a-very-long-implementation-model-name-that-wraps";
+    const WIDE: u16 = 200;
+    const HINT_TAIL: &str = "dismiss";
+    const USE_CURRENT_ROW: usize = MENU.len() - 1;
+
+    fn render(form: &PlanForm, width: u16) -> String {
+        let height = form.height(width, CURRENT_MODEL);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| form.view(frame, frame.area(), CURRENT_MODEL))
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
 
     #[test]
     fn on_plan_ready_shows_and_resets_selected() {
@@ -331,11 +351,32 @@ mod tests {
     #[test]
     fn height_reflects_visibility() {
         let mut form = PlanForm::new();
-        assert_eq!(form.height(), 0);
+        assert_eq!(form.height(WIDE, CURRENT_MODEL), 0);
         form.on_plan_ready();
-        assert_eq!(form.height(), (MODEL_ROW + 1) as u16 + CHROME_LINES);
+        assert!(form.height(WIDE, CURRENT_MODEL) > 0);
         form.hide();
-        assert_eq!(form.height(), 0);
+        assert_eq!(form.height(WIDE, CURRENT_MODEL), 0);
+    }
+
+    #[test_case(80, true, None, MODEL_ROW - 1, "Implement plan" ; "parallel_at_80_cols")]
+    #[test_case(50, false, Some(LONG_MODEL), USE_CURRENT_ROW, "Use current model" ; "long_model_at_50_cols")]
+    fn wrapped_form_keeps_hint_and_cursor_visible(
+        width: u16,
+        parallel: bool,
+        staged: Option<&str>,
+        selected: usize,
+        row_label: &str,
+    ) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        form.parallel = parallel;
+        if let Some(spec) = staged {
+            form.set_implementation_model(spec.into(), CURRENT_MODEL);
+        }
+        form.selected = selected;
+        let text = render(&form, width);
+        assert!(text.contains(HINT_TAIL));
+        assert!(text.contains(&format!("▸ {row_label}")));
     }
 
     #[test_case(0, KeyCode::Up,   0    ; "up_at_zero_stays")]
@@ -366,14 +407,14 @@ mod tests {
     fn choosing_current_model_clears_override(staged: bool) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
-        let height = form.height();
+        let height = form.height(WIDE, CURRENT_MODEL);
         if staged {
-            form.set_implementation_model("provider/other".into(), "provider/current");
-            assert_eq!(form.height(), height + 1);
+            form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
+            assert_eq!(form.height(WIDE, CURRENT_MODEL), height + 1);
         }
-        form.set_implementation_model("provider/current".into(), "provider/current");
+        form.set_implementation_model(CURRENT_MODEL.into(), CURRENT_MODEL);
         assert_eq!(form.implementation_model(), None);
-        assert_eq!(form.height(), height);
+        assert_eq!(form.height(WIDE, CURRENT_MODEL), height);
         assert_eq!(form.selected, MODEL_ROW);
         form.handle_key(key(KeyCode::Down));
         assert_eq!(form.selected, MODEL_ROW);
@@ -382,13 +423,13 @@ mod tests {
     #[test]
     fn staged_model_survives_planning_lifecycle_until_reset() {
         let mut form = PlanForm::new();
-        form.set_implementation_model("provider/other".into(), "provider/current");
+        form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
         form.on_plan_ready();
         form.hide();
         form.toggle();
         form.on_plan_drafting();
         form.on_plan_ready();
-        assert_eq!(form.implementation_model(), Some("provider/other"));
+        assert_eq!(form.implementation_model(), Some(OTHER_MODEL));
         form.selected = MODEL_ROW;
         form.handle_key(key(KeyCode::Down));
         assert_eq!(
@@ -397,7 +438,7 @@ mod tests {
         );
         form.use_current_model();
         assert_eq!(form.selected, MODEL_ROW);
-        form.set_implementation_model("provider/other".into(), "provider/current");
+        form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
         form.reset();
         assert_eq!(form.implementation_model(), None);
     }
