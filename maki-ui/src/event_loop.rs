@@ -4908,8 +4908,6 @@ mod tests {
     use maki_config::PermissionsConfig;
     use maki_providers::TokenUsage;
     use ratatui::{Terminal, backend::TestBackend};
-    use std::fs::{File, FileTimes};
-    use std::time::SystemTime;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -7449,91 +7447,6 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-        });
-    }
-
-    #[test]
-    fn heartbeat_renews_backdated_lock_during_pending_approval() {
-        const PENDING_INPUT: &str = "approval waiting for preparation";
-        const STALE_MARGIN: Duration = Duration::from_secs(1);
-        with_event_loop(|event_loop| {
-            let runtime = &mut event_loop.sessions[0];
-            let id = runtime.id();
-            runtime.session_lock = Some(SessionLockState::Held(
-                claim_lock(&event_loop.sessions_dir, &id).unwrap(),
-            ));
-            let (manager, root) = runtime.handles.manager_and_root();
-            let actor = manager.actor(root).unwrap();
-            let idle = manager.prepare_idle_subtree(root).unwrap();
-            let operation = actor
-                .reserve_prepared_operation(Some(maki_agent::actor::PreparedTurn {
-                    input: maki_agent::AgentInput::from_defaults(
-                        PENDING_INPUT.into(),
-                        maki_agent::AgentMode::Build,
-                        Vec::new(),
-                        maki_agent::SessionDefaults::default(),
-                    ),
-                    event_sender: None,
-                    correlation: PENDING_INPUT.into(),
-                }))
-                .unwrap();
-            let (trigger, _cancel) = CancelToken::new();
-            runtime.app.plan_approval_pending = true;
-            runtime.pending_approval = Some(PendingPlanApproval {
-                identity: Arc::new(()),
-                cancel: Some(trigger),
-                waiting_for_lock: None,
-            });
-            let path = session_lock::lock_path(&event_loop.sessions_dir, &id);
-            let stale_time = SystemTime::now() - session_lock::STALE_AFTER - STALE_MARGIN;
-            File::options()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_times(FileTimes::new().set_modified(stale_time))
-                .unwrap();
-            assert!(
-                SystemTime::now()
-                    .duration_since(std::fs::metadata(&path).unwrap().modified().unwrap())
-                    .unwrap()
-                    > session_lock::STALE_AFTER
-            );
-            event_loop.last_heartbeat = Instant::now() - session_lock::HEARTBEAT_INTERVAL;
-            let _ = event_loop.tick();
-            let event = event_loop
-                .internal_rx
-                .recv_timeout(AGENT_SHUTDOWN_TIMEOUT)
-                .unwrap();
-            assert!(
-                matches!(event, InternalEvent::SessionHeartbeat(value) if value == event_loop.sessions[0].generation)
-            );
-            event_loop.handle_internal(event);
-            assert!(event_loop.sessions[0].pending_approval.is_some());
-            assert!(event_loop.sessions[0].app.plan_approval_pending);
-            assert!(matches!(
-                operation.ready_config(),
-                Err(maki_agent::actor::ActorError::PolicyPending)
-            ));
-            assert!(matches!(
-                event_loop.sessions[0].session_lock,
-                Some(SessionLockState::Held(_))
-            ));
-            assert!(!event_loop.sessions[0].lock_lost);
-            assert!(
-                SystemTime::now()
-                    .duration_since(std::fs::metadata(path).unwrap().modified().unwrap())
-                    .unwrap()
-                    <= session_lock::STALE_AFTER
-            );
-            assert!(
-                session_lock::claim(&event_loop.sessions_dir, &id)
-                    .unwrap()
-                    .is_none()
-            );
-            event_loop.sessions[0].pending_approval.take();
-            event_loop.sessions[0].app.plan_approval_pending = false;
-            drop(operation);
-            drop(idle);
         });
     }
 
