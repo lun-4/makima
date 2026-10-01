@@ -1047,8 +1047,8 @@ impl AgentActorHandle {
 
     /// Queues a root input. It has no [`TurnId`]: the scheduler assigns one
     /// when it starts it, and an active run folds it instead. A root whose
-    /// correlation was precancelled is dropped. The mark stays until a
-    /// matching run is consumed by the runner.
+    /// correlation was precancelled is dropped. Precancel marks last until
+    /// the actor closes.
     pub fn rush(&self, root: RootWork) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {

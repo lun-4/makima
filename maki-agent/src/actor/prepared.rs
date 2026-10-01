@@ -81,23 +81,7 @@ impl AgentActorHandle {
 impl PreparedOperationTicket {
     pub fn replace_turn_input(&self, input: AgentInput) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(lifecycle_error(state.lifecycle));
-        }
-        if state.preparing == Some(self.id) {
-            return Err(ActorError::PolicyPending);
-        }
-        let pending = state
-            .operations
-            .iter_mut()
-            .find_map(|entry| match entry {
-                ActorOperation::Prepared(pending) if pending.id == self.id => Some(pending),
-                _ => None,
-            })
-            .ok_or(ActorError::PolicyCancelled)?;
-        if pending.change.is_some() || pending.ready.is_some() {
-            return Err(ActorError::PolicyPending);
-        }
+        let pending = self.unresolved(&mut state)?;
         let turn = pending.turn.as_mut().ok_or(ActorError::PolicyCancelled)?;
         turn.input = input;
         Ok(())
@@ -108,24 +92,7 @@ impl PreparedOperationTicket {
         change: Result<Option<ConfigChange>, ActorError>,
     ) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(lifecycle_error(state.lifecycle));
-        }
-        if state.preparing == Some(self.id) {
-            return Err(ActorError::PolicyPending);
-        }
-        let pending = state
-            .operations
-            .iter_mut()
-            .find_map(|entry| match entry {
-                ActorOperation::Prepared(pending) if pending.id == self.id => Some(pending),
-                _ => None,
-            })
-            .ok_or(ActorError::PolicyCancelled)?;
-        if pending.change.is_some() || pending.ready.is_some() {
-            return Err(ActorError::PolicyPending);
-        }
-        pending.change = Some(change);
+        self.unresolved(&mut state)?.change = Some(change);
         drive_operations(&self.inner, &mut state);
         Ok(())
     }
@@ -134,7 +101,7 @@ impl PreparedOperationTicket {
         loop {
             let listener = self.inner.policy_changed.listen();
             {
-                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(result) = self
                     .completion
                     .lock()
@@ -143,14 +110,19 @@ impl PreparedOperationTicket {
                 {
                     return result.map(|_| ());
                 }
-                if state.operations.iter().any(|entry| matches!(entry, ActorOperation::Prepared(pending) if pending.id == self.id && pending.ready.is_some())) { return Ok(()); }
+                if state
+                    .pending_prepared(self.id)
+                    .is_some_and(|pending| pending.ready.is_some())
+                {
+                    return Ok(());
+                }
             }
             listener.await;
         }
     }
 
     pub fn ready_config(&self) -> Result<Arc<EffectiveAgentConfig>, ActorError> {
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = self
             .completion
             .lock()
@@ -163,14 +135,9 @@ impl PreparedOperationTicket {
             return Err(lifecycle_error(state.lifecycle));
         }
         state
-            .operations
-            .iter()
-            .find_map(|entry| match entry {
-                ActorOperation::Prepared(pending) if pending.id == self.id => {
-                    pending.ready.as_ref().map(|(config, _)| Arc::clone(config))
-                }
-                _ => None,
-            })
+            .pending_prepared(self.id)
+            .and_then(|pending| pending.ready.as_ref())
+            .map(|(config, _)| Arc::clone(config))
             .ok_or(ActorError::PolicyPending)
     }
 
@@ -218,8 +185,7 @@ impl PreparedOperationTicket {
         {
             return result;
         }
-        if !matches!(state.operations.front(), Some(ActorOperation::Prepared(pending)) if pending.id == self.id && pending.ready.is_some())
-        {
+        if !state.prepared_head_ready(self.id) {
             return Err(ActorError::PolicyPending);
         }
         let Some(ActorOperation::Prepared(mut pending)) = state.operations.pop_front() else {
@@ -274,6 +240,44 @@ impl PreparedOperationTicket {
         drive_operations(&self.inner, &mut state);
         self.inner.policy_changed.notify(usize::MAX);
         Ok(result)
+    }
+}
+
+impl PreparedOperationTicket {
+    /// The pending operation, while it still accepts its turn input or change.
+    fn unresolved<'a>(
+        &self,
+        state: &'a mut ActorState,
+    ) -> Result<&'a mut PreparedOperation, ActorError> {
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        if state.preparing == Some(self.id) {
+            return Err(ActorError::PolicyPending);
+        }
+        let pending = state
+            .pending_prepared(self.id)
+            .ok_or(ActorError::PolicyCancelled)?;
+        if pending.change.is_some() || pending.ready.is_some() {
+            return Err(ActorError::PolicyPending);
+        }
+        Ok(pending)
+    }
+}
+
+impl ActorState {
+    fn pending_prepared(&mut self, id: u64) -> Option<&mut PreparedOperation> {
+        self.operations.iter_mut().find_map(|entry| match entry {
+            ActorOperation::Prepared(pending) if pending.id == id => Some(&mut **pending),
+            _ => None,
+        })
+    }
+
+    fn prepared_head_ready(&self, id: u64) -> bool {
+        match self.operations.front() {
+            Some(ActorOperation::Prepared(pending)) => pending.id == id && pending.ready.is_some(),
+            _ => false,
+        }
     }
 }
 
