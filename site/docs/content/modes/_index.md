@@ -26,17 +26,19 @@ A mode is not a sandbox for plugin effects. Lua filesystem writes require the pl
 
 ## Plan approval
 
-The review form shows the current implementation model as a selectable row. The model-picker shortcut or Enter on that row opens the searchable model picker. Selecting a model stages it without changing the session model or saving a preference. Selecting the current model clears the staged selection. When a different model is staged, `Use current model` also clears it.
+When a plan is ready, the plan form opens below the chat. It has three actions:
 
-Escape in the picker returns to the form without changing its selection or parallel setting. Editing, refining, rewriting, or dismissing and reopening the plan preserves the staged model. Leaving Plan mode, resetting the form, or replacing the session clears it.
+- `Refine plan` hides the form so you can keep planning with the agent.
+- `Implement plan` switches to build mode and implements the plan in the current conversation.
+- `Clear context and implement` starts a fresh build session that holds only the plan, then implements it.
 
-`Implement plan` keeps the current conversation. `Clear context and implement` prepares a fresh Build session with empty conversation history. Both paths require idle planning work and idle managed descendants. Busy approval reports a retry message without cancelling existing work. Implementation receives the captured approved plan text, so later file edits do not change its instructions.
+Space toggles parallel implementation, which asks the agent to split the work across subagents. Ctrl+O opens the plan in your editor. Esc hides the form, and Ctrl+T shows or hides it.
 
-While approval is preparing, form submission, editing, and model staging are locked. Escape cancels preparation and unlocks the form. Provider construction and prompt readiness finish before approval commits. A preparation failure leaves the original planning session, plan, history, and staged selection available for retry. Fresh-context approval prepares the new runtime and its first admission before replacing the planning runtime.
+The `Implementation model` row shows the model that will do the work. It starts as the current session model. Press Enter on that row to pick another one. Picking a model here does not change the session model yet. When a different model is picked, a `Use current model` row lets you go back. Your pick stays while you refine or edit the plan, and goes away when you leave plan mode. The [keybindings](/docs/keybindings/#form) page lists every key in the form.
 
-Successful approval commits the implementation model, normalized options, Build mode, and one implementation turn. The selected model remains the session model. Fresh-context approval displays the approved plan and implementation input in the new session. Cancellation or execution failure after successful approval does not restore the planning session or previous model. Saving follows [Configuration changes](#configuration-changes).
+Approval needs planning work to be finished. If the agent or one of its subagents is still running, Makima asks you to try again later and leaves that work running. While approval is getting ready, the form is locked. Esc cancels it and gives you the form back as it was.
 
-Cancellation releases the approval wait. It does not undo external prompt requests or authentication subprocesses that have already started.
+After approval, the picked model becomes the session model and the agent starts implementing. The agent gets the plan text as it was at approval, so later edits to the file do not change the task. Cancelling from here stops the implementation like any other turn. It does not bring back the planning session or the old model.
 
 ## Configuration changes
 
@@ -121,15 +123,8 @@ maki.setup({
 })
 ```
 
-- `mode_plan_override` replaces the built-in `plan` mode with a verbatim clone
-  of polytoken's plan directive (via the `plan` plugin override). It focuses
-  the model on producing a reviewable artifact, restricts writes to the plan
-  file, swaps the toolset to `read`, `grep`, `glob`, `webfetch`, `write`,
-  `edit`, `plan_submit`, and `task`, and adds `/plan` and `/build` slash commands.
-  The directive and the plan reviewer splice
-  one shared plan specification, so both always see the exact same document.
-- `plan_submit_tool` is a mode-scoped tool: it prints the finished plan inline
-  as a display-only message (kept out of the model context) and surfaces the plan review form, with accept (hands off to implementation), refine (keep planning), or cancel. It only exists in plan mode because plan's toolset lists it. While `plan_submit` is in an active mode's toolset, the built-in auto-hooks that open the review form on a plan-file write are skipped; the model calls `plan_submit` explicitly when the plan is ready. The review form uses the same approval workflow as a completed plan-file write.
+- `mode_plan_override` replaces the built-in `plan` mode with a verbatim clone of polytoken's plan directive (via the `plan` plugin override). It focuses the model on producing a reviewable artifact, restricts writes to the plan file, swaps the toolset to `read`, `grep`, `glob`, `webfetch`, `write`, `edit`, `plan_submit`, and `task`, and adds `/plan` and `/build` slash commands. The directive and the plan reviewer splice one shared plan specification, so both always see the exact same document.
+- `plan_submit_tool` is a mode-scoped tool: it prints the finished plan inline as a display-only message (kept out of the model context) and opens the [plan form](#plan-approval). It only exists in plan mode because plan's toolset lists it. While `plan_submit` is in an active mode's toolset, the built-in auto-hooks that open the plan form on a plan-file write are skipped; the model calls `plan_submit` explicitly when the plan is ready. The form works the same way as after a plan-file write.
 
 The built-in `task` tool grows a `plan_reviewer` subagent type when the plan
 override is active: a read-only audit that verifies the plan follows the shared
