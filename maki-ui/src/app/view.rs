@@ -122,7 +122,9 @@ impl App {
         } else if below_active {
             0
         } else if form_visible {
-            self.plan_form.height().min(max_bottom)
+            self.plan_form
+                .height(inner.width, &self.state.model.spec())
+                .min(max_bottom)
         } else if self.is_main_chat() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())
@@ -312,7 +314,8 @@ impl App {
                 );
             }
         } else if self.plan_form_active() {
-            self.plan_form.view(frame, layout.bottom_area);
+            self.plan_form
+                .view(frame, layout.bottom_area, &self.state.model.spec());
         } else if layout.bottom_area.height > 0 {
             let queue_entries = self.queue.panel_entries();
             queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
@@ -639,7 +642,17 @@ impl App {
     #[cfg(test)]
     pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
-        if self.plan_form_active() {
+        if self.permission_active()
+            || self.help_modal.is_open()
+            || self.btw_modal.is_open()
+            || self.float_mgr.is_focused()
+            || self.plan_approval_pending
+        {
+            return contexts;
+        }
+        if self.model_picker.is_open() && self.plan_form_active() {
+            contexts.push(KeybindContext::ModelPicker);
+        } else if self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);

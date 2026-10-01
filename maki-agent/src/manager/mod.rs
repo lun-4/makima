@@ -3,7 +3,8 @@
 //! The manager owns topology, actor tasks, graph limits, and managed turn
 //! admission. Node ids describe topology but grant no authority: descendants
 //! can only be created with a manager-issued token for a currently executing
-//! turn. The graph lock is never held across actor calls or awaits.
+//! turn. Idle reservation takes the graph lock before the actor state lock;
+//! actor callbacks run without the state lock, and no graph lock is held across awaits.
 
 mod manager_error;
 #[cfg(test)]
@@ -30,14 +31,62 @@ use event_listener::Event;
 use maki_providers::Message;
 use tracing::{info, warn};
 
-use crate::actor::ManagedTurnAdmission;
-use crate::{ActorBackend, AgentActorHandle, AgentId, SharedMessages, TurnId};
+use crate::actor::{ActorIdleGuard, ManagedTurnAdmission};
+use crate::{
+    ActorBackend, ActorError, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
+    SharedMessages, TurnCancellationReason, TurnId,
+};
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 static NEXT_MANAGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 type RunnerTask = smol::Task<()>;
+
+impl AgentManagerHandle {
+    pub fn prepare_idle_subtree(&self, agent_id: AgentId) -> Result<ActorIdleGuard, ManagerError> {
+        let graph = self.lock_graph();
+        if graph.shutting_down {
+            return Err(ManagerError::GraphShutdown);
+        }
+        let root = graph
+            .nodes
+            .get(&agent_id)
+            .ok_or(ManagerError::UnknownAgent(agent_id))?;
+        if root.lifecycle != GraphLifecycle::Live {
+            return Err(ManagerError::NonLiveAgent(agent_id));
+        }
+        let ids = Self::subtree_ids(&graph, agent_id);
+        if graph.active_turns.keys().any(|(id, _)| ids.contains(id))
+            || ids
+                .iter()
+                .skip(1)
+                .any(|id| Self::descendant_busy(&graph.nodes[id]))
+        {
+            return Err(ManagerError::BusySubtree(agent_id));
+        }
+        let actor = root
+            .actor
+            .as_ref()
+            .ok_or(ManagerError::NonLiveAgent(agent_id))?;
+        actor.prepare_idle().map_err(|error| match error {
+            ActorError::Closed | ActorError::Shutdown => ManagerError::NonLiveAgent(agent_id),
+            _ => ManagerError::BusySubtree(agent_id),
+        })
+    }
+
+    /// Live descendants stay registered after their turn (e.g. background
+    /// tasks awaiting despawn), so only their actor's work makes them busy.
+    fn descendant_busy(node: &Node) -> bool {
+        match node.lifecycle {
+            GraphLifecycle::Live => node
+                .actor
+                .as_ref()
+                .is_none_or(AgentActorHandle::has_pending_work),
+            lifecycle => lifecycle.consumes_capacity(),
+        }
+    }
+}
 
 struct Node {
     parent_id: Option<AgentId>,
@@ -127,6 +176,8 @@ pub(crate) struct ManagerInner {
     descendant_cut_gate: Mutex<Option<TestGate>>,
     #[cfg(test)]
     managed_acquire_gate: Mutex<Option<TestGate>>,
+    #[cfg(test)]
+    managed_registration_rejected: Mutex<Option<flume::Sender<()>>>,
 }
 
 #[derive(Clone)]
@@ -167,6 +218,8 @@ impl AgentManagerHandle {
             descendant_cut_gate: Mutex::new(None),
             #[cfg(test)]
             managed_acquire_gate: Mutex::new(None),
+            #[cfg(test)]
+            managed_registration_rejected: Mutex::new(None),
         })))
     }
 }
@@ -219,6 +272,42 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
+        self.create_root_inner(config, initial_messages, shared_messages, factory, None)
+    }
+
+    pub fn create_root_deferred_with_config<F, E>(
+        &self,
+        config: Option<crate::actor::EffectiveAgentConfig>,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        factory: F,
+        start: flume::Receiver<()>,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
+        self.create_root_inner(
+            config,
+            initial_messages,
+            shared_messages,
+            factory,
+            Some(start),
+        )
+    }
+
+    fn create_root_inner<F, E>(
+        &self,
+        config: Option<crate::actor::EffectiveAgentConfig>,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        factory: F,
+        start: Option<flume::Receiver<()>>,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
         let agent_id = AgentId::generate();
         let reservation = {
             let mut graph = self.lock_graph();
@@ -260,14 +349,17 @@ impl AgentManagerHandle {
                 return Err(ManagerError::Factory("agent factory panicked".into()));
             }
         };
-        self.commit_actor(
-            agent_id,
-            reservation,
-            initial_messages,
-            shared_messages,
-            backend,
-            config,
-        )
+        self.commit_actor(agent_id, reservation, |admission| {
+            AgentActorHandle::spawn_managed(
+                agent_id,
+                initial_messages,
+                shared_messages,
+                backend,
+                admission,
+                config,
+                start,
+            )
+        })
     }
 
     pub fn spawn_child(
@@ -434,14 +526,17 @@ impl AgentManagerHandle {
                 return Err(ManagerError::Factory("agent factory panicked".into()));
             }
         };
-        self.commit_actor(
-            child_id,
-            reservation,
-            initial_messages,
-            shared_messages,
-            backend,
-            Some(config),
-        )
+        self.commit_actor(child_id, reservation, |admission| {
+            AgentActorHandle::spawn_managed(
+                child_id,
+                initial_messages,
+                shared_messages,
+                backend,
+                admission,
+                Some(config),
+                None,
+            )
+        })
     }
 
     fn validate_manager(&self, current: &CurrentManagedTurn) -> Result<(), ManagerError> {
@@ -645,20 +740,9 @@ impl AgentManagerHandle {
         &self,
         agent_id: AgentId,
         reservation: u64,
-        initial_messages: Vec<Message>,
-        shared_messages: Option<SharedMessages>,
-        backend: Box<dyn ActorBackend>,
-        config: Option<crate::actor::EffectiveAgentConfig>,
+        spawn: impl FnOnce(ManagedTurnAdmission) -> (AgentActorHandle, RunnerTask),
     ) -> Result<AgentRef, ManagerError> {
-        let admission = ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id);
-        let (actor, task) = AgentActorHandle::spawn_managed(
-            agent_id,
-            initial_messages,
-            shared_messages,
-            backend,
-            admission,
-            config,
-        );
+        let (actor, task) = spawn(ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id));
         let manager = Arc::downgrade(&self.0);
         let task = smol::spawn(async move {
             task.await;
@@ -883,21 +967,49 @@ impl AgentManagerHandle {
         Ok(())
     }
 
-    pub fn close_descendants_for_turn(
+    /// Cancels matching root work and atomically retires its descendant authority.
+    pub fn cancel_correlation(
         &self,
         agent_id: AgentId,
-        turn_id: TurnId,
+        correlation: &str,
+        reason: TurnCancellationReason,
     ) -> Result<(), ManagerError> {
-        let actors = {
+        let (actor, cut, descendants) = {
             let mut graph = self.lock_graph();
-            let actors = Self::capture_subtree_locked(&mut graph, agent_id, false)?;
-            graph.active_turns.remove(&(agent_id, turn_id));
-            actors
+            let node = graph
+                .nodes
+                .get(&agent_id)
+                .ok_or(ManagerError::UnknownAgent(agent_id))?;
+            if !node.lifecycle.consumes_capacity() {
+                return Err(ManagerError::NonLiveAgent(agent_id));
+            }
+            let actor = node
+                .actor
+                .clone()
+                .ok_or(ManagerError::NonLiveAgent(agent_id))?;
+            let mut state = actor
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let matched_active = state.active_matches_correlation(correlation);
+            let descendants = if matched_active {
+                Self::capture_subtree_locked(&mut graph, agent_id, false)?
+            } else {
+                Vec::new()
+            };
+            let cut = actor.capture_correlation_cancel(&mut state, correlation, reason);
+            if let Some(turn_id) = cut.active_turn {
+                graph.active_turns.remove(&(agent_id, turn_id));
+            }
+            drop(state);
+            (actor, cut, descendants)
         };
         #[cfg(test)]
         self.wait_at_descendant_cut_gate();
-        for actor in actors {
-            actor.close();
+        actor.settle_correlation_cancel(cut, correlation, reason);
+        for descendant in descendants {
+            descendant.close();
         }
         Ok(())
     }
@@ -1671,7 +1783,7 @@ pub(crate) async fn enter_managed_turn(
         return Err(crate::TurnCancellationReason::Shutdown);
     }
     let nonce = NEXT_TURN_NONCE.fetch_add(1, Ordering::Relaxed);
-    {
+    let registered = {
         let mut graph = inner
             .graph
             .lock()
@@ -1679,7 +1791,49 @@ pub(crate) async fn enter_managed_turn(
         if graph.shutting_down {
             return Err(crate::TurnCancellationReason::Shutdown);
         }
-        graph.active_turns.insert((agent_id, turn_id), nonce);
+        let node = graph
+            .nodes
+            .get(&agent_id)
+            .ok_or(crate::TurnCancellationReason::Closed)?;
+        if node.lifecycle != GraphLifecycle::Live {
+            return Err(crate::TurnCancellationReason::Closed);
+        }
+        let actor = node
+            .actor
+            .as_ref()
+            .ok_or(crate::TurnCancellationReason::Closed)?;
+        let state = actor
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(match state.lifecycle {
+                ActorLifecycle::Shutdown => crate::TurnCancellationReason::Shutdown,
+                ActorLifecycle::Open | ActorLifecycle::Closed => {
+                    crate::TurnCancellationReason::Closed
+                }
+            });
+        }
+        let registered = state.status == ActorStatus::Running(turn_id) && state.active.is_some();
+        drop(state);
+        if registered {
+            graph.active_turns.insert((agent_id, turn_id), nonce);
+        }
+        registered
+    };
+    if !registered {
+        drop(permit);
+        #[cfg(test)]
+        if let Some(rejected) = inner
+            .managed_registration_rejected
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            rejected.send(()).unwrap();
+        }
+        return Err(cancel.cancelled().await);
     }
     let token = types::ManagedTurnToken {
         manager: AgentManagerHandle(Arc::clone(&inner)),

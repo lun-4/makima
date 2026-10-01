@@ -40,6 +40,8 @@ use super::SystemPromptOverride;
 /// Correlation prefix stamped on TUI root/turn admissions. Parsed back into a
 /// run id for event envelope correlation.
 pub(crate) const ROOT_CORRELATION_PREFIX: &str = "r";
+const PROMPT_SLOTS_CLOSED: &str = "the Lua plugin runtime stopped before returning prompt slots";
+const PROMPT_INPUTS_CLOSED: &str = "prompt input preparation stopped before it finished";
 
 /// Parses an actor correlation string back into the TUI run id.
 pub(crate) fn correlation_to_run_id(correlation: &str) -> u64 {
@@ -236,7 +238,12 @@ impl TuiActorBackend {
             self.vars = vars;
         }
         self.tools = self.build_tools(model, input.workflow);
-        let resolved = if let Some(receiver) = admission
+        let ready = admission
+            .and_then(|snapshot| snapshot.prompt_inputs.as_ref())
+            .and_then(|prompt| prompt.ready.clone());
+        let resolved = if ready.is_some() {
+            ready
+        } else if let Some(receiver) = admission
             .and_then(|snapshot| snapshot.prompt_inputs.as_ref())
             .and_then(|prompt| prompt.resolved.as_ref())
         {
@@ -304,6 +311,9 @@ impl TuiActorBackend {
         }
 
         let prompt_slots = if let Some(resolved) = resolved {
+            if let Some(error) = &resolved.slots_error {
+                warn!(%error, "using empty prompt slots after collection failed");
+            }
             resolved.slots
         } else {
             Arc::new(self.lua_handle.collect_prompt_slots_async().await)
@@ -535,7 +545,57 @@ fn prompt_message(pm: maki_agent::mcp::protocol::PromptMessage) -> Message {
     }
 }
 
+async fn resolve_prompt_slots(
+    receiver: flume::Receiver<maki_agent::prompt::ResolvedSlots>,
+) -> (Arc<maki_agent::prompt::ResolvedSlots>, Option<String>) {
+    match receiver.recv_async().await {
+        Ok(slots) => (Arc::new(slots), None),
+        Err(_) => (Arc::default(), Some(PROMPT_SLOTS_CLOSED.into())),
+    }
+}
+
+async fn prepare_prompt_inputs(
+    mut snapshot: maki_agent::agent::TurnAdmissionSnapshot,
+) -> Result<maki_agent::agent::TurnAdmissionSnapshot, maki_agent::actor::ActorError> {
+    // Only prepared (approval) admissions run through this readiness check,
+    // and they fail fast on prompt-slot errors. Ordinary turns instead fall
+    // back to default slots with a warning in `prepare_run`, because a
+    // planning session should not lose its turn to a broken Lua plugin, while
+    // an implementation handoff must not silently start with wrong prompt
+    // slots.
+    if let Some(prompt) = snapshot.prompt_inputs.as_mut() {
+        let prompt = Arc::make_mut(prompt);
+        if prompt.ready.is_none()
+            && let Some(receiver) = prompt.resolved.take()
+        {
+            prompt.ready = Some(
+                receiver
+                    .recv_async()
+                    .await
+                    .map_err(|_| {
+                        maki_agent::actor::ActorError::InvalidConfig(PROMPT_INPUTS_CLOSED.into())
+                    })?
+                    .map_err(maki_agent::actor::ActorError::InvalidConfig)?,
+            );
+        }
+        if let Some(error) = prompt
+            .ready
+            .as_ref()
+            .and_then(|ready| ready.slots_error.as_ref())
+        {
+            return Err(maki_agent::actor::ActorError::InvalidConfig(error.clone()));
+        }
+    }
+    Ok(snapshot)
+}
+
 impl ActorBackend for TuiActorBackend {
+    fn prepared_readiness(&self) -> Option<maki_agent::actor::PreparedReadiness> {
+        Some(Arc::new(|snapshot| {
+            Box::pin(prepare_prompt_inputs(snapshot))
+        }))
+    }
+
     fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
         let agent_tx = self.agent_tx.clone();
         Some(Arc::new(move |run_id, message| {
@@ -573,7 +633,7 @@ impl ActorBackend for TuiActorBackend {
             let pinned = binding.clone();
             let slot_request = lua_handle.request_prompt_slots();
             smol::spawn(async move {
-                let slots = async { Arc::new(slot_request.recv_async().await.unwrap_or_default()) };
+                let slots = resolve_prompt_slots(slot_request);
                 let messages = async {
                     match (mcp_prompt, pinned, prompt_mcp) {
                         (Some(prompt), Some(binding), Some(mcp)) => mcp
@@ -593,7 +653,8 @@ impl ActorBackend for TuiActorBackend {
                 let _ =
                     tx.send(
                         messages.map(|mcp_messages| maki_agent::agent::ResolvedPromptInputs {
-                            slots,
+                            slots: slots.0,
+                            slots_error: slots.1,
                             mcp_messages,
                         }),
                     );
@@ -609,6 +670,7 @@ impl ActorBackend for TuiActorBackend {
                     instructions,
                     mcp_prompt: binding,
                     resolved: Some(rx),
+                    ready: None,
                 })),
                 bindings: Arc::new(maki_agent::tools::TurnToolBindings::capture(
                     &registry,
@@ -963,17 +1025,101 @@ mod tests {
         );
         tx.send(Ok(maki_agent::agent::ResolvedPromptInputs {
             slots: Arc::new(slots),
+            slots_error: None,
             mcp_messages: None,
         }))
         .unwrap();
+        let snapshot = smol::block_on(backend.prepared_readiness().unwrap()(snapshot)).unwrap();
+        let prompt = snapshot.prompt_inputs.as_ref().unwrap();
+        assert!(prompt.resolved.is_none());
+        let pinned_slots = Arc::clone(&prompt.ready.as_ref().unwrap().slots);
+        let snapshot = smol::block_on(backend.prepared_readiness().unwrap()(snapshot)).unwrap();
+        assert!(Arc::ptr_eq(
+            &pinned_slots,
+            &snapshot
+                .prompt_inputs
+                .as_ref()
+                .unwrap()
+                .ready
+                .as_ref()
+                .unwrap()
+                .slots,
+        ));
         cwd.store(Arc::new(PathBuf::from("/tmp/changed")));
         let model = crate::components::test_model();
-        let (system, _, _) =
+        let (system, _, used_slots) =
             smol::block_on(backend.prepare_run(&mut input, &model, Some(&snapshot))).unwrap();
+        assert!(Arc::ptr_eq(&pinned_slots, &used_slots));
         assert!(system.contains("admitted instructions"));
         assert!(system.contains("admitted identity"));
         assert!(!system.contains("/tmp/changed"));
         assert_eq!(backend.vars.apply("{cwd}"), "/tmp/admitted");
+    }
+
+    #[test_case::test_case(false; "outer_channel_closed")]
+    #[test_case::test_case(true; "mcp_error")]
+    fn prepared_prompt_input_errors_fail(mcp_error: bool) {
+        const MCP_ERROR: &str = "MCP prompt expansion failed";
+        let (backend, input, _) = failing_backend();
+        let mut snapshot = backend.admission_preparation().unwrap()(&input, &input.mode, None);
+        let (tx, rx) = flume::bounded(1);
+        Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap()).resolved = Some(rx);
+        if mcp_error {
+            tx.send(Err(MCP_ERROR.into())).unwrap();
+        }
+        drop(tx);
+        let result = smol::block_on(backend.prepared_readiness().unwrap()(snapshot));
+        let Err(maki_agent::actor::ActorError::InvalidConfig(message)) = result else {
+            panic!("prompt readiness must fail");
+        };
+        let expected = if mcp_error {
+            MCP_ERROR
+        } else {
+            PROMPT_INPUTS_CLOSED
+        };
+        assert_eq!(message, expected);
+    }
+
+    #[test]
+    fn prepared_prompt_slots_reject_inner_channel_closure() {
+        smol::block_on(async {
+            let (mut backend, mut input, _) = failing_backend();
+            input.prompt = None;
+            let mut snapshot = backend.admission_preparation().unwrap()(&input, &input.mode, None);
+            let (slot_tx, slot_rx) = flume::bounded(1);
+            drop(slot_tx);
+            let (slots, slots_error) = resolve_prompt_slots(slot_rx).await;
+            assert_eq!(slots_error.as_deref(), Some(PROMPT_SLOTS_CLOSED));
+            let (tx, rx) = flume::bounded(1);
+            Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap()).resolved = Some(rx);
+            tx.send(Ok(maki_agent::agent::ResolvedPromptInputs {
+                slots,
+                slots_error,
+                mcp_messages: None,
+            }))
+            .unwrap();
+            let ordinary = snapshot.clone();
+            let Err(maki_agent::actor::ActorError::InvalidConfig(message)) =
+                backend.prepared_readiness().unwrap()(snapshot).await
+            else {
+                panic!("closed slot channel must fail readiness");
+            };
+            assert_eq!(message, PROMPT_SLOTS_CLOSED);
+            tx.send(Ok(maki_agent::agent::ResolvedPromptInputs {
+                slots: Arc::default(),
+                slots_error: Some(PROMPT_SLOTS_CLOSED.into()),
+                mcp_messages: None,
+            }))
+            .unwrap();
+            backend
+                .prepare_run(
+                    &mut input,
+                    &crate::components::test_model(),
+                    Some(&ordinary),
+                )
+                .await
+                .unwrap();
+        });
     }
 
     fn failing_backend() -> (TuiActorBackend, AgentInput, flume::Receiver<Envelope>) {

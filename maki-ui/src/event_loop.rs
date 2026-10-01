@@ -84,10 +84,10 @@ use crate::command_runtime::{CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
 use crate::components::{
-    Action, ExitRequest, ReplacementPostCommit, SessionReplacementKind, SessionReplacementRequest,
-    Status,
+    Action, ExitRequest, SessionReplacementKind, SessionReplacementRequest, Status,
 };
 use crate::input::InputReader;
+use crate::plan_approval::PrepareProvider;
 use crate::provider_usage::{
     ProviderIdentity, ProviderUsageCoordinator, ProviderUsageFetch, ProviderUsageFetchId,
     ProviderUsageFetchResult, ProviderUsageInput, ProviderUsageOutput, ProviderUsageRequestKind,
@@ -99,6 +99,10 @@ use crate::storage_writer::StorageWriter;
 use crate::terminal;
 use crate::theme::ThemesProvider;
 
+mod approval;
+
+use approval::{ApprovalStep, PendingPlanApproval};
+
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -108,6 +112,7 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
 const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
     "session lock ownership is unavailable; replacement is disabled";
@@ -390,9 +395,7 @@ impl Drop for HeartbeatCompletion {
 fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
     runtime.session_lock = None;
     runtime.lock_lost = true;
-    runtime
-        .app
-        .flash("Session lock lost to another process; stopping without saving".into());
+    runtime.app.flash(LOCK_LOST_MSG.into());
     runtime.app.exit_request = ExitRequest::Error;
     let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);
     warn!(id = %runtime.id(), "session lock lost to another process; stopping without saving");
@@ -414,10 +417,15 @@ fn apply_heartbeat_completion(runtime: &mut SessionRuntime, mut completion: Hear
 }
 
 fn complete_runtime_heartbeat(runtime: &mut SessionRuntime) {
-    let Some(SessionLockState::InFlight(completion_rx)) = runtime.session_lock.take() else {
-        return;
+    let completion_rx = match runtime.session_lock.take() {
+        Some(SessionLockState::InFlight(completion_rx)) => completion_rx,
+        state => {
+            runtime.session_lock = state;
+            return;
+        }
     };
-    let Some(completion) = collect_heartbeat(completion_rx, None) else {
+    let Some(completion) = collect_heartbeat(completion_rx.clone(), None) else {
+        runtime.session_lock = Some(SessionLockState::InFlight(completion_rx));
         return;
     };
     apply_heartbeat_completion(runtime, completion);
@@ -573,7 +581,6 @@ fn dispatch_mode_change_op(
     modes: Arc<maki_agent::ModeRegistry>,
     internal_tx: flume::Sender<InternalEvent>,
     id: String,
-    follow_up: Option<String>,
 ) {
     let session = runtime.id();
     let identity = runtime.handles.identity();
@@ -619,11 +626,7 @@ fn dispatch_mode_change_op(
         let _ = internal_tx.send(InternalEvent::SessionOp {
             session,
             runtime: identity,
-            kind: SessionOpKind::ModeChanged {
-                id,
-                plan,
-                follow_up,
-            },
+            kind: SessionOpKind::ModeChanged { id, plan },
             result,
         });
     })
@@ -747,19 +750,13 @@ fn handle_session_action(
     }
 }
 
-fn complete_mode_change(
-    app: &mut App,
-    id: String,
-    plan: crate::app::mode::PlanState,
-    follow_up: Option<String>,
-) -> Vec<Action> {
+fn complete_mode_change(app: &mut App, id: String, plan: crate::app::mode::PlanState) {
     if id == "plan" {
         app.state.plan = plan;
     } else if id == "build" {
         app.state.plan = crate::app::mode::PlanState::None;
     }
     app.set_mode_id(id);
-    follow_up.map_or_else(Vec::new, |message| app.start_plan_implementation(message))
 }
 
 fn agent_mode_for_app(app: &App) -> maki_agent::AgentMode {
@@ -911,7 +908,7 @@ impl Drop for CoordinatorRetirement {
 struct SessionRuntime {
     generation: u64,
     config_commits: flume::Receiver<maki_agent::actor::ConfigCommit>,
-    projected_config_generation: u64,
+    projected_config_generation: Option<u64>,
     app: App,
     handles: AgentHandles,
     model_slot: Arc<ProviderSlot>,
@@ -924,12 +921,17 @@ struct SessionRuntime {
     session_lock: Option<SessionLockState>,
     lock_lost: bool,
     restore_pending: bool,
+    pending_approval: Option<PendingPlanApproval>,
+    approved_turn: Option<(
+        maki_agent::actor::ActorIdleGuard,
+        maki_agent::actor::TurnTicket,
+    )>,
+    approval_runner_pending: bool,
 }
 
 struct PendingReplacement {
     prepared: PreparedSessionRuntime,
     kind: SessionReplacementKind,
-    post_commit: Option<ReplacementPostCommit>,
 }
 
 #[derive(Clone)]
@@ -1015,7 +1017,7 @@ impl PreparedSessionRuntime {
         let mut runtime = SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: 0,
+            projected_config_generation: None,
             app,
             handles,
             model_slot,
@@ -1028,6 +1030,9 @@ impl PreparedSessionRuntime {
             session_lock,
             lock_lost: false,
             restore_pending: resumed,
+            pending_approval: None,
+            approved_turn: None,
+            approval_runner_pending: false,
         };
         project_committed_options(&mut runtime);
         Ok(runtime)
@@ -1075,7 +1080,7 @@ impl PreparedSessionRuntime {
         let mut runtime = SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: 0,
+            projected_config_generation: None,
             app,
             handles,
             model_slot,
@@ -1088,6 +1093,9 @@ impl PreparedSessionRuntime {
             session_lock,
             lock_lost: false,
             restore_pending: resumed,
+            pending_approval: None,
+            approved_turn: None,
+            approval_runner_pending: false,
         };
         project_committed_options(&mut runtime);
         Ok(runtime)
@@ -1107,6 +1115,37 @@ fn ensure_replacement_lock_available(
     }
 }
 
+/// Activates `prepared` in place of `current` and hands back the outgoing
+/// runtime. A deferred runner stays parked until the caller releases it. On
+/// failure `current` is untouched and the target lock is returned.
+fn swap_session_runtime(
+    current: &mut SessionRuntime,
+    prepared: PreparedSessionRuntime,
+    target_lock: Option<SessionLockState>,
+    model_slot: &ProviderSlot,
+    defer_runner: bool,
+) -> std::result::Result<SessionRuntime, (String, Option<SessionLockState>)> {
+    let seed_snapshot = prepared.seed_snapshot.clone();
+    let mut runtime = prepared
+        .activate_replacing(model_slot, target_lock, &current.coordinator)
+        .map_err(|(error, target_lock)| (error.to_string(), target_lock))?;
+    if let Some((writer, session)) = seed_snapshot {
+        writer.seed(session);
+    }
+    runtime.app.exit_on_done = current.app.exit_on_done;
+    runtime
+        .app
+        .input_box
+        .replace_history_from(&mut current.app.input_box);
+    runtime.approval_runner_pending = defer_runner;
+    let old = std::mem::replace(current, runtime);
+    old.app
+        .command_runtime
+        .finish_theme_preview(old.app.command_target.id(), false);
+    current.activate_deferred();
+    Ok(old)
+}
+
 fn replace_session_runtime(
     current: &mut SessionRuntime,
     prepared: PreparedSessionRuntime,
@@ -1114,7 +1153,6 @@ fn replace_session_runtime(
     model_slot: &ProviderSlot,
 ) -> Result<SessionRuntime, String> {
     let target_id = prepared.app.session_id();
-    let exit_on_done = current.app.exit_on_done;
     let same_id = current.id() == target_id;
     if current.lock_lost {
         return Err(LOCK_LOST_REPLACEMENT_ERR.into());
@@ -1132,30 +1170,17 @@ fn replace_session_runtime(
             claim_lock(sessions_dir, &target_id).map_err(|error| error.to_string())?,
         ))
     };
-    prepared.seed_storage();
-    let mut runtime =
-        match prepared.activate_replacing(model_slot, target_lock, &current.coordinator) {
-            Ok(runtime) => runtime,
-            Err((error, target_lock)) => {
-                if same_id {
-                    current.session_lock = target_lock;
-                } else if let Err(release_error) = release_lock_state(target_lock) {
-                    warn!(%release_error, "replacement lock release failed after activation error");
-                }
-                return Err(error.to_string());
+    match swap_session_runtime(current, prepared, target_lock, model_slot, false) {
+        Ok(old) => Ok(old),
+        Err((error, target_lock)) => {
+            if same_id {
+                current.session_lock = target_lock;
+            } else if let Err(release_error) = release_lock_state(target_lock) {
+                warn!(%release_error, "replacement lock release failed after activation error");
             }
-        };
-    runtime.app.exit_on_done = exit_on_done;
-    runtime
-        .app
-        .input_box
-        .replace_history_from(&mut current.app.input_box);
-    let old = std::mem::replace(current, runtime);
-    old.app
-        .command_runtime
-        .finish_theme_preview(old.app.command_target.id(), false);
-    current.activate_deferred();
-    Ok(old)
+            Err(error)
+        }
+    }
 }
 
 impl SessionRuntime {
@@ -1165,12 +1190,15 @@ impl SessionRuntime {
             return false;
         };
         if !Arc::ptr_eq(&actor.identity(), &commit.identity)
-            || commit.generation < self.projected_config_generation
+            || self
+                .projected_config_generation
+                .is_some_and(|projected| commit.generation <= projected)
         {
             return false;
         }
-        self.projected_config_generation = commit.generation;
+        self.projected_config_generation = Some(commit.generation);
         project_actor_config(&mut self.app, &commit.config);
+        self.settle_plan_approval();
         true
     }
 
@@ -1195,9 +1223,13 @@ impl SessionRuntime {
     }
 
     fn activate_deferred(&mut self) {
+        if self.approval_runner_pending {
+            return;
+        }
         if std::mem::take(&mut self.restore_pending) {
             self.app.restore_resumed_session();
         }
+        self.handles.release_runner();
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -1219,10 +1251,6 @@ impl SessionRuntime {
             && !self.app.holds_recovery_text()
     }
 }
-
-type PrepareProvider = Arc<
-    dyn Fn(Model, Timeouts) -> Result<maki_agent::actor::PreparedModel, Arc<str>> + Send + Sync,
->;
 
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
@@ -1554,10 +1582,21 @@ impl SpawnCtx {
 
     fn prepare_runtime_with_provider_and_permissions(
         &self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+        permissions: &PermissionManager,
+        seed_snapshot: bool,
+    ) -> Result<PreparedSessionRuntime> {
+        self.prepare_runtime_with_config(session, provider, permissions, seed_snapshot, None)
+    }
+
+    fn prepare_runtime_with_config(
+        &self,
         mut session: AppSession,
         provider: Option<PreparedProvider>,
         permissions: &PermissionManager,
         seed_snapshot: bool,
+        effective_config: Option<maki_agent::EffectiveAgentConfig>,
     ) -> Result<PreparedSessionRuntime> {
         let resumed = session_has_content(&session);
         let session_id = session.id;
@@ -1626,7 +1665,7 @@ impl SpawnCtx {
         .with_mode_def(initial_mode_def);
         let handles = AgentHandles::prepare(
             &model_slot,
-            initial_config,
+            effective_config.unwrap_or(initial_config),
             history.clone(),
             self.config.clone(),
             self.ui_config.tool_output_lines,
@@ -1682,13 +1721,19 @@ impl SpawnCtx {
         let prepared = self.prepare_runtime_with_provider(session, provider)?;
         let session_lock = claim_lock(&self.sessions_dir, &id)?;
         prepared.seed_storage();
-        prepared
+        let mut runtime = prepared
             .activate(&self.model_slot, Some(SessionLockState::Held(session_lock)))
-            .map_err(|error| eyre!(error))
+            .map_err(|error| eyre!(error))?;
+        runtime.activate_deferred();
+        Ok(runtime)
     }
 }
 
 enum InternalEvent {
+    ApprovalRunnerReady {
+        session: MakiId,
+        runtime: Arc<()>,
+    },
     ModelCandidate {
         requested_spec: String,
         expected_provider: ProviderIdentity,
@@ -1713,6 +1758,12 @@ enum InternalEvent {
         kind: SessionOpKind,
         result: Result<(), String>,
     },
+    PlanApprovalReady {
+        session: MakiId,
+        runtime: Arc<()>,
+        request: Arc<()>,
+        result: Result<ApprovalStep, String>,
+    },
     SessionHeartbeat(u64),
 }
 
@@ -1736,7 +1787,6 @@ enum SessionOpKind {
     ModeChanged {
         id: String,
         plan: crate::app::mode::PlanState,
-        follow_up: Option<String>,
     },
     /// `/cd`: apply the canonical path the coordinator resolved, which is not
     /// necessarily the one that was typed.
@@ -2240,6 +2290,31 @@ impl<'t> EventLoop<'t> {
 
     fn handle_internal(&mut self, event: InternalEvent) {
         match event {
+            InternalEvent::ApprovalRunnerReady { session, runtime } => {
+                if let Some(idx) = self
+                    .position(session)
+                    .filter(|idx| Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity()))
+                    && std::mem::take(&mut self.sessions[idx].approval_runner_pending)
+                {
+                    self.sessions[idx].activate_deferred();
+                }
+            }
+            InternalEvent::PlanApprovalReady {
+                session,
+                runtime,
+                request,
+                result,
+            } => {
+                if let Some(idx) = self.position(session).filter(|idx| {
+                    Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity())
+                        && self.sessions[*idx]
+                            .pending_approval
+                            .as_ref()
+                            .is_some_and(|pending| Arc::ptr_eq(&pending.identity, &request))
+                }) {
+                    self.complete_plan_approval(idx, result);
+                }
+            }
             InternalEvent::ModelCandidate {
                 requested_spec,
                 expected_provider,
@@ -2505,7 +2580,19 @@ impl<'t> EventLoop<'t> {
             }
         }
         let mut login_actions: Vec<(usize, Vec<Action>)> = Vec::new();
+        let mut approvals = Vec::new();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
+            if matches!(rt.session_lock, Some(SessionLockState::InFlight(_))) {
+                complete_runtime_heartbeat(rt);
+            }
+            if !matches!(rt.session_lock, Some(SessionLockState::InFlight(_)))
+                && let Some(step) = rt
+                    .pending_approval
+                    .as_mut()
+                    .and_then(|pending| pending.waiting_for_lock.take())
+            {
+                approvals.push((i, step));
+            }
             while let Ok(commit) = rt.config_commits.try_recv() {
                 if rt.project_config(&commit) {
                     dirty = Dirty::YES;
@@ -2519,6 +2606,10 @@ impl<'t> EventLoop<'t> {
         }
         for (i, actions) in login_actions {
             self.dispatch(i, actions);
+        }
+        for (i, step) in approvals {
+            self.complete_plan_approval(i, Ok(step));
+            dirty = Dirty::YES;
         }
         dirty
     }
@@ -2553,6 +2644,15 @@ impl<'t> EventLoop<'t> {
     }
 
     fn drain_channels(&mut self) -> Result<Dirty> {
+        for runtime in &mut self.sessions {
+            if runtime
+                .approved_turn
+                .as_ref()
+                .is_some_and(|(_, ticket)| ticket.peek().is_some())
+            {
+                runtime.approved_turn.take();
+            }
+        }
         let mut dirty = Dirty::NO;
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
@@ -3286,14 +3386,13 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
-    fn dispatch_mode_change(&self, idx: usize, id: String, follow_up: Option<String>) {
+    fn dispatch_mode_change(&self, idx: usize, id: String) {
         dispatch_mode_change_op(
             &self.sessions[idx],
             &self.ctx.storage,
             self.ctx.lua_event_handle.mode_registry(),
             self.internal_tx.clone(),
             id,
-            follow_up,
         );
     }
 
@@ -3554,6 +3653,19 @@ impl<'t> EventLoop<'t> {
                 return Err(error);
             }
         };
+        smol::spawn(self.retire_runtime(idx, old, ())).detach();
+        Ok(())
+    }
+
+    /// Releases the outgoing session's lock now. The returned future shuts
+    /// its agents down, then drops `held`, then closes a replaced session's
+    /// coordinator and forgets its cached snapshot.
+    fn retire_runtime(
+        &self,
+        idx: usize,
+        old: SessionRuntime,
+        held: impl Send + 'static,
+    ) -> impl Future<Output = ()> + Send + 'static {
         let SessionRuntime {
             app,
             handles,
@@ -3567,16 +3679,23 @@ impl<'t> EventLoop<'t> {
             warn!(%error, "old session lock release failed");
         }
         drop(app);
-        handles.shutdown().detach();
-        if replaced_session {
-            let storage_writer = Arc::clone(&self.ctx.storage_writer);
-            smol::spawn(async move {
+        let shutdown = handles.shutdown();
+        let storage_writer = Arc::clone(&self.ctx.storage_writer);
+        async move {
+            shutdown.await;
+            drop(held);
+            if replaced_session {
                 let _ = coordinator.close().await;
                 storage_writer.forget(retired_id);
-            })
-            .detach();
+            }
         }
-        Ok(())
+    }
+
+    fn fire_session_reset(&self, idx: usize, ended_id: MakiId) {
+        self.sessions[idx]
+            .app
+            .lua_event_handle
+            .fire_autocmd("SessionReset", json!({ "session_id": ended_id }));
     }
 
     fn prepare_replacement(
@@ -3584,11 +3703,7 @@ impl<'t> EventLoop<'t> {
         idx: usize,
         request: SessionReplacementRequest,
     ) -> Result<PendingReplacement, String> {
-        let SessionReplacementRequest {
-            mut session,
-            kind,
-            post_commit,
-        } = request;
+        let SessionReplacementRequest { mut session, kind } = request;
         if session.id == self.sessions[idx].id() {
             apply_options_to_session(
                 &mut session,
@@ -3600,32 +3715,15 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].id(),
             self.sessions[idx].app.permissions.as_ref(),
         )?;
-        Ok(PendingReplacement {
-            prepared,
-            kind,
-            post_commit,
-        })
+        Ok(PendingReplacement { prepared, kind })
     }
 
     fn commit_replacement(&mut self, idx: usize, pending: PendingReplacement) {
-        let PendingReplacement {
-            prepared,
-            kind,
-            post_commit,
-        } = pending;
+        let PendingReplacement { prepared, kind } = pending;
         match self.replace_prepared_runtime(idx, prepared) {
             Ok(()) => {
                 if let SessionReplacementKind::Reset { ended_id } = kind {
-                    self.sessions[idx].app.lua_event_handle.fire_autocmd(
-                        "SessionReset",
-                        serde_json::json!({ "session_id": ended_id }),
-                    );
-                }
-                if let Some(post_commit) = post_commit {
-                    let actions = self.sessions[idx]
-                        .app
-                        .apply_replacement_post_commit(post_commit);
-                    self.dispatch(idx, actions);
+                    self.fire_session_reset(idx, ended_id);
                 }
             }
             Err(error) => self.sessions[idx].app.flash(error),
@@ -3850,10 +3948,16 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
-            Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode, None),
-            Action::ImplementPlan(text) => {
-                self.dispatch_mode_change(idx, "build".into(), Some(text));
+            Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode),
+            Action::ApprovePlan {
+                clear_context,
+                model,
+                parallel,
+                path,
+            } => {
+                self.prepare_plan_approval(idx, clear_context, model, parallel, path);
             }
+            Action::CancelPlanApproval => self.sessions[idx].end_plan_approval(),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
@@ -4010,15 +4114,11 @@ impl<'t> EventLoop<'t> {
                 }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
-            SessionOpKind::ModeChanged {
-                id,
-                plan,
-                follow_up,
-            } => match result {
+            SessionOpKind::ModeChanged { id, plan } => match result {
                 Ok(()) => {
-                    let actions =
-                        complete_mode_change(&mut self.sessions[idx].app, id, plan, follow_up);
-                    self.dispatch(idx, actions);
+                    let rt = &mut self.sessions[idx];
+                    complete_mode_change(&mut rt.app, id, plan);
+                    rt.settle_plan_approval();
                 }
                 Err(error) => self.sessions[idx].app.flash(error),
             },
@@ -4089,11 +4189,12 @@ impl<'t> EventLoop<'t> {
                 reply_tx,
             } => {
                 let reply = result.map(|()| {
-                    let app = &mut self.sessions[idx].app;
+                    let rt = &mut self.sessions[idx];
                     if let Some(path) = plan_path {
-                        app.state.plan = crate::app::mode::PlanState::Drafting(path);
+                        rt.app.state.plan = crate::app::mode::PlanState::Drafting(path);
                     }
-                    app.set_mode_id(id);
+                    rt.app.set_mode_id(id);
+                    rt.settle_plan_approval();
                     json!(true)
                 });
                 let _ = reply_tx.send(reply);
@@ -5003,7 +5104,6 @@ mod tests {
                 EventHandle::disconnected_for_test().mode_registry(),
                 internal_tx,
                 "plan".into(),
-                None,
             );
 
             assert_eq!(agent_mode_for_app(&runtime.app), initial_app_mode);
@@ -5013,13 +5113,8 @@ mod tests {
                 panic!("expected mode change completion");
             };
             result.unwrap();
-            if let SessionOpKind::ModeChanged {
-                id,
-                plan,
-                follow_up,
-            } = kind
-            {
-                complete_mode_change(&mut runtime.app, id, plan, follow_up);
+            if let SessionOpKind::ModeChanged { id, plan } = kind {
+                complete_mode_change(&mut runtime.app, id, plan);
             } else {
                 panic!("expected mode change completion");
             }
@@ -5378,14 +5473,14 @@ mod tests {
                 }
                 assert_eq!(
                     event_loop.sessions[0].projected_config_generation,
-                    latest.generation
+                    Some(latest.generation)
                 );
                 assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
                 queued_tx.send(older).unwrap();
                 let _ = event_loop.tick();
                 assert_eq!(
                     event_loop.sessions[0].projected_config_generation,
-                    latest.generation
+                    Some(latest.generation)
                 );
                 assert_eq!(event_loop.sessions[0].app.state.mode.id_key(), "plan");
                 assert!(event_loop.sessions[0].app.state.workflow);
@@ -5477,7 +5572,7 @@ mod tests {
                 assert_eq!(app.state.mode.id_key(), "build");
                 assert_eq!(app.state.thinking, replacement_thinking);
                 assert!(!app.state.workflow);
-                assert_eq!(event_loop.sessions[0].projected_config_generation, 0);
+                assert_eq!(event_loop.sessions[0].projected_config_generation, None);
                 let final_config = replacement_actor.config_snapshot().unwrap();
                 assert_eq!(final_config.generation, initial_config.generation);
                 assert!(Arc::ptr_eq(
@@ -5835,7 +5930,7 @@ mod tests {
         SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
-            projected_config_generation: 0,
+            projected_config_generation: None,
             app,
             handles,
             model_slot,
@@ -5848,6 +5943,9 @@ mod tests {
             session_lock: None,
             lock_lost: false,
             restore_pending: false,
+            pending_approval: None,
+            approved_turn: None,
+            approval_runner_pending: false,
         }
     }
 
@@ -6071,7 +6169,7 @@ mod tests {
     const SHELL_RESULT: &str = "command finished";
     const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-    fn with_event_loop(test: impl FnOnce(&mut EventLoop<'_>)) {
+    pub(super) fn with_event_loop(test: impl FnOnce(&mut EventLoop<'_>)) {
         let mut harness = RuntimeHarness::new();
         let runtime = test_runtime(model_named("test-model"));
         let ctx = harness.ctx.take().unwrap();
@@ -6234,7 +6332,7 @@ mod tests {
         }
     }
 
-    fn shutdown_manager(manager: &maki_agent::AgentManagerHandle) {
+    pub(super) fn shutdown_manager(manager: &maki_agent::AgentManagerHandle) {
         let report = smol::block_on(manager.shutdown(RUNTIME_SHUTDOWN_TIMEOUT));
         assert!(report.timed_out.is_empty());
     }
@@ -7301,6 +7399,58 @@ mod tests {
         );
         lease.release().unwrap();
         release_runtime(runtime);
+    }
+
+    #[test]
+    fn heartbeat_tick_then_delayed_notification_keeps_lock_held() {
+        with_event_loop(|event_loop| {
+            let id = event_loop.sessions[0].id();
+            event_loop.sessions[0].session_lock = Some(SessionLockState::Held(
+                claim_lock(&event_loop.sessions_dir, &id).unwrap(),
+            ));
+            let generation = event_loop.sessions[0].generation;
+            let (entered, entry) = flume::bounded(1);
+            let (release, gate) = flume::bounded(1);
+            start_runtime_heartbeat_with(
+                &mut event_loop.sessions[0],
+                &event_loop.internal_tx,
+                move |lease| {
+                    entered.send(()).unwrap();
+                    gate.recv().unwrap();
+                    (lease, Ok(session_lock::LockBeat::Held))
+                },
+            );
+            entry.recv_timeout(AGENT_SHUTDOWN_TIMEOUT).unwrap();
+            release.send(()).unwrap();
+            let event = event_loop
+                .internal_rx
+                .recv_timeout(AGENT_SHUTDOWN_TIMEOUT)
+                .unwrap();
+            assert!(matches!(event, InternalEvent::SessionHeartbeat(value) if value == generation));
+            event_loop.last_heartbeat = Instant::now();
+            let _ = event_loop.tick();
+            assert!(matches!(
+                event_loop.sessions[0].session_lock,
+                Some(SessionLockState::Held(_))
+            ));
+            assert!(
+                session_lock::claim(&event_loop.sessions_dir, &id)
+                    .unwrap()
+                    .is_none()
+            );
+            event_loop.handle_internal(event);
+            event_loop.handle_internal(InternalEvent::SessionHeartbeat(generation));
+            assert!(matches!(
+                event_loop.sessions[0].session_lock,
+                Some(SessionLockState::Held(_))
+            ));
+            assert!(!event_loop.sessions[0].lock_lost);
+            assert!(
+                session_lock::claim(&event_loop.sessions_dir, &id)
+                    .unwrap()
+                    .is_none()
+            );
+        });
     }
 
     #[test]

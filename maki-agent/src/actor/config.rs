@@ -25,6 +25,11 @@ pub struct ConfigPatch {
 #[derive(Clone)]
 pub enum ConfigChange {
     Patch(ConfigPatch),
+    PatchAndMode {
+        patch: ConfigPatch,
+        mode: AgentMode,
+        mode_def: ModeDef,
+    },
     Mode {
         mode: AgentMode,
         mode_def: Option<ModeDef>,
@@ -53,6 +58,18 @@ impl ConfigChange {
         let mut config = current.clone();
         let mut patch = match self {
             Self::Patch(patch) => patch,
+            Self::PatchAndMode {
+                patch,
+                mode,
+                mode_def,
+            } => {
+                let config = Self::Mode {
+                    mode,
+                    mode_def: Some(mode_def),
+                }
+                .apply(current)?;
+                return Self::Patch(patch).apply(&config);
+            }
             Self::Mode { mode, mode_def } => {
                 if mode_def.is_none() {
                     return Err(ActorError::InvalidConfig(

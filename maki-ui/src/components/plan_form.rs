@@ -1,7 +1,9 @@
-use crate::components::form::{render_form, selected_prefix};
+use crate::components::form::{form_height, render_form, selected_prefix};
 use crate::components::hint_line;
 use crate::components::keybindings::key;
-use crate::theme;
+use crate::theme::{self, Theme};
+
+use std::borrow::Cow;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -48,9 +50,14 @@ const MENU: &[MenuItem] = &[
     },
 ];
 
-// 2 borders + 1 empty line + 1 hint bar
-const CHROME_LINES: u16 = 4;
-const FORM_HEIGHT: u16 = MENU.len() as u16 + CHROME_LINES;
+const MODEL_ROW: usize = MENU.len();
+const USE_CURRENT_ROW: usize = MODEL_ROW + 1;
+const MODEL_LABEL: &str = "Implementation model";
+const MODEL_STAGED_TAG: &str = "  selected";
+const MODEL_CURRENT_TAG: &str = "  current";
+const USE_CURRENT_LABEL: &str = "Use current model";
+const USE_CURRENT_DESC: &str = "  Clear implementation model choice";
+const PARALLEL_TAG: &str = " (parallel)";
 
 #[derive(Debug, PartialEq)]
 pub enum PlanFormAction {
@@ -59,6 +66,8 @@ pub enum PlanFormAction {
     ClearAndImplement,
     Implement,
     OpenEditor,
+    OpenModelPicker,
+    UseCurrentModel,
     Hide,
 }
 
@@ -73,6 +82,7 @@ pub struct PlanForm {
     visibility: Visibility,
     selected: usize,
     parallel: bool,
+    implementation_model: Option<String>,
 }
 
 impl PlanForm {
@@ -81,6 +91,7 @@ impl PlanForm {
             visibility: Visibility::Hidden,
             selected: 0,
             parallel: false,
+            implementation_model: None,
         }
     }
 
@@ -121,6 +132,40 @@ impl PlanForm {
     pub fn reset(&mut self) {
         self.visibility = Visibility::Hidden;
         self.selected = 0;
+        self.implementation_model = None;
+    }
+
+    pub fn implementation_model(&self) -> Option<&str> {
+        self.implementation_model.as_deref()
+    }
+
+    pub fn set_implementation_model(&mut self, spec: String, current_model: &str) {
+        if spec == current_model {
+            self.use_current_model();
+        } else {
+            self.implementation_model = Some(spec);
+        }
+    }
+
+    pub fn use_current_model(&mut self) {
+        self.implementation_model = None;
+        self.selected = MODEL_ROW;
+    }
+
+    pub fn clear_model_if_current(&mut self, current_model: &str) {
+        if self.implementation_model() == Some(current_model) {
+            self.implementation_model = None;
+            self.selected = self.selected.min(MODEL_ROW);
+        }
+    }
+
+    fn staged_model(&self, current_model: &str) -> Option<&str> {
+        self.implementation_model()
+            .filter(|spec| *spec != current_model)
+    }
+
+    fn menu_len(staged: bool) -> usize {
+        MODEL_ROW + 1 + usize::from(staged)
     }
 
     pub fn hint_line(&self) -> Option<Line<'static>> {
@@ -135,11 +180,18 @@ impl PlanForm {
         ]))
     }
 
-    pub fn height(&self) -> u16 {
-        if self.is_visible() { FORM_HEIGHT } else { 0 }
+    pub fn height(&self, width: u16, current_model: &str) -> u16 {
+        if self.is_visible() {
+            form_height(self.lines(current_model), width)
+        } else {
+            0
+        }
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PlanFormAction {
+        if key::MODEL_PICKER.matches(key_event) {
+            return PlanFormAction::OpenModelPicker;
+        }
         if key::QUIT.matches(key_event)
             || key_event.code == KeyCode::Esc
             || key::PLAN_TOGGLE.matches(key_event)
@@ -155,53 +207,113 @@ impl PlanForm {
                 PlanFormAction::Consumed
             }
             KeyCode::Down => {
-                self.selected = (self.selected + 1).min(MENU.len() - 1);
+                self.selected = (self.selected + 1)
+                    .min(Self::menu_len(self.implementation_model.is_some()) - 1);
                 PlanFormAction::Consumed
             }
             KeyCode::Char(' ') => {
                 self.parallel = !self.parallel;
                 PlanFormAction::Consumed
             }
-            KeyCode::Enter => (MENU[self.selected].action)(),
+            KeyCode::Enter => match self.selected {
+                MODEL_ROW => PlanFormAction::OpenModelPicker,
+                USE_CURRENT_ROW => PlanFormAction::UseCurrentModel,
+                row => (MENU[row].action)(),
+            },
             KeyCode::Tab => PlanFormAction::Passthrough,
             _ => PlanFormAction::Consumed,
         }
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect) {
+    pub fn view(&self, frame: &mut Frame, area: Rect, current_model: &str) {
         if !self.is_visible() {
             return;
         }
-
         let t = theme::current();
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(MENU.len() + 1);
+        render_form(
+            &t,
+            FORM_LABEL,
+            frame,
+            area,
+            self.lines(current_model),
+            (0, 0),
+        );
+    }
 
-        for (i, item) in MENU.iter().enumerate() {
-            let (prefix, style) = selected_prefix(&t, i == self.selected);
-            let mut spans = vec![
-                Span::styled(prefix, t.tool_dim),
-                Span::styled(item.label, style),
-                Span::styled(item.desc, t.tool_dim),
-            ];
+    fn lines(&self, current_model: &str) -> Vec<Line<'static>> {
+        let t = theme::current();
+        let staged = self.staged_model(current_model);
+        let menu_len = Self::menu_len(staged.is_some());
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(menu_len + 2);
+
+        for (row, item) in MENU.iter().enumerate() {
+            let mut spans = self.row_spans(&t, row, item.label, item.desc);
             if self.parallel {
-                spans.push(Span::styled(" (parallel)", t.tool_dim.bold()));
+                spans.push(Span::styled(PARALLEL_TAG, t.tool_dim.bold()));
             }
             lines.push(Line::from(spans));
         }
+        let (spec, tag) = match staged {
+            Some(spec) => (spec, MODEL_STAGED_TAG),
+            None => (current_model, MODEL_CURRENT_TAG),
+        };
+        lines.push(Line::from(self.row_spans(
+            &t,
+            MODEL_ROW,
+            format!("{MODEL_LABEL}: {spec}"),
+            tag,
+        )));
+        if staged.is_some() {
+            lines.push(Line::from(self.row_spans(
+                &t,
+                USE_CURRENT_ROW,
+                USE_CURRENT_LABEL,
+                USE_CURRENT_DESC,
+            )));
+        }
         lines.push(Line::default());
         lines.push(hint_line(HINT_PAIRS));
+        lines
+    }
 
-        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
+    fn row_spans(
+        &self,
+        t: &Theme,
+        row: usize,
+        label: impl Into<Cow<'static, str>>,
+        desc: &'static str,
+    ) -> Vec<Span<'static>> {
+        let (prefix, style) = selected_prefix(t, row == self.selected);
+        vec![
+            Span::styled(prefix, t.tool_dim),
+            Span::styled(label, style),
+            Span::styled(desc, t.tool_dim),
+        ]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::key;
+    use crate::components::{buffer_text, key};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use test_case::test_case;
 
-    const LAST: usize = MENU.len() - 1;
+    const CURRENT_MODEL: &str = "provider/current";
+    const OTHER_MODEL: &str = "provider/other";
+    const LONG_MODEL: &str = "openrouter/vendor/a-very-long-implementation-model-name-that-wraps";
+    const WIDE: u16 = 200;
+    const HINT_TAIL: &str = "dismiss";
+
+    fn render(form: &PlanForm, width: u16, current_model: &str) -> String {
+        let height = form.height(width, current_model);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| form.view(frame, frame.area(), current_model))
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
 
     #[test]
     fn on_plan_ready_shows_and_resets_selected() {
@@ -268,17 +380,38 @@ mod tests {
     #[test]
     fn height_reflects_visibility() {
         let mut form = PlanForm::new();
-        assert_eq!(form.height(), 0);
+        assert_eq!(form.height(WIDE, CURRENT_MODEL), 0);
         form.on_plan_ready();
-        assert_eq!(form.height(), FORM_HEIGHT);
+        assert!(form.height(WIDE, CURRENT_MODEL) > 0);
         form.hide();
-        assert_eq!(form.height(), 0);
+        assert_eq!(form.height(WIDE, CURRENT_MODEL), 0);
+    }
+
+    #[test_case(80, true, None, MODEL_ROW - 1, "Implement plan" ; "parallel_at_80_cols")]
+    #[test_case(50, false, Some(LONG_MODEL), USE_CURRENT_ROW, "Use current model" ; "long_model_at_50_cols")]
+    fn wrapped_form_keeps_hint_and_cursor_visible(
+        width: u16,
+        parallel: bool,
+        staged: Option<&str>,
+        selected: usize,
+        row_label: &str,
+    ) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        form.parallel = parallel;
+        if let Some(spec) = staged {
+            form.set_implementation_model(spec.into(), CURRENT_MODEL);
+        }
+        form.selected = selected;
+        let text = render(&form, width, CURRENT_MODEL);
+        assert!(text.contains(HINT_TAIL));
+        assert!(text.contains(&format!("▸ {row_label}")));
     }
 
     #[test_case(0, KeyCode::Up,   0    ; "up_at_zero_stays")]
     #[test_case(0, KeyCode::Down, 1    ; "down_from_zero")]
-    #[test_case(LAST, KeyCode::Down, LAST ; "down_at_max_stays")]
-    #[test_case(LAST, KeyCode::Up, LAST - 1 ; "up_from_max")]
+    #[test_case(MODEL_ROW, KeyCode::Down, MODEL_ROW ; "down_at_max_stays")]
+    #[test_case(MODEL_ROW, KeyCode::Up, MODEL_ROW - 1 ; "up_from_max")]
     fn navigation(start: usize, code: KeyCode, expected: usize) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
@@ -290,11 +423,70 @@ mod tests {
     #[test_case(0, PlanFormAction::Hide              ; "enter_at_0_refine")]
     #[test_case(1, PlanFormAction::ClearAndImplement ; "enter_at_1")]
     #[test_case(2, PlanFormAction::Implement          ; "enter_at_2")]
+    #[test_case(MODEL_ROW, PlanFormAction::OpenModelPicker ; "enter_at_model_row")]
+    #[test_case(USE_CURRENT_ROW, PlanFormAction::UseCurrentModel ; "enter_at_use_current_row")]
     fn enter_dispatches(selected: usize, expected: PlanFormAction) {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         form.selected = selected;
         assert_eq!(form.handle_key(key(KeyCode::Enter)), expected);
+    }
+
+    #[test_case(false ; "current_to_current")]
+    #[test_case(true ; "override_to_current")]
+    fn choosing_current_model_clears_override(staged: bool) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        let height = form.height(WIDE, CURRENT_MODEL);
+        if staged {
+            form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
+            assert_eq!(form.height(WIDE, CURRENT_MODEL), height + 1);
+        }
+        form.set_implementation_model(CURRENT_MODEL.into(), CURRENT_MODEL);
+        assert_eq!(form.implementation_model(), None);
+        assert_eq!(form.height(WIDE, CURRENT_MODEL), height);
+        assert_eq!(form.selected, MODEL_ROW);
+        form.handle_key(key(KeyCode::Down));
+        assert_eq!(form.selected, MODEL_ROW);
+    }
+
+    #[test]
+    fn staged_model_survives_planning_lifecycle_until_reset() {
+        let mut form = PlanForm::new();
+        form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
+        form.on_plan_ready();
+        form.hide();
+        form.toggle();
+        form.on_plan_drafting();
+        form.on_plan_ready();
+        assert_eq!(form.implementation_model(), Some(OTHER_MODEL));
+        form.reset();
+        assert_eq!(form.implementation_model(), None);
+    }
+
+    #[test]
+    fn staged_model_matching_session_model_is_no_override() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        let unstaged_height = form.height(WIDE, OTHER_MODEL);
+        form.set_implementation_model(OTHER_MODEL.into(), CURRENT_MODEL);
+        form.selected = USE_CURRENT_ROW;
+        let text = render(&form, WIDE, OTHER_MODEL);
+        assert!(text.contains(&format!("Implementation model: {OTHER_MODEL}  current")));
+        assert!(!text.contains("Use current model"));
+        assert_eq!(form.height(WIDE, OTHER_MODEL), unstaged_height);
+        form.clear_model_if_current(OTHER_MODEL);
+        assert_eq!(form.implementation_model(), None);
+        assert_eq!(form.selected, MODEL_ROW);
+    }
+
+    #[test]
+    fn model_shortcut_opens_picker() {
+        let mut form = PlanForm::new();
+        assert_eq!(
+            form.handle_key(key::MODEL_PICKER.to_key_event()),
+            PlanFormAction::OpenModelPicker
+        );
     }
 
     #[test]

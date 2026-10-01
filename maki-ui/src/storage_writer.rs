@@ -31,7 +31,7 @@ use maki_storage::sessions::StoredMode;
 
 use crate::AppSession;
 
-const SAVE_FAILED_PREFIX: &str = "Session save failed";
+pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
 const CHECKPOINT_REPLACED: &str = "checkpoint payload superseded by authoritative session state";
 #[cfg(not(test))]
@@ -960,6 +960,7 @@ mod tests {
     use test_case::test_case;
 
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+    const DEFERRED_RETRY: Duration = Duration::from_secs(3600);
     const MODEL: &str = "test-model";
     const FAILED_MODEL: &str = "failed-model";
     const CWD: &str = "/tmp/writer";
@@ -2130,60 +2131,77 @@ mod tests {
         });
     }
 
+    /// Drives the flushes by hand: the threaded writer leaves the gap
+    /// between the failure warning, the requeue and the retry deadline to the
+    /// scheduler, so asserting on them raced under load.
     #[test]
     fn failed_checkpoint_does_not_delay_another_session() {
-        smol::block_on(async {
-            let (_tmp, dir) = state_dir();
-            let sessions_dir = dir.path().join(SESSIONS_DIR);
-            std::fs::create_dir(&sessions_dir).unwrap();
-            let (writer, warn_rx) = writer(&dir);
-            let blocked = AppSession::new(MODEL, CWD);
-            let blocked_id = blocked.id;
-            let blocked_tmp = sessions_dir.join(format!("{blocked_id}.jsonl.tmp"));
-            std::fs::create_dir(&blocked_tmp).unwrap();
-            let blocked_ack = writer.checkpoint(CheckpointRequest {
-                session_id: blocked_id,
-                version: CheckpointVersion {
-                    revision: blocked.revision(),
-                    epoch: 1,
-                },
-                snapshot: Arc::new(blocked),
-            });
-            let warning = warn_rx.recv_async().await.unwrap();
-            assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
-            let blocked_retry_at = match lock(&writer.pending).entries.get(&blocked_id) {
-                Some(Entry::Save(save)) => {
-                    save.retry_at.expect("blocked session must have retry_at")
-                }
-                _ => panic!("blocked session entry missing"),
-            };
+        let (_tmp, dir) = state_dir();
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let (writer, _wake_rx) = manual_writer();
+        let (warn_tx, warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        let retry_state = |id| match lock(&writer.pending).entries.get(&id) {
+            Some(Entry::Save(save)) => (save.retry_attempt, save.retry_at),
+            _ => panic!("blocked session entry missing"),
+        };
 
-            let healthy = AppSession::new(MODEL, CWD);
-            let healthy_id = healthy.id;
-            let healthy_version = CheckpointVersion {
-                revision: healthy.revision(),
+        let blocked = AppSession::new(MODEL, CWD);
+        let blocked_id = blocked.id;
+        let blocked_tmp = sessions_dir.join(format!("{blocked_id}.jsonl.tmp"));
+        std::fs::create_dir(&blocked_tmp).unwrap();
+        let blocked_ack = writer.checkpoint(CheckpointRequest {
+            session_id: blocked_id,
+            version: CheckpointVersion {
+                revision: blocked.revision(),
                 epoch: 1,
-            };
-            let healthy_ack = writer.checkpoint(CheckpointRequest {
-                session_id: healthy_id,
-                version: healthy_version,
-                snapshot: Arc::new(healthy),
-            });
-            let ack = healthy_ack
-                .await
-                .expect("healthy checkpoint was delayed or failed");
-            assert_eq!(ack.version, healthy_version);
-            assert!(
-                Instant::now() < blocked_retry_at,
-                "healthy checkpoint was delayed past the retry backoff of the failed session"
-            );
-
-            std::fs::remove_dir(blocked_tmp).unwrap();
-            assert!(blocked_ack.await.is_ok());
-            writer.shutdown(DRAIN_TIMEOUT);
-            assert!(AppSession::load(healthy_id, &dir).is_ok());
-            assert!(AppSession::load(blocked_id, &dir).is_ok());
+            },
+            snapshot: Arc::new(blocked),
         });
+        disk.flush(&writer.pending);
+        let warning = warn_rx.try_recv().unwrap();
+        assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
+        let blocked_retry_at = Instant::now() + DEFERRED_RETRY;
+        if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&blocked_id) {
+            save.retry_at = Some(blocked_retry_at);
+        }
+        let blocked_retry = retry_state(blocked_id);
+
+        let healthy = AppSession::new(MODEL, CWD);
+        let healthy_id = healthy.id;
+        let healthy_version = CheckpointVersion {
+            revision: healthy.revision(),
+            epoch: 1,
+        };
+        let healthy_ack = writer.checkpoint(CheckpointRequest {
+            session_id: healthy_id,
+            version: healthy_version,
+            snapshot: Arc::new(healthy),
+        });
+        let next_wake = disk.flush(&writer.pending);
+        let ack = smol::block_on(healthy_ack).expect("healthy checkpoint was delayed or failed");
+        assert_eq!(ack.version, healthy_version);
+        assert_eq!(
+            retry_state(blocked_id),
+            blocked_retry,
+            "the failed session must keep backing off while another session saves"
+        );
+        assert_eq!(next_wake, Some(blocked_retry_at));
+
+        std::fs::remove_dir(blocked_tmp).unwrap();
+        if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&blocked_id) {
+            save.retry_at = None;
+        }
+        disk.flush(&writer.pending);
+        assert!(smol::block_on(blocked_ack).is_ok());
+        assert!(AppSession::load(healthy_id, &dir).is_ok());
+        assert!(AppSession::load(blocked_id, &dir).is_ok());
     }
 
     #[test]

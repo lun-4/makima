@@ -1516,12 +1516,19 @@ fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
             .recv_async()
             .await
             .expect("timed-out managed provider request remained alive");
-        let child = manager
+        let child_id = manager
             .snapshot()
             .into_iter()
             .find(|node| node.parent_id == Some(root.id()))
-            .expect("managed timeout child");
-        assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
+            .expect("managed timeout child")
+            .agent_id;
+        while !manager.runner_finished(child_id).unwrap() {
+            smol::future::yield_now().await;
+        }
+        assert_eq!(
+            manager.node(child_id).unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

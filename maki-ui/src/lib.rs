@@ -35,6 +35,7 @@ pub mod wrap;
 mod agent;
 mod event_loop;
 mod input;
+mod plan_approval;
 mod terminal;
 
 use std::time::Instant;

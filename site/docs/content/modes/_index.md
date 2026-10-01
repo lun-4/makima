@@ -24,13 +24,33 @@ Switching to plan mode allocates a plan file under `plans/`. Native write and ed
 
 A mode is not a sandbox for plugin effects. Lua filesystem writes require the plugin's `fs_write` permission and are not restricted to the plan path. Tool selection and native write-target checks do not constrain every effect of a selected plugin.
 
+## Plan approval
+
+When a plan is ready, the plan form opens below the chat. It has three actions:
+
+- `Refine plan` hides the form so you can keep planning with the agent.
+- `Implement plan` switches to build mode and implements the plan in the current conversation.
+- `Clear context and implement` starts a fresh build session that holds only the plan, then implements it.
+
+Space toggles parallel implementation, which asks the agent to split the work across subagents. Ctrl+O opens the plan in your editor. Esc hides the form, and Ctrl+T shows or hides it.
+
+The `Implementation model` row shows the model that will do the work. It starts as the current session model. Press Enter on that row to pick another one. Picking a model here does not change the session model yet. When a different model is picked, a `Use current model` row lets you go back. Your pick stays while you refine or edit the plan, and goes away when you leave plan mode. The [keybindings](/docs/keybindings/#form) page lists every key in the form.
+
+Approval needs planning work to be finished. If the agent or one of its subagents is still running, Makima asks you to try again later and leaves that work running. While approval is getting ready, the form is locked. Esc cancels it and gives you the form back as it was.
+
+Approval is strict about the handoff turn's setup. If collecting prompt slots fails, say because a plugin stopped, the implementation cannot start and you get the form back. A turn you send yourself in that situation keeps going with default slots and a warning in the log, because planning should not lose its turn to a broken plugin.
+
+After approval, the picked model becomes the session model and the agent starts implementing. The agent gets the plan text as it was at approval, so later edits to the file do not change the task. Cancelling from here stops the implementation like any other turn. It does not bring back the planning session or the old model.
+
 ## Configuration changes
 
-Managed TUI roots and Lua agent sessions own their model, thinking, fast, workflow, and mode configuration. Changes apply in order to later admitted work. An active or already admitted turn retains its provider, settings, resolved mode definition, prompt inputs, and tool bindings. A mode registry change does not replace the definition captured for that turn. Selecting an undefined custom mode fails.
+The model, thinking, fast, workflow, and mode settings belong to the session. You change them with `/model`, `/thinking`, `/fast`, `/workflow`, Tab, a plan approval, or a plugin. Makima shows the new value as soon as it accepts the change. When you pick a model that does not support thinking or fast, those turn off.
 
-A successful managed setter means the actor committed the change. Session saving runs asynchronously and does not block admission. If saving fails, the committed configuration remains active and a warning reports that the configuration was applied but not saved. The storage writer retains the latest committed snapshot for retry. A successful retry clears the pending-save condition. A crash before saving can lose the latest configuration change.
+A change never touches a turn that has already started. The running turn finishes with the model, settings, mode, and tools it started with. A message you send while the agent works usually joins the running turn, but not after a change: then it waits for the running turn to finish and starts its own turn with the new settings. Messages that were already in the queue keep the settings they were queued with. The same is true when a plugin redefines a mode: running and queued turns keep the old definition.
 
-Headless, print, and ACP execution retain their existing frontend-owned initialization and configuration paths. They do not yet use the managed actor execution loop. YOLO and plugin options retain their existing owners; YOLO changes affect permission checks immediately.
+Makima saves the change with the session in the background, so you never wait on the disk. If saving fails, the change still applies, and a warning says the configuration was applied but not saved. Makima keeps retrying and tells you when the save recovers. If Makima crashes before the save lands, the session comes back with the older settings.
+
+All of this is how the TUI and Lua agent sessions work. Headless, print, and ACP runs set these options their own way. YOLO and plugin options sit outside it, and a YOLO change applies to permission checks right away.
 
 ## What a mode is
 
@@ -91,7 +111,7 @@ maki.api.mode.reset("plan")  -- drop a plugin override, restore the built-in
 maki.api.mode.reset()        -- restore every built-in
 ```
 
-Switching modes fires the autocmd `ModeChanged` with data `{ mode = "<id>" }`.
+Switching modes fires the autocmd `ModeChanged` with data `{ mode = "<id>" }`. Setting the mode you are already in does not fire it.
 
 ## Example: a plan-review workflow
 
@@ -107,20 +127,8 @@ maki.setup({
 })
 ```
 
-- `mode_plan_override` replaces the built-in `plan` mode with a verbatim clone
-  of polytoken's plan directive (via the `plan` plugin override). It focuses
-  the model on producing a reviewable artifact, restricts writes to the plan
-  file, swaps the toolset to `read`, `grep`, `glob`, `webfetch`, `write`,
-  `edit`, `plan_submit`, and `task`, and adds `/plan` and `/build` slash commands.
-  The directive and the plan reviewer splice
-  one shared plan specification, so both always see the exact same document.
-- `plan_submit_tool` is a mode-scoped tool: it prints the finished plan inline
-  as a **display-only** message (kept out of your context) and surfaces the plan
-  review form, with **accept** (hands off to implementation), **refine** (keep
-  planning), or **cancel**. It only exists in plan mode because plan's toolset
-  lists it. While `plan_submit` is in an active mode's toolset, the built-in
-  auto-hooks that open the review form on a plan-file write are skipped; the
-  model calls `plan_submit` explicitly when the plan is ready.
+- `mode_plan_override` replaces the built-in `plan` mode with a verbatim clone of polytoken's plan directive (via the `plan` plugin override). It focuses the model on producing a reviewable artifact, restricts writes to the plan file, swaps the toolset to `read`, `grep`, `glob`, `webfetch`, `write`, `edit`, `plan_submit`, and `task`, and adds `/plan` and `/build` slash commands. The directive and the plan reviewer splice one shared plan specification, so both always see the exact same document.
+- `plan_submit_tool` is a mode-scoped tool: it prints the finished plan inline as a display-only message (kept out of the model context) and opens the [plan form](#plan-approval). It only exists in plan mode because plan's toolset lists it. While `plan_submit` is in an active mode's toolset, the built-in auto-hooks that open the plan form on a plan-file write are skipped; the model calls `plan_submit` explicitly when the plan is ready. The form works the same way as after a plan-file write.
 
 The built-in `task` tool grows a `plan_reviewer` subagent type when the plan
 override is active: a read-only audit that verifies the plan follows the shared

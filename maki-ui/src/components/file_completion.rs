@@ -710,11 +710,13 @@ impl FileCompletionMenu {
         self.session.is_some()
     }
 
+    /// Whether Enter would act on the selection now, not just whether items
+    /// are on screen: a pending publication keeps the previous query's items.
     #[cfg(test)]
     pub fn has_selectable(&self) -> bool {
         self.session
             .as_ref()
-            .is_some_and(|s| s.visible && !s.matches.is_empty())
+            .is_some_and(|s| s.visible && s.publication.ready() && !s.matches.is_empty())
     }
 
     #[cfg(test)]

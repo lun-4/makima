@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
@@ -162,6 +162,62 @@ pub struct SessionReadHandle {
     session_id: MakiId,
     options: Arc<SessionOptions>,
     state: Arc<Mutex<CoordinatorState>>,
+    source_reservations: Arc<Mutex<usize>>,
+}
+
+pub struct IdleSessionLease {
+    lease: SessionLease,
+    snapshot: SessionSourceSnapshot,
+    coordinator: SessionCoordinatorHandle,
+}
+
+pub struct SessionSourceSnapshot {
+    cwd: PathBuf,
+    history: Arc<Vec<Message>>,
+    history_revision: u64,
+}
+
+impl SessionSourceSnapshot {
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn history(&self) -> &Arc<Vec<Message>> {
+        &self.history
+    }
+}
+
+impl IdleSessionLease {
+    pub fn snapshot(&self) -> &SessionSourceSnapshot {
+        &self.snapshot
+    }
+
+    pub fn revalidate(&self) -> Result<(), SessionCoordinatorError> {
+        self.coordinator.ensure_live()?;
+        let state = lock(&self.lease.read.state);
+        if state.cwd == self.snapshot.cwd
+            && state.history_revision == self.snapshot.history_revision
+            && Arc::ptr_eq(&state.history, &self.snapshot.history)
+        {
+            Ok(())
+        } else {
+            Err(SessionCoordinatorError::SessionBusy(
+                self.coordinator.session_id,
+            ))
+        }
+    }
+}
+
+/// Wraps an operation so it is rejected up front (rather than queued behind
+/// the coordinator) while a source reservation is live. The immediate
+/// `SessionBusy` a caller can observe without a coordinator roundtrip is
+/// what justifies the plumbing over a coordinator-side flag.
+struct SourceReservation(Arc<Mutex<usize>>);
+
+impl Drop for SourceReservation {
+    fn drop(&mut self) {
+        *lock(&self.0) -= 1;
+    }
 }
 
 pub struct SessionLease {
@@ -266,6 +322,10 @@ enum PluginOptionDecision {
 }
 
 enum Operation {
+    Reserved {
+        operation: Box<Operation>,
+        reservation: SourceReservation,
+    },
     AcquireLease {
         reply: flume::Sender<Result<SessionLease, SessionCoordinatorError>>,
     },
@@ -553,13 +613,54 @@ impl SessionCoordinatorHandle {
             .ok_or(SessionCoordinatorError::StaleSession(self.session_id))
     }
 
+    fn send_source_operation(
+        &self,
+        operation: Operation,
+        idle_only: bool,
+    ) -> Result<(), SessionCoordinatorError> {
+        let mut reservations = lock(&self.read.source_reservations);
+        if idle_only && *reservations != 0 {
+            return Err(SessionCoordinatorError::SessionBusy(self.session_id));
+        }
+        *reservations += 1;
+        let result = self.tx.send(Operation::Reserved {
+            operation: Box::new(operation),
+            reservation: SourceReservation(Arc::clone(&self.read.source_reservations)),
+        });
+        drop(reservations);
+        result.map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))
+    }
+
+    pub async fn try_acquire_idle_lease(
+        &self,
+    ) -> Result<IdleSessionLease, SessionCoordinatorError> {
+        self.ensure_live()?;
+        let (reply, response) = flume::bounded(1);
+        self.send_source_operation(Operation::AcquireLease { reply }, true)?;
+        let lease = response
+            .recv_async()
+            .await
+            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))??;
+        self.ensure_live()?;
+        let snapshot = {
+            let state = lock(&lease.read.state);
+            SessionSourceSnapshot {
+                cwd: state.cwd.clone(),
+                history: Arc::clone(&state.history),
+                history_revision: state.history_revision,
+            }
+        };
+        Ok(IdleSessionLease {
+            lease,
+            snapshot,
+            coordinator: self.clone(),
+        })
+    }
+
     pub async fn acquire_lease(&self) -> Result<SessionLease, SessionCoordinatorError> {
         self.ensure_live()?;
         let (reply, response) = flume::bounded(1);
-        self.tx
-            .send_async(Operation::AcquireLease { reply })
-            .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
+        self.send_source_operation(Operation::AcquireLease { reply }, false)?;
         response
             .recv_async()
             .await
@@ -682,13 +783,13 @@ impl SessionCoordinatorHandle {
     ) -> Result<(), SessionCoordinatorError> {
         self.ensure_live()?;
         let (reply, response) = flume::bounded(1);
-        self.tx
-            .send_async(Operation::ReplaceHistory {
+        self.send_source_operation(
+            Operation::ReplaceHistory {
                 history: Arc::new(history),
                 reply,
-            })
-            .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
+            },
+            false,
+        )?;
         response
             .recv_async()
             .await
@@ -701,10 +802,7 @@ impl SessionCoordinatorHandle {
     ) -> Result<PathBuf, SessionCoordinatorError> {
         self.ensure_live()?;
         let (reply, response) = flume::bounded(1);
-        self.tx
-            .send_async(Operation::ChangeDirectory { path, reply })
-            .await
-            .map_err(|_| SessionCoordinatorError::StaleSession(self.session_id))?;
+        self.send_source_operation(Operation::ChangeDirectory { path, reply }, false)?;
         response
             .recv_async()
             .await
@@ -791,6 +889,7 @@ impl PreparedSessionCoordinator {
         let read = SessionReadHandle {
             session_id,
             options,
+            source_reservations: Arc::new(Mutex::new(0)),
             state: Arc::new(Mutex::new(CoordinatorState {
                 history: Arc::new(history),
                 model,
@@ -1094,7 +1193,8 @@ fn project_committed_config(
 fn defers_behind_lease(operation: &Operation) -> bool {
     matches!(
         operation,
-        Operation::ReplaceHistory { .. }
+        Operation::Reserved { .. }
+            | Operation::ReplaceHistory { .. }
             | Operation::ChangeDirectory { .. }
             | Operation::Close { .. }
             | Operation::AcquireLease { .. }
@@ -1104,6 +1204,7 @@ fn defers_behind_lease(operation: &Operation) -> bool {
 fn reject_operation(operation: Operation, session_id: MakiId) {
     let error = || SessionCoordinatorError::StaleSession(session_id);
     match operation {
+        Operation::Reserved { operation, .. } => reject_operation(*operation, session_id),
         Operation::AcquireLease { reply } => {
             let _ = reply.send(Err(error()));
         }
@@ -1134,9 +1235,15 @@ fn reject_operation(operation: Operation, session_id: MakiId) {
     }
 }
 
-async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> ControlFlow<()> {
+/// A reserved operation releases its reservation before replying, so a caller
+/// that has its answer never sees the session busy on its account.
+async fn handle_operation(
+    ctx: &CoordinatorCtx,
+    operation: Operation,
+    reservation: Option<SourceReservation>,
+) -> ControlFlow<()> {
     match operation {
-        Operation::AcquireLease { .. } => {
+        Operation::AcquireLease { .. } | Operation::Reserved { .. } => {
             // Held leases are driven by `run`; a nested one cannot happen.
             unreachable!("lease acquisition is handled by the coordinator loop")
         }
@@ -1192,11 +1299,13 @@ async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> Control
         }
         Operation::ReplaceHistory { history, reply } => {
             let result = replace_history(&ctx.read, &*ctx.checkpoint, history).await;
+            drop(reservation);
             let _ = reply.send(result);
         }
         Operation::ChangeDirectory { path, reply } => {
             let result =
                 change_directory(&ctx.read, &*ctx.directory_adopter, &*ctx.checkpoint, path).await;
+            drop(reservation);
             let _ = reply.send(result);
         }
         Operation::UpdateModelValues { specs, reply } => {
@@ -1314,6 +1423,13 @@ async fn run(
                 Err(_) => break,
             },
         };
+        let (operation, reservation) = match operation {
+            Operation::Reserved {
+                operation,
+                reservation,
+            } => (*operation, Some(reservation)),
+            other => (other, None),
+        };
         match operation {
             Operation::AcquireLease { reply } => {
                 let (released, wait) = flume::unbounded();
@@ -1333,7 +1449,7 @@ async fn run(
                 }
             }
             other => {
-                if handle_operation(&ctx, other).await.is_break() {
+                if handle_operation(&ctx, other, reservation).await.is_break() {
                     for operation in deferred.drain(..).chain(rx.try_iter()) {
                         reject_operation(operation, ctx.session_id);
                     }
@@ -1397,7 +1513,7 @@ async fn hold_lease(
                         let result = finish_history_checkpoint(&ctx.read, pending).await;
                         let _ = reply.send(result);
                     }
-                    let _ = handle_operation(ctx, operation).await;
+                    let _ = handle_operation(ctx, operation, None).await;
                     return ControlFlow::Break(());
                 } else if let Operation::PreparePluginOptions { prepared, .. } = operation {
                     let _ =
@@ -1405,7 +1521,7 @@ async fn hold_lease(
                 } else if defers_behind_lease(&operation) {
                     deferred.push_back(operation);
                 } else {
-                    let _ = handle_operation(ctx, operation).await;
+                    let _ = handle_operation(ctx, operation, None).await;
                 }
             }
             // The last handle is gone; nothing more will arrive.
@@ -1510,7 +1626,7 @@ async fn finish_history_commit(
                 } else if defers_behind_lease(&operation) {
                     deferred.push_back(operation);
                 } else {
-                    let _ = handle_operation(ctx, operation).await;
+                    let _ = handle_operation(ctx, operation, None).await;
                 }
             }
             CommitEvent::Incoming(Err(_)) => closing = true,
@@ -2169,6 +2285,150 @@ mod tests {
 
     fn register(id: MakiId) -> SessionCoordinatorHandle {
         SessionCoordinatorHandle::register(params(id, writer(false))).unwrap()
+    }
+
+    #[test]
+    fn idle_lease_captures_source_and_defers_mutations() {
+        smol::block_on(async {
+            let coordinator = register(MakiId::generate());
+            let lease = coordinator.try_acquire_idle_lease().await.unwrap();
+            let original = coordinator.read().history();
+            assert!(Arc::ptr_eq(lease.snapshot().history(), &original));
+            assert_eq!(lease.snapshot().cwd(), Path::new("/project"));
+            assert_eq!(lease.snapshot().history_revision, 0);
+            let (reply, response) = flume::bounded(1);
+            coordinator
+                .send_source_operation(
+                    Operation::ChangeDirectory {
+                        path: PathBuf::from("/changed"),
+                        reply,
+                    },
+                    false,
+                )
+                .unwrap();
+            let (reply, history_response) = flume::bounded(1);
+            coordinator
+                .send_source_operation(
+                    Operation::ReplaceHistory {
+                        history: Arc::new(vec![Message::user("replacement".into())]),
+                        reply,
+                    },
+                    false,
+                )
+                .unwrap();
+            coordinator
+                .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                .await
+                .unwrap();
+            assert!(response.is_empty());
+            assert!(history_response.is_empty());
+            lease.revalidate().unwrap();
+            assert!(matches!(
+                coordinator.try_acquire_idle_lease().await,
+                Err(SessionCoordinatorError::SessionBusy(_))
+            ));
+            drop(lease);
+            response.recv_async().await.unwrap().unwrap();
+            history_response.recv_async().await.unwrap().unwrap();
+            coordinator
+                .set_option(YOLO_OPTION_ID, DISABLED_VALUE)
+                .await
+                .unwrap();
+            let lease = coordinator.try_acquire_idle_lease().await.unwrap();
+            assert_eq!(lease.snapshot().cwd(), Path::new("/changed"));
+            assert_eq!(lease.snapshot().history_revision, 1);
+            assert!(!Arc::ptr_eq(lease.snapshot().history(), &original));
+            drop(lease);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case::test_case(false)]
+    #[test_case::test_case(true)]
+    fn idle_lease_rejects_pending_source_mutation(directory: bool) {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+                Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let started = started_tx.clone();
+                    let release = release_rx.clone();
+                    Box::pin(async move {
+                        started.send(()).unwrap();
+                        release.recv_async().await.unwrap();
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                });
+            let coordinator = SessionCoordinatorHandle::register(params(id, checkpoint)).unwrap();
+            let mutation = coordinator.clone();
+            let task = smol::spawn(async move {
+                if directory {
+                    mutation
+                        .change_directory(PathBuf::from("/changed"))
+                        .await
+                        .map(|_| ())
+                } else {
+                    mutation
+                        .replace_history(vec![Message::user("replacement".into())])
+                        .await
+                }
+            });
+            started_rx.recv_async().await.unwrap();
+            assert!(matches!(
+                coordinator.try_acquire_idle_lease().await,
+                Err(SessionCoordinatorError::SessionBusy(_))
+            ));
+            release_tx.send(()).unwrap();
+            task.await.unwrap();
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn idle_lease_rejects_history_finalization_after_release() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+                Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
+                    let started = started_tx.clone();
+                    let release = release_rx.clone();
+                    Box::pin(async move {
+                        started.send(()).unwrap();
+                        release.recv_async().await.unwrap();
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                });
+            let coordinator = SessionCoordinatorHandle::register(params(id, checkpoint)).unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+            assert!(matches!(
+                coordinator.try_acquire_idle_lease().await,
+                Err(SessionCoordinatorError::SessionBusy(_))
+            ));
+            let commit = lease
+                .committer()
+                .unwrap()
+                .begin_history_commit(vec![Message::user("complete".into())], None)
+                .await
+                .unwrap();
+            started_rx.recv_async().await.unwrap();
+            drop(lease);
+            assert!(matches!(
+                coordinator.try_acquire_idle_lease().await,
+                Err(SessionCoordinatorError::SessionBusy(_))
+            ));
+            release_tx.send(()).unwrap();
+            commit.wait().await.unwrap();
+            coordinator.close().await.unwrap();
+        });
     }
 
     fn register_with_catalog(

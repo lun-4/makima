@@ -532,9 +532,14 @@ impl CommandPalette {
             .unwrap_or(0);
     }
 
+    /// Whether Enter would act on the final selection now: a pending
+    /// publication keeps the previous query's items, and an unfinished request
+    /// can still reorder or restamp them.
     #[cfg(test)]
     pub(crate) fn has_argument_selectable(&self) -> bool {
-        !self.argument_publication.is_pending() && !self.argument_items.is_empty()
+        !self.argument_publication.is_pending()
+            && self.pending_arguments.is_none()
+            && !self.argument_items.is_empty()
     }
 
     #[cfg(test)]
@@ -1992,12 +1997,13 @@ mod tests {
             ])
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
-        (
-            CommandPalette::new(registry, target),
-            started_rx,
-            release_tx,
-            events,
-        )
+        let mut palette = CommandPalette::new(registry, target);
+        let timeout = u64::try_from(MATCHER_SETTLE_TIMEOUT.as_millis()).unwrap();
+        assert!(
+            !palette.nucleo.tick(timeout).running,
+            "command matcher did not settle"
+        );
+        (palette, started_rx, release_tx, events)
     }
 
     #[test_case("/cd missing ", "/cd missing ".len(); "trailing_space")]

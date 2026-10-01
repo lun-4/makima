@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use maki_agent::actor::AgentActorHandle;
 use maki_agent::{AgentId, AgentManagerHandle, CancelMap, CancelTrigger, TurnCancellationReason};
 
 use super::AgentCommand;
@@ -15,7 +14,6 @@ use super::shared_queue::correlation;
 /// readiness.
 pub(super) fn spawn_command_router(
     cmd_rx: flume::Receiver<AgentCommand>,
-    actor: Arc<AgentActorHandle>,
     manager: AgentManagerHandle,
     root_id: AgentId,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -30,12 +28,10 @@ pub(super) fn spawn_command_router(
             match cmd {
                 AgentCommand::Cancel { run_id } => {
                     let correlation = correlation(run_id);
-                    actor.cancel_correlation_with_active(
+                    let _ = manager.cancel_correlation(
+                        root_id,
                         &correlation,
                         TurnCancellationReason::User,
-                        |turn_id| {
-                            let _ = manager.close_descendants_for_turn(root_id, turn_id);
-                        },
                     );
                 }
                 AgentCommand::CancelAll => {
@@ -289,7 +285,6 @@ mod tests {
             let (init_trigger, _) = maki_agent::CancelToken::new();
             spawn_command_router(
                 cmd_rx,
-                Arc::new(root_actor.clone()),
                 manager.clone(),
                 root.id(),
                 Arc::new(CancelMap::new()),
@@ -391,7 +386,6 @@ mod tests {
             let (init_trigger, init_cancel) = maki_agent::CancelToken::new();
             spawn_command_router(
                 cmd_rx,
-                Arc::new(root_actor.clone()),
                 manager.clone(),
                 root.id(),
                 Arc::new(CancelMap::new()),

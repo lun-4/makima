@@ -843,20 +843,21 @@ Listen for one or more events. Returns an id you can pass to
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-`"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
-`"SplashHidden"`, and `"StoreChanged"`. Plugins can
+`"SessionFocusChanged"`, `"ProviderChanged"`, `"ModeChanged"`, `"SessionPickerRequested"`,
+`"SplashShown"`, `"SplashHidden"`, and `"StoreChanged"`. Plugins can
 also fire their own events with `exec_autocmds`.
 
 `"SessionPickerRequested"` opens the `/sessions` picker, but only
 asynchronously: the callback defers through `maki.async.run`, so the
 picker is not open when the event returns.
 
-Except `"SessionPickerRequested"` and `"StoreChanged"`, each host event
+Except `"SessionPickerRequested"`, `"ModeChanged"` and `"StoreChanged"`, each host event
 carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
 running or focused. Tool events also carry `data.tool_id` and `data.tool`.
 `"SessionFocusChanged"` also carries `data.previous_session_id` except on
-initial startup. `"StoreChanged"` carries `data.registry` and, for
+initial startup. `"ModeChanged"` carries `data.mode`, and fires only when
+the mode actually changes. `"StoreChanged"` carries `data.registry` and, for
 registrations, `data.key`.
 
 **Parameters:**

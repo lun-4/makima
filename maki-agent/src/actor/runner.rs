@@ -9,7 +9,10 @@ use tracing::{debug, info, warn};
 
 use super::queue::{ActorQueue, InterruptQueue};
 use super::types::{ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind};
-use super::{ActiveCancel, ActorInner, ActorWork, TurnAdmission, cancelled_outcome, finalize_turn};
+use super::{
+    ActiveCancel, ActorInner, ActorWork, ProcessingWork, TurnAdmission, cancelled_outcome,
+    settle_and_finalize_turn,
+};
 use crate::types::{TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
 
@@ -108,14 +111,17 @@ impl Runner {
     async fn step(&mut self) -> Step {
         loop {
             let popped = {
-                let state = self
+                let mut state = self
                     .inner
                     .state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                self.queue
-                    .pop()
-                    .map(|work| (work, state.cancellation_generation))
+                let work = state.pop_work(&self.queue);
+                if let Some(work) = &work {
+                    state.retire_superseded_precancels(work);
+                }
+                state.processing = work.as_ref().map(ProcessingWork::new);
+                work.map(|work| (work, state.cancellation_generation))
             };
             let Some((work, cancellation_generation)) = popped else {
                 break;
@@ -126,6 +132,11 @@ impl Runner {
                 let _ = release.recv_async().await;
             }
             self.process(work, cancellation_generation).await;
+            self.inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .processing = None;
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
 
@@ -229,13 +240,16 @@ impl Runner {
                 self.settle_turn(&admission, outcome, true);
                 return;
             }
-            // A precancelled correlation's mark is retired once its matching
-            // work is consumed, so it cannot poison a later generation.
-            state.cancelled_correlations.remove(&correlation);
-            if let WorkKind::Root { ref earlier, .. } = work {
-                for item in earlier {
-                    state.cancelled_correlations.remove(&item.correlation);
-                }
+            if let Some(reason) = state
+                .processing
+                .as_ref()
+                .and_then(|processing| processing.cancellation_reason)
+            {
+                drop(state);
+                let outcome =
+                    (!admission.root).then(|| cancelled_outcome(agent_id, turn_id, reason));
+                self.settle_turn(&admission, outcome, true);
+                return;
             }
             state.active = Some(active);
             state.status = ActorStatus::Running(turn_id);
@@ -402,10 +416,15 @@ impl Runner {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if state.cancellation_generation != popped_generation {
+            if state.cancellation_generation != popped_generation
+                || state.lifecycle != ActorLifecycle::Open
+                || state
+                    .processing
+                    .as_ref()
+                    .is_some_and(|processing| processing.cancellation_reason.is_some())
+            {
                 return;
             }
-            state.cancelled_correlations.remove(&correlation);
             state.active = Some(active);
         }
         if plain.is_cancelled() {
@@ -453,16 +472,19 @@ impl Runner {
         policy: Option<Arc<super::EffectiveAgentConfig>>,
         popped_generation: u64,
     ) {
-        // Consumed: retire any precancel mark for this run_id's canonical
-        // correlation.
         let correlation = super::run_correlation(run_id);
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.cancellation_generation != popped_generation {
+            if state.cancellation_generation != popped_generation
+                || state.lifecycle != ActorLifecycle::Open
+                || state
+                    .processing
+                    .as_ref()
+                    .is_some_and(|processing| processing.cancellation_reason.is_some())
+            {
                 return;
             }
-            state.cancelled_correlations.remove(&correlation);
             state.active = Some(active);
         }
         if plain.is_cancelled() {
@@ -498,29 +520,24 @@ impl Runner {
         }
     }
 
-    /// Retains (and optionally delivers once) the turn's outcome, then clears
-    /// the active-turn slot and wakes the next runner step. Always clears
-    /// state even when no outcome exists, so a misbehaving backend cannot
-    /// strand the actor in a running state.
+    /// Clears the active-turn slot together with retaining the turn's outcome,
+    /// then delivers it at most once and wakes the next runner step. Always
+    /// clears state even when no outcome exists, so a misbehaving backend
+    /// cannot strand the actor in a running state.
     fn settle_turn(
         &mut self,
         admission: &TurnAdmission,
         outcome: Option<TurnOutcome>,
         deliver: bool,
     ) {
-        {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.active = None;
-            state.status = ActorStatus::Idle;
-        }
-        if let Some(outcome) = outcome {
-            finalize_turn(
-                &self.inner,
-                admission.turn_id,
-                outcome,
-                Some(admission),
-                deliver,
-            );
+        match outcome {
+            Some(outcome) => settle_and_finalize_turn(&self.inner, admission, outcome, deliver),
+            None => self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .settle_runner(),
         }
         self.wake.wake();
     }

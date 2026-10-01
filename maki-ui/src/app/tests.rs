@@ -51,6 +51,7 @@ const MISSING_DIR: &str = "gone";
 const CD_ERROR_PREFIX: &str = "cd:";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_IMAGE_DATA: &str = "dGVzdA==";
+const IMAGE_PATH_PASTE: &str = "file:///tmp/nonexistent.png";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
     "command failed: local commands cannot include non-text content";
 const FAST_UNSUPPORTED_COMMAND_ERROR: &str = "command failed: Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
@@ -466,11 +467,16 @@ fn app_without_splash() -> App {
 /// Hands back the slot providers publish their model lists into, since the app
 /// keeps no handle to it once the picker owns it.
 fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
-    let models = Arc::new(ArcSwapOption::empty());
     let mut app = test_app();
+    let models = install_model_slot(&mut app);
+    (app, models)
+}
+
+fn install_model_slot(app: &mut App) -> Arc<ArcSwapOption<Vec<String>>> {
+    let models = Arc::new(ArcSwapOption::empty());
     app.model_picker = ModelPicker::new(Arc::clone(&models));
     app.available_models = Arc::clone(&models);
-    (app, models)
+    models
 }
 
 /// Hands back the end a plugin publishes hints through. That is the Lua thread
@@ -845,7 +851,7 @@ fn paste_normalizes_line_endings(input: &str, expected: &str) {
 #[test]
 fn paste_file_path_triggers_image_load() {
     let mut app = test_app();
-    app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
+    app.update(Msg::Paste(IMAGE_PATH_PASTE.into()));
     assert!(!app.image_paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
 }
@@ -4629,16 +4635,25 @@ fn copy_tui_fixture() -> CopyTuiFixture {
     }
 }
 
+/// Every provider publish bumps the completion revision and `accept` refuses
+/// a stale candidate, so Enter only lands once the request has finished, not
+/// as soon as the visible labels look right.
+fn poll_settled_copy_completion(app: &mut App, mut ready: impl FnMut(&App) -> bool, what: &str) {
+    wait_for(
+        || {
+            let _ = app.tick();
+            app.command_palette.cadence() != Cadence::PENDING && ready(app)
+        },
+        what,
+    );
+}
+
 fn poll_copy_completion(app: &mut App) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let _ = app.tick();
-        if app.command_palette.has_argument_selectable() {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    panic!("copy completion popup never offered a selectable item");
+    poll_settled_copy_completion(
+        app,
+        |app| app.command_palette.has_argument_selectable(),
+        "copy completion popup never offered a selectable item",
+    );
 }
 
 fn copy_candidate_labels(app: &App) -> Vec<String> {
@@ -4650,21 +4665,15 @@ fn copy_candidate_labels(app: &App) -> Vec<String> {
 }
 
 fn poll_copy_candidates(app: &mut App, expected: &[&str]) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let _ = app.tick();
-        if copy_candidate_labels(app)
-            .iter()
-            .map(String::as_str)
-            .eq(expected.iter().copied())
-        {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    panic!(
-        "copy completion candidates did not settle: expected {expected:?}, got {:?}",
-        copy_candidate_labels(app)
+    poll_settled_copy_completion(
+        app,
+        |app| {
+            copy_candidate_labels(app)
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied())
+        },
+        &format!("copy completion candidates did not settle on {expected:?}"),
     );
 }
 
@@ -5822,14 +5831,6 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 
 // --- Plan form integration tests ---
 
-fn implement_msg(parallel: bool) -> String {
-    if parallel {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`. {IMPLEMENT_PARALLEL_HINT}")
-    } else {
-        format!("{IMPLEMENT_MSG_PREFIX} at `test-plan.md`.")
-    }
-}
-
 fn plan_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -5989,31 +5990,10 @@ fn plan_form_menu_options(downs: usize, has_new_session: bool) {
     assert!(app.plan_form.is_visible());
     assert_eq!(app.state.mode, Mode::Plan);
     assert!(app.state.plan.is_ready());
-    assert_eq!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ReplaceSession(_))),
-        has_new_session
-    );
-    let expected_msg = implement_msg(PlanForm::new().parallel());
-    assert_eq!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ImplementPlan(message) if message == &expected_msg)),
-        !has_new_session
-    );
-    if has_new_session {
-        let Action::ReplaceSession(request) = &actions[0] else {
-            panic!("expected replacement request");
-        };
-        assert_eq!(
-            request
-                .post_commit
-                .as_ref()
-                .map(|post| post.prompt.as_str()),
-            Some(expected_msg.as_str())
-        );
-    }
+    assert!(app.plan_approval_pending);
+    assert!(matches!(actions.as_slice(), [Action::ApprovePlan {
+        clear_context, model: None, parallel: false, path,
+    }] if *clear_context == has_new_session && path == Path::new("test-plan.md")));
 }
 
 #[test]
@@ -6023,12 +6003,300 @@ fn plan_form_implement_toggled_parallel() {
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    let expected_msg = implement_msg(!PlanForm::new().parallel());
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ApprovePlan {
+            clear_context: false,
+            parallel: true,
+            ..
+        }]
+    ));
+}
+
+#[test_case(false ; "shortcut")]
+#[test_case(true ; "model_row")]
+fn plan_model_picker_stages_without_switching(row: bool) {
+    // `test_app` shares `$TMPDIR` as its state dir with every other test
+    // process, which rewrite the model, recents and prefs this test pins.
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let models = install_model_slot(&mut app);
+    const MODEL: &str = "zai/glm-5";
+    models.store(Some(Arc::new(vec![MODEL.into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    let original = app.state.model.spec();
+    let persisted_model = maki_storage::model::read_model(&app.storage);
+    let recents = maki_storage::model::read_recents(&app.storage);
+    let prefs = serde_json::to_value(maki_storage::sessions::read_prefs(&app.storage)).unwrap();
+    let actions = if row {
+        for _ in 0..3 {
+            app.update(Msg::Key(key(KeyCode::Down)));
+        }
+        app.update(Msg::Key(key(KeyCode::Enter)))
+    } else {
+        app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()))
+    };
+    assert!(matches!(actions.as_slice(), [Action::RefreshModels]));
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::ImplementPlan(message) if message == &expected_msg))
+        app.active_keybind_contexts()
+            .contains(&KeybindContext::ModelPicker)
     );
+    app.route_paste(MODEL.split_once('/').unwrap().1);
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty());
+    assert_eq!(app.plan_form.implementation_model(), Some(MODEL));
+    assert_eq!(app.state.model.spec(), original);
+    assert_eq!(
+        maki_storage::model::read_model(&app.storage),
+        persisted_model
+    );
+    assert_eq!(maki_storage::model::read_recents(&app.storage), recents);
+    assert_eq!(
+        serde_json::to_value(maki_storage::sessions::read_prefs(&app.storage)).unwrap(),
+        prefs
+    );
+    assert!(!app.plan_approval_pending);
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(app.plan_form.implementation_model(), Some(MODEL));
+    assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
+}
+
+#[test]
+fn open_session_model_picker_keeps_keys_when_plan_form_appears() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+    app.state.mode = Mode::Plan;
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    let contexts = app.active_keybind_contexts();
+    assert!(contexts.contains(&KeybindContext::ModelPicker));
+    assert!(!contexts.contains(&KeybindContext::FormInput));
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
+    app.update(Msg::Paste(
+        LATE_MODEL_SPEC.split_once('/').unwrap().1.into(),
+    ));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(actions.as_slice(), [Action::ChangeModel(spec)] if spec == LATE_MODEL_SPEC));
+    assert_eq!(app.plan_form.implementation_model(), None);
+    assert!(app.plan_form.is_visible());
+}
+
+enum BlockingSurface {
+    Permission,
+    Question,
+    Help,
+    Btw,
+    Float,
+}
+
+#[test_case(BlockingSurface::Permission ; "permission")]
+#[test_case(BlockingSurface::Question ; "question")]
+#[test_case(BlockingSurface::Help ; "help")]
+#[test_case(BlockingSurface::Btw ; "btw")]
+#[test_case(BlockingSurface::Float ; "float")]
+fn plan_picker_yields_to_blocking_overlay(surface: BlockingSurface) {
+    const MODEL: &str = "zai/glm-5";
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![MODEL.into()])));
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
+    app.plan_form.on_plan_ready();
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    let (_btw_tx, btw_rx) = flume::bounded(1);
+    let (event_tx, event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    let forwards_to_float = matches!(surface, BlockingSurface::Question | BlockingSurface::Float);
+    match surface {
+        BlockingSurface::Permission => {
+            app.permission_prompt.open(
+                "permission".into(),
+                maki_config::ToolKey::native("bash"),
+                vec!["execute".into()],
+                None,
+            );
+            app.active_input = Some(InputKind::Permission);
+        }
+        BlockingSurface::Help => app.help_modal.toggle(),
+        BlockingSurface::Btw => app.btw_modal.open("question", btw_rx),
+        BlockingSurface::Question | BlockingSurface::Float => {
+            let question = matches!(surface, BlockingSurface::Question);
+            let config = maki_lua::FloatConfig {
+                needs_input: question,
+                ..maki_lua::FloatConfig::default()
+            };
+            app.float_mgr.open(
+                Arc::new(maki_agent::SharedBuf::new()),
+                config,
+                true,
+                event_tx,
+                cmd_rx,
+            );
+            if question {
+                app.active_input = Some(InputKind::Question);
+            }
+        }
+    }
+    let contexts = app.active_keybind_contexts();
+    assert!(!contexts.contains(&KeybindContext::ModelPicker));
+    assert!(!contexts.contains(&KeybindContext::FormInput));
+    assert!(app.update(Msg::Key(key(KeyCode::Char('x')))).is_empty());
+    app.route_paste("no-such-model");
+    assert!(app.model_picker.is_open());
+    assert_eq!(app.plan_form.implementation_model(), None);
+    if forwards_to_float {
+        assert!(event_rx.try_recv().is_ok());
+    }
+    app.help_modal.close();
+    app.btw_modal.close();
+    app.permission_prompt.close();
+    app.float_mgr.close_all();
+    app.active_input = None;
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.plan_form.implementation_model(), Some(MODEL));
+}
+
+#[test_case(false ; "help")]
+#[test_case(true ; "btw")]
+fn plan_form_yields_escape_to_blocking_modal(btw: bool) {
+    let mut app = plan_app();
+    let (_tx, rx) = flume::bounded(1);
+    if btw {
+        app.btw_modal.open("question", rx);
+    } else {
+        app.help_modal.toggle();
+    }
+    app.route_paste("blocked");
+    assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    assert!(app.plan_form.is_visible());
+    assert!(!app.help_modal.is_open());
+    assert!(!app.btw_modal.is_open());
+}
+
+#[test_case("build" ; "build")]
+#[test_case("custom" ; "custom")]
+fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
+    let mut app = plan_app();
+    app.plan_form
+        .set_implementation_model("zai/glm-5".into(), &app.state.model.spec());
+    app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+    app.set_mode_id(mode.into());
+    assert_eq!(app.plan_form.implementation_model(), None);
+    assert!(!app.model_picker.is_open());
+    assert!(app.model_picker_purpose == ModelPickerPurpose::Session);
+}
+
+#[test]
+fn normal_model_picker_still_requests_model_change() {
+    const MODEL: &str = "zai/glm-5";
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![MODEL.into()])));
+    app.run_builtin(BuiltinAction::ModelPicker);
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(actions.as_slice(), [Action::ChangeModel(spec)] if spec == MODEL));
+    assert_eq!(app.plan_form.implementation_model(), None);
+}
+
+#[test]
+fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
+    let mut app = plan_app();
+    app.plan_form
+        .set_implementation_model("zai/glm-5".into(), &app.state.model.spec());
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.plan_approval_pending);
+    assert!(
+        app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()))
+            .is_empty()
+    );
+    assert!(!app.model_picker.is_open());
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    app.route_paste("blocked");
+    assert!(matches!(
+        app.update(Msg::Key(key(KeyCode::Esc))).as_slice(),
+        [Action::CancelPlanApproval]
+    ));
+    assert!(app.plan_approval_pending);
+    assert_eq!(app.plan_form.implementation_model(), Some("zai/glm-5"));
+    assert!(app.state.plan.is_ready());
+}
+
+#[test_case(false ; "plan_model_picker")]
+#[test_case(true ; "approval_pending")]
+fn image_path_paste_follows_plan_ownership(approval_pending: bool) {
+    let mut app = plan_app();
+    if approval_pending {
+        app.update(Msg::Key(key(KeyCode::Down)));
+        app.update(Msg::Key(key(KeyCode::Enter)));
+        assert!(app.plan_approval_pending);
+    } else {
+        app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
+        assert!(app.model_picker.is_open());
+    }
+    app.update(Msg::Paste(IMAGE_PATH_PASTE.into()));
+    assert!(app.image_paste_rx.is_empty());
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test_case(false ; "current")]
+#[test_case(true ; "staged")]
+fn plan_form_renders_effective_implementation_model(staged: bool) {
+    let mut app = plan_app();
+    let initial_height = app
+        .plan_form
+        .height(RENDER_AREA.width, &app.state.model.spec());
+    const MODEL: &str = "zai/glm-5";
+    if !staged {
+        app.state.model = Model::from_spec(MODEL).unwrap();
+    }
+    if staged {
+        app.plan_form
+            .set_implementation_model(MODEL.into(), &app.state.model.spec());
+    }
+    let rows = rendered_area(&mut app).join("\n");
+    let spec = if staged {
+        MODEL.to_owned()
+    } else {
+        app.state.model.spec()
+    };
+    assert!(rows.contains(&format!("Implementation model: {spec}")));
+    assert_eq!(rows.contains("Use current model"), staged);
+    let height = app
+        .plan_form
+        .height(RENDER_AREA.width, &app.state.model.spec());
+    assert_eq!(height, initial_height + u16::from(staged));
+    let (_, bottom, _, _, _) = app.layout_geometry(RENDER_AREA);
+    assert_eq!(bottom.height, height);
+}
+
+#[test]
+fn staged_model_matching_session_model_approves_without_override() {
+    let mut app = plan_app();
+    app.plan_form
+        .set_implementation_model(LATE_MODEL_SPEC.into(), &app.state.model.spec());
+    app.state.model = Model::from_spec(LATE_MODEL_SPEC).unwrap();
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Down)));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::ApprovePlan { model: None, .. }]
+    ));
+}
+
+#[test]
+fn admitted_plan_run_uses_exact_run_id_without_submitting() {
+    let mut app = plan_app();
+    app.plan_approval_pending = true;
+    app.record_plan_implementation(42, "plan".into(), "test-plan.md".into(), "implement".into());
+    assert_eq!(app.run_id, 42);
+    assert_eq!(app.status, Status::Streaming);
+    assert!(!app.plan_approval_pending);
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(app.state.plan, PlanState::None);
 }
 
 #[test]

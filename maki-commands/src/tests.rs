@@ -565,6 +565,40 @@ fn completion_snapshot_replacement_rejects_removed_value_before_validate_highlig
     assert!(events.lock().unwrap().is_empty());
 }
 
+#[test_case(false ; "finish")]
+#[test_case(true ; "republish")]
+fn completion_candidate_survives_snapshot_that_still_offers_it(republish: bool) {
+    let (provider, started, mut release, events) =
+        gated_snapshot_provider(CompletionItemNavigation::Terminal);
+    let (_registry, session) = snapshot_session(
+        provider,
+        CompletionPolicy::Replace,
+        CompletionProviders::default(),
+    );
+    let worker = start_snapshot(&session);
+    let publisher = started.recv().unwrap();
+    let first = publisher.publish(vec![completion_item("kept")]).unwrap();
+    let old = first.candidates[0].clone();
+    if republish {
+        publisher
+            .publish(vec![completion_item("kept"), completion_item("new")])
+            .unwrap();
+    }
+    publisher.finish().unwrap();
+    session.validate(&old).unwrap();
+    session.highlight(&old).unwrap();
+    session.accept(old).unwrap();
+    release.send();
+    worker.join().unwrap();
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            CompletionLifecycleEvent::Highlight(completion_item("kept")),
+            CompletionLifecycleEvent::Accept(completion_item("kept")),
+        ]
+    );
+}
+
 #[test]
 fn completion_snapshot_replacement_rejects_changed_navigation_before_highlight_and_accept() {
     let (provider, started, mut release, events) =

@@ -101,6 +101,7 @@ struct ScriptedBackend {
     gate: Option<Arc<Gate>>,
     outcomes: Mutex<Vec<BackendResult>>,
     preparation: Option<super::AdmissionPreparation>,
+    readiness: Option<super::PreparedReadiness>,
     root_preparation_error: Option<Arc<dyn Fn(u64, String) + Send + Sync>>,
 }
 
@@ -143,6 +144,7 @@ impl ScriptedBackend {
             gate: None,
             outcomes: Mutex::new(Vec::new()),
             preparation: None,
+            readiness: None,
             root_preparation_error: None,
         }
     }
@@ -189,6 +191,10 @@ fn default_completed(context: &TurnContext) -> BackendResult {
 impl ActorBackend for ScriptedBackend {
     fn root_preparation_error_handler(&self) -> Option<Arc<dyn Fn(u64, String) + Send + Sync>> {
         self.root_preparation_error.clone()
+    }
+
+    fn prepared_readiness(&self) -> Option<super::PreparedReadiness> {
+        self.readiness.clone()
     }
 
     fn admission_preparation(&self) -> Option<super::AdmissionPreparation> {
@@ -1099,6 +1105,94 @@ fn root_folds_into_active_turn_with_no_orphan() {
             Some(main.turn_id())
         );
         assert_eq!(snapshot.status, ActorStatus::Idle);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn permitted_idle_turn_folds_interrupts_like_any_turn() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let guard = handle.prepare_idle().unwrap();
+        let approved = handle
+            .admit_turn(input("approved"), None, "approved".into())
+            .unwrap();
+        guard.allow_turn(&approved).unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) > 0).await;
+        handle
+            .rush(RootWork::new(
+                input("fold-me"),
+                1,
+                false,
+                "fold-me".into(),
+                Vec::new(),
+                "r1".into(),
+            ))
+            .unwrap();
+        gate.open();
+        approved.wait().await;
+        assert_eq!(state.folds.lock().unwrap().as_slice(), ["fold-me"]);
+        assert_eq!(state.runs.lock().unwrap().len(), 1);
+        drop(guard);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn permitted_idle_turn_without_outcome_does_not_hold_actor() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        *backend.outcomes.lock().unwrap() = vec![BackendResult::ControlDone];
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let guard = handle.prepare_idle().unwrap();
+        let approved = handle
+            .admit_turn(input("approved"), None, "approved".into())
+            .unwrap();
+        let later = handle
+            .admit_turn(input("later"), None, "later".into())
+            .unwrap();
+        guard.allow_turn(&approved).unwrap();
+        assert!(matches!(later.wait().await, TurnOutcome::Completed { .. }));
+        assert!(approved.peek().is_none());
+        assert_eq!(state.entered.load(Ordering::SeqCst), 2);
+        drop(guard);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn permitted_idle_turn_runs_ahead_of_earlier_queued_turn() {
+    smol::block_on(async {
+        const EARLIER: &str = "earlier";
+        const APPROVED: &str = "approved";
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let guard = handle.prepare_idle().unwrap();
+        let earlier = handle
+            .admit_turn(input(EARLIER), None, EARLIER.into())
+            .unwrap();
+        let approved = handle
+            .admit_turn(input(APPROVED), None, APPROVED.into())
+            .unwrap();
+        guard.allow_turn(&approved).unwrap();
+        earlier.wait().await;
+        let order: Vec<_> = state
+            .policies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(message, _, _)| message.clone())
+            .collect();
+        assert_eq!(order, [APPROVED, EARLIER]);
+        drop(guard);
         handle.close();
         task.await;
     });
@@ -2196,6 +2290,32 @@ fn targeted_cancel_matching_active_run() {
             .admit_turn(input("later"), None, "run-b".into())
             .unwrap();
         assert!(matches!(later.wait().await, TurnOutcome::Completed { .. }));
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn started_run_retires_superseded_precancel_marks() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let (handle, task) = spawn(backend);
+        // Cancel r2 while nothing with that correlation exists, so its mark
+        // only shields later pushes with r2.
+        handle.cancel_correlation("r2", TurnCancellationReason::User);
+        let first = handle
+            .admit_turn(input("first"), None, "r1".into())
+            .unwrap();
+        assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
+        // Starting r1 retires the r2 mark: run-id pushes always stamp the
+        // latest run, so the mark could never match again.
+        let retried = handle
+            .admit_turn(input("retried"), None, "r2".into())
+            .unwrap();
+        assert!(matches!(
+            retried.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
         handle.close();
         task.await;
     });
