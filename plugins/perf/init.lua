@@ -12,7 +12,17 @@ local REFRESH_SECS = 0.25
 
 local timer_id = nil
 
+local function is_enabled()
+  return maki.store.collect(REGISTRY)[FPS_KEY] == true
+end
+
 local function render_readout()
+  -- A fire can sit queued while the disable path runs: the timer is already
+  -- gone by the time the fire executes, so without this check it would
+  -- repaint the readout after the clear and nothing would ever remove it.
+  if not is_enabled() then
+    return
+  end
   local t = maki.perf.timings()
   local text = string.format("splash %.0f fps · %.1f ms", t.fps, t.render_ms)
   maki.ui.set_status_hint({ { text, "dim" } })
@@ -27,10 +37,6 @@ local function set_overlay(enabled)
     timer_id = nil
     maki.ui.set_status_hint(nil)
   end
-end
-
-local function is_enabled()
-  return maki.store.collect(REGISTRY)[FPS_KEY] == true
 end
 
 maki.api.register_command({
