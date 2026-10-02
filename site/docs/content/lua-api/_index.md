@@ -260,7 +260,7 @@ maki.notify({msg}, {level?}, {opts?})
 
 Show a one line notice. By default it goes to `maki.ui.flash`, with
 `{opts.title}` in front of the message when you pass one. A run with
-no UI, such as `maki -p` or the sdk, logs the notice instead of
+no UI, such as `makima --print` or the sdk, logs the notice instead of
 dropping it.
 
 There is one handler for the whole process. Once a plugin calls

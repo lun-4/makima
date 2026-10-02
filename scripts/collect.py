@@ -95,8 +95,8 @@ def parse_args():
 
 def build_cmd_makima(args):
     cmd = [
-        "makima", "-p", "--verbose", "--output-format", "stream-json",
-        args.prompt,
+        "makima", "--print", "--verbose", "--output-format", "stream-json",
+        f"--prompt={args.prompt}",
     ]
     if args.model:
         cmd += ["-m", args.model]
@@ -417,7 +417,7 @@ def run(args):
 
     build_cmd, process_stream = STREAM_PROCESSORS[args.agent]
     cmd = build_cmd(args)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, cwd=args.cwd)
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, cwd=args.cwd)
     assert proc.stdout is not None
 
     summary, turn_usage, all_tool_calls, result_text = process_stream(proc, meta)

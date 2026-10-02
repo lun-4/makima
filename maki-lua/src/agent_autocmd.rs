@@ -1,5 +1,5 @@
 //! One place that turns agent events into autocmds, shared by the UI app loop,
-//! `maki -p` and sdk mode, so a plugin sees the same events whichever way maki
+//! `makima --print` and sdk mode, so a plugin sees the same events whichever way maki
 //! was started. `maki-acp` drives the agent from its own loop and does not call
 //! this yet, so plugins loaded under ACP get no turn events.
 

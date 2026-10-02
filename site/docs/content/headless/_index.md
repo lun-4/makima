@@ -7,17 +7,19 @@ group = "Guides"
 
 # Headless Mode
 
-Run Makima non-interactively with `--print` / `-p`. Useful for scripts, CI, and automation.
+Run Makima non-interactively with `--print`, and pass the prompt with `-p` / `--prompt`. Useful for scripts, CI, and automation.
 
 ```bash
-makima "explain this codebase" --print
+makima --print -p "explain this codebase"
 ```
 
 Pipe via stdin:
 
 ```bash
-echo "list all TODO comments" | makima -p
+echo "list all TODO comments" | makima --print
 ```
+
+With both `-p` and piped stdin, the prompt is the `-p` text, a blank line, then everything read from stdin. Makima reads stdin until it closes, so a run whose stdin stays open waits for it. Inside a `while read` loop, Makima would also read the rest of the loop's input. Give such runs `</dev/null` (see the [migration example](#examples)).
 
 ## Output Formats
 
@@ -28,7 +30,7 @@ echo "list all TODO comments" | makima -p
 | `stream-json` | JSONL stream, one event per line |
 
 ```bash
-makima "fix the tests" --print --output-format json
+makima --print -p "fix the tests" --output-format json
 ```
 
 JSON output includes `type`, `subtype`, `is_error`, `duration_ms`, `num_turns`, `result`, `stop_reason`, `session_id`, `total_cost_usd`, and `usage`.
@@ -45,14 +47,14 @@ See [Commands](/docs/commands/) for matching, collision priority, and the genera
 
 ## Claude Code Compatibility
 
-Makima's `--print` is a drop-in replacement for Claude Code:
+Makima's `--print` output matches Claude Code. One flag differs: in Makima, `-p` is the prompt, so print mode is always the long `--print`.
 
 ```bash
 # Before
-claude "fix the bug" --print --output-format json
+claude -p "fix the bug" --output-format json
 
 # After
-makima "fix the bug" --print --output-format json
+makima --print -p "fix the bug" --output-format json
 ```
 
 Same JSON fields, same `--output-format` options, same `--verbose` behavior. Scripts that parse Claude Code output work unchanged.
@@ -99,35 +101,35 @@ echo '{"type":"user","message":{"content":"explain this repo"}}' \
 Pipe compiler errors back for a fix:
 
 ```bash
-cargo build 2>&1 | makima "Fix these compiler errors." --print --yolo
+cargo build 2>&1 | makima --print -p "Fix these compiler errors." --yolo
 ```
 
 Generate a changelog from recent commits:
 
 ```bash
-git log --oneline v1.2.0..HEAD | makima "Write a user-facing \
-  changelog grouped by: Added, Changed, Fixed. Skip chores." --print
+git log --oneline v1.2.0..HEAD | makima --print -p "Write a user-facing \
+  changelog grouped by: Added, Changed, Fixed. Skip chores."
 ```
 
 Automated PR summaries in CI:
 
 ```bash
-SUMMARY=$(git diff main..HEAD | makima "Write a 2-3 sentence \
-  summary of this change for a PR description." --print)
+SUMMARY=$(git diff main..HEAD | makima --print -p "Write a 2-3 sentence \
+  summary of this change for a PR description.")
 gh pr edit --body "$SUMMARY"
 ```
 
-Migrate an API across many files:
+Migrate an API across many files. The `</dev/null` keeps each run from reading the rest of the file list:
 
 ```bash
 grep -rl 'old_api_call' src/ | while read file; do
-  makima "In $file, migrate old_api_call() to new_api_call(). \
-    Keep behavior identical." -p --yolo --allowed-tools Read,Edit
+  makima --print -p "In $file, migrate old_api_call() to new_api_call(). \
+    Keep behavior identical." --yolo --allowed-tools Read,Edit </dev/null
 done
 ```
 
 Cost tracking:
 
 ```bash
-makima "refactor the database layer" -p --output-format json | jq '.total_cost_usd'
+makima --print -p "refactor the database layer" --output-format json | jq '.total_cost_usd'
 ```

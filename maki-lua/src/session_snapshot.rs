@@ -90,7 +90,7 @@ fn lock(totals: &Mutex<Totals>) -> MutexGuard<'_, Totals> {
 }
 
 /// Backs `maki.session.read` for the single session headless drivers
-/// (`maki -p`, sdk mode). The driver writes while the Lua thread reads, hence
+/// (`makima --print`, sdk mode). The driver writes while the Lua thread reads, hence
 /// the lock, though the two rarely meet.
 #[derive(Clone, Default)]
 pub struct HeadlessSnapshot(Arc<Mutex<Totals>>);

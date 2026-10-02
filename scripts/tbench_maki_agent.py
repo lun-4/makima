@@ -160,12 +160,12 @@ class MakiAgent(BaseInstalledAgent):
             raise ValueError("Model is required. Pass -m to harbor run.")
 
         self._last_instruction = instruction
-        escaped = shlex.quote(instruction)
+        escaped = shlex.quote(f"--prompt={instruction}")
         await self.exec_as_agent(
             environment,
             command=(
                 f"makima --print --yolo --verbose --output-format stream-json --model {self.model_name} "
-                f"-- {escaped} 2>&1 </dev/null | tee {AGENT_LOG_PATH}"
+                f"{escaped} 2>&1 </dev/null | tee {AGENT_LOG_PATH}"
             ),
         )
 
