@@ -108,6 +108,7 @@ love             = "#f08098"
 mode_plan        = "#fcc8c8"
 
 [ui]
+user_bg            = { bg = "current_line" }
 user               = { fg = "rose" }
 assistant_prefix   = { fg = "iris" }
 assistant          = { fg = "foreground" }

@@ -110,6 +110,7 @@ rosewater       = "#f5e0dc"
 
 [ui]
 # Role styles
+user_bg            = { bg = "current_line" }
 user               = { fg = "lavender" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "rosewater" }

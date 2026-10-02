@@ -107,6 +107,7 @@ flamingo        = "#dd7878"
 rosewater       = "#dc8a78"
 
 [ui]
+user_bg            = { bg = "current_line" }
 user               = { fg = "lavender" }
 assistant          = { fg = "foreground" }
 assistant_prefix   = { fg = "rosewater" }

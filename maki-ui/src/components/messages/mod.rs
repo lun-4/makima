@@ -1049,7 +1049,14 @@ impl MessagesPanel {
             }
             let h = seg.text_height(width);
             let highlight = self.highlight_segment == Some(i);
-            let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
+            let style = match &seg.tool_id {
+                Some(_) => Some(theme::current().tool_bg),
+                None => seg
+                    .msg_index
+                    .and_then(|idx| self.messages.get(idx))
+                    .filter(|msg| msg.role == DisplayRole::User)
+                    .map(|_| theme::current().user_bg),
+            };
             cursor.render(seg.lines(), h, style, highlight, frame);
             for image in &mut seg.images {
                 cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);

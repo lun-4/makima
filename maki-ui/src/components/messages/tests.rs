@@ -1167,6 +1167,33 @@ fn user_annotation_renders_below_message() {
 }
 
 #[test]
+fn user_turn_renders_with_lifted_background() {
+    let mut panel = MessagesPanel::new(
+        UiConfig::default(),
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "hi".into()));
+    let terminal = render(&mut panel, 80, 10);
+
+    let buf = terminal.backend().buffer();
+    let lifted = theme::current()
+        .user_bg
+        .bg
+        .expect("default theme defines a user band");
+    assert_ne!(lifted, Color::Reset);
+    for x in 0..79 {
+        assert_eq!(buf[(x, 0)].bg, lifted, "user row must be lifted (x={x})");
+    }
+    assert_eq!(
+        buf[(0, 2)].bg,
+        Color::Reset,
+        "assistant rows stay lifted-free"
+    );
+}
+
+#[test]
 fn toggle_expand_collapse_truncated_tool() {
     let mut panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);

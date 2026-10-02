@@ -118,6 +118,7 @@ panel_border       = { fg = "blue" }
 panel_title        = { fg = "blue", modifiers = ["bold"] }
 cursor             = { fg = "background", bg = "base1" }
 keybind_key        = { fg = "cyan", modifiers = ["bold"] }
+user_bg            = { bg = "current_line" }
 user               = { fg = "blue" }
 assistant          = { fg = "foreground" }
 thinking           = { fg = "comment", modifiers = ["italic"] }

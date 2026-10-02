@@ -103,6 +103,7 @@ selection       = "#3e4452"
 mode_plan       = "#56b6c2"
 
 [ui]
+user_bg            = { bg = "current_line" }
 user               = { fg = "blue", modifiers = ["bold"] }
 assistant_prefix   = { fg = "purple" }
 assistant          = { fg = "foreground" }

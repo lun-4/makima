@@ -460,6 +460,7 @@ pub struct Theme {
     pub foreground: Color,
 
     pub user: Style,
+    pub user_bg: Style,
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
@@ -829,6 +830,7 @@ impl Theme {
             foreground: color("foreground"),
 
             user: style("user"),
+            user_bg: style("user_bg"),
             assistant: style("assistant"),
             assistant_prefix: style("assistant_prefix"),
             thinking: brighten_toward(
@@ -1267,7 +1269,20 @@ orange = "#ffb86c"
 [ui]
 "#;
         let theme = Theme::from_toml(toml).unwrap();
-        assert_eq!(theme.user, Style::default());
+        assert_eq!(theme.user_bg, Style::default());
+    }
+
+    #[test]
+    fn explicit_user_bg_key_is_respected() {
+        let toml = r##"
+[palette]
+background = "#120c0c"
+foreground = "#e9dede"
+[ui]
+user_bg = { bg = "background" }
+"##;
+        let theme = Theme::from_toml(toml).unwrap();
+        assert_eq!(theme.user_bg.bg, Some(Color::Rgb(0x12, 0x0c, 0x0c)));
     }
 
     #[test]
