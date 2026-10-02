@@ -27,6 +27,7 @@ use crate::setup;
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+const PIPED_INPUT_SEPARATOR: &str = "\n\n";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 const PICKER_NEEDS_TUI_ERR: &str = "continuing without a session ID opens the session picker, which needs the TUI; run `makima sessions --json` to list session IDs";
 
@@ -259,16 +260,24 @@ fn resolve_session(
     Ok(AppSession::new(model, cwd))
 }
 
-fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
-    match cli_prompt {
-        Some(p) => Ok(Some(p)),
-        None if !io::stdin().is_terminal() => {
-            let mut buf = String::new();
-            io::stdin().read_to_string(&mut buf).context("read stdin")?;
-            Ok(Some(buf))
-        }
-        None => Ok(None),
+/// Piped stdin follows the `--prompt` text, or stands alone without it.
+fn read_initial_prompt(
+    flag: Option<String>,
+    mut stdin: impl Read,
+    piped: bool,
+) -> Result<Option<String>> {
+    if !piped {
+        return Ok(flag);
     }
+    let mut buf = String::new();
+    stdin.read_to_string(&mut buf).context("read stdin")?;
+    Ok(match flag {
+        Some(prompt) if !buf.trim().is_empty() => {
+            Some(format!("{prompt}{PIPED_INPUT_SEPARATOR}{buf}"))
+        }
+        Some(prompt) => Some(prompt),
+        None => Some(buf),
+    })
 }
 
 /// A bare `-c` (no ID) asks for the session picker; a valued flag
@@ -376,11 +385,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
         .context("run sdk mode")?;
         return Ok(());
     }
+    let mut initial_prompt =
+        read_initial_prompt(cli.prompt.take(), io::stdin(), !io::stdin().is_terminal())?;
     if cli.print {
         let timeouts = stack.timeouts();
         crate::print::run(
             &stack.model,
-            cli.initial_prompt,
+            initial_prompt,
             cli.images,
             cli.output_format,
             cli.verbose,
@@ -414,7 +425,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     )?];
     let mut focused = 0;
     let mut warnings = startup_warnings;
-    let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let mut teardown = Teardown::default();
     let default_thinking: Option<StoredThinking> = maki_storage::sessions::read_prefs(&storage)
         .default_thinking
@@ -565,6 +575,33 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
+
+    const PROMPT: &str = "hello";
+    const PIPED: &str = "data";
+
+    fn combined() -> String {
+        format!("{PROMPT}{PIPED_INPUT_SEPARATOR}{PIPED}")
+    }
+
+    #[test_case(&["makima", "-p", PROMPT], "", false, Some(PROMPT.into()); "tui_flag_only")]
+    #[test_case(&["makima", "--print", "-p", PROMPT], "", false, Some(PROMPT.into()); "print_flag_only")]
+    #[test_case(&["makima"], PIPED, true, Some(PIPED.into()); "piped_only")]
+    #[test_case(&["makima", "-p", PROMPT], PIPED, true, Some(combined()); "tui_flag_and_pipe")]
+    #[test_case(&["makima", "--print", "-p", PROMPT], PIPED, true, Some(combined()); "print_flag_and_pipe")]
+    #[test_case(&["makima", "-p", PROMPT], " \n", true, Some(PROMPT.into()); "flag_and_blank_pipe")]
+    #[test_case(&["makima"], "", false, None; "neither")]
+    fn initial_prompt_resolution(
+        args: &[&str],
+        stdin: &str,
+        piped: bool,
+        expected: Option<String>,
+    ) {
+        use clap::Parser;
+
+        let flag = Cli::parse_from(args).prompt;
+        let prompt = read_initial_prompt(flag, stdin.as_bytes(), piped).unwrap();
+        assert_eq!(prompt, expected);
+    }
 
     #[test_case(false, false, false ; "untrusted reload leaves the env alone")]
     #[test_case(true, true, false ; "ordinary reload of a trusted folder does not reload the env")]

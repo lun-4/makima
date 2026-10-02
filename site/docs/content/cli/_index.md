@@ -10,16 +10,17 @@ group = "Reference"
 `makima` without a subcommand starts the TUI. Subcommands cover auth, models, MCP OAuth, updates, and a few debug helpers. Many flags only apply to one of three run paths: **TUI**, one-shot **`--print`**, or **SDK** (`--print --input-format stream-json`).
 
 ```bash
-makima [OPTIONS] [PROMPT]
+makima [OPTIONS]
 makima <COMMAND>
 ```
 
-If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and that text is the first message. With `--print`, Makima runs non-interactively and exits when done.
+Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin follows the `-p` text. Without `--print`, the TUI opens and that text is the first message. With `--print`, Makima runs non-interactively and exits when done. A bare word that is not a subcommand, such as `makima resume`, is an error.
 
 ## Flags by run path
 
 | Flag | TUI | `--print` | SDK (`stream-json`) |
 |------|-----|-----------|---------------------|
+| `-p` / `--prompt` | yes | yes | no |
 | `-m` / `--model` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-rtk` / `--no-jit` | yes | yes | yes |
@@ -38,7 +39,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 
 | Flag | Description |
 |------|-------------|
-| `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
+| `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
+| `-p`, `--prompt <TEXT>` | Initial prompt. Piped stdin is appended after a blank line. Use `--prompt=<TEXT>` when the text starts with `-` |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
@@ -177,7 +179,7 @@ Moves data from `~/.makima/` into platform directories. Safe to re-run. See [Con
 cd ~/code/my-app && makima
 
 # One-shot with YOLO and a model pin
-makima -p --yolo -m anthropic/claude-sonnet-4-6 "summarize the architecture"
+makima --print --yolo -m anthropic/claude-sonnet-4-6 -p "summarize the architecture"
 
 # Resume yesterday's session
 makima -l

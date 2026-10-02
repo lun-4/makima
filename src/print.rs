@@ -1,4 +1,4 @@
-//! Non-interactive (headless) mode: `makima "prompt" --print`.
+//! Non-interactive (headless) mode: `makima --print -p "prompt"`.
 //!
 //! Wire format intentionally matches Claude Code so existing scripts work
 //! unchanged. Keep `PrintResult` fields a strict subset of theirs. `StreamJson`
@@ -374,7 +374,7 @@ pub fn run(
                 fast: false,
                 thinking: String::new(),
             },
-            // `maki -p` always runs the agent in build mode
+            // `makima --print` always runs the agent in build mode
             // (`headless::spawn` hardcodes `AgentMode::Build`).
             || MODE_BUILD,
         );

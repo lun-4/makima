@@ -30,8 +30,12 @@ pub struct Cli {
     pub command: Option<Command>,
 
     /// Non-interactive mode. Runs the prompt and exits. Compatible with Claude Code's --print flag
-    #[arg(short, long)]
+    #[arg(long)]
     pub print: bool,
+
+    /// Initial prompt. Seeds the TUI, or runs headless with --print. Piped stdin is appended after it, or used alone without it
+    #[arg(short, long)]
+    pub prompt: Option<String>,
 
     /// Attach an image to the prompt in --print mode as vision content (repeatable)
     #[arg(long = "image", value_name = "PATH")]
@@ -166,10 +170,6 @@ pub struct Cli {
     pub thinking: Option<String>,
     #[arg(long, hide = true)]
     pub thinking_display: Option<String>,
-
-    /// Initial prompt (reads stdin if piped)
-    #[arg(value_name = "PROMPT")]
-    pub initial_prompt: Option<String>,
 }
 
 impl Cli {
@@ -358,7 +358,11 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use test_case::test_case;
+
+    const PROMPT: &str = "hello";
+    const PROMPT_EQUALS_ARG: &str = "--prompt=hello";
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
@@ -427,5 +431,42 @@ mod tests {
             Cli::try_parse_from(args).is_err(),
             "{args:?} must be rejected"
         );
+    }
+
+    #[test_case(&["makima", "resume"]; "misremembered_subcommand")]
+    #[test_case(&["makima", "fix the bug"]; "bare_prompt")]
+    fn unknown_first_argument_is_rejected(args: &[&str]) {
+        let err = Cli::try_parse_from(args)
+            .err()
+            .expect("bare word must be rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test_case(&["makima", "-p", PROMPT]; "short")]
+    #[test_case(&["makima", "--prompt", PROMPT]; "long")]
+    #[test_case(&["makima", PROMPT_EQUALS_ARG]; "long_equals")]
+    fn prompt_flag_parses(args: &[&str]) {
+        let cli = Cli::parse_from(args);
+        assert_eq!(cli.prompt.as_deref(), Some(PROMPT));
+        assert!(!cli.print);
+    }
+
+    #[test]
+    fn print_flag_is_long_only() {
+        let cli = Cli::parse_from(["makima", "--print"]);
+        assert!(cli.print);
+        assert_eq!(cli.prompt, None);
+
+        let err = Cli::try_parse_from(["makima", "-p"])
+            .err()
+            .expect("bare -p needs a prompt value");
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn print_with_prompt_flag() {
+        let cli = Cli::parse_from(["makima", "--print", "-p", PROMPT]);
+        assert!(cli.print);
+        assert_eq!(cli.prompt.as_deref(), Some(PROMPT));
     }
 }

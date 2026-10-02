@@ -124,7 +124,7 @@ continues on global configuration.
 Pass `--trust` where the container is already the boundary you rely on:
 
 ```bash
-makima --trust -p "run the test suite"
+makima --trust --print -p "run the test suite"
 ```
 
 The flag loads the project configuration for that run and records no decision,
