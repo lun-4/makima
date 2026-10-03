@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use maki_storage::paths::canonical_key;
 use tracing::warn;
 
-const STALE_READ_MSG: &str = "file changed since last read";
+pub const STALE_READ_MSG: &str = "file changed since last read";
 
 pub struct FileReadTracker(Mutex<HashMap<PathBuf, SystemTime>>);
 

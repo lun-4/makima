@@ -14,7 +14,7 @@ use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
     CallOrigin, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext, TurnToolRoute,
-    truncate_line,
+    truncate_scope,
 };
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{FILE_WRITE_TOOLS, ToolKey};
@@ -899,7 +899,7 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool}': {e}"), true);
         }
     };
-    let perm_scope = truncate_line(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
+    let perm_scope = truncate_scope(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
 
     if let Err(e) = ctx

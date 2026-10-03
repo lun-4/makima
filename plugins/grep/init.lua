@@ -13,8 +13,9 @@ local opts = maki.api.register_options(output_limits.extend({
     min = 10,
     desc = "Max match groups per search. A call's `limit` param overrides it.",
   },
-  max_line_bytes = { default = 500, min = 80, desc = "Skip lines longer than this many bytes." },
+  max_line_bytes = output_limits.deprecated_line_bytes_spec,
 }))
+output_limits.warn_deprecated_line_bytes(opts, "grep")
 
 local function has_context(groups)
   for _, group in ipairs(groups) do
@@ -260,7 +261,7 @@ maki.api.register_tool({
 
     local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
 
-    local max_line_bytes = opts.max_line_bytes
+    local max_line_bytes = output_limits.line_bytes(ctx)
     local path, path_err = ctx:resolve_path(input.path or ".")
     if not path then
       return { llm_output = "error: " .. tostring(path_err), is_error = true }

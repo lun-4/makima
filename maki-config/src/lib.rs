@@ -29,6 +29,7 @@ pub mod providers;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
+pub const DEFAULT_MAX_LINE_BYTES: usize = 1000;
 pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
@@ -75,6 +76,7 @@ pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
 
 pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
+pub const MIN_LINE_BYTES: usize = 80;
 pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_MAX_TURN_OUTPUT: u32 = 1_024;
 pub const MIN_AGENT_LIMIT: usize = 1;
@@ -685,6 +687,7 @@ impl<'de> Deserialize<'de> for CompactionBuffer {
 pub struct AgentFileConfig {
     pub max_output_bytes: Option<usize>,
     pub max_output_lines: Option<usize>,
+    pub max_line_bytes: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub max_turn_output: Option<u32>,
     pub max_concurrent_agent_turns: Option<usize>,
@@ -705,6 +708,7 @@ impl AgentFileConfig {
             overlay,
             max_output_bytes,
             max_output_lines,
+            max_line_bytes,
             max_continuation_turns,
             max_turn_output,
             max_concurrent_agent_turns,
@@ -1372,6 +1376,9 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_OUTPUT_LINES, min = MIN_OUTPUT_LINES, desc = "Max tool output lines")]
     pub max_output_lines: usize,
 
+    #[config(default = DEFAULT_MAX_LINE_BYTES, min = MIN_LINE_BYTES, desc = "Max bytes of one line shown by read and grep; longer lines are cut, and write and edit_lines refuse to alter them")]
+    pub max_line_bytes: usize,
+
     #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
     pub max_continuation_turns: u32,
 
@@ -1436,6 +1443,7 @@ impl AgentConfig {
         Self {
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
             max_output_lines: file.max_output_lines.unwrap_or(DEFAULT_MAX_OUTPUT_LINES),
+            max_line_bytes: file.max_line_bytes.unwrap_or(DEFAULT_MAX_LINE_BYTES),
             max_continuation_turns: file
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
@@ -2588,6 +2596,7 @@ mod tests {
         let config = raw.into_config().unwrap();
         assert_eq!(config.agent.max_output_lines, 5000);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
+        assert_eq!(config.agent.max_line_bytes, DEFAULT_MAX_LINE_BYTES);
     }
 
     #[test]
@@ -2633,6 +2642,7 @@ mod tests {
             },
             agent: AgentFileConfig {
                 max_output_lines: Some(5000),
+                max_line_bytes: Some(400),
                 ..Default::default()
             },
             ..Default::default()
@@ -2642,6 +2652,7 @@ mod tests {
         assert_eq!(base.always_yolo, Some(true), "overlay wins");
         assert_eq!(base.agent.max_output_lines, Some(5000), "overlay wins");
         assert_eq!(base.agent.max_output_bytes, Some(80_000), "base preserved");
+        assert_eq!(base.agent.max_line_bytes, Some(400), "overlay adds");
         assert_eq!(base.ui.splash_animation, Some(false), "base preserved");
         assert_eq!(
             base.ui.notifications,
@@ -2830,6 +2841,7 @@ mod tests {
 
     #[test_case("max_output_bytes",  0 ; "zero_output_bytes")]
     #[test_case("max_output_lines",  0 ; "zero_output_lines")]
+    #[test_case("max_line_bytes",  79 ; "max_line_bytes_below_min")]
     #[test_case("max_output_bytes",  500 ; "below_min_output_bytes")]
     #[test_case("max_concurrent_agent_turns", 0 ; "zero_concurrent_agent_turns")]
     #[test_case("max_agent_depth", 0 ; "zero_agent_depth")]
@@ -2840,6 +2852,7 @@ mod tests {
         match field {
             "max_output_bytes" => config.max_output_bytes = value,
             "max_output_lines" => config.max_output_lines = value,
+            "max_line_bytes" => config.max_line_bytes = value,
             "max_concurrent_agent_turns" => config.max_concurrent_agent_turns = value,
             "max_agent_depth" => config.max_agent_depth = value,
             "max_children_per_agent" => config.max_children_per_agent = value,

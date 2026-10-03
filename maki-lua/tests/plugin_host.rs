@@ -11,7 +11,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
     ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
-    ToolSource, TurnToolBindings, timeout_annotation,
+    ToolSource, TurnToolBindings, format_line_truncated_marker, timeout_annotation,
 };
 use maki_agent::{AgentMode, SharedBuf, ToolOutput};
 use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
@@ -6532,4 +6532,98 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     assert_eq!(version, set_version);
     responder.join().unwrap();
     smol::block_on(session.close()).unwrap();
+}
+
+const CUT_LINE_BYTES: usize = 100;
+const LONG_LINE_BYTES: usize = 300;
+
+fn ctx_with_line_bytes(max_line_bytes: usize) -> ToolContext {
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.max_line_bytes = max_line_bytes;
+    ctx
+}
+
+#[test]
+fn read_cuts_lines_at_agent_max_line_bytes() {
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.txt");
+    std::fs::write(&path, "x".repeat(LONG_LINE_BYTES)).unwrap();
+
+    let out = exec_with_ctx(
+        &reg,
+        "read",
+        json!({"path": path.to_str().unwrap(), "offset": 1, "limit": 0}),
+        &ctx_with_line_bytes(CUT_LINE_BYTES),
+    )
+    .unwrap();
+    let line = out.lines().next().unwrap().trim_start_matches("1: ");
+    assert!(
+        line.len() <= CUT_LINE_BYTES,
+        "line not cut at the cap: {line}"
+    );
+    let hidden = LONG_LINE_BYTES - line.find('[').unwrap();
+    assert!(
+        line.ends_with(&format_line_truncated_marker(hidden)),
+        "{line}"
+    );
+}
+
+#[test]
+fn grep_cuts_lines_at_agent_max_line_bytes() {
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("long.txt"),
+        format!("needle{}", "x".repeat(LONG_LINE_BYTES)),
+    )
+    .unwrap();
+
+    let out = exec_with_ctx(
+        &reg,
+        "grep",
+        json!({"pattern": "needle", "path": dir.path().to_str().unwrap()}),
+        &ctx_with_line_bytes(CUT_LINE_BYTES),
+    )
+    .unwrap();
+    let line = out
+        .lines()
+        .find(|l| l.contains("needle"))
+        .expect("match line")
+        .trim_start()
+        .trim_start_matches("1: ");
+    assert!(
+        line.len() <= CUT_LINE_BYTES,
+        "line not cut at the cap: {line}"
+    );
+    let hidden = "needle".len() + LONG_LINE_BYTES - line.find('[').unwrap();
+    assert!(
+        line.ends_with(&format_line_truncated_marker(hidden)),
+        "{line}"
+    );
+}
+
+#[test_case::test_case("read" ; "read")]
+#[test_case::test_case("grep" ; "grep")]
+fn deprecated_plugin_max_line_bytes_loads_and_is_ignored(plugin: &str) {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config.opts.insert(
+        plugin.to_owned(),
+        json_obj(json!({ "max_line_bytes": CUT_LINE_BYTES })),
+    );
+    let (reg, _host) = builtins_host_with(&config);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.txt");
+    let content = format!("needle{}", "x".repeat(LONG_LINE_BYTES));
+    std::fs::write(&path, &content).unwrap();
+
+    let input = match plugin {
+        "read" => json!({"path": path.to_str().unwrap(), "offset": 1, "limit": 0}),
+        _ => json!({"pattern": "needle", "path": dir.path().to_str().unwrap()}),
+    };
+    let out = exec_tool(&reg, plugin, input).unwrap();
+    assert!(
+        out.contains(&content),
+        "the deprecated option must not cut: {out}"
+    );
 }

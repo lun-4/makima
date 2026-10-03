@@ -14,7 +14,7 @@ pub mod registry;
 pub mod schema;
 
 pub use file_locks::FileWriteLocks;
-pub use file_tracker::FileReadTracker;
+pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
@@ -640,15 +640,38 @@ pub fn mtime(path: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-pub const LINE_TRUNCATED_MARKER: &str = "[line truncated]";
+pub const LINE_TRUNCATED_PREFIX: &str = "[line truncated";
+pub const LEGACY_LINE_TRUNCATED_MARKER: &str = "[line truncated]";
 pub const FILE_TRUNCATED_MARKER: &str = "[file truncated]";
+
+pub fn format_line_truncated_marker(hidden_bytes: usize) -> String {
+    format!("{LINE_TRUNCATED_PREFIX}, +{hidden_bytes} bytes]")
+}
 
 pub fn truncate_line(line: &str, max_bytes: usize) -> String {
     if line.len() <= max_bytes {
         return line.to_owned();
     }
-    let boundary = line.floor_char_boundary(max_bytes.saturating_sub(LINE_TRUNCATED_MARKER.len()));
-    format!("{}{}", &line[..boundary], LINE_TRUNCATED_MARKER)
+    // The hidden count is at most the whole line, so its marker is the widest
+    // one this cut can need.
+    let reserve = format_line_truncated_marker(line.len()).len();
+    let boundary = line.floor_char_boundary(max_bytes.saturating_sub(reserve));
+    format!(
+        "{}{}",
+        &line[..boundary],
+        format_line_truncated_marker(line.len() - boundary)
+    )
+}
+
+/// For strings that stored rules match against, such as MCP permission
+/// scopes: a fixed suffix keeps them stable across inputs of any length.
+pub fn truncate_scope(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let boundary =
+        text.floor_char_boundary(max_bytes.saturating_sub(LEGACY_LINE_TRUNCATED_MARKER.len()));
+    format!("{}{}", &text[..boundary], LEGACY_LINE_TRUNCATED_MARKER)
 }
 
 pub fn truncate_file(
@@ -659,6 +682,7 @@ pub fn truncate_file(
 ) -> String {
     let mut result = String::new();
     let mut truncated = remaining_lines.is_some();
+    let mut emitted = 0;
     for (index, line) in text.split('\n').enumerate() {
         if index >= max_lines
             || result.len() + line.len() + usize::from(!result.is_empty()) > max_bytes
@@ -670,12 +694,16 @@ pub fn truncate_file(
             result.push('\n');
         }
         result.push_str(line);
+        emitted += 1;
     }
     if truncated {
         if !result.is_empty() {
             result.push_str("\n\n");
         }
-        result.push_str(&format_file_truncated_marker(remaining_lines));
+        let cut_here = text.split('\n').count() - emitted;
+        result.push_str(&format_file_truncated_marker(
+            remaining_lines.map(|lines| lines + cut_here),
+        ));
     }
     result
 }
@@ -1081,16 +1109,33 @@ mod tests {
 
     #[test_case("short",                            "short"                             ; "short_passthrough")]
     #[test_case(&"x".repeat(LINE_LIMIT),       &"x".repeat(LINE_LIMIT)        ; "exact_boundary")]
-    #[test_case(&"x".repeat(LINE_LIMIT + 500), &format!("{}{}", "x".repeat(LINE_LIMIT - LINE_TRUNCATED_MARKER.len()), LINE_TRUNCATED_MARKER) ; "long_truncated")]
+    #[test_case(&"x".repeat(1000), &format!("{}{}", "x".repeat(471), format_line_truncated_marker(529)) ; "ascii_reports_hidden_bytes")]
+    #[test_case(&"é".repeat(500), &format!("{}{}", "é".repeat(235), format_line_truncated_marker(530)) ; "multibyte_reports_hidden_bytes")]
     fn truncate_line_cases(input: &str, expected: &str) {
         let result = truncate_line(input, LINE_LIMIT);
         assert_eq!(result, expected);
+        assert!(result.len() <= LINE_LIMIT);
+    }
+
+    #[test_case("short", "short" ; "short_passthrough")]
+    #[test_case(&"x".repeat(LINE_LIMIT + 500), &format!("{}{}", "x".repeat(LINE_LIMIT - LEGACY_LINE_TRUNCATED_MARKER.len()), LEGACY_LINE_TRUNCATED_MARKER) ; "long_keeps_fixed_suffix")]
+    fn truncate_scope_cases(input: &str, expected: &str) {
+        assert_eq!(truncate_scope(input, LINE_LIMIT), expected);
+    }
+
+    #[test]
+    fn truncate_file_counts_byte_cut_lines_as_remaining() {
+        let result = truncate_file("aaaa\nbbbb\ncccc\ndddd", usize::MAX, 9, Some(3));
+        assert_eq!(
+            result,
+            format!("aaaa\nbbbb\n\n{}", format_file_truncated_marker(Some(5)))
+        );
     }
 
     #[test]
     fn truncate_file_includes_remaining_line_count() {
         let result = truncate_file("a\nb\nc", 2, usize::MAX, Some(7));
-        assert!(result.ends_with("[file truncated, 7 lines remaining]"));
+        assert!(result.ends_with(&format_file_truncated_marker(Some(8))));
     }
 
     #[test]

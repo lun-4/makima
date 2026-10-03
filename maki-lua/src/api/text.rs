@@ -21,10 +21,11 @@ fn html_to_markdown(_lua: &Lua, html: String) -> LuaResult<Pair<String>> {
     ))
 }
 
-/// Truncate one line while preserving a UTF-8 boundary and adding `[line truncated]`.
+/// Truncate one line while preserving a UTF-8 boundary and ending it with
+/// `[line truncated, +N bytes]`, where N is the number of bytes cut.
 ///
 /// @param text string The line to truncate.
-/// @param max_bytes integer Maximum source bytes to retain.
+/// @param max_bytes integer Maximum bytes of the result, marker included.
 /// @return string The truncated line.
 #[lua_fn]
 fn truncate_line(_lua: &Lua, text: String, max_bytes: usize) -> LuaResult<String> {

@@ -4094,12 +4094,13 @@ print(md) -- "# Hello\n\nworld"
 maki.text.truncate_line({text}, {max_bytes})
 ```
 
-Truncate one line while preserving a UTF-8 boundary and adding `[line truncated]`.
+Truncate one line while preserving a UTF-8 boundary and ending it with
+`[line truncated, +N bytes]`, where N is the number of bytes cut.
 
 **Parameters:**
 
 - `{text}` (`string`) The line to truncate.
-- `{max_bytes}` (`integer`) Maximum source bytes to retain.
+- `{max_bytes}` (`integer`) Maximum bytes of the result, marker included.
 
 **Returns:** string The truncated line.
 
@@ -6583,33 +6584,13 @@ ListPicker.highlight_spans = highlight_spans
 ```lua
 -- Shared per-tool output limit options, so the tools that support them
 -- cannot drift apart.
-
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
-local DEFAULT_MAX_LINE_BYTES = 1000
-
-local M = {}
-
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
-M.specs = {
-  max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
-  max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
-}
-
+function M.warn_deprecated_line_bytes(opts, plugin)
+function M.line_bytes(ctx)
 function M.extend(spec)
-  for name, s in pairs(M.specs) do
-    spec[name] = s
-  end
-  return spec
-end
 
 --- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
 function M.resolve(opts, ctx)
-  return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES),
-    opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
-end
-
-return M
 ```
 
 ### `require("maki.partial")`

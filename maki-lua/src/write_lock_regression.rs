@@ -1029,3 +1029,196 @@ fn memory_computed_mutable_path_locks_the_real_note() {
         "memory read must not participate in write serialization"
     );
 }
+
+/// Real-disk read barrier: the first `read` takes its content, then parks
+/// until released and hands back that content. The file tracker stats the
+/// real disk, so a stat-versus-read race can only be staged on `RealFs`.
+struct RealReadBarrierFs {
+    fs: crate::api::fs::RealFs,
+    armed: AtomicBool,
+    parked_tx: flume::Sender<()>,
+    parked_rx: flume::Receiver<()>,
+    release_tx: flume::Sender<()>,
+    release_rx: flume::Receiver<()>,
+}
+
+impl RealReadBarrierFs {
+    fn new() -> Arc<Self> {
+        let (parked_tx, parked_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        Arc::new(Self {
+            fs: crate::api::fs::RealFs,
+            armed: AtomicBool::new(true),
+            parked_tx,
+            parked_rx,
+            release_tx,
+            release_rx,
+        })
+    }
+
+    async fn wait_parked(&self) {
+        let _ = self.parked_rx.recv_async().await;
+    }
+
+    fn release(&self) {
+        self.release_tx.send(()).ok();
+    }
+}
+
+impl FsBackend for RealReadBarrierFs {
+    fn read(&self, path: PathBuf) -> crate::api::fs::BoxFuture<'_, std::io::Result<String>> {
+        Box::pin(async move {
+            let content = self.fs.read(path).await?;
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.parked_tx.send(()).ok();
+                let _ = self.release_rx.recv_async().await;
+            }
+            Ok(content)
+        })
+    }
+    fn read_bytes(&self, path: PathBuf) -> crate::api::fs::BoxFuture<'_, std::io::Result<Vec<u8>>> {
+        self.fs.read_bytes(path)
+    }
+    fn stat(
+        &self,
+        path: PathBuf,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<crate::api::fs::FsMeta>> {
+        self.fs.stat(path)
+    }
+    fn write(
+        &self,
+        path: PathBuf,
+        content: Vec<u8>,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.write(path, content)
+    }
+    fn atomic_write(
+        &self,
+        path: PathBuf,
+        content: Vec<u8>,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.atomic_write(path, content)
+    }
+    fn rm(
+        &self,
+        path: PathBuf,
+        recursive: bool,
+        force: bool,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.rm(path, recursive, force)
+    }
+    fn mkdir(
+        &self,
+        path: PathBuf,
+        parents: bool,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.mkdir(path, parents)
+    }
+    fn dir(
+        &self,
+        path: PathBuf,
+        max_depth: u32,
+    ) -> crate::api::fs::BoxFuture<'_, Result<Vec<(String, &'static str)>, crate::api::fs::FsError>>
+    {
+        self.fs.dir(path, max_depth)
+    }
+    fn glob(
+        &self,
+        patterns: Vec<String>,
+        path: Option<String>,
+        limit: Option<usize>,
+        gitignore: bool,
+        sort_mtime: bool,
+    ) -> crate::api::fs::BoxFuture<'_, Result<Vec<String>, crate::api::fs::FsError>> {
+        self.fs.glob(patterns, path, limit, gitignore, sort_mtime)
+    }
+    fn grep(
+        &self,
+        params: maki_agent::tools::grep::GrepParams,
+    ) -> crate::api::fs::BoxFuture<
+        '_,
+        Result<(PathBuf, Vec<maki_agent::GrepFileEntry>), crate::api::fs::FsError>,
+    > {
+        self.fs.grep(params)
+    }
+}
+
+#[test]
+fn real_read_barrier_blocks_until_released() {
+    smol::block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "before").unwrap();
+        let barrier = RealReadBarrierFs::new();
+
+        let reader = Arc::clone(&barrier);
+        let read_path = path.clone();
+        let read = smol::spawn(async move { reader.read(read_path).await });
+        barrier.wait_parked().await;
+        std::fs::write(&path, "after").unwrap();
+        barrier.release();
+
+        assert_eq!(
+            read.await.unwrap(),
+            "before",
+            "content taken before parking"
+        );
+        assert_eq!(
+            barrier.read(path).await.unwrap(),
+            "after",
+            "later reads pass through"
+        );
+    });
+}
+
+/// A file changed between `read`'s stat and its content read must leave the
+/// tracker on the older mtime, so an edit built on the stale content fails.
+#[test]
+fn read_racing_modification_leaves_stale_mtime() {
+    smol::block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.txt");
+        std::fs::write(&path, "alpha\n").unwrap();
+        let path_str = path.to_str().unwrap().to_owned();
+        let barrier = RealReadBarrierFs::new();
+        let (registry, _host) =
+            boot_with_backend(&["read", "edit"], Arc::clone(&barrier) as _, HashMap::new());
+        let ctx = shared_ctx(&registry);
+
+        let ctx_read = ctx.clone();
+        let read_input = json!({"path": path_str, "offset": 1, "limit": 0});
+        let read =
+            smol::spawn(async move { dispatch_async(&ctx_read, "r1", "read", read_input).await });
+        barrier.wait_parked().await;
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        barrier.release();
+        let read_done = read.await;
+        assert!(
+            !read_done.is_error,
+            "read failed: {}",
+            read_done.output.as_text()
+        );
+
+        let edit = dispatch(
+            &ctx,
+            "e1",
+            "edit",
+            json!({"path": path_str, "old_string": "alpha", "new_string": "ALPHA"}),
+        );
+        assert!(edit.is_error, "edit on stale content must be rejected");
+        assert!(
+            edit.output
+                .as_text()
+                .contains(maki_agent::tools::STALE_READ_MSG),
+            "unexpected error: {}",
+            edit.output.as_text()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+    });
+}
