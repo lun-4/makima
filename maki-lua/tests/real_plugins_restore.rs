@@ -13,7 +13,8 @@ use maki_agent::session_coordinator::{
     DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
     SessionCoordinatorParams, builtin_option_definitions,
 };
-use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolRegistry};
+use maki_agent::tools::offload::{OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore};
+use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry};
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
@@ -318,7 +319,7 @@ fn exec_live_with(
     reg: &ToolRegistry,
     tool: &str,
     input: Value,
-    shape: impl FnOnce(&mut maki_agent::tools::ToolContext),
+    shape: impl FnOnce(&mut ToolContext),
 ) -> Live {
     let (tx, rx) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
@@ -520,9 +521,7 @@ fn many_match_dir() -> tempfile::TempDir {
     dir
 }
 
-fn offloading(
-    store: &Arc<maki_agent::tools::offload::OffloadStore>,
-) -> impl FnOnce(&mut maki_agent::tools::ToolContext) {
+fn offloading(store: &Arc<OffloadStore>) -> impl FnOnce(&mut ToolContext) {
     let store = Arc::clone(store);
     move |ctx| {
         ctx.offload = Some(store);
@@ -536,9 +535,7 @@ fn offloading(
 fn grep_offload_footer_survives_restore() {
     let dir = many_match_dir();
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(maki_agent::tools::offload::OffloadStore::on_disk(
-        store_dir.path().to_path_buf(),
-    ));
+    let store = Arc::new(OffloadStore::on_disk(store_dir.path().to_path_buf()));
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
     let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
@@ -564,9 +561,7 @@ fn grep_offload_footer_survives_restore() {
 fn grep_identical_pointer_live_equals_restored() {
     let dir = many_match_dir();
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(maki_agent::tools::offload::OffloadStore::on_disk(
-        store_dir.path().to_path_buf(),
-    ));
+    let store = Arc::new(OffloadStore::on_disk(store_dir.path().to_path_buf()));
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
     let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
@@ -574,8 +569,7 @@ fn grep_identical_pointer_live_equals_restored() {
     exec_live_with(&host, &reg, GREP_TOOL, input.clone(), offloading(&store));
     let live = exec_live_with(&host, &reg, GREP_TOOL, input.clone(), offloading(&store));
     assert!(
-        live.output
-            .starts_with(maki_agent::tools::offload::OFFLOAD_POINTER_PREFIX),
+        live.output.starts_with(OFFLOAD_POINTER_PREFIX),
         "{}",
         live.output
     );
@@ -611,7 +605,7 @@ fn bash_offloaded_failure_restores_exit_code() {
     let host = load_host();
     let output = format!(
         "1\n2\n\n{}12 lines, 30 B; all of it saved to /s/x.txt; inspect it with grep, or read with offset and limit]\n{EXIT_LINE}",
-        maki_agent::tools::offload::OFFLOAD_FOOTER_PREFIX
+        OFFLOAD_FOOTER_PREFIX
     );
     let restored = restore_as(
         &host,

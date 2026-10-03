@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use maki_agent::template::Vars;
+use maki_agent::tools::offload::{
+    LINE_CUT_PREFIX, OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore,
+};
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
     ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
@@ -18,6 +21,7 @@ use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
+use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend};
 use maki_lua::{
     MAX_INFLIGHT_TOOLS, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
     WinCommand, WinEvent,
@@ -7037,23 +7041,19 @@ fn read_byte_cut_reports_remaining_lines() {
     assert!(out.ends_with(&marker), "{}", out.lines().last().unwrap());
 }
 
-const OFFLOAD_FOOTER_PREFIX: &str = maki_agent::tools::offload::OFFLOAD_FOOTER_PREFIX;
-const OFFLOAD_POINTER_PREFIX: &str = maki_agent::tools::offload::OFFLOAD_POINTER_PREFIX;
 const SEQ_LINES: usize = 5000;
 const BIG_BASH_CMD: &str = "seq 1 5000";
 const BIG_BASH_THEN_WAIT_CMD: &str = "seq 1 5000 && printf '%s%s\\n' X Y && sleep 30";
 
-fn disk_store(dir: &Path) -> Arc<maki_agent::tools::offload::OffloadStore> {
-    Arc::new(maki_agent::tools::offload::OffloadStore::on_disk(
-        dir.to_path_buf(),
-    ))
+fn disk_store(dir: &Path) -> Arc<OffloadStore> {
+    Arc::new(OffloadStore::on_disk(dir.to_path_buf()))
 }
 
 /// bash reads session options, so it needs a live coordinator: keep the
 /// returned handle alive for the test's duration.
 fn offload_ctx(
     host: &PluginHost,
-    store: &Arc<maki_agent::tools::offload::OffloadStore>,
+    store: &Arc<OffloadStore>,
 ) -> (
     ToolContext,
     maki_agent::session_coordinator::SessionCoordinatorHandle,
@@ -7136,7 +7136,7 @@ fn write_new_file_with_preview_cut_marker_is_rejected() {
     .unwrap();
     let cut_line = out
         .lines()
-        .find(|l| l.contains(maki_agent::tools::offload::LINE_CUT_PREFIX))
+        .find(|l| l.contains(LINE_CUT_PREFIX))
         .unwrap_or_else(|| panic!("no cut line in: {out}"))
         .to_owned();
     let target = dir.path().join("pasted.txt");
@@ -7203,11 +7203,12 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
 #[test]
 fn bash_large_output_offloads_into_in_memory_store() {
     let (reg, host) = builtins_host();
-    let fs = Arc::new(maki_lua::test_support::InMemoryFs::new());
+    let fs = Arc::new(InMemoryFs::new());
     let store_dir = PathBuf::from("/maki-test-state/sessions/offload/s");
-    let store = Arc::new(maki_agent::tools::offload::OffloadStore::new(Box::new(
-        maki_lua::test_support::InMemoryOffloadBackend::new(Arc::clone(&fs), store_dir.clone()),
-    )));
+    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
+        Arc::clone(&fs),
+        store_dir.clone(),
+    ))));
     let (ctx, _session) = offload_ctx(&host, &store);
 
     let err = exec_with_ctx(

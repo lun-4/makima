@@ -54,7 +54,7 @@ Rust workspace, key crates in root dir:
 - maki-providers: Integration with LLM providers via APIs (e.g. Anthropic, Z.AI)
 - maki-agent: Owns the smol-based agent loop and the persistent actor shared by TUI roots and Lua agent sessions
 - maki-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
-- maki-storage: Persistent state across runs (e.g. sessions, auth); cross-process session locks (`session_lock`) keep a session that is open in another terminal from being resumed here
+- maki-storage: Persistent state across runs (e.g. sessions, auth); cross-process session locks (`session_lock`) keep a session that is open in another terminal from being resumed here; per-session offload dirs (`sessions/offload/<id>/`) hold tool output past the limits, written through `maki-agent`'s `tools::offload` store
 - maki-config: User config
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - maki-match: shared fuzzy matching (nucleo): `fuzzy_match`/`fuzzy_resolve` used by command-argument resolution and the `maki.match` Lua API

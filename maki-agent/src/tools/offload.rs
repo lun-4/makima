@@ -35,6 +35,8 @@ const BASH_ADVICE: &str =
 const CLIPPED_NOTE: &str =
     "; lines longer than agent.max_line_bytes are clipped in the saved file too";
 const SHELL_SAFE: &[u8] = b"/._-+:,@%=";
+const SIZE_UNITS: [&str; 3] = ["KB", "MB", "GB"];
+const ROUNDS_TO_NEXT_UNIT: f64 = 1023.95;
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
 
@@ -101,6 +103,10 @@ impl OffloadStore {
 
     pub fn path_of(&self, saved: &Saved) -> PathBuf {
         self.backend.path(&saved.name)
+    }
+
+    pub fn dir(&self) -> PathBuf {
+        self.backend.path("")
     }
 
     /// Saves `body` unless an identical result is already stored. Existing
@@ -208,11 +214,9 @@ impl DiskBackend {
         Ok(())
     }
 
-    fn files(&self) -> io::Result<Vec<fs::DirEntry>> {
+    fn entries(&self) -> io::Result<Vec<fs::DirEntry>> {
         match fs::read_dir(&self.dir) {
-            Ok(entries) => entries
-                .filter(|entry| entry.as_ref().map_or(true, |e| e.path().is_file()))
-                .collect(),
+            Ok(entries) => entries.collect(),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
         }
@@ -239,18 +243,22 @@ impl OffloadBackend for DiskBackend {
         }
     }
 
+    /// Every entry, not only regular files: a directory or dangling symlink
+    /// at a slot name still takes that name.
     fn names(&self) -> io::Result<Vec<String>> {
         Ok(self
-            .files()?
+            .entries()?
             .into_iter()
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect())
     }
 
     fn total_bytes(&self) -> io::Result<u64> {
-        self.files()?
+        self.entries()?
             .into_iter()
-            .map(|entry| entry.metadata().map(|meta| meta.len()))
+            .map(|entry| entry.metadata())
+            .filter(|meta| meta.as_ref().map_or(true, |meta| meta.is_file()))
+            .map(|meta| meta.map(|meta| meta.len()))
             .sum()
     }
 
@@ -272,7 +280,7 @@ pub enum PreviewShape {
     HeadTail,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct OutputLimits {
     pub max_lines: usize,
     pub max_bytes: usize,
@@ -289,7 +297,7 @@ impl OutputLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LimitOpts<'a> {
     pub trailer: Option<&'a str>,
     pub shape: PreviewShape,
@@ -311,8 +319,8 @@ pub fn limit_output(body: &str, opts: &LimitOpts, store: Option<&OffloadStore>) 
     }
     let (metadata, shape) = match store.map(|store| (store, store.put(body))) {
         None => (FILE_TRUNCATED_MARKER.to_owned(), PreviewShape::Head),
-        Some((_, Err(e))) => {
-            warn!(error = %e, bytes = body.len(), "tool output not offloaded");
+        Some((store, Err(e))) => {
+            warn!(error = %e, dir = %store.dir().display(), bytes = body.len(), "tool output not offloaded");
             (
                 format!("{FILE_TRUNCATED_MARKER} (full output not saved: {e})"),
                 PreviewShape::Head,
@@ -372,17 +380,17 @@ fn fits(text: &str, max_lines: usize, max_bytes: usize) -> bool {
 }
 
 fn human_size(bytes: usize) -> String {
-    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
     if bytes < 1024 {
         return format!("{bytes} B");
     }
     let mut size = bytes as f64 / 1024.0;
     let mut unit = 0;
-    while size >= 1024.0 && unit + 1 < UNITS.len() {
+    // Anything that would print as "1024.0" belongs to the next unit.
+    while size >= ROUNDS_TO_NEXT_UNIT && unit + 1 < SIZE_UNITS.len() {
         size /= 1024.0;
         unit += 1;
     }
-    format!("{size:.1} {}", UNITS[unit])
+    format!("{size:.1} {}", SIZE_UNITS[unit])
 }
 
 fn shell_quoted(path: &str) -> Option<String> {
@@ -453,7 +461,7 @@ fn pointer(body: &str, saved: &Saved, path: &Path, opts: &LimitOpts) -> String {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct Budget {
     lines: usize,
     bytes: usize,
@@ -474,6 +482,9 @@ fn cut_line(line: &str, bytes: usize, from_start: bool) -> Option<String> {
     } else {
         &line[line.ceil_char_boundary(line.len() - room)..]
     };
+    if kept.is_empty() {
+        return None;
+    }
     Some(format!(
         "{kept}{}",
         format_line_cut(kept.len(), line.len(), from_start)
@@ -513,7 +524,7 @@ fn omission_line(omitted: usize) -> String {
 
 fn head_tail(body: &str, budget: Budget) -> Option<String> {
     let total = line_count(body);
-    if total < 2 {
+    if total < 2 || budget.lines < 2 {
         return head(body, budget);
     }
     let omission_reserve = omission_line(total).len() + 2;
@@ -556,6 +567,8 @@ mod tests {
     use super::*;
 
     const BIG: usize = 100_000;
+    const SHORT_TRAILER: &str = "Exit code: 3";
+    const LONG_TRAILER: &str = "Exit code: 3 after a trailer long enough to eat a real share of the byte budget, as a long path or reason would";
 
     #[derive(Default)]
     struct MapBackend {
@@ -799,29 +812,39 @@ mod tests {
         within(&out, &o);
     }
 
-    #[test_case(PreviewShape::Head, 10, 400 ; "head_even")]
-    #[test_case(PreviewShape::Head, 7, 333 ; "head_odd")]
-    #[test_case(PreviewShape::HeadTail, 10, 400 ; "head_tail_even")]
-    #[test_case(PreviewShape::HeadTail, 7, 333 ; "head_tail_odd")]
-    #[test_case(PreviewShape::HeadTail, 4, 260 ; "head_tail_tiny")]
-    fn total_output_within_limits(shape: PreviewShape, max_lines: usize, max_bytes: usize) {
+    #[test_case(PreviewShape::Head, 10, 400, SHORT_TRAILER ; "head_even")]
+    #[test_case(PreviewShape::Head, 7, 333, SHORT_TRAILER ; "head_odd")]
+    #[test_case(PreviewShape::HeadTail, 10, 400, SHORT_TRAILER ; "head_tail_even")]
+    #[test_case(PreviewShape::HeadTail, 7, 333, SHORT_TRAILER ; "head_tail_odd")]
+    #[test_case(PreviewShape::HeadTail, 4, 260, SHORT_TRAILER ; "head_tail_tiny")]
+    #[test_case(PreviewShape::HeadTail, 30, 900, LONG_TRAILER ; "head_tail_long_trailer")]
+    #[test_case(PreviewShape::Head, 30, 900, LONG_TRAILER ; "head_long_trailer")]
+    fn total_output_within_limits(
+        shape: PreviewShape,
+        max_lines: usize,
+        max_bytes: usize,
+        trailer: &'static str,
+    ) {
         let o = LimitOpts {
-            trailer: Some("Exit code: 3"),
+            trailer: Some(trailer),
             ..opts(shape, max_lines, max_bytes)
         };
         for body in [
             numbered(200),
             format!("{}\n{}", "a".repeat(5000), numbered(20)),
             format!("{}\n{}", numbered(20), "b".repeat(5000)),
+            format!("{}\n{}", "é".repeat(3000), "日".repeat(2000)),
         ] {
             let (_, store) = map_store();
             for store in [None, Some(&store)] {
                 let out = limit_output(&body, &o, store);
-                let metadata_alone = out.lines().next().unwrap_or("").starts_with('[');
-                if !metadata_alone {
+                // A preview is always joined to the metadata by a blank
+                // line; without one the result is metadata alone, which
+                // may exceed the limits by design.
+                if out.contains("\n\n") {
                     within(&out, &o);
                 }
-                assert!(out.ends_with("Exit code: 3"), "{out}");
+                assert!(out.ends_with(trailer), "{out}");
             }
         }
     }
@@ -1075,6 +1098,7 @@ mod tests {
         inner: Arc<MapBackend>,
         entered: flume::Sender<()>,
         release: flume::Receiver<()>,
+        events: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl OffloadBackend for GatedBackend {
@@ -1084,6 +1108,7 @@ mod tests {
         fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
+            self.events.lock().unwrap().push("create");
             self.inner.create_new(name, bytes)
         }
         fn names(&self) -> io::Result<Vec<String>> {
@@ -1093,6 +1118,7 @@ mod tests {
             self.inner.total_bytes()
         }
         fn remove_all(&self) -> io::Result<()> {
+            self.events.lock().unwrap().push("remove");
             self.inner.remove_all()
         }
         fn path(&self, name: &str) -> PathBuf {
@@ -1105,10 +1131,12 @@ mod tests {
         let inner = Arc::new(MapBackend::default());
         let (entered_tx, entered_rx) = flume::unbounded();
         let (release_tx, release_rx) = flume::unbounded();
+        let events = Arc::new(Mutex::new(Vec::new()));
         let store = Arc::new(OffloadStore::new(Box::new(GatedBackend {
             inner: Arc::clone(&inner),
             entered: entered_tx,
             release: release_rx,
+            events: Arc::clone(&events),
         })));
 
         let putter = {
@@ -1116,21 +1144,23 @@ mod tests {
             thread::spawn(move || store.put("in flight").is_ok())
         };
         entered_rx.recv().unwrap();
-        let (closed_tx, closed_rx) = flume::unbounded();
+        let (closing_tx, closing_rx) = flume::unbounded();
         let closer = {
             let store = Arc::clone(&store);
             thread::spawn(move || {
+                closing_tx.send(()).unwrap();
                 store.close_and_remove().unwrap();
-                closed_tx.send(()).unwrap();
             })
         };
-        assert!(
-            closed_rx.is_empty(),
-            "close must wait for the in-flight put"
-        );
+        closing_rx.recv().unwrap();
         release_tx.send(()).unwrap();
         assert!(putter.join().unwrap(), "the in-flight put completes");
         closer.join().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["create", "remove"],
+            "close must wait for the in-flight put"
+        );
         assert!(
             inner.files.lock().unwrap().is_empty(),
             "removed after the put"

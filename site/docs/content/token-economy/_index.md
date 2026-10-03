@@ -42,7 +42,17 @@ one line stays              ~20k tokens never seen
 
 **Deferred MCP tools.** An MCP server with 100 tools would ship 100 definitions in every request. Makima loads a single `tool_search` tool instead; the model searches when it actually needs something and only the matches load. See [MCP](/docs/mcp/#tool-search).
 
-**Truncation everywhere.** Tool output is capped (`agent.max_output_bytes`, `agent.max_output_lines`), overlong grep lines are skipped, and every builtin tool description nags the model to read only what it needs. The nagging works.
+**Cut, but not lost.** Tool output is capped (`agent.max_output_bytes`, `agent.max_output_lines`), and every builtin tool description nags the model to read only what it needs. The nagging works. When bash, grep, glob, webfetch, websearch, `code_execution` or an MCP tool goes past the cap, the full output is saved to a file. The model gets the start of it (for bash and `code_execution`, the start and the end, where build errors live) and a footer like this one, from `seq 1 5000`:
+
+```
+[output truncated: 5000 lines, 23.3 KB; all of it saved to /home/you/.local/state/makima/sessions/offload/<session>/<hash>.txt; inspect it with grep, or read with offset and limit]
+```
+
+The model can grep the file or page through it with `read`. `read` never saves its own output, so looking at a saved file can't make another one, and the same output twice gets a one-line pointer to the first file instead of a second copy. The files belong to the session: they are deleted with it, one file keeps at most 8 MiB, and a session keeps at most 256 MiB. Nothing cleans up sessions you keep, so their files stay until you delete the session. Print mode (`--print`) deletes its files when the run ends, so a path in its final answer no longer exists afterwards. A session made with `--fork-session` still points into the original session's files.
+
+MCP results used to reach the model in full, however large. They now go through the same limit, and only when a session has a place to save them; without one they pass through unchanged.
+
+**Long lines stay whole on disk.** `read` and `grep` cut any line longer than `agent.max_line_bytes` (default 1000) and end it with `[line truncated, +N bytes]`. That prefix is all the model saw, so writing it back would lose the rest. `write` and `edit_lines` refuse to drop or change such a line, and no edit tool accepts a new line that ends in a truncation marker. To change text inside a long line, the model uses `edit` with an exact `old_string`. If the match stops partway through the line, the result says how many bytes of it are left.
 
 **Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 

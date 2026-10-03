@@ -369,11 +369,19 @@ impl UserData for LuaCtx {
                         label = given;
                     }
                     lines_clipped = opts.get::<Option<bool>>("lines_clipped")?.unwrap_or(false);
-                    if let Some(max_lines) = opts.get::<Option<usize>>("max_lines")? {
-                        limits.max_lines = max_lines;
-                    }
-                    if let Some(max_bytes) = opts.get::<Option<usize>>("max_bytes")? {
-                        limits.max_bytes = max_bytes;
+                    for (key, limit) in [
+                        ("max_lines", &mut limits.max_lines),
+                        ("max_bytes", &mut limits.max_bytes),
+                    ] {
+                        match opts.get::<Option<usize>>(key)? {
+                            Some(0) => {
+                                return Err(mlua::Error::runtime(format!(
+                                    "limit_output: {key} must be at least 1"
+                                )));
+                            }
+                            Some(given) => *limit = given,
+                            None => {}
+                        }
                     }
                 }
                 let opts = LimitOpts {

@@ -97,18 +97,27 @@ fn setup(
     }
 }
 
-/// Names advertised to SDK clients: base tools plus what the first request
-/// would carry from MCP (always-load definitions and `tool_search`).
 fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc<OffloadStore>> {
     offload_dir_for(state_dir?, Some(session)).map(|dir| Arc::new(OffloadStore::on_disk(dir)))
 }
 
-fn close_offload(store: &OffloadStore) {
-    if let Err(e) = store.close_and_remove() {
-        warn!(error = %e, "offloaded tool output remains after the run");
+/// Closes and removes a print run's store when the run's task ends for any
+/// reason: completion, the task being dropped on a shutdown timeout, or a
+/// panic. A print run is never restored, so nothing can refer to its saved
+/// output afterwards, and closing first keeps a late subagent from
+/// recreating the directory.
+struct RemoveOffloadOnDrop(Arc<OffloadStore>);
+
+impl Drop for RemoveOffloadOnDrop {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.close_and_remove() {
+            warn!(error = %e, dir = %self.0.dir().display(), "offloaded tool output remains after the run");
+        }
     }
 }
 
+/// Names advertised to SDK clients: base tools plus what the first request
+/// would carry from MCP (always-load definitions and `tool_search`).
 fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
     let mut probe = tools.clone();
     if let Some(mcp) = mcp {
@@ -233,7 +242,9 @@ fn spawn_initialized(
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
         let _stream_guard = guard;
+        let remove_offload = offload.clone().map(RemoveOffloadOnDrop);
         async move {
+            let remove_offload = remove_offload;
             let event_tx = EventSender::new(raw_tx, 0);
             let mut model = params.model;
             let provider: Arc<dyn Provider> = match async {
@@ -298,12 +309,7 @@ fn spawn_initialized(
 
             agent.run(TurnId::generate(), params.input).await;
             drop(agent);
-            // A print run is never restored, so nothing can refer to its
-            // saved output once it ends. Closing first keeps a late subagent
-            // from recreating the directory.
-            if let Some(store) = &offload {
-                close_offload(store);
-            }
+            drop(remove_offload);
 
             if let Some(handle) = mcp_shutdown {
                 handle.shutdown().await;

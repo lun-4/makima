@@ -20,6 +20,7 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::tools::offload::OffloadStore;
 use crate::tools::{
     Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
     TurnToolBindings,
@@ -173,7 +174,7 @@ pub struct AgentParams {
     pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
     /// One store per session, cloned into subagents so they share its lock
     /// and quota.
-    pub offload: Option<Arc<crate::tools::offload::OffloadStore>>,
+    pub offload: Option<Arc<OffloadStore>>,
     pub managed_turn: Option<crate::CurrentManagedTurn>,
 }
 
@@ -226,7 +227,7 @@ pub struct Agent<'h> {
     turn_bindings: Arc<TurnToolBindings>,
     model_policy: Arc<ModelPolicy>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
-    offload: Option<Arc<crate::tools::offload::OffloadStore>>,
+    offload: Option<Arc<OffloadStore>>,
     managed_turn: Option<crate::CurrentManagedTurn>,
     admission: Option<TurnAdmissionSnapshot>,
 }
@@ -1117,9 +1118,7 @@ mod tests {
     fn tool_context_carries_offload_store() {
         let mut history = History::new(Vec::new());
         let (mut agent, _rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
-        let store = Arc::new(crate::tools::offload::OffloadStore::on_disk(PathBuf::from(
-            "/unused",
-        )));
+        let store = Arc::new(OffloadStore::on_disk(PathBuf::from("/unused")));
         agent.offload = Some(Arc::clone(&store));
         assert!(Arc::ptr_eq(
             agent.tool_context().offload.as_ref().unwrap(),

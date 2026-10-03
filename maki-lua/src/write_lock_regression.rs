@@ -17,12 +17,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use maki_agent::agent::tool_dispatch;
+use maki_agent::mcp::test_support::stub_session_with_result;
+use maki_agent::tools::offload::OffloadStore;
 use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry, TurnToolBindings};
 use maki_agent::{AgentMode, ToolDoneEvent};
 use maki_config::PluginsConfig;
 use serde_json::{Map, Value, json};
 
-use crate::api::fs::{FsBackend, InMemoryFs};
+use crate::api::fs::{FsBackend, InMemoryFs, InMemoryOffloadBackend};
 
 const FILE: &str = "/tmp/writelock/file.txt";
 const STATE_DIR: &str = crate::test_support::TEST_STATE_DIR;
@@ -1401,16 +1403,13 @@ fn mcp_offload_readable_by_lua_read() {
     let (registry, _host) = boot(Arc::clone(&fs), &["read"]);
     let mut ctx = shared_ctx(&registry);
     ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
-    ctx.offload = Some(Arc::new(maki_agent::tools::offload::OffloadStore::new(
-        Box::new(crate::api::fs::InMemoryOffloadBackend::new(
+    ctx.offload = Some(Arc::new(OffloadStore::new(Box::new(
+        InMemoryOffloadBackend::new(
             Arc::clone(&fs),
             PathBuf::from(STATE_DIR).join("sessions/offload/s"),
-        )),
-    )));
-    ctx.mcp = Some(maki_agent::mcp::test_support::stub_session_with_result(
-        &[(MCP_TOOL_QUALIFIED, "")],
-        &text,
-    ));
+        ),
+    ))));
+    ctx.mcp = Some(stub_session_with_result(&[(MCP_TOOL_QUALIFIED, "")], &text));
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
         &ctx.registry,
         &ctx.local_tools,
