@@ -346,6 +346,15 @@ pub fn limit_output(body: &str, opts: &LimitOpts, store: Option<&OffloadStore>) 
     }
 }
 
+/// Whether `line` is a footer or pointer `limit_output` wrote, for views
+/// that rebuild themselves from the model-facing text.
+pub fn is_offload_notice(line: &str) -> bool {
+    line.starts_with(OFFLOAD_POINTER_PREFIX)
+        || line
+            .split_once(" truncated: ")
+            .is_some_and(|(head, rest)| head.starts_with('[') && rest.contains(" saved "))
+}
+
 fn with_trailer(text: &str, trailer: Option<&str>) -> String {
     match trailer {
         Some(trailer) if text.is_empty() => trailer.to_owned(),
@@ -929,6 +938,24 @@ mod tests {
     #[test_case("/it's/p.txt", Some(r"'/it'\''s/p.txt'") ; "quote")]
     fn shell_quoted_path_in_advice(path: &str, expected: Option<&str>) {
         assert_eq!(shell_quoted(path).as_deref(), expected);
+    }
+
+    #[test]
+    fn notices_are_recognised() {
+        let (_, store) = map_store();
+        let o = LimitOpts {
+            label: "search results",
+            ..opts(PreviewShape::Head, 5, BIG)
+        };
+        let footer = limit_output(&numbered(50), &o, Some(&store));
+        let pointer = limit_output(&numbered(50), &o, Some(&store));
+        assert!(
+            is_offload_notice(footer.lines().last().unwrap()),
+            "{footer}"
+        );
+        assert!(is_offload_notice(&pointer), "{pointer}");
+        assert!(!is_offload_notice(FILE_TRUNCATED_MARKER));
+        assert!(!is_offload_notice("No files found"));
     }
 
     #[test]

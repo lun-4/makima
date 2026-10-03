@@ -284,7 +284,10 @@ local function handler(input, ctx)
     cut_reply = cut_reply
       or partial.cut(
         view,
-        maki.text.truncate_file(table.concat(output_parts, "\n"), max_lines, max_bytes, nil),
+        ctx:limit_output(
+          table.concat(output_parts, "\n"),
+          { preview = "head_tail", max_lines = max_lines, max_bytes = max_bytes }
+        ),
         reason,
         timeout
       )
@@ -353,7 +356,7 @@ local function handler(input, ctx)
     view:append({ { "No output", "dim" } })
   end
 
-  local llm_output = maki.text.truncate_file(output, max_lines, max_bytes)
+  local llm_output = ctx:limit_output(output, { preview = "head_tail", max_lines = max_lines, max_bytes = max_bytes })
   view:finish()
 
   return { llm_output = llm_output, body = buf }

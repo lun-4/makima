@@ -89,6 +89,18 @@ fn restore(
     state: Option<Value>,
     clicks: Vec<usize>,
 ) -> Restored {
+    restore_as(host, tool, input, output, false, state, clicks)
+}
+
+fn restore_as(
+    host: &PluginHost,
+    tool: &str,
+    input: Value,
+    output: &str,
+    is_error: bool,
+    state: Option<Value>,
+    clicks: Vec<usize>,
+) -> Restored {
     let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
     handle.request_restore(
@@ -97,7 +109,7 @@ fn restore(
             tool_use_id: "restore_id".to_owned(),
             output: output.to_owned(),
             input,
-            is_error: false,
+            is_error,
             tool_output_lines: view_lines(),
             theme_gen: None,
             clicks,
@@ -298,6 +310,16 @@ struct Live {
 }
 
 fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) -> Live {
+    exec_live_with(host, reg, tool, input, |_| {})
+}
+
+fn exec_live_with(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    tool: &str,
+    input: Value,
+    shape: impl FnOnce(&mut maki_agent::tools::ToolContext),
+) -> Live {
     let (tx, rx) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
@@ -306,6 +328,7 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
         Some(LIVE_TOOL_USE_ID),
     );
     ctx.tool_output_lines = view_lines();
+    shape(&mut ctx);
     let inv = reg
         .get(tool)
         .unwrap_or_else(|| panic!("tool {tool} not registered"))
@@ -482,6 +505,127 @@ fn grep_restore_keeps_truncation_marker() {
     assert!(
         restored.body.ends_with(FILE_TRUNCATED_MARKER),
         "marker kept as the last line: {}",
+        restored.body
+    );
+}
+
+const GREP_MATCH_FILES: usize = 40;
+const SMALL_OUTPUT_LINES: usize = 12;
+
+fn many_match_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..GREP_MATCH_FILES {
+        std::fs::write(dir.path().join(format!("f{i}.rs")), "fn one() {}\n").unwrap();
+    }
+    dir
+}
+
+fn offloading(
+    store: &Arc<maki_agent::tools::offload::OffloadStore>,
+) -> impl FnOnce(&mut maki_agent::tools::ToolContext) {
+    let store = Arc::clone(store);
+    move |ctx| {
+        ctx.offload = Some(store);
+        ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
+    }
+}
+
+/// Offloaded grep output ends in a footer line; the restored view must keep
+/// it, and match the live one.
+#[test]
+fn grep_offload_footer_survives_restore() {
+    let dir = many_match_dir();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(maki_agent::tools::offload::OffloadStore::on_disk(
+        store_dir.path().to_path_buf(),
+    ));
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
+
+    let live = exec_live_with(&host, &reg, GREP_TOOL, input.clone(), offloading(&store));
+    assert!(
+        live.output.contains("[search results truncated: "),
+        "{}",
+        live.output
+    );
+    assert!(
+        live.output.contains("clipped in the saved file too"),
+        "{}",
+        live.output
+    );
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, Vec::new());
+    assert_eq!(restored.spans, live.spans);
+}
+
+/// A repeated identical grep returns only the pointer, which has no entries:
+/// it must still restore as the grep view it rendered live.
+#[test]
+fn grep_identical_pointer_live_equals_restored() {
+    let dir = many_match_dir();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(maki_agent::tools::offload::OffloadStore::on_disk(
+        store_dir.path().to_path_buf(),
+    ));
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
+
+    exec_live_with(&host, &reg, GREP_TOOL, input.clone(), offloading(&store));
+    let live = exec_live_with(&host, &reg, GREP_TOOL, input.clone(), offloading(&store));
+    assert!(
+        live.output
+            .starts_with(maki_agent::tools::offload::OFFLOAD_POINTER_PREFIX),
+        "{}",
+        live.output
+    );
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, Vec::new());
+    assert_eq!(restored.spans, live.spans);
+}
+
+#[test]
+fn grep_no_matches_restore_unchanged() {
+    const NO_MATCHES: &str = "No files found";
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let restored = restore(
+        &host,
+        GREP_TOOL,
+        json!({ "pattern": "fn" }),
+        NO_MATCHES,
+        None,
+        Vec::new(),
+    );
+    assert!(
+        restored.body.is_empty(),
+        "grep must keep declining to restore no-match output: {}",
+        restored.body
+    );
+}
+
+/// bash's restore splits a failed run's body from its trailing exit code;
+/// an offload footer before the trailer must not break that.
+#[test]
+fn bash_offloaded_failure_restores_exit_code() {
+    const EXIT_LINE: &str = "Exit code: 3";
+    let host = load_host();
+    let output = format!(
+        "1\n2\n\n{}12 lines, 30 B; all of it saved to /s/x.txt; inspect it with grep, or read with offset and limit]\n{EXIT_LINE}",
+        maki_agent::tools::offload::OFFLOAD_FOOTER_PREFIX
+    );
+    let restored = restore_as(
+        &host,
+        "bash",
+        json!({ "command": "seq 1 12; exit 3" }),
+        &output,
+        true,
+        None,
+        Vec::new(),
+    );
+    assert!(restored.body.ends_with(EXIT_LINE), "{}", restored.body);
+    assert!(
+        !restored.body.contains(&format!("\n{EXIT_LINE}\n")),
+        "the exit code is split out of the body, not left inside it: {}",
         restored.body
     );
 }

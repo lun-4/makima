@@ -1384,3 +1384,56 @@ fn write_target_errors_fail_closed(fail_stat: bool, fail_read_bytes: bool) {
         guarded_content()
     );
 }
+
+/// MCP output offloaded through the session's store can be opened by the Lua
+/// `read` tool of the same host: both go through the host-chosen backend.
+#[test]
+fn mcp_offload_readable_by_lua_read() {
+    const LINES: usize = 50;
+    const SMALL_OUTPUT_LINES: usize = 5;
+    const MCP_TOOL_WIRE: &str = "srv__probe";
+    const MCP_TOOL_QUALIFIED: &str = "srv.probe";
+    let text = (1..=LINES)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fs = Arc::new(InMemoryFs::new());
+    let (registry, _host) = boot(Arc::clone(&fs), &["read"]);
+    let mut ctx = shared_ctx(&registry);
+    ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
+    ctx.offload = Some(Arc::new(maki_agent::tools::offload::OffloadStore::new(
+        Box::new(crate::api::fs::InMemoryOffloadBackend::new(
+            Arc::clone(&fs),
+            PathBuf::from(STATE_DIR).join("sessions/offload/s"),
+        )),
+    )));
+    ctx.mcp = Some(maki_agent::mcp::test_support::stub_session_with_result(
+        &[(MCP_TOOL_QUALIFIED, "")],
+        &text,
+    ));
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+
+    let mcp = dispatch(&ctx, "m1", MCP_TOOL_WIRE, json!({}));
+    let footer = mcp.output.as_text();
+    let (_, rest) = footer.split_once("saved to ").expect("offload footer");
+    let path = rest.split_once(';').unwrap().0;
+
+    let read = dispatch(
+        &ctx,
+        "r1",
+        "read",
+        json!({"path": path, "offset": LINES - 2, "limit": 0}),
+    );
+    assert!(!read.is_error, "{}", read.output.as_text());
+    assert!(
+        read.output
+            .as_text()
+            .contains(&format!("{LINES}: line {LINES}")),
+        "{}",
+        read.output.as_text()
+    );
+}

@@ -1,6 +1,7 @@
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Value};
 
+use maki_agent::tools::offload;
 use maki_agent::tools::{
     trailing_truncation_marker, truncate_file as truncate_file_text,
     truncate_line as truncate_line_text,
@@ -79,6 +80,16 @@ fn truncation_marker(_lua: &Lua, line: String) -> LuaResult<Option<&'static str>
     Ok(trailing_truncation_marker(&line).map(|marker| marker.as_str()))
 }
 
+/// Whether a line is a footer or pointer that offloading left in tool
+/// output, so a restored view can be rebuilt the way it was rendered live.
+///
+/// @param line string One line of tool output.
+/// @return boolean
+#[lua_fn]
+fn is_offload_notice(_lua: &Lua, line: String) -> LuaResult<bool> {
+    Ok(offload::is_offload_notice(&line))
+}
+
 lua_table! {
     /// Text transformation utilities.
     ///
@@ -92,5 +103,6 @@ lua_table! {
         truncate_line,
         truncate_file,
         truncation_marker,
+        is_offload_notice,
     ]
 }

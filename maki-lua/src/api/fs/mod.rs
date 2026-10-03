@@ -24,7 +24,7 @@ use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 
 #[cfg(feature = "test-support")]
-pub use in_memory::InMemoryFs;
+pub use in_memory::{InMemoryFs, InMemoryOffloadBackend};
 pub use real::RealFs;
 
 /// `dir` entry type tags, shared by both backends and asserted by tests.

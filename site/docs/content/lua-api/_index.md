@@ -384,6 +384,9 @@ string or a table with richer output fields.
   - `mutable_path` (`string|function`) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
+  Handlers bound their model-facing output with `ctx:limit_output(text, opts)`. Text within `agent.max_output_lines` / `agent.max_output_bytes` comes back unchanged. Longer text is saved to the session's offload store and replaced by a preview plus a footer naming the saved file; without a store it is cut instead. `opts`: `preview` ("head" or "head_tail"), `trailer` (a line that always comes last, never cut), `label` (what the footer calls the output), `lines_clipped` (the text already has long lines cut), `max_lines` / `max_bytes` (per-call limits). Returns the limited string.
+
+
 **Example:**
 
 ```lua
@@ -4139,6 +4142,23 @@ Mutation guards use it to reject markers pasted back as file content.
 - `{line}` (`string`) One line, without its newline.
 
 **Returns:** string? `"read"` for a read or grep line marker (current or legacy format), `"preview"` for a line cut in an offload preview, or nil.
+
+---
+
+### `maki.text.is_offload_notice()` {#maki-text-is_offload_notice}
+
+```lua
+maki.text.is_offload_notice({line})
+```
+
+Whether a line is a footer or pointer that offloading left in tool
+output, so a restored view can be rebuilt the way it was rendered live.
+
+**Parameters:**
+
+- `{line}` (`string`) One line of tool output.
+
+**Returns:** boolean
 
 
 ## maki.time {#maki-time}

@@ -152,7 +152,7 @@ maki.api.register_tool({
       body = strip_html(body)
     end
 
-    local llm_output = maki.text.truncate_file(body, max_lines, max_bytes, nil)
+    local llm_output = ctx:limit_output(body, { max_lines = max_lines, max_bytes = max_bytes })
 
     return {
       llm_output = llm_output,

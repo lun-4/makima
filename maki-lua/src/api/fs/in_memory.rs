@@ -2,11 +2,12 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::path::{Component, Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use globset::{Glob, GlobMatcher};
 use maki_agent::tools::grep::GrepParams;
+use maki_agent::tools::offload::OffloadBackend;
 use maki_agent::{GrepFileEntry, GrepLine, GrepMatchGroup};
 use regex::Regex;
 
@@ -84,6 +85,82 @@ impl InMemoryFs {
     fn bump_seq(inner: &mut Inner) -> u64 {
         inner.seq += 1;
         inner.seq
+    }
+}
+
+/// Offload store files inside an `InMemoryFs`, so a hermetic host's Lua
+/// tools can read what was offloaded without anything touching disk.
+pub struct InMemoryOffloadBackend {
+    fs: Arc<InMemoryFs>,
+    dir: PathBuf,
+}
+
+impl InMemoryOffloadBackend {
+    pub fn new(fs: Arc<InMemoryFs>, dir: PathBuf) -> Self {
+        Self { fs, dir }
+    }
+
+    fn files_in_dir(inner: &Inner, dir: &Path) -> Vec<(String, usize)> {
+        inner
+            .entries
+            .iter()
+            .filter(|(path, _)| path.parent() == Some(dir))
+            .filter_map(|(path, entry)| match entry {
+                Entry::File(bytes, _) => Some((
+                    path.file_name()?.to_string_lossy().into_owned(),
+                    bytes.len(),
+                )),
+                Entry::Dir => None,
+            })
+            .collect()
+    }
+}
+
+impl OffloadBackend for InMemoryOffloadBackend {
+    fn read(&self, name: &str) -> IoResult<Option<Vec<u8>>> {
+        let inner = self.fs.inner.read().unwrap();
+        Ok(match inner.entries.get(&self.dir.join(name)) {
+            Some(Entry::File(bytes, _)) => Some(bytes.clone()),
+            _ => None,
+        })
+    }
+
+    fn create_new(&self, name: &str, bytes: &[u8]) -> IoResult<bool> {
+        let mut inner = self.fs.inner.write().unwrap();
+        let path = self.dir.join(name);
+        if inner.entries.contains_key(&path) {
+            return Ok(false);
+        }
+        create_dir_all(&mut inner, &self.dir)?;
+        let seq = InMemoryFs::bump_seq(&mut inner);
+        inner.entries.insert(path, Entry::File(bytes.to_vec(), seq));
+        Ok(true)
+    }
+
+    fn names(&self) -> IoResult<Vec<String>> {
+        let inner = self.fs.inner.read().unwrap();
+        Ok(Self::files_in_dir(&inner, &self.dir)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    fn total_bytes(&self) -> IoResult<u64> {
+        let inner = self.fs.inner.read().unwrap();
+        Ok(Self::files_in_dir(&inner, &self.dir)
+            .into_iter()
+            .map(|(_, len)| len as u64)
+            .sum())
+    }
+
+    fn remove_all(&self) -> IoResult<()> {
+        let mut inner = self.fs.inner.write().unwrap();
+        inner.entries.retain(|path, _| !path.starts_with(&self.dir));
+        Ok(())
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
     }
 }
 

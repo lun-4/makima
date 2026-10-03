@@ -7036,3 +7036,197 @@ fn read_byte_cut_reports_remaining_lines() {
     let marker = maki_agent::tools::format_file_truncated_marker(Some(LINES - shown));
     assert!(out.ends_with(&marker), "{}", out.lines().last().unwrap());
 }
+
+const OFFLOAD_FOOTER_PREFIX: &str = maki_agent::tools::offload::OFFLOAD_FOOTER_PREFIX;
+const OFFLOAD_POINTER_PREFIX: &str = maki_agent::tools::offload::OFFLOAD_POINTER_PREFIX;
+const SEQ_LINES: usize = 5000;
+const BIG_BASH_CMD: &str = "seq 1 5000";
+const BIG_BASH_THEN_WAIT_CMD: &str = "seq 1 5000 && printf '%s%s\\n' X Y && sleep 30";
+
+fn disk_store(dir: &Path) -> Arc<maki_agent::tools::offload::OffloadStore> {
+    Arc::new(maki_agent::tools::offload::OffloadStore::on_disk(
+        dir.to_path_buf(),
+    ))
+}
+
+/// bash reads session options, so it needs a live coordinator: keep the
+/// returned handle alive for the test's duration.
+fn offload_ctx(
+    host: &PluginHost,
+    store: &Arc<maki_agent::tools::offload::OffloadStore>,
+) -> (
+    ToolContext,
+    maki_agent::session_coordinator::SessionCoordinatorHandle,
+) {
+    let session = test_session(host);
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
+        &AgentMode::Build,
+        None,
+        None,
+        session.read().session_id(),
+    );
+    ctx.config.rtk = false;
+    ctx.offload = Some(Arc::clone(store));
+    (ctx, session)
+}
+
+/// The path a footer or pointer names, between "saved to "/"at " and ";".
+fn offloaded_path(output: &str) -> PathBuf {
+    let notice = output
+        .lines()
+        .find(|l| l.starts_with(OFFLOAD_FOOTER_PREFIX) || l.starts_with(OFFLOAD_POINTER_PREFIX))
+        .unwrap_or_else(|| panic!("no offload notice in: {output}"));
+    let (_, rest) = notice
+        .split_once("saved to ")
+        .or_else(|| notice.split_once(", at "))
+        .unwrap();
+    PathBuf::from(rest.split_once(';').unwrap().0.trim_end_matches(','))
+}
+
+#[test]
+fn cat_offload_file_returns_pointer() {
+    let (reg, host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let store = disk_store(dir.path());
+    let (ctx, _session) = offload_ctx(&host, &store);
+
+    let first = exec_with_ctx(&reg, "bash", json!({"command": BIG_BASH_CMD}), &ctx).unwrap();
+    let saved = offloaded_path(&first);
+    let expected: String = (1..=SEQ_LINES).map(|i| format!("{i}\n")).collect();
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        expected.trim_end()
+    );
+
+    let cat = format!("cat '{}'", saved.display());
+    let again = exec_with_ctx(&reg, "bash", json!({"command": cat}), &ctx).unwrap();
+    assert!(again.starts_with(OFFLOAD_POINTER_PREFIX), "{again}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn bash_failure_keeps_exit_code_after_footer() {
+    let (reg, host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+
+    let err = exec_with_ctx(
+        &reg,
+        "bash",
+        json!({"command": format!("{BIG_BASH_CMD}; exit 3")}),
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(err.starts_with("1\n"), "{err}");
+    assert!(err.contains(OFFLOAD_FOOTER_PREFIX), "{err}");
+    assert!(err.ends_with("]\nExit code: 3"), "{err}");
+}
+
+#[test]
+fn write_new_file_with_preview_cut_marker_is_rejected() {
+    let (reg, host) = edit_tools_host();
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _session) = offload_ctx(&host, &disk_store(&dir.path().join("store")));
+    let out = exec_with_ctx(
+        &reg,
+        "bash",
+        json!({"command": "printf 'q%.0s' $(seq 1 80000)"}),
+        &ctx,
+    )
+    .unwrap();
+    let cut_line = out
+        .lines()
+        .find(|l| l.contains(maki_agent::tools::offload::LINE_CUT_PREFIX))
+        .unwrap_or_else(|| panic!("no cut line in: {out}"))
+        .to_owned();
+    let target = dir.path().join("pasted.txt");
+
+    let err = exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": target.to_str().unwrap(), "content": cut_line}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cut tool-output preview"), "{err}");
+    assert!(!target.exists());
+}
+
+/// Esc on a run whose output already passed the limits: the full output is
+/// saved, and the partial marker still comes last.
+#[test]
+fn cancelled_bash_large_output_keeps_partial_marker_last() {
+    let (tx, events) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    let (result_tx, result_rx) = flume::bounded(1);
+    let dir = tempfile::tempdir().unwrap();
+    let store = disk_store(dir.path());
+    std::thread::spawn(move || {
+        let (reg, host) = builtins_host();
+        let session = test_session(&host);
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
+            &maki_agent::AgentMode::Build,
+            Some(&event_tx),
+            Some(BASH_CANCEL_ID),
+            session.read().session_id(),
+        );
+        ctx.cancel = token;
+        ctx.config.rtk = false;
+        ctx.offload = Some(store);
+        let input = json!({ "command": BIG_BASH_THEN_WAIT_CMD });
+        result_tx
+            .send(exec_with_ctx(&reg, "bash", input, &ctx))
+            .ok();
+        drop(host);
+    });
+
+    let buf = poll_until("bash must publish its live buf", || {
+        recv_live_buf(&events, BASH_CANCEL_ID)
+    });
+    poll_until("bash output never reached the live buf", || {
+        buf.take().text().contains(BASH_PARTIAL_PROBE).then_some(())
+    });
+
+    trigger.cancel();
+
+    let err = result_rx
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("cancelled bash must settle")
+        .expect_err("a partial reply is an error reply");
+    assert!(err.contains(OFFLOAD_FOOTER_PREFIX), "{err}");
+    assert!(err.ends_with(BASH_PARTIAL_MARKER), "{err}");
+}
+
+/// The store is the host's choice: with an in-memory backend the offloaded
+/// output lands in the in-memory map and nowhere on disk.
+#[test]
+fn bash_large_output_offloads_into_in_memory_store() {
+    let (reg, host) = builtins_host();
+    let fs = Arc::new(maki_lua::test_support::InMemoryFs::new());
+    let store_dir = PathBuf::from("/maki-test-state/sessions/offload/s");
+    let store = Arc::new(maki_agent::tools::offload::OffloadStore::new(Box::new(
+        maki_lua::test_support::InMemoryOffloadBackend::new(Arc::clone(&fs), store_dir.clone()),
+    )));
+    let (ctx, _session) = offload_ctx(&host, &store);
+
+    let err = exec_with_ctx(
+        &reg,
+        "bash",
+        json!({"command": format!("{BIG_BASH_CMD}; exit 3")}),
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(err.ends_with("]\nExit code: 3"), "{err}");
+    let saved = offloaded_path(&err);
+    assert!(saved.starts_with(&store_dir), "{}", saved.display());
+    assert!(!saved.exists(), "nothing may reach the disk");
+    let expected: String = (1..=SEQ_LINES).map(|i| format!("{i}\n")).collect();
+    let files = fs.files();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, saved);
+    assert_eq!(
+        String::from_utf8(files[0].1.clone()).unwrap(),
+        expected.trim_end()
+    );
+}

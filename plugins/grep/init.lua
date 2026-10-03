@@ -244,7 +244,7 @@ maki.api.register_tool({
 
   restore = function(_input, output, _is_error, ctx)
     local entries, trailer = parse_llm_output(output)
-    if #entries == 0 then
+    if #entries == 0 and not (trailer[1] and maki.text.is_offload_notice(trailer[1])) then
       return nil
     end
     return build_grep_view(entries, ctx, trailer)
@@ -289,7 +289,12 @@ maki.api.register_tool({
     end
 
     local llm_output = format_llm_output(entries)
-    llm_output = maki.text.truncate_file(llm_output, max_lines, max_bytes, nil)
+    llm_output = ctx:limit_output(llm_output, {
+      label = "search results",
+      lines_clipped = true,
+      max_lines = max_lines,
+      max_bytes = max_bytes,
+    })
 
     -- Built from the truncated output rather than `entries`, so the view
     -- shows exactly what the model got and restore renders the same way.

@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 use maki_agent::AgentEvent;
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
+use maki_agent::tools::offload::{
+    DEFAULT_LABEL, LimitOpts, OutputLimits, PreviewShape, limit_output,
+};
 use maki_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -18,6 +21,8 @@ use crate::api::util::pair::Pair;
 use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
+const PREVIEW_HEAD: &str = "head";
+const PREVIEW_HEAD_TAIL: &str = "head_tail";
 
 fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
     let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
@@ -336,6 +341,53 @@ impl UserData for LuaCtx {
             Ok((Some(true), None))
         });
 
+        // Synchronous on purpose: bash calls it from job exit callbacks and
+        // cancel hooks, which cannot yield.
+        methods.add_method(
+            "limit_output",
+            |lua, this, (body, opts): (mlua::String, Option<mlua::Table>)| {
+                let Some(agent) = this.agent() else {
+                    return Ok(this.cap_err_pair("limit_output"));
+                };
+                let mut limits = OutputLimits::from_config(&agent.config);
+                let mut trailer = None;
+                let mut shape = PreviewShape::Head;
+                let mut label = DEFAULT_LABEL.to_owned();
+                let mut lines_clipped = false;
+                if let Some(opts) = opts {
+                    trailer = opts.get::<Option<String>>("trailer")?;
+                    shape = match opts.get::<Option<String>>("preview")?.as_deref() {
+                        None | Some(PREVIEW_HEAD) => PreviewShape::Head,
+                        Some(PREVIEW_HEAD_TAIL) => PreviewShape::HeadTail,
+                        Some(other) => {
+                            return Err(mlua::Error::runtime(format!(
+                                "limit_output: preview must be \"{PREVIEW_HEAD}\" or \"{PREVIEW_HEAD_TAIL}\", got \"{other}\""
+                            )));
+                        }
+                    };
+                    if let Some(given) = opts.get::<Option<String>>("label")? {
+                        label = given;
+                    }
+                    lines_clipped = opts.get::<Option<bool>>("lines_clipped")?.unwrap_or(false);
+                    if let Some(max_lines) = opts.get::<Option<usize>>("max_lines")? {
+                        limits.max_lines = max_lines;
+                    }
+                    if let Some(max_bytes) = opts.get::<Option<usize>>("max_bytes")? {
+                        limits.max_bytes = max_bytes;
+                    }
+                }
+                let opts = LimitOpts {
+                    trailer: trailer.as_deref(),
+                    shape,
+                    label: &label,
+                    lines_clipped,
+                    limits,
+                };
+                let limited = limit_output(&body.to_string_lossy(), &opts, agent.offload.as_deref());
+                Ok((Some(lua.create_string(limited)?), None))
+            },
+        );
+
         methods.add_method("record_read", |_, this, path: String| {
             let Some(tracker) = this.file_tracker() else {
                 return Ok(this.cap_err_pair("record_read"));
@@ -575,6 +627,54 @@ mod tests {
             Some(None),
             "a sessionless run still has the capability, so lua sees nil without an error"
         );
+    }
+
+    const LIMITED_LINES: usize = 3;
+
+    fn call_limit_output(ctx: LuaCtx, body: &str) -> (Option<String>, Option<String>) {
+        let lua = mlua::Lua::new();
+        lua.globals()
+            .set("ctx", lua.create_userdata(ctx).unwrap())
+            .unwrap();
+        lua.globals().set("body", body).unwrap();
+        lua.load(format!(
+            "return ctx:limit_output(body, {{ max_lines = {LIMITED_LINES} }})"
+        ))
+        .eval()
+        .unwrap()
+    }
+
+    fn many_lines() -> String {
+        (1..=50).map(|i| format!("line {i}\n")).collect()
+    }
+
+    #[test]
+    fn limit_output_is_handler_only() {
+        let ctx = populated_ctx();
+        let (limited, err) = call_limit_output(LuaCtx::handler(&ctx), &many_lines());
+        assert!(limited.is_some() && err.is_none());
+        for lacking in [
+            LuaCtx::start(&ctx),
+            LuaCtx::restore(ToolOutputLines::default(), None),
+        ] {
+            let (limited, err) = call_limit_output(lacking, &many_lines());
+            assert!(
+                limited.is_none() && err.is_some(),
+                "only handlers limit output"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_output_without_store_truncates() {
+        let (limited, _) = call_limit_output(LuaCtx::handler(&populated_ctx()), &many_lines());
+        let limited = limited.unwrap();
+        assert!(limited.starts_with("line 1\n"), "{limited}");
+        assert!(
+            limited.ends_with(maki_agent::tools::FILE_TRUNCATED_MARKER),
+            "{limited}"
+        );
+        assert!(limited.lines().count() <= LIMITED_LINES, "{limited}");
     }
 
     #[test]

@@ -125,7 +125,7 @@ maki.api.register_tool({
       return { llm_output = "error: " .. tostring(parse_err), is_error = true }
     end
 
-    local llm_output = maki.text.truncate_file(text, max_lines, max_bytes, nil)
+    local llm_output = ctx:limit_output(text, { max_lines = max_lines, max_bytes = max_bytes })
 
     return {
       llm_output = llm_output,
