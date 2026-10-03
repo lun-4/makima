@@ -28,7 +28,7 @@ fn html_to_markdown(_lua: &Lua, html: String) -> LuaResult<Pair<String>> {
 /// `[line truncated, +N bytes]`, where N is the number of bytes cut.
 ///
 /// @param text string The line to truncate.
-/// @param max_bytes integer Maximum bytes of the result, marker included.
+/// @param max_bytes integer Maximum bytes of the result, marker included; a cap smaller than the marker yields the marker alone.
 /// @return string The truncated line.
 #[lua_fn]
 fn truncate_line(_lua: &Lua, text: String, max_bytes: usize) -> LuaResult<String> {
@@ -51,7 +51,7 @@ fn truncate_file(
     remaining_lines: Value,
 ) -> LuaResult<String> {
     let remaining_lines = match remaining_lines {
-        Value::Integer(lines) if lines > 0 => Some(lines as usize),
+        Value::Integer(lines) if lines >= 0 => Some(lines as usize),
         Value::Integer(_) | Value::Nil => None,
         value => {
             return Err(mlua::Error::FromLuaConversionError {

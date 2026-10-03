@@ -8,6 +8,9 @@ local insert_after = require("edit_helpers").insert_after
 local preserve_line_endings = require("edit_helpers").preserve_line_endings
 
 local SNIPPET_MAX_CHARS = 32
+local MID_LINE_NOTE =
+  "\nnote: the match ends inside line %d, which continues for %d more bytes that old_string did not cover"
+local MULTIEDIT_NOTE_SCOPE = " (line numbers as of edits[%d])"
 local FALLBACK_VIEW_LINES = 10
 
 local EDIT_LINES_DESCRIPTION =
@@ -23,6 +26,7 @@ local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 - When copying text from read output, do NOT include the line number prefix (e.g. `42: `) - only the content after it.
 - Prefer this over write for targeted changes - it uses far fewer tokens.
 - Use replace_all for renaming across a file.
+- A note in the result means old_string ended partway through a line longer than `agent.max_line_bytes`; the rest of that line is still in the file.
 ]]
 
 local MULTIEDIT_DESCRIPTION = [[Make multiple find-and-replace edits to a single file atomically.
@@ -34,6 +38,7 @@ Prefer this over edit when making multiple changes to the same file.
 - Edits are applied in sequence - each operates on the result of the previous.
 - If any edit fails, none are written.
 - Ensure earlier edits don't affect text that later edits need to find.
+- A note in the result means an old_string ended partway through a line longer than `agent.max_line_bytes`; the rest of that line is still in the file.
 ]]
 
 local function edit_header(input)
@@ -235,6 +240,10 @@ local function apply_edit(path, ctx, transform)
   }
 end
 
+local function mid_line_note(note)
+  return note and string.format(MID_LINE_NOTE, note.line, note.rest) or ""
+end
+
 local function diff_result(edit_result, summary)
   return {
     llm_output = summary,
@@ -298,14 +307,23 @@ maki.api.register_tool({
   end),
 
   handler = function(input, ctx)
+    local note
     local result, err = apply_edit(input.path, ctx, function(content)
-      return fuzzy_replace.replace(content, input.old_string, input.new_string, input.replace_all or false)
+      local replaced, replace_err
+      replaced, replace_err, note = fuzzy_replace.replace(
+        content,
+        input.old_string,
+        input.new_string,
+        input.replace_all or false,
+        output_limits.line_bytes(ctx)
+      )
+      return replaced, replace_err
     end)
     if not result then
       return { llm_output = err, is_error = true }
     end
 
-    return diff_result(result, "edited " .. shorten_path(result.path))
+    return diff_result(result, "edited " .. shorten_path(result.path) .. mid_line_note(note))
   end,
 })
 
@@ -370,10 +388,15 @@ register_tool_if(opts.multiedit, {
       return { llm_output = "provide at least one edit", is_error = true }
     end
 
+    local note, note_index
+    local max_line_bytes = output_limits.line_bytes(ctx)
     local result, err = apply_edit(input.path, ctx, function(content)
       for i, edit in ipairs(edits) do
-        local replaced, replace_err =
-          fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false)
+        local replaced, replace_err, edit_note =
+          fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false, max_line_bytes)
+        if edit_note and not note then
+          note, note_index = edit_note, i - 1
+        end
         if replace_err then
           local snippet = edit.old_string:match("[^\n]*")
           local cut = utf8.offset(snippet, SNIPPET_MAX_CHARS + 1)
@@ -392,7 +415,11 @@ register_tool_if(opts.multiedit, {
 
     local n = #edits
     local s = n == 1 and "" or "s"
-    return diff_result(result, string.format("applied %d edit%s to %s", n, s, shorten_path(result.path)))
+    local summary = string.format("applied %d edit%s to %s", n, s, shorten_path(result.path))
+    if note then
+      summary = summary .. mid_line_note(note) .. string.format(MULTIEDIT_NOTE_SCOPE, note_index)
+    end
+    return diff_result(result, summary)
   end,
 })
 

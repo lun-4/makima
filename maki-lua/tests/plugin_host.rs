@@ -6915,3 +6915,124 @@ fn write_new_file_with_legacy_marker_is_rejected() {
     assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
     assert!(!path.exists());
 }
+
+const MATCHED_PREFIX_BYTES: usize = 100;
+const NOTED_EDIT_INDEX: &str = "edits[1]";
+
+fn mid_line_note_fragment() -> String {
+    format!(
+        "the match ends inside line 2, which continues for {} more bytes",
+        GUARD_LONG_LINE_BYTES - MATCHED_PREFIX_BYTES
+    )
+}
+
+fn edit_summary(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> String {
+    let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
+    match smol::block_on(async { inv.execute(&fresh_ctx()).await }).output {
+        Ok(ToolOutput::Diff { summary, .. }) => summary,
+        other => panic!("{name} did not produce a diff: {other:?}"),
+    }
+}
+
+#[test]
+fn edit_output_includes_mid_line_note() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let old = format!("short\n{}", "x".repeat(MATCHED_PREFIX_BYTES));
+
+    let summary = edit_summary(
+        &reg,
+        "edit",
+        json!({"path": file.path_str(), "old_string": old, "new_string": "short\nY"}),
+    );
+    assert!(summary.contains(&mid_line_note_fragment()), "{summary}");
+    assert_eq!(
+        file.on_disk(),
+        format!(
+            "short\nY{}\nend\n",
+            "x".repeat(GUARD_LONG_LINE_BYTES - MATCHED_PREFIX_BYTES)
+        )
+    );
+}
+
+#[test]
+fn multiedit_output_includes_mid_line_note() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let old = format!("short\n{}", "x".repeat(MATCHED_PREFIX_BYTES));
+
+    let summary = edit_summary(
+        &reg,
+        "multiedit",
+        json!({"path": file.path_str(), "edits": [
+            {"old_string": "end", "new_string": "END"},
+            {"old_string": old, "new_string": "short\nY"},
+        ]}),
+    );
+    assert!(summary.contains(&mid_line_note_fragment()), "{summary}");
+    assert!(summary.contains(NOTED_EDIT_INDEX), "{summary}");
+}
+
+#[test]
+fn multiedit_new_string_with_truncated_marker_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let lossy_line = content_from_read(&reg, file.path_str())
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+
+    let err = exec_with_ctx(
+        &reg,
+        "multiedit",
+        json!({"path": file.path_str(), "edits": [
+            {"old_string": "short", "new_string": "SHORT"},
+            {"old_string": "end", "new_string": lossy_line},
+        ]}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn editing_other_lines_keeps_existing_marker_line() {
+    let (reg, _host) = edit_tools_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("doc.md");
+    let marker_line = format!("example{}", format_line_truncated_marker(42));
+    std::fs::write(&path, format!("{marker_line}\nold\n")).unwrap();
+
+    exec_succeeds(
+        &reg,
+        "edit",
+        json!({"path": path.to_str().unwrap(), "old_string": "old", "new_string": "new"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{marker_line}\nnew\n")
+    );
+}
+
+#[test]
+fn read_byte_cut_reports_remaining_lines() {
+    const LINE_BYTES: usize = 900;
+    const LINES: usize = 100;
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.txt");
+    std::fs::write(&path, vec!["y".repeat(LINE_BYTES); LINES].join("\n")).unwrap();
+
+    let out = exec_tool(
+        &reg,
+        "read",
+        json!({"path": path.to_str().unwrap(), "offset": 1, "limit": 0}),
+    )
+    .unwrap();
+    let shown = out.lines().filter(|l| l.contains(": y")).count();
+    assert!(shown < LINES, "the byte cap must cut this file");
+    let marker = maki_agent::tools::format_file_truncated_marker(Some(LINES - shown));
+    assert!(out.ends_with(&marker), "{}", out.lines().last().unwrap());
+}

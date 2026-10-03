@@ -26,6 +26,10 @@ use crate::api::fs::{FsBackend, InMemoryFs};
 
 const FILE: &str = "/tmp/writelock/file.txt";
 const STATE_DIR: &str = crate::test_support::TEST_STATE_DIR;
+const GUARDED_FILE: &str = "/tmp/writelock/guarded.txt";
+const INJECTED_FAILURE: &str = "injected failure";
+const LONG_LINE_CHANGED_FRAGMENT: &str = "longer than agent.max_line_bytes";
+const GUARDED_LONG_LINE_BYTES: usize = 1500;
 
 fn boot_with_backend(
     plugins: &[&str],
@@ -1223,12 +1227,8 @@ fn read_racing_modification_leaves_stale_mtime() {
     });
 }
 
-const GUARDED_FILE: &str = "/tmp/writelock/guarded.txt";
-const INJECTED_FAILURE: &str = "injected failure";
-const LONG_LINE_CHANGED_FRAGMENT: &str = "longer than agent.max_line_bytes";
-
 fn guarded_content() -> Vec<u8> {
-    format!("short\n{}\nend\n", "x".repeat(1500)).into_bytes()
+    format!("short\n{}\nend\n", "x".repeat(GUARDED_LONG_LINE_BYTES)).into_bytes()
 }
 
 /// The write guard holds through the real dispatcher with the freshness

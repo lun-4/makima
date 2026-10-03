@@ -622,19 +622,66 @@ local function all_start_a_line(content, at)
   return true
 end
 
+-- A line longer than {max_line_bytes} may have been shown to the model cut,
+-- so a fuzzy candidate may only include it when {find} holds its own copy:
+-- each long candidate line consumes one trimmed-equal line of {find}. Without
+-- that, block matchers that ignore middle lines could replace a long line
+-- the model never saw in full, or collapse two copies into one.
+local function covers_long_lines(matched, find, max_line_bytes)
+  local available = {}
+  for _, line in ipairs(split_lines(find)) do
+    local key = trim(line)
+    available[key] = (available[key] or 0) + 1
+  end
+  for _, line in ipairs(split_lines(matched)) do
+    if #line > max_line_bytes then
+      local key = trim(line)
+      local left = available[key] or 0
+      if left == 0 then
+        return false
+      end
+      available[key] = left - 1
+    end
+  end
+  return true
+end
+
+-- Where a match ends partway through a line longer than {max_line_bytes},
+-- the line number and the bytes left after the match, for the first such
+-- match in {at}. The model may have pasted a visible prefix meaning the
+-- whole line, and would otherwise not learn that the rest survived.
+local function mid_line_end(content, at, len, max_line_bytes)
+  for _, start in ipairs(at) do
+    local last = start + len - 1
+    local next_byte = content:sub(last + 1, last + 1)
+    if content:sub(last, last) ~= "\n" and next_byte ~= "" and next_byte ~= "\n" then
+      local line_end = (content:find("\n", last + 1, true) or #content + 1) - 1
+      local before = content:sub(1, last)
+      local line_start = (before:match(".*\n()") or 1)
+      if line_end - line_start + 1 > max_line_bytes then
+        local _, newlines = before:gsub("\n", "")
+        return { line = newlines + 1, rest = line_end - last }
+      end
+    end
+  end
+end
+
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
--- one of the error constants above.
-function M.replace(content, old_string, new_string, replace_all)
+-- one of the error constants above. With {max_line_bytes}, fuzzy matches
+-- must cover long lines in full, and a third value reports a match that
+-- ends inside a long line (see mid_line_end).
+function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
   if old_string == "" then
     return nil, M.EMPTY_OLD_STRING
   end
 
   local any_found = false
 
-  local function try_match(candidates, find, replacement)
+  local function try_match(candidates, find, replacement, guarded)
     for _, matched in ipairs(candidates) do
-      local at = occurrences(content, matched)
+      local admitted = not (guarded and max_line_bytes) or covers_long_lines(matched, find, max_line_bytes)
+      local at = admitted and occurrences(content, matched) or {}
       if #at > 0 then
         any_found = true
         if replace_all or #at == 1 then
@@ -642,7 +689,8 @@ function M.replace(content, old_string, new_string, replace_all)
           if all_start_a_line(content, at) then
             text = reindent(matched, find, replacement)
           end
-          return splice(content, at, #matched, text)
+          local note = max_line_bytes and mid_line_end(content, at, #matched, max_line_bytes)
+          return splice(content, at, #matched, text), note
         end
       end
     end
@@ -650,24 +698,26 @@ function M.replace(content, old_string, new_string, replace_all)
   end
 
   for _, r in ipairs(REPLACERS) do
-    local res = try_match(r(content, old_string), old_string, new_string)
+    local res, note = try_match(r(content, old_string), old_string, new_string, r ~= exact)
     if res then
-      return res, nil
+      return res, nil, note
     end
   end
 
   local unescaped = unescape(old_string)
   if unescaped ~= old_string then
-    local res = try_match(escape_normalized(content, unescaped), unescaped, unescape(new_string))
+    -- Unguarded: every candidate unescapes line for line to the find, so it
+    -- already holds each long line in full.
+    local res, note = try_match(escape_normalized(content, unescaped), unescaped, unescape(new_string), false)
     if res then
-      return res, nil
+      return res, nil, note
     end
   end
 
   for _, r in ipairs(LATE_REPLACERS) do
-    local res = try_match(r(content, old_string), old_string, new_string)
+    local res, note = try_match(r(content, old_string), old_string, new_string, true)
     if res then
-      return res, nil
+      return res, nil, note
     end
   end
 

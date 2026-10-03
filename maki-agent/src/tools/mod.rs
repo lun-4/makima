@@ -679,6 +679,7 @@ impl TruncationMarker {
 }
 
 pub fn trailing_truncation_marker(line: &str) -> Option<TruncationMarker> {
+    let line = line.trim_end();
     if line.ends_with(LEGACY_LINE_TRUNCATED_MARKER) {
         return Some(TruncationMarker::ReadLine);
     }
@@ -707,7 +708,7 @@ pub fn truncate_file(
     remaining_lines: Option<usize>,
 ) -> String {
     let mut result = String::new();
-    let mut truncated = remaining_lines.is_some();
+    let mut truncated = remaining_lines.is_some_and(|lines| lines > 0);
     let mut emitted = 0;
     for (index, line) in text.split('\n').enumerate() {
         if index >= max_lines
@@ -1149,6 +1150,7 @@ mod tests {
     #[test_case("abc[line truncated, +42 bytes] tail", None ; "marker_mid_line")]
     #[test_case("abc[line truncated, +x bytes]", None ; "non_numeric_count")]
     #[test_case("abc[line truncated, + bytes]", None ; "empty_count")]
+    #[test_case("abc[line truncated, +42 bytes]  ", Some(TruncationMarker::ReadLine) ; "trailing_whitespace")]
     fn trailing_truncation_marker_cases(line: &str, expected: Option<TruncationMarker>) {
         assert_eq!(trailing_truncation_marker(line), expected);
     }
@@ -1157,6 +1159,16 @@ mod tests {
     #[test_case(&"x".repeat(LINE_LIMIT + 500), &format!("{}{}", "x".repeat(LINE_LIMIT - LEGACY_LINE_TRUNCATED_MARKER.len()), LEGACY_LINE_TRUNCATED_MARKER) ; "long_keeps_fixed_suffix")]
     fn truncate_scope_cases(input: &str, expected: &str) {
         assert_eq!(truncate_scope(input, LINE_LIMIT), expected);
+    }
+
+    #[test]
+    fn truncate_file_counts_byte_cut_lines_when_none_remained() {
+        let result = truncate_file("aaaa\nbbbb\ncccc", usize::MAX, 9, Some(0));
+        assert!(
+            result.ends_with(&format_file_truncated_marker(Some(1))),
+            "{result}"
+        );
+        assert_eq!(truncate_file("aaaa", usize::MAX, 9, Some(0)), "aaaa");
     }
 
     #[test]

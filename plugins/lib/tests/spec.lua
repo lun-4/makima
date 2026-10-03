@@ -1488,6 +1488,10 @@ case("check_markers_removing_marker_allowed", function()
   eq(long_lines.check_markers(MARKED, "abc"), nil)
 end)
 
+case("check_markers_rejects_marker_with_trailing_space", function()
+  eq(long_lines.check_markers("", MARKED .. "  "), marker_err(1))
+end)
+
 case("check_markers_ignores_marker_mid_line", function()
   eq(long_lines.check_markers("", "x [line truncated] y"), nil)
 end)

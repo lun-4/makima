@@ -4100,7 +4100,7 @@ Truncate one line while preserving a UTF-8 boundary and ending it with
 **Parameters:**
 
 - `{text}` (`string`) The line to truncate.
-- `{max_bytes}` (`integer`) Maximum bytes of the result, marker included.
+- `{max_bytes}` (`integer`) Maximum bytes of the result, marker included; a cap smaller than the marker yields the marker alone.
 
 **Returns:** string The truncated line.
 
@@ -6568,8 +6568,10 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
--- one of the error constants above.
-function M.replace(content, old_string, new_string, replace_all)
+-- one of the error constants above. With {max_line_bytes}, fuzzy matches
+-- must cover long lines in full, and a third value reports a match that
+-- ends inside a long line (see mid_line_end).
+function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
 ```
 
 ### `require("maki.list_picker")`

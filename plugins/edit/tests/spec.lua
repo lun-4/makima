@@ -416,4 +416,81 @@ case("line_endings_follow_the_majority_when_mixed", function()
   eq(edit_lines("a\r\nb\n", 1, 1, "X"), "X\nb\n")
 end)
 
+-- Long-line protection: a line over the cap may have been shown cut, so
+-- fuzzy candidates must hold their own copy of every long line.
+local CAP = 40
+local LONG = (function()
+  local tokens = {}
+  for i = 1, 20 do
+    tokens[i] = string.format("%04d", i)
+  end
+  return table.concat(tokens)
+end)()
+local TRUNC = LONG:sub(1, 20) .. "[line truncated, +60 bytes]"
+
+case("block_anchor_rejects_truncated_long_middle_line", function()
+  local content = "fn a() {\n" .. LONG .. "\n}"
+  local old = "fn a() {\n" .. TRUNC .. "\n}"
+  has(fr.replace(content, old, R, false), R)
+  local result, err = fr.replace(content, old, R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+end)
+
+case("context_aware_rejects_truncated_long_middle_line", function()
+  local content = "fn h() {\n    a();\n" .. LONG .. "\n    b();\n}"
+  local old = "fn h() {\n    a();\n" .. TRUNC .. "\n    b();\n}"
+  local result, err = fr.replace(content, old, R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+end)
+
+case("block_anchor_rejects_duplicate_long_line_collapse", function()
+  local content = "BEGIN\n" .. LONG .. "\n" .. LONG .. "\nEND"
+  local old = "BEGIN\n" .. LONG .. "\nEND"
+  has(fr.replace(content, old, R, false), R)
+  local result, err = fr.replace(content, old, R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+end)
+
+case("short_line_fuzzy_unchanged_with_cap", function()
+  local result = fr.replace(
+    "fn test() {\n    let x = 1;\n    let y = 2;\n}",
+    "fn test() {\n    let x = 99;\n    let y = 2;\n}",
+    R,
+    false,
+    CAP
+  )
+  has(result, R)
+end)
+
+case("escape_normalized_keeps_long_line_with_backslashes", function()
+  local content = 'p("' .. LONG .. '")\nq'
+  local result = fr.replace(content, 'p(\\"' .. LONG .. '\\")\nq', R, false, CAP)
+  eq(result, R)
+end)
+
+case("escape_normalized_matches_long_line_with_cap", function()
+  local content = "a = \"it\\'s " .. LONG .. '"\nq'
+  local old = "a = \\\"it's " .. LONG .. '\\"\nq'
+  eq(fr.replace(content, old, R, false), R)
+  eq(fr.replace(content, old, R, false, CAP), R)
+end)
+
+case("exact_match_ending_mid_long_line_returns_note", function()
+  local result, err, note = fr.replace("a\n" .. LONG .. "\nb", LONG:sub(1, 20), "Y", false, CAP)
+  eq(err, nil)
+  eq(result, "a\nY" .. LONG:sub(21) .. "\nb")
+  eq(note.line, 2)
+  eq(note.rest, 60)
+end)
+
+case("match_ending_at_line_end_has_no_note", function()
+  local _, _, at_end = fr.replace("a\n" .. LONG .. "\nb", LONG:sub(21), "Y", false, CAP)
+  eq(at_end, nil)
+  local _, _, short_line = fr.replace("abcdef", "abc", "Y", false, CAP)
+  eq(short_line, nil)
+end)
+
 th.report()
