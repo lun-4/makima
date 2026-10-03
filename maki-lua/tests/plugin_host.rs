@@ -6627,3 +6627,291 @@ fn deprecated_plugin_max_line_bytes_loads_and_is_ignored(plugin: &str) {
         "the deprecated option must not cut: {out}"
     );
 }
+
+const GUARD_LONG_LINE_BYTES: usize = 1500;
+const LONG_LINE_CHANGED_FRAGMENT: &str = "longer than agent.max_line_bytes";
+const MARKER_ADDED_FRAGMENT: &str = "marker from truncated read or grep output";
+
+fn edit_tools_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config.opts.insert(
+        "edit".to_owned(),
+        json_obj(json!({ "edit_lines": true, "insert_lines": true })),
+    );
+    builtins_host_with(&config)
+}
+
+struct LongLineFile {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    content: String,
+}
+
+impl LongLineFile {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        let content = format!("short\n{}\nend\n", "x".repeat(GUARD_LONG_LINE_BYTES));
+        std::fs::write(&path, &content).unwrap();
+        Self {
+            _dir: dir,
+            path,
+            content,
+        }
+    }
+
+    fn path_str(&self) -> &str {
+        self.path.to_str().unwrap()
+    }
+
+    fn on_disk(&self) -> String {
+        std::fs::read_to_string(&self.path).unwrap()
+    }
+
+    fn sibling(&self, name: &str) -> PathBuf {
+        self.path.with_file_name(name)
+    }
+}
+
+fn fresh_ctx() -> ToolContext {
+    maki_agent::tools::test_support::stub_ctx(&AgentMode::Build)
+}
+
+fn exec_succeeds(reg: &ToolRegistry, name: &str, input: serde_json::Value) {
+    let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
+    let output = smol::block_on(async { inv.execute(&fresh_ctx()).await }).output;
+    assert!(output.is_ok(), "{name} failed: {output:?}");
+}
+
+/// What a model holding only the read output would write back: the shown
+/// lines with their `N: ` gutters stripped.
+fn content_from_read(reg: &ToolRegistry, path: &str) -> String {
+    let out = exec_with_ctx(
+        reg,
+        "read",
+        json!({"path": path, "offset": 1, "limit": 0}),
+        &fresh_ctx(),
+    )
+    .unwrap();
+    let mut text: String = out
+        .lines()
+        .filter_map(|line| line.split_once(": ").map(|(_, rest)| rest))
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    text
+}
+
+#[test]
+fn write_after_truncated_read_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let lossy = content_from_read(&reg, file.path_str());
+
+    let err = exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": file.path_str(), "content": lossy}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(LONG_LINE_CHANGED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn guard_holds_with_fresh_ctx() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+
+    let err = exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": file.path_str(), "content": "short\nend\n"}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(LONG_LINE_CHANGED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn write_new_file_with_truncated_marker_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let lossy = content_from_read(&reg, file.path_str());
+    let copy = file.sibling("copy.txt");
+
+    let err = exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": copy.to_str().unwrap(), "content": lossy}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
+    assert!(!copy.exists(), "rejected write must not create the file");
+}
+
+#[test]
+fn write_preserving_long_lines_succeeds() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let moved = format!("end\n{}\nSHORT\n", "x".repeat(GUARD_LONG_LINE_BYTES));
+
+    exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": file.path_str(), "content": moved}),
+        &fresh_ctx(),
+    )
+    .unwrap();
+    assert_eq!(file.on_disk(), moved);
+}
+
+#[test]
+fn write_over_non_utf8_file_succeeds() {
+    let (reg, _host) = edit_tools_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("latin1.txt");
+    std::fs::write(&path, [0xe9, b'\n', 0xff]).unwrap();
+
+    exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": path.to_str().unwrap(), "content": "fresh\n"}),
+        &fresh_ctx(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+}
+
+#[test]
+fn edit_lines_altering_long_line_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+
+    let err = exec_with_ctx(
+        &reg,
+        "edit_lines",
+        json!({"path": file.path_str(), "start": 1, "end": 2, "new_string": "SHORT\nxxx"}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(LONG_LINE_CHANGED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn edit_lines_deleting_long_line_succeeds() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+
+    exec_succeeds(
+        &reg,
+        "edit_lines",
+        json!({"path": file.path_str(), "start": 2, "end": 2, "new_string": ""}),
+    );
+    assert_eq!(file.on_disk(), "short\nend\n");
+}
+
+#[test]
+fn insert_lines_next_to_long_line_succeeds() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+
+    exec_succeeds(
+        &reg,
+        "insert_lines",
+        json!({"path": file.path_str(), "line": 2, "new_string": "after"}),
+    );
+    assert_eq!(
+        file.on_disk(),
+        format!("short\n{}\nafter\nend\n", "x".repeat(GUARD_LONG_LINE_BYTES))
+    );
+}
+
+#[test]
+fn insert_lines_with_truncated_marker_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let lossy_line = content_from_read(&reg, file.path_str())
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+
+    let err = exec_with_ctx(
+        &reg,
+        "insert_lines",
+        json!({"path": file.path_str(), "line": 3, "new_string": lossy_line}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn edit_new_string_with_truncated_marker_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let lossy_line = content_from_read(&reg, file.path_str())
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+
+    let err = exec_with_ctx(
+        &reg,
+        "edit",
+        json!({"path": file.path_str(), "old_string": "end", "new_string": lossy_line}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn edit_lines_delete_then_insert_truncated_copy_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let lossy_line = content_from_read(&reg, file.path_str())
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+
+    exec_succeeds(
+        &reg,
+        "edit_lines",
+        json!({"path": file.path_str(), "start": 2, "end": 2, "new_string": ""}),
+    );
+    let err = exec_with_ctx(
+        &reg,
+        "insert_lines",
+        json!({"path": file.path_str(), "line": 1, "new_string": lossy_line}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), "short\nend\n");
+}
+
+#[test]
+fn write_new_file_with_legacy_marker_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pasted.txt");
+
+    let err = exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": path.to_str().unwrap(), "content": "abc[line truncated]\n"}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
+    assert!(!path.exists());
+}

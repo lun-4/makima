@@ -663,6 +663,32 @@ pub fn truncate_line(line: &str, max_bytes: usize) -> String {
     )
 }
 
+/// Which tool output a line-ending truncation marker came from, so a
+/// mutation guard can reject pasted markers with the right recovery advice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncationMarker {
+    ReadLine,
+}
+
+impl TruncationMarker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadLine => "read",
+        }
+    }
+}
+
+pub fn trailing_truncation_marker(line: &str) -> Option<TruncationMarker> {
+    if line.ends_with(LEGACY_LINE_TRUNCATED_MARKER) {
+        return Some(TruncationMarker::ReadLine);
+    }
+    let (head, digits) = line.strip_suffix(" bytes]")?.rsplit_once(", +")?;
+    (head.ends_with(LINE_TRUNCATED_PREFIX)
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit()))
+    .then_some(TruncationMarker::ReadLine)
+}
+
 /// For strings that stored rules match against, such as MCP permission
 /// scopes: a fixed suffix keeps them stable across inputs of any length.
 pub fn truncate_scope(text: &str, max_bytes: usize) -> String {
@@ -1115,6 +1141,16 @@ mod tests {
         let result = truncate_line(input, LINE_LIMIT);
         assert_eq!(result, expected);
         assert!(result.len() <= LINE_LIMIT);
+    }
+
+    #[test_case("plain line", None ; "no_marker")]
+    #[test_case(&format!("abc{}", format_line_truncated_marker(42)), Some(TruncationMarker::ReadLine) ; "current_marker")]
+    #[test_case("abc[line truncated]", Some(TruncationMarker::ReadLine) ; "legacy_marker")]
+    #[test_case("abc[line truncated, +42 bytes] tail", None ; "marker_mid_line")]
+    #[test_case("abc[line truncated, +x bytes]", None ; "non_numeric_count")]
+    #[test_case("abc[line truncated, + bytes]", None ; "empty_count")]
+    fn trailing_truncation_marker_cases(line: &str, expected: Option<TruncationMarker>) {
+        assert_eq!(trailing_truncation_marker(line), expected);
     }
 
     #[test_case("short", "short" ; "short_passthrough")]

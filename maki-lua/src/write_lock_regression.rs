@@ -1222,3 +1222,165 @@ fn read_racing_modification_leaves_stale_mtime() {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
     });
 }
+
+const GUARDED_FILE: &str = "/tmp/writelock/guarded.txt";
+const INJECTED_FAILURE: &str = "injected failure";
+const LONG_LINE_CHANGED_FRAGMENT: &str = "longer than agent.max_line_bytes";
+
+fn guarded_content() -> Vec<u8> {
+    format!("short\n{}\nend\n", "x".repeat(1500)).into_bytes()
+}
+
+/// The write guard holds through the real dispatcher with the freshness
+/// check off and a tracker that never saw a read: it compares content, not
+/// read history.
+#[test]
+fn guard_holds_through_dispatcher_with_stale_check_off() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(GUARDED_FILE), guarded_content());
+    let (registry, _host) = boot(Arc::clone(&fs), &["write"]);
+    let mut ctx = shared_ctx(&registry);
+    ctx.config.stale_read_check = false;
+
+    let done = dispatch(
+        &ctx,
+        "w1",
+        "write",
+        json!({"path": GUARDED_FILE, "content": "short\nend\n"}),
+    );
+    assert!(done.is_error, "lossy write must be rejected");
+    assert!(
+        done.output.as_text().contains(LONG_LINE_CHANGED_FRAGMENT),
+        "{}",
+        done.output.as_text()
+    );
+    assert_eq!(
+        file_content(&fs, GUARDED_FILE).into_bytes(),
+        guarded_content()
+    );
+}
+
+/// In-memory backend whose `stat` or `read_bytes` fail with a non-NotFound
+/// error, so the write guard's classification of the target can be probed.
+struct FailingFs {
+    fs: InMemoryFs,
+    fail_stat: bool,
+    fail_read_bytes: bool,
+}
+
+fn injected() -> std::io::Error {
+    std::io::Error::other(INJECTED_FAILURE)
+}
+
+impl FsBackend for FailingFs {
+    fn read(&self, path: PathBuf) -> crate::api::fs::BoxFuture<'_, std::io::Result<String>> {
+        self.fs.read(path)
+    }
+    fn read_bytes(&self, path: PathBuf) -> crate::api::fs::BoxFuture<'_, std::io::Result<Vec<u8>>> {
+        if self.fail_read_bytes {
+            return Box::pin(async { Err(injected()) });
+        }
+        self.fs.read_bytes(path)
+    }
+    fn stat(
+        &self,
+        path: PathBuf,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<crate::api::fs::FsMeta>> {
+        if self.fail_stat {
+            return Box::pin(async { Err(injected()) });
+        }
+        self.fs.stat(path)
+    }
+    fn write(
+        &self,
+        path: PathBuf,
+        content: Vec<u8>,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.write(path, content)
+    }
+    fn atomic_write(
+        &self,
+        path: PathBuf,
+        content: Vec<u8>,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.atomic_write(path, content)
+    }
+    fn rm(
+        &self,
+        path: PathBuf,
+        recursive: bool,
+        force: bool,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.rm(path, recursive, force)
+    }
+    fn mkdir(
+        &self,
+        path: PathBuf,
+        parents: bool,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.mkdir(path, parents)
+    }
+    fn dir(
+        &self,
+        path: PathBuf,
+        max_depth: u32,
+    ) -> crate::api::fs::BoxFuture<'_, Result<Vec<(String, &'static str)>, crate::api::fs::FsError>>
+    {
+        self.fs.dir(path, max_depth)
+    }
+    fn glob(
+        &self,
+        patterns: Vec<String>,
+        path: Option<String>,
+        limit: Option<usize>,
+        gitignore: bool,
+        sort_mtime: bool,
+    ) -> crate::api::fs::BoxFuture<'_, Result<Vec<String>, crate::api::fs::FsError>> {
+        self.fs.glob(patterns, path, limit, gitignore, sort_mtime)
+    }
+    fn grep(
+        &self,
+        params: maki_agent::tools::grep::GrepParams,
+    ) -> crate::api::fs::BoxFuture<
+        '_,
+        Result<(PathBuf, Vec<maki_agent::GrepFileEntry>), crate::api::fs::FsError>,
+    > {
+        self.fs.grep(params)
+    }
+}
+
+#[test_case::test_case(true, false ; "write_metadata_error_leaves_target_unchanged")]
+#[test_case::test_case(false, true ; "write_read_error_leaves_target_unchanged")]
+fn write_target_errors_fail_closed(fail_stat: bool, fail_read_bytes: bool) {
+    let failing = Arc::new(FailingFs {
+        fs: InMemoryFs::new(),
+        fail_stat,
+        fail_read_bytes,
+    });
+    failing
+        .fs
+        .seed(std::path::Path::new(GUARDED_FILE), guarded_content());
+    let (registry, _host) =
+        boot_with_backend(&["write"], Arc::clone(&failing) as _, HashMap::new());
+    let ctx = shared_ctx(&registry);
+
+    let done = dispatch(
+        &ctx,
+        "w1",
+        "write",
+        json!({"path": GUARDED_FILE, "content": "anything\n"}),
+    );
+    assert!(
+        done.is_error,
+        "write must fail when the target can't be inspected"
+    );
+    assert!(
+        done.output.as_text().contains(INJECTED_FAILURE),
+        "{}",
+        done.output.as_text()
+    );
+    assert_eq!(
+        file_content(&failing.fs, GUARDED_FILE).into_bytes(),
+        guarded_content()
+    );
+}

@@ -1,7 +1,10 @@
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Value};
 
-use maki_agent::tools::{truncate_file as truncate_file_text, truncate_line as truncate_line_text};
+use maki_agent::tools::{
+    trailing_truncation_marker, truncate_file as truncate_file_text,
+    truncate_line as truncate_line_text,
+};
 
 use super::util::pair::{Pair, pair};
 
@@ -66,6 +69,16 @@ fn truncate_file(
     ))
 }
 
+/// Name the tool output a line's trailing truncation marker came from, if any.
+/// Mutation guards use it to reject markers pasted back as file content.
+///
+/// @param line string One line, without its newline.
+/// @return string? `"read"` for a read or grep line marker (current or legacy format), or nil.
+#[lua_fn]
+fn truncation_marker(_lua: &Lua, line: String) -> LuaResult<Option<&'static str>> {
+    Ok(trailing_truncation_marker(&line).map(|marker| marker.as_str()))
+}
+
 lua_table! {
     /// Text transformation utilities.
     ///
@@ -78,5 +91,6 @@ lua_table! {
         html_to_markdown,
         truncate_line,
         truncate_file,
+        truncation_marker,
     ]
 }

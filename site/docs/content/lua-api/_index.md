@@ -4123,6 +4123,23 @@ Truncate file output by line and byte limits, adding `[file truncated]` when nee
 
 **Returns:** string The truncated file output.
 
+---
+
+### `maki.text.truncation_marker()` {#maki-text-truncation_marker}
+
+```lua
+maki.text.truncation_marker({line})
+```
+
+Name the tool output a line's trailing truncation marker came from, if any.
+Mutation guards use it to reject markers pasted back as file content.
+
+**Parameters:**
+
+- `{line}` (`string`) One line, without its newline.
+
+**Returns:** string? `"read"` for a read or grep line marker (current or legacy format), or nil.
+
 
 ## maki.time {#maki-time}
 
@@ -6577,6 +6594,30 @@ function ListPicker.open(items, opts)
 ListPicker.split_words = split_words
 ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
+```
+
+### `require("maki.long_lines")`
+
+```lua
+-- Write-time guard against lossy write-back of truncated tool output.
+--
+-- read and grep cut lines longer than agent.max_line_bytes, so the model may
+-- only ever have seen a prefix of them. These checks compare content, not
+-- read history: they hold after resume, in subagents, and whatever the model
+-- last read. Lines are compared exactly, and every protected line consumes
+-- its own occurrence, so two identical long lines cannot collapse into one.
+M.LONG_LINE_CHANGED = "line %d is %d bytes, longer than agent.max_line_bytes (%d), so it may have been shown "
+
+--- Every long line of `before` must survive unchanged somewhere in `after`.
+function M.check_write(before, after, max_line_bytes)
+
+--- Every long line in content's [start_line, end_line] must survive in
+--- `new_string`. An empty `new_string` is an explicit deletion and passes.
+function M.check_replace_lines(content, start_line, end_line, new_string, max_line_bytes)
+
+--- Reject lines of `after` that end in a truncation marker unless an
+--- identical line is still available in `before`. Removing a marker passes.
+function M.check_markers(before, after)
 ```
 
 ### `require("maki.output_limits")`

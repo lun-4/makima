@@ -1,6 +1,8 @@
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
+local output_limits = require("maki.output_limits")
+local long_lines = require("maki.long_lines")
 local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
 local preserve_line_endings = require("edit_helpers").preserve_line_endings
@@ -9,7 +11,7 @@ local SNIPPET_MAX_CHARS = 32
 local FALLBACK_VIEW_LINES = 10
 
 local EDIT_LINES_DESCRIPTION =
-  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.]]
+  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Lines longer than `agent.max_line_bytes` may have been shown cut, so a non-empty `new_string` must keep them unchanged; change text inside them with `edit`. Do not use with the batch tool.]]
 
 local INSERT_LINES_DESCRIPTION =
   [[Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.]]
@@ -212,6 +214,11 @@ local function apply_edit(path, ctx, transform)
   local after, transform_err = preserve_line_endings(before, transform)
   if transform_err then
     return nil, transform_err
+  end
+
+  local marker_err = long_lines.check_markers(before, after)
+  if marker_err then
+    return nil, marker_err
   end
 
   local _, write_err = maki.fs.atomic_write(path, after)
@@ -432,7 +439,21 @@ register_tool_if(opts.edit_lines, {
 
   handler = function(input, ctx)
     local result, err = apply_edit(input.path, ctx, function(content)
-      return replace_lines(content, input.start, input["end"], input.new_string)
+      local replaced, range_err = replace_lines(content, input.start, input["end"], input.new_string)
+      if not replaced then
+        return nil, range_err
+      end
+      local guard_err = long_lines.check_replace_lines(
+        content,
+        input.start,
+        input["end"],
+        input.new_string,
+        output_limits.line_bytes(ctx)
+      )
+      if guard_err then
+        return nil, guard_err
+      end
+      return replaced
     end)
     if not result then
       return { llm_output = err, is_error = true }
