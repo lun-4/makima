@@ -73,7 +73,7 @@ fn truncate_file(
 /// Mutation guards use it to reject markers pasted back as file content.
 ///
 /// @param line string One line, without its newline.
-/// @return string? `"read"` for a read or grep line marker (current or legacy format), or nil.
+/// @return string? `"read"` for a read or grep line marker (current or legacy format), `"preview"` for a line cut in an offload preview, or nil.
 #[lua_fn]
 fn truncation_marker(_lua: &Lua, line: String) -> LuaResult<Option<&'static str>> {
     Ok(trailing_truncation_marker(&line).map(|marker| marker.as_str()))

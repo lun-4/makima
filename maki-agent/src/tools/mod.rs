@@ -10,6 +10,7 @@ mod file_tracker;
 pub mod grep;
 pub mod hook;
 pub mod interpreter_bridge;
+pub mod offload;
 pub mod registry;
 pub mod schema;
 
@@ -485,6 +486,9 @@ pub struct ToolContext {
     /// from this one (batch siblings, subagents, recursive `call_tool`). See
     /// [`FileWriteLocks`].
     pub file_write_locks: Arc<FileWriteLocks>,
+    /// Where output past the limits is saved, shared by every agent in the
+    /// session. `None` without a session, and tools then cut output instead.
+    pub offload: Option<Arc<offload::OffloadStore>>,
     /// Logical owner chain of the dispatch that produced this context: the
     /// tokens of every ancestor dispatch, root first. Empty for root agent
     /// contexts; [`crate::agent::tool_dispatch::run`] appends its own token
@@ -668,12 +672,14 @@ pub fn truncate_line(line: &str, max_bytes: usize) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncationMarker {
     ReadLine,
+    PreviewCut,
 }
 
 impl TruncationMarker {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadLine => "read",
+            Self::PreviewCut => "preview",
         }
     }
 }
@@ -683,11 +689,19 @@ pub fn trailing_truncation_marker(line: &str) -> Option<TruncationMarker> {
     if line.ends_with(LEGACY_LINE_TRUNCATED_MARKER) {
         return Some(TruncationMarker::ReadLine);
     }
-    let (head, digits) = line.strip_suffix(" bytes]")?.rsplit_once(", +")?;
-    (head.ends_with(LINE_TRUNCATED_PREFIX)
-        && !digits.is_empty()
-        && digits.bytes().all(|b| b.is_ascii_digit()))
-    .then_some(TruncationMarker::ReadLine)
+    let counted = line.strip_suffix(" bytes]")?;
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some((head, hidden)) = counted.rsplit_once(", +")
+        && head.ends_with(LINE_TRUNCATED_PREFIX)
+        && all_digits(hidden)
+    {
+        return Some(TruncationMarker::ReadLine);
+    }
+    let (_, cut) = counted.rsplit_once(offload::LINE_CUT_PREFIX)?;
+    let (end, counts) = cut.split_once(' ')?;
+    let (kept, of) = counts.split_once(" of ")?;
+    (matches!(end, "first" | "last") && all_digits(kept) && all_digits(of))
+        .then_some(TruncationMarker::PreviewCut)
 }
 
 /// For strings that stored rules match against, such as MCP permission
@@ -837,6 +851,7 @@ pub fn interpreter_ctx(
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
         file_write_locks: Arc::new(FileWriteLocks::new()),
+        offload: None,
         write_lock_chain: Arc::new(Vec::new()),
         managed_turn: None,
     }
@@ -1151,6 +1166,9 @@ mod tests {
     #[test_case("abc[line truncated, +x bytes]", None ; "non_numeric_count")]
     #[test_case("abc[line truncated, + bytes]", None ; "empty_count")]
     #[test_case("abc[line truncated, +42 bytes]  ", Some(TruncationMarker::ReadLine) ; "trailing_whitespace")]
+    #[test_case(&format!("abc{}", offload::format_line_cut(3, 900, true)), Some(TruncationMarker::PreviewCut) ; "preview_head_cut")]
+    #[test_case(&format!("abc{}", offload::format_line_cut(3, 900, false)), Some(TruncationMarker::PreviewCut) ; "preview_tail_cut")]
+    #[test_case("abc[line cut: middle 3 of 900 bytes]", None ; "preview_unknown_end")]
     fn trailing_truncation_marker_cases(line: &str, expected: Option<TruncationMarker>) {
         assert_eq!(trailing_truncation_marker(line), expected);
     }

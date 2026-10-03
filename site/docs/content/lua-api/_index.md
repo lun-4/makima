@@ -4138,7 +4138,7 @@ Mutation guards use it to reject markers pasted back as file content.
 
 - `{line}` (`string`) One line, without its newline.
 
-**Returns:** string? `"read"` for a read or grep line marker (current or legacy format), or nil.
+**Returns:** string? `"read"` for a read or grep line marker (current or legacy format), `"preview"` for a line cut in an offload preview, or nil.
 
 
 ## maki.time {#maki-time}

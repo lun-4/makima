@@ -1488,6 +1488,13 @@ case("check_markers_removing_marker_allowed", function()
   eq(long_lines.check_markers(MARKED, "abc"), nil)
 end)
 
+case("check_markers_rejects_preview_cut_marker", function()
+  eq(
+    long_lines.check_markers("", "abc[line cut: first 3 of 900 bytes]"),
+    string.format(long_lines.TRUNCATED_MARKER_ADDED.preview, 1)
+  )
+end)
+
 case("check_markers_rejects_marker_with_trailing_space", function()
   eq(long_lines.check_markers("", MARKED .. "  "), marker_err(1))
 end)

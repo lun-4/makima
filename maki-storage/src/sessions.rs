@@ -50,6 +50,9 @@ const LOG_BLOATED: &str = "too many stale meta records";
 const MAX_APPENDS: usize = 512;
 /// Where a shrink rewrite parks the log it is about to drop, as `archive/<id>/`.
 const ARCHIVE_DIR: &str = "archive";
+/// Full tool output saved instead of being cut, as `offload/<id>/`. It goes
+/// with the session, so references to it in the history stay valid.
+pub const OFFLOAD_DIR: &str = "offload";
 /// Archives kept per session. The extra ones go on the next archive, not on a
 /// timer.
 const ARCHIVE_KEEP: usize = 3;
@@ -997,6 +1000,10 @@ fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), Sto
     atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)
 }
 
+pub fn offload_dir(sessions_dir: &Path, id: MakiId) -> PathBuf {
+    sessions_dir.join(OFFLOAD_DIR).join(id.to_string())
+}
+
 fn jsonl_path(dir: &Path, id: MakiId) -> PathBuf {
     dir.join(format!("{id}.jsonl"))
 }
@@ -1694,10 +1701,15 @@ where
         // Backups, not the session: failing to sweep them must not fail a
         // delete whose log is already gone, and their presence alone does not
         // make a session exist.
-        if let Err(e) = fs::remove_dir_all(dir.join(ARCHIVE_DIR).join(id.to_string()))
-            && e.kind() != ErrorKind::NotFound
-        {
-            warn!(error = %e, session_id = %id, "session archives remain after delete");
+        for (sweep, what) in [
+            (dir.join(ARCHIVE_DIR).join(id.to_string()), "archives"),
+            (offload_dir(dir, id), "offloaded tool output"),
+        ] {
+            if let Err(e) = fs::remove_dir_all(&sweep)
+                && e.kind() != ErrorKind::NotFound
+            {
+                warn!(error = %e, session_id = %id, what, "session data remains after delete");
+            }
         }
         session_lock::release(dir, &id);
         if !removed {
@@ -1716,8 +1728,8 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, StoredSubagent, TAIL_BUF,
-        generate_title, json_path, jsonl_path, load_cwd_index, next_epoch, update_cwd_index,
-        write_full_session,
+        generate_title, json_path, jsonl_path, load_cwd_index, next_epoch, offload_dir,
+        update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
@@ -2400,6 +2412,21 @@ mod tests {
         TestSession::delete_from(session.id, dir).unwrap();
         assert!(!archive_dir.exists());
         assert!(!jsonl_path(dir, session.id).exists());
+    }
+
+    #[test]
+    fn delete_removes_offload_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.save_to(dir).unwrap();
+        let offload = offload_dir(dir, session.id);
+        fs::create_dir_all(&offload).unwrap();
+        fs::write(offload.join("0123456789abcdef.txt"), "output").unwrap();
+
+        TestSession::delete_from(session.id, dir).unwrap();
+        assert!(!offload.exists());
     }
 
     /// A rename with no new messages must survive restart, while a no-op

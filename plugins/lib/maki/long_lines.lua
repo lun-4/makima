@@ -18,6 +18,9 @@ M.TRUNCATED_MARKER_ADDED = {
   read = "line %d ends with a [line truncated] marker from truncated read or grep output; the text after it "
     .. "was never shown. Change the original line with edit instead."
     .. SHELL_HINT,
+  preview = "line %d ends with a [line cut: ...] marker from a cut tool-output preview; read the saved output "
+    .. "file for the full line."
+    .. SHELL_HINT,
 }
 
 local function lines_of(text)

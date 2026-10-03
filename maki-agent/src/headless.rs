@@ -1,6 +1,4 @@
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_lock::Mutex;
@@ -13,7 +11,7 @@ use maki_providers::provider::{self, Provider};
 use maki_providers::{Timeouts, TokenUsage};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
@@ -24,6 +22,7 @@ use crate::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
 };
 use crate::template;
+use crate::tools::offload::{OffloadStore, offload_dir_for};
 use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -51,6 +50,9 @@ pub struct HeadlessParams {
     /// coordinator: tools read their options through one, and
     /// `SessionMailbox::notify` resolves through one.
     pub session_options: SessionOptionCatalog,
+    /// Root for the run's offload store. `None` cuts oversized tool output
+    /// instead of saving it.
+    pub state_dir: Option<PathBuf>,
 }
 
 pub struct HeadlessHandle {
@@ -97,6 +99,16 @@ fn setup(
 
 /// Names advertised to SDK clients: base tools plus what the first request
 /// would carry from MCP (always-load definitions and `tool_search`).
+fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc<OffloadStore>> {
+    offload_dir_for(state_dir?, Some(session)).map(|dir| Arc::new(OffloadStore::on_disk(dir)))
+}
+
+fn close_offload(store: &OffloadStore) {
+    if let Err(e) = store.close_and_remove() {
+        warn!(error = %e, "offloaded tool output remains after the run");
+    }
+}
+
 fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
     let mut probe = tools.clone();
     if let Some(mcp) = mcp {
@@ -215,6 +227,7 @@ fn spawn_initialized(
         mailbox: mailbox.clone(),
     })?;
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
+    let offload = session_offload(params.state_dir.as_deref(), &session_ref);
     let task = smol::spawn({
         let file_write_locks = Arc::clone(&file_write_locks);
         let mcp_shutdown = params.mcp_handle.clone();
@@ -270,6 +283,7 @@ fn spawn_initialized(
                     question_mode: crate::tools::QuestionMode::Headless,
                     model_policy: Arc::clone(&params.model_policy),
                     file_write_locks: Arc::clone(&file_write_locks),
+                    offload: offload.clone(),
                     managed_turn: None,
                 },
                 AgentRunParams {
@@ -284,6 +298,12 @@ fn spawn_initialized(
 
             agent.run(TurnId::generate(), params.input).await;
             drop(agent);
+            // A print run is never restored, so nothing can refer to its
+            // saved output once it ends. Closing first keeps a late subagent
+            // from recreating the directory.
+            if let Some(store) = &offload {
+                close_offload(store);
+            }
 
             if let Some(handle) = mcp_shutdown {
                 handle.shutdown().await;
@@ -325,6 +345,9 @@ pub struct InteractiveParams {
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
+    /// Root for the session's offload store. `None` cuts oversized tool
+    /// output instead of saving it.
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -923,6 +946,7 @@ pub fn spawn_interactive_with_preparation(
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
+    let offload = session_offload(params.state_dir.as_deref(), &session_ref);
 
     let session_ref_clone = session_ref.clone();
     let task = smol::spawn({
@@ -1205,6 +1229,7 @@ pub fn spawn_interactive_with_preparation(
                         question_mode: params.question_mode,
                         model_policy: Arc::clone(&params.model_policy),
                         file_write_locks: Arc::clone(&file_write_locks),
+                        offload: offload.clone(),
                         managed_turn: None,
                     },
                     AgentRunParams {
@@ -1315,6 +1340,7 @@ mod tests {
             project_config: ProjectConfig::for_project(Path::new("/tmp")),
             modes: Arc::default(),
             session_options: Default::default(),
+            state_dir: None,
         }
     }
 
@@ -2078,6 +2104,7 @@ mod tests {
                     plugin_rules: params.plugin_rules,
                     project_config: params.project_config,
                     local_tools: Default::default(),
+                    state_dir: None,
                 },
                 Box::new(|model, _| {
                     Box::pin(

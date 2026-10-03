@@ -795,6 +795,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         project_config,
         local_tools: Default::default(),
+        state_dir: Some(storage.path().to_path_buf()),
     });
     let definitions = maki_agent::session_coordinator::builtin_option_definitions(
         startup_model.spec(),

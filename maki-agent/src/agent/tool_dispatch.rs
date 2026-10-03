@@ -11,6 +11,7 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
+use crate::tools::offload::{DEFAULT_LABEL, LimitOpts, OutputLimits, PreviewShape, limit_output};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
     CallOrigin, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext, TurnToolRoute,
@@ -931,7 +932,20 @@ async fn execute_mcp_tool(
     };
     mcp.mark_loaded(&tool, origin);
     match mcp.call_bound_tool(binding, input).await {
-        Ok(text) => done(text, false),
+        Ok(text) => match ctx.offload.clone() {
+            Some(store) => {
+                let opts = LimitOpts {
+                    trailer: None,
+                    shape: PreviewShape::Head,
+                    label: DEFAULT_LABEL,
+                    lines_clipped: false,
+                    limits: OutputLimits::from_config(&ctx.config),
+                };
+                let limited = smol::unblock(move || limit_output(&text, &opts, Some(&store))).await;
+                done(limited, false)
+            }
+            None => done(text, false),
+        },
         Err(e) => done(e.to_string(), true),
     }
 }
@@ -1028,10 +1042,11 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::cancel::CancelToken;
-    use crate::mcp::test_support::stub_session;
+    use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
     use crate::template::Vars;
+    use crate::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadStore};
     use crate::tools::registry::{ToolRegistry, ToolSource};
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
@@ -2024,6 +2039,61 @@ mod tests {
                 vec![TOOL_SEARCH_TOOL_NAME],
                 "a nested call must not change the next request"
             );
+        });
+    }
+
+    const MCP_RESULT_LINES: usize = 100;
+    const SMALL_OUTPUT_LINES: usize = 10;
+
+    fn many_lines() -> String {
+        (1..=MCP_RESULT_LINES)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn answering_ctx(text: &str) -> ToolContext {
+        let mcp = stub_session_with_result(&[(PROBE_QUALIFIED, "")], text);
+        let mut ctx = mcp_ctx(&mcp);
+        ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
+        ctx
+    }
+
+    #[test]
+    fn stubbed_tool_call_returns_text() {
+        smol::block_on(async {
+            let done = dispatch(&answering_ctx("hello"), PROBE_WIRE, &serde_json::json!({})).await;
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert_eq!(done.output.as_text(), "hello");
+        });
+    }
+
+    #[test]
+    fn mcp_result_without_store_is_unchanged() {
+        smol::block_on(async {
+            let text = many_lines();
+            let done = dispatch(&answering_ctx(&text), PROBE_WIRE, &serde_json::json!({})).await;
+            assert_eq!(done.output.as_text(), text);
+        });
+    }
+
+    #[test]
+    fn mcp_result_over_limit_is_offloaded() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let text = many_lines();
+            let mut ctx = answering_ctx(&text);
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+
+            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+            let out = done.output.as_text();
+            assert!(out.starts_with("line 1\n"), "{out}");
+            assert!(out.contains(OFFLOAD_FOOTER_PREFIX), "{out}");
+            assert!(out.lines().count() <= SMALL_OUTPUT_LINES, "{out}");
+            let saved: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+            assert_eq!(saved.len(), 1);
+            let saved = std::fs::read_to_string(saved[0].as_ref().unwrap().path()).unwrap();
+            assert_eq!(saved, text);
         });
     }
 

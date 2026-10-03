@@ -308,6 +308,7 @@ pub fn run(
     }
 
     let terminal_result_emitted = std::cell::Cell::new(false);
+    let state_dir = maki_storage::paths::state_dir().ok();
     let runner = |input: AgentInput| {
         let handle = maki_agent::headless::spawn(HeadlessParams {
             model: model.clone(),
@@ -326,6 +327,7 @@ pub fn run(
             project_config,
             modes: Arc::clone(&modes),
             session_options: session_options.clone(),
+            state_dir: state_dir.clone(),
         })
         .map_err(|error| eyre!("register print session coordinator: {error}"))?;
 
@@ -658,6 +660,47 @@ mod tests {
         }
     }
 
+    /// The provider's report is a rendezvous, so the run can't reach its
+    /// cleanup before the saved output below exists.
+    #[test]
+    fn print_run_removes_offload_dir() {
+        let state = tempfile::tempdir().unwrap();
+        let cwd = std::env::temp_dir();
+        let (requests, received) = flume::bounded(0);
+        let handle = maki_agent::headless::spawn_with_provider(
+            HeadlessParams {
+                model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+                config: AgentConfig::default(),
+                permissions_config: PermissionsConfig::default(),
+                timeouts: Default::default(),
+                input: input("print request"),
+                prompt_slots: Default::default(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: cwd.clone(),
+                system_prompt_override: None,
+                append_system_prompt: None,
+                model_policy: Arc::default(),
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(&cwd),
+                modes: Arc::default(),
+                session_options: Default::default(),
+                state_dir: Some(state.path().to_path_buf()),
+            },
+            Arc::new(RecordingPrintProvider(requests)),
+        )
+        .unwrap();
+        let dir =
+            maki_agent::tools::offload::offload_dir_for(state.path(), Some(&handle.session_id))
+                .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("saved.txt"), "output").unwrap();
+
+        received.recv().unwrap();
+        smol::block_on(handle.task);
+        assert!(!dir.exists(), "print mode must remove its offload dir");
+    }
+
     #[test]
     fn print_turn_uses_initialized_config() {
         const SPEC: &str = "anthropic/claude-opus-4-8";
@@ -687,6 +730,7 @@ mod tests {
                     project_config: ProjectConfig::for_project(&cwd),
                     modes: Arc::default(),
                     session_options: Default::default(),
+                    state_dir: None,
                 },
                 Arc::new(RecordingPrintProvider(requests)),
             )?;

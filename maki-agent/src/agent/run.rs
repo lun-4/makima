@@ -171,6 +171,9 @@ pub struct AgentParams {
     /// Same-process per-path mutation locks, cloned from the parent context
     /// for subagents so concurrent same-path mutations stay serialized.
     pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
+    /// One store per session, cloned into subagents so they share its lock
+    /// and quota.
+    pub offload: Option<Arc<crate::tools::offload::OffloadStore>>,
     pub managed_turn: Option<crate::CurrentManagedTurn>,
 }
 
@@ -223,6 +226,7 @@ pub struct Agent<'h> {
     turn_bindings: Arc<TurnToolBindings>,
     model_policy: Arc<ModelPolicy>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
+    offload: Option<Arc<crate::tools::offload::OffloadStore>>,
     managed_turn: Option<crate::CurrentManagedTurn>,
     admission: Option<TurnAdmissionSnapshot>,
 }
@@ -271,6 +275,7 @@ impl<'h> Agent<'h> {
             turn_bindings: Arc::new(TurnToolBindings::default()),
             model_policy: params.model_policy,
             file_write_locks: params.file_write_locks,
+            offload: params.offload,
             managed_turn: params.managed_turn,
             admission: None,
         }
@@ -745,6 +750,7 @@ impl<'h> Agent<'h> {
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             file_write_locks: Arc::clone(&self.file_write_locks),
+            offload: self.offload.clone(),
             write_lock_chain: Arc::new(Vec::new()),
             managed_turn: self.managed_turn.clone(),
         }
@@ -1108,6 +1114,20 @@ mod tests {
     }
 
     #[test]
+    fn tool_context_carries_offload_store() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let store = Arc::new(crate::tools::offload::OffloadStore::on_disk(PathBuf::from(
+            "/unused",
+        )));
+        agent.offload = Some(Arc::clone(&store));
+        assert!(Arc::ptr_eq(
+            agent.tool_context().offload.as_ref().unwrap(),
+            &store
+        ));
+    }
+
+    #[test]
     fn run_uses_input_options_without_settings_snapshot() {
         let mut history = History::new(Vec::new());
         let (mut agent, _rx) = make_agent(
@@ -1159,6 +1179,7 @@ mod tests {
                 question_mode: crate::tools::QuestionMode::Tui,
                 model_policy: Arc::new(ModelPolicy::default()),
                 file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
+                offload: None,
                 managed_turn: None,
             },
             AgentRunParams {

@@ -667,6 +667,7 @@ fn spawn_session(params: &AcpParams, session: SpawnSession) -> InteractiveHandle
         plugin_rules: Arc::clone(&params.plugin_rules),
         project_config,
         local_tools: Default::default(),
+        state_dir: Some(params.storage.path().to_path_buf()),
     })
 }
 
@@ -2577,6 +2578,7 @@ mod tests {
             plugin_rules: Arc::default(),
             project_config: ProjectConfig::for_project(Path::new("/project")),
             local_tools: Default::default(),
+            state_dir: None,
         });
         let handle = InteractiveHandle {
             model: Default::default(),
@@ -5036,6 +5038,7 @@ mod tests {
                     plugin_rules: Arc::default(),
                     project_config: ProjectConfig::for_project(Path::new("/tmp")),
                     local_tools: Default::default(),
+                    state_dir: None,
                 },
                 Box::new(move |model, _| {
                     Box::pin(async move {
