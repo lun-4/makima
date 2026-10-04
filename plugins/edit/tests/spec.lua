@@ -493,4 +493,31 @@ case("match_ending_at_line_end_has_no_note", function()
   eq(short_line, nil)
 end)
 
+case("many_short_line_matches_have_no_note", function()
+  local content = string.rep("xb\n", 1000)
+  local result, err, note = fr.replace(content, "x", "y", true, CAP)
+  eq(err, nil)
+  eq(result, string.rep("yb\n", 1000))
+  eq(note, nil)
+end)
+
+case("multiple_matches_on_one_long_line_report_first_note", function()
+  local content = string.rep("x", 100) .. LONG
+  local result, err, note = fr.replace(content, "x", "y", true, CAP)
+  eq(err, nil)
+  eq(result, string.rep("y", 100) .. LONG)
+  eq(note.line, 1)
+  eq(note.rest, #content - 1)
+end)
+
+case("short_line_matches_before_long_line_report_correct_note", function()
+  local short_lines = string.rep("xb\n", 1000)
+  local content = short_lines .. LONG .. "x" .. LONG
+  local result, err, note = fr.replace(content, "x", "y", true, CAP)
+  eq(err, nil)
+  eq(result, string.rep("yb\n", 1000) .. LONG .. "y" .. LONG)
+  eq(note.line, 1001)
+  eq(note.rest, #LONG)
+end)
+
 th.report()

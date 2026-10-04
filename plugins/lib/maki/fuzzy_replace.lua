@@ -9,6 +9,7 @@ local MULTI_CANDIDATE_THRESHOLD = 0.3
 local CONTEXT_AWARE_LINE_MIN = 3
 local CONTEXT_AWARE_MATCH_RATIO = 0.5
 local INDENT_PATTERN = "^[ \t]*"
+local NEWLINE_BYTE = string.byte("\n")
 
 local function split_lines(s)
   local lines = {}
@@ -651,16 +652,24 @@ end
 -- match in {at}. The model may have pasted a visible prefix meaning the
 -- whole line, and would otherwise not learn that the rest survived.
 local function mid_line_end(content, at, len, max_line_bytes)
+  local line_start = 1
+  local line_number = 1
+  local newline = content:find("\n", line_start, true)
+  local line_end = newline and newline - 1 or #content
+
   for _, start in ipairs(at) do
     local last = start + len - 1
-    local next_byte = content:sub(last + 1, last + 1)
-    if content:sub(last, last) ~= "\n" and next_byte ~= "" and next_byte ~= "\n" then
-      local line_end = (content:find("\n", last + 1, true) or #content + 1) - 1
-      local before = content:sub(1, last)
-      local line_start = (before:match(".*\n()") or 1)
+    while newline and last > newline do
+      line_start = newline + 1
+      line_number = line_number + 1
+      newline = content:find("\n", line_start, true)
+      line_end = newline and newline - 1 or #content
+    end
+
+    local next_byte = content:byte(last + 1)
+    if content:byte(last) ~= NEWLINE_BYTE and next_byte and next_byte ~= NEWLINE_BYTE then
       if line_end - line_start + 1 > max_line_bytes then
-        local _, newlines = before:gsub("\n", "")
-        return { line = newlines + 1, rest = line_end - last }
+        return { line = line_number, rest = line_end - last }
       end
     end
   end
