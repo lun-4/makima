@@ -7059,7 +7059,8 @@ fn read_byte_cut_reports_remaining_lines() {
 
 const SEQ_LINES: usize = 5000;
 const BIG_BASH_CMD: &str = "seq 1 5000";
-const BIG_BASH_THEN_WAIT_CMD: &str = "seq 1 5000 && printf '%s%s\\n' X Y && sleep 30";
+#[cfg(unix)]
+const BASH_CANCEL_OUTPUT_BYTES: usize = 60 * 1024;
 
 fn disk_store(dir: &Path) -> Arc<OffloadStore> {
     Arc::new(OffloadStore::on_disk(dir.to_path_buf()))
@@ -7311,6 +7312,7 @@ fn write_new_file_with_preview_cut_marker_is_rejected() {
 
 /// Esc on a run whose output already passed the limits: the full output is
 /// saved, and the partial marker still comes last.
+#[cfg(unix)]
 #[test]
 fn cancelled_bash_large_output_keeps_partial_marker_last() {
     let (tx, events) = flume::unbounded();
@@ -7319,7 +7321,7 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
     let (result_tx, result_rx) = flume::bounded(1);
     let dir = tempfile::tempdir().unwrap();
     let store = disk_store(dir.path());
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let (reg, host) = builtins_host();
         let session = test_session(&host);
         let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
@@ -7331,11 +7333,17 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
         ctx.cancel = token;
         ctx.config.rtk = false;
         ctx.offload = Some(store);
-        let input = json!({ "command": BIG_BASH_THEN_WAIT_CMD });
+        let command = format!(
+            "printf '%*s\\n' {BASH_CANCEL_OUTPUT_BYTES} '' | tr ' ' q; printf '%s%s\\n' X Y; kill -STOP $$"
+        );
         result_tx
-            .send(exec_with_ctx(&reg, "bash", input, &ctx))
-            .ok();
-        drop(host);
+            .send(exec_with_ctx(
+                &reg,
+                "bash",
+                json!({ "command": command }),
+                &ctx,
+            ))
+            .unwrap();
     });
 
     let buf = poll_until("bash must publish its live buf", || {
@@ -7351,8 +7359,16 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("cancelled bash must settle")
         .expect_err("a partial reply is an error reply");
+    worker.join().unwrap();
     assert!(err.contains(OFFLOAD_FOOTER_PREFIX), "{err}");
     assert!(err.ends_with(BASH_PARTIAL_MARKER), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(offloaded_path(&err)).unwrap(),
+        format!(
+            "{}\n{BASH_PARTIAL_PROBE}",
+            "q".repeat(BASH_CANCEL_OUTPUT_BYTES)
+        )
+    );
 }
 
 /// The store is the host's choice: with an in-memory backend the offloaded
