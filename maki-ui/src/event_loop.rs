@@ -35,6 +35,7 @@ use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
     WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
 };
+use maki_agent::tools::offload::{OffloadStore, offload_dir_for};
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
     McpSnapshotReader, RunSettings, mcp,
@@ -1532,15 +1533,23 @@ impl SpawnCtx {
         mut session: AppSession,
         current_id: MakiId,
         permissions: &PermissionManager,
+        current_offload: Option<&Arc<OffloadStore>>,
     ) -> Result<PreparedSessionRuntime, String> {
         session.meta.yolo = permissions.persisted_yolo();
         let provider = self.prepare_replacement_provider(&session)?;
         let seed_snapshot = session.id != current_id;
-        self.prepare_runtime_with_provider_and_permissions(
+        let offload = if seed_snapshot {
+            None
+        } else {
+            current_offload.cloned()
+        };
+        self.prepare_runtime_with_config(
             session,
             provider,
             permissions,
             seed_snapshot,
+            None,
+            offload,
         )
         .map_err(|error| error.to_string())
     }
@@ -1587,7 +1596,7 @@ impl SpawnCtx {
         permissions: &PermissionManager,
         seed_snapshot: bool,
     ) -> Result<PreparedSessionRuntime> {
-        self.prepare_runtime_with_config(session, provider, permissions, seed_snapshot, None)
+        self.prepare_runtime_with_config(session, provider, permissions, seed_snapshot, None, None)
     }
 
     fn prepare_runtime_with_config(
@@ -1597,9 +1606,14 @@ impl SpawnCtx {
         permissions: &PermissionManager,
         seed_snapshot: bool,
         effective_config: Option<maki_agent::EffectiveAgentConfig>,
+        offload: Option<Arc<OffloadStore>>,
     ) -> Result<PreparedSessionRuntime> {
         let resumed = session_has_content(&session);
         let session_id = session.id;
+        let offload = offload.or_else(|| {
+            offload_dir_for(self.storage.path(), Some(&SessionRef::from(session_id)))
+                .map(|dir| Arc::new(OffloadStore::on_disk(dir)))
+        });
         let history = session.messages().to_vec();
         let cwd = PathBuf::from(&session.cwd);
         let (model, runtime_provider): (Model, Arc<dyn Provider>) = match provider.as_ref() {
@@ -1672,6 +1686,7 @@ impl SpawnCtx {
             &permissions,
             cwd,
             Some(SessionRef::from(session_id)),
+            offload,
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
@@ -3628,6 +3643,7 @@ impl<'t> EventLoop<'t> {
             session,
             self.sessions[idx].id(),
             self.sessions[idx].app.permissions.as_ref(),
+            self.sessions[idx].handles.offload.as_ref(),
         )?;
         self.replace_prepared_runtime(idx, prepared)
     }
@@ -3714,6 +3730,7 @@ impl<'t> EventLoop<'t> {
             session,
             self.sessions[idx].id(),
             self.sessions[idx].app.permissions.as_ref(),
+            self.sessions[idx].handles.offload.as_ref(),
         )?;
         Ok(PendingReplacement { prepared, kind })
     }
@@ -4907,10 +4924,12 @@ mod tests {
     }
     use crate::selection::SelectionZone;
     use crossterm::event::KeyModifiers;
+    use maki_agent::tools::offload::{MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError};
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
     use maki_providers::TokenUsage;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -6349,6 +6368,175 @@ mod tests {
         shutdown_manager(&manager);
     }
 
+    #[test_case::test_case(true; "same_session")]
+    #[test_case::test_case(false; "different_session")]
+    fn replacement_offload_store_identity(same_session: bool) {
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let mut runtime = harness.runtime(session.clone());
+        let original = Arc::clone(runtime.handles.offload.as_ref().unwrap());
+        let mut replacement = if same_session {
+            session
+        } else {
+            harness.session()
+        };
+        replacement.model = runtime.app.state.model.spec();
+        let target_id = replacement.id;
+        let prepared = harness
+            .ctx()
+            .prepare_replacement_runtime(
+                replacement,
+                runtime.id(),
+                runtime.app.permissions.as_ref(),
+                runtime.handles.offload.as_ref(),
+            )
+            .unwrap();
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+        let replacement = runtime.handles.offload.as_ref().unwrap();
+        assert_eq!(Arc::ptr_eq(&original, replacement), same_session);
+        assert_eq!(
+            replacement.dir(),
+            maki_storage::sessions::offload_dir(&harness.ctx().sessions_dir, target_id)
+        );
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn offload_uses_supplied_storage_root_and_session_deletion() {
+        const BODY: &str = "saved in the supplied state directory";
+        let mut harness = RuntimeHarness::new();
+        let session = harness.session();
+        let id = session.id;
+        let runtime = harness.runtime(session);
+        let store = Arc::clone(runtime.handles.offload.as_ref().unwrap());
+        let expected = maki_storage::sessions::offload_dir(&harness.ctx().sessions_dir, id);
+        assert_eq!(store.dir(), expected);
+        let saved = store.put(BODY).unwrap();
+        let artifact = store.path_of(&saved);
+        assert_eq!(artifact.parent(), Some(expected.as_path()));
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), BODY);
+        release_runtime(runtime);
+        let storage = harness.shutdown_writer();
+        AppSession::load(id, &storage).unwrap();
+        AppSession::delete(id, &storage).unwrap();
+        assert!(!artifact.exists());
+        assert!(!expected.exists());
+    }
+
+    struct GatedQuotaBackend {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        created: Arc<AtomicBool>,
+    }
+
+    impl OffloadBackend for GatedQuotaBackend {
+        fn read(&self, _name: &str) -> io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn create_new(&self, _name: &str, _bytes: &[u8]) -> io::Result<bool> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            self.created.store(true, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        fn names(&self) -> io::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn total_bytes(&self) -> io::Result<u64> {
+            Ok(MAX_OFFLOAD_SESSION_BYTES - u64::from(!self.created.load(Ordering::SeqCst)))
+        }
+
+        fn remove_all(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            PathBuf::from(name)
+        }
+    }
+
+    #[test]
+    fn same_id_replacement_serializes_in_flight_offload_put() {
+        const OUTGOING: &str = "a";
+        const INCOMING: &str = "b";
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        let (entered_tx, entered_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        let created = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(OffloadStore::new(Box::new(GatedQuotaBackend {
+            entered: entered_tx,
+            release: release_rx,
+            created: Arc::clone(&created),
+        })));
+        let prepared = harness
+            .ctx()
+            .prepare_runtime_with_config(
+                session.clone(),
+                None,
+                &harness.ctx().permissions,
+                true,
+                None,
+                Some(Arc::clone(&store)),
+            )
+            .unwrap();
+        let lock = claim_lock(&harness.ctx().sessions_dir, &session.id).unwrap();
+        prepared.seed_storage();
+        let mut runtime = prepared
+            .activate(
+                &harness.ctx().model_slot,
+                Some(SessionLockState::Held(lock)),
+            )
+            .unwrap();
+        runtime.activate_deferred();
+        session.model = runtime.app.state.model.spec();
+        let outgoing = std::thread::spawn({
+            let store = Arc::clone(runtime.handles.offload.as_ref().unwrap());
+            move || store.put(OUTGOING)
+        });
+        entered_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+        let replacement = harness
+            .ctx()
+            .prepare_replacement_runtime(
+                session,
+                runtime.id(),
+                runtime.app.permissions.as_ref(),
+                runtime.handles.offload.as_ref(),
+            )
+            .unwrap();
+        let old = replace_session_runtime(
+            &mut runtime,
+            replacement,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &store,
+            runtime.handles.offload.as_ref().unwrap()
+        ));
+        let incoming = std::thread::spawn({
+            let store = Arc::clone(runtime.handles.offload.as_ref().unwrap());
+            move || store.put(INCOMING)
+        });
+        release_tx.send(()).unwrap();
+        outgoing.join().unwrap().unwrap();
+        assert!(matches!(incoming.join().unwrap(), Err(OffloadError::Quota)));
+        assert!(created.load(Ordering::SeqCst));
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
     #[test]
     fn failed_runtime_claim_cannot_rewrite_session() {
         const OWNER_CONTENT: &str = "written by lock owner";
@@ -6966,6 +7154,7 @@ mod tests {
                     session,
                     runtime.id(),
                     runtime.app.permissions.as_ref(),
+                    runtime.handles.offload.as_ref(),
                 )
                 .is_err()
         );
@@ -7153,6 +7342,7 @@ mod tests {
                 replacement,
                 runtime.id(),
                 runtime.app.permissions.as_ref(),
+                runtime.handles.offload.as_ref(),
             )
             .unwrap();
 
@@ -7350,7 +7540,12 @@ mod tests {
         session.model = runtime.app.state.model.spec();
         let prepared = harness
             .ctx()
-            .prepare_replacement_runtime(session, runtime.id(), runtime.app.permissions.as_ref())
+            .prepare_replacement_runtime(
+                session,
+                runtime.id(),
+                runtime.app.permissions.as_ref(),
+                runtime.handles.offload.as_ref(),
+            )
             .unwrap();
         assert_eq!(
             serde_json::to_value(

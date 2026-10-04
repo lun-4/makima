@@ -368,6 +368,7 @@ impl EventLoop<'_> {
                     &self.sessions[idx].app.permissions,
                     true,
                     Some((*config).clone()),
+                    None,
                 )
                 .map_err(|error| error.to_string())?;
             let (manager, root) = candidate.handles.manager_and_root();

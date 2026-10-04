@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
 use maki_agent::permissions::PermissionManager;
-use maki_agent::tools::offload::{OffloadStore, offload_dir_for};
+use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
     McpCommand, McpConfigErrors, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages,
@@ -315,6 +315,7 @@ pub(crate) struct AgentHandles {
     system_prompt: SystemPromptOverride,
     mailbox: Option<SessionMailbox>,
     cwd: Arc<ArcSwap<PathBuf>>,
+    pub(crate) offload: Option<Arc<OffloadStore>>,
     subagent_cancels: Arc<CancelMap<String>>,
     manager: AgentManagerHandle,
     root_id: maki_agent::AgentId,
@@ -368,6 +369,7 @@ impl AgentHandles {
             permissions,
             initial_cwd,
             session_id,
+            None,
             timeouts,
             lua_handle,
             mcp_handle,
@@ -390,6 +392,7 @@ impl AgentHandles {
         permissions: &Arc<PermissionManager>,
         initial_cwd: PathBuf,
         session_id: Option<SessionRef>,
+        offload: Option<Arc<OffloadStore>>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
@@ -410,6 +413,7 @@ impl AgentHandles {
             mcp_handle,
             mcp_config_errors,
             session_id,
+            offload,
             timeouts,
             lua_handle,
             model_policy,
@@ -513,6 +517,7 @@ impl AgentHandles {
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
             Some(SessionRef::from(app.state.session.id)),
+            self.offload.clone(),
             self.timeouts,
             lua_handle,
             Arc::clone(&self.model_policy),
@@ -583,6 +588,7 @@ fn spawn_agent_internal(
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     session_id: Option<SessionRef>,
+    offload: Option<Arc<OffloadStore>>,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
@@ -612,12 +618,6 @@ fn spawn_agent_internal(
             .map(PreparedSessionMailbox::mailbox)
     });
 
-    // One store per session, built here rather than per turn so every agent
-    // in the session shares its lock and quota.
-    let offload = maki_storage::paths::state_dir().ok().and_then(|state_dir| {
-        offload_dir_for(&state_dir, session_id.as_ref())
-            .map(|dir| Arc::new(OffloadStore::on_disk(dir)))
-    });
     let (init_trigger, init_cancel) = maki_agent::CancelToken::new();
 
     let (drain_tx, drain_rx) = flume::unbounded::<u64>();
@@ -670,7 +670,7 @@ fn spawn_agent_internal(
                     Arc::clone(&model_policy),
                     system_prompt.clone(),
                     Arc::new(maki_agent::tools::FileWriteLocks::new()),
-                    offload,
+                    offload.clone(),
                     init_cancel,
                     drain_tx,
                     Arc::clone(&run_id),
@@ -726,6 +726,7 @@ fn spawn_agent_internal(
             system_prompt,
             mailbox,
             cwd,
+            offload,
             subagent_cancels,
             manager,
             root_id,
