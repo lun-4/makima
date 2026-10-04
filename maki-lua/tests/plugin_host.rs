@@ -12,9 +12,10 @@ use maki_agent::tools::offload::{
     LINE_CUT_PREFIX, OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore,
 };
 use maki_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
-    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
-    ToolSource, TurnToolBindings, format_line_truncated_marker, timeout_annotation,
+    DescriptionContext, ExecFuture, FILE_TRUNCATED_MARKER, HeaderFuture, HeaderResult, ParseError,
+    QuestionMode, Tool, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
+    ToolLive, ToolRegistry, ToolSource, TurnToolBindings, format_line_truncated_marker,
+    timeout_annotation,
 };
 use maki_agent::{AgentMode, SharedBuf, ToolOutput};
 use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
@@ -48,6 +49,12 @@ const PICKER_CLOSE_TIMEOUT: &str = "sessions picker did not close";
 const SHADOWED_TOOL: &str = "skill";
 const REPLACEMENT_PLUGIN: &str = "my_skill";
 const REPLACEMENT_DESC: &str = "took the builtin name over";
+const ZERO_LINES_OPTION: &str = "max_output_lines";
+const ZERO_BYTES_OPTION: &str = "max_output_bytes";
+const ZERO_GLOB_FILE: &str = "zero-limit.txt";
+const ZERO_BASH_COMMAND: &str = "printf '%s%s\\n' X Y";
+const ZERO_BASH_TIMEOUT_SECS: u64 = 10;
+const BASH_FAILURE_EXIT_LINE: &str = "Exit code: 3";
 
 struct FakeCommandHost;
 
@@ -121,6 +128,17 @@ fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost)
 
 fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
     builtins_host_with(&PluginsConfig::from_plugins(HashMap::new()))
+}
+
+fn builtins_host_with_zero_output_limit(
+    plugin: &str,
+    option: &str,
+) -> (Arc<ToolRegistry>, PluginHost) {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config
+        .opts
+        .insert(plugin.to_owned(), json_obj(json!({ (option): 0 })));
+    builtins_host_with(&config)
 }
 
 /// A tool can be registered and still stay invisible to the model, so this
@@ -7081,6 +7099,147 @@ fn offloaded_path(output: &str) -> PathBuf {
         .or_else(|| notice.split_once(", at "))
         .unwrap();
     PathBuf::from(rest.split_once(';').unwrap().0.trim_end_matches(','))
+}
+
+fn assert_metadata_only(output: &str, with_store: bool) {
+    assert_eq!(output.lines().count(), 1, "{output}");
+    if with_store {
+        assert!(output.starts_with(OFFLOAD_FOOTER_PREFIX), "{output}");
+    } else {
+        assert_eq!(output, FILE_TRUNCATED_MARKER);
+    }
+}
+
+#[test_case::test_case(ZERO_LINES_OPTION, false; "zero_lines_without_store")]
+#[test_case::test_case(ZERO_BYTES_OPTION, false; "zero_bytes_without_store")]
+#[test_case::test_case(ZERO_LINES_OPTION, true; "zero_lines_with_store")]
+#[test_case::test_case(ZERO_BYTES_OPTION, true; "zero_bytes_with_store")]
+fn glob_zero_output_override_returns_metadata_only(option: &str, with_store: bool) {
+    let (reg, host) = builtins_host_with_zero_output_limit("glob", option);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(ZERO_GLOB_FILE), "").unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(store_dir.path()));
+    if !with_store {
+        ctx.offload = None;
+    }
+    let output = exec_with_ctx(
+        &reg,
+        "glob",
+        json!({ "pattern": "*.txt", "path": dir.path() }),
+        &ctx,
+    )
+    .unwrap();
+    assert_metadata_only(&output, with_store);
+    if with_store {
+        let saved = std::fs::read_to_string(offloaded_path(&output)).unwrap();
+        assert!(saved.contains(ZERO_GLOB_FILE), "{saved}");
+    }
+}
+
+#[test_case::test_case(ZERO_LINES_OPTION, false; "zero_lines_without_store")]
+#[test_case::test_case(ZERO_BYTES_OPTION, false; "zero_bytes_without_store")]
+#[test_case::test_case(ZERO_LINES_OPTION, true; "zero_lines_with_store")]
+#[test_case::test_case(ZERO_BYTES_OPTION, true; "zero_bytes_with_store")]
+fn bash_zero_output_override_finishes_on_exit(option: &str, with_store: bool) {
+    let (reg, host) = builtins_host_with_zero_output_limit("bash", option);
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    if !with_store {
+        ctx.offload = None;
+    }
+    for exit_code in [0, 3] {
+        let result = exec_with_ctx(
+            &reg,
+            "bash",
+            json!({
+                "command": format!("{ZERO_BASH_COMMAND}; exit {exit_code}"),
+                "timeout": ZERO_BASH_TIMEOUT_SECS,
+            }),
+            &ctx,
+        );
+        let output = if exit_code == 0 {
+            result.unwrap()
+        } else {
+            result.unwrap_err()
+        };
+        let metadata = if exit_code == 0 {
+            output.as_str()
+        } else {
+            output
+                .strip_suffix(&format!("\n{BASH_FAILURE_EXIT_LINE}"))
+                .unwrap_or_else(|| panic!("{output}"))
+        };
+        if with_store && exit_code != 0 {
+            assert_eq!(metadata.lines().count(), 1, "{metadata}");
+            assert!(metadata.starts_with(OFFLOAD_POINTER_PREFIX), "{metadata}");
+        } else {
+            assert_metadata_only(metadata, with_store);
+        }
+        if with_store {
+            assert_eq!(
+                std::fs::read_to_string(offloaded_path(&output)).unwrap(),
+                BASH_PARTIAL_PROBE
+            );
+        }
+    }
+}
+
+#[test_case::test_case(ZERO_LINES_OPTION, false; "zero_lines_without_store")]
+#[test_case::test_case(ZERO_BYTES_OPTION, false; "zero_bytes_without_store")]
+#[test_case::test_case(ZERO_LINES_OPTION, true; "zero_lines_with_store")]
+#[test_case::test_case(ZERO_BYTES_OPTION, true; "zero_bytes_with_store")]
+fn bash_zero_output_override_finishes_on_cancel(option: &str, with_store: bool) {
+    let (tx, events) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    let (result_tx, result_rx) = flume::bounded(1);
+    let dir = tempfile::tempdir().unwrap();
+    let store = with_store.then(|| disk_store(dir.path()));
+    let option = option.to_owned();
+    let worker = std::thread::spawn(move || {
+        let (reg, host) = builtins_host_with_zero_output_limit("bash", &option);
+        let session = test_session(&host);
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
+            &AgentMode::Build,
+            Some(&event_tx),
+            Some(BASH_CANCEL_ID),
+            session.read().session_id(),
+        );
+        ctx.cancel = token;
+        ctx.config.rtk = false;
+        ctx.offload = store;
+        result_tx
+            .send(exec_with_ctx(
+                &reg,
+                "bash",
+                json!({ "command": BASH_PARTIAL_CMD }),
+                &ctx,
+            ))
+            .unwrap();
+    });
+    let buf = poll_until("bash must publish its live buf", || {
+        recv_live_buf(&events, BASH_CANCEL_ID)
+    });
+    poll_until("bash output never reached the live buf", || {
+        buf.take().text().contains(BASH_PARTIAL_PROBE).then_some(())
+    });
+    trigger.cancel();
+    let output = result_rx
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("cancelled bash must settle")
+        .unwrap_err();
+    worker.join().unwrap();
+    let metadata = output
+        .strip_suffix(&format!("\n{BASH_PARTIAL_MARKER}"))
+        .unwrap_or_else(|| panic!("{output}"));
+    assert_metadata_only(metadata, with_store);
+    if with_store {
+        assert_eq!(
+            std::fs::read_to_string(offloaded_path(&output)).unwrap(),
+            BASH_PARTIAL_PROBE
+        );
+    }
 }
 
 #[test]

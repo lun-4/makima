@@ -373,14 +373,8 @@ impl UserData for LuaCtx {
                         ("max_lines", &mut limits.max_lines),
                         ("max_bytes", &mut limits.max_bytes),
                     ] {
-                        match opts.get::<Option<usize>>(key)? {
-                            Some(0) => {
-                                return Err(mlua::Error::runtime(format!(
-                                    "limit_output: {key} must be at least 1"
-                                )));
-                            }
-                            Some(given) => *limit = given,
-                            None => {}
+                        if let Some(given) = opts.get::<Option<usize>>(key)? {
+                            *limit = given;
                         }
                     }
                 }
@@ -527,13 +521,17 @@ mod tests {
     use std::collections::HashMap;
 
     use maki_agent::AgentMode;
-    use maki_agent::tools::Deadline;
+    use maki_agent::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadStore};
     use maki_agent::tools::test_support::stub_ctx_with;
+    use maki_agent::tools::{Deadline, FILE_TRUNCATED_MARKER};
     use maki_agent::tools::{LocalTool, ToolAudience};
 
     use super::*;
 
     const TOOL_USE_ID: &str = "tu-1";
+    const LIMIT_LINES_KEY: &str = "max_lines";
+    const LIMIT_BYTES_KEY: &str = "max_bytes";
+    const LIMIT_TRAILER: &str = "Exit code: 3";
     const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";
     const LOCAL_TOOL_NAME: &str = "sess_tool";
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
@@ -683,6 +681,37 @@ mod tests {
             "{limited}"
         );
         assert!(limited.lines().count() <= LIMITED_LINES, "{limited}");
+    }
+
+    #[test_case::test_case(LIMIT_LINES_KEY, false; "zero_lines_without_store")]
+    #[test_case::test_case(LIMIT_BYTES_KEY, false; "zero_bytes_without_store")]
+    #[test_case::test_case(LIMIT_LINES_KEY, true; "zero_lines_with_store")]
+    #[test_case::test_case(LIMIT_BYTES_KEY, true; "zero_bytes_with_store")]
+    fn limit_output_zero_keeps_metadata_and_success_pair(key: &str, with_store: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = populated_ctx();
+        if with_store {
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+        }
+        let lua = mlua::Lua::new();
+        lua.globals().set("ctx", LuaCtx::handler(&ctx)).unwrap();
+        lua.globals().set("body", many_lines()).unwrap();
+        lua.globals().set("limit", key).unwrap();
+        lua.globals().set("trailer", LIMIT_TRAILER).unwrap();
+        let (limited, err): (Option<String>, Option<String>) = lua
+            .load("return ctx:limit_output(body, { [limit] = 0, trailer = trailer })")
+            .eval()
+            .unwrap();
+        assert_eq!(err, None);
+        let limited = limited.unwrap();
+        assert_eq!(limited.lines().count(), 2, "{limited}");
+        assert!(limited.ends_with(LIMIT_TRAILER), "{limited}");
+        if with_store {
+            assert!(limited.starts_with(OFFLOAD_FOOTER_PREFIX), "{limited}");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        } else {
+            assert_eq!(limited, format!("{FILE_TRUNCATED_MARKER}\n{LIMIT_TRAILER}"));
+        }
     }
 
     #[test]
