@@ -13,7 +13,9 @@ use maki_agent::session_coordinator::{
     DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
     SessionCoordinatorParams, builtin_option_definitions,
 };
-use maki_agent::tools::offload::{OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore};
+use maki_agent::tools::offload::{
+    LINE_CUT_PREFIX, OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore,
+};
 use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry};
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
@@ -42,6 +44,12 @@ const EXPAND_HINT: &str = "click to expand";
 const VIEW_CAP: usize = 3;
 const INDEX_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
+const GREP_CUT_HEADER_BYTES: usize = 512;
+const GREP_LONG_PATH_DEPTH: usize = 8;
+const GREP_LONG_PATH_SEGMENT_BYTES: usize = 100;
+const GREP_MATCH_LINE: &str = "fn one() {}\n";
+const GREP_NO_MATCHES: &str = "No files found";
+const GREP_ERROR_OUTPUT: &str = "error: pattern is required";
 
 fn view_lines() -> ToolOutputLines {
     ToolOutputLines {
@@ -555,6 +563,40 @@ fn grep_offload_footer_survives_restore() {
     assert_eq!(restored.spans, live.spans);
 }
 
+#[test]
+fn grep_cut_path_header_live_equals_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut nested = dir.path().to_path_buf();
+    for _ in 0..GREP_LONG_PATH_DEPTH {
+        nested.push("a".repeat(GREP_LONG_PATH_SEGMENT_BYTES));
+    }
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("match.rs"), GREP_MATCH_LINE).unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(OffloadStore::on_disk(store_dir.path().to_path_buf()));
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "pattern": "fn", "path": dir.path() });
+    let byte_limit = GREP_CUT_HEADER_BYTES + store_dir.path().as_os_str().len();
+    let live = exec_live_with(&host, &reg, GREP_TOOL, input.clone(), |ctx| {
+        ctx.offload = Some(store);
+        ctx.config.max_output_bytes = byte_limit;
+    });
+    assert!(live.output.len() <= byte_limit, "{}", live.output);
+    assert_eq!(live.output.lines().count(), 3, "{}", live.output);
+    let header = live.output.lines().next().unwrap();
+    assert!(header.contains(LINE_CUT_PREFIX), "{header}");
+    assert!(!header.ends_with(':'), "{header}");
+    assert!(
+        !live.output.contains(GREP_MATCH_LINE.trim_end()),
+        "{}",
+        live.output
+    );
+    assert_eq!(live.body.lines().count(), 2, "{}", live.body);
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, Vec::new());
+    assert_eq!(restored.spans, live.spans);
+}
+
 /// A repeated identical grep returns only the pointer, which has no entries:
 /// it must still restore as the grep view it rendered live.
 #[test]
@@ -577,16 +619,17 @@ fn grep_identical_pointer_live_equals_restored() {
     assert_eq!(restored.spans, live.spans);
 }
 
-#[test]
-fn grep_no_matches_restore_unchanged() {
-    const NO_MATCHES: &str = "No files found";
+#[test_case::test_case(GREP_NO_MATCHES, false; "no_matches")]
+#[test_case::test_case(GREP_ERROR_OUTPUT, true; "error")]
+fn grep_no_matches_restore_unchanged(output: &str, is_error: bool) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-    let restored = restore(
+    let restored = restore_as(
         &host,
         GREP_TOOL,
         json!({ "pattern": "fn" }),
-        NO_MATCHES,
+        output,
+        is_error,
         None,
         Vec::new(),
     );

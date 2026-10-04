@@ -244,7 +244,12 @@ maki.api.register_tool({
 
   restore = function(_input, output, _is_error, ctx)
     local entries, trailer = parse_llm_output(output)
-    if #entries == 0 and not (trailer[1] and maki.text.is_offload_notice(trailer[1])) then
+    if #entries == 0 then
+      for _, line in ipairs(trailer) do
+        if maki.text.is_offload_notice(line) then
+          return build_grep_view(entries, ctx, trailer)
+        end
+      end
       return nil
     end
     return build_grep_view(entries, ctx, trailer)
