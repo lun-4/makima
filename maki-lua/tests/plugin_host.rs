@@ -1,8 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
