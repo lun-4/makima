@@ -81,7 +81,7 @@ pub async fn authenticate(
     let resource_meta =
         discovery::discover_resource_metadata(&client, server_url, www_auth.as_ref())
             .await
-            .map_err(&wrap)?;
+            .map_err(wrap)?;
 
     let auth_server_url = resource_meta
         .authorization_servers
@@ -91,7 +91,7 @@ pub async fn authenticate(
 
     let auth_server = discovery::discover_auth_server(&client, &auth_server_url)
         .await
-        .map_err(&wrap)?;
+        .map_err(wrap)?;
 
     if !auth_server.code_challenge_methods_supported.is_empty()
         && !auth_server
@@ -134,14 +134,14 @@ pub async fn authenticate(
     } else if let Some(endpoint) = &auth_server.registration_endpoint {
         registration::register_client(&client, endpoint, &redirect_uri)
             .await
-            .map_err(&wrap)?
+            .map_err(wrap)?
     } else {
         return Err(wrap(OAuthError::Other(
             "no stored client and server has no registration endpoint".into(),
         )));
     };
 
-    let pkce = pkce::generate().map_err(&wrap)?;
+    let pkce = pkce::generate().map_err(wrap)?;
 
     let mut state_buf = [0u8; 16];
     getrandom::fill(&mut state_buf)
@@ -162,7 +162,7 @@ pub async fn authenticate(
         scope.as_deref(),
         server_url,
     )
-    .map_err(&wrap)?;
+    .map_err(wrap)?;
 
     info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
     let result = match interaction {
@@ -216,7 +216,7 @@ pub async fn authenticate(
         server_url,
     )
     .await
-    .map_err(&wrap)?;
+    .map_err(wrap)?;
 
     let data = McpAuthData {
         server_url: server_url.to_string(),
