@@ -3191,7 +3191,7 @@ impl LuaRuntime {
             candidate
         }));
         let pending_timers = Arc::new(Mutex::new(
-            TimerStore::candidate(&self.lua, &name).map_err(&map_err)?,
+            TimerStore::candidate(&self.lua, &name).map_err(map_err)?,
         ));
 
         let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
@@ -3224,15 +3224,15 @@ impl LuaRuntime {
             permissions,
             Arc::clone(&opts),
         )
-        .map_err(&map_err)?;
+        .map_err(map_err)?;
 
         if let Some(cs) = config_store {
             let setup_fn = crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(cs))
-                .map_err(&map_err)?;
-            maki.set("setup", setup_fn).map_err(&map_err)?;
+                .map_err(map_err)?;
+            maki.set("setup", setup_fn).map_err(map_err)?;
         }
 
-        let env = self.build_env(maki, require_root).map_err(&map_err)?;
+        let env = self.build_env(maki, require_root).map_err(map_err)?;
 
         self.lua
             .set_app_data(LoadingPlugin(Arc::clone(&name), generation));
