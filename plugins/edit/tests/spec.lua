@@ -454,6 +454,65 @@ case("block_anchor_rejects_duplicate_long_line_collapse", function()
   eq(err, NO_MATCH)
 end)
 
+local LONG_BLANKS = {
+  spaces = string.rep(" ", CAP + 1),
+  tabs = string.rep("\t", CAP + 1),
+  mixed = string.rep(" \t", CAP),
+}
+
+for name, blank in pairs(LONG_BLANKS) do
+  for coverage_name, coverage in pairs({ empty = "", short = " \t", different = blank .. " " }) do
+    case("long_blank_rejects_" .. name .. "_" .. coverage_name, function()
+      local content = "BEGIN\n" .. blank .. "\nEND"
+      local old = " BEGIN\n" .. coverage .. "\n END"
+      eq(fr.replace(content, old, R, false), R)
+      local result, err = fr.replace(content, old, R, false, CAP)
+      eq(result, nil)
+      eq(err, NO_MATCH)
+    end)
+  end
+
+  case("long_blank_duplicates_need_each_copy_" .. name, function()
+    local content = "BEGIN\n" .. blank .. "\n" .. blank .. "\nEND"
+    local result, err = fr.replace(content, " BEGIN\n" .. blank .. "\n END", R, false, CAP)
+    eq(result, nil)
+    eq(err, NO_MATCH)
+    eq(fr.replace(content, " BEGIN\n" .. blank .. "\n" .. blank .. "\n END", R, false, CAP), R)
+  end)
+
+  case("long_blank_full_fuzzy_coverage_" .. name, function()
+    eq(fr.replace("BEGIN\n" .. blank .. "\nEND", " BEGIN\n" .. blank .. "\n END", R, false, CAP), R)
+  end)
+
+  case("long_blank_exact_substring_" .. name, function()
+    local prefix = blank:sub(1, CAP / 2)
+    eq(fr.replace("BEGIN\n" .. blank, "BEGIN\n" .. prefix, R, false, CAP), R .. blank:sub(#prefix + 1))
+  end)
+end
+
+case("long_blank_counts_separate_byte_sequences", function()
+  local spaces, tabs = LONG_BLANKS.spaces, LONG_BLANKS.tabs
+  local content = "BEGIN\n" .. spaces .. "\n" .. tabs .. "\nEND"
+  local result, err = fr.replace(content, " BEGIN\n" .. spaces .. "\n" .. spaces .. "\n END", R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+  eq(fr.replace(content, " BEGIN\n" .. tabs .. "\n" .. spaces .. "\n END", R, false, CAP), R)
+end)
+
+case("long_nonblank_trimmed_coverage_still_passes", function()
+  eq(fr.replace("BEGIN\n  " .. LONG .. " \nEND", " BEGIN\n" .. LONG .. "\n END", R, false, CAP), R)
+end)
+
+case("long_blank_escape_normalized_still_passes", function()
+  local content = "BEGIN\n" .. LONG_BLANKS.tabs .. "\nEND"
+  local old = "BEGIN\\n" .. string.rep("\\t", #LONG_BLANKS.tabs) .. "\\nEND"
+  eq(fr.replace(content, old, R, false, CAP), R)
+end)
+
+case("short_blank_fuzzy_still_passes", function()
+  eq(fr.replace("BEGIN\n \t\nEND", " BEGIN\n\n END", R, false, CAP), R)
+end)
+
 case("short_line_fuzzy_unchanged_with_cap", function()
   local result = fr.replace(
     "fn test() {\n    let x = 1;\n    let y = 2;\n}",

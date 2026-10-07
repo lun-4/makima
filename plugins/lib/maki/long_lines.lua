@@ -88,15 +88,13 @@ end
 function M.check_markers(before, after)
   local available = occurrences(lines_of(before))
   for i, line in ipairs(lines_of(after)) do
-    if line:find("%]%s*$") then
-      local kind = maki.text.truncation_marker(line)
-      if kind then
-        local left = available[line] or 0
-        if left == 0 then
-          return string.format(M.TRUNCATED_MARKER_ADDED[kind], i)
-        end
-        available[line] = left - 1
+    local kind = maki.text.truncation_marker(line)
+    if kind then
+      local left = available[line] or 0
+      if left == 0 then
+        return string.format(M.TRUNCATED_MARKER_ADDED[kind], i)
       end
+      available[line] = left - 1
     end
   end
 end

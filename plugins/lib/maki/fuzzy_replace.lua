@@ -625,18 +625,23 @@ end
 
 -- A line longer than {max_line_bytes} may have been shown to the model cut,
 -- so a fuzzy candidate may only include it when {find} holds its own copy:
--- each long candidate line consumes one trimmed-equal line of {find}. Without
--- that, block matchers that ignore middle lines could replace a long line
--- the model never saw in full, or collapse two copies into one.
+-- each long nonblank candidate line consumes one trimmed-equal line of {find}.
+-- Whitespace-only lines require byte-identical copies in separate counts.
+-- Otherwise block matchers could replace a long line the model never saw in
+-- full, or collapse two copies into one.
 local function covers_long_lines(matched, find, max_line_bytes)
-  local available = {}
+  local nonblank, blank = {}, {}
   for _, line in ipairs(split_lines(find)) do
     local key = trim(line)
+    local available = key == "" and blank or nonblank
+    key = key == "" and line or key
     available[key] = (available[key] or 0) + 1
   end
   for _, line in ipairs(split_lines(matched)) do
     if #line > max_line_bytes then
       local key = trim(line)
+      local available = key == "" and blank or nonblank
+      key = key == "" and line or key
       local left = available[key] or 0
       if left == 0 then
         return false
