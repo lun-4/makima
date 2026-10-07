@@ -48,7 +48,9 @@ one line stays              ~20k tokens never seen
 [output truncated: 5000 lines, 23.3 KB; all of it saved to /home/you/.local/state/makima/sessions/offload/<session>/<hash>.txt; inspect it with grep, or read with offset and limit]
 ```
 
-The model can grep the file or page through it with `read`. `read` never saves its own output, so looking at a saved file can't make another one, and the same output twice gets a one-line pointer to the first file instead of a second copy. The files belong to the session: they are deleted with it, one file keeps at most 8 MiB, and a session keeps at most 256 MiB. Nothing cleans up sessions you keep, so their files stay until you delete the session. Print mode (`--print`) deletes its files when the run ends, so a path in its final answer no longer exists afterwards. A session made with `--fork-session` still points into the original session's files.
+The model can grep the file or page through it with `read`. `read` never saves its own output, so looking at a saved file cannot make another one. Repeated output gets a pointer to the existing file instead of a second copy. The pointer includes inspection advice and any saved-line clipping notice, even when another agent created the file and its first result is absent from the current conversation. Files with long physical lines include bash inspection advice and a quoted shell path when needed.
+
+The files belong to the session: they are deleted with it, one file keeps at most 8 MiB, and a session keeps at most 256 MiB. Nothing cleans up sessions you keep, so their files stay until you delete the session. Print mode (`--print`) deletes its files when the run ends, so a path in its final answer no longer exists afterwards. A session made with `--fork-session` still points into the original session's files.
 
 MCP results used to reach the model in full, however large. They now go through the same limit, and only when a session has a place to save them; without one they pass through unchanged.
 

@@ -635,10 +635,12 @@ fn pointer(body: &str, saved: &Saved, path: &Path, opts: &LimitOpts) -> String {
     } else {
         format!(" ({})", opts.label)
     };
+    let path = path.display().to_string();
+    let clipped = if opts.lines_clipped { CLIPPED_NOTE } else { "" };
     format!(
-        "{OFFLOAD_POINTER_PREFIX} in this session (possibly by another agent){label_note}: {}{capped}, at {}; read the file if that result is not in this conversation]",
+        "{OFFLOAD_POINTER_PREFIX} in this session (possibly by another agent){label_note}: {}{capped}, at {path}; read the file if that result is not in this conversation; {}{clipped}]",
         size_summary(body, saved),
-        path.display()
+        advice(&body[..saved.saved_bytes], &path, opts)
     )
 }
 
@@ -1826,6 +1828,77 @@ mod tests {
         drop(operation);
         assert!(matches!(putter.join().unwrap(), Err(OffloadError::Closed)));
         assert_eq!(snapshots.load(Ordering::SeqCst), 0);
+    }
+
+    #[test_case(false, false, None, 0; "tiny_short")]
+    #[test_case(true, false, Some(SHORT_TRAILER), 0; "tiny_long_trailer")]
+    #[test_case(false, true, Some(LONG_TRAILER), 0; "tiny_clipped_trailer")]
+    #[test_case(true, true, None, BIG; "long_clipped")]
+    #[test_case(false, false, Some(SHORT_TRAILER), BIG; "short_trailer")]
+    fn repeated_output_keeps_advice_and_clipping(
+        long_lines: bool,
+        clipped: bool,
+        trailer: Option<&'static str>,
+        max_bytes: usize,
+    ) {
+        let (_, store) = map_store();
+        let mut options = opts(PreviewShape::HeadTail, 0, max_bytes);
+        options.limits.max_line_bytes = if long_lines { 1 } else { TEST_BODY.len() };
+        options.lines_clipped = clipped;
+        options.trailer = trailer;
+        limit_output(TEST_BODY, &options, Some(&store));
+        let output = limit_output(TEST_BODY, &options, Some(&store));
+        assert!(output.starts_with(OFFLOAD_POINTER_PREFIX), "{output}");
+        assert!(
+            output.contains(if long_lines { BASH_ADVICE } else { READ_ADVICE }),
+            "{output}"
+        );
+        assert_eq!(output.contains(CLIPPED_NOTE), clipped, "{output}");
+        assert!(!output.starts_with(TEST_BODY), "pointer has no preview");
+        if let Some(trailer) = trailer {
+            assert!(output.ends_with(trailer), "{output}");
+        }
+    }
+
+    #[test_case(false; "short_lines")]
+    #[test_case(true; "long_lines")]
+    fn capped_pointer_advice_uses_only_saved_prefix(long_lines: bool) {
+        let (_, store) = map_store();
+        let mut body = if long_lines {
+            "x".repeat(MAX_OFFLOAD_FILE_BYTES)
+        } else {
+            "x\n".repeat(MAX_OFFLOAD_FILE_BYTES / 2)
+        };
+        body.push_str(&"z".repeat(COMPARE_CHUNK_BYTES));
+        let mut options = opts(PreviewShape::Head, 0, 0);
+        options.limits.max_line_bytes = 2;
+        options.lines_clipped = true;
+        options.trailer = Some(LONG_TRAILER);
+        limit_output(&body, &options, Some(&store));
+        let output = limit_output(&body, &options, Some(&store));
+        assert!(
+            output.contains(if long_lines { BASH_ADVICE } else { READ_ADVICE }),
+            "{output}"
+        );
+        assert!(output.contains(CLIPPED_NOTE), "{output}");
+        assert!(output.contains("discarded"), "{output}");
+        assert!(output.ends_with(LONG_TRAILER), "{output}");
+    }
+
+    #[test]
+    fn repeated_long_line_pointer_quotes_shell_path() {
+        let root = TempDir::new().unwrap();
+        let store = OffloadStore::on_disk(root.path().join("a path's artifacts"));
+        let mut options = opts(PreviewShape::Head, 0, 0);
+        options.limits.max_line_bytes = 1;
+        limit_output(TEST_BODY, &options, Some(&store));
+        let output = limit_output(TEST_BODY, &options, Some(&store));
+        let saved = store.put(TEST_BODY).unwrap();
+        let path = store.path_of(&saved).display().to_string();
+        assert!(
+            output.contains(&format!("shell path: {}", shell_quoted(&path).unwrap())),
+            "{output}"
+        );
     }
 
     #[test]
