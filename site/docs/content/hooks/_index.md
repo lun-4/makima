@@ -107,9 +107,9 @@ maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
 end)
 ```
 
-A replacement table has to carry `text`. Without it the output is left alone and
-the reason is logged. Set `is_error` to turn a success into a failure, or a
-failure into a success.
+A replacement table has to carry `text`. Without it the output is left alone and the reason is logged. Set `is_error` to turn a success into a failure, or a failure into a success.
+
+MCP output slots receive the complete text before output limiting or saving. A successful replacement is the text saved when it exceeds the limits. A denial or a replacement marked `is_error` creates no artifact. Changing a permission or transport error into success does not make that result eligible for saving. Builtin tools retain their own output-limiting behavior.
 
 An output slot fires only when the text is the whole output. Tools the UI renders
 from fields, like `read` or `edit`, are excluded, because prose edited underneath
