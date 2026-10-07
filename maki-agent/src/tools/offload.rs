@@ -870,7 +870,10 @@ mod tests {
         );
         assert!(out.starts_with("line 1\n"), "{out}");
         assert!(
-            out.contains(&format!("all of it saved to /offload/{name}")),
+            out.contains(&format!(
+                "all of it saved to {}",
+                backend.path(&name).display()
+            )),
             "{out}"
         );
         assert!(out.ends_with("]\nExit code: 2"), "{out}");
@@ -1624,11 +1627,9 @@ mod tests {
             self.inner.matches(name, expected)
         }
         fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
-            if self
-                .collisions
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
+            let collisions = self.collisions.load(Ordering::SeqCst);
+            if collisions > 0 {
+                self.collisions.fetch_sub(1, Ordering::SeqCst);
                 self.inner
                     .files
                     .lock()
