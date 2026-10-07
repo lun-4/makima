@@ -1,5 +1,10 @@
+use std::any::Any;
+use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use async_lock::Mutex;
 use flume::Receiver;
@@ -11,7 +16,7 @@ use maki_providers::provider::{self, Provider};
 use maki_providers::{Timeouts, TokenUsage};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
@@ -22,7 +27,7 @@ use crate::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
 };
 use crate::template;
-use crate::tools::offload::{OffloadStore, offload_dir_for};
+use crate::tools::offload::{OffloadCleanup, OffloadStore, offload_dir_for};
 use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -61,6 +66,56 @@ pub struct HeadlessHandle {
     pub session_id: SessionRef,
     pub cwd: String,
     pub task: smol::Task<()>,
+    pub offload_cleanup: Option<OffloadCleanup>,
+    pub teardown: HeadlessTeardown,
+}
+
+pub struct HeadlessTeardown(Receiver<std::thread::Result<()>>);
+
+impl HeadlessTeardown {
+    /// Waits for destruction of the owned future, including resources retained
+    /// after its final poll. Cancel or join the task before waiting. A destructor
+    /// panic is returned rather than resumed on the executor thread.
+    pub async fn wait(self) -> std::thread::Result<()> {
+        self.0
+            .recv_async()
+            .await
+            .unwrap_or_else(|error| Err(Box::new(error) as Box<dyn Any + Send>))
+    }
+}
+
+struct SupervisedFuture<F> {
+    inner: Option<Pin<Box<F>>>,
+    completed: flume::Sender<std::thread::Result<()>>,
+}
+
+impl<F: Future<Output = ()>> Future for SupervisedFuture<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().inner.as_mut().unwrap().as_mut().poll(cx)
+    }
+}
+
+impl<F> Drop for SupervisedFuture<F> {
+    fn drop(&mut self) {
+        let inner = self.inner.take();
+        // The future is consumed, never polled again. Catch here because task
+        // cancellation destroys it on the executor, where an escaping panic aborts.
+        let result = catch_unwind(AssertUnwindSafe(|| drop(inner)));
+        let _ = self.completed.send(result);
+    }
+}
+
+fn supervise<F: Future<Output = ()>>(future: F) -> (SupervisedFuture<F>, HeadlessTeardown) {
+    let (completed, receiver) = flume::bounded(1);
+    (
+        SupervisedFuture {
+            inner: Some(Box::pin(future)),
+            completed,
+        },
+        HeadlessTeardown(receiver),
+    )
 }
 
 struct AgentSetup {
@@ -101,18 +156,20 @@ fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc
     offload_dir_for(state_dir?, Some(session)).map(|dir| Arc::new(OffloadStore::on_disk(dir)))
 }
 
-/// Closes and removes a print run's store when the run's task ends for any
-/// reason: completion, the task being dropped on a shutdown timeout, or a
-/// panic. A print run is never restored, so nothing can refer to its saved
-/// output afterwards, and closing first keeps a late subagent from
-/// recreating the directory.
-struct RemoveOffloadOnDrop(Arc<OffloadStore>);
+/// Cancellation and unwinding cannot await removal. The handle retains the
+/// same controller so callers can drain the request made by this guard.
+struct RemoveOffloadOnDrop(OffloadCleanup);
 
 impl Drop for RemoveOffloadOnDrop {
     fn drop(&mut self) {
-        if let Err(e) = self.0.close_and_remove() {
-            warn!(error = %e, dir = %self.0.dir().display(), "offloaded tool output remains after the run");
-        }
+        self.0.request();
+    }
+}
+
+async fn drain_offload(cleanup: Option<&OffloadCleanup>) {
+    if let Some(cleanup) = cleanup {
+        cleanup.request();
+        let _ = cleanup.wait().await;
     }
 }
 
@@ -143,13 +200,13 @@ pub fn spawn_with_provider(
     params: HeadlessParams,
     provider: Arc<dyn Provider>,
 ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_initialized(params, MakiId::generate(), Some(provider))
+    spawn_initialized(params, MakiId::generate(), Some(Ok(provider)))
 }
 
 fn spawn_initialized(
     params: HeadlessParams,
     session_id: MakiId,
-    initialized_provider: Option<Arc<dyn Provider>>,
+    initialized_provider: Option<Result<Arc<dyn Provider>, crate::AgentError>>,
 ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = params.input.mode.clone();
@@ -237,19 +294,23 @@ fn spawn_initialized(
     })?;
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
     let offload = session_offload(params.state_dir.as_deref(), &session_ref);
-    let task = smol::spawn({
+    let offload_cleanup = offload
+        .as_ref()
+        .map(|store| OffloadCleanup::new(Arc::clone(store)));
+    let (future, teardown) = supervise({
         let file_write_locks = Arc::clone(&file_write_locks);
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
         let _stream_guard = guard;
-        let remove_offload = offload.clone().map(RemoveOffloadOnDrop);
+        let cleanup = offload_cleanup.clone();
+        let remove_offload = cleanup.clone().map(RemoveOffloadOnDrop);
         async move {
             let remove_offload = remove_offload;
             let event_tx = EventSender::new(raw_tx, 0);
             let mut model = params.model;
             let provider: Arc<dyn Provider> = match async {
                 match initialized_provider {
-                    Some(provider) => Ok(provider),
+                    Some(provider) => provider,
                     None => provider::from_model_async(&mut model, params.timeouts)
                         .await
                         .map(Arc::from),
@@ -264,6 +325,7 @@ fn spawn_initialized(
                         message: e.user_message(),
                     });
                     let _ = coordinator.close().await;
+                    drain_offload(cleanup.as_ref()).await;
                     return;
                 }
             };
@@ -309,6 +371,7 @@ fn spawn_initialized(
 
             agent.run(TurnId::generate(), params.input).await;
             drop(agent);
+            drain_offload(cleanup.as_ref()).await;
             drop(remove_offload);
 
             if let Some(handle) = mcp_shutdown {
@@ -324,7 +387,9 @@ fn spawn_initialized(
         tool_names,
         session_id: session_ref,
         cwd: working_dir,
-        task,
+        task: smol::spawn(future),
+        offload_cleanup,
+        teardown,
     })
 }
 
@@ -1316,6 +1381,332 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::offload::{OffloadBackend, OffloadSnapshot};
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use test_case::test_case;
+
+    const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+    const HEADLESS_PROVIDER_ERROR: &str = "headless provider failed";
+    const HEADLESS_PROVIDER_PANIC: &str = "headless provider panicked";
+    const SAVED_OUTPUT: &str = "saved output";
+    const FUTURE_DROP_PANIC: &str = "owned future destructor panic";
+
+    struct TeardownProbe {
+        polled: Arc<AtomicBool>,
+        ready: bool,
+        poll_panic: bool,
+        drop_panic: bool,
+    }
+
+    impl Future for TeardownProbe {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            self.polled.store(true, Ordering::Release);
+            if self.poll_panic {
+                panic!("{HEADLESS_PROVIDER_PANIC}");
+            }
+            if self.ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for TeardownProbe {
+        fn drop(&mut self) {
+            if self.drop_panic {
+                panic!("{FUTURE_DROP_PANIC}");
+            }
+        }
+    }
+
+    fn assert_panic_payload(panic: Box<dyn Any + Send>, expected: &str) {
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied());
+        assert_eq!(message, Some(expected));
+    }
+
+    #[test]
+    fn headless_teardown_is_published_on_drop_not_ready() {
+        let (future, teardown) = supervise(TeardownProbe {
+            polled: Arc::default(),
+            ready: true,
+            poll_panic: false,
+            drop_panic: false,
+        });
+        let mut future = Box::pin(future);
+        assert!(smol::block_on(future::poll_once(&mut future)).is_some());
+        assert!(
+            teardown.0.try_recv().is_err(),
+            "Ready must retain ownership until actual destruction"
+        );
+        drop(future);
+        smol::block_on(teardown.wait()).unwrap();
+    }
+
+    #[test]
+    fn headless_unpolled_cancellation_catches_destructor_panic() {
+        let executor = smol::LocalExecutor::new();
+        let polled = Arc::new(AtomicBool::new(false));
+        let (future, teardown) = supervise(TeardownProbe {
+            polled: Arc::clone(&polled),
+            ready: false,
+            poll_panic: false,
+            drop_panic: true,
+        });
+        let task = executor.spawn(future);
+        drop(task);
+        let panic = smol::block_on(executor.run(teardown.wait())).unwrap_err();
+        assert!(!polled.load(Ordering::Acquire));
+        assert_panic_payload(panic, FUTURE_DROP_PANIC);
+    }
+
+    #[test]
+    fn headless_poll_panic_preserves_second_destructor_panic() {
+        let (future, teardown) = supervise(TeardownProbe {
+            polled: Arc::default(),
+            ready: false,
+            poll_panic: true,
+            drop_panic: true,
+        });
+        let task = smol::spawn(future);
+        let panic = catch_unwind(AssertUnwindSafe(|| smol::block_on(task))).unwrap_err();
+        assert_panic_payload(panic, HEADLESS_PROVIDER_PANIC);
+        assert_panic_payload(
+            smol::block_on(teardown.wait()).unwrap_err(),
+            FUTURE_DROP_PANIC,
+        );
+    }
+
+    #[derive(Clone)]
+    enum ProviderExit {
+        Success,
+        Error,
+        Pending,
+        Panic,
+    }
+
+    struct GatedHeadlessProvider {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        exit: ProviderExit,
+    }
+
+    impl Provider for GatedHeadlessProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, crate::AgentError>,
+        > {
+            Box::pin(async move {
+                self.entered.send_async(()).await.unwrap();
+                self.release.recv_async().await.unwrap();
+                match self.exit {
+                    ProviderExit::Success => Ok(maki_providers::StreamResponse {
+                        message: Message {
+                            role: maki_providers::Role::Assistant,
+                            content: vec![maki_providers::ContentBlock::Text {
+                                text: SAVED_OUTPUT.into(),
+                            }],
+                            ..Default::default()
+                        },
+                        usage: TokenUsage::default(),
+                        stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    }),
+                    ProviderExit::Error => Err(crate::AgentError::Config {
+                        message: HEADLESS_PROVIDER_ERROR.into(),
+                    }),
+                    ProviderExit::Pending => std::future::pending().await,
+                    ProviderExit::Panic => panic!("{HEADLESS_PROVIDER_PANIC}"),
+                }
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct ReleaseProvider(flume::Sender<()>);
+
+    impl Drop for ReleaseProvider {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test_case(ProviderExit::Success ; "normal completion")]
+    #[test_case(ProviderExit::Error ; "provider failure")]
+    #[test_case(ProviderExit::Pending ; "dropped task")]
+    #[test_case(ProviderExit::Panic ; "provider panic")]
+    fn headless_offload_cleanup_covers_task_exit(exit: ProviderExit) {
+        let state = tempfile::tempdir().unwrap();
+        let mut params = test_params();
+        params.state_dir = Some(state.path().to_path_buf());
+        let (entered, received) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let release = ReleaseProvider(release);
+        let handle = spawn_with_provider(
+            params,
+            Arc::new(GatedHeadlessProvider {
+                entered,
+                release: released,
+                exit: exit.clone(),
+            }),
+        )
+        .unwrap();
+        received.recv_timeout(GATE_TIMEOUT).unwrap();
+        let dir = offload_dir_for(state.path(), Some(&handle.session_id)).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
+        let cleanup = handle.offload_cleanup.unwrap();
+        match exit {
+            ProviderExit::Pending => {
+                drop(handle.task);
+                drop(release);
+                smol::block_on(handle.teardown.wait()).unwrap();
+                smol::block_on(cleanup.wait()).unwrap();
+            }
+            ProviderExit::Panic => {
+                drop(release);
+                let panic = catch_unwind(AssertUnwindSafe(|| smol::block_on(handle.task)))
+                    .expect_err("provider panic must reach task join");
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied());
+                assert_eq!(message, Some(HEADLESS_PROVIDER_PANIC));
+                smol::block_on(handle.teardown.wait()).unwrap();
+                smol::block_on(cleanup.wait()).unwrap();
+            }
+            ProviderExit::Success | ProviderExit::Error => {
+                drop(release);
+                while let Ok(envelope) = handle.event_rx.recv() {
+                    if matches!(envelope.event, AgentEvent::StreamClosed) {
+                        assert!(!dir.exists(), "stream close must follow cleanup");
+                        break;
+                    }
+                }
+                smol::block_on(handle.task);
+                smol::block_on(handle.teardown.wait()).unwrap();
+                smol::block_on(cleanup.wait()).unwrap();
+            }
+        }
+        assert!(!dir.exists());
+    }
+
+    struct GatedGuardRemoval {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl OffloadBackend for GatedGuardRemoval {
+        fn matches(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            Ok(OffloadSnapshot {
+                names: Vec::new(),
+                total_bytes: 0,
+            })
+        }
+        fn remove_all(&self) -> io::Result<()> {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(GATE_TIMEOUT).unwrap();
+            Ok(())
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            PathBuf::from("/headless-offload-test").join(name)
+        }
+    }
+
+    #[test]
+    fn headless_drop_guard_requests_without_waiting_for_removal() {
+        let (entered, received) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let release = ReleaseProvider(release);
+        let cleanup =
+            OffloadCleanup::new(Arc::new(OffloadStore::new(Box::new(GatedGuardRemoval {
+                entered,
+                release: released,
+            }))));
+        let guard = RemoveOffloadOnDrop(cleanup.clone());
+        let (returned, dropped) = flume::bounded(1);
+        let thread = std::thread::spawn(move || {
+            drop(guard);
+            returned.send(()).unwrap();
+        });
+        received.recv_timeout(GATE_TIMEOUT).unwrap();
+        dropped.recv_timeout(GATE_TIMEOUT).unwrap();
+        thread.join().unwrap();
+        let mut wait = Box::pin(cleanup.wait());
+        assert!(smol::block_on(future::poll_once(&mut wait)).is_none());
+        drop(release);
+        smol::block_on(wait).unwrap();
+    }
+
+    #[test]
+    fn headless_initialization_error_drains_cleanup_before_stream_close() {
+        let state = tempfile::tempdir().unwrap();
+        let session_id = MakiId::generate();
+        let dir = offload_dir_for(state.path(), Some(&SessionRef::from(session_id))).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
+        let mut params = test_params();
+        params.state_dir = Some(state.path().to_path_buf());
+        let handle = spawn_initialized(
+            params,
+            session_id,
+            Some(Err(crate::AgentError::Config {
+                message: HEADLESS_PROVIDER_ERROR.into(),
+            })),
+        )
+        .unwrap();
+        let mut saw_error = false;
+        let mut saw_close = false;
+        while let Ok(envelope) = handle.event_rx.recv() {
+            match envelope.event {
+                AgentEvent::ControlError { message } => {
+                    assert!(message.contains(HEADLESS_PROVIDER_ERROR));
+                    saw_error = true;
+                }
+                AgentEvent::StreamClosed => {
+                    assert!(!dir.exists());
+                    saw_close = true;
+                    break;
+                }
+                _ => (),
+            }
+        }
+        assert!(saw_error);
+        assert!(saw_close);
+        smol::block_on(handle.task);
+        smol::block_on(handle.teardown.wait()).unwrap();
+        smol::block_on(handle.offload_cleanup.unwrap().wait()).unwrap();
+        assert!(!dir.exists());
+    }
 
     fn test_params() -> HeadlessParams {
         HeadlessParams {
@@ -1368,6 +1759,7 @@ mod tests {
             .expect("notify resolves through the registered coordinator");
 
         drop(handle.task);
+        smol::block_on(handle.teardown.wait()).unwrap();
         let _ = futures_lite::future::block_on(coordinator.close());
     }
 

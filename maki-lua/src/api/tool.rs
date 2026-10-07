@@ -12,6 +12,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
+use maki_agent::tools::offload::{OffloadStore, OutputLimits};
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
@@ -46,7 +47,7 @@ use crate::api::util::command::{
     PendingCommandMap, UiAction, ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
-use crate::api::util::ctx::LuaCtx;
+use crate::api::util::ctx::{LuaCtx, ParsedOutputLimits};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{
@@ -571,6 +572,7 @@ impl ToolInvocation for LuaToolInvocation {
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
                 Some(Ok(reply)) => {
+                    let reply = reply.finalize(ctx.offload.clone()).await;
                     if let Some(ref id) = ctx.tool_use_id {
                         if let Some(live_buf) = reply.live_buf {
                             crate::runtime::send_render_event(
@@ -725,6 +727,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                              Must return a string or a table with any of these fields:
 ///                                llm_output  (string)  Text sent to the model.
 ///                                is_error    (boolean) When true, the result is treated as an error.
+///                                output_limits (table) Bounds raw plain-text output after the handler or ctx:finish returns. Same options as ctx:limit_output.
 ///                                content     (string)  Alias for llm_output (legacy).
 ///                                body        (BufHandle) Rich rendered body shown in the UI.
 ///                                header      (BufHandle) One-line header shown before the body.
@@ -749,7 +752,9 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   mutable_path    (string|function) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 ///
-/// Handlers bound their model-facing output with `ctx:limit_output(text, opts)`. Text within `agent.max_output_lines` / `agent.max_output_bytes` comes back unchanged. Longer text is saved to the session's offload store and replaced by a preview plus a footer naming the saved file; without a store it is cut instead. `opts`: `preview` ("head" or "head_tail"), `trailer` (a line that always comes last, never cut), `label` (what the footer calls the output), `lines_clipped` (the text already has long lines cut), `max_lines` / `max_bytes` (per-call limits; zero returns metadata only). Returns `(string, nil)` on success or `(nil, err)` outside a handler.
+/// Handlers bound their model-facing output with `ctx:limit_output(text, opts)`. This method yields from handler coroutines while the full limiting operation runs on a worker, including store-lock waits. Text within `agent.max_output_lines` / `agent.max_output_bytes` comes back unchanged. Longer text is saved to the session's offload store and replaced by a preview plus a footer naming the saved file; without a store it is cut instead. `opts`: `preview` ("head" or "head_tail"), `trailer` (a line that always comes last, never cut), `label` (what the footer calls the output), `lines_clipped` (the text already has long lines cut), `max_lines` / `max_bytes` (per-call limits; zero returns metadata only). Returns `(string, nil)` on success or `(nil, err)` outside a handler. Invalid options raise a programmer error.
+///
+/// Job exit and cancellation hooks are synchronous callbacks and cannot yield. They pass the raw body as `llm_output` with `output_limits = opts` to `ctx:finish(reply)` instead. Direct handler returns accept the same reply field. The host applies the limits after receiving the reply, outside the Lua cancellation window, and preserves `is_error`. Deferred limits require plain text and reject image, diff, markdown, and structured `state` replies. The raw text is saved without its trailer. A started worker retains its owned text, options, and store even when its caller is dropped; session cleanup closes the store before removing its files.
 /// @return
 /// @example
 /// maki.api.register_tool({
@@ -2140,10 +2145,20 @@ pub(crate) struct ToolCallReply {
     /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
+    output_limits: Option<ParsedOutputLimits>,
 }
 
 impl ToolCallReply {
+    #[cfg(test)]
     pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
+        Self::from_lua_value_with_limits(lua, val, OutputLimits::from_config(&Default::default()))
+    }
+
+    pub(crate) fn from_lua_value_with_limits(
+        lua: &Lua,
+        val: &LuaValue,
+        limits: OutputLimits,
+    ) -> Self {
         let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
             return Self::plain(result);
@@ -2171,6 +2186,13 @@ impl ToolCallReply {
                 None
             }
         };
+        let output_limits = match extract_output_limits(t, limits) {
+            Ok(limits) => limits,
+            Err(error) => {
+                result = Err(format!("output_limits: {error}"));
+                None
+            }
+        };
         let state = match t.get::<LuaValue>("state") {
             Ok(LuaValue::Nil) | Err(_) => None,
             Ok(v) => crate::api::util::convert::lua_to_json(lua, &v)
@@ -2189,7 +2211,25 @@ impl ToolCallReply {
             diff,
             image,
             state,
+            output_limits,
         }
+    }
+
+    pub(crate) fn has_output_limits(&self) -> bool {
+        self.output_limits.is_some()
+    }
+
+    async fn finalize(mut self, store: Option<Arc<OffloadStore>>) -> Self {
+        if let Some(opts) = self.output_limits.take() {
+            let result = std::mem::replace(&mut self.result, Ok(String::new()));
+            let is_error = result.is_err();
+            let body = match result {
+                Ok(body) | Err(body) => body,
+            };
+            let body = opts.apply(body, store).await;
+            self.result = if is_error { Err(body) } else { Ok(body) };
+        }
+        self
     }
 
     fn extract_body_handle(t: &mlua::Table) -> (Option<BufferSnapshot>, Option<Arc<SharedBuf>>) {
@@ -2222,12 +2262,40 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
+            output_limits: None,
         }
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
         Self::plain(Err(msg.into()))
     }
+}
+
+fn extract_output_limits(
+    t: &Table,
+    limits: OutputLimits,
+) -> mlua::Result<Option<ParsedOutputLimits>> {
+    let opts = match t.get::<LuaValue>("output_limits")? {
+        LuaValue::Nil => return Ok(None),
+        LuaValue::Table(opts) => opts,
+        _ => return Err(mlua::Error::runtime("expected an options table")),
+    };
+    if extract_tool_output(t)?.is_none() {
+        return Err(mlua::Error::runtime("requires a text llm_output"));
+    }
+    for field in ["image", "diff_path", "diff_before", "diff_after", "state"] {
+        if !matches!(t.get::<LuaValue>(field)?, LuaValue::Nil) {
+            return Err(mlua::Error::runtime(format!(
+                "cannot be combined with {field}"
+            )));
+        }
+    }
+    if !matches!(t.get::<LuaValue>("format")?, LuaValue::Nil)
+        && t.get::<String>("format")? != LUA_FORMAT_PLAIN
+    {
+        return Err(mlua::Error::runtime("requires plain text format"));
+    }
+    ParsedOutputLimits::parse(Some(opts), limits).map(Some)
 }
 
 fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
@@ -2303,25 +2371,30 @@ fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
     }
 }
 
+fn extract_tool_output(t: &Table) -> mlua::Result<Option<String>> {
+    let output = match t.get::<LuaValue>("llm_output")? {
+        LuaValue::Nil => t.get::<LuaValue>("content")?,
+        output => output,
+    };
+    match output {
+        LuaValue::Nil => Ok(None),
+        LuaValue::String(output) => output.to_str().map(|output| Some(output.to_owned())),
+        _ => Err(mlua::Error::runtime("tool output must be a string")),
+    }
+}
+
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     match result {
         LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
-        LuaValue::Table(t) => {
-            let output = t.get::<LuaValue>("llm_output").ok().and_then(|v| {
-                if let LuaValue::String(s) = v {
-                    s.to_str().ok().map(|s| s.to_owned())
-                } else {
-                    None
-                }
-            });
-            match output {
-                Some(s) if matches!(t.get::<LuaValue>("is_error"), Ok(LuaValue::Boolean(true))) => {
-                    Err(s)
-                }
-                Some(s) => Ok(s),
-                None => Err(TOOL_HANDLER_RETURN_ERR.to_string()),
+        LuaValue::Table(t) => match extract_tool_output(t) {
+            Ok(Some(output))
+                if matches!(t.get::<LuaValue>("is_error"), Ok(LuaValue::Boolean(true))) =>
+            {
+                Err(output)
             }
-        }
+            Ok(Some(output)) => Ok(output),
+            Ok(None) | Err(_) => Err(TOOL_HANDLER_RETURN_ERR.to_string()),
+        },
         _ => Err(TOOL_HANDLER_RETURN_ERR.to_string()),
     }
 }
@@ -2671,6 +2744,47 @@ mod tests {
         assert_eq!(
             coerce_tool_result(&LuaValue::Table(t)),
             Err("boom".to_string())
+        );
+    }
+
+    #[test_case::test_case(false; "success")]
+    #[test_case::test_case(true; "error")]
+    fn coerce_legacy_content_preserves_result_kind(is_error: bool) {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("content", "body").unwrap();
+        t.set("is_error", is_error).unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            if is_error {
+                Err("body".to_owned())
+            } else {
+                Ok("body".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn coerce_llm_output_precedes_legacy_content() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "primary").unwrap();
+        t.set("content", "legacy").unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Ok("primary".to_owned())
+        );
+    }
+
+    #[test]
+    fn coerce_unsupported_llm_output_does_not_fall_back_to_content() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", false).unwrap();
+        t.set("content", "legacy").unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Err(TOOL_HANDLER_RETURN_ERR.to_owned())
         );
     }
 

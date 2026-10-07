@@ -7,7 +7,7 @@ use maki_agent::AgentEvent;
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::offload::{
-    DEFAULT_LABEL, LimitOpts, OutputLimits, PreviewShape, limit_output,
+    DEFAULT_LABEL, LimitOpts, OffloadStore, OutputLimits, PreviewShape, limit_output,
 };
 use maki_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
@@ -23,6 +23,66 @@ use crate::runtime::{active_task, lock_cell};
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 const PREVIEW_HEAD: &str = "head";
 const PREVIEW_HEAD_TAIL: &str = "head_tail";
+
+pub(crate) struct ParsedOutputLimits {
+    trailer: Option<String>,
+    shape: PreviewShape,
+    label: String,
+    lines_clipped: bool,
+    limits: OutputLimits,
+}
+
+impl ParsedOutputLimits {
+    pub(crate) fn parse(opts: Option<mlua::Table>, limits: OutputLimits) -> mlua::Result<Self> {
+        let mut parsed = Self {
+            trailer: None,
+            shape: PreviewShape::Head,
+            label: DEFAULT_LABEL.to_owned(),
+            lines_clipped: false,
+            limits,
+        };
+        if let Some(opts) = opts {
+            parsed.trailer = opts.get("trailer")?;
+            parsed.shape = match opts.get::<Option<String>>("preview")?.as_deref() {
+                None | Some(PREVIEW_HEAD) => PreviewShape::Head,
+                Some(PREVIEW_HEAD_TAIL) => PreviewShape::HeadTail,
+                Some(other) => {
+                    return Err(mlua::Error::runtime(format!(
+                        "limit_output: preview must be \"{PREVIEW_HEAD}\" or \"{PREVIEW_HEAD_TAIL}\", got \"{other}\""
+                    )));
+                }
+            };
+            if let Some(label) = opts.get("label")? {
+                parsed.label = label;
+            }
+            parsed.lines_clipped = opts.get::<Option<bool>>("lines_clipped")?.unwrap_or(false);
+            if let Some(max_lines) = opts.get("max_lines")? {
+                parsed.limits.max_lines = max_lines;
+            }
+            if let Some(max_bytes) = opts.get("max_bytes")? {
+                parsed.limits.max_bytes = max_bytes;
+            }
+        }
+        Ok(parsed)
+    }
+
+    pub(crate) async fn apply(self, body: String, store: Option<Arc<OffloadStore>>) -> String {
+        smol::unblock(move || {
+            limit_output(
+                &body,
+                &LimitOpts {
+                    trailer: self.trailer.as_deref(),
+                    shape: self.shape,
+                    label: &self.label,
+                    lines_clipped: self.lines_clipped,
+                    limits: self.limits,
+                },
+                store.as_deref(),
+            )
+        })
+        .await
+    }
+}
 
 fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
     let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
@@ -341,51 +401,19 @@ impl UserData for LuaCtx {
             Ok((Some(true), None))
         });
 
-        // Synchronous on purpose: bash calls it from job exit callbacks and
-        // cancel hooks, which cannot yield.
-        methods.add_method(
+        methods.add_async_method(
             "limit_output",
-            |lua, this, (body, opts): (mlua::String, Option<mlua::Table>)| {
+            |lua, this, (body, opts): (mlua::String, Option<mlua::Table>)| async move {
                 let Some(agent) = this.agent() else {
                     return Ok(this.cap_err_pair("limit_output"));
                 };
-                let mut limits = OutputLimits::from_config(&agent.config);
-                let mut trailer = None;
-                let mut shape = PreviewShape::Head;
-                let mut label = DEFAULT_LABEL.to_owned();
-                let mut lines_clipped = false;
-                if let Some(opts) = opts {
-                    trailer = opts.get::<Option<String>>("trailer")?;
-                    shape = match opts.get::<Option<String>>("preview")?.as_deref() {
-                        None | Some(PREVIEW_HEAD) => PreviewShape::Head,
-                        Some(PREVIEW_HEAD_TAIL) => PreviewShape::HeadTail,
-                        Some(other) => {
-                            return Err(mlua::Error::runtime(format!(
-                                "limit_output: preview must be \"{PREVIEW_HEAD}\" or \"{PREVIEW_HEAD_TAIL}\", got \"{other}\""
-                            )));
-                        }
-                    };
-                    if let Some(given) = opts.get::<Option<String>>("label")? {
-                        label = given;
-                    }
-                    lines_clipped = opts.get::<Option<bool>>("lines_clipped")?.unwrap_or(false);
-                    for (key, limit) in [
-                        ("max_lines", &mut limits.max_lines),
-                        ("max_bytes", &mut limits.max_bytes),
-                    ] {
-                        if let Some(given) = opts.get::<Option<usize>>(key)? {
-                            *limit = given;
-                        }
-                    }
-                }
-                let opts = LimitOpts {
-                    trailer: trailer.as_deref(),
-                    shape,
-                    label: &label,
-                    lines_clipped,
-                    limits,
-                };
-                let limited = limit_output(&body.to_string_lossy(), &opts, agent.offload.as_deref());
+                let limits = OutputLimits::from_config(&agent.config);
+                let store = agent.offload.clone();
+                let opts = ParsedOutputLimits::parse(opts, limits)?;
+                let body = body.to_string_lossy();
+                // Cancel hooks can call ctx:finish while the worker holds the store lock.
+                drop(this);
+                let limited = opts.apply(body, store).await;
                 Ok((Some(lua.create_string(limited)?), None))
             },
         );
@@ -491,9 +519,10 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method_mut("finish", |lua, this, val: LuaValue| {
-            if !matches!(this.caps, Caps::Handler { .. }) {
+            let Some(agent) = this.agent() else {
                 return Ok(this.cap_err_pair("finish"));
-            }
+            };
+            let limits = OutputLimits::from_config(&agent.config);
             let tx = this
                 .finish_tx
                 .take()
@@ -502,7 +531,7 @@ impl UserData for LuaCtx {
             if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
                 lock_cell(&active_task(lua)).root_buf = Some(buf);
             }
-            let _ = tx.send(ToolCallReply::from_lua_value(lua, &val));
+            let _ = tx.send(ToolCallReply::from_lua_value_with_limits(lua, &val, limits));
             Ok((Some(true), None))
         });
     }
@@ -643,10 +672,12 @@ mod tests {
             .set("ctx", lua.create_userdata(ctx).unwrap())
             .unwrap();
         lua.globals().set("body", body).unwrap();
-        lua.load(format!(
-            "return ctx:limit_output(body, {{ max_lines = {LIMITED_LINES} }})"
-        ))
-        .eval()
+        smol::block_on(
+            lua.load(format!(
+                "return ctx:limit_output(body, {{ max_lines = {LIMITED_LINES} }})"
+            ))
+            .eval_async(),
+        )
         .unwrap()
     }
 
@@ -698,10 +729,11 @@ mod tests {
         lua.globals().set("body", many_lines()).unwrap();
         lua.globals().set("limit", key).unwrap();
         lua.globals().set("trailer", LIMIT_TRAILER).unwrap();
-        let (limited, err): (Option<String>, Option<String>) = lua
-            .load("return ctx:limit_output(body, { [limit] = 0, trailer = trailer })")
-            .eval()
-            .unwrap();
+        let (limited, err): (Option<String>, Option<String>) = smol::block_on(
+            lua.load("return ctx:limit_output(body, { [limit] = 0, trailer = trailer })")
+                .eval_async(),
+        )
+        .unwrap();
         assert_eq!(err, None);
         let limited = limited.unwrap();
         assert_eq!(limited.lines().count(), 2, "{limited}");

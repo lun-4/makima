@@ -7,7 +7,9 @@
 //! We adopt new fields when Claude Code adds them but never invent our own.
 //! Check their docs before changing anything here.
 
+use std::future::Future;
 use std::io::{self, Read};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,10 +17,12 @@ use std::time::{Duration, Instant};
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use futures::FutureExt;
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_agent::headless::{HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
+use maki_agent::tools::offload::OffloadCleanup;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, ImageSource,
     ModeRegistry, PermissionsConfig, TurnOutcome,
@@ -251,6 +255,55 @@ impl VerboseOutput {
     }
 }
 
+fn run_and_settle<T>(
+    task: smol::Task<()>,
+    teardown: impl Future<Output = std::thread::Result<()>>,
+    cleanup: Option<OffloadCleanup>,
+    shutdown: impl Future<Output = ()>,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    // Body state is never reused after unwinding. Settlement only borrows the
+    // task, and the cleanup controller stays outside every unwind boundary.
+    let body_result = catch_unwind(AssertUnwindSafe(body));
+    let mut task = task;
+    let settlement = smol::block_on(
+        AssertUnwindSafe(async {
+            futures_lite::future::or(&mut task, shutdown).await;
+        })
+        .catch_unwind(),
+    );
+    drop(task);
+    let teardown = smol::block_on(teardown);
+    let settlement = match (settlement, teardown) {
+        (Err(panic), teardown) => {
+            if teardown.is_err() {
+                tracing::error!(
+                    "headless future destruction also panicked after agent settlement panic"
+                );
+            }
+            Err(panic)
+        }
+        (Ok(()), teardown) => teardown,
+    };
+    smol::block_on(async {
+        if let Some(cleanup) = cleanup {
+            cleanup.request();
+            let _ = cleanup.wait().await;
+        }
+    });
+
+    match (body_result, settlement) {
+        (Err(body_panic), settlement) => {
+            if settlement.is_err() {
+                tracing::error!("agent settlement also panicked after print body panic");
+            }
+            resume_unwind(body_panic)
+        }
+        (Ok(_), Err(settlement_panic)) => resume_unwind(settlement_panic),
+        (Ok(result), Ok(())) => result,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     model: &Model,
@@ -337,195 +390,200 @@ pub fn run(
             session_id,
             cwd,
             task,
+            offload_cleanup,
+            teardown,
         } = handle;
         let start = Instant::now();
-
-        let mut verbose_out = match format {
-            OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
-            _ if verbose => Some(VerboseOutput::Json(Vec::new())),
-            _ => None,
-        };
-
-        if let Some(out) = &mut verbose_out {
-            out.emit(&InitEvent {
-                event_type: "system",
-                subtype: "init",
-                cwd: &cwd,
-                session_id: &session_id,
-                tools: &tool_names,
-                model: &model.id,
-            })?;
-        }
-
-        let mut result_text = String::new();
-        let mut is_error = false;
-        let mut num_turns: u32 = 0;
-        let mut usage = TokenUsage::default();
-        // Summed as the turns land: rates move mid-run, and only a turn knows the
-        // rate it paid.
-        let mut cost = None;
-        let mut stop_reason: Option<DoneReason> = None;
-
-        let snapshot = HeadlessSnapshot::default();
-        snapshot.install(
-            &lua_handle,
-            HeadlessMeta {
-                id: session_id.to_string(),
-                cwd: cwd.clone(),
-                model: model.spec(),
-                fast: false,
-                thinking: String::new(),
-            },
-            // `makima --print` always runs the agent in build mode
-            // (`headless::spawn` hardcodes `AgentMode::Build`).
-            || MODE_BUILD,
-        );
-
-        while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
-            if matches!(envelope.event, AgentEvent::StreamClosed) {
-                break;
-            }
-            snapshot.observe(&envelope);
-            maki_lua::agent_autocmd::dispatch(
-                &lua_handle,
-                &session_id,
-                &envelope,
-                envelope.subagent.is_some(),
-            );
-            let Envelope {
-                ref event,
-                ref subagent,
-                ..
-            } = envelope;
-            let parent_tool_use_id = subagent.as_ref().map(|s| s.parent_tool_use_id.as_str());
-
-            match event {
-                AgentEvent::TextDelta { text } => {
-                    if parent_tool_use_id.is_none() {
-                        result_text.push_str(text);
-                    }
-                }
-                AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
-                AgentEvent::ToolPending { .. }
-                | AgentEvent::ToolStart(_)
-                | AgentEvent::ToolExecutionStart { .. }
-                | AgentEvent::ToolOutput { .. }
-                | AgentEvent::ToolDone(_)
-                | AgentEvent::QueueItemConsumed { .. }
-                | AgentEvent::ModelSwitched { .. }
-                | AgentEvent::QueueDrained
-                | AgentEvent::AutoCompacting { .. }
-                | AgentEvent::CompactionDone { .. }
-                | AgentEvent::AuthRequired
-                | AgentEvent::PermissionRequest { .. }
-                | AgentEvent::Question { .. }
-                | AgentEvent::SubagentHistory { .. }
-                | AgentEvent::SubagentClosed
-                | AgentEvent::ToolSnapshot { .. }
-                | AgentEvent::ToolHeaderSnapshot { .. }
-                | AgentEvent::LiveToolBuf { .. }
-                | AgentEvent::Nudge
-                | AgentEvent::PromptProgress { .. }
-                | AgentEvent::StreamClosed => {}
-                AgentEvent::Retry {
-                    attempt,
-                    message,
-                    delay_ms,
-                } => {
-                    if let Some(out) = &mut verbose_out {
-                        out.emit(&RetryEvent {
-                            event_type: "system",
-                            subtype: "api_retry",
-                            attempt: *attempt,
-                            retry_delay_ms: *delay_ms,
-                            error: message,
-                            session_id: &session_id,
-                        })?;
-                    }
-                }
-                AgentEvent::TurnComplete(tc) => {
-                    add_cost(&mut cost, tc.cost);
-                    if let Some(out) = &mut verbose_out {
-                        let content_value = serde_json::to_value(&tc.message.content)?;
-                        out.emit(&AssistantEvent {
-                            event_type: "assistant",
-                            message: AssistantMessage {
-                                model: &tc.model,
-                                role: "assistant",
-                                content: &content_value,
-                                usage: &tc.usage,
-                            },
-                            session_id: &session_id,
-                            parent_tool_use_id,
-                        })?;
-                    }
-                }
-                AgentEvent::ToolResultsSubmitted { message } => {
-                    if let Some(out) = &mut verbose_out {
-                        let content_value = serde_json::to_value(&message.content)?;
-                        out.emit(&UserEvent {
-                            event_type: "user",
-                            message: UserMessage {
-                                role: "user",
-                                content: &content_value,
-                            },
-                            session_id: &session_id,
-                            parent_tool_use_id,
-                        })?;
-                    }
-                }
-                AgentEvent::TurnOutcome(outcome) => {
-                    num_turns = outcome.num_turns();
-                    usage = outcome.usage();
-                    match outcome {
-                        TurnOutcome::Completed { reason, .. } => stop_reason = Some(*reason),
-                        TurnOutcome::Failed { failure, .. } => {
-                            is_error = true;
-                            result_text = failure.user_message.clone();
-                        }
-                        TurnOutcome::Cancelled { .. } => {
-                            is_error = true;
-                        }
-                    }
-                    break;
-                }
-                AgentEvent::ControlComplete { .. } => break,
-                AgentEvent::ControlError { message } => {
-                    is_error = true;
-                    result_text = message.clone();
-                    break;
-                }
-            }
-        }
-        smol::block_on(async {
-            futures_lite::future::or(task, async {
+        let (mut result, verbose_out) = run_and_settle(
+            task,
+            teardown.wait(),
+            offload_cleanup,
+            async {
                 smol::Timer::after(AGENT_SHUTDOWN_TIMEOUT).await;
-            })
-            .await;
-        });
-
-        let duration_ms = start.elapsed().as_millis();
-        // Zero on an unpriced model, which is what its turns reported too.
-        let total_cost_usd = cost.unwrap_or_default();
-        let run_error = is_error.then(|| result_text.clone());
-
-        match format {
-            OutputFormat::Text => {
-                print!("{result_text}");
-            }
-            OutputFormat::Json | OutputFormat::StreamJson => {
-                let result = PrintResult {
-                    result_type: "result",
-                    subtype: if is_error { "error" } else { "success" },
-                    is_error,
-                    duration_ms,
-                    num_turns,
-                    result: result_text,
-                    stop_reason,
-                    session_id,
-                    total_cost_usd,
-                    usage,
+            },
+            || {
+                let mut verbose_out = match format {
+                    OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
+                    _ if verbose => Some(VerboseOutput::Json(Vec::new())),
+                    _ => None,
                 };
+
+                if let Some(out) = &mut verbose_out {
+                    out.emit(&InitEvent {
+                        event_type: "system",
+                        subtype: "init",
+                        cwd: &cwd,
+                        session_id: &session_id,
+                        tools: &tool_names,
+                        model: &model.id,
+                    })?;
+                }
+
+                let mut result_text = String::new();
+                let mut is_error = false;
+                let mut num_turns: u32 = 0;
+                let mut usage = TokenUsage::default();
+                // Summed as the turns land: rates move mid-run, and only a turn knows the
+                // rate it paid.
+                let mut cost = None;
+                let mut stop_reason: Option<DoneReason> = None;
+
+                let snapshot = HeadlessSnapshot::default();
+                snapshot.install(
+                    &lua_handle,
+                    HeadlessMeta {
+                        id: session_id.to_string(),
+                        cwd: cwd.clone(),
+                        model: model.spec(),
+                        fast: false,
+                        thinking: String::new(),
+                    },
+                    // `makima --print` always runs the agent in build mode
+                    // (`headless::spawn` hardcodes `AgentMode::Build`).
+                    || MODE_BUILD,
+                );
+
+                while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
+                    if matches!(envelope.event, AgentEvent::StreamClosed) {
+                        break;
+                    }
+                    snapshot.observe(&envelope);
+                    maki_lua::agent_autocmd::dispatch(
+                        &lua_handle,
+                        &session_id,
+                        &envelope,
+                        envelope.subagent.is_some(),
+                    );
+                    let Envelope {
+                        ref event,
+                        ref subagent,
+                        ..
+                    } = envelope;
+                    let parent_tool_use_id =
+                        subagent.as_ref().map(|s| s.parent_tool_use_id.as_str());
+
+                    match event {
+                        AgentEvent::TextDelta { text } => {
+                            if parent_tool_use_id.is_none() {
+                                result_text.push_str(text);
+                            }
+                        }
+                        AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
+                        AgentEvent::ToolPending { .. }
+                        | AgentEvent::ToolStart(_)
+                        | AgentEvent::ToolExecutionStart { .. }
+                        | AgentEvent::ToolOutput { .. }
+                        | AgentEvent::ToolDone(_)
+                        | AgentEvent::QueueItemConsumed { .. }
+                        | AgentEvent::ModelSwitched { .. }
+                        | AgentEvent::QueueDrained
+                        | AgentEvent::AutoCompacting { .. }
+                        | AgentEvent::CompactionDone { .. }
+                        | AgentEvent::AuthRequired
+                        | AgentEvent::PermissionRequest { .. }
+                        | AgentEvent::Question { .. }
+                        | AgentEvent::SubagentHistory { .. }
+                        | AgentEvent::SubagentClosed
+                        | AgentEvent::ToolSnapshot { .. }
+                        | AgentEvent::ToolHeaderSnapshot { .. }
+                        | AgentEvent::LiveToolBuf { .. }
+                        | AgentEvent::Nudge
+                        | AgentEvent::PromptProgress { .. }
+                        | AgentEvent::StreamClosed => {}
+                        AgentEvent::Retry {
+                            attempt,
+                            message,
+                            delay_ms,
+                        } => {
+                            if let Some(out) = &mut verbose_out {
+                                out.emit(&RetryEvent {
+                                    event_type: "system",
+                                    subtype: "api_retry",
+                                    attempt: *attempt,
+                                    retry_delay_ms: *delay_ms,
+                                    error: message,
+                                    session_id: &session_id,
+                                })?;
+                            }
+                        }
+                        AgentEvent::TurnComplete(tc) => {
+                            add_cost(&mut cost, tc.cost);
+                            if let Some(out) = &mut verbose_out {
+                                let content_value = serde_json::to_value(&tc.message.content)?;
+                                out.emit(&AssistantEvent {
+                                    event_type: "assistant",
+                                    message: AssistantMessage {
+                                        model: &tc.model,
+                                        role: "assistant",
+                                        content: &content_value,
+                                        usage: &tc.usage,
+                                    },
+                                    session_id: &session_id,
+                                    parent_tool_use_id,
+                                })?;
+                            }
+                        }
+                        AgentEvent::ToolResultsSubmitted { message } => {
+                            if let Some(out) = &mut verbose_out {
+                                let content_value = serde_json::to_value(&message.content)?;
+                                out.emit(&UserEvent {
+                                    event_type: "user",
+                                    message: UserMessage {
+                                        role: "user",
+                                        content: &content_value,
+                                    },
+                                    session_id: &session_id,
+                                    parent_tool_use_id,
+                                })?;
+                            }
+                        }
+                        AgentEvent::TurnOutcome(outcome) => {
+                            num_turns = outcome.num_turns();
+                            usage = outcome.usage();
+                            match outcome {
+                                TurnOutcome::Completed { reason, .. } => {
+                                    stop_reason = Some(*reason)
+                                }
+                                TurnOutcome::Failed { failure, .. } => {
+                                    is_error = true;
+                                    result_text = failure.user_message.clone();
+                                }
+                                TurnOutcome::Cancelled { .. } => {
+                                    is_error = true;
+                                }
+                            }
+                            break;
+                        }
+                        AgentEvent::ControlComplete { .. } => break,
+                        AgentEvent::ControlError { message } => {
+                            is_error = true;
+                            result_text = message.clone();
+                            break;
+                        }
+                    }
+                }
+                Ok((
+                    PrintResult {
+                        result_type: "result",
+                        subtype: if is_error { "error" } else { "success" },
+                        is_error,
+                        duration_ms: 0,
+                        num_turns,
+                        result: result_text,
+                        stop_reason,
+                        session_id,
+                        // Zero on an unpriced model, which is what its turns reported too.
+                        total_cost_usd: cost.unwrap_or_default(),
+                        usage,
+                    },
+                    verbose_out,
+                ))
+            },
+        )?;
+        result.duration_ms = start.elapsed().as_millis();
+        match format {
+            OutputFormat::Text => print!("{}", result.result),
+            OutputFormat::Json | OutputFormat::StreamJson => {
                 match verbose_out {
                     Some(VerboseOutput::Json(mut events)) => {
                         events.push(serde_json::to_value(&result)?);
@@ -536,12 +594,12 @@ pub fn run(
                 terminal_result_emitted.set(true);
             }
         }
-
-        match run_error {
+        if result.is_error {
             // The error text is already in the emitted result; a detailed
             // error report here would print it twice.
-            Some(_) => Err(eyre!("agent run failed")),
-            None => Ok(()),
+            Err(eyre!("agent run failed"))
+        } else {
+            Ok(())
         }
     };
     let outcome = drive_print(
@@ -576,8 +634,268 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::tools::offload::{OffloadBackend, OffloadSnapshot, OffloadStore};
     use maki_providers::TokenUsage;
+    use serde::Serializer;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
+
+    const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+    const BODY_PANIC: &str = "print body panic";
+    const TASK_PANIC: &str = "agent task panic";
+    const DESTRUCTOR_PANIC: &str = "pending provider resource destructor panic";
+    const SHUTDOWN_PANIC: &str = "shutdown future panic";
+    const SERIALIZER_ERROR: &str = "print serializer failed";
+    const OUTPUT_ERROR: &str = "print output failed";
+    const CLEANUP_ERROR: &str = "offload removal failed";
+
+    struct GatedRemoval {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        removed: Arc<AtomicBool>,
+        fail: bool,
+    }
+
+    impl OffloadBackend for GatedRemoval {
+        fn matches(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+            Ok(false)
+        }
+
+        fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            Ok(OffloadSnapshot {
+                names: Vec::new(),
+                total_bytes: 0,
+            })
+        }
+
+        fn remove_all(&self) -> io::Result<()> {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(GATE_TIMEOUT).unwrap();
+            if self.fail {
+                Err(io::Error::other(CLEANUP_ERROR))
+            } else {
+                self.removed.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            PathBuf::from("/print-offload-test").join(name)
+        }
+    }
+
+    struct ReleaseRemoval(flume::Sender<()>);
+
+    impl Drop for ReleaseRemoval {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn gated_cleanup(
+        fail: bool,
+    ) -> (
+        OffloadCleanup,
+        flume::Receiver<()>,
+        ReleaseRemoval,
+        Arc<AtomicBool>,
+    ) {
+        let (entered, received) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let removed = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(OffloadStore::new(Box::new(GatedRemoval {
+            entered,
+            release: released,
+            removed: Arc::clone(&removed),
+            fail,
+        })));
+        (
+            OffloadCleanup::new(store),
+            received,
+            ReleaseRemoval(release),
+            removed,
+        )
+    }
+
+    struct FailingSerializer;
+
+    impl Serialize for FailingSerializer {
+        fn serialize<S: Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(SERIALIZER_ERROR))
+        }
+    }
+
+    struct FailingOutput;
+
+    impl Write for FailingOutput {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other(OUTPUT_ERROR))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    enum BodyExit {
+        Success,
+        SerializerError,
+        OutputError,
+        Panic,
+    }
+
+    #[derive(Clone)]
+    enum TaskExit {
+        Success,
+        Timeout,
+        Panic,
+        ShutdownPanic,
+    }
+
+    #[test_case(BodyExit::Success, TaskExit::Success ; "success")]
+    #[test_case(BodyExit::SerializerError, TaskExit::Success ; "serializer error")]
+    #[test_case(BodyExit::OutputError, TaskExit::Success ; "output error")]
+    #[test_case(BodyExit::Success, TaskExit::Timeout ; "timeout")]
+    #[test_case(BodyExit::Panic, TaskExit::Success ; "body panic")]
+    #[test_case(BodyExit::Success, TaskExit::Panic ; "task panic")]
+    #[test_case(BodyExit::Panic, TaskExit::Panic ; "dual panic")]
+    #[test_case(BodyExit::Success, TaskExit::ShutdownPanic ; "shutdown panic")]
+    fn print_settlement_drains_removal_before_return(body_exit: BodyExit, task_exit: TaskExit) {
+        let (cleanup, entered, release, removed) = gated_cleanup(false);
+        let (task_dropped, dropped) = flume::bounded(1);
+        let (teardown_done, teardown_rx) = flume::bounded(1);
+        struct MarkTaskDropped {
+            dropped: flume::Sender<()>,
+            completed: flume::Sender<()>,
+        }
+        impl Drop for MarkTaskDropped {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(());
+                let _ = self.completed.send(());
+            }
+        }
+        let marker = MarkTaskDropped {
+            dropped: task_dropped,
+            completed: teardown_done,
+        };
+        let task_behavior = task_exit.clone();
+        let task = smol::spawn(async move {
+            let _marker = marker;
+            match task_behavior {
+                TaskExit::Success => (),
+                TaskExit::Panic => panic!("{TASK_PANIC}"),
+                TaskExit::Timeout | TaskExit::ShutdownPanic => std::future::pending().await,
+            }
+        });
+        let (completed, completion) = flume::bounded(1);
+        let shutdown_behavior = task_exit.clone();
+        let body_behavior = body_exit.clone();
+        let thread = std::thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run_and_settle(
+                    task,
+                    async {
+                        teardown_rx.recv_async().await.unwrap();
+                        Ok(())
+                    },
+                    Some(cleanup),
+                    async move {
+                        match shutdown_behavior {
+                            TaskExit::Timeout => (),
+                            TaskExit::ShutdownPanic => panic!("{SHUTDOWN_PANIC}"),
+                            TaskExit::Success | TaskExit::Panic => std::future::pending().await,
+                        }
+                    },
+                    || match body_behavior {
+                        BodyExit::Success => Ok(()),
+                        BodyExit::SerializerError => {
+                            VerboseOutput::Json(Vec::new()).emit(&FailingSerializer)
+                        }
+                        BodyExit::OutputError => {
+                            FailingOutput.write_all(b"result")?;
+                            Ok(())
+                        }
+                        BodyExit::Panic => panic!("{BODY_PANIC}"),
+                    },
+                )
+            }));
+            dropped
+                .try_recv()
+                .expect("task destruction must finish at return boundary");
+            completed.send(()).unwrap();
+            result
+        });
+        entered.recv_timeout(GATE_TIMEOUT).unwrap();
+        assert!(
+            completion.try_recv().is_err(),
+            "return boundary must wait for removal"
+        );
+        assert!(!removed.load(Ordering::Acquire));
+        drop(release);
+        let result = thread.join().unwrap();
+        assert!(removed.load(Ordering::Acquire));
+        let expected_panic = match (&body_exit, &task_exit) {
+            (BodyExit::Panic, _) => Some(BODY_PANIC),
+            (_, TaskExit::Panic) => Some(TASK_PANIC),
+            (_, TaskExit::ShutdownPanic) => Some(SHUTDOWN_PANIC),
+            _ => None,
+        };
+        if let Some(expected) = expected_panic {
+            let panic = result.expect_err("panic must escape after cleanup");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied());
+            assert_eq!(message, Some(expected));
+        } else {
+            match body_exit {
+                BodyExit::Success => result.unwrap().unwrap(),
+                BodyExit::SerializerError => assert!(
+                    result
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains(SERIALIZER_ERROR)
+                ),
+                BodyExit::OutputError => assert!(
+                    result
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains(OUTPUT_ERROR)
+                ),
+                BodyExit::Panic => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn print_settlement_reports_cleanup_failure() {
+        let (cleanup, entered, release, removed) = gated_cleanup(true);
+        let observer = cleanup.clone();
+        let thread = std::thread::spawn(move || {
+            run_and_settle(
+                smol::spawn(async {}),
+                async { Ok(()) },
+                Some(cleanup),
+                std::future::pending(),
+                || Ok(()),
+            )
+        });
+        entered.recv_timeout(GATE_TIMEOUT).unwrap();
+        drop(release);
+        thread.join().unwrap().unwrap();
+        let error = smol::block_on(observer.wait()).unwrap_err();
+        assert_eq!(error.to_string(), CLEANUP_ERROR);
+        assert!(!removed.load(Ordering::Acquire));
+    }
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
         "type",
@@ -660,6 +978,168 @@ mod tests {
         }
     }
 
+    struct PendingResource {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        dropped: Arc<AtomicBool>,
+        panic: bool,
+    }
+
+    impl Drop for PendingResource {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(GATE_TIMEOUT).unwrap();
+            self.dropped.store(true, Ordering::Release);
+            if self.panic {
+                panic!("{DESTRUCTOR_PANIC}");
+            }
+        }
+    }
+
+    struct PendingPrintProvider {
+        polled: flume::Sender<()>,
+        resource: Mutex<Option<PendingResource>>,
+    }
+
+    impl maki_providers::provider::Provider for PendingPrintProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [maki_providers::Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_agent::AgentError>,
+        > {
+            let resource = self.resource.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                let _resource = resource;
+                self.polled.send_async(()).await.unwrap();
+                std::future::pending().await
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case(false, false ; "pending destruction acknowledged before timeout return")]
+    #[test_case(true, false ; "pending destructor panic resumes after removal")]
+    #[test_case(true, true ; "body panic wins over pending destructor panic")]
+    fn print_waits_for_actual_headless_future_destruction(
+        destructor_panic: bool,
+        body_panic: bool,
+    ) {
+        let (polled, polled_rx) = flume::bounded(1);
+        let (destroying, destroying_rx) = flume::bounded(1);
+        let (release_drop, release_drop_rx) = flume::bounded(1);
+        let release_drop = ReleaseRemoval(release_drop);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cwd = std::env::temp_dir();
+        let handle = maki_agent::headless::spawn_with_provider(
+            HeadlessParams {
+                model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+                config: AgentConfig::default(),
+                permissions_config: PermissionsConfig::default(),
+                timeouts: Default::default(),
+                input: input("pending provider request"),
+                prompt_slots: Default::default(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: cwd.clone(),
+                system_prompt_override: None,
+                append_system_prompt: None,
+                model_policy: Arc::default(),
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(&cwd),
+                modes: Arc::default(),
+                session_options: Default::default(),
+                state_dir: None,
+            },
+            Arc::new(PendingPrintProvider {
+                polled,
+                resource: Mutex::new(Some(PendingResource {
+                    entered: destroying,
+                    release: release_drop_rx,
+                    dropped: Arc::clone(&dropped),
+                    panic: destructor_panic,
+                })),
+            }),
+        )
+        .unwrap();
+        polled_rx.recv_timeout(GATE_TIMEOUT).unwrap();
+        let (cleanup, removing, release_removal, removed) = gated_cleanup(false);
+        let (completed, returned) = flume::bounded(1);
+        let at_boundary = Arc::clone(&dropped);
+        let thread = std::thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run_and_settle(
+                    handle.task,
+                    handle.teardown.wait(),
+                    Some(cleanup),
+                    async {},
+                    || {
+                        if body_panic {
+                            panic!("{BODY_PANIC}");
+                        }
+                        Ok(())
+                    },
+                )
+            }));
+            assert!(
+                at_boundary.load(Ordering::Acquire),
+                "actual destruction must finish before return or panic"
+            );
+            completed.send(()).unwrap();
+            result
+        });
+        destroying_rx.recv_timeout(GATE_TIMEOUT).unwrap();
+        assert!(
+            removing.try_recv().is_err(),
+            "cleanup must follow actual destruction"
+        );
+        assert!(returned.try_recv().is_err());
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(release_drop);
+        removing.recv_timeout(GATE_TIMEOUT).unwrap();
+        assert!(
+            returned.try_recv().is_err(),
+            "outer catch must wait for removal"
+        );
+        assert!(!removed.load(Ordering::Acquire));
+        drop(release_removal);
+        returned.recv_timeout(GATE_TIMEOUT).unwrap();
+        let result = thread.join().unwrap();
+        assert!(removed.load(Ordering::Acquire));
+        if destructor_panic || body_panic {
+            let panic = result.expect_err("panic must remain a panic");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied());
+            assert_eq!(
+                message,
+                Some(if body_panic {
+                    BODY_PANIC
+                } else {
+                    DESTRUCTOR_PANIC
+                })
+            );
+        } else {
+            result.unwrap().unwrap();
+        }
+    }
+
     /// The provider's report is a rendezvous, so the run can't reach its
     /// cleanup before the saved output below exists.
     #[test]
@@ -698,6 +1178,7 @@ mod tests {
 
         received.recv().unwrap();
         smol::block_on(handle.task);
+        smol::block_on(handle.teardown.wait()).unwrap();
         assert!(!dir.exists(), "print mode must remove its offload dir");
     }
 
@@ -735,6 +1216,7 @@ mod tests {
                 Arc::new(RecordingPrintProvider(requests)),
             )?;
             smol::block_on(handle.task);
+            smol::block_on(handle.teardown.wait()).unwrap();
             Ok(())
         })
         .unwrap();

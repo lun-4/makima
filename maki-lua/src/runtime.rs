@@ -19,6 +19,7 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::hook::{Authority, Verdict};
+use maki_agent::tools::offload::OutputLimits;
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
@@ -4340,6 +4341,10 @@ async fn run_tool_call(
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
+    let Some(agent) = ctx.agent() else {
+        return ToolCallReply::err("tool handler context required");
+    };
+    let output_limits = OutputLimits::from_config(&agent.config);
     let live_sink = ctx.agent().and_then(|agent| agent.live_sink.clone());
     let managed_turn = ctx.agent().and_then(|agent| agent.managed_turn.clone());
     let ctx_ud = match lua.create_userdata(*ctx) {
@@ -4392,10 +4397,16 @@ async fn run_tool_call(
                 dispatch_async(&lua, Arc::clone(&handle), &plugin, &tool, finish_rx).await
             }
             Ok(val) => {
+                if cancel.is_cancelled()
+                    && let Ok(reply) = finish_rx.try_recv()
+                    && reply.has_output_limits()
+                {
+                    return reply;
+                }
                 if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
                     lock_cell(&handle).root_buf = Some(buf);
                 }
-                ToolCallReply::from_lua_value(&lua, &val)
+                ToolCallReply::from_lua_value_with_limits(&lua, &val, output_limits)
             }
             // Bound before the `and_then` so the guard drops before the
             // hooks run: they lock the same cell.

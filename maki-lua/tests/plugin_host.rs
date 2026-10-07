@@ -7371,6 +7371,222 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
     );
 }
 
+const CODE_EXECUTION_BLOCKED_TOOL: &str = "blocked_interpreter_child";
+const CODE_EXECUTION_CANCEL_BODY: &str = "first\nsecond\nthird\nfourth";
+const CODE_EXECUTION_CANCEL_WATCHDOG: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+struct BlockedInterpreterChild {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+impl Tool for BlockedInterpreterChild {
+    fn name(&self) -> &str {
+        CODE_EXECUTION_BLOCKED_TOOL
+    }
+
+    fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+        "waits for the cancellation test".into()
+    }
+
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    fn audience(&self) -> ToolAudience {
+        ToolAudience::MAIN | ToolAudience::INTERPRETER
+    }
+
+    fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl ToolInvocation for BlockedInterpreterChild {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(CODE_EXECUTION_BLOCKED_TOOL.to_owned()))
+    }
+
+    fn execute<'a>(self: Box<Self>, _: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_async().await;
+            ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(String::new().into())))
+        })
+    }
+}
+
+struct ReleaseInterpreterChild(flume::Sender<()>);
+
+impl Drop for ReleaseInterpreterChild {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+#[test]
+fn code_execution_cancel_deferred_output_offloads() {
+    let (reg, host) = builtins_host_with_zero_output_limit("code_execution", ZERO_LINES_OPTION);
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let _release = ReleaseInterpreterChild(release_tx);
+    reg.register(
+        Arc::new(BlockedInterpreterChild {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+        ToolSource::Lua {
+            plugin: Arc::from("cancellation_fixture"),
+        },
+    )
+    .unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
+        Arc::clone(&fs),
+        PathBuf::from("/interpreter-cancel-output"),
+    ))));
+    let mut ctx = fresh_ctx();
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    ctx.offload = Some(store);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    ctx.cancel = token;
+    let (events_tx, events_rx) = flume::unbounded();
+    ctx.event_tx = maki_agent::EventSender::new(events_tx, 0);
+    ctx.tool_use_id = Some("interpreter-cancel-output".to_owned());
+    let invocation = reg.get("code_execution").unwrap().tool.parse(&json!({
+        "code": format!("print({})\nawait {CODE_EXECUTION_BLOCKED_TOOL}()", json!(CODE_EXECUTION_CANCEL_BODY)),
+        "timeout": 10,
+    })).unwrap();
+    let reply = smol::block_on(async {
+        let caller = smol::spawn(async move { invocation.execute(&ctx).await });
+        futures_lite::future::race(entered_rx.recv_async(), async {
+            smol::Timer::after(CODE_EXECUTION_CANCEL_WATCHDOG).await;
+            panic!("code_execution did not enter its blocking child");
+        })
+        .await
+        .unwrap();
+        trigger.cancel();
+        futures_lite::future::race(caller, async {
+            smol::Timer::after(CODE_EXECUTION_CANCEL_WATCHDOG).await;
+            panic!("code_execution cancellation did not settle");
+        })
+        .await
+    });
+    let output = reply.output.unwrap_err();
+    assert!(output.starts_with(OFFLOAD_FOOTER_PREFIX), "{output}");
+    assert!(output.ends_with(BASH_PARTIAL_MARKER), "{output}");
+    let files = fs.files();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, CODE_EXECUTION_CANCEL_BODY.as_bytes());
+    let buf = recv_live_buf(&events_rx, "interpreter-cancel-output").unwrap();
+    assert_eq!(buf.take().text().matches(BASH_PARTIAL_MARKER).count(), 1);
+    drop(host);
+}
+
+const DEFERRED_CALLBACK_BODY: &str = "first\nsecond\nthird\nfourth";
+const DEFERRED_CALLBACK_TRAILER: &str = "Exit code: 3";
+const DEFERRED_CALLBACK_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "deferred_exit", description = "finishes from a job callback",
+    schema = { type = "object", properties = {
+        body = { type = "string" }, is_error = { type = "boolean" }, trailer = { type = "string" },
+    } },
+    handler = function(input, ctx)
+        maki.fn.jobstart("true", {
+            on_exit = function()
+                ctx:finish({
+                    llm_output = input.body, is_error = input.is_error,
+                    output_limits = { max_lines = 0, trailer = input.trailer },
+                })
+            end,
+        })
+        return nil
+    end,
+})
+maki.api.register_tool({
+    name = "memoized_partial", description = "closes partial output once",
+    schema = { type = "object", properties = { body = { type = "string" } } },
+    handler = function(input)
+        local partial = require("maki.partial")
+        local paints, closes = 0, 0
+        local view = {
+            append = function() paints = paints + 1 end,
+            finish = function() closes = closes + 1 end,
+            clear = function() end,
+        }
+        local limits = { max_lines = 0 }
+        local reply = partial.cut(view, input.body, "cancelled", 10, limits)
+        local repeated = partial.cut(view, "changed", "timeout", 10, limits)
+        assert(reply == repeated and paints == 1 and closes == 1)
+        assert(reply.llm_output == input.body and limits.trailer == nil)
+        return reply
+    end,
+})
+"#;
+
+#[test_case::test_case(false; "success")]
+#[test_case::test_case(true; "error")]
+fn job_exit_callback_uses_deferred_output_limits(is_error: bool) {
+    let (reg, host) = builtins_host();
+    host.load_source("deferred_callbacks", DEFERRED_CALLBACK_PLUGIN)
+        .unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
+        Arc::clone(&fs),
+        PathBuf::from("/deferred-callback-output"),
+    ))));
+    let mut ctx = fresh_ctx();
+    ctx.offload = Some(store);
+    let result = exec_with_ctx(
+        &reg,
+        "deferred_exit",
+        json!({
+            "body": DEFERRED_CALLBACK_BODY, "is_error": is_error,
+            "trailer": DEFERRED_CALLBACK_TRAILER,
+        }),
+        &ctx,
+    );
+    assert_eq!(result.is_err(), is_error);
+    let output = match result {
+        Ok(output) | Err(output) => output,
+    };
+    assert!(output.starts_with(OFFLOAD_FOOTER_PREFIX), "{output}");
+    assert!(output.ends_with(DEFERRED_CALLBACK_TRAILER), "{output}");
+    let files = fs.files();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, DEFERRED_CALLBACK_BODY.as_bytes());
+}
+
+#[test]
+fn partial_cut_memoizes_raw_reply_and_paints_marker_once() {
+    let (reg, host) = builtins_host();
+    host.load_source("deferred_callbacks", DEFERRED_CALLBACK_PLUGIN)
+        .unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
+        Arc::clone(&fs),
+        PathBuf::from("/partial-callback-output"),
+    ))));
+    let mut ctx = fresh_ctx();
+    ctx.offload = Some(store);
+    let output = exec_with_ctx(
+        &reg,
+        "memoized_partial",
+        json!({
+            "body": DEFERRED_CALLBACK_BODY,
+        }),
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(output.starts_with(OFFLOAD_FOOTER_PREFIX), "{output}");
+    assert!(output.ends_with(BASH_PARTIAL_MARKER), "{output}");
+    let files = fs.files();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, DEFERRED_CALLBACK_BODY.as_bytes());
+}
+
 /// The store is the host's choice: with an in-memory backend the offloaded
 /// output lands in the in-memory map and nowhere on disk.
 #[test]

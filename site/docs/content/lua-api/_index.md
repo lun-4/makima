@@ -360,6 +360,7 @@ string or a table with richer output fields.
     Must return a string or a table with any of these fields:
     - `llm_output` (`string`) Text sent to the model.
     - `is_error` (`boolean`) When true, the result is treated as an error.
+    - `output_limits` (`table`) Bounds raw plain-text output after the handler or ctx:finish returns. Same options as ctx:limit_output.
     - `content` (`string`) Alias for llm_output (legacy).
     - `body` (`BufHandle`) Rich rendered body shown in the UI.
     - `header` (`BufHandle`) One-line header shown before the body.
@@ -384,7 +385,10 @@ string or a table with richer output fields.
   - `mutable_path` (`string|function`) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
-  Handlers bound their model-facing output with `ctx:limit_output(text, opts)`. Text within `agent.max_output_lines` / `agent.max_output_bytes` comes back unchanged. Longer text is saved to the session's offload store and replaced by a preview plus a footer naming the saved file; without a store it is cut instead. `opts`: `preview` ("head" or "head_tail"), `trailer` (a line that always comes last, never cut), `label` (what the footer calls the output), `lines_clipped` (the text already has long lines cut), `max_lines` / `max_bytes` (per-call limits; zero returns metadata only). Returns `(string, nil)` on success or `(nil, err)` outside a handler.
+  Handlers bound their model-facing output with `ctx:limit_output(text, opts)`. This method yields from handler coroutines while the full limiting operation runs on a worker, including store-lock waits. Text within `agent.max_output_lines` / `agent.max_output_bytes` comes back unchanged. Longer text is saved to the session's offload store and replaced by a preview plus a footer naming the saved file; without a store it is cut instead. `opts`: `preview` ("head" or "head_tail"), `trailer` (a line that always comes last, never cut), `label` (what the footer calls the output), `lines_clipped` (the text already has long lines cut), `max_lines` / `max_bytes` (per-call limits; zero returns metadata only). Returns `(string, nil)` on success or `(nil, err)` outside a handler. Invalid options raise a programmer error.
+
+
+  Job exit and cancellation hooks are synchronous callbacks and cannot yield. They pass the raw body as `llm_output` with `output_limits = opts` to `ctx:finish(reply)` instead. Direct handler returns accept the same reply field. The host applies the limits after receiving the reply, outside the Lua cancellation window, and preserves `is_error`. Deferred limits require plain text and reject image, diff, markdown, and structured `state` replies. The raw text is saved without its trailer. A started worker retains its owned text, options, and store even when its caller is dropped; session cleanup closes the store before removing its files.
 
 
 **Example:**
@@ -6663,11 +6667,9 @@ function M.resolve(opts, ctx)
 -- tells the model that output is real but unfinished. One home for the
 -- wording and the painting, so every tool says it the same way.
 
---- Close {view} on the marker and build the tool reply. {out} is everything
---- the tool streamed, already truncated; empty means the view still shows a
---- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
---- "timeout").
-function M.cut(view, out, reason, timeout_secs)
+--- Close {view} once and return raw output with a deferred marker trailer.
+--- {reason} is a cancel-hook reason ("cancelled" | "timeout").
+function M.cut(view, out, reason, timeout_secs, limits)
 ```
 
 ### `require("maki.plan_spec")`

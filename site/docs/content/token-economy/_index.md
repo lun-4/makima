@@ -50,7 +50,7 @@ one line stays              ~20k tokens never seen
 
 The model can grep the file or page through it with `read`. `read` never saves its own output, so looking at a saved file cannot make another one. Repeated output gets a pointer to the existing file instead of a second copy. The pointer includes inspection advice and any saved-line clipping notice, even when another agent created the file and its first result is absent from the current conversation. Files with long physical lines include bash inspection advice and a quoted shell path when needed.
 
-The files belong to the session: they are deleted with it, one file keeps at most 8 MiB, and a session keeps at most 256 MiB. Nothing cleans up sessions you keep, so their files stay until you delete the session. Print mode (`--print`) deletes its files when the run ends, so a path in its final answer no longer exists afterwards. A session made with `--fork-session` still points into the original session's files.
+The files belong to the session: they are deleted with it, one file keeps at most 8 MiB, and a session keeps at most 256 MiB. Kept sessions retain their files until deletion. A session made with `--fork-session` still points into the original session's files. Print mode (`--print`) closes admission to new saves and waits for in-flight saves and removal before returning, including after a handled output error or before propagating a caught panic. A path in its final answer no longer exists after successful cleanup. Removal failures are logged. Abrupt process termination can leave files behind.
 
 MCP results go through the same limit only when a session has a place to save them; without one they pass through unchanged. [Output hooks](/docs/hooks/#trimming-output) receive the complete MCP result before limiting or saving. A successful hook replacement is saved instead of the original text. Failed, cancelled, or timed-out output hooks retain the documented fail-open behavior.
 
@@ -59,6 +59,8 @@ MCP results go through the same limit only when a session has a place to save th
 Fuzzy `edit` and `multi_edit` matches require full coverage of long lines. Nonblank long lines tolerate indentation changes. A long whitespace-only line requires a byte-identical line in `old_string` for each occurrence. An empty, shorter, or differently spaced blank line does not cover it. Exact substring edits remain available.
 
 **Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
+
+Lua handler calls to `ctx:limit_output` yield while a blocking worker saves output, so other tools on the same Lua host can continue. Synchronous completion and cancellation callbacks use `ctx:finish` with raw `llm_output` and `output_limits` instead. Limits are applied after the terminal reply leaves Lua. Saved partial output contains the raw streamed body, not preview footers or cancellation markers. The partial marker, or a failing bash command's exit code, remains the final trailer. See the [tool API](/docs/lua-api/#maki-api-register_tool).
 
 ## Fewer round-trips
 

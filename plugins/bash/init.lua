@@ -514,15 +514,15 @@ maki.api.register_tool({
       finished = true
       local output = table.concat(output_parts)
       local is_error = exit_code ~= 0
-      local llm_output = "Exit code: " .. exit_code
-      if output ~= "" then
-        llm_output = ctx:limit_output(output, {
-          preview = "head_tail",
-          trailer = is_error and llm_output or nil,
-          max_lines = max_lines,
-          max_bytes = max_bytes,
-        })
-      end
+      local llm_output = output ~= "" and output or "Exit code: " .. exit_code
+      local limits = output ~= ""
+          and {
+            preview = "head_tail",
+            trailer = is_error and "Exit code: " .. exit_code or nil,
+            max_lines = max_lines,
+            max_bytes = max_bytes,
+          }
+        or nil
 
       if output == "" then
         view:clear()
@@ -534,7 +534,7 @@ maki.api.register_tool({
       end
       view:finish()
 
-      ctx:finish({ llm_output = llm_output, is_error = is_error, body = buf })
+      ctx:finish({ llm_output = llm_output, output_limits = limits, is_error = is_error, body = buf })
     end
 
     view:append({ { "Waiting for output...", "dim" } })
@@ -571,11 +571,11 @@ maki.api.register_tool({
         return
       end
       finished = true
-      local out = ctx:limit_output(
-        table.concat(output_parts),
-        { preview = "head_tail", max_lines = max_lines, max_bytes = max_bytes }
-      )
-      ctx:finish(partial.cut(view, out, reason, timeout_secs))
+      ctx:finish(partial.cut(view, table.concat(output_parts), reason, timeout_secs, {
+        preview = "head_tail",
+        max_lines = max_lines,
+        max_bytes = max_bytes,
+      }))
     end)
 
     return nil

@@ -277,21 +277,12 @@ local function handler(input, ctx)
 
   local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
-  -- Memoized, because a cancel reaches us twice: once through the hook and
-  -- again as the interpreter's error, and the view is painted only once.
-  local cut_reply
   local function cut(reason)
-    cut_reply = cut_reply
-      or partial.cut(
-        view,
-        ctx:limit_output(
-          table.concat(output_parts, "\n"),
-          { preview = "head_tail", max_lines = max_lines, max_bytes = max_bytes }
-        ),
-        reason,
-        timeout
-      )
-    return cut_reply
+    return partial.cut(view, table.concat(output_parts, "\n"), reason, timeout, {
+      preview = "head_tail",
+      max_lines = max_lines,
+      max_bytes = max_bytes,
+    })
   end
 
   -- Only for a handler still parked when the host gives up on it: normally

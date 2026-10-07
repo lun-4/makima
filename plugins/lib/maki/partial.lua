@@ -10,11 +10,14 @@ local TIMEOUT_FMT = "[timed out after %ds; %s]"
 local SOME_OUTPUT = "output above is partial"
 local NO_OUTPUT = "no output before the cut"
 
---- Close {view} on the marker and build the tool reply. {out} is everything
---- the tool streamed, already truncated; empty means the view still shows a
---- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
---- "timeout").
-function M.cut(view, out, reason, timeout_secs)
+local replies = setmetatable({}, { __mode = "k" })
+
+--- Close {view} once and return raw output with a deferred marker trailer.
+--- {reason} is a cancel-hook reason ("cancelled" | "timeout").
+function M.cut(view, out, reason, timeout_secs, limits)
+  if replies[view] then
+    return replies[view]
+  end
   local tail = out ~= "" and SOME_OUTPUT or NO_OUTPUT
   local marker = reason == "timeout" and TIMEOUT_FMT:format(timeout_secs, tail) or CANCELLED_FMT:format(tail)
 
@@ -24,11 +27,19 @@ function M.cut(view, out, reason, timeout_secs)
   view:append({ { marker, "dim" } })
   view:finish()
 
-  return {
-    llm_output = (out ~= "" and out .. "\n" or "") .. marker,
+  local output_limits = {}
+  for key, value in pairs(limits or {}) do
+    output_limits[key] = value
+  end
+  output_limits.trailer = marker
+  local reply = {
+    llm_output = out,
+    output_limits = output_limits,
     is_error = true,
     body = view.buf,
   }
+  replies[view] = reply
+  return reply
 end
 
 return M
