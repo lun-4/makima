@@ -4924,7 +4924,9 @@ mod tests {
     }
     use crate::selection::SelectionZone;
     use crossterm::event::KeyModifiers;
-    use maki_agent::tools::offload::{MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError};
+    use maki_agent::tools::offload::{
+        MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError, OffloadSnapshot,
+    };
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
     use maki_providers::TokenUsage;
@@ -6437,8 +6439,8 @@ mod tests {
     }
 
     impl OffloadBackend for GatedQuotaBackend {
-        fn read(&self, _name: &str) -> io::Result<Option<Vec<u8>>> {
-            Ok(None)
+        fn matches(&self, _name: &str, _expected: &[u8]) -> io::Result<bool> {
+            Ok(false)
         }
 
         fn create_new(&self, _name: &str, _bytes: &[u8]) -> io::Result<bool> {
@@ -6448,12 +6450,12 @@ mod tests {
             Ok(true)
         }
 
-        fn names(&self) -> io::Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-
-        fn total_bytes(&self) -> io::Result<u64> {
-            Ok(MAX_OFFLOAD_SESSION_BYTES - u64::from(!self.created.load(Ordering::SeqCst)))
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            Ok(OffloadSnapshot {
+                names: Vec::new(),
+                total_bytes: MAX_OFFLOAD_SESSION_BYTES
+                    - u64::from(!self.created.load(Ordering::SeqCst)),
+            })
         }
 
         fn remove_all(&self) -> io::Result<()> {

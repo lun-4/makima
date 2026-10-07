@@ -2781,6 +2781,7 @@ dependencies = [
  "async-process",
  "base64 0.22.1",
  "bitflags 2.13.1",
+ "criterion",
  "event-listener",
  "flume 0.11.1",
  "futures-lite",
@@ -2813,6 +2814,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "tracing",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -5,11 +5,14 @@
 //! `put` both deduplicates and enforces the session quota, so parallel tools
 //! and subagents sharing a store can't race past either.
 
-use std::fs;
-use std::io::{self, ErrorKind, Write};
+use std::borrow::Cow;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use event_listener::Event;
 use maki_config::AgentConfig;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
@@ -29,6 +32,7 @@ pub const DEFAULT_LABEL: &str = "output";
 const HASH_HEX_CHARS: usize = 16;
 const SLOT_EXT: &str = ".txt";
 const MAX_PUT_ATTEMPTS: usize = 8;
+const COMPARE_CHUNK_BYTES: usize = 16 * 1024;
 const READ_ADVICE: &str = "inspect it with grep, or read with offset and limit";
 const BASH_ADVICE: &str =
     "inspect it with bash (e.g. jq, or cut -c) since some lines exceed agent.max_line_bytes";
@@ -55,13 +59,17 @@ pub enum OffloadError {
 /// Raw file operations under one directory. The store logic sits above this
 /// once, so the disk and in-memory variants can't drift apart.
 pub trait OffloadBackend: Send + Sync {
-    fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>>;
+    fn matches(&self, name: &str, expected: &[u8]) -> io::Result<bool>;
     /// Writes `bytes` under `name` unless the name is taken; false if taken.
     fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool>;
-    fn names(&self) -> io::Result<Vec<String>>;
-    fn total_bytes(&self) -> io::Result<u64>;
+    fn snapshot(&self) -> io::Result<OffloadSnapshot>;
     fn remove_all(&self) -> io::Result<()>;
     fn path(&self, name: &str) -> PathBuf;
+}
+
+pub struct OffloadSnapshot {
+    pub names: Vec<String>,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,14 +94,16 @@ impl Saved {
 
 pub struct OffloadStore {
     backend: Box<dyn OffloadBackend>,
-    closed: Mutex<bool>,
+    closed: AtomicBool,
+    operation: Mutex<()>,
 }
 
 impl OffloadStore {
     pub fn new(backend: Box<dyn OffloadBackend>) -> Self {
         Self {
             backend,
-            closed: Mutex::new(false),
+            closed: AtomicBool::new(false),
+            operation: Mutex::new(()),
         }
     }
 
@@ -113,8 +123,15 @@ impl OffloadStore {
     /// files are compared byte for byte, because the model may have edited
     /// one, so neither a name nor the lowest free slot proves anything.
     pub fn put(&self, body: &str) -> Result<Saved, OffloadError> {
-        let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
-        if *closed {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(OffloadError::Closed);
+        }
+        self.put_serialized(body)
+    }
+
+    fn put_serialized(&self, body: &str) -> Result<Saved, OffloadError> {
+        let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.load(Ordering::Acquire) {
             return Err(OffloadError::Closed);
         }
         let saved_bytes = body.floor_char_boundary(MAX_OFFLOAD_FILE_BYTES);
@@ -127,23 +144,24 @@ impl OffloadStore {
             saved_bytes,
         };
         for _ in 0..MAX_PUT_ATTEMPTS {
-            let slots: Vec<String> = self
-                .backend
-                .names()?
-                .into_iter()
+            let snapshot = self.backend.snapshot()?;
+            let slots: Vec<_> = snapshot
+                .names
+                .iter()
                 .filter(|name| slot_number(name, &hash).is_some())
                 .collect();
             for name in &slots {
-                if self.backend.read(name)?.as_deref() == Some(stored.as_bytes()) {
-                    return Ok(saved(name.clone(), PutOutcome::Existing));
+                if self.backend.matches(name, stored.as_bytes())? {
+                    return Ok(saved((*name).clone(), PutOutcome::Existing));
                 }
             }
-            if self.backend.total_bytes()? + stored.len() as u64 > MAX_OFFLOAD_SESSION_BYTES {
+            if snapshot.total_bytes.saturating_add(stored.len() as u64) > MAX_OFFLOAD_SESSION_BYTES
+            {
                 return Err(OffloadError::Quota);
             }
             let free = (1..)
                 .map(|n| slot_name(&hash, n))
-                .find(|name| !slots.contains(name))
+                .find(|name| !slots.contains(&name))
                 .expect("slot numbers are unbounded");
             if self.backend.create_new(&free, stored.as_bytes())? {
                 return Ok(saved(free, PutOutcome::Created));
@@ -152,12 +170,81 @@ impl OffloadStore {
         Err(OffloadError::SlotsTaken)
     }
 
-    /// Waits for any in-flight `put`, then refuses all later ones and removes
-    /// the files, so a late subagent can't recreate the directory.
+    pub fn request_close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Closes admission immediately, then waits for an in-flight `put` before removal.
     pub fn close_and_remove(&self) -> io::Result<()> {
-        let mut closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
-        *closed = true;
+        self.request_close();
+        self.remove_after_close()
+    }
+
+    fn remove_after_close(&self) -> io::Result<()> {
+        let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
         self.backend.remove_all()
+    }
+}
+
+#[derive(Clone)]
+pub struct OffloadCleanup {
+    shared: Arc<CleanupShared>,
+}
+
+struct CleanupShared {
+    store: Arc<OffloadStore>,
+    requested: AtomicBool,
+    result: Mutex<Option<Result<(), Arc<io::Error>>>>,
+    completed: Event,
+}
+
+impl OffloadCleanup {
+    pub fn new(store: Arc<OffloadStore>) -> Self {
+        Self {
+            shared: Arc::new(CleanupShared {
+                store,
+                requested: AtomicBool::new(false),
+                result: Mutex::new(None),
+                completed: Event::new(),
+            }),
+        }
+    }
+
+    pub fn request(&self) {
+        self.shared.store.request_close();
+        if self.shared.requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        smol::spawn(async move {
+            smol::unblock(move || {
+                let result = shared.store.remove_after_close().map_err(Arc::new);
+                if let Err(error) = &result {
+                    warn!(%error, dir = %shared.store.dir().display(), "offload cleanup failed");
+                }
+                *shared.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                shared.completed.notify(usize::MAX);
+            })
+            .await;
+        })
+        .detach();
+    }
+
+    pub async fn wait(&self) -> Result<(), Arc<io::Error>> {
+        self.request();
+        loop {
+            let listener = self.shared.completed.listen();
+            if let Some(result) = self
+                .shared
+                .result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                return result;
+            }
+            listener.await;
+        }
     }
 }
 
@@ -188,15 +275,108 @@ fn slot_number(name: &str, hash: &str) -> Option<usize> {
     }
 }
 
-fn stored_form(body: &str, saved_bytes: usize) -> String {
+fn stored_form(body: &str, saved_bytes: usize) -> Cow<'_, str> {
     if saved_bytes == body.len() {
-        return body.to_owned();
+        return Cow::Borrowed(body);
     }
-    format!(
+    Cow::Owned(format!(
         "{}\n[offload capped: first {saved_bytes} of {} bytes saved]",
         &body[..saved_bytes],
         body.len()
-    )
+    ))
+}
+
+fn open_regular(path: &Path) -> io::Result<Option<File>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if not_regular_error(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !regular_metadata(&file.metadata()?) {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+fn not_regular_error(error: &io::Error) -> bool {
+    if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ELOOP | libc::ENXIO | libc::ENODEV)
+    ) {
+        return true;
+    }
+    false
+}
+
+fn regular_metadata(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    metadata.is_file()
+}
+
+fn compare_reader(reader: &mut impl Read, expected: &[u8]) -> io::Result<bool> {
+    let mut buffer = [0; COMPARE_CHUNK_BYTES];
+    let mut consumed = 0;
+    loop {
+        let limit = buffer
+            .len()
+            .min(expected.len().saturating_sub(consumed) + 1);
+        let read = match reader.read(&mut buffer[..limit]) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            return Ok(consumed == expected.len());
+        }
+        let end = consumed + read;
+        if end > expected.len() || buffer[..read] != expected[consumed..end] {
+            return Ok(false);
+        }
+        consumed = end;
+    }
+}
+
+fn matches_reader(
+    mut reader: impl Read,
+    expected: &[u8],
+    mut length: impl FnMut() -> io::Result<u64>,
+) -> io::Result<bool> {
+    if length()? != expected.len() as u64 {
+        return Ok(false);
+    }
+    if !compare_reader(&mut reader, expected)? {
+        return Ok(false);
+    }
+    Ok(length()? == expected.len() as u64)
+}
+
+fn matches_open_file(file: File, expected: &[u8]) -> io::Result<bool> {
+    matches_reader(&file, expected, || Ok(file.metadata()?.len()))
 }
 
 pub struct DiskBackend {
@@ -224,11 +404,10 @@ impl DiskBackend {
 }
 
 impl OffloadBackend for DiskBackend {
-    fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
-        match fs::read(self.dir.join(name)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+    fn matches(&self, name: &str, expected: &[u8]) -> io::Result<bool> {
+        match open_regular(&self.dir.join(name))? {
+            Some(file) => matches_open_file(file, expected),
+            None => Ok(false),
         }
     }
 
@@ -243,23 +422,25 @@ impl OffloadBackend for DiskBackend {
         }
     }
 
-    /// Every entry, not only regular files: a directory or dangling symlink
-    /// at a slot name still takes that name.
-    fn names(&self) -> io::Result<Vec<String>> {
-        Ok(self
-            .entries()?
-            .into_iter()
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .collect())
-    }
-
-    fn total_bytes(&self) -> io::Result<u64> {
-        self.entries()?
-            .into_iter()
-            .map(|entry| entry.metadata())
-            .filter(|meta| meta.as_ref().map_or(true, |meta| meta.is_file()))
-            .map(|meta| meta.map(|meta| meta.len()))
-            .sum()
+    fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+        let mut snapshot = OffloadSnapshot {
+            names: Vec::new(),
+            total_bytes: 0,
+        };
+        for entry in self.entries()? {
+            if let Ok(name) = entry.file_name().into_string() {
+                snapshot.names.push(name);
+            }
+            match entry.metadata() {
+                Ok(metadata) if regular_metadata(&metadata) => {
+                    snapshot.total_bytes = snapshot.total_bytes.saturating_add(metadata.len());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(snapshot)
     }
 
     fn remove_all(&self) -> io::Result<()> {
@@ -557,9 +738,16 @@ fn head_tail(body: &str, budget: Budget) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod offload_benchmark_fixtures {
+        include!("offload_benchmark_fixtures.rs");
+    }
+
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Barrier};
+    use std::io::Cursor;
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
+    use std::time::Duration;
 
     use tempfile::TempDir;
     use test_case::test_case;
@@ -567,6 +755,11 @@ mod tests {
     use super::*;
 
     const BIG: usize = 100_000;
+    const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+    const TEST_BODY: &str = "stored body";
+    const REMOVE_ERROR: &str = "remove denied";
+    const CREATE_EVENT: &str = "create";
+    const REMOVE_EVENT: &str = "remove";
     const SHORT_TRAILER: &str = "Exit code: 3";
     const LONG_TRAILER: &str = "Exit code: 3 after a trailer long enough to eat a real share of the byte budget, as a long path or reason would";
 
@@ -577,8 +770,8 @@ mod tests {
     }
 
     impl OffloadBackend for Arc<MapBackend> {
-        fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
-            Ok(self.files.lock().unwrap().get(name).cloned())
+        fn matches(&self, name: &str, expected: &[u8]) -> io::Result<bool> {
+            Ok(self.files.lock().unwrap().get(name).map(Vec::as_slice) == Some(expected))
         }
         fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
             if self.fail {
@@ -591,17 +784,12 @@ mod tests {
             files.insert(name.to_owned(), bytes.to_vec());
             Ok(true)
         }
-        fn names(&self) -> io::Result<Vec<String>> {
-            Ok(self.files.lock().unwrap().keys().cloned().collect())
-        }
-        fn total_bytes(&self) -> io::Result<u64> {
-            Ok(self
-                .files
-                .lock()
-                .unwrap()
-                .values()
-                .map(|v| v.len() as u64)
-                .sum())
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            let files = self.files.lock().unwrap();
+            Ok(OffloadSnapshot {
+                names: files.keys().cloned().collect(),
+                total_bytes: files.values().map(|v| v.len() as u64).sum(),
+            })
         }
         fn remove_all(&self) -> io::Result<()> {
             self.files.lock().unwrap().clear();
@@ -1022,7 +1210,7 @@ mod tests {
             .filter(|ok| *ok)
             .count();
         assert_eq!(stored, 3);
-        assert!(backend.total_bytes().unwrap() <= MAX_OFFLOAD_SESSION_BYTES);
+        assert!(backend.snapshot().unwrap().total_bytes <= MAX_OFFLOAD_SESSION_BYTES);
     }
 
     #[test]
@@ -1102,8 +1290,8 @@ mod tests {
     }
 
     impl OffloadBackend for GatedBackend {
-        fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
-            self.inner.read(name)
+        fn matches(&self, name: &str, expected: &[u8]) -> io::Result<bool> {
+            self.inner.matches(name, expected)
         }
         fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
             self.entered.send(()).unwrap();
@@ -1111,11 +1299,8 @@ mod tests {
             self.events.lock().unwrap().push("create");
             self.inner.create_new(name, bytes)
         }
-        fn names(&self) -> io::Result<Vec<String>> {
-            self.inner.names()
-        }
-        fn total_bytes(&self) -> io::Result<u64> {
-            self.inner.total_bytes()
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            self.inner.snapshot()
         }
         fn remove_all(&self) -> io::Result<()> {
             self.events.lock().unwrap().push("remove");
@@ -1166,6 +1351,565 @@ mod tests {
             "removed after the put"
         );
         assert!(matches!(store.put("late"), Err(OffloadError::Closed)));
+    }
+
+    #[test_case(-1; "shrinking_reader")]
+    #[test_case(0; "equal_reader")]
+    #[test_case(1; "growing_reader")]
+    fn comparison_reader_is_bounded(delta: isize) {
+        struct CountingReader {
+            reader: Cursor<Vec<u8>>,
+            bytes: usize,
+            largest_request: usize,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.largest_request = self.largest_request.max(buffer.len());
+                let read = self.reader.read(buffer)?;
+                self.bytes += read;
+                Ok(read)
+            }
+        }
+        let expected = vec![b'x'; COMPARE_CHUNK_BYTES * 2];
+        let actual_len = expected.len().checked_add_signed(delta).unwrap();
+        let mut reader = CountingReader {
+            reader: Cursor::new(vec![b'x'; actual_len]),
+            bytes: 0,
+            largest_request: 0,
+        };
+        assert_eq!(compare_reader(&mut reader, &expected).unwrap(), delta == 0);
+        assert!(reader.bytes <= expected.len() + 1);
+        assert!(reader.largest_request <= COMPARE_CHUNK_BYTES);
+    }
+
+    #[test_case(-1; "shrunk_after_read")]
+    #[test_case(1; "grown_after_read")]
+    fn comparison_rechecks_opened_handle_length(delta: isize) {
+        let expected = TEST_BODY.as_bytes();
+        let mut lengths = [
+            expected.len() as u64,
+            expected.len().checked_add_signed(delta).unwrap() as u64,
+        ]
+        .into_iter();
+        assert!(
+            !matches_reader(Cursor::new(expected), expected, || {
+                Ok(lengths.next().unwrap())
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn comparison_rejects_wrong_initial_length_without_reading() {
+        struct NeverRead;
+        impl Read for NeverRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                panic!("initial size mismatch must not read")
+            }
+        }
+        assert!(!matches_reader(NeverRead, TEST_BODY.as_bytes(), || Ok(0)).unwrap());
+    }
+
+    #[test]
+    fn comparison_propagates_read_errors() {
+        struct FailedReader;
+        impl Read for FailedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(ErrorKind::PermissionDenied))
+            }
+        }
+        assert_eq!(
+            compare_reader(&mut FailedReader, TEST_BODY.as_bytes())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    fn symlink_file(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    fn symlink_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn symlink_swap_before_open_is_not_followed() {
+        let root = TempDir::new().unwrap();
+        let backend = DiskBackend {
+            dir: root.path().join("store"),
+        };
+        backend.create_new("slot", TEST_BODY.as_bytes()).unwrap();
+        let snapshot = backend.snapshot().unwrap();
+        let path = backend.path("slot");
+        let target = root.path().join("outside");
+        fs::write(&target, TEST_BODY).unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink_file(&target, &path);
+        assert!(snapshot.names.iter().any(|name| name == "slot"));
+        assert!(!backend.matches("slot", TEST_BODY.as_bytes()).unwrap());
+        assert_eq!(backend.snapshot().unwrap().total_bytes, 0);
+        assert_eq!(fs::read(&target).unwrap(), TEST_BODY.as_bytes());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replacement_after_open_does_not_change_compared_handle() {
+        let root = TempDir::new().unwrap();
+        let backend = DiskBackend {
+            dir: root.path().to_owned(),
+        };
+        backend.create_new("slot", TEST_BODY.as_bytes()).unwrap();
+        let opened = open_regular(&backend.path("slot")).unwrap().unwrap();
+        fs::rename(backend.path("slot"), backend.path("original")).unwrap();
+        let target = root.path().join("outside");
+        fs::write(&target, "replacement").unwrap();
+        symlink_file(&target, &backend.path("slot"));
+        assert!(matches_open_file(opened, TEST_BODY.as_bytes()).unwrap());
+        assert!(!backend.matches("slot", TEST_BODY.as_bytes()).unwrap());
+        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test_case("directory"; "directory")]
+    #[test_case("file_link"; "file_link")]
+    #[test_case("directory_link"; "directory_link")]
+    #[test_case("dangling_link"; "dangling_link")]
+    #[test_case("oversized"; "oversized")]
+    fn wrong_disk_occupants_are_preserved(kind: &str) {
+        let root = TempDir::new().unwrap();
+        let store = OffloadStore::on_disk(root.path().join("store"));
+        let first = store.put(TEST_BODY).unwrap();
+        let path = store.path_of(&first);
+        fs::remove_file(&path).unwrap();
+        let target = root.path().join("outside");
+        let expected_bytes = match kind {
+            "directory" => {
+                fs::create_dir(&path).unwrap();
+                0
+            }
+            "file_link" => {
+                fs::write(&target, TEST_BODY).unwrap();
+                symlink_file(&target, &path);
+                0
+            }
+            "directory_link" => {
+                fs::create_dir(&target).unwrap();
+                symlink_dir(&target, &path);
+                0
+            }
+            "dangling_link" => {
+                symlink_file(&target, &path);
+                0
+            }
+            "oversized" => {
+                let file = File::create(&path).unwrap();
+                let len = MAX_OFFLOAD_FILE_BYTES as u64 + 1;
+                file.set_len(len).unwrap();
+                len
+            }
+            _ => unreachable!(),
+        };
+        let snapshot = store.backend.snapshot().unwrap();
+        assert!(snapshot.names.contains(&first.name));
+        assert_eq!(snapshot.total_bytes, expected_bytes);
+        let next = store.put(TEST_BODY).unwrap();
+        assert_eq!(next.outcome, PutOutcome::Created);
+        assert_ne!(next.name, first.name);
+        match kind {
+            "directory" => assert!(path.is_dir()),
+            "oversized" => assert_eq!(fs::metadata(&path).unwrap().len(), expected_bytes),
+            _ => assert_eq!(fs::read_link(&path).unwrap(), target),
+        }
+        if kind == "file_link" {
+            assert_eq!(fs::read(&target).unwrap(), TEST_BODY.as_bytes());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test_case(false; "fifo")]
+    #[test_case(true; "socket")]
+    fn special_occupants_do_not_block_and_are_preserved(socket: bool) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        use std::os::unix::net::UnixListener;
+
+        struct SupervisedPut {
+            path: PathBuf,
+            fifo: Option<File>,
+            worker: Option<thread::JoinHandle<()>>,
+        }
+        impl Drop for SupervisedPut {
+            fn drop(&mut self) {
+                if let Some(worker) = self.worker.take() {
+                    if self.fifo.is_some() {
+                        // Release a regressed reader whether it is opening or reading the FIFO.
+                        let _ = fs::remove_file(&self.path);
+                        let _ = fs::write(&self.path, TEST_BODY);
+                        self.fifo.take();
+                    }
+                    let _ = worker.join();
+                }
+            }
+        }
+        let root = TempDir::new().unwrap();
+        let store = Arc::new(OffloadStore::on_disk(root.path().join("store")));
+        let first = store.put(TEST_BODY).unwrap();
+        let path = store.path_of(&first);
+        fs::remove_file(&path).unwrap();
+        let listener = socket.then(|| UnixListener::bind(&path).unwrap());
+        let fifo = if socket {
+            None
+        } else {
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), DIR_MODE) }, 0);
+            Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                    .unwrap(),
+            )
+        };
+        let (done_tx, done_rx) = flume::bounded(1);
+        let worker = thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                done_tx.send(store.put(TEST_BODY)).unwrap();
+            }
+        });
+        let mut supervised = SupervisedPut {
+            path: path.clone(),
+            fifo,
+            worker: Some(worker),
+        };
+        let saved = done_rx
+            .recv_timeout(GATE_TIMEOUT)
+            .expect("special occupant blocked put")
+            .unwrap();
+        supervised.worker.take().unwrap().join().unwrap();
+        assert_eq!(saved.outcome, PutOutcome::Created);
+        assert_ne!(saved.name, first.name);
+        let kind = fs::symlink_metadata(&path).unwrap().file_type();
+        assert!(if socket {
+            kind.is_socket()
+        } else {
+            kind.is_fifo()
+        });
+        drop(listener);
+    }
+
+    struct CountingBackend {
+        inner: Arc<MapBackend>,
+        snapshots: Arc<AtomicUsize>,
+        collisions: AtomicUsize,
+    }
+
+    impl OffloadBackend for CountingBackend {
+        fn matches(&self, name: &str, expected: &[u8]) -> io::Result<bool> {
+            self.inner.matches(name, expected)
+        }
+        fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
+            if self
+                .collisions
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                self.inner
+                    .files
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_owned(), Vec::new());
+                return Ok(false);
+            }
+            self.inner.create_new(name, bytes)
+        }
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            self.snapshots.fetch_add(1, Ordering::SeqCst);
+            self.inner.snapshot()
+        }
+        fn remove_all(&self) -> io::Result<()> {
+            self.inner.remove_all()
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.inner.path(name)
+        }
+    }
+
+    #[test_case(0; "ordinary_put")]
+    #[test_case(1; "collision_resnapshots")]
+    fn put_takes_one_snapshot_per_attempt(collisions: usize) {
+        let inner = Arc::new(MapBackend::default());
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let store = OffloadStore::new(Box::new(CountingBackend {
+            inner,
+            snapshots: Arc::clone(&snapshots),
+            collisions: AtomicUsize::new(collisions),
+        }));
+        let first = store.put(TEST_BODY).unwrap();
+        assert_eq!(first.outcome, PutOutcome::Created);
+        assert_eq!(snapshots.load(Ordering::SeqCst), collisions + 1);
+        snapshots.store(0, Ordering::SeqCst);
+        assert_eq!(store.put(TEST_BODY).unwrap().outcome, PutOutcome::Existing);
+        assert_eq!(snapshots.load(Ordering::SeqCst), 1);
+    }
+
+    struct CleanupBackend {
+        put_entered: flume::Sender<()>,
+        put_release: flume::Receiver<()>,
+        remove_entered: flume::Sender<()>,
+        remove_release: flume::Receiver<()>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+
+    impl OffloadBackend for CleanupBackend {
+        fn matches(&self, _name: &str, _expected: &[u8]) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            Ok(OffloadSnapshot {
+                names: Vec::new(),
+                total_bytes: 0,
+            })
+        }
+        fn create_new(&self, _name: &str, _bytes: &[u8]) -> io::Result<bool> {
+            self.put_entered.send(()).unwrap();
+            self.put_release.recv().unwrap();
+            self.events.lock().unwrap().push(CREATE_EVENT);
+            Ok(true)
+        }
+        fn remove_all(&self) -> io::Result<()> {
+            self.remove_entered.send(()).unwrap();
+            self.remove_release.recv().unwrap();
+            self.events.lock().unwrap().push(REMOVE_EVENT);
+            if self.fail {
+                Err(io::Error::other(REMOVE_ERROR))
+            } else {
+                Ok(())
+            }
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            PathBuf::from("/offload").join(name)
+        }
+    }
+
+    struct CleanupDrain {
+        cleanup: OffloadCleanup,
+        put_release: flume::Sender<()>,
+        remove_release: flume::Sender<()>,
+        putter: Option<thread::JoinHandle<Result<Saved, OffloadError>>>,
+    }
+
+    impl Drop for CleanupDrain {
+        fn drop(&mut self) {
+            let _ = self.put_release.send(());
+            let _ = self.remove_release.send(());
+            if let Some(putter) = self.putter.take() {
+                let _ = putter.join();
+            }
+            let _ = smol::block_on(self.cleanup.wait());
+        }
+    }
+
+    #[test_case(false; "success")]
+    #[test_case(true; "failure")]
+    fn cleanup_request_is_nonblocking_ordered_and_idempotent(fail: bool) {
+        let (put_entered_tx, put_entered_rx) = flume::unbounded();
+        let (put_release_tx, put_release_rx) = flume::unbounded();
+        let (remove_entered_tx, remove_entered_rx) = flume::unbounded();
+        let (remove_release_tx, remove_release_rx) = flume::unbounded();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(OffloadStore::new(Box::new(CleanupBackend {
+            put_entered: put_entered_tx,
+            put_release: put_release_rx,
+            remove_entered: remove_entered_tx,
+            remove_release: remove_release_rx,
+            events: Arc::clone(&events),
+            fail,
+        })));
+        let cleanup = OffloadCleanup::new(Arc::clone(&store));
+        let putter = thread::spawn({
+            let store = Arc::clone(&store);
+            move || store.put(TEST_BODY)
+        });
+        let mut drain = CleanupDrain {
+            cleanup: cleanup.clone(),
+            put_release: put_release_tx,
+            remove_release: remove_release_tx,
+            putter: Some(putter),
+        };
+        put_entered_rx.recv_timeout(GATE_TIMEOUT).unwrap();
+        const REQUESTERS: usize = 4;
+        let barrier = Arc::new(Barrier::new(REQUESTERS));
+        let (requested_tx, requested_rx) = flume::unbounded();
+        let requesters: Vec<_> = (0..REQUESTERS)
+            .map(|_| {
+                let cleanup = cleanup.clone();
+                let barrier = Arc::clone(&barrier);
+                let requested_tx = requested_tx.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    cleanup.request();
+                    drop(cleanup);
+                    let _ = requested_tx.send(());
+                })
+            })
+            .collect();
+        let requested: Result<Vec<_>, _> = (0..REQUESTERS)
+            .map(|_| requested_rx.recv_timeout(GATE_TIMEOUT))
+            .collect();
+        if requested.is_err() {
+            let _ = drain.put_release.send(());
+            let _ = drain.remove_release.send(());
+        }
+        for requester in requesters {
+            let _ = requester.join();
+        }
+        requested.expect("cleanup request or drop blocked on backend I/O");
+        let mut wait = Box::pin(cleanup.wait());
+        assert!(smol::block_on(futures_lite::future::poll_once(&mut wait)).is_none());
+        drop(wait);
+        cleanup.request();
+        cleanup.clone().request();
+        drop(cleanup.clone());
+        assert!(matches!(store.put("late"), Err(OffloadError::Closed)));
+        assert!(events.lock().unwrap().is_empty());
+        drain.put_release.send(()).unwrap();
+        drain.putter.take().unwrap().join().unwrap().unwrap();
+        remove_entered_rx.recv_timeout(GATE_TIMEOUT).unwrap();
+        let mut first_waiter = Box::pin(cleanup.wait());
+        assert!(smol::block_on(futures_lite::future::poll_once(&mut first_waiter)).is_none());
+        drain.remove_release.send(()).unwrap();
+        let first = smol::block_on(first_waiter);
+        let late = smol::block_on(cleanup.wait());
+        match (first, late) {
+            (Ok(()), Ok(())) => assert!(!fail),
+            (Err(first), Err(late)) => {
+                assert!(fail);
+                assert_eq!(first.to_string(), REMOVE_ERROR);
+                assert!(Arc::ptr_eq(&first, &late));
+            }
+            _ => panic!("cleanup waiters disagreed"),
+        }
+        assert_eq!(*events.lock().unwrap(), [CREATE_EVENT, REMOVE_EVENT]);
+        assert!(matches!(store.put("later"), Err(OffloadError::Closed)));
+    }
+
+    #[test]
+    fn queued_put_rejects_after_closure_without_backend_work() {
+        let inner = Arc::new(MapBackend::default());
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(OffloadStore::new(Box::new(CountingBackend {
+            inner,
+            snapshots: Arc::clone(&snapshots),
+            collisions: AtomicUsize::new(0),
+        })));
+        let operation = store.operation.lock().unwrap();
+        let putter = thread::spawn({
+            let store = Arc::clone(&store);
+            move || store.put_serialized(TEST_BODY)
+        });
+        store.request_close();
+        drop(operation);
+        assert!(matches!(putter.join().unwrap(), Err(OffloadError::Closed)));
+        assert_eq!(snapshots.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn capped_comparison_includes_note_and_never_reads_beyond_expected_plus_one() {
+        struct CountingReader {
+            bytes: Vec<u8>,
+            consumed: usize,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = buffer.len().min(self.bytes.len() - self.consumed);
+                buffer[..count].copy_from_slice(&self.bytes[self.consumed..self.consumed + count]);
+                self.consumed += count;
+                Ok(count)
+            }
+        }
+        let body = "x".repeat(MAX_OFFLOAD_FILE_BYTES + COMPARE_CHUNK_BYTES);
+        let expected = stored_form(&body, MAX_OFFLOAD_FILE_BYTES);
+        assert!(expected.len() > MAX_OFFLOAD_FILE_BYTES);
+        let mut equal = CountingReader {
+            bytes: expected.as_bytes().to_vec(),
+            consumed: 0,
+        };
+        assert!(compare_reader(&mut equal, expected.as_bytes()).unwrap());
+        assert_eq!(equal.consumed, expected.len());
+        let mut growing = CountingReader {
+            bytes: [expected.as_bytes(), body.as_bytes()].concat(),
+            consumed: 0,
+        };
+        assert!(!compare_reader(&mut growing, expected.as_bytes()).unwrap());
+        assert_eq!(growing.consumed, expected.len() + 1);
+        let mut changed_note = expected.as_bytes().to_vec();
+        *changed_note.last_mut().unwrap() = b'!';
+        assert!(!compare_reader(&mut Cursor::new(changed_note), expected.as_bytes()).unwrap());
+    }
+
+    #[test_case(ErrorKind::NotFound, true; "disappeared")]
+    #[test_case(ErrorKind::NotADirectory, true; "not_directory")]
+    #[test_case(ErrorKind::PermissionDenied, false; "access_failure")]
+    #[test_case(ErrorKind::Other, false; "io_failure")]
+    fn expected_occupant_errors_only_are_ignored(kind: ErrorKind, ignored: bool) {
+        assert_eq!(not_regular_error(&io::Error::from(kind)), ignored);
+    }
+
+    #[cfg(unix)]
+    #[test_case(libc::ELOOP; "symlink")]
+    #[test_case(libc::ENXIO; "socket")]
+    #[test_case(libc::ENODEV; "device")]
+    fn unix_special_occupant_errors_are_ignored(code: i32) {
+        assert!(not_regular_error(&io::Error::from_raw_os_error(code)));
+    }
+
+    #[test]
+    fn disappeared_entry_is_ignored_by_snapshot() {
+        let root = TempDir::new().unwrap();
+        let backend = DiskBackend {
+            dir: root.path().to_owned(),
+        };
+        backend.create_new("slot", TEST_BODY.as_bytes()).unwrap();
+        let entries = backend.entries().unwrap();
+        fs::remove_file(backend.path("slot")).unwrap();
+        assert!(open_regular(&entries[0].path()).unwrap().is_none());
+        assert_eq!(backend.snapshot().unwrap().total_bytes, 0);
+    }
+
+    #[test]
+    fn offload_benchmark_fixtures_reset_per_sample() {
+        for artifact_count in [10, 100, 1000] {
+            let new_sample = offload_benchmark_fixtures::Fixture::new(artifact_count).unwrap();
+            assert_eq!(new_sample.file_count().unwrap(), artifact_count);
+            new_sample.put_new().unwrap();
+            assert_eq!(new_sample.file_count().unwrap(), artifact_count + 1);
+
+            let duplicate_sample =
+                offload_benchmark_fixtures::Fixture::new(artifact_count).unwrap();
+            assert_eq!(duplicate_sample.file_count().unwrap(), artifact_count);
+            duplicate_sample.put_duplicate().unwrap();
+            assert_eq!(duplicate_sample.file_count().unwrap(), artifact_count);
+
+            let sequence_sample = offload_benchmark_fixtures::Fixture::new(artifact_count).unwrap();
+            assert_eq!(sequence_sample.file_count().unwrap(), artifact_count);
+            sequence_sample.put_sequence().unwrap();
+            assert_eq!(sequence_sample.file_count().unwrap(), artifact_count * 2);
+        }
     }
 
     #[test_case(Some("abc") ; "some_session_maps_to_sessions_offload_id")]

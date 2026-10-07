@@ -7,7 +7,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use globset::{Glob, GlobMatcher};
 use maki_agent::tools::grep::GrepParams;
-use maki_agent::tools::offload::OffloadBackend;
+use maki_agent::tools::offload::{OffloadBackend, OffloadSnapshot};
 use maki_agent::{GrepFileEntry, GrepLine, GrepMatchGroup};
 use regex::Regex;
 
@@ -99,30 +99,13 @@ impl InMemoryOffloadBackend {
     pub fn new(fs: Arc<InMemoryFs>, dir: PathBuf) -> Self {
         Self { fs, dir }
     }
-
-    fn files_in_dir(inner: &Inner, dir: &Path) -> Vec<(String, usize)> {
-        inner
-            .entries
-            .iter()
-            .filter(|(path, _)| path.parent() == Some(dir))
-            .filter_map(|(path, entry)| match entry {
-                Entry::File(bytes, _) => Some((
-                    path.file_name()?.to_string_lossy().into_owned(),
-                    bytes.len(),
-                )),
-                Entry::Dir => None,
-            })
-            .collect()
-    }
 }
 
 impl OffloadBackend for InMemoryOffloadBackend {
-    fn read(&self, name: &str) -> IoResult<Option<Vec<u8>>> {
+    fn matches(&self, name: &str, expected: &[u8]) -> IoResult<bool> {
         let inner = self.fs.inner.read().unwrap();
-        Ok(match inner.entries.get(&self.dir.join(name)) {
-            Some(Entry::File(bytes, _)) => Some(bytes.clone()),
-            _ => None,
-        })
+        Ok(matches!(inner.entries.get(&self.dir.join(name)),
+            Some(Entry::File(bytes, _)) if bytes == expected))
     }
 
     fn create_new(&self, name: &str, bytes: &[u8]) -> IoResult<bool> {
@@ -137,20 +120,25 @@ impl OffloadBackend for InMemoryOffloadBackend {
         Ok(true)
     }
 
-    fn names(&self) -> IoResult<Vec<String>> {
+    fn snapshot(&self) -> IoResult<OffloadSnapshot> {
         let inner = self.fs.inner.read().unwrap();
-        Ok(Self::files_in_dir(&inner, &self.dir)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect())
-    }
-
-    fn total_bytes(&self) -> IoResult<u64> {
-        let inner = self.fs.inner.read().unwrap();
-        Ok(Self::files_in_dir(&inner, &self.dir)
-            .into_iter()
-            .map(|(_, len)| len as u64)
-            .sum())
+        let mut snapshot = OffloadSnapshot {
+            names: Vec::new(),
+            total_bytes: 0,
+        };
+        for (path, entry) in inner
+            .entries
+            .iter()
+            .filter(|(path, _)| path.parent() == Some(self.dir.as_path()))
+        {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                snapshot.names.push(name.to_owned());
+            }
+            if let Entry::File(bytes, _) = entry {
+                snapshot.total_bytes = snapshot.total_bytes.saturating_add(bytes.len() as u64);
+            }
+        }
+        Ok(snapshot)
     }
 
     fn remove_all(&self) -> IoResult<()> {
@@ -528,6 +516,25 @@ mod tests {
         smol::block_on(fs.write(PathBuf::from("/t/a.rs"), b"fn a()".to_vec())).unwrap();
         smol::block_on(fs.write(PathBuf::from("/t/b.txt"), b"hello".to_vec())).unwrap();
         fs
+    }
+
+    #[test]
+    fn offload_snapshot_reserves_directory_names_and_counts_only_direct_files() {
+        const BODY: &[u8] = b"saved";
+        let fs = Arc::new(InMemoryFs::new());
+        let dir = PathBuf::from(ROOT).join("offload");
+        let backend = InMemoryOffloadBackend::new(Arc::clone(&fs), dir.clone());
+        smol::block_on(fs.mkdir(dir.join("occupied"), true)).unwrap();
+        fs.seed(&dir.join("occupied").join("nested"), b"not direct".to_vec());
+        assert!(backend.create_new("file", BODY).unwrap());
+        assert!(!backend.create_new("occupied", BODY).unwrap());
+        assert!(!backend.matches("occupied", BODY).unwrap());
+        assert!(backend.matches("file", BODY).unwrap());
+        let snapshot = backend.snapshot().unwrap();
+        assert_eq!(snapshot.names, ["file", "occupied"]);
+        assert_eq!(snapshot.total_bytes, BODY.len() as u64);
+        backend.remove_all().unwrap();
+        assert!(backend.snapshot().unwrap().names.is_empty());
     }
 
     #[test]
