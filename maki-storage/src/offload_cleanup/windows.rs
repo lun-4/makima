@@ -5,7 +5,7 @@ use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::path::{Component, Path};
+use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::slice;
 
