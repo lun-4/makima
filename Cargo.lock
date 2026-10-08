@@ -3069,7 +3069,7 @@ dependencies = [
  "getrandom 0.3.4",
  "isahc",
  "maki-domain",
- "rustix",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "smol",
