@@ -2725,7 +2725,6 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "flume 0.11.1",
- "futures",
  "futures-lite",
  "isahc",
  "libc",
