@@ -31,6 +31,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
+pub use offload_cleanup::remove_offload_dir_from;
 use paths::state_dir;
 
 #[cfg(windows)]

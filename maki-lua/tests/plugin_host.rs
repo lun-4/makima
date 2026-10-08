@@ -10,9 +10,7 @@ use maki_agent::template::Vars;
 use maki_agent::tools::hook::{
     HookCall, HookStage, OUTPUT_TEXT, OUTPUT_TRAILER, ToolHook, Verdict,
 };
-use maki_agent::tools::offload::{
-    LINE_CUT_PREFIX, OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore,
-};
+use maki_agent::tools::offload::{LINE_CUT_PREFIX, OffloadStore};
 use maki_agent::tools::{
     BoxFuture, CallOrigin, DescriptionContext, ExecFuture, FILE_TRUNCATED_MARKER, HeaderFuture,
     HeaderResult, ParseError, QuestionMode, Tool, ToolAudience, ToolContext, ToolExecResult,
@@ -52,11 +50,8 @@ const SHADOWED_TOOL: &str = "skill";
 const REPLACEMENT_PLUGIN: &str = "my_skill";
 const REPLACEMENT_DESC: &str = "took the builtin name over";
 const ZERO_LINES_OPTION: &str = "max_output_lines";
-const ZERO_BYTES_OPTION: &str = "max_output_bytes";
-const ZERO_GLOB_FILE: &str = "zero-limit.txt";
 const ZERO_BASH_COMMAND: &str = "printf '%s%s\\n' X Y";
 const ZERO_BASH_TIMEOUT_SECS: u64 = 10;
-const BASH_FAILURE_EXIT_LINE: &str = "Exit code: 3";
 
 struct FakeCommandHost;
 
@@ -7067,7 +7062,6 @@ const OFFLOAD_SECRET: &str = "offload-secret";
 const OFFLOAD_REDACTED: &str = "redacted";
 const OFFLOAD_DENIED: &str = "output denied";
 const OFFLOAD_HOOK_ID: &str = "offload-hook-test";
-const OFFLOAD_SECRET_COMMAND: &str = "printf 'head\noffload-secret\ntail\n'";
 
 struct OffloadOutputHook {
     deny: bool,
@@ -7104,36 +7098,10 @@ impl ToolHook for OffloadOutputHook {
     }
 }
 
-#[test_case::test_case("glob", false; "immediate_redaction")]
-#[test_case::test_case("glob", true; "immediate_denial")]
-#[test_case::test_case("bash", false; "deferred_redaction")]
-#[test_case::test_case("bash", true; "deferred_denial")]
-#[test_case::test_case("trailer_probe", false; "trailer_redaction")]
-#[test_case::test_case("trailer_probe", true; "trailer_denial")]
-fn builtin_output_hook_precedes_offload(tool: &str, deny: bool) {
-    let (reg, host) = if tool == "trailer_probe" {
-        builtins_host()
-    } else {
-        builtins_host_with_zero_output_limit(tool, ZERO_LINES_OPTION)
-    };
-    if tool == "trailer_probe" {
-        host.load_source(
-            "trailer_probe",
-            &format!(
-                r#"
-            maki.api.register_tool({{
-                name = "trailer_probe", description = "trailer output probe",
-                schema = {{ type = "object", properties = {{}} }},
-                handler = function()
-                    return {{ llm_output = "head", is_error = true,
-                        output_limits = {{ max_lines = 0, trailer = "{OFFLOAD_SECRET}" }} }}
-                end,
-            }})
-        "#
-            ),
-        )
-        .unwrap();
-    }
+#[test_case::test_case(false; "redaction")]
+#[test_case::test_case(true; "denial")]
+fn builtin_output_hook_precedes_offload(deny: bool) {
+    let (reg, host) = builtins_host_with_zero_output_limit("glob", ZERO_LINES_OPTION);
     let store_dir = tempfile::tempdir().unwrap();
     let work_dir = tempfile::tempdir().unwrap();
     std::fs::write(work_dir.path().join(OFFLOAD_SECRET), "").unwrap();
@@ -7141,34 +7109,23 @@ fn builtin_output_hook_precedes_offload(tool: &str, deny: bool) {
     reg.set_hook(OffloadOutputHook { deny });
     ctx.registry = Arc::clone(&reg);
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
-    let input = if tool == "glob" {
-        json!({ "pattern": "*", "path": work_dir.path() })
-    } else if tool == "bash" {
-        json!({ "command": OFFLOAD_SECRET_COMMAND, "timeout": ZERO_BASH_TIMEOUT_SECS })
-    } else {
-        json!({})
-    };
     let done = smol::block_on(tool_dispatch::run(
         OFFLOAD_HOOK_ID.to_owned(),
-        tool,
-        &input,
+        "glob",
+        &json!({ "pattern": "*", "path": work_dir.path() }),
         &ctx,
         CallOrigin::Nested,
     ));
     let output = done.output.as_text();
-    assert_eq!(done.is_error, deny || tool == "trailer_probe", "{output}");
+    assert_eq!(done.is_error, deny, "{output}");
     let artifacts: Vec<_> = std::fs::read_dir(store_dir.path()).unwrap().collect();
     if deny {
         assert_eq!(output, OFFLOAD_DENIED);
         assert!(artifacts.is_empty());
     } else {
         assert_eq!(artifacts.len(), 1);
-        let saved = std::fs::read_to_string(offloaded_path(&output)).unwrap();
-        if tool == "trailer_probe" {
-            assert!(output.ends_with(OFFLOAD_REDACTED), "{output}");
-        } else {
-            assert!(saved.contains(OFFLOAD_REDACTED), "{saved}");
-        }
+        let saved = std::fs::read_to_string(artifacts[0].as_ref().unwrap().path()).unwrap();
+        assert!(saved.contains(OFFLOAD_REDACTED), "{saved}");
         assert!(!saved.contains(OFFLOAD_SECRET), "{saved}");
     }
 }
@@ -7252,11 +7209,8 @@ impl ToolInvocation for GatedOffloadInvocation {
     }
 }
 
-#[test_case::test_case(false, false; "immediate_cancelled_before_filter")]
-#[test_case::test_case(true, false; "deferred_cancelled_before_filter")]
-#[test_case::test_case(false, true; "immediate_cancelled_during_filter")]
-#[test_case::test_case(true, true; "deferred_cancelled_during_filter")]
-fn cancelled_output_hook_does_not_offload_raw_output(deferred: bool, during_filter: bool) {
+#[test]
+fn cancelled_output_hook_does_not_offload_raw_output() {
     let (reg, host) = builtins_host();
     host.load_source(
         CANCEL_OFFLOAD_TOOL,
@@ -7264,15 +7218,10 @@ fn cancelled_output_hook_does_not_offload_raw_output(deferred: bool, during_filt
             r#"
         maki.api.register_tool({{
             name = "{CANCEL_OFFLOAD_TOOL}", description = "cancellation output probe",
-            schema = {{ type = "object", properties = {{ deferred = {{ type = "boolean" }} }} }},
-            handler = function(input, ctx)
-                local reply = {{ llm_output = "head\n{OFFLOAD_SECRET}\ntail",
+            schema = {{ type = "object", properties = {{}} }},
+            handler = function()
+                return {{ llm_output = "head\n{OFFLOAD_SECRET}\ntail",
                     output_limits = {{ max_lines = 0 }} }}
-                if input.deferred then
-                    maki.fn.jobstart("true", {{ on_exit = function() ctx:finish(reply) end }})
-                    return nil
-                end
-                return reply
             end,
         }})
     "#
@@ -7310,108 +7259,25 @@ fn cancelled_output_hook_does_not_offload_raw_output(deferred: bool, during_filt
             tool_dispatch::run(
                 OFFLOAD_HOOK_ID.to_owned(),
                 CANCEL_OFFLOAD_DISPATCH_TOOL,
-                &json!({ "deferred": deferred }),
+                &json!({}),
                 &ctx,
                 CallOrigin::Nested,
             )
             .await
         });
-        futures_lite::future::race(
-            async {
-                execution_rx.recv_async().await.unwrap();
-                if during_filter {
-                    execution_release_tx.send(()).unwrap();
-                    hook_rx.recv_async().await.unwrap();
-                    trigger.cancel();
-                } else {
-                    trigger.cancel();
-                    execution_release_tx.send(()).unwrap();
-                }
-                caller.await
-            },
-            async {
-                smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
-                panic!("cancelled output hook did not settle");
-            },
-        )
+        execution_rx.recv_async().await.unwrap();
+        execution_release_tx.send(()).unwrap();
+        hook_rx.recv_async().await.unwrap();
+        trigger.cancel();
+        futures_lite::future::race(caller, async {
+            smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
+            panic!("cancelled output hook did not settle");
+        })
         .await
     });
     let output = done.output.as_text();
     assert!(done.is_error, "{output}");
     assert!(!output.contains(OFFLOAD_SECRET), "{output}");
-    assert!(!output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
-    assert!(!output.contains(OFFLOAD_POINTER_PREFIX), "{output}");
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    assert!(
-        hook_rx.try_recv().is_err(),
-        "hook invoked after cancellation"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn cancelled_bash_partial_output_hook_does_not_offload_raw_output() {
-    let (events_tx, events_rx) = flume::unbounded();
-    let (result_tx, result_rx) = flume::bounded(1);
-    let (hook_tx, hook_rx) = flume::bounded(1);
-    let (_hook_release_tx, hook_release_rx) = flume::bounded(1);
-    let (trigger, token) = maki_agent::CancelToken::new();
-    let dir = tempfile::tempdir().unwrap();
-    let store = disk_store(dir.path());
-    let worker = std::thread::spawn(move || {
-        let (reg, host) = builtins_host_with_zero_output_limit("bash", ZERO_LINES_OPTION);
-        reg.set_hook(GatedOffloadOutputHook {
-            entered: hook_tx,
-            release: hook_release_rx,
-        });
-        let (mut ctx, _session) = offload_ctx(&host, &store);
-        ctx.registry = Arc::clone(&reg);
-        ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
-        ctx.event_tx = maki_agent::EventSender::new(events_tx, 0);
-        ctx.tool_use_id = Some(BASH_CANCEL_ID.to_owned());
-        ctx.cancel = token;
-        let command = format!("printf '%s\\n' '{OFFLOAD_SECRET}'; kill -STOP $$");
-        result_tx
-            .send(smol::block_on(tool_dispatch::run(
-                BASH_CANCEL_ID.to_owned(),
-                "bash",
-                &json!({ "command": command }),
-                &ctx,
-                CallOrigin::Nested,
-            )))
-            .unwrap();
-    });
-    let deadline = Instant::now() + CANCEL_TEST_TIMEOUT;
-    let buf = loop {
-        let env = events_rx
-            .recv_deadline(deadline)
-            .expect("bash must publish its live buffer");
-        if let maki_agent::AgentEvent::LiveToolBuf { id, body } = env.event
-            && id == BASH_CANCEL_ID
-        {
-            break body;
-        }
-    };
-    let (changed_tx, changed_rx) = flume::unbounded();
-    buf.set_on_change(move || {
-        let _ = changed_tx.send(());
-    });
-    while !buf.take().text().contains(OFFLOAD_SECRET) {
-        changed_rx
-            .recv_deadline(deadline)
-            .expect("bash must accumulate the secret before cancellation");
-    }
-    buf.clear_on_change();
-    trigger.cancel();
-    let done = result_rx
-        .recv_timeout(CANCEL_TEST_TIMEOUT)
-        .expect("cancelled bash dispatch must settle");
-    worker.join().unwrap();
-    let output = done.output.as_text();
-    assert!(done.is_error, "{output}");
-    assert!(!output.contains(OFFLOAD_SECRET), "{output}");
-    assert!(!output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
-    assert!(!output.contains(OFFLOAD_POINTER_PREFIX), "{output}");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     assert!(
         hook_rx.try_recv().is_err(),
@@ -7425,38 +7291,30 @@ const BASH_TIMEOUT_SENTINEL: &str = "timeout-cleanup-sentinel";
 const BASH_TIMEOUT_REDACTED: &str = "filtered-timeout-cleanup";
 #[cfg(unix)]
 const BASH_TIMEOUT_TRAILER: &str = "[timed out after 1s; output above is partial]";
+#[cfg(unix)]
+const BASH_CANCEL_OUTPUT_BYTES: usize = 60 * 1024;
 
 #[cfg(unix)]
-#[test_case::test_case(false, false, false; "direct_timeout_partial")]
-#[test_case::test_case(true, false, false; "lua_hook_timeout_partial")]
-#[test_case::test_case(true, true, false; "lua_hook_timeout_partial_offloaded")]
-#[test_case::test_case(true, true, true; "lua_hook_cleanup_expiry_fails_closed")]
-fn timed_out_bash_keeps_partial_output(hooked: bool, offloaded: bool, blocked: bool) {
-    let (reg, host) = if offloaded {
-        builtins_host_with_zero_output_limit("bash", ZERO_LINES_OPTION)
-    } else {
-        builtins_host()
-    };
-    if hooked {
-        host.load_source(
-            "timeout_redactor",
-            &format!(
-                r#"
+#[test]
+fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
+    let (reg, host) = builtins_host_with_zero_output_limit("bash", ZERO_LINES_OPTION);
+    host.load_source(
+        "timeout_redactor",
+        &format!(
+            r#"
             maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
                 assert(out.text:find("{BASH_TIMEOUT_SENTINEL}", 1, true))
-                assert(out.trailer == "{BASH_TIMEOUT_TRAILER}")
-                if {blocked} then maki.async.await(1, function(callback) end) end
                 local sentinel = ("{BASH_TIMEOUT_SENTINEL}"):gsub("%-", "%%-")
                 out.text = out.text:gsub(sentinel, "{BASH_TIMEOUT_REDACTED}")
                 return prev(out, ctx)
             end)
         "#
-            ),
-        )
-        .unwrap();
-    }
+        ),
+    )
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    let store = disk_store(dir.path());
+    let (mut ctx, _session) = offload_ctx(&host, &store);
     ctx.registry = Arc::clone(&reg);
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
     let command = format!("printf '%s\\n' '{BASH_TIMEOUT_SENTINEL}'; kill -STOP $$");
@@ -7475,90 +7333,13 @@ fn timed_out_bash_keeps_partial_output(hooked: bool, offloaded: bool, blocked: b
     ));
     let output = done.output.as_text();
     assert!(done.is_error, "{output}");
-    if blocked {
-        assert!(!output.contains(BASH_TIMEOUT_SENTINEL), "{output}");
-        assert!(!output.contains(BASH_TIMEOUT_REDACTED), "{output}");
-        assert!(!output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-        return;
-    }
     assert!(output.ends_with(BASH_TIMEOUT_TRAILER), "{output}");
-    let expected = if hooked {
-        BASH_TIMEOUT_REDACTED
-    } else {
-        BASH_TIMEOUT_SENTINEL
-    };
-    if offloaded {
-        assert!(output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
-        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert_eq!(files.len(), 1);
-        let saved = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
-        assert!(saved.contains(expected), "{saved}");
-        assert!(!saved.contains(BASH_TIMEOUT_SENTINEL), "{saved}");
-    } else {
-        assert!(output.contains(expected), "{output}");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
+    let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(files.len(), 1);
+    let saved = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
+    assert!(saved.contains(BASH_TIMEOUT_REDACTED), "{saved}");
+    assert!(!saved.contains(BASH_TIMEOUT_SENTINEL), "{saved}");
 }
-
-#[test]
-fn immediate_output_limits_with_state_fail_without_artifact() {
-    let (reg, host) = builtins_host();
-    host.load_source(
-        "state_probe",
-        &format!(
-            r#"
-        maki.api.register_tool({{
-            name = "state_probe", description = "limited state probe",
-            schema = {{ type = "object", properties = {{}} }},
-            handler = function(_, ctx)
-                local text = ctx:limit_output("{OFFLOAD_SECRET}", {{ max_lines = 0 }})
-                return {{ llm_output = text, state = {{ secret = "{OFFLOAD_SECRET}" }} }}
-            end,
-        }})
-    "#
-        ),
-    )
-    .unwrap();
-    struct UnchangedOutputHook;
-    impl ToolHook for UnchangedOutputHook {
-        fn wraps(&self, _: &str, stage: HookStage) -> bool {
-            stage == HookStage::Output
-        }
-        fn run<'a>(
-            &'a self,
-            _: HookStage,
-            value: Value,
-            _: &'a HookCall<'a>,
-        ) -> BoxFuture<'a, Verdict> {
-            assert!(
-                !value[OUTPUT_TEXT]
-                    .as_str()
-                    .unwrap()
-                    .contains(OFFLOAD_SECRET)
-            );
-            Box::pin(async { Verdict::Unchanged })
-        }
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
-    reg.set_hook(UnchangedOutputHook);
-    ctx.registry = Arc::clone(&reg);
-    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
-    let done = smol::block_on(tool_dispatch::run(
-        OFFLOAD_HOOK_ID.to_owned(),
-        "state_probe",
-        &json!({}),
-        &ctx,
-        CallOrigin::Nested,
-    ));
-    assert!(done.is_error);
-    assert!(!done.output.as_text().contains(OFFLOAD_SECRET));
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-}
-
-#[cfg(unix)]
-const BASH_CANCEL_OUTPUT_BYTES: usize = 60 * 1024;
 
 fn disk_store(dir: &Path) -> Arc<OffloadStore> {
     Arc::new(OffloadStore::on_disk(dir.to_path_buf()))
@@ -7585,255 +7366,27 @@ fn offload_ctx(
     (ctx, session)
 }
 
-/// The path a footer or pointer names, between "saved to "/"at " and ";".
-fn offloaded_path(output: &str) -> PathBuf {
-    let notice = output
-        .lines()
-        .find(|l| l.starts_with(OFFLOAD_FOOTER_PREFIX) || l.starts_with(OFFLOAD_POINTER_PREFIX))
-        .unwrap_or_else(|| panic!("no offload notice in: {output}"));
-    let (_, rest) = notice
-        .split_once("saved to ")
-        .or_else(|| notice.split_once(", at "))
-        .unwrap();
-    PathBuf::from(rest.split_once(';').unwrap().0.trim_end_matches(','))
+fn only_offloaded_file(dir: &Path) -> PathBuf {
+    let mut files = std::fs::read_dir(dir).unwrap();
+    let path = files.next().unwrap().unwrap().path();
+    assert!(files.next().is_none(), "expected one offloaded file");
+    path
 }
 
-fn assert_metadata_only(output: &str, with_store: bool) {
-    assert_eq!(output.lines().count(), 1, "{output}");
-    if with_store {
-        assert!(output.starts_with(OFFLOAD_FOOTER_PREFIX), "{output}");
-    } else {
-        assert_eq!(output, FILE_TRUNCATED_MARKER);
-    }
-}
-
-#[test_case::test_case(ZERO_LINES_OPTION, false; "zero_lines_without_store")]
-#[test_case::test_case(ZERO_BYTES_OPTION, false; "zero_bytes_without_store")]
-#[test_case::test_case(ZERO_LINES_OPTION, true; "zero_lines_with_store")]
-#[test_case::test_case(ZERO_BYTES_OPTION, true; "zero_bytes_with_store")]
-fn glob_zero_output_override_returns_metadata_only(option: &str, with_store: bool) {
-    let (reg, host) = builtins_host_with_zero_output_limit("glob", option);
+#[test]
+fn bash_zero_output_override_finishes_on_exit() {
+    let (reg, host) = builtins_host_with_zero_output_limit("bash", ZERO_LINES_OPTION);
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(ZERO_GLOB_FILE), "").unwrap();
-    let store_dir = tempfile::tempdir().unwrap();
-    let (mut ctx, _session) = offload_ctx(&host, &disk_store(store_dir.path()));
-    if !with_store {
-        ctx.offload = None;
-    }
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    ctx.offload = None;
     let output = exec_with_ctx(
         &reg,
-        "glob",
-        json!({ "pattern": "*.txt", "path": dir.path() }),
+        "bash",
+        json!({ "command": ZERO_BASH_COMMAND, "timeout": ZERO_BASH_TIMEOUT_SECS }),
         &ctx,
     )
     .unwrap();
-    assert_metadata_only(&output, with_store);
-    if with_store {
-        let saved = std::fs::read_to_string(offloaded_path(&output)).unwrap();
-        assert!(saved.contains(ZERO_GLOB_FILE), "{saved}");
-    }
-}
-
-#[test_case::test_case(0; "zero_limits")]
-#[test_case::test_case(1; "tiny_limits")]
-fn hooked_failed_bash_preserves_terminal_exit_status_and_restore(budget: usize) {
-    let mut config = PluginsConfig::from_plugins(HashMap::new());
-    config.opts.insert(
-        "bash".to_owned(),
-        json_obj(json!({ "max_output_lines": budget, "max_output_bytes": budget })),
-    );
-    let (reg, host) = builtins_host_with(&config);
-    reg.set_hook(OffloadOutputHook { deny: false });
-    let dir = tempfile::tempdir().unwrap();
-    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
-    ctx.registry = Arc::clone(&reg);
-    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
-    let input = json!({
-        "command": format!("{OFFLOAD_SECRET_COMMAND}; exit 3"),
-        "timeout": ZERO_BASH_TIMEOUT_SECS,
-    });
-    for notice in [OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX] {
-        let done = smol::block_on(tool_dispatch::run(
-            OFFLOAD_HOOK_ID.to_owned(),
-            "bash",
-            &input,
-            &ctx,
-            CallOrigin::Nested,
-        ));
-        let output = done.output.as_text();
-        assert!(done.is_error, "{output}");
-        assert!(output.contains(notice), "{output}");
-        assert!(output.ends_with(BASH_FAILURE_EXIT_LINE), "{output}");
-        assert!(!output.contains(OFFLOAD_SECRET), "{output}");
-        let saved = std::fs::read_to_string(offloaded_path(&output)).unwrap();
-        assert!(saved.contains(OFFLOAD_REDACTED), "{saved}");
-        assert!(!saved.contains(OFFLOAD_SECRET), "{saved}");
-        let handle = host.event_handle();
-        let (tx, rx) = flume::unbounded();
-        handle.request_restore(
-            maki_lua::RestoreItem {
-                tool: Arc::from("bash"),
-                tool_use_id: OFFLOAD_HOOK_ID.to_owned(),
-                output: output.to_owned(),
-                input: input.clone(),
-                is_error: true,
-                tool_output_lines: ToolOutputLines::default(),
-                theme_gen: None,
-                clicks: vec![0],
-                state: None,
-            },
-            maki_agent::EventSender::new(tx, 0),
-        );
-        handle.wait_restore_complete_for_test();
-        let restored = snapshot_texts(&rx, OFFLOAD_HOOK_ID).join("\n");
-        assert!(restored.contains(BASH_FAILURE_EXIT_LINE), "{restored}");
-        assert!(restored.contains(notice), "{restored}");
-    }
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-}
-
-#[test_case::test_case(ZERO_LINES_OPTION, false; "zero_lines_without_store")]
-#[test_case::test_case(ZERO_BYTES_OPTION, false; "zero_bytes_without_store")]
-#[test_case::test_case(ZERO_LINES_OPTION, true; "zero_lines_with_store")]
-#[test_case::test_case(ZERO_BYTES_OPTION, true; "zero_bytes_with_store")]
-fn bash_zero_output_override_finishes_on_exit(option: &str, with_store: bool) {
-    let (reg, host) = builtins_host_with_zero_output_limit("bash", option);
-    let dir = tempfile::tempdir().unwrap();
-    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
-    if !with_store {
-        ctx.offload = None;
-    }
-    for exit_code in [0, 3] {
-        let result = exec_with_ctx(
-            &reg,
-            "bash",
-            json!({
-                "command": format!("{ZERO_BASH_COMMAND}; exit {exit_code}"),
-                "timeout": ZERO_BASH_TIMEOUT_SECS,
-            }),
-            &ctx,
-        );
-        let output = if exit_code == 0 {
-            result.unwrap()
-        } else {
-            result.unwrap_err()
-        };
-        let metadata = if exit_code == 0 {
-            output.as_str()
-        } else {
-            output
-                .strip_suffix(&format!("\n{BASH_FAILURE_EXIT_LINE}"))
-                .unwrap_or_else(|| panic!("{output}"))
-        };
-        if with_store && exit_code != 0 {
-            assert_eq!(metadata.lines().count(), 1, "{metadata}");
-            assert!(metadata.starts_with(OFFLOAD_POINTER_PREFIX), "{metadata}");
-        } else {
-            assert_metadata_only(metadata, with_store);
-        }
-        if with_store {
-            assert_eq!(
-                std::fs::read_to_string(offloaded_path(&output)).unwrap(),
-                BASH_PARTIAL_PROBE
-            );
-        }
-    }
-}
-
-#[test_case::test_case(ZERO_LINES_OPTION, false; "zero_lines_without_store")]
-#[test_case::test_case(ZERO_BYTES_OPTION, false; "zero_bytes_without_store")]
-#[test_case::test_case(ZERO_LINES_OPTION, true; "zero_lines_with_store")]
-#[test_case::test_case(ZERO_BYTES_OPTION, true; "zero_bytes_with_store")]
-fn bash_zero_output_override_finishes_on_cancel(option: &str, with_store: bool) {
-    let (tx, events) = flume::unbounded();
-    let event_tx = maki_agent::EventSender::new(tx, 0);
-    let (trigger, token) = maki_agent::CancelToken::new();
-    let (result_tx, result_rx) = flume::bounded(1);
-    let dir = tempfile::tempdir().unwrap();
-    let store = with_store.then(|| disk_store(dir.path()));
-    let option = option.to_owned();
-    let worker = std::thread::spawn(move || {
-        let (reg, host) = builtins_host_with_zero_output_limit("bash", &option);
-        let session = test_session(&host);
-        let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
-            &AgentMode::Build,
-            Some(&event_tx),
-            Some(BASH_CANCEL_ID),
-            session.read().session_id(),
-        );
-        ctx.cancel = token;
-        ctx.config.rtk = false;
-        ctx.offload = store;
-        result_tx
-            .send(exec_with_ctx(
-                &reg,
-                "bash",
-                json!({ "command": BASH_PARTIAL_CMD }),
-                &ctx,
-            ))
-            .unwrap();
-    });
-    let buf = poll_until("bash must publish its live buf", || {
-        recv_live_buf(&events, BASH_CANCEL_ID)
-    });
-    poll_until("bash output never reached the live buf", || {
-        buf.take().text().contains(BASH_PARTIAL_PROBE).then_some(())
-    });
-    trigger.cancel();
-    let output = result_rx
-        .recv_timeout(CANCEL_TEST_TIMEOUT)
-        .expect("cancelled bash must settle")
-        .unwrap_err();
-    worker.join().unwrap();
-    let metadata = output
-        .strip_suffix(&format!("\n{BASH_PARTIAL_MARKER}"))
-        .unwrap_or_else(|| panic!("{output}"));
-    assert_metadata_only(metadata, with_store);
-    if with_store {
-        assert_eq!(
-            std::fs::read_to_string(offloaded_path(&output)).unwrap(),
-            BASH_PARTIAL_PROBE
-        );
-    }
-}
-
-#[test]
-fn cat_offload_file_returns_pointer() {
-    let (reg, host) = builtins_host();
-    let dir = tempfile::tempdir().unwrap();
-    let store = disk_store(dir.path());
-    let (ctx, _session) = offload_ctx(&host, &store);
-
-    let first = exec_with_ctx(&reg, "bash", json!({"command": BIG_BASH_CMD}), &ctx).unwrap();
-    let saved = offloaded_path(&first);
-    let expected: String = (1..=SEQ_LINES).map(|i| format!("{i}\n")).collect();
-    assert_eq!(
-        std::fs::read_to_string(&saved).unwrap(),
-        expected.trim_end()
-    );
-
-    let cat = format!("cat '{}'", saved.display());
-    let again = exec_with_ctx(&reg, "bash", json!({"command": cat}), &ctx).unwrap();
-    assert!(again.starts_with(OFFLOAD_POINTER_PREFIX), "{again}");
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-}
-
-#[test]
-fn bash_failure_keeps_exit_code_after_footer() {
-    let (reg, host) = builtins_host();
-    let dir = tempfile::tempdir().unwrap();
-    let (ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
-
-    let err = exec_with_ctx(
-        &reg,
-        "bash",
-        json!({"command": format!("{BIG_BASH_CMD}; exit 3")}),
-        &ctx,
-    )
-    .unwrap_err();
-    assert!(err.starts_with("1\n"), "{err}");
-    assert!(err.contains(OFFLOAD_FOOTER_PREFIX), "{err}");
-    assert!(err.ends_with("]\nExit code: 3"), "{err}");
+    assert_eq!(output, FILE_TRUNCATED_MARKER);
 }
 
 #[test]
@@ -7916,10 +7469,9 @@ fn cancelled_bash_large_output_keeps_partial_marker_last() {
         .expect("cancelled bash must settle")
         .expect_err("a partial reply is an error reply");
     worker.join().unwrap();
-    assert!(err.contains(OFFLOAD_FOOTER_PREFIX), "{err}");
     assert!(err.ends_with(BASH_PARTIAL_MARKER), "{err}");
     assert_eq!(
-        std::fs::read_to_string(offloaded_path(&err)).unwrap(),
+        std::fs::read_to_string(only_offloaded_file(dir.path())).unwrap(),
         format!(
             "{}\n{BASH_PARTIAL_PROBE}",
             "q".repeat(BASH_CANCEL_OUTPUT_BYTES)
@@ -8031,7 +7583,6 @@ fn code_execution_cancel_deferred_output_offloads() {
         .await
     });
     let output = reply.output.unwrap_err();
-    assert!(output.starts_with(OFFLOAD_FOOTER_PREFIX), "{output}");
     assert!(output.ends_with(BASH_PARTIAL_MARKER), "{output}");
     let files = fs.files();
     assert_eq!(files.len(), 1);
@@ -8108,7 +7659,6 @@ fn job_exit_callback_uses_deferred_output_limits(is_error: bool) {
     let output = match result {
         Ok(output) | Err(output) => output,
     };
-    assert!(output.starts_with(OFFLOAD_FOOTER_PREFIX), "{output}");
     assert!(output.ends_with(DEFERRED_CALLBACK_TRAILER), "{output}");
     let files = fs.files();
     assert_eq!(files.len(), 1);
@@ -8136,7 +7686,6 @@ fn partial_cut_memoizes_raw_reply_and_paints_marker_once() {
         &ctx,
     )
     .unwrap_err();
-    assert!(output.starts_with(OFFLOAD_FOOTER_PREFIX), "{output}");
     assert!(output.ends_with(BASH_PARTIAL_MARKER), "{output}");
     let files = fs.files();
     assert_eq!(files.len(), 1);
@@ -8163,14 +7712,13 @@ fn bash_large_output_offloads_into_in_memory_store() {
         &ctx,
     )
     .unwrap_err();
-    assert!(err.ends_with("]\nExit code: 3"), "{err}");
-    let saved = offloaded_path(&err);
-    assert!(saved.starts_with(&store_dir), "{}", saved.display());
-    assert!(!saved.exists(), "nothing may reach the disk");
+    assert!(err.contains("Exit code: 3"), "{err}");
     let expected: String = (1..=SEQ_LINES).map(|i| format!("{i}\n")).collect();
     let files = fs.files();
     assert_eq!(files.len(), 1);
-    assert_eq!(files[0].0, saved);
+    let saved = &files[0].0;
+    assert!(saved.starts_with(&store_dir), "{}", saved.display());
+    assert!(!saved.exists(), "nothing may reach the disk");
     assert_eq!(
         String::from_utf8(files[0].1.clone()).unwrap(),
         expected.trim_end()

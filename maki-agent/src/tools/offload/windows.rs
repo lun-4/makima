@@ -28,7 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::{DiskBackend, OffloadSnapshot};
+use super::DiskBackend;
 
 const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -185,14 +185,6 @@ fn nt_error(status: i32) -> io::Error {
 }
 
 pub(super) fn walk_dir(root: &File, relative: &Path, create: bool) -> io::Result<File> {
-    walk(root, relative, create, false)
-}
-
-pub(super) fn walk_deletable_dir(root: &File, relative: &Path) -> io::Result<File> {
-    walk(root, relative, false, true)
-}
-
-fn walk(root: &File, relative: &Path, create: bool, deletable: bool) -> io::Result<File> {
     if relative
         .components()
         .any(|part| !matches!(part, Component::Normal(_)))
@@ -203,27 +195,10 @@ fn walk(root: &File, relative: &Path, create: bool, deletable: bool) -> io::Resu
         ));
     }
     let mut dir = root.try_clone()?;
-    let mut parts = relative.components().peekable();
-    while let Some(part) = parts.next() {
-        dir = open_relative(
-            &dir,
-            part.as_os_str(),
-            Some(true),
-            create,
-            deletable && parts.peek().is_none(),
-            false,
-        )?;
+    for part in relative.components() {
+        dir = open_relative(&dir, part.as_os_str(), Some(true), create, false, false)?;
     }
     Ok(dir)
-}
-
-pub(super) fn read_file(dir: &File, name: &str) -> io::Result<Option<File>> {
-    match open_relative(dir, OsStr::new(name), None, false, false, false) {
-        Ok(file) if super::regular_metadata(&file.metadata()?) => Ok(Some(file)),
-        Ok(_) => Ok(None),
-        Err(error) if super::not_regular_error(&error) => Ok(None),
-        Err(error) => Err(error),
-    }
 }
 
 fn delete(file: &File) -> io::Result<()> {
@@ -309,7 +284,6 @@ pub(super) fn create_in(dir: &File, name: &str, bytes: &[u8]) -> io::Result<bool
 }
 
 struct Entry {
-    name: OsString,
     attributes: u32,
     bytes: u64,
 }
@@ -378,7 +352,6 @@ fn entries(dir: &File) -> io::Result<Vec<Entry>> {
             let name = OsString::from_wide(wide);
             if name != "." && name != ".." {
                 entries.push(Entry {
-                    name,
                     attributes: unsafe { (*pointer).FileAttributes },
                     bytes: unsafe { (*pointer).EndOfFile }.max(0) as u64,
                 });
@@ -391,39 +364,14 @@ fn entries(dir: &File) -> io::Result<Vec<Entry>> {
     }
 }
 
-pub(super) fn snapshot(dir: &File) -> io::Result<OffloadSnapshot> {
-    let mut snapshot = OffloadSnapshot {
-        names: Vec::new(),
-        total_bytes: 0,
-    };
+pub(super) fn total_bytes(dir: &File) -> io::Result<u64> {
+    let mut total: u64 = 0;
     for entry in entries(dir)? {
-        if let Some(name) = entry.name.to_str() {
-            snapshot.names.push(name.to_owned());
-        }
         if entry.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
-            snapshot.total_bytes = snapshot.total_bytes.saturating_add(entry.bytes);
+            total = total.saturating_add(entry.bytes);
         }
     }
-    Ok(snapshot)
-}
-
-pub(super) fn remove_all(dir: &File) -> io::Result<()> {
-    for entry in entries(dir)? {
-        let child = match open_relative(dir, &entry.name, None, false, true, true) {
-            Ok(child) => child,
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let attributes = child.metadata()?.file_attributes();
-        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0
-            && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
-        {
-            remove_all(&child)?;
-        } else {
-            delete(&child)?;
-        }
-    }
-    delete(dir)
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -432,13 +380,11 @@ mod tests {
     use std::os::windows::fs::symlink_dir;
 
     use maki_storage::id::{MakiId, SessionRef};
+    use maki_storage::remove_offload_dir_from;
     use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::{
-        create_in, open_relative, publish, read_file, remove_all, snapshot, walk_deletable_dir,
-        walk_dir,
-    };
+    use super::{create_in, open_relative, publish, total_bytes, walk_dir};
     use crate::tools::offload::{DiskBackend, OffloadError, OffloadStore};
     use std::ffi::OsStr;
     use std::io::Write;
@@ -491,38 +437,14 @@ mod tests {
         let leaf = walk_dir(&opened_parent, Path::new(remaining), true).unwrap();
         assert!(create_in(&leaf, SLOT, BODY).unwrap());
         assert!(!create_in(&leaf, SLOT, b"replacement").unwrap());
-        let file = read_file(&leaf, SLOT).unwrap().unwrap();
-        assert!(crate::tools::offload::matches_open_file(file, BODY).unwrap());
-        let listing = snapshot(&leaf).unwrap();
-        assert_eq!(listing.names, [SLOT]);
-        assert_eq!(listing.total_bytes, BODY.len() as u64);
+        assert_eq!(total_bytes(&leaf).unwrap(), BODY.len() as u64);
         assert_eq!(fs::read(moved.join(remaining).join(SLOT)).unwrap(), BODY);
         assert!(backend.open_dir(true).is_err());
         assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
         drop(leaf);
-        let leaf = walk_deletable_dir(&opened_parent, Path::new(remaining)).unwrap();
-        remove_all(&leaf).unwrap();
-        drop(leaf);
+        remove_offload_dir_from(&opened_parent, Path::new(remaining)).unwrap();
         assert!(!moved.join(remaining).exists());
         assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
-    }
-
-    #[test_case(false; "directory")]
-    #[test_case(true; "directory_link")]
-    fn read_file_rejects_directory_occupants(link: bool) {
-        let root = TempDir::new().unwrap();
-        let backend = DiskBackend::new(root.path().join("store"));
-        let dir = backend.open_dir(true).unwrap();
-        let occupant = backend.dir.join(SLOT);
-        if link {
-            let target = root.path().join("outside");
-            fs::create_dir(&target).unwrap();
-            symlink_dir(target, &occupant).unwrap();
-        } else {
-            fs::create_dir(&occupant).unwrap();
-        }
-        assert!(read_file(&dir, SLOT).unwrap().is_none());
-        assert!(fs::symlink_metadata(&occupant).is_ok());
     }
 
     #[test]
@@ -563,9 +485,7 @@ mod tests {
         fs::create_dir(backend.dir.join("nested")).unwrap();
         symlink_dir(&external, backend.dir.join("nested/link")).unwrap();
         drop(dir);
-        let dir = walk_deletable_dir(backend.root.as_ref().unwrap(), &backend.relative).unwrap();
-        remove_all(&dir).unwrap();
-        drop(dir);
+        remove_offload_dir_from(backend.root.as_ref().unwrap(), &backend.relative).unwrap();
         assert!(!backend.dir.exists());
         assert_eq!(fs::read(external.join(SLOT)).unwrap(), BODY);
     }

@@ -80,8 +80,7 @@ fn truncation_marker(_lua: &Lua, line: String) -> LuaResult<Option<&'static str>
     Ok(trailing_truncation_marker(&line).map(|marker| marker.as_str()))
 }
 
-/// Whether a line is a footer or pointer that offloading left in tool
-/// output, so a restored view can be rebuilt the way it was rendered live.
+/// Whether a line is the saved-output footer in a tool result.
 ///
 /// @param line string One line of tool output.
 /// @return boolean

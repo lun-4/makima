@@ -347,10 +347,13 @@ local function handler(input, ctx)
     view:append({ { "No output", "dim" } })
   end
 
-  local llm_output = ctx:limit_output(output, { preview = "head_tail", max_lines = max_lines, max_bytes = max_bytes })
   view:finish()
 
-  return { llm_output = llm_output, body = buf }
+  return {
+    llm_output = output,
+    output_limits = { preview = "head_tail", max_lines = max_lines, max_bytes = max_bytes },
+    body = buf,
+  }
 end
 
 local function header(input)

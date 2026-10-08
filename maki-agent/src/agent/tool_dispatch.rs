@@ -14,7 +14,7 @@ use crate::task_set::TaskSet;
 use crate::tools::hook::{
     Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
 };
-use crate::tools::offload::{DEFAULT_LABEL, OutputLimitOptions, OutputLimits, PreviewShape};
+use crate::tools::offload::{OutputLimitOptions, OutputLimits, PreviewShape};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
     CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
@@ -209,7 +209,6 @@ pub async fn run(
             deadline: None,
             trailer: None,
             shape: PreviewShape::Head,
-            label: DEFAULT_LABEL.to_owned(),
             lines_clipped: false,
             limits: OutputLimits::from_config(&ctx.config),
         };
@@ -1191,7 +1190,7 @@ pub(super) async fn process_tool_calls(
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1207,9 +1206,7 @@ mod tests {
     use crate::mcp::tool_names;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
     use crate::template::Vars;
-    use crate::tools::offload::{
-        OFFLOAD_FOOTER_PREFIX, OffloadBackend, OffloadSnapshot, OffloadStore,
-    };
+    use crate::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadBackend, OffloadStore};
     use crate::tools::registry::{ToolRegistry, ToolSource};
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
@@ -2475,25 +2472,33 @@ mod tests {
     }
 
     impl OffloadBackend for GatedOffloadBackend {
-        fn matches(&self, _name: &str, expected: &[u8]) -> io::Result<bool> {
-            Ok(*self.saved.lock().unwrap() == expected)
-        }
-
-        fn create_new(&self, _name: &str, bytes: &[u8]) -> io::Result<bool> {
+        fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.dir.join(name))
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            file.write_all(bytes)?;
             *self.saved.lock().unwrap() = bytes.to_vec();
             Ok(true)
         }
 
-        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+        fn total_bytes(&self) -> io::Result<u64> {
             self.gate.entered.send(()).unwrap();
             self.gate.release_rx.recv().unwrap();
-            Ok(OffloadSnapshot {
-                names: Vec::new(),
-                total_bytes: 0,
+            std::fs::read_dir(&self.dir)?.try_fold(0_u64, |total, entry| {
+                Ok::<_, io::Error>(total + entry?.metadata()?.len())
             })
         }
 
         fn remove_all(&self) -> io::Result<()> {
+            for entry in std::fs::read_dir(&self.dir)? {
+                std::fs::remove_file(entry?.path())?;
+            }
             self.saved.lock().unwrap().clear();
             Ok(())
         }

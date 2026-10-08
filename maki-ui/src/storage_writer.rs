@@ -1598,7 +1598,7 @@ mod tests {
     #[test_case(false; "failed_log_delete_preserves_artifacts")]
     #[test_case(true; "cleanup_failure_does_not_fail_log_delete")]
     fn guarded_deletion_preserves_artifacts_until_log_removal(cleanup_failure: bool) {
-        use maki_agent::tools::offload::{OffloadBackend, OffloadSnapshot};
+        use maki_agent::tools::offload::OffloadBackend;
         use maki_storage::session_lock;
         use std::path::PathBuf;
 
@@ -1608,19 +1608,12 @@ mod tests {
         }
 
         impl OffloadBackend for FailingCleanup {
-            fn matches(&self, _: &str, _: &[u8]) -> io::Result<bool> {
-                Ok(false)
-            }
-
             fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
                 unreachable!()
             }
 
-            fn snapshot(&self) -> io::Result<OffloadSnapshot> {
-                Ok(OffloadSnapshot {
-                    names: Vec::new(),
-                    total_bytes: 0,
-                })
+            fn total_bytes(&self) -> io::Result<u64> {
+                Ok(0)
             }
 
             fn remove_all(&self) -> io::Result<()> {

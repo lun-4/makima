@@ -31,6 +31,10 @@ const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
 pub(super) struct Root(File);
 
 impl Root {
+    pub(super) fn from_file(root: &File) -> io::Result<Self> {
+        Ok(Self(root.try_clone()?))
+    }
+
     pub(super) fn open(path: &Path) -> io::Result<Self> {
         let root = OpenOptions::new()
             .read(true)

@@ -13,17 +13,14 @@ use maki_agent::session_coordinator::{
     DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
     SessionCoordinatorParams, builtin_option_definitions,
 };
-use maki_agent::tools::offload::{
-    LINE_CUT_PREFIX, OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore,
-};
-use maki_agent::tools::{FILE_TRUNCATED_MARKER, LINE_TRUNCATED_PREFIX, ToolContext, ToolRegistry};
+use maki_agent::tools::offload::{OffloadStore, is_offload_notice};
+use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry};
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     ToolOutputLines,
 };
 use maki_lua::PluginHost;
-use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend};
 use maki_providers::{Model, StreamResponse};
 use maki_storage::checkpoint::{
     CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
@@ -45,23 +42,8 @@ const EXPAND_HINT: &str = "click to expand";
 const VIEW_CAP: usize = 3;
 const INDEX_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
-const GREP_CUT_HEADER_BYTES: usize = 512;
-const GREP_LONG_PATH_DEPTH: usize = 8;
-const GREP_LONG_PATH_SEGMENT_BYTES: usize = 100;
-const GREP_MATCH_LINE: &str = "fn one() {}\n";
 const GREP_NO_MATCHES: &str = "No files found";
 const GREP_ERROR_OUTPUT: &str = "error: pattern is required";
-const POINTER_READ_ADVICE: &str = "inspect it with grep, or read with offset and limit";
-const POINTER_BASH_ADVICE: &str = "inspect it with bash (e.g. jq, or cut -c)";
-const POINTER_CLIPPED_NOTE: &str =
-    "lines longer than agent.max_line_bytes are clipped in the saved file too";
-const POINTER_STORE_DIR: &str = "/maki-test-state/sessions/offload/repeated grep's files";
-const POINTER_LINE_BYTES: usize = 128;
-const POINTER_LONG_LINE_BYTES: usize = POINTER_LINE_BYTES * 4;
-const POINTER_OUTPUT_BYTES: usize = 4096;
-const BASH_TOOL: &str = "bash";
-const CAT_OFFLOAD_LINES: usize = 100;
-const CAT_OFFLOAD_STORE_NAME: &str = "saved output's files";
 
 fn view_lines() -> ToolOutputLines {
     ToolOutputLines {
@@ -549,10 +531,8 @@ fn offloading(store: &Arc<OffloadStore>) -> impl FnOnce(&mut ToolContext) {
     }
 }
 
-/// Offloaded grep output ends in a footer line; the restored view must keep
-/// it, and match the live one.
 #[test]
-fn grep_offload_footer_survives_restore() {
+fn grep_offload_restore_keeps_preview_and_notice() {
     let dir = many_match_dir();
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(OffloadStore::on_disk(store_dir.path().to_path_buf()));
@@ -561,263 +541,19 @@ fn grep_offload_footer_survives_restore() {
     let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
 
     let live = exec_live_with(&host, &reg, GREP_TOOL, input.clone(), offloading(&store));
-    assert!(
-        live.output.contains("[search results truncated: "),
-        "{}",
-        live.output
-    );
-    assert!(
-        live.output.contains("clipped in the saved file too"),
-        "{}",
-        live.output
-    );
-    let restored = restore(&host, GREP_TOOL, input, &live.output, None, Vec::new());
-    assert_eq!(restored.spans, live.spans);
-}
-
-#[test]
-fn grep_cut_path_header_live_equals_restored() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut nested = dir.path().to_path_buf();
-    for _ in 0..GREP_LONG_PATH_DEPTH {
-        nested.push("a".repeat(GREP_LONG_PATH_SEGMENT_BYTES));
-    }
-    std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(nested.join("match.rs"), GREP_MATCH_LINE).unwrap();
-    let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(OffloadStore::on_disk(store_dir.path().to_path_buf()));
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-    let input = json!({ "pattern": "fn", "path": dir.path() });
-    let byte_limit = GREP_CUT_HEADER_BYTES + store_dir.path().as_os_str().len();
-    let live = exec_live_with(&host, &reg, GREP_TOOL, input.clone(), |ctx| {
-        ctx.offload = Some(store);
-        ctx.config.max_output_bytes = byte_limit;
-    });
-    assert!(live.output.len() <= byte_limit, "{}", live.output);
-    assert_eq!(live.output.lines().count(), 3, "{}", live.output);
-    let header = live.output.lines().next().unwrap();
-    assert!(header.contains(LINE_CUT_PREFIX), "{header}");
-    assert!(!header.ends_with(':'), "{header}");
-    assert!(
-        !live.output.contains(GREP_MATCH_LINE.trim_end()),
-        "{}",
-        live.output
-    );
-    assert_eq!(live.body.lines().count(), 2, "{}", live.body);
-    let restored = restore(&host, GREP_TOOL, input, &live.output, None, Vec::new());
-    assert_eq!(restored.spans, live.spans);
-}
-
-#[test_case::test_case(false; "short_lines")]
-#[test_case::test_case(true; "clipped_long_lines")]
-fn grep_repeated_pointer_live_equals_restore(long_lines: bool) {
-    let fs = Arc::new(InMemoryFs::new());
-    let dir = tempfile::tempdir().unwrap();
-    let line = if long_lines {
-        format!("fn {}\n", "x".repeat(POINTER_LONG_LINE_BYTES))
-    } else {
-        GREP_MATCH_LINE.to_owned()
-    };
-    for i in 0..GREP_MATCH_FILES {
-        std::fs::write(dir.path().join(format!("f{i}.rs")), &line).unwrap();
-    }
-    let store_dir = PathBuf::from(POINTER_STORE_DIR);
-    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
-        Arc::clone(&fs),
-        store_dir.clone(),
-    ))));
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-    let input = json!({ "pattern": "fn", "path": dir.path() });
-    let run = || {
-        exec_live_with(&host, &reg, GREP_TOOL, input.clone(), |ctx| {
-            ctx.offload = Some(Arc::clone(&store));
-            ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
-            ctx.config.max_output_bytes = POINTER_OUTPUT_BYTES;
-            ctx.config.max_line_bytes = POINTER_LINE_BYTES;
-        })
-    };
-
-    let first = run();
-    assert!(
-        !first.output.starts_with(OFFLOAD_POINTER_PREFIX),
-        "{}",
-        first.output
-    );
-    assert!(
-        first.output.contains(POINTER_CLIPPED_NOTE),
-        "{}",
-        first.output
-    );
-    let advice = if long_lines {
-        POINTER_BASH_ADVICE
-    } else {
-        POINTER_READ_ADVICE
-    };
-    assert!(first.output.contains(advice), "{}", first.output);
-    let saved = fs
-        .files()
-        .into_iter()
-        .filter(|(path, _)| path.starts_with(&store_dir))
-        .collect::<Vec<_>>();
-    assert_eq!(saved.len(), 1);
-    let saved_body = String::from_utf8(saved[0].1.clone()).unwrap();
-    if long_lines {
-        assert!(saved_body.contains(LINE_TRUNCATED_PREFIX), "{saved_body}");
-        assert!(!saved_body.contains(line.trim_end()), "{saved_body}");
-    } else {
-        assert!(!saved_body.contains(LINE_TRUNCATED_PREFIX), "{saved_body}");
-    }
-
-    let live = run();
-    assert!(
-        live.output.starts_with(OFFLOAD_POINTER_PREFIX),
-        "{}",
-        live.output
-    );
-    assert!(live.output.contains(advice), "{}", live.output);
-    assert!(
-        live.output.contains(POINTER_CLIPPED_NOTE),
-        "{}",
-        live.output
-    );
-    assert!(
-        live.output.contains(&saved[0].0.display().to_string()),
-        "{}",
-        live.output
-    );
-    assert_eq!(live.output.lines().count(), 1, "{}", live.output);
-    assert!(live.output.len() <= POINTER_OUTPUT_BYTES, "{}", live.output);
-    assert!(live.body.contains(OFFLOAD_POINTER_PREFIX), "{}", live.body);
-    assert!(live.body.contains(advice), "{}", live.body);
-    assert!(live.body.contains(POINTER_CLIPPED_NOTE), "{}", live.body);
-    if long_lines {
-        let quoted_path = format!(
-            "shell path: '{}'",
-            saved[0].0.display().to_string().replace('\'', r"'\''")
-        );
-        assert!(first.output.contains(&quoted_path), "{}", first.output);
-        assert!(live.output.contains(&quoted_path), "{}", live.output);
-        assert!(live.body.contains(&quoted_path), "{}", live.body);
-    }
-    let restored = restore(
-        &host,
-        GREP_TOOL,
-        input,
-        &live.output,
-        live.state,
-        Vec::new(),
-    );
-    assert_eq!(restored.body, live.body);
-    assert_eq!(restored.spans, live.spans);
+    let preview_matches = live.output.matches("fn one() {}").count();
+    assert!(preview_matches > 0 && preview_matches < GREP_MATCH_FILES);
+    let notice = live
+        .output
+        .lines()
+        .find(|line| is_offload_notice(line))
+        .unwrap();
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, vec![0]);
     assert_eq!(
-        fs.files()
-            .into_iter()
-            .filter(|(path, _)| path.starts_with(&store_dir))
-            .collect::<Vec<_>>(),
-        saved,
-        "repeated execution and restore must not create or change artifacts"
+        restored.body.matches("fn one() {}").count(),
+        preview_matches
     );
-}
-
-#[test]
-fn cat_offload_file_returns_pointer_and_restores_without_new_artifact() {
-    let dir = tempfile::tempdir().unwrap();
-    let store_dir = dir.path().join(CAT_OFFLOAD_STORE_NAME);
-    let store = Arc::new(OffloadStore::on_disk(store_dir.clone()));
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-    let session = session_for(&host);
-    let run = |input: Value| {
-        exec_live_with(&host, &reg, BASH_TOOL, input, |ctx| {
-            maki_agent::tools::test_support::set_session(ctx, session.read().session_id());
-            ctx.offload = Some(Arc::clone(&store));
-            ctx.config.rtk = false;
-            ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
-            ctx.config.max_output_bytes = POINTER_OUTPUT_BYTES;
-            ctx.config.max_line_bytes = POINTER_LINE_BYTES;
-        })
-    };
-    let first = run(json!({ "command": format!("seq 1 {CAT_OFFLOAD_LINES}") }));
-    assert!(
-        first.output.contains(OFFLOAD_FOOTER_PREFIX),
-        "{}",
-        first.output
-    );
-    let saved = std::fs::read_dir(&store_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect::<Vec<_>>();
-    assert_eq!(saved.len(), 1);
-    let expected = (1..=CAT_OFFLOAD_LINES)
-        .map(|i| format!("{i}\n"))
-        .collect::<String>();
-    assert_eq!(
-        std::fs::read_to_string(&saved[0]).unwrap(),
-        expected.trim_end()
-    );
-
-    let quoted_path = format!(
-        "'{}'",
-        saved[0].display().to_string().replace('\'', r"'\''")
-    );
-    let input = json!({ "command": format!("cat {quoted_path}") });
-    let live = run(input.clone());
-    assert!(
-        live.output.starts_with(OFFLOAD_POINTER_PREFIX),
-        "{}",
-        live.output
-    );
-    assert!(live.output.contains(POINTER_READ_ADVICE), "{}", live.output);
-    assert!(
-        !live.output.contains(POINTER_BASH_ADVICE),
-        "{}",
-        live.output
-    );
-    assert!(
-        !live.output.contains(POINTER_CLIPPED_NOTE),
-        "{}",
-        live.output
-    );
-    assert!(
-        live.output.contains(&saved[0].display().to_string()),
-        "{}",
-        live.output
-    );
-    assert_eq!(live.output.lines().count(), 1, "{}", live.output);
-    assert!(live.output.len() <= POINTER_OUTPUT_BYTES, "{}", live.output);
-    let restored = restore(
-        &host,
-        BASH_TOOL,
-        input,
-        &live.output,
-        live.state,
-        Vec::new(),
-    );
-    assert!(
-        restored.body.contains(OFFLOAD_POINTER_PREFIX),
-        "{}",
-        restored.body
-    );
-    assert!(
-        restored.body.contains(POINTER_READ_ADVICE),
-        "{}",
-        restored.body
-    );
-    assert!(restored.body.ends_with(&live.output), "{}", restored.body);
-    assert_eq!(
-        std::fs::read_dir(&store_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>(),
-        saved,
-        "cat and restore must reuse the existing artifact"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&saved[0]).unwrap(),
-        expected.trim_end()
-    );
+    assert!(restored.body.ends_with(notice), "{}", restored.body);
 }
 
 #[test_case::test_case(GREP_NO_MATCHES, false; "no_matches")]
@@ -837,33 +573,6 @@ fn grep_no_matches_restore_unchanged(output: &str, is_error: bool) {
     assert!(
         restored.body.is_empty(),
         "grep must keep declining to restore no-match output: {}",
-        restored.body
-    );
-}
-
-/// bash's restore splits a failed run's body from its trailing exit code;
-/// an offload footer before the trailer must not break that.
-#[test]
-fn bash_offloaded_failure_restores_exit_code() {
-    const EXIT_LINE: &str = "Exit code: 3";
-    let host = load_host();
-    let output = format!(
-        "1\n2\n\n{}12 lines, 30 B; all of it saved to /s/x.txt; inspect it with grep, or read with offset and limit]\n{EXIT_LINE}",
-        OFFLOAD_FOOTER_PREFIX
-    );
-    let restored = restore_as(
-        &host,
-        "bash",
-        json!({ "command": "seq 1 12; exit 3" }),
-        &output,
-        true,
-        None,
-        Vec::new(),
-    );
-    assert!(restored.body.ends_with(EXIT_LINE), "{}", restored.body);
-    assert!(
-        !restored.body.contains(&format!("\n{EXIT_LINE}\n")),
-        "the exit code is split out of the body, not left inside it: {}",
         restored.body
     );
 }

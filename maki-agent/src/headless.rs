@@ -1381,7 +1381,8 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::offload::{OffloadBackend, OffloadSnapshot, offload_dir_for};
+    use crate::tools::offload::OffloadBackend;
+    use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -1575,7 +1576,7 @@ mod tests {
         )
         .unwrap();
         received.recv_timeout(GATE_TIMEOUT).unwrap();
-        let dir = offload_dir_for(state.path(), Some(&handle.session_id)).unwrap();
+        let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
         let cleanup = handle.offload_cleanup.unwrap();
@@ -1620,17 +1621,11 @@ mod tests {
     }
 
     impl OffloadBackend for GatedGuardRemoval {
-        fn matches(&self, _: &str, _: &[u8]) -> io::Result<bool> {
-            Ok(false)
-        }
         fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
             Ok(true)
         }
-        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
-            Ok(OffloadSnapshot {
-                names: Vec::new(),
-                total_bytes: 0,
-            })
+        fn total_bytes(&self) -> io::Result<u64> {
+            Ok(0)
         }
         fn remove_all(&self) -> io::Result<()> {
             self.entered.send(()).unwrap();
@@ -1671,7 +1666,7 @@ mod tests {
     fn headless_initialization_error_drains_cleanup_before_stream_close() {
         let state = tempfile::tempdir().unwrap();
         let session_id = MakiId::generate();
-        let dir = offload_dir_for(state.path(), Some(&SessionRef::from(session_id))).unwrap();
+        let dir = offload_dir(&state.path().join(SESSIONS_DIR), session_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
         let mut params = test_params();

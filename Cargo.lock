@@ -2782,7 +2782,6 @@ dependencies = [
  "async-process",
  "base64 0.22.1",
  "bitflags 2.13.1",
- "criterion",
  "event-listener",
  "flume 0.11.1",
  "futures-lite",

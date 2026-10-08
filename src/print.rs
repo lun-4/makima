@@ -659,7 +659,7 @@ mod tests {
         tools::{
             DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
             ToolContext, ToolInvocation, ToolRegistry, ToolSource,
-            offload::{OffloadBackend, OffloadError, OffloadSnapshot, OffloadStore},
+            offload::{OffloadBackend, OffloadError, OffloadStore},
         },
     };
     use maki_providers::{
@@ -667,6 +667,7 @@ mod tests {
         StreamResponse, TokenUsage,
         provider::{BoxFuture, Provider},
     };
+    use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
     use serde::Serializer;
     use std::borrow::Cow;
     use std::io::Write;
@@ -692,10 +693,6 @@ mod tests {
     }
 
     impl OffloadBackend for GatedRemoval {
-        fn matches(&self, _: &str, _: &[u8]) -> io::Result<bool> {
-            Ok(false)
-        }
-
         fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
             if let Some((entered, release)) = &self.persistence {
                 entered.send(()).unwrap();
@@ -704,11 +701,8 @@ mod tests {
             Ok(true)
         }
 
-        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
-            Ok(OffloadSnapshot {
-                names: Vec::new(),
-                total_bytes: 0,
-            })
+        fn total_bytes(&self) -> io::Result<u64> {
+            Ok(0)
         }
 
         fn remove_all(&self) -> io::Result<()> {
@@ -1455,9 +1449,7 @@ mod tests {
             Arc::new(RecordingPrintProvider(requests)),
         )
         .unwrap();
-        let dir =
-            maki_agent::tools::offload::offload_dir_for(state.path(), Some(&handle.session_id))
-                .unwrap();
+        let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("saved.txt"), "output").unwrap();
 

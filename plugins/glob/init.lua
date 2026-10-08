@@ -78,7 +78,7 @@ maki.api.register_tool({
       lines[i] = shorten_path(f)
     end
     local text = table.concat(lines, "\n")
-    local llm_output = ctx:limit_output(text, { max_lines = max_lines, max_bytes = max_bytes })
+    local llm_output = text
 
     local buf = maki.ui.buf()
     local view = ToolView.new(buf, glob_view_opts(ctx))
@@ -92,6 +92,7 @@ maki.api.register_tool({
 
     return {
       llm_output = llm_output,
+      output_limits = { max_lines = max_lines, max_bytes = max_bytes },
       body = buf,
     }
   end,

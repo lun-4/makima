@@ -109,7 +109,7 @@ end)
 
 A replacement table has to carry `text`. Without it the output is left alone and the reason is logged. Set `is_error` to turn a success into a failure, or a failure into a success.
 
-Tools with staged output limits pass the full body and trailer in `text`, with the original trailer also in the optional `trailer` string field. An unchanged verdict preserves the original trailer. Replaced text protects a trailer only when the replacement explicitly includes a string `trailer` field matching a separate terminal suffix in `text`. An absent, null, or mismatched field removes protection and leaves the entire replacement in the body saved to the offload artifact. Updating metadata cannot append or restore missing text. Generated notices use the trusted label `output`.
+Tools with staged output limits pass the full body and trailer in `text`, and the original trailer separately in the optional string field `trailer`. An unchanged verdict preserves the trailer. A replacement protects a trailer only if it includes a matching `trailer` string and the same separate terminal suffix in `text`. If the field is absent, null, or mismatched, the whole replacement becomes the saved body. Metadata cannot add or restore text. Generated notices use the trusted label `output`.
 
 A redactor that changes trailer text must update both fields:
 

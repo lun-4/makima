@@ -7,7 +7,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use globset::{Glob, GlobMatcher};
 use maki_agent::tools::grep::GrepParams;
-use maki_agent::tools::offload::{OffloadBackend, OffloadSnapshot};
+use maki_agent::tools::offload::OffloadBackend;
 use maki_agent::{GrepFileEntry, GrepLine, GrepMatchGroup};
 use regex::Regex;
 
@@ -102,12 +102,6 @@ impl InMemoryOffloadBackend {
 }
 
 impl OffloadBackend for InMemoryOffloadBackend {
-    fn matches(&self, name: &str, expected: &[u8]) -> IoResult<bool> {
-        let inner = self.fs.inner.read().unwrap();
-        Ok(matches!(inner.entries.get(&self.dir.join(name)),
-            Some(Entry::File(bytes, _)) if bytes == expected))
-    }
-
     fn create_new(&self, name: &str, bytes: &[u8]) -> IoResult<bool> {
         let mut inner = self.fs.inner.write().unwrap();
         let path = self.dir.join(name);
@@ -120,25 +114,17 @@ impl OffloadBackend for InMemoryOffloadBackend {
         Ok(true)
     }
 
-    fn snapshot(&self) -> IoResult<OffloadSnapshot> {
+    fn total_bytes(&self) -> IoResult<u64> {
         let inner = self.fs.inner.read().unwrap();
-        let mut snapshot = OffloadSnapshot {
-            names: Vec::new(),
-            total_bytes: 0,
-        };
-        for (path, entry) in inner
+        Ok(inner
             .entries
             .iter()
             .filter(|(path, _)| path.parent() == Some(self.dir.as_path()))
-        {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                snapshot.names.push(name.to_owned());
-            }
-            if let Entry::File(bytes, _) = entry {
-                snapshot.total_bytes = snapshot.total_bytes.saturating_add(bytes.len() as u64);
-            }
-        }
-        Ok(snapshot)
+            .filter_map(|(_, entry)| match entry {
+                Entry::File(bytes, _) => Some(bytes.len() as u64),
+                Entry::Dir => None,
+            })
+            .fold(0, u64::saturating_add))
     }
 
     fn remove_all(&self) -> IoResult<()> {
@@ -519,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn offload_snapshot_reserves_directory_names_and_counts_only_direct_files() {
+    fn offload_total_bytes_counts_only_direct_files_and_reserves_directory_names() {
         const BODY: &[u8] = b"saved";
         let fs = Arc::new(InMemoryFs::new());
         let dir = PathBuf::from(ROOT).join("offload");
@@ -528,13 +514,9 @@ mod tests {
         fs.seed(&dir.join("occupied").join("nested"), b"not direct".to_vec());
         assert!(backend.create_new("file", BODY).unwrap());
         assert!(!backend.create_new("occupied", BODY).unwrap());
-        assert!(!backend.matches("occupied", BODY).unwrap());
-        assert!(backend.matches("file", BODY).unwrap());
-        let snapshot = backend.snapshot().unwrap();
-        assert_eq!(snapshot.names, ["file", "occupied"]);
-        assert_eq!(snapshot.total_bytes, BODY.len() as u64);
+        assert_eq!(backend.total_bytes().unwrap(), BODY.len() as u64);
         backend.remove_all().unwrap();
-        assert!(backend.snapshot().unwrap().names.is_empty());
+        assert_eq!(backend.total_bytes().unwrap(), 0);
     }
 
     #[test]

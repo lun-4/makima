@@ -152,10 +152,11 @@ maki.api.register_tool({
       body = strip_html(body)
     end
 
-    local llm_output = ctx:limit_output(body, { max_lines = max_lines, max_bytes = max_bytes })
+    local llm_output = body
 
     return {
       llm_output = llm_output,
+      output_limits = { max_lines = max_lines, max_bytes = max_bytes },
       body = ToolView.restore(body, web_view_opts(ctx)),
     }
   end,

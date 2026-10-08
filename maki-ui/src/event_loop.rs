@@ -5034,9 +5034,7 @@ mod tests {
     }
     use crate::selection::SelectionZone;
     use crossterm::event::KeyModifiers;
-    use maki_agent::tools::offload::{
-        MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError, OffloadSnapshot,
-    };
+    use maki_agent::tools::offload::{MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError};
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
     use maki_providers::TokenUsage;
@@ -6549,10 +6547,6 @@ mod tests {
     }
 
     impl OffloadBackend for GatedDiskBackend {
-        fn matches(&self, name: &str, expected: &[u8]) -> io::Result<bool> {
-            Ok(std::fs::read(self.path(name))? == expected)
-        }
-
         fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
@@ -6561,11 +6555,8 @@ mod tests {
             Ok(true)
         }
 
-        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
-            Ok(OffloadSnapshot {
-                names: Vec::new(),
-                total_bytes: 0,
-            })
+        fn total_bytes(&self) -> io::Result<u64> {
+            Ok(0)
         }
 
         fn remove_all(&self) -> io::Result<()> {
@@ -6891,10 +6882,6 @@ mod tests {
     }
 
     impl OffloadBackend for GatedQuotaBackend {
-        fn matches(&self, _name: &str, _expected: &[u8]) -> io::Result<bool> {
-            Ok(false)
-        }
-
         fn create_new(&self, _name: &str, _bytes: &[u8]) -> io::Result<bool> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
@@ -6902,12 +6889,8 @@ mod tests {
             Ok(true)
         }
 
-        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
-            Ok(OffloadSnapshot {
-                names: Vec::new(),
-                total_bytes: MAX_OFFLOAD_SESSION_BYTES
-                    - u64::from(!self.created.load(Ordering::SeqCst)),
-            })
+        fn total_bytes(&self) -> io::Result<u64> {
+            Ok(MAX_OFFLOAD_SESSION_BYTES - u64::from(!self.created.load(Ordering::SeqCst)))
         }
 
         fn remove_all(&self) -> io::Result<()> {

@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::{Component, Path};
 
@@ -11,7 +12,35 @@ pub(crate) struct Root {
     inner: windows::Root,
 }
 
+/// Removes an offload directory beneath a captured root handle without following descendant links.
+/// The root is trusted; the relative path must be nonempty and contain only normal components.
+/// Missing directories are already removed.
+pub fn remove_offload_dir_from(root: &File, relative: &Path) -> io::Result<()> {
+    let root = Root::from_file(root)?;
+    match root.directory(relative) {
+        Ok(_) => root.remove(relative),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 impl Root {
+    fn from_file(root: &File) -> io::Result<Self> {
+        #[cfg(unix)]
+        let inner = unix::Root::from_file(root)?;
+        #[cfg(windows)]
+        let inner = windows::Root::from_file(root)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = root;
+            Ok(Self {})
+        }
+        #[cfg(any(unix, windows))]
+        {
+            Ok(Self { inner })
+        }
+    }
+
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         let inner = unix::Root::open(path)?;
@@ -93,6 +122,10 @@ mod unix {
     pub(super) struct Root(File);
 
     impl Root {
+        pub(super) fn from_file(root: &File) -> io::Result<Self> {
+            Ok(Self(root.try_clone()?))
+        }
+
         pub(super) fn open(path: &Path) -> io::Result<Self> {
             Ok(Self(File::from(fs::open(path, ROOT_FLAGS, Mode::empty())?)))
         }
