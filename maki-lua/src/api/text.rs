@@ -1,7 +1,11 @@
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Value};
 
-use maki_agent::tools::{truncate_file as truncate_file_text, truncate_line as truncate_line_text};
+use maki_agent::tools::offload;
+use maki_agent::tools::{
+    trailing_truncation_marker, truncate_file as truncate_file_text,
+    truncate_line as truncate_line_text,
+};
 
 use super::util::pair::{Pair, pair};
 
@@ -21,10 +25,11 @@ fn html_to_markdown(_lua: &Lua, html: String) -> LuaResult<Pair<String>> {
     ))
 }
 
-/// Truncate one line while preserving a UTF-8 boundary and adding `[line truncated]`.
+/// Truncate one line while preserving a UTF-8 boundary and ending it with
+/// `[line truncated, +N bytes]`, where N is the number of bytes cut.
 ///
 /// @param text string The line to truncate.
-/// @param max_bytes integer Maximum source bytes to retain.
+/// @param max_bytes integer Maximum bytes of the result, marker included; a cap smaller than the marker yields the marker alone.
 /// @return string The truncated line.
 #[lua_fn]
 fn truncate_line(_lua: &Lua, text: String, max_bytes: usize) -> LuaResult<String> {
@@ -47,7 +52,7 @@ fn truncate_file(
     remaining_lines: Value,
 ) -> LuaResult<String> {
     let remaining_lines = match remaining_lines {
-        Value::Integer(lines) if lines > 0 => Some(lines as usize),
+        Value::Integer(lines) if lines >= 0 => Some(lines as usize),
         Value::Integer(_) | Value::Nil => None,
         value => {
             return Err(mlua::Error::FromLuaConversionError {
@@ -65,6 +70,25 @@ fn truncate_file(
     ))
 }
 
+/// Name the tool output a line's trailing truncation marker came from, if any.
+/// Mutation guards use it to reject markers pasted back as file content.
+///
+/// @param line string One line, without its newline.
+/// @return string? `"read"` for a read or grep line marker (current or legacy format), `"preview"` for a line cut in an offload preview, or nil.
+#[lua_fn]
+fn truncation_marker(_lua: &Lua, line: String) -> LuaResult<Option<&'static str>> {
+    Ok(trailing_truncation_marker(&line).map(|marker| marker.as_str()))
+}
+
+/// Whether a line is the saved-output footer in a tool result.
+///
+/// @param line string One line of tool output.
+/// @return boolean
+#[lua_fn]
+fn is_offload_notice(_lua: &Lua, line: String) -> LuaResult<bool> {
+    Ok(offload::is_offload_notice(&line))
+}
+
 lua_table! {
     /// Text transformation utilities.
     ///
@@ -77,5 +101,7 @@ lua_table! {
         html_to_markdown,
         truncate_line,
         truncate_file,
+        truncation_marker,
+        is_offload_notice,
     ]
 }

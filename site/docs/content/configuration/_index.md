@@ -146,6 +146,7 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | usize | `51200` | 1024 | Max tool output size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
+| `max_line_bytes` | usize | `1000` | 80 | Max bytes of one line shown by read and grep; longer lines are cut, and write and edit_lines refuse to alter them |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
 | `max_turn_output` | u32 | `32768` | 1024 | Output tokens one turn asks for, raised where an effort level needs the room and capped by the model's own limit |
 | `max_concurrent_agent_turns` | usize | `8` | 1 | Max agent turns running concurrently |
@@ -275,7 +276,6 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_line_bytes` | integer | `500` | 80 | Skip lines longer than this many bytes. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
@@ -290,7 +290,6 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_line_bytes` | integer | `1000` | 80 | Truncate lines longer than this many bytes. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 

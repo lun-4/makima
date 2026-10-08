@@ -1551,13 +1551,26 @@ pub mod test_support {
     /// Goes through the real `publish` path, so it cannot drift from how the
     /// index is built in production. Tools are named `server.tool`.
     pub fn stub_session(tools: &[(&str, &str)]) -> McpSession {
+        stub_session_answering(tools, None)
+    }
+
+    /// Like `stub_session`, but every `tools/call` succeeds with `text` as
+    /// its only content block.
+    pub fn stub_session_with_result(tools: &[(&str, &str)], text: &str) -> McpSession {
+        stub_session_answering(tools, Some(Arc::from(text)))
+    }
+
+    fn stub_session_answering(tools: &[(&str, &str)], result: Option<Arc<str>>) -> McpSession {
         let entry = ServerEntry {
             name: "stub".into(),
             config: None,
             transport_kind: "stub",
             origin: PathBuf::new(),
             status: McpServerStatus::Running,
-            transport: Some(Arc::new(StubTransport(Arc::from("stub")))),
+            transport: Some(Arc::new(StubTransport {
+                name: Arc::from("stub"),
+                result,
+            })),
             tools: tools
                 .iter()
                 .map(|(qualified, description)| McpToolDef {
@@ -1591,9 +1604,12 @@ pub mod test_support {
         )
     }
 
-    /// Fails every call with `UnknownTool`, which is how a test proves the call
-    /// reached MCP at all.
-    struct StubTransport(Arc<str>);
+    /// Without a `result`, fails every call with `UnknownTool`, which is how a
+    /// test proves the call reached MCP at all.
+    struct StubTransport {
+        name: Arc<str>,
+        result: Option<Arc<str>>,
+    }
 
     impl McpTransport for StubTransport {
         fn send_request<'a>(
@@ -1602,9 +1618,12 @@ pub mod test_support {
             _params: Option<Value>,
         ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
             Box::pin(async move {
-                Err(McpError::UnknownTool {
-                    name: method.into(),
-                })
+                match &self.result {
+                    Some(text) => Ok(json!({ "content": [{ "type": "text", "text": &**text }] })),
+                    None => Err(McpError::UnknownTool {
+                        name: method.into(),
+                    }),
+                }
             })
         }
         fn send_notification<'a>(
@@ -1618,7 +1637,7 @@ pub mod test_support {
             Box::pin(async {})
         }
         fn server_name(&self) -> &Arc<str> {
-            &self.0
+            &self.name
         }
         fn transport_kind(&self) -> &'static str {
             "stub"

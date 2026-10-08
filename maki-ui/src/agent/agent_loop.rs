@@ -22,6 +22,7 @@ use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
+use maki_agent::tools::offload::OffloadStore;
 use maki_agent::tools::{FileReadTracker, QuestionMode, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams, AgentRunParams, CancelMap,
@@ -71,6 +72,7 @@ pub(crate) struct TuiActorBackend {
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
+    offload: Option<Arc<OffloadStore>>,
     /// Live MCP session; recreated per spawn so deferred tools stay fresh.
     mcp: Option<McpSession>,
     /// Startup cancellation: races env/instruction/MCP initialization.
@@ -108,6 +110,7 @@ pub(super) fn new_backend(
     model_policy: Arc<ModelPolicy>,
     system_prompt: SystemPromptOverride,
     file_write_locks: Arc<maki_agent::tools::FileWriteLocks>,
+    offload: Option<Arc<OffloadStore>>,
     init_cancel: CancelToken,
     drain_tx: flume::Sender<u64>,
     run_id: Arc<AtomicU64>,
@@ -132,6 +135,7 @@ pub(super) fn new_backend(
         model_policy,
         system_prompt,
         file_write_locks,
+        offload,
         mcp,
         init_cancel,
         initialized: false,
@@ -470,6 +474,7 @@ impl TuiActorBackend {
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
                 file_write_locks: Arc::clone(&self.file_write_locks),
+                offload: self.offload.clone(),
                 managed_turn: context.managed_turn.clone(),
             },
             AgentRunParams {
@@ -999,6 +1004,7 @@ mod tests {
             Arc::new(ModelPolicy::default()),
             SystemPromptOverride::default(),
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
+            None,
             init_cancel,
             drain_tx,
             Arc::new(AtomicU64::new(0)),
@@ -1156,6 +1162,7 @@ mod tests {
             Arc::new(ModelPolicy::default()),
             SystemPromptOverride::default(),
             Arc::new(maki_agent::tools::FileWriteLocks::new()),
+            None,
             init_cancel,
             drain_tx,
             Arc::new(AtomicU64::new(0)),

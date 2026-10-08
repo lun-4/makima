@@ -330,10 +330,29 @@ impl UserData for LuaCtx {
                 return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
             }
             cell.deadline_secs.set(Some(secs));
-            cell.deadline
-                .set(Some(Instant::now() + Duration::from_secs(secs)));
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            cell.deadline.set(Some(
+                cell.deadline
+                    .get()
+                    .map_or(deadline, |current| current.min(deadline)),
+            ));
             cell.deadline_changed.notify(usize::MAX);
             Ok((Some(true), None))
+        });
+
+        methods.add_method("capture_read", |lua, this, path: String| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("capture_read"));
+            };
+            let tracker = Arc::clone(&agent.file_tracker);
+            let mut snapshot = tracker.capture_read(Path::new(&path));
+            let commit = lua.create_function_mut(move |_, ()| {
+                if let Some(snapshot) = snapshot.take() {
+                    tracker.commit_read(snapshot);
+                }
+                Ok(())
+            })?;
+            Ok((Some(commit), None))
         });
 
         methods.add_method("record_read", |_, this, path: String| {
@@ -437,9 +456,10 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method_mut("finish", |lua, this, val: LuaValue| {
-            if !matches!(this.caps, Caps::Handler { .. }) {
+            let Some(agent) = this.agent() else {
                 return Ok(this.cap_err_pair("finish"));
-            }
+            };
+            let reply = ToolCallReply::from_lua_value_with_config(lua, &val, &agent.config);
             let tx = this
                 .finish_tx
                 .take()
@@ -448,7 +468,7 @@ impl UserData for LuaCtx {
             if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
                 lock_cell(&active_task(lua)).root_buf = Some(buf);
             }
-            let _ = tx.send(ToolCallReply::from_lua_value(lua, &val));
+            let _ = tx.send(reply);
             Ok((Some(true), None))
         });
     }

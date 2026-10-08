@@ -125,10 +125,11 @@ maki.api.register_tool({
       return { llm_output = "error: " .. tostring(parse_err), is_error = true }
     end
 
-    local llm_output = maki.text.truncate_file(text, max_lines, max_bytes, nil)
+    local llm_output = text
 
     return {
       llm_output = llm_output,
+      output_limits = { max_lines = max_lines, max_bytes = max_bytes },
       body = ToolView.restore(text, web_view_opts(ctx)),
     }
   end,

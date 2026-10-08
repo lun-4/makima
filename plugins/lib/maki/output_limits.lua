@@ -13,6 +13,10 @@ M.specs = {
   max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
 }
 
+function M.line_bytes(ctx)
+  return ctx:config("max_line_bytes", DEFAULT_MAX_LINE_BYTES)
+end
+
 function M.extend(spec)
   for name, s in pairs(M.specs) do
     spec[name] = s

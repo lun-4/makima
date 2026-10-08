@@ -1212,11 +1212,12 @@ async fn session(
         modes: Arc::clone(&agent_ctx.modes),
         subagent_cancels: Arc::new(CancelMap::new()),
         ledger: RunLedger::child(&agent_ctx.ledger),
-        registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+        registry: Arc::clone(ToolRegistry::global_arc()),
         audience,
         question_mode: agent_ctx.question_mode,
         model_policy: Arc::clone(&agent_ctx.model_policy),
         file_write_locks: Arc::clone(&agent_ctx.file_write_locks),
+        offload: agent_ctx.offload.clone(),
         managed_turn: None,
     };
     let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
@@ -2224,6 +2225,7 @@ mod tests {
             question_mode: ctx.question_mode,
             model_policy: Arc::clone(&ctx.model_policy),
             file_write_locks: Arc::clone(&ctx.file_write_locks),
+            offload: ctx.offload.clone(),
             managed_turn: None,
         };
         let (parent_cancels, cancel_slot) = {

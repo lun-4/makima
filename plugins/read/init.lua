@@ -13,7 +13,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
 - Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
-- Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
+- When output ends with `[file truncated, N lines remaining]`, continue from the next offset.
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
 - Call in parallel when reading multiple files.
@@ -21,13 +21,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
-local opts = maki.api.register_options(output_limits.extend({
-  max_line_bytes = {
-    default = output_limits.DEFAULT_MAX_LINE_BYTES,
-    min = 80,
-    desc = "Truncate lines longer than this many bytes.",
-  },
-}))
+local opts = maki.api.register_options(output_limits.extend({}))
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -86,10 +80,12 @@ local function build_file_view(lines, start_line, total_lines, path, ctx)
 end
 
 local function read_file(path, offset, limit, ctx)
+  local commit_read = ctx:capture_read(path)
   local content, err = maki.fs.read(path)
   if not content then
     return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
+  commit_read()
 
   local all_lines = split_lines(content)
   local total_lines = #all_lines
@@ -97,14 +93,12 @@ local function read_file(path, offset, limit, ctx)
   local start = math.max(math.floor(offset), 1)
   local max_lines, max_bytes = output_limits.resolve(opts, ctx)
   max_lines = limit == 0 and max_lines or math.min(limit, max_lines)
-  local max_line_bytes = opts.max_line_bytes
+  local max_line_bytes = output_limits.line_bytes(ctx)
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do
     lines[#lines + 1] = maki.text.truncate_line(all_lines[i], max_line_bytes)
   end
-
-  ctx:record_read(path)
 
   local parts = {}
   local nr_fmt = ToolView.line_nr_fmt(start + #lines - 1) .. ": %s"

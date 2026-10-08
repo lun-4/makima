@@ -42,9 +42,25 @@ one line stays              ~20k tokens never seen
 
 **Deferred MCP tools.** An MCP server with 100 tools would ship 100 definitions in every request. Makima loads a single `tool_search` tool instead; the model searches when it actually needs something and only the matches load. See [MCP](/docs/mcp/#tool-search).
 
-**Truncation everywhere.** Tool output is capped (`agent.max_output_bytes`, `agent.max_output_lines`), overlong grep lines are skipped, and every builtin tool description nags the model to read only what it needs. The nagging works.
+**Cut, but not lost.** Tool output is capped (`agent.max_output_bytes`, `agent.max_output_lines`). When bash, grep, glob, webfetch, websearch, `code_execution` or an MCP tool exceeds a cap, its full output is saved to a file. The model gets a preview and a footer with this format:
+
+```
+[output truncated: N bytes saved to PATH[, M bytes discarded]; inspect with read or grep; use bash for long lines[; saved search results also contain clipped lines]]
+```
+
+The model can inspect the saved file with `read` or `grep`. Each oversized result gets a unique artifact. Artifacts are limited to 8 MiB each, with a 256 MiB quota per session. The quota starts with the directory's existing usage and increases only after successful writes. Editing or deleting artifacts does not change the quota until the session is reopened. Artifacts remain until the session is deleted. A forked session can still refer to artifacts in its original session.
+
+Print mode (`--print`) stops new saves and waits up to five seconds for in-flight saves and cleanup. Saved paths may no longer exist after cleanup. Removal failures are logged. Abrupt process termination can leave artifacts behind.
+
+MCP results go through the same limit only when a session has a place to save them; without one they pass through unchanged. [Output hooks](/docs/hooks/#trimming-output) receive the complete MCP result before limiting or saving. A successful hook replacement is saved instead of the original text. A layer that throws is skipped and its error is logged. Cancellation or timeout during an output hook replaces the output with an error and prevents saving.
+
+**Long lines stay whole on disk.** `read` and `grep` cut any line longer than `agent.max_line_bytes` (default 1000) and end it with `[line truncated, +N bytes]`. That prefix is all the model saw, so writing it back would lose the rest. `write` and `edit_lines` refuse to drop or change such a line, and no edit tool accepts a new line that ends in a recognized truncation marker, including one followed by Unicode whitespace. Existing literal marker lines can remain unchanged or be removed, but cannot gain extra occurrences. To change text inside a long line, the model uses `edit` with an exact `old_string`.
+
+Fuzzy `edit` and `multi_edit` matches require full coverage of long lines. Nonblank long lines tolerate indentation changes. A long whitespace-only line requires a byte-identical line in `old_string` for each occurrence. An empty, shorter, or differently spaced blank line does not cover it. Exact substring edits remain available.
 
 **Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
+
+Lua tool handlers return raw `llm_output` and `output_limits` in a result table or through `ctx:finish`. Output limits apply after the terminal reply leaves Lua. See the [tool API](/docs/lua-api/#maki-api-register_tool).
 
 ## Fewer round-trips
 

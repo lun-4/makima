@@ -17,15 +17,21 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use maki_agent::agent::tool_dispatch;
+use maki_agent::mcp::test_support::stub_session_with_result;
+use maki_agent::tools::offload::OffloadStore;
 use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry, TurnToolBindings};
 use maki_agent::{AgentMode, ToolDoneEvent};
 use maki_config::PluginsConfig;
 use serde_json::{Map, Value, json};
 
-use crate::api::fs::{FsBackend, InMemoryFs};
+use crate::api::fs::{FsBackend, InMemoryFs, InMemoryOffloadBackend};
 
 const FILE: &str = "/tmp/writelock/file.txt";
 const STATE_DIR: &str = crate::test_support::TEST_STATE_DIR;
+const GUARDED_FILE: &str = "/tmp/writelock/guarded.txt";
+const INJECTED_FAILURE: &str = "injected failure";
+const LONG_LINE_CHANGED_FRAGMENT: &str = "longer than agent.max_line_bytes";
+const GUARDED_LONG_LINE_BYTES: usize = 1500;
 
 fn boot_with_backend(
     plugins: &[&str],
@@ -1027,5 +1033,447 @@ fn memory_computed_mutable_path_locks_the_real_note() {
     assert!(
         read.mutable_path(&first_ctx).is_none(),
         "memory read must not participate in write serialization"
+    );
+}
+
+/// Real-disk read barrier: the first `read` takes its content, then parks
+/// until released and hands back that content. The file tracker stats the
+/// real disk, so a stat-versus-read race can only be staged on `RealFs`.
+struct RealReadBarrierFs {
+    fs: crate::api::fs::RealFs,
+    armed: AtomicBool,
+    parked_tx: flume::Sender<()>,
+    parked_rx: flume::Receiver<()>,
+    release_tx: flume::Sender<()>,
+    release_rx: flume::Receiver<()>,
+}
+
+impl RealReadBarrierFs {
+    fn new() -> Arc<Self> {
+        let (parked_tx, parked_rx) = flume::unbounded();
+        let (release_tx, release_rx) = flume::unbounded();
+        Arc::new(Self {
+            fs: crate::api::fs::RealFs,
+            armed: AtomicBool::new(true),
+            parked_tx,
+            parked_rx,
+            release_tx,
+            release_rx,
+        })
+    }
+
+    async fn wait_parked(&self) {
+        let _ = self.parked_rx.recv_async().await;
+    }
+
+    fn release(&self) {
+        self.release_tx.send(()).ok();
+    }
+}
+
+impl FsBackend for RealReadBarrierFs {
+    fn read(&self, path: PathBuf) -> crate::api::fs::BoxFuture<'_, std::io::Result<String>> {
+        Box::pin(async move {
+            let content = self.fs.read(path).await?;
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.parked_tx.send(()).ok();
+                let _ = self.release_rx.recv_async().await;
+            }
+            Ok(content)
+        })
+    }
+    fn read_bytes(&self, path: PathBuf) -> crate::api::fs::BoxFuture<'_, std::io::Result<Vec<u8>>> {
+        self.fs.read_bytes(path)
+    }
+    fn stat(
+        &self,
+        path: PathBuf,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<crate::api::fs::FsMeta>> {
+        self.fs.stat(path)
+    }
+    fn write(
+        &self,
+        path: PathBuf,
+        content: Vec<u8>,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.write(path, content)
+    }
+    fn atomic_write(
+        &self,
+        path: PathBuf,
+        content: Vec<u8>,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.atomic_write(path, content)
+    }
+    fn rm(
+        &self,
+        path: PathBuf,
+        recursive: bool,
+        force: bool,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.rm(path, recursive, force)
+    }
+    fn mkdir(
+        &self,
+        path: PathBuf,
+        parents: bool,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.mkdir(path, parents)
+    }
+    fn dir(
+        &self,
+        path: PathBuf,
+        max_depth: u32,
+    ) -> crate::api::fs::BoxFuture<'_, Result<Vec<(String, &'static str)>, crate::api::fs::FsError>>
+    {
+        self.fs.dir(path, max_depth)
+    }
+    fn glob(
+        &self,
+        patterns: Vec<String>,
+        path: Option<String>,
+        limit: Option<usize>,
+        gitignore: bool,
+        sort_mtime: bool,
+    ) -> crate::api::fs::BoxFuture<'_, Result<Vec<String>, crate::api::fs::FsError>> {
+        self.fs.glob(patterns, path, limit, gitignore, sort_mtime)
+    }
+    fn grep(
+        &self,
+        params: maki_agent::tools::grep::GrepParams,
+    ) -> crate::api::fs::BoxFuture<
+        '_,
+        Result<(PathBuf, Vec<maki_agent::GrepFileEntry>), crate::api::fs::FsError>,
+    > {
+        self.fs.grep(params)
+    }
+}
+
+#[test]
+fn real_read_barrier_blocks_until_released() {
+    smol::block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "before").unwrap();
+        let barrier = RealReadBarrierFs::new();
+
+        let reader = Arc::clone(&barrier);
+        let read_path = path.clone();
+        let read = smol::spawn(async move { reader.read(read_path).await });
+        barrier.wait_parked().await;
+        std::fs::write(&path, "after").unwrap();
+        barrier.release();
+
+        assert_eq!(
+            read.await.unwrap(),
+            "before",
+            "content taken before parking"
+        );
+        assert_eq!(
+            barrier.read(path).await.unwrap(),
+            "after",
+            "later reads pass through"
+        );
+    });
+}
+
+/// A file changed between `read`'s stat and its content read must leave the
+/// tracker on the older mtime, so an edit built on the stale content fails.
+#[test]
+fn read_racing_modification_leaves_stale_mtime() {
+    smol::block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.txt");
+        std::fs::write(&path, "alpha\n").unwrap();
+        let path_str = path.to_str().unwrap().to_owned();
+        let barrier = RealReadBarrierFs::new();
+        let (registry, _host) =
+            boot_with_backend(&["read", "edit"], Arc::clone(&barrier) as _, HashMap::new());
+        let ctx = shared_ctx(&registry);
+
+        let ctx_read = ctx.clone();
+        let read_input = json!({"path": path_str, "offset": 1, "limit": 0});
+        let read =
+            smol::spawn(async move { dispatch_async(&ctx_read, "r1", "read", read_input).await });
+        barrier.wait_parked().await;
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        barrier.release();
+        let read_done = read.await;
+        assert!(
+            !read_done.is_error,
+            "read failed: {}",
+            read_done.output.as_text()
+        );
+
+        let edit = dispatch(
+            &ctx,
+            "e1",
+            "edit",
+            json!({"path": path_str, "old_string": "alpha", "new_string": "ALPHA"}),
+        );
+        assert!(edit.is_error, "edit on stale content must be rejected");
+        assert!(
+            edit.output
+                .as_text()
+                .contains(maki_agent::tools::STALE_READ_MSG),
+            "unexpected error: {}",
+            edit.output.as_text()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+    });
+}
+
+#[test]
+fn failed_reread_preserves_stale_write_protection() {
+    use crate::api::fs::RealFs;
+    use maki_agent::tools::STALE_READ_MSG;
+    use std::fs::{File, read, write};
+    use std::time::{Duration, SystemTime};
+
+    const ORIGINAL: &str = "original\n";
+    const REPLACEMENT: &[u8] = b"external\xff\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reread.txt");
+    write(&path, ORIGINAL).unwrap();
+    let (registry, _host) = boot_with_backend(&["read", "write"], Arc::new(RealFs), HashMap::new());
+    let ctx = shared_ctx(&registry);
+    let input = json!({"path": path, "offset": 1, "limit": 0});
+    let initial = dispatch(&ctx, "r1", "read", input.clone());
+    assert!(!initial.is_error, "{}", initial.output.as_text());
+    assert!(initial.output.as_text().contains(ORIGINAL.trim_end()));
+
+    write(&path, REPLACEMENT).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
+    let reread = dispatch(&ctx, "r2", "read", input);
+    assert!(reread.is_error, "{}", reread.output.as_text());
+
+    let result = dispatch(
+        &ctx,
+        "w1",
+        "write",
+        json!({"path": path, "content": ORIGINAL}),
+    );
+    assert!(result.is_error, "{}", result.output.as_text());
+    assert!(result.output.as_text().contains(STALE_READ_MSG));
+    assert_eq!(read(&path).unwrap(), REPLACEMENT);
+}
+
+fn guarded_content() -> Vec<u8> {
+    format!("short\n{}\nend\n", "x".repeat(GUARDED_LONG_LINE_BYTES)).into_bytes()
+}
+
+/// The write guard holds through the real dispatcher with the freshness
+/// check off and a tracker that never saw a read: it compares content, not
+/// read history.
+#[test]
+fn guard_holds_through_dispatcher_with_stale_check_off() {
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(std::path::Path::new(GUARDED_FILE), guarded_content());
+    let (registry, _host) = boot(Arc::clone(&fs), &["write"]);
+    let mut ctx = shared_ctx(&registry);
+    ctx.config.stale_read_check = false;
+
+    let done = dispatch(
+        &ctx,
+        "w1",
+        "write",
+        json!({"path": GUARDED_FILE, "content": "short\nend\n"}),
+    );
+    assert!(done.is_error, "lossy write must be rejected");
+    assert!(
+        done.output.as_text().contains(LONG_LINE_CHANGED_FRAGMENT),
+        "{}",
+        done.output.as_text()
+    );
+    assert_eq!(
+        file_content(&fs, GUARDED_FILE).into_bytes(),
+        guarded_content()
+    );
+}
+
+/// In-memory backend whose `stat` or `read_bytes` fail with a non-NotFound
+/// error, so the write guard's classification of the target can be probed.
+struct FailingFs {
+    fs: InMemoryFs,
+    fail_stat: bool,
+    fail_read_bytes: bool,
+}
+
+fn injected() -> std::io::Error {
+    std::io::Error::other(INJECTED_FAILURE)
+}
+
+impl FsBackend for FailingFs {
+    fn read(&self, path: PathBuf) -> crate::api::fs::BoxFuture<'_, std::io::Result<String>> {
+        self.fs.read(path)
+    }
+    fn read_bytes(&self, path: PathBuf) -> crate::api::fs::BoxFuture<'_, std::io::Result<Vec<u8>>> {
+        if self.fail_read_bytes {
+            return Box::pin(async { Err(injected()) });
+        }
+        self.fs.read_bytes(path)
+    }
+    fn stat(
+        &self,
+        path: PathBuf,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<crate::api::fs::FsMeta>> {
+        if self.fail_stat {
+            return Box::pin(async { Err(injected()) });
+        }
+        self.fs.stat(path)
+    }
+    fn write(
+        &self,
+        path: PathBuf,
+        content: Vec<u8>,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.write(path, content)
+    }
+    fn atomic_write(
+        &self,
+        path: PathBuf,
+        content: Vec<u8>,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.atomic_write(path, content)
+    }
+    fn rm(
+        &self,
+        path: PathBuf,
+        recursive: bool,
+        force: bool,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.rm(path, recursive, force)
+    }
+    fn mkdir(
+        &self,
+        path: PathBuf,
+        parents: bool,
+    ) -> crate::api::fs::BoxFuture<'_, std::io::Result<()>> {
+        self.fs.mkdir(path, parents)
+    }
+    fn dir(
+        &self,
+        path: PathBuf,
+        max_depth: u32,
+    ) -> crate::api::fs::BoxFuture<'_, Result<Vec<(String, &'static str)>, crate::api::fs::FsError>>
+    {
+        self.fs.dir(path, max_depth)
+    }
+    fn glob(
+        &self,
+        patterns: Vec<String>,
+        path: Option<String>,
+        limit: Option<usize>,
+        gitignore: bool,
+        sort_mtime: bool,
+    ) -> crate::api::fs::BoxFuture<'_, Result<Vec<String>, crate::api::fs::FsError>> {
+        self.fs.glob(patterns, path, limit, gitignore, sort_mtime)
+    }
+    fn grep(
+        &self,
+        params: maki_agent::tools::grep::GrepParams,
+    ) -> crate::api::fs::BoxFuture<
+        '_,
+        Result<(PathBuf, Vec<maki_agent::GrepFileEntry>), crate::api::fs::FsError>,
+    > {
+        self.fs.grep(params)
+    }
+}
+
+#[test_case::test_case(true, false ; "write_metadata_error_leaves_target_unchanged")]
+#[test_case::test_case(false, true ; "write_read_error_leaves_target_unchanged")]
+fn write_target_errors_fail_closed(fail_stat: bool, fail_read_bytes: bool) {
+    let failing = Arc::new(FailingFs {
+        fs: InMemoryFs::new(),
+        fail_stat,
+        fail_read_bytes,
+    });
+    failing
+        .fs
+        .seed(std::path::Path::new(GUARDED_FILE), guarded_content());
+    let (registry, _host) =
+        boot_with_backend(&["write"], Arc::clone(&failing) as _, HashMap::new());
+    let ctx = shared_ctx(&registry);
+
+    let done = dispatch(
+        &ctx,
+        "w1",
+        "write",
+        json!({"path": GUARDED_FILE, "content": "anything\n"}),
+    );
+    assert!(
+        done.is_error,
+        "write must fail when the target can't be inspected"
+    );
+    assert!(
+        done.output.as_text().contains(INJECTED_FAILURE),
+        "{}",
+        done.output.as_text()
+    );
+    assert_eq!(
+        file_content(&failing.fs, GUARDED_FILE).into_bytes(),
+        guarded_content()
+    );
+}
+
+/// MCP output offloaded through the session's store can be opened by the Lua
+/// `read` tool of the same host: both go through the host-chosen backend.
+#[test]
+fn mcp_offload_readable_by_lua_read() {
+    const LINES: usize = 50;
+    const SMALL_OUTPUT_LINES: usize = 5;
+    const MCP_TOOL_WIRE: &str = "srv__probe";
+    const MCP_TOOL_QUALIFIED: &str = "srv.probe";
+    let text = (1..=LINES)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fs = Arc::new(InMemoryFs::new());
+    let (registry, _host) = boot(Arc::clone(&fs), &["read"]);
+    let mut ctx = shared_ctx(&registry);
+    ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
+    ctx.offload = Some(Arc::new(OffloadStore::new(Box::new(
+        InMemoryOffloadBackend::new(
+            Arc::clone(&fs),
+            PathBuf::from(STATE_DIR).join("sessions/offload/s"),
+        ),
+    ))));
+    ctx.mcp = Some(stub_session_with_result(&[(MCP_TOOL_QUALIFIED, "")], &text));
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &ctx.registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+
+    let mcp = dispatch(&ctx, "m1", MCP_TOOL_WIRE, json!({}));
+    let footer = mcp.output.as_text();
+    let (_, rest) = footer.split_once("saved to ").expect("offload footer");
+    let path = rest.split_once(';').unwrap().0;
+
+    let read = dispatch(
+        &ctx,
+        "r1",
+        "read",
+        json!({"path": path, "offset": LINES - 2, "limit": 0}),
+    );
+    assert!(!read.is_error, "{}", read.output.as_text());
+    assert!(
+        read.output
+            .as_text()
+            .contains(&format!("{LINES}: line {LINES}")),
+        "{}",
+        read.output.as_text()
     );
 }

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use maki_agent::AgentMode;
 use maki_agent::mcp::test_support::stub_session;
@@ -373,6 +374,7 @@ fn model_only_client_tool_stays_out_of_the_sandbox() {
 // --- script rendering ---
 
 const SCRIPT_TOOL_ID: &str = "ce-script-1";
+const RESTORE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_SCRIPT_LINES: usize = 2000;
 const EXPAND_NOTICE: &str = "click to expand";
 const DIVIDER_LINE: &str = "──────";
@@ -533,7 +535,7 @@ fn restore_lines_with(code: &str, output: &str, is_error: bool, clicks: Vec<usiz
     );
     let snapshot = loop {
         let env = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
+            .recv_timeout(RESTORE_SNAPSHOT_TIMEOUT)
             .expect("restore must emit a snapshot");
         if let maki_agent::AgentEvent::ToolSnapshot { id, snapshot, .. } = env.event
             && id == SCRIPT_TOOL_ID

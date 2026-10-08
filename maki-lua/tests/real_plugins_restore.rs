@@ -13,7 +13,8 @@ use maki_agent::session_coordinator::{
     DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
     SessionCoordinatorParams, builtin_option_definitions,
 };
-use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolRegistry};
+use maki_agent::tools::offload::{OffloadStore, is_offload_notice};
+use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry};
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
@@ -41,6 +42,8 @@ const EXPAND_HINT: &str = "click to expand";
 const VIEW_CAP: usize = 3;
 const INDEX_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
+const GREP_NO_MATCHES: &str = "No files found";
+const GREP_ERROR_OUTPUT: &str = "error: pattern is required";
 
 fn view_lines() -> ToolOutputLines {
     ToolOutputLines {
@@ -89,6 +92,18 @@ fn restore(
     state: Option<Value>,
     clicks: Vec<usize>,
 ) -> Restored {
+    restore_as(host, tool, input, output, false, state, clicks)
+}
+
+fn restore_as(
+    host: &PluginHost,
+    tool: &str,
+    input: Value,
+    output: &str,
+    is_error: bool,
+    state: Option<Value>,
+    clicks: Vec<usize>,
+) -> Restored {
     let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
     handle.request_restore(
@@ -97,7 +112,7 @@ fn restore(
             tool_use_id: "restore_id".to_owned(),
             output: output.to_owned(),
             input,
-            is_error: false,
+            is_error,
             tool_output_lines: view_lines(),
             theme_gen: None,
             clicks,
@@ -298,6 +313,16 @@ struct Live {
 }
 
 fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) -> Live {
+    exec_live_with(host, reg, tool, input, |_| {})
+}
+
+fn exec_live_with(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    tool: &str,
+    input: Value,
+    shape: impl FnOnce(&mut ToolContext),
+) -> Live {
     let (tx, rx) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
     let mut ctx = maki_agent::tools::test_support::stub_ctx_with(
@@ -306,6 +331,7 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
         Some(LIVE_TOOL_USE_ID),
     );
     ctx.tool_output_lines = view_lines();
+    shape(&mut ctx);
     let inv = reg
         .get(tool)
         .unwrap_or_else(|| panic!("tool {tool} not registered"))
@@ -482,6 +508,71 @@ fn grep_restore_keeps_truncation_marker() {
     assert!(
         restored.body.ends_with(FILE_TRUNCATED_MARKER),
         "marker kept as the last line: {}",
+        restored.body
+    );
+}
+
+const GREP_MATCH_FILES: usize = 40;
+const SMALL_OUTPUT_LINES: usize = 12;
+
+fn many_match_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..GREP_MATCH_FILES {
+        std::fs::write(dir.path().join(format!("f{i}.rs")), "fn one() {}\n").unwrap();
+    }
+    dir
+}
+
+fn offloading(store: &Arc<OffloadStore>) -> impl FnOnce(&mut ToolContext) {
+    let store = Arc::clone(store);
+    move |ctx| {
+        ctx.offload = Some(store);
+        ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
+    }
+}
+
+#[test]
+fn grep_offload_restore_keeps_preview_and_notice() {
+    let dir = many_match_dir();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(OffloadStore::on_disk(store_dir.path().to_path_buf()));
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
+
+    let live = exec_live_with(&host, &reg, GREP_TOOL, input.clone(), offloading(&store));
+    let preview_matches = live.output.matches("fn one() {}").count();
+    assert!(preview_matches > 0 && preview_matches < GREP_MATCH_FILES);
+    let notice = live
+        .output
+        .lines()
+        .find(|line| is_offload_notice(line))
+        .unwrap();
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, vec![0]);
+    assert_eq!(
+        restored.body.matches("fn one() {}").count(),
+        preview_matches
+    );
+    assert!(restored.body.ends_with(notice), "{}", restored.body);
+}
+
+#[test_case::test_case(GREP_NO_MATCHES, false; "no_matches")]
+#[test_case::test_case(GREP_ERROR_OUTPUT, true; "error")]
+fn grep_no_matches_restore_unchanged(output: &str, is_error: bool) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let restored = restore_as(
+        &host,
+        GREP_TOOL,
+        json!({ "pattern": "fn" }),
+        output,
+        is_error,
+        None,
+        Vec::new(),
+    );
+    assert!(
+        restored.body.is_empty(),
+        "grep must keep declining to restore no-match output: {}",
         restored.body
     );
 }

@@ -9,6 +9,7 @@ local MULTI_CANDIDATE_THRESHOLD = 0.3
 local CONTEXT_AWARE_LINE_MIN = 3
 local CONTEXT_AWARE_MATCH_RATIO = 0.5
 local INDENT_PATTERN = "^[ \t]*"
+local NEWLINE_BYTE = string.byte("\n")
 
 local function split_lines(s)
   local lines = {}
@@ -622,19 +623,50 @@ local function all_start_a_line(content, at)
   return true
 end
 
+-- A line longer than {max_line_bytes} may have been shown to the model cut,
+-- so a fuzzy candidate may only include it when {find} holds its own copy:
+-- each long nonblank candidate line consumes one trimmed-equal line of {find}.
+-- Whitespace-only lines require byte-identical copies in separate counts.
+-- Otherwise block matchers could replace a long line the model never saw in
+-- full, or collapse two copies into one.
+local function covers_long_lines(matched, find, max_line_bytes)
+  local nonblank, blank = {}, {}
+  for _, line in ipairs(split_lines(find)) do
+    local key = trim(line)
+    local available = key == "" and blank or nonblank
+    key = key == "" and line or key
+    available[key] = (available[key] or 0) + 1
+  end
+  for _, line in ipairs(split_lines(matched)) do
+    if #line > max_line_bytes then
+      local key = trim(line)
+      local available = key == "" and blank or nonblank
+      key = key == "" and line or key
+      local left = available[key] or 0
+      if left == 0 then
+        return false
+      end
+      available[key] = left - 1
+    end
+  end
+  return true
+end
+
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
--- one of the error constants above.
-function M.replace(content, old_string, new_string, replace_all)
+-- one of the error constants above. With {max_line_bytes}, fuzzy matches
+-- must cover long lines in full.
+function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
   if old_string == "" then
     return nil, M.EMPTY_OLD_STRING
   end
 
   local any_found = false
 
-  local function try_match(candidates, find, replacement)
+  local function try_match(candidates, find, replacement, guarded)
     for _, matched in ipairs(candidates) do
-      local at = occurrences(content, matched)
+      local admitted = not (guarded and max_line_bytes) or covers_long_lines(matched, find, max_line_bytes)
+      local at = admitted and occurrences(content, matched) or {}
       if #at > 0 then
         any_found = true
         if replace_all or #at == 1 then
@@ -650,24 +682,26 @@ function M.replace(content, old_string, new_string, replace_all)
   end
 
   for _, r in ipairs(REPLACERS) do
-    local res = try_match(r(content, old_string), old_string, new_string)
+    local res = try_match(r(content, old_string), old_string, new_string, r ~= exact)
     if res then
-      return res, nil
+      return res
     end
   end
 
   local unescaped = unescape(old_string)
   if unescaped ~= old_string then
-    local res = try_match(escape_normalized(content, unescaped), unescaped, unescape(new_string))
+    -- Unguarded: every candidate unescapes line for line to the find, so it
+    -- already holds each long line in full.
+    local res = try_match(escape_normalized(content, unescaped), unescaped, unescape(new_string), false)
     if res then
-      return res, nil
+      return res
     end
   end
 
   for _, r in ipairs(LATE_REPLACERS) do
-    local res = try_match(r(content, old_string), old_string, new_string)
+    local res = try_match(r(content, old_string), old_string, new_string, true)
     if res then
-      return res, nil
+      return res
     end
   end
 

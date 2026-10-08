@@ -416,4 +416,116 @@ case("line_endings_follow_the_majority_when_mixed", function()
   eq(edit_lines("a\r\nb\n", 1, 1, "X"), "X\nb\n")
 end)
 
+-- Long-line protection: a line over the cap may have been shown cut, so
+-- fuzzy candidates must hold their own copy of every long line.
+local CAP = 40
+local LONG = (function()
+  local tokens = {}
+  for i = 1, 20 do
+    tokens[i] = string.format("%04d", i)
+  end
+  return table.concat(tokens)
+end)()
+local TRUNC = LONG:sub(1, 20) .. "[line truncated, +60 bytes]"
+
+case("block_anchor_rejects_truncated_long_middle_line", function()
+  local content = "fn a() {\n" .. LONG .. "\n}"
+  local old = "fn a() {\n" .. TRUNC .. "\n}"
+  has(fr.replace(content, old, R, false), R)
+  local result, err = fr.replace(content, old, R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+end)
+
+case("context_aware_rejects_truncated_long_middle_line", function()
+  local content = "fn h() {\n    a();\n" .. LONG .. "\n    b();\n}"
+  local old = "fn h() {\n    a();\n" .. TRUNC .. "\n    b();\n}"
+  local result, err = fr.replace(content, old, R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+end)
+
+case("block_anchor_rejects_duplicate_long_line_collapse", function()
+  local content = "BEGIN\n" .. LONG .. "\n" .. LONG .. "\nEND"
+  local old = "BEGIN\n" .. LONG .. "\nEND"
+  has(fr.replace(content, old, R, false), R)
+  local result, err = fr.replace(content, old, R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+end)
+
+local LONG_SPACES = string.rep(" ", CAP + 1)
+local LONG_TABS = string.rep("\t", CAP + 1)
+
+case("long_blank_requires_byte_identical_coverage", function()
+  local content = "BEGIN\n" .. LONG_SPACES .. "\nEND"
+  for _, coverage in ipairs({ "", " \t", LONG_SPACES .. " " }) do
+    local old = " BEGIN\n" .. coverage .. "\n END"
+    eq(fr.replace(content, old, R, false), R)
+    local result, err = fr.replace(content, old, R, false, CAP)
+    eq(result, nil)
+    eq(err, NO_MATCH)
+  end
+end)
+
+case("long_blank_duplicate_copies_require_separate_coverage", function()
+  local content = "BEGIN\n" .. LONG_SPACES .. "\n" .. LONG_SPACES .. "\nEND"
+  local result, err = fr.replace(content, " BEGIN\n" .. LONG_SPACES .. "\n END", R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+  eq(fr.replace(content, " BEGIN\n" .. LONG_SPACES .. "\n" .. LONG_SPACES .. "\n END", R, false, CAP), R)
+end)
+
+case("long_blank_full_fuzzy_coverage_and_exact_substring_are_allowed", function()
+  eq(fr.replace("BEGIN\n" .. LONG_TABS .. "\nEND", " BEGIN\n" .. LONG_TABS .. "\n END", R, false, CAP), R)
+  local prefix = LONG_SPACES:sub(1, CAP / 2)
+  eq(fr.replace("BEGIN\n" .. LONG_SPACES, "BEGIN\n" .. prefix, R, false, CAP), R .. LONG_SPACES:sub(#prefix + 1))
+end)
+
+case("long_blank_coverage_preserves_spaces_and_tabs_as_distinct_bytes", function()
+  local content = "BEGIN\n" .. LONG_SPACES .. "\n" .. LONG_TABS .. "\nEND"
+  local result, err = fr.replace(content, " BEGIN\n" .. LONG_SPACES .. "\n" .. LONG_SPACES .. "\n END", R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+  eq(fr.replace(content, " BEGIN\n" .. LONG_TABS .. "\n" .. LONG_SPACES .. "\n END", R, false, CAP), R)
+end)
+
+case("long_nonblank_trimmed_coverage_still_passes", function()
+  eq(fr.replace("BEGIN\n  " .. LONG .. " \nEND", " BEGIN\n" .. LONG .. "\n END", R, false, CAP), R)
+end)
+
+case("long_blank_escape_normalized_still_passes", function()
+  local content = "BEGIN\n" .. LONG_TABS .. "\nEND"
+  local old = "BEGIN\\n" .. string.rep("\\t", #LONG_TABS) .. "\\nEND"
+  eq(fr.replace(content, old, R, false, CAP), R)
+end)
+
+case("short_blank_fuzzy_still_passes", function()
+  eq(fr.replace("BEGIN\n \t\nEND", " BEGIN\n\n END", R, false, CAP), R)
+end)
+
+case("short_line_fuzzy_unchanged_with_cap", function()
+  local result = fr.replace(
+    "fn test() {\n    let x = 1;\n    let y = 2;\n}",
+    "fn test() {\n    let x = 99;\n    let y = 2;\n}",
+    R,
+    false,
+    CAP
+  )
+  has(result, R)
+end)
+
+case("escape_normalized_keeps_long_line_with_backslashes", function()
+  local content = 'p("' .. LONG .. '")\nq'
+  local result = fr.replace(content, 'p(\\"' .. LONG .. '\\")\nq', R, false, CAP)
+  eq(result, R)
+end)
+
+case("escape_normalized_matches_long_line_with_cap", function()
+  local content = "a = \"it\\'s " .. LONG .. '"\nq'
+  local old = "a = \\\"it's " .. LONG .. '\\"\nq'
+  eq(fr.replace(content, old, R, false), R)
+  eq(fr.replace(content, old, R, false, CAP), R)
+end)
+
 th.report()

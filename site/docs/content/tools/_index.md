@@ -73,7 +73,7 @@ Prefer this over edit when making multiple changes to the same file.
 
 ### `edit_lines` {#edit_lines}
 
-Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
+Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Lines longer than `agent.max_line_bytes` may have been shown cut, so a non-empty `new_string` must keep them unchanged; change text inside them with `edit`. Do not use with the batch tool.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

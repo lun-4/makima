@@ -360,6 +360,7 @@ string or a table with richer output fields.
     Must return a string or a table with any of these fields:
     - `llm_output` (`string`) Text sent to the model.
     - `is_error` (`boolean`) When true, the result is treated as an error.
+    - `output_limits` (`table`) Bounds raw plain-text `llm_output` after the handler or `ctx:finish` returns.
     - `content` (`string`) Alias for llm_output (legacy).
     - `body` (`BufHandle`) Rich rendered body shown in the UI.
     - `header` (`BufHandle`) One-line header shown before the body.
@@ -383,6 +384,12 @@ string or a table with richer output fields.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input, ctx)` returning a list of path scopes that need write permission. `ctx.session_id` identifies the invocation session when available.
   - `mutable_path` (`string|function`) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
+
+  The handler can bound its model-facing output by returning `output_limits` with `llm_output`, or by passing the same reply table to `ctx:finish(reply)`. Options are `preview` ("head" or "head_tail"), `trailer` (a line that always comes last and is never cut), `lines_clipped` (the text already has long lines cut), and `max_lines` / `max_bytes` (per-tool limits; zero returns metadata only). The fixed output label is "output". Limits require plain-text `llm_output` and cannot be combined with markdown, image, diff, `state`, or `instructions` fields. Trailing newlines are removed before limiting, hashing, and saving. Longer output is saved to the session's offload store and replaced by a preview and footer; without a store it is cut instead.
+
+
+  Job exit and cancellation hooks are synchronous callbacks and cannot yield, so pass the reply table with `output_limits` to `ctx:finish(reply)`. The host applies limits after receiving the reply and preserves `is_error`. With an output hook, dispatch filters the full output before limiting. Persistence retains its absolute deadline, including any per-tool timeout or deadline set with `ctx:set_deadline`. Cancellation or an expired deadline denies filtering without saving output. The body is saved without trailing newlines or the protected trailer. A started worker retains its owned text, options, and store even when its caller is dropped; session cleanup closes the store before removing its files.
+
 
 **Example:**
 
@@ -4094,12 +4101,13 @@ print(md) -- "# Hello\n\nworld"
 maki.text.truncate_line({text}, {max_bytes})
 ```
 
-Truncate one line while preserving a UTF-8 boundary and adding `[line truncated]`.
+Truncate one line while preserving a UTF-8 boundary and ending it with
+`[line truncated, +N bytes]`, where N is the number of bytes cut.
 
 **Parameters:**
 
 - `{text}` (`string`) The line to truncate.
-- `{max_bytes}` (`integer`) Maximum source bytes to retain.
+- `{max_bytes}` (`integer`) Maximum bytes of the result, marker included; a cap smaller than the marker yields the marker alone.
 
 **Returns:** string The truncated line.
 
@@ -4121,6 +4129,39 @@ Truncate file output by line and byte limits, adding `[file truncated]` when nee
 - `{remaining_lines}` (`integer?`) Number of source lines remaining after the output.
 
 **Returns:** string The truncated file output.
+
+---
+
+### `maki.text.truncation_marker()` {#maki-text-truncation_marker}
+
+```lua
+maki.text.truncation_marker({line})
+```
+
+Name the tool output a line's trailing truncation marker came from, if any.
+Mutation guards use it to reject markers pasted back as file content.
+
+**Parameters:**
+
+- `{line}` (`string`) One line, without its newline.
+
+**Returns:** string? `"read"` for a read or grep line marker (current or legacy format), `"preview"` for a line cut in an offload preview, or nil.
+
+---
+
+### `maki.text.is_offload_notice()` {#maki-text-is_offload_notice}
+
+```lua
+maki.text.is_offload_notice({line})
+```
+
+Whether a line is the saved-output footer in a tool result.
+
+**Parameters:**
+
+- `{line}` (`string`) One line of tool output.
+
+**Returns:** boolean
 
 
 ## maki.time {#maki-time}
@@ -6550,8 +6591,9 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
--- one of the error constants above.
-function M.replace(content, old_string, new_string, replace_all)
+-- one of the error constants above. With {max_line_bytes}, fuzzy matches
+-- must cover long lines in full.
+function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
 ```
 
 ### `require("maki.list_picker")`
@@ -6578,6 +6620,30 @@ ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
 ```
 
+### `require("maki.long_lines")`
+
+```lua
+-- Write-time guard against lossy write-back of truncated tool output.
+--
+-- read and grep cut lines longer than agent.max_line_bytes, so the model may
+-- only ever have seen a prefix of them. These checks compare content, not
+-- read history: they hold after resume, in subagents, and whatever the model
+-- last read. Lines are compared exactly, and every protected line consumes
+-- its own occurrence, so two identical long lines cannot collapse into one.
+M.LONG_LINE_CHANGED = "line %d is %d bytes, longer than agent.max_line_bytes (%d), so it may have been shown "
+
+--- Every long line of `before` must survive unchanged somewhere in `after`.
+function M.check_write(before, after, max_line_bytes)
+
+--- Every long line in content's [start_line, end_line] must survive in
+--- `new_string`. An empty `new_string` is an explicit deletion and passes.
+function M.check_replace_lines(content, start_line, end_line, new_string, max_line_bytes)
+
+--- Reject lines of `after` that end in a truncation marker unless an
+--- identical line is still available in `before`. Removing a marker passes.
+function M.check_markers(before, after)
+```
+
 ### `require("maki.output_limits")`
 
 ```lua
@@ -6595,6 +6661,10 @@ M.specs = {
   max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
   max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
 }
+
+function M.line_bytes(ctx)
+  return ctx:config("max_line_bytes", DEFAULT_MAX_LINE_BYTES)
+end
 
 function M.extend(spec)
   for name, s in pairs(M.specs) do
@@ -6619,11 +6689,9 @@ return M
 -- tells the model that output is real but unfinished. One home for the
 -- wording and the painting, so every tool says it the same way.
 
---- Close {view} on the marker and build the tool reply. {out} is everything
---- the tool streamed, already truncated; empty means the view still shows a
---- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
---- "timeout").
-function M.cut(view, out, reason, timeout_secs)
+--- Close {view} once and return raw output with a deferred marker trailer.
+--- {reason} is a cancel-hook reason ("cancelled" | "timeout").
+function M.cut(view, out, reason, timeout_secs, limits)
 ```
 
 ### `require("maki.plan_spec")`

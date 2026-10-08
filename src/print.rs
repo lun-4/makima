@@ -8,6 +8,7 @@
 //! Check their docs before changing anything here.
 
 use std::io::{self, Read};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_agent::headless::{HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
+use maki_agent::tools::offload::OffloadCleanup;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, ImageSource,
     ModeRegistry, PermissionsConfig, TurnOutcome,
@@ -251,6 +253,65 @@ impl VerboseOutput {
     }
 }
 
+fn run_and_settle<T>(
+    task: smol::Task<()>,
+    cleanup: Option<OffloadCleanup>,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let body_result = catch_unwind(AssertUnwindSafe(body));
+    let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
+    let settlement = catch_unwind(AssertUnwindSafe(|| {
+        smol::block_on(async {
+            let mut task = task;
+            if matches!(&body_result, Ok(Ok(_)))
+                && futures_lite::future::or(
+                    async {
+                        (&mut task).await;
+                        true
+                    },
+                    async {
+                        smol::Timer::at(deadline).await;
+                        false
+                    },
+                )
+                .await
+            {
+                return;
+            }
+            if let Some(cleanup) = &cleanup {
+                cleanup.request();
+            }
+            futures_lite::future::or(
+                async {
+                    task.cancel().await;
+                },
+                async {
+                    smol::Timer::at(deadline).await;
+                },
+            )
+            .await;
+        });
+    }));
+
+    if let Some(cleanup) = cleanup {
+        cleanup.request();
+        smol::block_on(futures_lite::future::or(
+            async {
+                let _ = cleanup.wait().await;
+            },
+            async {
+                smol::Timer::at(deadline).await;
+            },
+        ));
+    }
+
+    match (body_result, settlement) {
+        (Err(body_panic), _) => resume_unwind(body_panic),
+        (Ok(_), Err(task_panic)) => resume_unwind(task_panic),
+        (Ok(result), Ok(())) => result,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     model: &Model,
@@ -308,6 +369,7 @@ pub fn run(
     }
 
     let terminal_result_emitted = std::cell::Cell::new(false);
+    let state_dir = maki_storage::paths::state_dir().ok();
     let runner = |input: AgentInput| {
         let handle = maki_agent::headless::spawn(HeadlessParams {
             model: model.clone(),
@@ -326,6 +388,7 @@ pub fn run(
             project_config,
             modes: Arc::clone(&modes),
             session_options: session_options.clone(),
+            state_dir: state_dir.clone(),
         })
         .map_err(|error| eyre!("register print session coordinator: {error}"))?;
 
@@ -335,195 +398,188 @@ pub fn run(
             session_id,
             cwd,
             task,
+            offload_cleanup,
         } = handle;
         let start = Instant::now();
+        let (mut result, verbose_out) = run_and_settle(task, offload_cleanup, || {
+            let mut verbose_out = match format {
+                OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
+                _ if verbose => Some(VerboseOutput::Json(Vec::new())),
+                _ => None,
+            };
 
-        let mut verbose_out = match format {
-            OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
-            _ if verbose => Some(VerboseOutput::Json(Vec::new())),
-            _ => None,
-        };
-
-        if let Some(out) = &mut verbose_out {
-            out.emit(&InitEvent {
-                event_type: "system",
-                subtype: "init",
-                cwd: &cwd,
-                session_id: &session_id,
-                tools: &tool_names,
-                model: &model.id,
-            })?;
-        }
-
-        let mut result_text = String::new();
-        let mut is_error = false;
-        let mut num_turns: u32 = 0;
-        let mut usage = TokenUsage::default();
-        // Summed as the turns land: rates move mid-run, and only a turn knows the
-        // rate it paid.
-        let mut cost = None;
-        let mut stop_reason: Option<DoneReason> = None;
-
-        let snapshot = HeadlessSnapshot::default();
-        snapshot.install(
-            &lua_handle,
-            HeadlessMeta {
-                id: session_id.to_string(),
-                cwd: cwd.clone(),
-                model: model.spec(),
-                fast: false,
-                thinking: String::new(),
-            },
-            // `makima --print` always runs the agent in build mode
-            // (`headless::spawn` hardcodes `AgentMode::Build`).
-            || MODE_BUILD,
-        );
-
-        while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
-            if matches!(envelope.event, AgentEvent::StreamClosed) {
-                break;
+            if let Some(out) = &mut verbose_out {
+                out.emit(&InitEvent {
+                    event_type: "system",
+                    subtype: "init",
+                    cwd: &cwd,
+                    session_id: &session_id,
+                    tools: &tool_names,
+                    model: &model.id,
+                })?;
             }
-            snapshot.observe(&envelope);
-            maki_lua::agent_autocmd::dispatch(
+
+            let mut result_text = String::new();
+            let mut is_error = false;
+            let mut num_turns: u32 = 0;
+            let mut usage = TokenUsage::default();
+            // Summed as the turns land: rates move mid-run, and only a turn knows the
+            // rate it paid.
+            let mut cost = None;
+            let mut stop_reason: Option<DoneReason> = None;
+
+            let snapshot = HeadlessSnapshot::default();
+            snapshot.install(
                 &lua_handle,
-                &session_id,
-                &envelope,
-                envelope.subagent.is_some(),
+                HeadlessMeta {
+                    id: session_id.to_string(),
+                    cwd: cwd.clone(),
+                    model: model.spec(),
+                    fast: false,
+                    thinking: String::new(),
+                },
+                // `makima --print` always runs the agent in build mode
+                // (`headless::spawn` hardcodes `AgentMode::Build`).
+                || MODE_BUILD,
             );
-            let Envelope {
-                ref event,
-                ref subagent,
-                ..
-            } = envelope;
-            let parent_tool_use_id = subagent.as_ref().map(|s| s.parent_tool_use_id.as_str());
 
-            match event {
-                AgentEvent::TextDelta { text } => {
-                    if parent_tool_use_id.is_none() {
-                        result_text.push_str(text);
-                    }
-                }
-                AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
-                AgentEvent::ToolPending { .. }
-                | AgentEvent::ToolStart(_)
-                | AgentEvent::ToolExecutionStart { .. }
-                | AgentEvent::ToolOutput { .. }
-                | AgentEvent::ToolDone(_)
-                | AgentEvent::QueueItemConsumed { .. }
-                | AgentEvent::ModelSwitched { .. }
-                | AgentEvent::QueueDrained
-                | AgentEvent::AutoCompacting { .. }
-                | AgentEvent::CompactionDone { .. }
-                | AgentEvent::AuthRequired
-                | AgentEvent::PermissionRequest { .. }
-                | AgentEvent::Question { .. }
-                | AgentEvent::SubagentHistory { .. }
-                | AgentEvent::SubagentClosed
-                | AgentEvent::ToolSnapshot { .. }
-                | AgentEvent::ToolHeaderSnapshot { .. }
-                | AgentEvent::LiveToolBuf { .. }
-                | AgentEvent::Nudge
-                | AgentEvent::PromptProgress { .. }
-                | AgentEvent::StreamClosed => {}
-                AgentEvent::Retry {
-                    attempt,
-                    message,
-                    delay_ms,
-                } => {
-                    if let Some(out) = &mut verbose_out {
-                        out.emit(&RetryEvent {
-                            event_type: "system",
-                            subtype: "api_retry",
-                            attempt: *attempt,
-                            retry_delay_ms: *delay_ms,
-                            error: message,
-                            session_id: &session_id,
-                        })?;
-                    }
-                }
-                AgentEvent::TurnComplete(tc) => {
-                    add_cost(&mut cost, tc.cost);
-                    if let Some(out) = &mut verbose_out {
-                        let content_value = serde_json::to_value(&tc.message.content)?;
-                        out.emit(&AssistantEvent {
-                            event_type: "assistant",
-                            message: AssistantMessage {
-                                model: &tc.model,
-                                role: "assistant",
-                                content: &content_value,
-                                usage: &tc.usage,
-                            },
-                            session_id: &session_id,
-                            parent_tool_use_id,
-                        })?;
-                    }
-                }
-                AgentEvent::ToolResultsSubmitted { message } => {
-                    if let Some(out) = &mut verbose_out {
-                        let content_value = serde_json::to_value(&message.content)?;
-                        out.emit(&UserEvent {
-                            event_type: "user",
-                            message: UserMessage {
-                                role: "user",
-                                content: &content_value,
-                            },
-                            session_id: &session_id,
-                            parent_tool_use_id,
-                        })?;
-                    }
-                }
-                AgentEvent::TurnOutcome(outcome) => {
-                    num_turns = outcome.num_turns();
-                    usage = outcome.usage();
-                    match outcome {
-                        TurnOutcome::Completed { reason, .. } => stop_reason = Some(*reason),
-                        TurnOutcome::Failed { failure, .. } => {
-                            is_error = true;
-                            result_text = failure.user_message.clone();
-                        }
-                        TurnOutcome::Cancelled { .. } => {
-                            is_error = true;
-                        }
-                    }
+            while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
+                if matches!(envelope.event, AgentEvent::StreamClosed) {
                     break;
                 }
-                AgentEvent::ControlComplete { .. } => break,
-                AgentEvent::ControlError { message } => {
-                    is_error = true;
-                    result_text = message.clone();
-                    break;
+                snapshot.observe(&envelope);
+                maki_lua::agent_autocmd::dispatch(
+                    &lua_handle,
+                    &session_id,
+                    &envelope,
+                    envelope.subagent.is_some(),
+                );
+                let Envelope {
+                    ref event,
+                    ref subagent,
+                    ..
+                } = envelope;
+                let parent_tool_use_id = subagent.as_ref().map(|s| s.parent_tool_use_id.as_str());
+
+                match event {
+                    AgentEvent::TextDelta { text } => {
+                        if parent_tool_use_id.is_none() {
+                            result_text.push_str(text);
+                        }
+                    }
+                    AgentEvent::ThinkingDelta { .. } | AgentEvent::ThinkingBlockEnd => {}
+                    AgentEvent::ToolPending { .. }
+                    | AgentEvent::ToolStart(_)
+                    | AgentEvent::ToolExecutionStart { .. }
+                    | AgentEvent::ToolOutput { .. }
+                    | AgentEvent::ToolDone(_)
+                    | AgentEvent::QueueItemConsumed { .. }
+                    | AgentEvent::ModelSwitched { .. }
+                    | AgentEvent::QueueDrained
+                    | AgentEvent::AutoCompacting { .. }
+                    | AgentEvent::CompactionDone { .. }
+                    | AgentEvent::AuthRequired
+                    | AgentEvent::PermissionRequest { .. }
+                    | AgentEvent::Question { .. }
+                    | AgentEvent::SubagentHistory { .. }
+                    | AgentEvent::SubagentClosed
+                    | AgentEvent::ToolSnapshot { .. }
+                    | AgentEvent::ToolHeaderSnapshot { .. }
+                    | AgentEvent::LiveToolBuf { .. }
+                    | AgentEvent::Nudge
+                    | AgentEvent::PromptProgress { .. }
+                    | AgentEvent::StreamClosed => {}
+                    AgentEvent::Retry {
+                        attempt,
+                        message,
+                        delay_ms,
+                    } => {
+                        if let Some(out) = &mut verbose_out {
+                            out.emit(&RetryEvent {
+                                event_type: "system",
+                                subtype: "api_retry",
+                                attempt: *attempt,
+                                retry_delay_ms: *delay_ms,
+                                error: message,
+                                session_id: &session_id,
+                            })?;
+                        }
+                    }
+                    AgentEvent::TurnComplete(tc) => {
+                        add_cost(&mut cost, tc.cost);
+                        if let Some(out) = &mut verbose_out {
+                            let content_value = serde_json::to_value(&tc.message.content)?;
+                            out.emit(&AssistantEvent {
+                                event_type: "assistant",
+                                message: AssistantMessage {
+                                    model: &tc.model,
+                                    role: "assistant",
+                                    content: &content_value,
+                                    usage: &tc.usage,
+                                },
+                                session_id: &session_id,
+                                parent_tool_use_id,
+                            })?;
+                        }
+                    }
+                    AgentEvent::ToolResultsSubmitted { message } => {
+                        if let Some(out) = &mut verbose_out {
+                            let content_value = serde_json::to_value(&message.content)?;
+                            out.emit(&UserEvent {
+                                event_type: "user",
+                                message: UserMessage {
+                                    role: "user",
+                                    content: &content_value,
+                                },
+                                session_id: &session_id,
+                                parent_tool_use_id,
+                            })?;
+                        }
+                    }
+                    AgentEvent::TurnOutcome(outcome) => {
+                        num_turns = outcome.num_turns();
+                        usage = outcome.usage();
+                        match outcome {
+                            TurnOutcome::Completed { reason, .. } => stop_reason = Some(*reason),
+                            TurnOutcome::Failed { failure, .. } => {
+                                is_error = true;
+                                result_text = failure.user_message.clone();
+                            }
+                            TurnOutcome::Cancelled { .. } => {
+                                is_error = true;
+                            }
+                        }
+                        break;
+                    }
+                    AgentEvent::ControlComplete { .. } => break,
+                    AgentEvent::ControlError { message } => {
+                        is_error = true;
+                        result_text = message.clone();
+                        break;
+                    }
                 }
             }
-        }
-        smol::block_on(async {
-            futures_lite::future::or(task, async {
-                smol::Timer::after(AGENT_SHUTDOWN_TIMEOUT).await;
-            })
-            .await;
-        });
-
-        let duration_ms = start.elapsed().as_millis();
-        // Zero on an unpriced model, which is what its turns reported too.
-        let total_cost_usd = cost.unwrap_or_default();
-        let run_error = is_error.then(|| result_text.clone());
-
-        match format {
-            OutputFormat::Text => {
-                print!("{result_text}");
-            }
-            OutputFormat::Json | OutputFormat::StreamJson => {
-                let result = PrintResult {
+            Ok((
+                PrintResult {
                     result_type: "result",
                     subtype: if is_error { "error" } else { "success" },
                     is_error,
-                    duration_ms,
+                    duration_ms: 0,
                     num_turns,
                     result: result_text,
                     stop_reason,
                     session_id,
-                    total_cost_usd,
+                    // Zero on an unpriced model, which is what its turns reported too.
+                    total_cost_usd: cost.unwrap_or_default(),
                     usage,
-                };
+                },
+                verbose_out,
+            ))
+        })?;
+        result.duration_ms = start.elapsed().as_millis();
+        match format {
+            OutputFormat::Text => print!("{}", result.result),
+            OutputFormat::Json | OutputFormat::StreamJson => {
                 match verbose_out {
                     Some(VerboseOutput::Json(mut events)) => {
                         events.push(serde_json::to_value(&result)?);
@@ -534,12 +590,12 @@ pub fn run(
                 terminal_result_emitted.set(true);
             }
         }
-
-        match run_error {
+        if result.is_error {
             // The error text is already in the emitted result; a detailed
             // error report here would print it twice.
-            Some(_) => Err(eyre!("agent run failed")),
-            None => Ok(()),
+            Err(eyre!("agent run failed"))
+        } else {
+            Ok(())
         }
     };
     let outcome = drive_print(
@@ -574,8 +630,127 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_providers::TokenUsage;
+    use flume::{Receiver, Sender};
+    use maki_agent::{
+        AgentError, ToolOutput,
+        tools::{
+            DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
+            ToolContext, ToolInvocation, ToolRegistry, ToolSource,
+            offload::{OffloadBackend, OffloadError, OffloadStore},
+        },
+    };
+    use maki_providers::{
+        ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions, Role, StopReason,
+        StreamResponse, TokenUsage,
+        provider::{BoxFuture, Provider},
+    };
+    use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
+    use std::borrow::Cow;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
+
+    const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+    const OUTPUT_ERROR: &str = "print output failed";
+
+    struct GatedRemoval {
+        persistence: Option<(Sender<()>, Receiver<()>)>,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        removed: Arc<AtomicBool>,
+    }
+
+    impl OffloadBackend for GatedRemoval {
+        fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+            if let Some((entered, release)) = &self.persistence {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Ok(true)
+        }
+
+        fn total_bytes(&self) -> io::Result<u64> {
+            Ok(0)
+        }
+
+        fn remove_all(&self) -> io::Result<()> {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(GATE_TIMEOUT).unwrap();
+            self.removed.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            PathBuf::from("/print-offload-test").join(name)
+        }
+    }
+
+    struct ReleaseRemoval(flume::Sender<()>);
+
+    impl Drop for ReleaseRemoval {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    struct FailingOutput;
+
+    impl Write for FailingOutput {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other(OUTPUT_ERROR))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn print_cancellation_returns_with_persistence_still_gated() {
+        let (writing, writing_rx) = flume::bounded(1);
+        let (release_write, write_gate) = flume::bounded(1);
+        let release_write = ReleaseRemoval(release_write);
+        let (removing, removing_rx) = flume::bounded(1);
+        let (release_remove, remove_gate) = flume::bounded(1);
+        let release_remove = ReleaseRemoval(release_remove);
+        let removed = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(OffloadStore::new(Box::new(GatedRemoval {
+            persistence: Some((writing, write_gate)),
+            entered: removing,
+            release: remove_gate,
+            removed: Arc::clone(&removed),
+        })));
+        let writer_store = Arc::clone(&store);
+        let writer = std::thread::spawn(move || writer_store.put("pending output"));
+        writing_rx.recv_timeout(GATE_TIMEOUT).unwrap();
+        let cleanup = OffloadCleanup::new(Arc::clone(&store));
+        let observer = cleanup.clone();
+        let task = smol::spawn(std::future::pending::<()>());
+        let (completed, returned) = flume::bounded(1);
+        let thread = std::thread::spawn(move || {
+            let result = run_and_settle(task, Some(cleanup), || {
+                FailingOutput.write_all(b"result")?;
+                Ok(())
+            });
+            completed.send(()).unwrap();
+            result
+        });
+        returned.recv_timeout(GATE_TIMEOUT).unwrap();
+        let result = thread.join().unwrap();
+        assert_eq!(result.unwrap_err().to_string(), OUTPUT_ERROR);
+        assert!(matches!(
+            store.put("late output"),
+            Err(OffloadError::Closed)
+        ));
+        assert!(removing_rx.try_recv().is_err());
+        assert!(!removed.load(Ordering::Acquire));
+        drop(release_write);
+        writer.join().unwrap().unwrap();
+        removing_rx.recv_timeout(GATE_TIMEOUT).unwrap();
+        drop(release_remove);
+        smol::block_on(observer.wait()).unwrap();
+        assert!(removed.load(Ordering::Acquire));
+    }
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
         "type",
@@ -658,6 +833,178 @@ mod tests {
         }
     }
 
+    struct SettlementTool {
+        name: &'static str,
+        executed: Sender<()>,
+    }
+
+    impl Tool for SettlementTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            self.name.into()
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(Self {
+                name: self.name,
+                executed: self.executed.clone(),
+            }))
+        }
+    }
+
+    impl ToolInvocation for SettlementTool {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(self.name.into()))
+        }
+
+        fn execute<'a>(self: Box<Self>, _: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                self.executed.send(()).unwrap();
+                Ok(ToolOutput::Plain(String::new().into())).into()
+            })
+        }
+    }
+
+    struct GatedToolProvider {
+        name: &'static str,
+        polled: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Provider for GatedToolProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.polled.send_async(()).await.unwrap();
+                self.release.recv_async().await.unwrap();
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: self.name.into(),
+                            name: self.name.into(),
+                            input: serde_json::json!({}),
+                            thought_signature: None,
+                        }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(StopReason::ToolUse),
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn print_failure_cancels_pending_headless_before_next_tool() {
+        let name = "print_settle_output_error";
+        let (executed, execution) = flume::bounded(1);
+        ToolRegistry::global()
+            .register(
+                Arc::new(SettlementTool { name, executed }),
+                ToolSource::Lua {
+                    plugin: name.into(),
+                },
+            )
+            .unwrap();
+        let (polled, polling) = flume::bounded(1);
+        let (release, gate) = flume::bounded(1);
+        let cwd = std::env::temp_dir();
+        let handle = maki_agent::headless::spawn_with_provider(
+            HeadlessParams {
+                model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+                config: AgentConfig::default(),
+                permissions_config: PermissionsConfig::default(),
+                timeouts: Default::default(),
+                input: input(name),
+                prompt_slots: Default::default(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: cwd.clone(),
+                system_prompt_override: None,
+                append_system_prompt: None,
+                model_policy: Arc::default(),
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(&cwd),
+                modes: Arc::default(),
+                session_options: Default::default(),
+                state_dir: None,
+            },
+            Arc::new(GatedToolProvider {
+                name,
+                polled,
+                release: gate,
+            }),
+        )
+        .unwrap();
+        polling.recv_timeout(GATE_TIMEOUT).unwrap();
+        let result = run_and_settle(handle.task, handle.offload_cleanup, || {
+            FailingOutput.write_all(b"result")?;
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().to_string(), OUTPUT_ERROR);
+        let _ = release.send(());
+        assert!(execution.try_recv().is_err());
+    }
+
+    /// The provider's report is a rendezvous, so the run can't reach its
+    /// cleanup before the saved output below exists.
+    #[test]
+    fn print_run_removes_offload_dir() {
+        let state = tempfile::tempdir().unwrap();
+        let cwd = std::env::temp_dir();
+        let (requests, received) = flume::bounded(0);
+        let handle = maki_agent::headless::spawn_with_provider(
+            HeadlessParams {
+                model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+                config: AgentConfig::default(),
+                permissions_config: PermissionsConfig::default(),
+                timeouts: Default::default(),
+                input: input("print request"),
+                prompt_slots: Default::default(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: cwd.clone(),
+                system_prompt_override: None,
+                append_system_prompt: None,
+                model_policy: Arc::default(),
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(&cwd),
+                modes: Arc::default(),
+                session_options: Default::default(),
+                state_dir: Some(state.path().to_path_buf()),
+            },
+            Arc::new(RecordingPrintProvider(requests)),
+        )
+        .unwrap();
+        let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("saved.txt"), "output").unwrap();
+
+        received.recv().unwrap();
+        smol::block_on(handle.task);
+        assert!(!dir.exists(), "print mode must remove its offload dir");
+    }
+
     #[test]
     fn print_turn_uses_initialized_config() {
         const SPEC: &str = "anthropic/claude-opus-4-8";
@@ -687,6 +1034,7 @@ mod tests {
                     project_config: ProjectConfig::for_project(&cwd),
                     modes: Arc::default(),
                     session_options: Default::default(),
+                    state_dir: None,
                 },
                 Arc::new(RecordingPrintProvider(requests)),
             )?;

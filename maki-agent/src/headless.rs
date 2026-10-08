@@ -1,6 +1,5 @@
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_lock::Mutex;
@@ -24,6 +23,7 @@ use crate::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
 };
 use crate::template;
+use crate::tools::offload::{OffloadCleanup, OffloadStore};
 use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -51,6 +51,9 @@ pub struct HeadlessParams {
     /// coordinator: tools read their options through one, and
     /// `SessionMailbox::notify` resolves through one.
     pub session_options: SessionOptionCatalog,
+    /// Root for the run's offload store. `None` cuts oversized tool output
+    /// instead of saving it.
+    pub state_dir: Option<PathBuf>,
 }
 
 pub struct HeadlessHandle {
@@ -59,6 +62,7 @@ pub struct HeadlessHandle {
     pub session_id: SessionRef,
     pub cwd: String,
     pub task: smol::Task<()>,
+    pub offload_cleanup: Option<OffloadCleanup>,
 }
 
 struct AgentSetup {
@@ -95,6 +99,27 @@ fn setup(
     }
 }
 
+fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc<OffloadStore>> {
+    Some(Arc::new(OffloadStore::for_session(state_dir?, session)))
+}
+
+/// Cancellation and unwinding cannot await removal. The handle retains the
+/// same controller so callers can drain the request made by this guard.
+struct RemoveOffloadOnDrop(OffloadCleanup);
+
+impl Drop for RemoveOffloadOnDrop {
+    fn drop(&mut self) {
+        self.0.request();
+    }
+}
+
+async fn drain_offload(cleanup: Option<&OffloadCleanup>) {
+    if let Some(cleanup) = cleanup {
+        cleanup.request();
+        let _ = cleanup.wait().await;
+    }
+}
+
 /// Names advertised to SDK clients: base tools plus what the first request
 /// would carry from MCP (always-load definitions and `tool_search`).
 fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
@@ -122,13 +147,13 @@ pub fn spawn_with_provider(
     params: HeadlessParams,
     provider: Arc<dyn Provider>,
 ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
-    spawn_initialized(params, MakiId::generate(), Some(provider))
+    spawn_initialized(params, MakiId::generate(), Some(Ok(provider)))
 }
 
 fn spawn_initialized(
     params: HeadlessParams,
     session_id: MakiId,
-    initialized_provider: Option<Arc<dyn Provider>>,
+    initialized_provider: Option<Result<Arc<dyn Provider>, crate::AgentError>>,
 ) -> Result<HeadlessHandle, crate::session_coordinator::SessionCoordinatorError> {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = params.input.mode.clone();
@@ -215,17 +240,24 @@ fn spawn_initialized(
         mailbox: mailbox.clone(),
     })?;
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
-    let task = smol::spawn({
+    let offload = session_offload(params.state_dir.as_deref(), &session_ref);
+    let offload_cleanup = offload
+        .as_ref()
+        .map(|store| OffloadCleanup::new(Arc::clone(store)));
+    let future = {
         let file_write_locks = Arc::clone(&file_write_locks);
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
         let _stream_guard = guard;
+        let cleanup = offload_cleanup.clone();
+        let remove_offload = cleanup.clone().map(RemoveOffloadOnDrop);
         async move {
+            let remove_offload = remove_offload;
             let event_tx = EventSender::new(raw_tx, 0);
             let mut model = params.model;
             let provider: Arc<dyn Provider> = match async {
                 match initialized_provider {
-                    Some(provider) => Ok(provider),
+                    Some(provider) => provider,
                     None => provider::from_model_async(&mut model, params.timeouts)
                         .await
                         .map(Arc::from),
@@ -240,6 +272,7 @@ fn spawn_initialized(
                         message: e.user_message(),
                     });
                     let _ = coordinator.close().await;
+                    drain_offload(cleanup.as_ref()).await;
                     return;
                 }
             };
@@ -270,6 +303,7 @@ fn spawn_initialized(
                     question_mode: crate::tools::QuestionMode::Headless,
                     model_policy: Arc::clone(&params.model_policy),
                     file_write_locks: Arc::clone(&file_write_locks),
+                    offload: offload.clone(),
                     managed_turn: None,
                 },
                 AgentRunParams {
@@ -284,6 +318,8 @@ fn spawn_initialized(
 
             agent.run(TurnId::generate(), params.input).await;
             drop(agent);
+            drain_offload(cleanup.as_ref()).await;
+            drop(remove_offload);
 
             if let Some(handle) = mcp_shutdown {
                 handle.shutdown().await;
@@ -291,14 +327,15 @@ fn spawn_initialized(
             let _ = coordinator.close().await;
             drop(_stream_guard);
         }
-    });
+    };
 
     Ok(HeadlessHandle {
         event_rx,
         tool_names,
         session_id: session_ref,
         cwd: working_dir,
-        task,
+        task: smol::spawn(future),
+        offload_cleanup,
     })
 }
 
@@ -325,6 +362,9 @@ pub struct InteractiveParams {
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
+    /// Root for the session's offload store. `None` cuts oversized tool
+    /// output instead of saving it.
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -923,6 +963,7 @@ pub fn spawn_interactive_with_preparation(
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
+    let offload = session_offload(params.state_dir.as_deref(), &session_ref);
 
     let session_ref_clone = session_ref.clone();
     let task = smol::spawn({
@@ -1205,6 +1246,7 @@ pub fn spawn_interactive_with_preparation(
                         question_mode: params.question_mode,
                         model_policy: Arc::clone(&params.model_policy),
                         file_write_locks: Arc::clone(&file_write_locks),
+                        offload: offload.clone(),
                         managed_turn: None,
                     },
                     AgentRunParams {
@@ -1285,6 +1327,197 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::offload::{OffloadBackend, OffloadError};
+    use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
+    use std::io;
+    use std::time::Duration;
+    use test_case::test_case;
+
+    const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+    const HEADLESS_PROVIDER_ERROR: &str = "headless provider failed";
+    const SAVED_OUTPUT: &str = "saved output";
+
+    #[derive(Clone, Copy)]
+    enum ProviderExit {
+        Success,
+        Pending,
+    }
+
+    struct GatedHeadlessProvider {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        exit: ProviderExit,
+    }
+
+    impl Provider for GatedHeadlessProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, crate::AgentError>,
+        > {
+            Box::pin(async move {
+                self.entered.send_async(()).await.unwrap();
+                self.release.recv_async().await.unwrap();
+                match self.exit {
+                    ProviderExit::Success => Ok(maki_providers::StreamResponse {
+                        message: Message {
+                            role: maki_providers::Role::Assistant,
+                            content: vec![maki_providers::ContentBlock::Text {
+                                text: SAVED_OUTPUT.into(),
+                            }],
+                            ..Default::default()
+                        },
+                        usage: TokenUsage::default(),
+                        stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    }),
+                    ProviderExit::Pending => std::future::pending().await,
+                }
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case(ProviderExit::Success ; "successful completion")]
+    #[test_case(ProviderExit::Pending ; "cancelled task")]
+    fn headless_offload_cleanup_covers_task_exit(exit: ProviderExit) {
+        let state = tempfile::tempdir().unwrap();
+        let mut params = test_params();
+        params.state_dir = Some(state.path().to_path_buf());
+        let (entered, received) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let handle = spawn_with_provider(
+            params,
+            Arc::new(GatedHeadlessProvider {
+                entered,
+                release: released,
+                exit,
+            }),
+        )
+        .unwrap();
+        received.recv_timeout(GATE_TIMEOUT).unwrap();
+        let dir = offload_dir(&state.path().join(SESSIONS_DIR), handle.session_id.id());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
+        let cleanup = handle.offload_cleanup.unwrap();
+        match exit {
+            ProviderExit::Pending => {
+                smol::block_on(handle.task.cancel());
+            }
+            ProviderExit::Success => {
+                release.send(()).unwrap();
+                while let Ok(envelope) = handle.event_rx.recv() {
+                    if matches!(envelope.event, AgentEvent::StreamClosed) {
+                        assert!(!dir.exists(), "stream close must follow cleanup");
+                        break;
+                    }
+                }
+                smol::block_on(handle.task);
+            }
+        }
+        smol::block_on(cleanup.wait()).unwrap();
+        assert!(!dir.exists());
+    }
+
+    struct GatedGuardRemoval {
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl OffloadBackend for GatedGuardRemoval {
+        fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn total_bytes(&self) -> io::Result<u64> {
+            Ok(0)
+        }
+        fn remove_all(&self) -> io::Result<()> {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(GATE_TIMEOUT).unwrap();
+            Ok(())
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            PathBuf::from("/headless-offload-test").join(name)
+        }
+    }
+
+    #[test]
+    fn headless_dropped_task_requests_cleanup_without_waiting_for_removal() {
+        let (entered, received) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let store = Arc::new(OffloadStore::new(Box::new(GatedGuardRemoval {
+            entered,
+            release: released,
+        })));
+        let cleanup = OffloadCleanup::new(Arc::clone(&store));
+        let guard = RemoveOffloadOnDrop(cleanup.clone());
+        let task = smol::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        drop(task);
+        received.recv_timeout(GATE_TIMEOUT).unwrap();
+        assert!(matches!(store.put(SAVED_OUTPUT), Err(OffloadError::Closed)));
+        let mut wait = Box::pin(cleanup.wait());
+        assert!(smol::block_on(future::poll_once(&mut wait)).is_none());
+        release.send(()).unwrap();
+        smol::block_on(wait).unwrap();
+    }
+
+    #[test]
+    fn headless_initialization_error_drains_cleanup_before_stream_close() {
+        let state = tempfile::tempdir().unwrap();
+        let session_id = MakiId::generate();
+        let dir = offload_dir(&state.path().join(SESSIONS_DIR), session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("saved.txt"), SAVED_OUTPUT).unwrap();
+        let mut params = test_params();
+        params.state_dir = Some(state.path().to_path_buf());
+        let handle = spawn_initialized(
+            params,
+            session_id,
+            Some(Err(crate::AgentError::Config {
+                message: HEADLESS_PROVIDER_ERROR.into(),
+            })),
+        )
+        .unwrap();
+        let mut saw_error = false;
+        let mut saw_close = false;
+        while let Ok(envelope) = handle.event_rx.recv() {
+            match envelope.event {
+                AgentEvent::ControlError { message } => {
+                    assert!(message.contains(HEADLESS_PROVIDER_ERROR));
+                    saw_error = true;
+                }
+                AgentEvent::StreamClosed => {
+                    assert!(!dir.exists());
+                    saw_close = true;
+                    break;
+                }
+                _ => (),
+            }
+        }
+        assert!(saw_error);
+        assert!(saw_close);
+        smol::block_on(handle.task);
+        smol::block_on(handle.offload_cleanup.unwrap().wait()).unwrap();
+        assert!(!dir.exists());
+    }
 
     fn test_params() -> HeadlessParams {
         HeadlessParams {
@@ -1315,6 +1548,7 @@ mod tests {
             project_config: ProjectConfig::for_project(Path::new("/tmp")),
             modes: Arc::default(),
             session_options: Default::default(),
+            state_dir: None,
         }
     }
 
@@ -1335,7 +1569,7 @@ mod tests {
         SessionMailbox::notify(session_id, "ping".into(), true)
             .expect("notify resolves through the registered coordinator");
 
-        drop(handle.task);
+        smol::block_on(handle.task.cancel());
         let _ = futures_lite::future::block_on(coordinator.close());
     }
 
@@ -2078,6 +2312,7 @@ mod tests {
                     plugin_rules: params.plugin_rules,
                     project_config: params.project_config,
                     local_tools: Default::default(),
+                    state_dir: None,
                 },
                 Box::new(|model, _| {
                     Box::pin(

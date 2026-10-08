@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -10,11 +11,14 @@ use tracing::{debug, error, warn};
 
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
-use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
+use crate::tools::hook::{
+    Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
+};
+use crate::tools::offload::{OutputLimitOptions, OutputLimits, PreviewShape};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext, TurnToolRoute,
-    truncate_line,
+    CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
+    TurnToolRoute, truncate_scope,
 };
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{FILE_WRITE_TOOLS, ToolKey};
@@ -33,6 +37,7 @@ const SOURCE_MCP: &str = "mcp";
 const SOURCE_UNKNOWN: &str = "unknown";
 
 const ERROR_CANCELLED: &str = "cancelled";
+const UNFILTERABLE_LIMITED_OUTPUT: &str = "output limits with an output hook require filterable text without instructions, structured state, image, or diff";
 
 /// The window a chain gets when the call carries no deadline of its own.
 /// Generous, because a layer may shell out before it decides, but a layer that
@@ -121,11 +126,133 @@ pub async fn run(
     if let Err(reason) = authorize_mode(&resolved, ctx) {
         return mode_denied(id, name, reason);
     }
-    let mut done = run_inner(resolved, id, &input, ctx, origin).await;
-    if let Some(hook) = &hook {
-        hook.filter_output(&mut done).await;
+    let is_mcp = matches!(resolved.route, Route::Mcp(..));
+    let mut execution_ctx = ctx.clone();
+    execution_ctx.pending_output_limits = hook
+        .as_ref()
+        .filter(|hook| hook.installed.wraps(name, HookStage::Output))
+        .map(|_| Arc::new(Mutex::new(None)));
+    let mut done = run_inner(resolved, id, &input, &execution_ctx, origin).await;
+    let mcp_succeeded = is_mcp && !done.is_error;
+    let finalization = execution_ctx
+        .pending_output_limits
+        .as_ref()
+        .and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        });
+    let output_deadline = finalization.as_ref().map_or(ctx.deadline, |metadata| {
+        let deadline = metadata.deadline.map_or(Deadline::None, Deadline::At);
+        if metadata.terminal_cleanup {
+            deadline
+        } else {
+            deadline.min(ctx.deadline)
+        }
+    });
+    let mut output_ctx = ctx.clone();
+    output_ctx.deadline = output_deadline;
+    let output_hook = hook.as_ref().map(|hook| Hook {
+        installed: hook.installed.clone(),
+        ctx: &output_ctx,
+        tool: hook.tool,
+        origin: hook.origin,
+        authority: hook.authority,
+    });
+    let mut pending = finalization.and_then(|metadata| metadata.limits);
+    if pending.is_some()
+        && (done.output.instructions().is_some() || done.output.filterable_text_mut().is_none())
+    {
+        pending = None;
+        done.output = ToolOutput::Plain(UNFILTERABLE_LIMITED_OUTPUT.into());
+        done.is_error = true;
+    }
+    if let Some(opts) = pending.as_mut()
+        && let Some(text) = done.output.filterable_text_mut()
+    {
+        opts.prepare_for_output_hook(text);
+    }
+    let deadline = match output_deadline {
+        Deadline::At(deadline) => Some(deadline),
+        Deadline::None => pending.as_ref().and_then(|opts| opts.deadline),
+    };
+    let denied = if let Some(hook) = &output_hook {
+        hook.filter_output(&mut done, deadline, pending.as_mut())
+            .await
+    } else {
+        false
+    };
+    if !denied
+        && let Some(mut opts) = pending
+        && let Some(text) = done.output.filterable_text_mut()
+    {
+        opts.recover_filtered_trailer(text);
+        let deadline = match (deadline, opts.deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        let apply = opts.apply(std::mem::take(text), ctx.offload.clone());
+        match finalize_output(apply, deadline, ctx).await {
+            Ok(limited) => *text = limited,
+            Err(reason) => {
+                *text = reason.to_owned();
+                done.is_error = true;
+            }
+        }
+    }
+    if mcp_succeeded
+        && !done.is_error
+        && let Some(store) = ctx.offload.clone()
+    {
+        let text = done.output.as_text();
+        let opts = OutputLimitOptions {
+            deadline: None,
+            trailer: None,
+            shape: PreviewShape::Head,
+            lines_clipped: false,
+            limits: OutputLimits::from_config(&ctx.config),
+        };
+        let apply = opts.apply(text, Some(store));
+        let deadline = match ctx.deadline {
+            Deadline::At(deadline) => Some(deadline),
+            Deadline::None => None,
+        };
+        match finalize_output(apply, deadline, ctx).await {
+            Ok(limited) => done.output = ToolOutput::Plain(limited.into()),
+            Err(reason) => {
+                done.output = ToolOutput::Plain(reason.into());
+                done.is_error = true;
+            }
+        }
     }
     done
+}
+
+async fn finalize_output(
+    apply: impl Future<Output = String>,
+    deadline: Option<Instant>,
+    ctx: &ToolContext,
+) -> Result<String, &'static str> {
+    let result = ctx
+        .cancel
+        .race(async {
+            match deadline {
+                Some(deadline) if deadline <= Instant::now() => Err(DEADLINE_EXCEEDED),
+                Some(deadline) => {
+                    futures_lite::future::race(async { Ok(apply.await) }, async {
+                        smol::Timer::at(deadline).await;
+                        Err(DEADLINE_EXCEEDED)
+                    })
+                    .await
+                }
+                None => Ok(apply.await),
+            }
+        })
+        .await;
+    if ctx.cancel.is_cancelled() {
+        return Err(ERROR_CANCELLED);
+    }
+    result.map_err(|_| ERROR_CANCELLED)?
 }
 
 /// The hook installed on this registry, bound to one call. `None` when nobody
@@ -157,15 +284,20 @@ impl<'a> Hook<'a> {
             return Verdict::Unchanged;
         }
         let cancelled = Verdict::Denied(ERROR_CANCELLED.to_owned());
-        self.fire(HookStage::Input, tool_id, input.clone(), cancelled)
+        self.fire(HookStage::Input, tool_id, input.clone(), cancelled, None)
             .await
     }
 
     /// Rewrites the finished event in place. Text and error flag move together,
     /// so a hook that cannot reach the text cannot flip the flag either.
-    async fn filter_output(&self, done: &mut ToolDoneEvent) {
+    async fn filter_output(
+        &self,
+        done: &mut ToolDoneEvent,
+        deadline: Option<Instant>,
+        mut limits: Option<&mut OutputLimitOptions>,
+    ) -> bool {
         if !self.installed.wraps(self.tool, HookStage::Output) {
-            return;
+            return false;
         }
         let was_error = done.is_error;
         let Some(text) = done.output.filterable_text_mut() else {
@@ -173,37 +305,56 @@ impl<'a> Hook<'a> {
                 tool = %self.tool,
                 "output hook skipped: this output renders from fields, not prose"
             );
-            return;
+            return false;
         };
-        let value = json!({ OUTPUT_TEXT: &*text, OUTPUT_IS_ERROR: was_error });
-        let (rewritten, is_error) = match self
-            .fire(HookStage::Output, &done.id, value, Verdict::Unchanged)
+        let mut value = json!({ OUTPUT_TEXT: &*text, OUTPUT_IS_ERROR: was_error });
+        if let Some(trailer) = limits.as_ref().and_then(|opts| opts.trailer.as_deref()) {
+            value[OUTPUT_TRAILER] = Value::String(trailer.to_owned());
+        }
+        let (rewritten, is_error, denied) = match self
+            .fire(
+                HookStage::Output,
+                &done.id,
+                value,
+                Verdict::Denied(ERROR_CANCELLED.to_owned()),
+                deadline,
+            )
             .await
         {
-            Verdict::Unchanged => return,
+            Verdict::Unchanged => return false,
             // Nothing left to stop, so the reason becomes what the model reads.
-            Verdict::Denied(reason) => (reason, true),
+            Verdict::Denied(reason) => (reason, true, true),
             Verdict::Replaced(value) => match value.get(OUTPUT_TEXT).and_then(Value::as_str) {
-                Some(replaced) => (
-                    replaced.to_owned(),
-                    value
-                        .get(OUTPUT_IS_ERROR)
-                        .and_then(Value::as_bool)
-                        .unwrap_or(was_error),
-                ),
+                Some(replaced) => {
+                    if let Some(opts) = limits.as_mut() {
+                        opts.trailer = value
+                            .get(OUTPUT_TRAILER)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                    }
+                    (
+                        replaced.to_owned(),
+                        value
+                            .get(OUTPUT_IS_ERROR)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(was_error),
+                        false,
+                    )
+                }
                 None => {
                     warn!(
                         tool = %self.tool,
                         field = OUTPUT_TEXT,
                         "output hook replaced the output without a text field, leaving it alone"
                     );
-                    return;
+                    return false;
                 }
             },
         };
         *text = rewritten;
         done.is_error = is_error;
         debug!(tool = %self.tool, "output hook rewrote the output");
+        denied
     }
 
     /// Cancellation outranks a hook: nobody is left to read the verdict, so
@@ -214,7 +365,11 @@ impl<'a> Hook<'a> {
         tool_id: &str,
         value: Value,
         on_cancel: Verdict,
+        deadline: Option<Instant>,
     ) -> Verdict {
+        if self.ctx.cancel.is_cancelled() {
+            return on_cancel;
+        }
         let call = HookCall {
             tool: self.tool,
             tool_id,
@@ -222,13 +377,31 @@ impl<'a> Hook<'a> {
             origin: self.origin,
             authority: self.authority,
             cancel: &self.ctx.cancel,
-            deadline: self.window(),
+            deadline: deadline.map_or_else(|| self.window(), |at| at.min(self.window())),
         };
-        self.ctx
+        let run = self.installed.run(stage, value, &call);
+        let verdict = self
+            .ctx
             .cancel
-            .race(self.installed.run(stage, value, &call))
-            .await
-            .unwrap_or(on_cancel)
+            .race(async {
+                if call.deadline <= Instant::now() {
+                    return Verdict::Denied(DEADLINE_EXCEEDED.to_owned());
+                }
+                futures_lite::future::race(run, async {
+                    smol::Timer::at(call.deadline).await;
+                    Verdict::Denied(DEADLINE_EXCEEDED.to_owned())
+                })
+                .await
+            })
+            .await;
+        match verdict {
+            _ if self.ctx.cancel.is_cancelled() => on_cancel,
+            Err(_) => on_cancel,
+            Ok(_) if call.deadline <= Instant::now() => {
+                Verdict::Denied(DEADLINE_EXCEEDED.to_owned())
+            }
+            Ok(verdict) => verdict,
+        }
     }
 
     /// Read when a stage fires, not once per call: the input chain and the tool
@@ -899,7 +1072,7 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool}': {e}"), true);
         }
     };
-    let perm_scope = truncate_line(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
+    let perm_scope = truncate_scope(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
 
     if let Err(e) = ctx
@@ -1017,6 +1190,7 @@ pub(super) async fn process_tool_calls(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1028,10 +1202,11 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::cancel::CancelToken;
-    use crate::mcp::test_support::stub_session;
+    use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
     use crate::template::Vars;
+    use crate::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadBackend, OffloadStore};
     use crate::tools::registry::{ToolRegistry, ToolSource};
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
@@ -1318,7 +1493,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Reply {
         Answers(fn(HookStage, &Value) -> Verdict),
-        /// Never resolves, so only cancellation can end the wait.
+        /// Never resolves, so cancellation or the deadline ends the wait.
         Pending,
     }
 
@@ -1569,11 +1744,8 @@ mod tests {
         });
     }
 
-    /// Nobody is left reading the answer, so waiting on a verdict that never
-    /// comes would only keep the call alive. Each stage keeps what it has: no
-    /// input was judged, and an output already produced stands.
-    #[test_case(&[HookStage::Input],  true,  ERROR_CANCELLED.to_owned() ; "input")]
-    #[test_case(&[HookStage::Output], false, ran(HOOK_PLAIN)            ; "output")]
+    #[test_case(&[HookStage::Input],  true, ERROR_CANCELLED.to_owned() ; "input")]
+    #[test_case(&[HookStage::Output], true, ERROR_CANCELLED.to_owned() ; "output")]
     fn a_cancelled_call_does_not_wait_for_a_verdict(
         wrapped: &'static [HookStage],
         is_error: bool,
@@ -1591,6 +1763,100 @@ mod tests {
         });
     }
 
+    #[test_case(false; "already_cancelled")]
+    #[test_case(true; "cancelled_while_filtering")]
+    fn interrupted_output_filter_denies_unfiltered_text(during_filter: bool) {
+        smol::block_on(async {
+            let (trigger, token) = CancelToken::new();
+            let mut ctx = build_ctx();
+            ctx.cancel = token;
+            let (ctx, recording) = hooked_with(
+                ctx,
+                None,
+                RecordingHook::never_answering(&[HookStage::Output]),
+            );
+            let mut trigger = Some(trigger);
+            if !during_filter {
+                trigger.take().unwrap().cancel();
+            }
+            let resolved = resolve(&ctx, HOOK_TOOL_NAME);
+            let hook = Hook::of(&ctx, &resolved, CallOrigin::Model).unwrap();
+            let mut done = ToolDoneEvent {
+                id: TEST_ID.into(),
+                tool: Arc::from(HOOK_TOOL_NAME),
+                output: ToolOutput::Plain(MCP_SECRET.into()),
+                is_error: false,
+                annotation: None,
+                written_path: None,
+            };
+            let denied = if during_filter {
+                let mut filtering = Box::pin(hook.filter_output(&mut done, None, None));
+                assert!(
+                    futures_lite::future::poll_once(&mut filtering)
+                        .await
+                        .is_none()
+                );
+                assert_eq!(recording.seen().len(), 1);
+                trigger.take().unwrap().cancel();
+                filtering.await
+            } else {
+                hook.filter_output(&mut done, None, None).await
+            };
+            assert!(denied);
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), ERROR_CANCELLED);
+            assert_eq!(recording.seen().len(), usize::from(during_filter));
+        });
+    }
+
+    #[test]
+    fn output_filter_spends_the_effective_absolute_deadline() {
+        let caller = Some(HOOK_CALL_DEADLINE);
+        let pending = Some(HOOK_CHAIN_MAX);
+        smol::block_on(async {
+            let started = Instant::now();
+            let caller = caller.map(|duration| started + duration);
+            let pending = pending.map(|duration| started + duration);
+            let expected = match (caller, pending) {
+                (Some(left), Some(right)) => left.min(right),
+                (Some(at), None) | (None, Some(at)) => at,
+                (None, None) => unreachable!(),
+            };
+            let (trigger, token) = CancelToken::new();
+            let mut ctx = build_ctx();
+            ctx.cancel = token;
+            ctx.deadline = caller.map_or(Deadline::None, Deadline::At);
+            let (ctx, recording) = hooked_with(
+                ctx,
+                None,
+                RecordingHook::never_answering(&[HookStage::Output]),
+            );
+            let resolved = resolve(&ctx, HOOK_TOOL_NAME);
+            let hook = Hook::of(&ctx, &resolved, CallOrigin::Model).unwrap();
+            let mut done = ToolDoneEvent {
+                id: TEST_ID.into(),
+                tool: Arc::from(HOOK_TOOL_NAME),
+                output: ToolOutput::Plain(MCP_SECRET.into()),
+                is_error: false,
+                annotation: None,
+                written_path: None,
+            };
+            let mut filtering = Box::pin(hook.filter_output(&mut done, pending, None));
+            let result = futures_lite::future::poll_once(&mut filtering).await;
+            assert_eq!(recording.at(HookStage::Output).unwrap().deadline, expected);
+            if expected <= started {
+                assert_eq!(result, Some(true));
+                drop(filtering);
+                assert!(done.is_error);
+                assert_eq!(done.output.as_text(), DEADLINE_EXCEEDED);
+            } else {
+                assert!(result.is_none());
+                trigger.cancel();
+                assert!(filtering.await);
+            }
+        });
+    }
+
     /// A chain runs off this thread, so it only dies with the call it filters
     /// when it is handed that call's own token and an instant to be killed at.
     #[test]
@@ -1599,14 +1865,16 @@ mod tests {
             let at = Instant::now() + HOOK_CALL_DEADLINE;
             let mut ctx = build_ctx();
             ctx.deadline = Deadline::At(at);
-            ctx.cancel = cancelled_token();
+            let (trigger, token) = CancelToken::new();
+            ctx.cancel = token;
             let (ctx, hook) = hooked_ctx(ctx);
 
             dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
             let firing = hook.at(HookStage::Input).expect("the input stage fired");
-            assert!(firing.cancelled, "the call's own token, not a fresh one");
+            assert!(!firing.cancelled);
             assert_eq!(firing.deadline, at, "and no later than the call itself");
+            trigger.cancel();
         });
     }
 
@@ -2024,6 +2292,279 @@ mod tests {
                 vec![TOOL_SEARCH_TOOL_NAME],
                 "a nested call must not change the next request"
             );
+        });
+    }
+
+    const MCP_RESULT_LINES: usize = 100;
+    const SMALL_OUTPUT_LINES: usize = 10;
+    const MCP_SECRET: &str = "private sentinel beyond the preview";
+    const MCP_REDACTED: &str = "[redacted]";
+
+    fn redact_mcp_output(stage: HookStage, value: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Unchanged,
+            HookStage::Output => Verdict::Replaced(json!({
+                OUTPUT_TEXT: value[OUTPUT_TEXT].as_str().unwrap().replace(MCP_SECRET, MCP_REDACTED),
+                OUTPUT_IS_ERROR: false,
+            })),
+        }
+    }
+
+    #[test]
+    fn mcp_output_hook_redacts_before_offload() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let text = format!("{}\n{MCP_SECRET}", many_lines());
+            let mut ctx = answering_ctx(&text);
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+            let hook = RecordingHook::answering(redact_mcp_output);
+            ctx.registry.set_hook(hook.clone());
+            let done = run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &json!({}),
+                &ctx,
+                CallOrigin::Nested,
+            )
+            .await;
+            assert!(!done.is_error);
+            assert!(!done.output.as_text().contains(MCP_SECRET));
+            let seen = hook.seen();
+            let outputs: Vec<_> = seen
+                .iter()
+                .filter(|s| s.stage == HookStage::Output)
+                .collect();
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].value[OUTPUT_TEXT], text);
+            let saved: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+            assert_eq!(saved.len(), 1);
+            let saved = std::fs::read_to_string(saved[0].as_ref().unwrap().path()).unwrap();
+            assert_eq!(saved, text.replace(MCP_SECRET, MCP_REDACTED));
+        });
+    }
+
+    fn deny_mcp_output(stage: HookStage, _: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Unchanged,
+            HookStage::Output => Verdict::Denied(HOOK_DENY_REASON.into()),
+        }
+    }
+
+    #[test]
+    fn mcp_output_hook_denial_does_not_persist() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut ctx = answering_ctx(&many_lines());
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+            ctx.registry
+                .set_hook(RecordingHook::answering(deny_mcp_output));
+            let done = run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &json!({}),
+                &ctx,
+                CallOrigin::Nested,
+            )
+            .await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), HOOK_DENY_REASON);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        });
+    }
+
+    fn replace_mcp_large(stage: HookStage, _: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Unchanged,
+            HookStage::Output => {
+                Verdict::Replaced(json!({OUTPUT_TEXT: many_lines(), OUTPUT_IS_ERROR: false}))
+            }
+        }
+    }
+
+    fn many_lines() -> String {
+        (1..=MCP_RESULT_LINES)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn answering_ctx(text: &str) -> ToolContext {
+        let mcp = stub_session_with_result(&[(PROBE_QUALIFIED, "")], text);
+        let mut ctx = mcp_ctx(&mcp);
+        ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
+        ctx
+    }
+
+    struct GatedOffloadBackend {
+        dir: PathBuf,
+        saved: Arc<Mutex<Vec<u8>>>,
+        gate: Arc<Gate>,
+    }
+
+    impl OffloadBackend for GatedOffloadBackend {
+        fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.dir.join(name))
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            file.write_all(bytes)?;
+            *self.saved.lock().unwrap() = bytes.to_vec();
+            Ok(true)
+        }
+
+        fn total_bytes(&self) -> io::Result<u64> {
+            self.gate.entered.send(()).unwrap();
+            self.gate.release_rx.recv().unwrap();
+            std::fs::read_dir(&self.dir)?.try_fold(0_u64, |total, entry| {
+                Ok::<_, io::Error>(total + entry?.metadata()?.len())
+            })
+        }
+
+        fn remove_all(&self) -> io::Result<()> {
+            for entry in std::fs::read_dir(&self.dir)? {
+                std::fs::remove_file(entry?.path())?;
+            }
+            self.saved.lock().unwrap().clear();
+            Ok(())
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for GatedOffloadBackend {
+        fn drop(&mut self) {
+            self.gate.exited.send(()).ok();
+        }
+    }
+
+    #[test]
+    fn mcp_offload_deadline_returns_while_worker_is_blocked() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let gate = Gate::new();
+            let text = many_lines();
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = answering_ctx(&text);
+            ctx.offload = Some(Arc::new(OffloadStore::new(Box::new(GatedOffloadBackend {
+                dir: dir.path().to_path_buf(),
+                saved: Arc::clone(&saved),
+                gate: Arc::clone(&gate),
+            }))));
+            let store = Arc::downgrade(ctx.offload.as_ref().unwrap());
+            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+            let input = json!({});
+            let mut call = Box::pin(run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &input,
+                &ctx,
+                CallOrigin::Model,
+            ));
+            assert!(futures_lite::future::poll_once(&mut call).await.is_none());
+            gate.entered().await;
+            let done = call.await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), DEADLINE_EXCEEDED);
+            assert!(saved.lock().unwrap().is_empty());
+            drop(ctx);
+            assert!(
+                store.upgrade().is_some(),
+                "the blocked worker owns the store"
+            );
+            gate.release();
+            gate.exited().await;
+            assert!(store.upgrade().is_none());
+            assert_eq!(*saved.lock().unwrap(), text.as_bytes());
+        });
+    }
+
+    #[test]
+    fn mcp_offload_cancellation_returns_while_worker_is_blocked() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let gate = Gate::new();
+            let text = many_lines();
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = answering_ctx(&text);
+            ctx.offload = Some(Arc::new(OffloadStore::new(Box::new(GatedOffloadBackend {
+                dir: dir.path().to_path_buf(),
+                saved: Arc::clone(&saved),
+                gate: Arc::clone(&gate),
+            }))));
+            let store = Arc::downgrade(ctx.offload.as_ref().unwrap());
+            let (cancel, token) = crate::CancelToken::new();
+            ctx.cancel = token;
+            let input = json!({});
+            let mut call = Box::pin(run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &input,
+                &ctx,
+                CallOrigin::Nested,
+            ));
+            assert!(futures_lite::future::poll_once(&mut call).await.is_none());
+            gate.entered().await;
+            cancel.cancel();
+            let done = call.await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), ERROR_CANCELLED);
+            assert!(saved.lock().unwrap().is_empty());
+            drop(ctx);
+            assert!(store.upgrade().is_some());
+            gate.release();
+            gate.exited().await;
+            assert!(store.upgrade().is_none());
+            assert_eq!(*saved.lock().unwrap(), text.as_bytes());
+        });
+    }
+
+    #[test]
+    fn mcp_result_over_limit_is_offloaded() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let text = many_lines();
+            let mut ctx = answering_ctx(&text);
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+
+            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+            let out = done.output.as_text();
+            assert!(out.starts_with("line 1\n"), "{out}");
+            assert!(out.contains(OFFLOAD_FOOTER_PREFIX), "{out}");
+            assert!(out.lines().count() <= SMALL_OUTPUT_LINES, "{out}");
+            let saved: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+            assert_eq!(saved.len(), 1);
+            let saved = std::fs::read_to_string(saved[0].as_ref().unwrap().path()).unwrap();
+            assert_eq!(saved, text);
+        });
+    }
+
+    #[test]
+    fn mcp_hook_cannot_offload_a_failed_execution() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mcp = stub_mcp(&[PROBE_QUALIFIED]);
+            let mut ctx = mcp_ctx(&mcp);
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+            ctx.registry
+                .set_hook(RecordingHook::answering(replace_mcp_large));
+            let done = run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &json!({}),
+                &ctx,
+                CallOrigin::Model,
+            )
+            .await;
+            assert!(!done.is_error);
+            assert_eq!(done.output.as_text(), many_lines());
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         });
     }
 

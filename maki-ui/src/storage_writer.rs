@@ -17,6 +17,7 @@ use maki_storage::checkpoint::{
     CheckpointWriter,
 };
 use maki_storage::id::MakiId;
+use maki_storage::session_lock::SessionPublicationGuard;
 use maki_storage::sessions::{HistoryIdentity, SESSIONS_DIR, SessionError, SessionLog};
 use maki_storage::{StateDir, StorageError};
 use tracing::warn;
@@ -26,6 +27,7 @@ use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
     YOLO_OPTION_ID,
 };
+use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{AgentMode, ThinkingConfig};
 use maki_storage::sessions::StoredMode;
 
@@ -57,6 +59,7 @@ type Pending = Arc<Mutex<PendingState>>;
 
 #[derive(Default)]
 struct PendingState {
+    closed: bool,
     entries: HashMap<MakiId, Entry>,
     /// Latest authoritative state from the app or a successful coordinator
     /// checkpoint. It may still be newer than durable storage.
@@ -82,7 +85,11 @@ type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 /// had just saved.
 enum Entry {
     Save(PendingSave),
-    Delete(DeleteCallback),
+    Delete(
+        DeleteCallback,
+        Option<SessionPublicationGuard>,
+        Option<Arc<OffloadStore>>,
+    ),
 }
 
 struct PendingSave {
@@ -131,6 +138,9 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
         let session_id = request.session_id;
         let version = request.version;
         let mut state = lock(&self.pending);
+        if state.closed {
+            return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
+        }
         let config_version = request
             .snapshot
             .config
@@ -327,6 +337,9 @@ impl StorageWriter {
         let id = session.id;
         let incoming_history = session.history_identity();
         let mut state = lock(&self.pending);
+        if state.closed {
+            return;
+        }
         let preserve_history = state
             .coordinator_history_bases
             .get(&id)
@@ -408,6 +421,9 @@ impl StorageWriter {
         let version = request.version;
         let (reply, response) = flume::bounded(1);
         let mut state = lock(&self.pending);
+        if state.closed {
+            return Box::pin(async move { Err(CheckpointError::Closed(session_id)) });
+        }
         let generation = next_generation(&mut state);
         let config_version = state.config_versions.get(&session_id).copied();
         let snapshot = if config_version.is_some() {
@@ -480,6 +496,7 @@ impl StorageWriter {
     /// reports success, and a save enqueued afterwards supersedes the delete.
     /// The session is forgotten entirely: this is the user asking for it to be
     /// gone, not the cleanup of a session that has not earned a file yet.
+    #[cfg(test)]
     pub fn delete(&self, id: MakiId, done: impl FnOnce(Result<(), SessionError>) + Send + 'static) {
         self.delete_inner(id, done, true);
     }
@@ -490,7 +507,23 @@ impl StorageWriter {
         done: impl FnOnce(Result<(), SessionError>) + Send + 'static,
         forget_snapshot: bool,
     ) {
+        self.delete_inner_guarded(id, done, forget_snapshot, None, None);
+    }
+
+    fn delete_inner_guarded(
+        &self,
+        id: MakiId,
+        done: impl FnOnce(Result<(), SessionError>) + Send + 'static,
+        forget_snapshot: bool,
+        guard: Option<SessionPublicationGuard>,
+        store: Option<Arc<OffloadStore>>,
+    ) {
         let mut state = lock(&self.pending);
+        if state.closed {
+            drop(state);
+            done(Err(writer_gone()));
+            return;
+        }
         if forget_snapshot {
             state.latest.remove(&id);
             state.latest_generations.remove(&id);
@@ -498,7 +531,9 @@ impl StorageWriter {
             state.coordinator_history_bases.remove(&id);
             state.config_versions.remove(&id);
         }
-        let replaced = state.entries.insert(id, Entry::Delete(Box::new(done)));
+        let replaced = state
+            .entries
+            .insert(id, Entry::Delete(Box::new(done), guard, store));
         drop(state);
         if let Some(Entry::Save(save)) = replaced {
             discard_coordinator_candidate(&self.pending, id, &save);
@@ -512,17 +547,30 @@ impl StorageWriter {
             && let Some(entry) = lock(&self.pending).entries.remove(&id)
         {
             match entry {
-                Entry::Delete(done) => done(Err(writer_gone())),
+                Entry::Delete(done, _, _) => done(Err(writer_gone())),
                 Entry::Save(save) => fail_waiters(id, save.waiters, "storage writer unavailable"),
             }
         }
     }
 
-    pub fn shutdown(self, timeout: Duration) {
-        self.stop.store(true, Ordering::Release);
+    pub fn delete_guarded(
+        &self,
+        id: MakiId,
+        guard: SessionPublicationGuard,
+        store: Option<Arc<OffloadStore>>,
+        done: impl FnOnce(Result<(), SessionError>) + Send + 'static,
+    ) {
+        self.delete_inner_guarded(id, done, true, Some(guard), store);
+    }
+
+    pub fn shutdown(&self, timeout: Duration) {
+        {
+            let mut state = lock(&self.pending);
+            state.closed = true;
+            self.stop.store(true, Ordering::Release);
+        }
         // Wake it so it observes the flag; the final flush still runs.
         let _ = self.wake.send(());
-        drop(self.wake);
         if self.done_rx.recv_timeout(timeout).is_err() {
             warn!("storage writer did not drain within {timeout:?}");
         }
@@ -646,8 +694,8 @@ fn requeue_save(
             state.entries.insert(id, Entry::Save(newer));
             Ok(())
         }
-        Some(Entry::Delete(done)) => {
-            state.entries.insert(id, Entry::Delete(done));
+        Some(Entry::Delete(done, guard, store)) => {
+            state.entries.insert(id, Entry::Delete(done, guard, store));
             Err(save.waiters)
         }
         None => {
@@ -866,9 +914,27 @@ impl Writer {
                         }
                     }
                 }
-                Entry::Delete(done) => {
+                Entry::Delete(done, guard, store) => {
                     self.forget(id);
-                    done(match AppSession::delete(id, &self.dir) {
+                    let result = match guard {
+                        Some(guard) => guard
+                            .publish(|| {
+                                let result = AppSession::delete(id, &self.dir);
+                                if (result.is_ok()
+                                    || matches!(result, Err(SessionError::Storage(StorageError::NotFound(_)))))
+                                    && let Some(store) = store
+                                    && let Err(error) = store.close_and_remove()
+                                {
+                                    warn!(%error, session_id = %id, "offload cleanup failed after session deletion");
+                                }
+                                result
+                            })
+                            .map_err(StorageError::from)
+                            .map_err(SessionError::from)
+                            .and_then(|result| result.unwrap_or(Err(SessionError::OpenElsewhere))),
+                        None => AppSession::delete(id, &self.dir),
+                    };
+                    done(match result {
                         Err(SessionError::Storage(StorageError::NotFound(_))) => Ok(()),
                         result => result,
                     });
@@ -880,7 +946,7 @@ impl Writer {
             .values()
             .filter_map(|entry| match entry {
                 Entry::Save(save) => save.retry_at,
-                Entry::Delete(_) => None,
+                Entry::Delete(_, _, _) => None,
             })
             .min()
     }
@@ -1527,6 +1593,80 @@ mod tests {
     fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
         let (warn_tx, warn_rx) = flume::unbounded();
         (StorageWriter::new(dir.clone(), warn_tx), warn_rx)
+    }
+
+    #[test_case(false; "failed_log_delete_preserves_artifacts")]
+    #[test_case(true; "cleanup_failure_does_not_fail_log_delete")]
+    fn guarded_deletion_preserves_artifacts_until_log_removal(cleanup_failure: bool) {
+        use maki_agent::tools::offload::OffloadBackend;
+        use maki_storage::session_lock;
+        use std::path::PathBuf;
+
+        struct FailingCleanup {
+            path: PathBuf,
+            attempted: Arc<AtomicBool>,
+        }
+
+        impl OffloadBackend for FailingCleanup {
+            fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+                unreachable!()
+            }
+
+            fn total_bytes(&self) -> io::Result<u64> {
+                Ok(0)
+            }
+
+            fn remove_all(&self) -> io::Result<()> {
+                self.attempted.store(true, Ordering::Release);
+                Err(io::Error::other("gated cleanup failure"))
+            }
+
+            fn path(&self, _: &str) -> PathBuf {
+                self.path.clone()
+            }
+        }
+
+        const BODY: &str = "referenced output";
+        let (_temp, dir) = state_dir();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::observation(BODY.into()));
+        session.save(&dir).unwrap();
+        let id = session.id;
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+        let lease = session_lock::claim(&sessions_dir, &id).unwrap().unwrap();
+        let guard = lease.publication_guard();
+        let artifact = dir.path().join("retained-artifact.txt");
+        std::fs::write(&artifact, BODY).unwrap();
+        let attempted = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(OffloadStore::new(Box::new(FailingCleanup {
+            path: artifact.clone(),
+            attempted: Arc::clone(&attempted),
+        })));
+        store.close_and_drain();
+        let log = sessions_dir.join(format!("{id}.jsonl"));
+        let backup = sessions_dir.join("retained-log.jsonl");
+        if !cleanup_failure {
+            std::fs::rename(&log, &backup).unwrap();
+            std::fs::create_dir(&log).unwrap();
+        }
+        let (writer, _) = writer(&dir);
+        let (done_tx, done_rx) = flume::bounded(1);
+        writer.delete_guarded(id, guard, Some(store), move |result| {
+            done_tx.send(result).unwrap();
+        });
+        let result = done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        assert_eq!(result.is_ok(), cleanup_failure);
+        assert_eq!(attempted.load(Ordering::Acquire), cleanup_failure);
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), BODY);
+        if cleanup_failure {
+            assert!(AppSession::load(id, &dir).is_err());
+        } else {
+            std::fs::remove_dir(&log).unwrap();
+            std::fs::rename(&backup, &log).unwrap();
+            assert_eq!(message_texts(&AppSession::load(id, &dir).unwrap()), [BODY]);
+        }
+        writer.shutdown(DRAIN_TIMEOUT);
+        drop(lease);
     }
 
     fn message_texts(session: &AppSession) -> Vec<String> {

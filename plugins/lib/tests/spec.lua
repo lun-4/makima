@@ -1395,6 +1395,154 @@ case("plan_spec_is_shared_source_with_all_headings", function()
   end
 end)
 
+local long_lines = require("maki.long_lines")
+local LL_MAX = 10
+local LONG = string.rep("L", 20)
+local OTHER_LONG = string.rep("M", 20)
+
+local function long_line_err(line_nr, size)
+  return string.format(long_lines.LONG_LINE_CHANGED, line_nr, size, LL_MAX)
+end
+
+local function marker_err(line_nr)
+  return string.format(long_lines.TRUNCATED_MARKER_ADDED.read, line_nr)
+end
+
+case("check_write_keeps_unchanged_long_line", function()
+  eq(long_lines.check_write("a\n" .. LONG .. "\nb", "x\n" .. LONG .. "\ny", LL_MAX), nil)
+end)
+
+case("check_write_allows_moved_long_line", function()
+  eq(long_lines.check_write(LONG .. "\na\n", "a\n" .. LONG .. "\n", LL_MAX), nil)
+end)
+
+case("check_write_rejects_altered_long_line", function()
+  eq(long_lines.check_write("a\n" .. LONG, "a\n" .. LONG:sub(1, 15), LL_MAX), long_line_err(2, 20))
+end)
+
+case("check_write_duplicate_long_line_collapse_rejected", function()
+  eq(long_lines.check_write(LONG .. "\n" .. LONG, LONG, LL_MAX), long_line_err(2, 20))
+end)
+
+case("check_write_stripped_prefix_of_duplicate_rejected", function()
+  eq(long_lines.check_write(LONG .. "\n" .. LONG, LONG .. "\n" .. LONG:sub(1, 12), LL_MAX), long_line_err(2, 20))
+end)
+
+case("check_write_ignores_short_lines", function()
+  eq(long_lines.check_write("short\nlines", "", LL_MAX), nil)
+end)
+
+case("check_write_crlf_matches_lf", function()
+  eq(long_lines.check_write(LONG .. "\r\nb\r\n", LONG .. "\nb\n", LL_MAX), nil)
+end)
+
+case("check_write_multibyte_counts_bytes", function()
+  local wide = string.rep("é", 6)
+  eq(long_lines.check_write(wide, "", LL_MAX), long_line_err(1, 12))
+end)
+
+case("check_replace_lines_allows_deletion", function()
+  eq(long_lines.check_replace_lines("a\n" .. LONG .. "\nb", 2, 2, "", LL_MAX), nil)
+end)
+
+case("check_replace_lines_rejects_dropped_long_line", function()
+  eq(long_lines.check_replace_lines("a\n" .. LONG .. "\nb", 1, 3, "a\nb", LL_MAX), long_line_err(2, 20))
+end)
+
+case("check_replace_lines_keeps_long_line", function()
+  eq(long_lines.check_replace_lines("a\n" .. LONG .. "\nb", 1, 3, "A\n" .. LONG .. "\nB", LL_MAX), nil)
+end)
+
+case("check_replace_lines_only_checks_range", function()
+  eq(long_lines.check_replace_lines(LONG .. "\na\nb", 2, 3, "x", LL_MAX), nil)
+end)
+
+case("check_replace_lines_duplicate_collapse_rejected", function()
+  eq(long_lines.check_replace_lines(LONG .. "\n" .. LONG, 1, 2, LONG, LL_MAX), long_line_err(2, 20))
+end)
+
+local MARKED = "abc" .. "[line truncated, +42 bytes]"
+local LEGACY_MARKED = "abc[line truncated]"
+
+case("check_markers_rejects_added_marker", function()
+  eq(long_lines.check_markers("a", "a\n" .. MARKED), marker_err(2))
+end)
+
+case("check_markers_rejects_added_legacy_marker", function()
+  eq(long_lines.check_markers("", LEGACY_MARKED), marker_err(1))
+end)
+
+case("check_markers_keeps_existing_marker_line", function()
+  eq(long_lines.check_markers(MARKED .. "\nold", MARKED .. "\nnew"), nil)
+end)
+
+case("check_markers_duplicate_rejected", function()
+  eq(long_lines.check_markers(MARKED, MARKED .. "\n" .. MARKED), marker_err(2))
+end)
+
+case("check_markers_changed_marker_line_rejected", function()
+  eq(long_lines.check_markers(MARKED, "xyz[line truncated, +42 bytes]"), marker_err(1))
+end)
+
+case("check_markers_removing_marker_allowed", function()
+  eq(long_lines.check_markers(MARKED, "abc"), nil)
+end)
+
+case("check_markers_rejects_preview_cut_marker", function()
+  eq(
+    long_lines.check_markers("", "abc[line cut: first 3 of 900 bytes]"),
+    string.format(long_lines.TRUNCATED_MARKER_ADDED.preview, 1)
+  )
+end)
+
+case("check_markers_rejects_marker_with_trailing_space", function()
+  eq(long_lines.check_markers("", MARKED .. "  "), marker_err(1))
+end)
+
+case("check_markers_rejects_unicode_trailing_whitespace", function()
+  local suffixes = {
+    utf8.char(0xA0),
+    utf8.char(0x2003),
+    utf8.char(0x202F),
+    " \t" .. utf8.char(0xA0, 0x2003, 0x202F) .. "\t ",
+  }
+  for _, suffix in ipairs(suffixes) do
+    eq(long_lines.check_markers("", MARKED .. suffix), marker_err(1))
+  end
+end)
+
+case("check_markers_preserves_unicode_suffixed_literals_and_rejects_duplicates", function()
+  local suffix = " \t" .. utf8.char(0xA0, 0x2003, 0x202F) .. "\t "
+  local legacy = LEGACY_MARKED .. suffix
+  local preview = "abc[line cut: first 3 of 900 bytes]" .. suffix
+  local preview_err = string.format(long_lines.TRUNCATED_MARKER_ADDED.preview, 1)
+  eq(long_lines.check_markers(MARKED .. suffix, MARKED .. suffix), nil)
+  eq(long_lines.check_markers(legacy .. "\nold", legacy .. "\nnew"), nil)
+  eq(long_lines.check_markers(MARKED .. suffix, MARKED .. suffix .. "\n" .. MARKED .. suffix), marker_err(2))
+  eq(long_lines.check_markers("", legacy), marker_err(1))
+  eq(long_lines.check_markers("", preview), preview_err)
+  eq(
+    long_lines.check_markers(preview, preview .. "\n" .. preview),
+    string.format(long_lines.TRUNCATED_MARKER_ADDED.preview, 2)
+  )
+  eq(long_lines.check_markers("", "abc[line truncated, +oops bytes]" .. suffix), nil)
+  eq(long_lines.check_markers("", "abc[ordinary brackets]" .. suffix), nil)
+end)
+
+case("check_markers_ignores_marker_mid_line", function()
+  eq(long_lines.check_markers("", "x [line truncated] y"), nil)
+end)
+
+case("check_markers_error_names_category", function()
+  local err = long_lines.check_markers("", MARKED)
+  eq(err, marker_err(1))
+  assert(err:find("read or grep output", 1, true), err)
+end)
+
+case("check_write_other_long_line_unaffected", function()
+  eq(long_lines.check_write(LONG .. "\n" .. OTHER_LONG, OTHER_LONG .. "\n" .. LONG, LL_MAX), nil)
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

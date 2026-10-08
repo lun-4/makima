@@ -32,7 +32,7 @@ passes through, so builtins, MCP tools, and ACP client tools behave alike:
 | Slot | Fires | Gets |
 | --- | --- | --- |
 | `tool.<name>.input` | before the input is parsed or checked against your permission rules | the call the model wrote |
-| `tool.<name>.output` | on the result of a call that ran, including a failure or a permission refusal | `{ text, is_error }` |
+| `tool.<name>.output` | on the result of a call that ran, including a failure or a permission refusal | `{ text, is_error, trailer? }` |
 
 A call an input layer stopped never reaches the output slot: the reason came
 from a layer, so there is nothing left to filter. A name that resolves to no
@@ -107,9 +107,22 @@ maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
 end)
 ```
 
-A replacement table has to carry `text`. Without it the output is left alone and
-the reason is logged. Set `is_error` to turn a success into a failure, or a
-failure into a success.
+A replacement table has to carry `text`. Without it the output is left alone and the reason is logged. Set `is_error` to turn a success into a failure, or a failure into a success.
+
+Tools with staged output limits pass the full body and trailer in `text`, and the original trailer separately in the optional string field `trailer`. An unchanged verdict preserves the trailer. A replacement protects a trailer only if it includes a matching `trailer` string and the same separate terminal suffix in `text`. If the field is absent, null, or mismatched, the whole replacement becomes the saved body. Metadata cannot add or restore text. Generated notices use the trusted label `output`.
+
+A redactor that changes trailer text must update both fields:
+
+```lua
+out.text = out.text:gsub("sk%-%w+", "[redacted]")
+if out.trailer then
+  out.trailer = out.trailer:gsub("sk%-%w+", "[redacted]")
+end
+```
+
+Body-only redaction can retain the original `trailer` field unchanged when the original terminal suffix remains intact.
+
+MCP output slots receive the complete text before output limiting or saving. A successful replacement is the text saved when it exceeds the limits. A denial or a replacement marked `is_error` creates no artifact. Changing a permission or transport error into success does not make that result eligible for saving. Builtin tools retain their own output-limiting behavior.
 
 An output slot fires only when the text is the whole output. Tools the UI renders
 from fields, like `read` or `edit`, are excluded, because prose edited underneath
@@ -140,17 +153,9 @@ Declaring no capability does not mean a tool uses none. `batch`,
 reading undeclared as free would hand a plugin everything. Undeclared costs the
 maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
 
-**A layer may wait, within a window.** Chains are async, so a layer can read a
-file or run a job before it decides. It runs inside the call it is filtering, so
-cancelling the call cancels the layer too. Each stage gets whatever the call has
-left of its own deadline, capped at 60 seconds. A layer still running when the
-window closes is dropped, and the call proceeds as if that layer had passed the
-value along.
+A layer may wait within a window. Chains are async, so a layer can read a file or run a job before returning a verdict. Cancelling the call cancels the layer too. Each stage gets the call's remaining deadline, capped at 60 seconds. A layer still running when the window closes is dropped and the result becomes a deadline error.
 
-Cancellation lands differently on the two stages. An input layer cut short stops
-the call, because nothing has run yet and nobody is left to read a result. An
-output layer cut short leaves the output as it found it, since the work is
-already done.
+Cancellation stops an input layer's call before the tool runs. Cancellation during an output layer replaces the output with a cancellation error. The tool's work is already done, but its unfiltered output is not returned or saved.
 
 **A broken layer is skipped.** If a layer throws, the chain continues as if it
 had passed the value along, and the error is logged with the plugin name.
@@ -183,6 +188,9 @@ Slot names are per tool, so a layer on `tool.bash.input` costs nothing when
 ```lua
 local function redact(prev, out, ctx)
   out.text = out.text:gsub("sk%-%w+", "[redacted]")
+  if out.trailer then
+    out.trailer = out.trailer:gsub("sk%-%w+", "[redacted]")
+  end
   return prev(out, ctx)
 end
 

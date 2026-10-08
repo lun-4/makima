@@ -263,7 +263,7 @@ Commands run in ]] .. cwd .. [[ by default.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
-- Output truncated beyond 2000 lines or 50KB.
+- Output beyond 2000 lines or 50KB is saved to a file; the result shows its start and end and gives the path.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 
 maki.api.register_prompt_hint({
@@ -513,19 +513,16 @@ maki.api.register_tool({
       end
       finished = true
       local output = table.concat(output_parts)
-      output = maki.text.truncate_file(output, max_lines, max_bytes)
-
       local is_error = exit_code ~= 0
-      local llm_output
-      if exit_code == 0 then
-        llm_output = output == "" and "Exit code: 0" or output
-      else
-        if output == "" then
-          llm_output = "Exit code: " .. exit_code
-        else
-          llm_output = output .. "\nExit code: " .. exit_code
-        end
-      end
+      local llm_output = output ~= "" and output or "Exit code: " .. exit_code
+      local limits = output ~= ""
+          and {
+            preview = "head_tail",
+            trailer = is_error and "Exit code: " .. exit_code or nil,
+            max_lines = max_lines,
+            max_bytes = max_bytes,
+          }
+        or nil
 
       if output == "" then
         view:clear()
@@ -537,7 +534,7 @@ maki.api.register_tool({
       end
       view:finish()
 
-      ctx:finish({ llm_output = llm_output, is_error = is_error, body = buf })
+      ctx:finish({ llm_output = llm_output, output_limits = limits, is_error = is_error, body = buf })
     end
 
     view:append({ { "Waiting for output...", "dim" } })
@@ -574,8 +571,11 @@ maki.api.register_tool({
         return
       end
       finished = true
-      local out = maki.text.truncate_file(table.concat(output_parts), max_lines, max_bytes, nil)
-      ctx:finish(partial.cut(view, out, reason, timeout_secs))
+      ctx:finish(partial.cut(view, table.concat(output_parts), reason, timeout_secs, {
+        preview = "head_tail",
+        max_lines = max_lines,
+        max_bytes = max_bytes,
+      }))
     end)
 
     return nil

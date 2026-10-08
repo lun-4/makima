@@ -13,7 +13,6 @@ local opts = maki.api.register_options(output_limits.extend({
     min = 10,
     desc = "Max match groups per search. A call's `limit` param overrides it.",
   },
-  max_line_bytes = { default = 500, min = 80, desc = "Skip lines longer than this many bytes." },
 }))
 
 local function has_context(groups)
@@ -244,6 +243,11 @@ maki.api.register_tool({
   restore = function(_input, output, _is_error, ctx)
     local entries, trailer = parse_llm_output(output)
     if #entries == 0 then
+      for _, line in ipairs(trailer) do
+        if maki.text.is_offload_notice(line) then
+          return build_grep_view(entries, ctx, trailer)
+        end
+      end
       return nil
     end
     return build_grep_view(entries, ctx, trailer)
@@ -260,7 +264,7 @@ maki.api.register_tool({
 
     local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
 
-    local max_line_bytes = opts.max_line_bytes
+    local max_line_bytes = output_limits.line_bytes(ctx)
     local path, path_err = ctx:resolve_path(input.path or ".")
     if not path then
       return { llm_output = "error: " .. tostring(path_err), is_error = true }
@@ -288,14 +292,10 @@ maki.api.register_tool({
     end
 
     local llm_output = format_llm_output(entries)
-    llm_output = maki.text.truncate_file(llm_output, max_lines, max_bytes, nil)
-
-    -- Built from the truncated output rather than `entries`, so the view
-    -- shows exactly what the model got and restore renders the same way.
-    local shown, trailer = parse_llm_output(llm_output)
     return {
       llm_output = llm_output,
-      body = build_grep_view(shown, ctx, trailer),
+      output_limits = { max_lines = max_lines, max_bytes = max_bytes, lines_clipped = true },
+      body = build_grep_view(entries, ctx),
       annotation = count_matches(entries),
     }
   end,

@@ -2,11 +2,12 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::path::{Component, Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use globset::{Glob, GlobMatcher};
 use maki_agent::tools::grep::GrepParams;
+use maki_agent::tools::offload::OffloadBackend;
 use maki_agent::{GrepFileEntry, GrepLine, GrepMatchGroup};
 use regex::Regex;
 
@@ -84,6 +85,56 @@ impl InMemoryFs {
     fn bump_seq(inner: &mut Inner) -> u64 {
         inner.seq += 1;
         inner.seq
+    }
+}
+
+/// Offload store files inside an `InMemoryFs`, so a hermetic host's Lua
+/// tools can read what was offloaded without anything touching disk.
+pub struct InMemoryOffloadBackend {
+    fs: Arc<InMemoryFs>,
+    dir: PathBuf,
+}
+
+impl InMemoryOffloadBackend {
+    pub fn new(fs: Arc<InMemoryFs>, dir: PathBuf) -> Self {
+        Self { fs, dir }
+    }
+}
+
+impl OffloadBackend for InMemoryOffloadBackend {
+    fn create_new(&self, name: &str, bytes: &[u8]) -> IoResult<bool> {
+        let mut inner = self.fs.inner.write().unwrap();
+        let path = self.dir.join(name);
+        if inner.entries.contains_key(&path) {
+            return Ok(false);
+        }
+        create_dir_all(&mut inner, &self.dir)?;
+        let seq = InMemoryFs::bump_seq(&mut inner);
+        inner.entries.insert(path, Entry::File(bytes.to_vec(), seq));
+        Ok(true)
+    }
+
+    fn total_bytes(&self) -> IoResult<u64> {
+        let inner = self.fs.inner.read().unwrap();
+        Ok(inner
+            .entries
+            .iter()
+            .filter(|(path, _)| path.parent() == Some(self.dir.as_path()))
+            .filter_map(|(_, entry)| match entry {
+                Entry::File(bytes, _) => Some(bytes.len() as u64),
+                Entry::Dir => None,
+            })
+            .fold(0, u64::saturating_add))
+    }
+
+    fn remove_all(&self) -> IoResult<()> {
+        let mut inner = self.fs.inner.write().unwrap();
+        inner.entries.retain(|path, _| !path.starts_with(&self.dir));
+        Ok(())
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
     }
 }
 
@@ -451,6 +502,21 @@ mod tests {
         smol::block_on(fs.write(PathBuf::from("/t/a.rs"), b"fn a()".to_vec())).unwrap();
         smol::block_on(fs.write(PathBuf::from("/t/b.txt"), b"hello".to_vec())).unwrap();
         fs
+    }
+
+    #[test]
+    fn offload_total_bytes_counts_only_direct_files_and_reserves_directory_names() {
+        const BODY: &[u8] = b"saved";
+        let fs = Arc::new(InMemoryFs::new());
+        let dir = PathBuf::from(ROOT).join("offload");
+        let backend = InMemoryOffloadBackend::new(Arc::clone(&fs), dir.clone());
+        smol::block_on(fs.mkdir(dir.join("occupied"), true)).unwrap();
+        fs.seed(&dir.join("occupied").join("nested"), b"not direct".to_vec());
+        assert!(backend.create_new("file", BODY).unwrap());
+        assert!(!backend.create_new("occupied", BODY).unwrap());
+        assert_eq!(backend.total_bytes().unwrap(), BODY.len() as u64);
+        backend.remove_all().unwrap();
+        assert_eq!(backend.total_bytes().unwrap(), 0);
     }
 
     #[test]

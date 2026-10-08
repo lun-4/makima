@@ -28,6 +28,8 @@ jobs:
               - "Cargo.lock"
               - "src/**"
               - "maki-*/src/**"
+              - "maki-*/benches/**"
+              - "maki-*/tests/**"
               - "plugins/**"
               - "justfile"
               - ".github/workflows/rust.yml"
@@ -121,7 +123,7 @@ jobs:
       - run: just build
 
   windows:
-    name: Lint + Build (Windows)
+    name: Lint + Offload Tests + Build (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
@@ -131,6 +133,32 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      - name: Verify file and directory symlink privileges
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP ([Guid]::NewGuid().ToString())
+          New-Item -ItemType Directory -Path $root | Out-Null
+          try {
+            $file = Join-Path $root 'target.txt'
+            $directory = Join-Path $root 'target-dir'
+            Set-Content -LiteralPath $file -Value 'probe'
+            New-Item -ItemType Directory -Path $directory | Out-Null
+            foreach ($target in @($file, $directory)) {
+              $link = "$target-link"
+              New-Item -ItemType SymbolicLink -Path $link -Target $target -ErrorAction Stop | Out-Null
+              $attributes = [IO.File]::GetAttributes($link)
+              if (($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                throw "Symlink probe did not create a reparse point: $link"
+              }
+            }
+          } catch {
+            throw "Offload tests require symlink privileges: $($_.Exception.Message)"
+          } finally {
+            Remove-Item -LiteralPath $root -Recurse -Force
+          }
+      - run: cargo test -p maki-agent --lib tools::offload
+      - run: cargo test -p maki-storage --lib sessions::tests::delete
       - run: just lint
       - run: just build
 

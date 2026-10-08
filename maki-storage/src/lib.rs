@@ -10,6 +10,7 @@ pub mod intern;
 pub mod lock;
 pub mod log;
 pub mod model;
+mod offload_cleanup;
 pub mod paths;
 pub mod plans;
 pub mod session_lock;
@@ -30,6 +31,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
+pub use offload_cleanup::remove_offload_dir_from;
 use paths::state_dir;
 
 #[cfg(windows)]

@@ -1,12 +1,34 @@
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
+local long_lines = require("maki.long_lines")
 
 local DESCRIPTION = [[Write content to a file, replacing existing content.
 
 - Creates parent directories if needed.
 - Always read the file first before writing.
+- Refuses to drop or alter lines longer than `agent.max_line_bytes`, since read may have shown them cut. Change text inside such a line with **edit**, or delete it with **edit_lines** and an empty new_string.
+- Refuses to add lines ending in a `[line truncated, +N bytes]` marker; that marker is read output, not file content.
 - NEVER create files unless absolutely necessary - prefer editing existing files.
 - NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.]]
+
+-- The current text for the guard to compare against: "" for a new file, and
+-- false for non-UTF-8 content, which read can never have shown as lines.
+local function existing_text(path)
+  local meta, meta_err = maki.fs.metadata(path)
+  if meta_err then
+    return nil, meta_err
+  end
+  if not meta then
+    return ""
+  end
+  local bytes, read_err = maki.fs.read_bytes(path)
+  if not bytes then
+    return nil, read_err
+  end
+  local text = buffer.tostring(bytes)
+  return utf8.len(text) ~= nil and text
+end
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -82,6 +104,16 @@ maki.api.register_tool({
     local ok, err = ctx:check_before_edit(path)
     if not ok then
       return { llm_output = err, is_error = true }
+    end
+
+    local before, read_err = existing_text(path)
+    if before == nil then
+      return { llm_output = "read error: " .. tostring(read_err), is_error = true }
+    end
+    local guard_err = before and long_lines.check_write(before, content, output_limits.line_bytes(ctx))
+      or long_lines.check_markers(before or "", content)
+    if guard_err then
+      return { llm_output = guard_err, is_error = true }
     end
 
     local parent = maki.fs.dirname(path)

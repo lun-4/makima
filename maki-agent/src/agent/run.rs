@@ -20,6 +20,7 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::tools::offload::OffloadStore;
 use crate::tools::{
     Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
     TurnToolBindings,
@@ -171,6 +172,9 @@ pub struct AgentParams {
     /// Same-process per-path mutation locks, cloned from the parent context
     /// for subagents so concurrent same-path mutations stay serialized.
     pub file_write_locks: Arc<crate::tools::FileWriteLocks>,
+    /// One store per session, cloned into subagents so they share its lock
+    /// and quota.
+    pub offload: Option<Arc<OffloadStore>>,
     pub managed_turn: Option<crate::CurrentManagedTurn>,
 }
 
@@ -223,6 +227,7 @@ pub struct Agent<'h> {
     turn_bindings: Arc<TurnToolBindings>,
     model_policy: Arc<ModelPolicy>,
     file_write_locks: Arc<crate::tools::FileWriteLocks>,
+    offload: Option<Arc<OffloadStore>>,
     managed_turn: Option<crate::CurrentManagedTurn>,
     admission: Option<TurnAdmissionSnapshot>,
 }
@@ -271,6 +276,7 @@ impl<'h> Agent<'h> {
             turn_bindings: Arc::new(TurnToolBindings::default()),
             model_policy: params.model_policy,
             file_write_locks: params.file_write_locks,
+            offload: params.offload,
             managed_turn: params.managed_turn,
             admission: None,
         }
@@ -745,6 +751,8 @@ impl<'h> Agent<'h> {
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             file_write_locks: Arc::clone(&self.file_write_locks),
+            offload: self.offload.clone(),
+            pending_output_limits: None,
             write_lock_chain: Arc::new(Vec::new()),
             managed_turn: self.managed_turn.clone(),
         }
@@ -1159,6 +1167,7 @@ mod tests {
                 question_mode: crate::tools::QuestionMode::Tui,
                 model_policy: Arc::new(ModelPolicy::default()),
                 file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
+                offload: None,
                 managed_turn: None,
             },
             AgentRunParams {

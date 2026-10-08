@@ -211,7 +211,7 @@ pub mod test_support {
     /// Never created on the real disk; hosts run on the in-memory backend.
     pub const TEST_STATE_DIR: &str = "/maki-test-state";
 
-    pub use crate::api::fs::InMemoryFs;
+    pub use crate::api::fs::{InMemoryFs, InMemoryOffloadBackend};
 
     /// Boots a real `PluginHost` (background Lua thread) pre-loading the given
     /// builtins on an in-memory FS backend with a synthetic state dir, so the

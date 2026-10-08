@@ -5,19 +5,21 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
+use maki_agent::tools::offload::{OutputLimitOptions, OutputLimits, PreviewShape};
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    is_tool_enabled, timeout_annotation,
+    BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+    OutputFinalization, ParseError, PermissionScopes, TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT,
+    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, is_tool_enabled,
+    timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
@@ -27,7 +29,7 @@ use maki_commands::{
     ArgumentKind, CommandArguments, CommandContent, CommandError, CommandOutcome, CompletionPolicy,
     InputDispatch, PositionalArgument,
 };
-use maki_config::{Effect, Permission, PermissionRule, ToolKey, ToolOutputLines};
+use maki_config::{AgentConfig, Effect, Permission, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::SessionRef;
 use mlua::{
@@ -56,6 +58,8 @@ use crate::runtime::{
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
+const OUTPUT_TIMEOUT_ERR: &str = "timeout exceeded";
+const OUTPUT_CANCELLED_ERR: &str = "cancelled";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const TUI_ONLY_ERR: &str = "register_command: 'tui_only' must be a boolean";
 const ARGUMENT_HINT_ERR: &str = "register_command: 'argument_hint' must be a string";
@@ -507,20 +511,16 @@ impl ToolInvocation for LuaToolInvocation {
         let tool_timeout = self.timeout;
 
         Box::pin(async move {
-            let effective_secs: Option<u64> = match tool_timeout {
-                Some(d) => match deadline.cap_timeout(d.as_secs()) {
-                    Ok(s) => Some(s),
-                    Err(e) => return Err(e).into(),
-                },
-                None => match deadline {
-                    Deadline::At(_) => match deadline.cap_timeout(u64::MAX) {
-                        Ok(s) => Some(s),
-                        Err(e) => return Err(e).into(),
-                    },
-                    Deadline::None => None,
-                },
-            };
-
+            let now = Instant::now();
+            let invocation_deadline = invocation_deadline(deadline, tool_timeout, now);
+            let effective_secs = invocation_deadline
+                .map(|deadline| deadline.saturating_duration_since(now).as_secs());
+            if let Err(error) = deadline.check() {
+                return Err(error).into();
+            }
+            let mut invocation_ctx = ctx.clone();
+            invocation_ctx.deadline = invocation_deadline.map_or(Deadline::None, Deadline::At);
+            let ctx = &invocation_ctx;
             let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
             let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
                 event_tx: ctx.event_tx.clone(),
@@ -535,10 +535,7 @@ impl ToolInvocation for LuaToolInvocation {
                     generation,
                     input,
                     ctx: Box::new(lua_ctx),
-                    deadline: match deadline {
-                        Deadline::At(t) => Some(t),
-                        Deadline::None => None,
-                    },
+                    deadline: invocation_deadline,
                     reply: reply_tx,
                     live,
                     nested,
@@ -550,10 +547,10 @@ impl ToolInvocation for LuaToolInvocation {
             }
 
             let recv = async { Some(reply_rx.recv_async().await) };
-            let result = match effective_secs {
-                Some(secs) => {
+            let result = match invocation_deadline {
+                Some(deadline) => {
                     futures_lite::future::race(recv, async move {
-                        smol::Timer::after(Duration::from_secs(secs)).await;
+                        smol::Timer::at(deadline + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT).await;
                         None
                     })
                     .await
@@ -570,7 +567,54 @@ impl ToolInvocation for LuaToolInvocation {
                 ))
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
-                Some(Ok(reply)) => {
+                Some(Ok(mut reply)) => {
+                    reply.deadline = if reply.timeout_cleanup {
+                        Some(Instant::now() + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT)
+                    } else {
+                        match (reply.deadline, invocation_deadline) {
+                            (Some(runtime), Some(invocation)) => Some(runtime.min(invocation)),
+                            (runtime, invocation) => runtime.or(invocation),
+                        }
+                    };
+                    let limiting = reply.has_output_limits();
+                    let already_cancelled = ctx.cancel.is_cancelled();
+                    let finalization_deadline = if limiting && already_cancelled {
+                        Some(Instant::now() + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT)
+                    } else {
+                        reply.deadline.filter(|_| limiting)
+                    };
+                    if !limiting {
+                        reply = reply.finalize(ctx).await;
+                    } else {
+                        let finalize = reply.finalize(ctx);
+                        let finalize = async {
+                            match finalization_deadline {
+                                Some(deadline) if deadline <= Instant::now() => {
+                                    ToolCallReply::err(OUTPUT_TIMEOUT_ERR)
+                                }
+                                Some(deadline) => {
+                                    futures_lite::future::race(finalize, async {
+                                        smol::Timer::at(deadline).await;
+                                        ToolCallReply::err(OUTPUT_TIMEOUT_ERR)
+                                    })
+                                    .await
+                                }
+                                None => finalize.await,
+                            }
+                        };
+                        if already_cancelled {
+                            reply = finalize.await;
+                        } else {
+                            let finalized = ctx.cancel.race(finalize).await;
+                            reply = match finalized {
+                                _ if ctx.cancel.is_cancelled() => {
+                                    ToolCallReply::err(OUTPUT_CANCELLED_ERR)
+                                }
+                                Ok(reply) => reply,
+                                Err(reason) => ToolCallReply::err(reason),
+                            };
+                        }
+                    }
                     if let Some(ref id) = ctx.tool_use_id {
                         if let Some(live_buf) = reply.live_buf {
                             crate::runtime::send_render_event(
@@ -622,6 +666,19 @@ impl ToolInvocation for LuaToolInvocation {
                 }
             }
         })
+    }
+}
+
+fn invocation_deadline(
+    inherited: Deadline,
+    timeout: Option<Duration>,
+    now: Instant,
+) -> Option<Instant> {
+    let deadline =
+        inherited.min(timeout.map_or(Deadline::None, |timeout| Deadline::At(now + timeout)));
+    match deadline {
+        Deadline::At(deadline) => Some(deadline),
+        Deadline::None => None,
     }
 }
 
@@ -725,6 +782,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                              Must return a string or a table with any of these fields:
 ///                                llm_output  (string)  Text sent to the model.
 ///                                is_error    (boolean) When true, the result is treated as an error.
+///                                output_limits (table) Bounds raw plain-text `llm_output` after the handler or `ctx:finish` returns.
 ///                                content     (string)  Alias for llm_output (legacy).
 ///                                body        (BufHandle) Rich rendered body shown in the UI.
 ///                                header      (BufHandle) One-line header shown before the body.
@@ -748,6 +806,10 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input, ctx)` returning a list of path scopes that need write permission. `ctx.session_id` identifies the invocation session when available.
 ///   mutable_path    (string|function) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
+///
+/// The handler can bound its model-facing output by returning `output_limits` with `llm_output`, or by passing the same reply table to `ctx:finish(reply)`. Options are `preview` ("head" or "head_tail"), `trailer` (a line that always comes last and is never cut), `lines_clipped` (the text already has long lines cut), and `max_lines` / `max_bytes` (per-tool limits; zero returns metadata only). The fixed output label is "output". Limits require plain-text `llm_output` and cannot be combined with markdown, image, diff, `state`, or `instructions` fields. Trailing newlines are removed before limiting, hashing, and saving. Longer output is saved to the session's offload store and replaced by a preview and footer; without a store it is cut instead.
+///
+/// Job exit and cancellation hooks are synchronous callbacks and cannot yield, so pass the reply table with `output_limits` to `ctx:finish(reply)`. The host applies limits after receiving the reply and preserves `is_error`. With an output hook, dispatch filters the full output before limiting. Persistence retains its absolute deadline, including any per-tool timeout or deadline set with `ctx:set_deadline`. Cancellation or an expired deadline denies filtering without saving output. The body is saved without trailing newlines or the protected trailer. A started worker retains its owned text, options, and store even when its caller is dropped; session cleanup closes the store before removing its files.
 /// @return
 /// @example
 /// maki.api.register_tool({
@@ -2117,6 +2179,8 @@ pub(crate) enum LuaOutputFormat {
 
 const LUA_FORMAT_MARKDOWN: &str = "markdown";
 const LUA_FORMAT_PLAIN: &str = "plain";
+const OUTPUT_PREVIEW_HEAD: &str = "head";
+const OUTPUT_PREVIEW_HEAD_TAIL: &str = "head_tail";
 
 pub(crate) struct DiffPayload {
     pub path: String,
@@ -2138,10 +2202,30 @@ pub(crate) struct ToolCallReply {
     /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
+    output_limits: Option<OutputLimitOptions>,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) timeout_cleanup: bool,
 }
 
 impl ToolCallReply {
+    #[cfg(test)]
     pub fn from_lua_value(lua: &Lua, val: &LuaValue) -> Self {
+        Self::from_lua_value_with_limits(lua, val, OutputLimits::from_config(&Default::default()))
+    }
+
+    pub(crate) fn from_lua_value_with_config(
+        lua: &Lua,
+        val: &LuaValue,
+        config: &AgentConfig,
+    ) -> Self {
+        Self::from_lua_value_with_limits(lua, val, OutputLimits::from_config(config))
+    }
+
+    pub(crate) fn from_lua_value_with_limits(
+        lua: &Lua,
+        val: &LuaValue,
+        limits: OutputLimits,
+    ) -> Self {
         let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
             return Self::plain(result);
@@ -2169,6 +2253,13 @@ impl ToolCallReply {
                 None
             }
         };
+        let output_limits = match extract_output_limits(t, limits) {
+            Ok(limits) => limits,
+            Err(error) => {
+                result = Err(format!("output_limits: {error}"));
+                None
+            }
+        };
         let state = match t.get::<LuaValue>("state") {
             Ok(LuaValue::Nil) | Err(_) => None,
             Ok(v) => crate::api::util::convert::lua_to_json(lua, &v)
@@ -2187,7 +2278,47 @@ impl ToolCallReply {
             diff,
             image,
             state,
+            output_limits,
+            deadline: None,
+            timeout_cleanup: false,
         }
+    }
+
+    pub(crate) fn has_output_limits(&self) -> bool {
+        self.output_limits.is_some()
+    }
+
+    async fn finalize(mut self, ctx: &ToolContext) -> Self {
+        let mut ctx = ctx.clone();
+        ctx.deadline = self.deadline.map_or(Deadline::None, Deadline::At);
+        if let Some(pending) = &ctx.pending_output_limits {
+            let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+            let metadata = pending.get_or_insert_with(|| OutputFinalization {
+                limits: None,
+                deadline: self.deadline,
+                terminal_cleanup: self.timeout_cleanup,
+            });
+            metadata.deadline = self.deadline;
+            metadata.terminal_cleanup = self.timeout_cleanup;
+            if let Some(opts) = metadata.limits.as_mut() {
+                opts.deadline = self.deadline;
+            }
+        }
+        if let Some(mut opts) = self.output_limits.take() {
+            opts.deadline = self.deadline;
+            if ctx.pending_output_limits.is_some() {
+                ctx.defer_output_limits(opts);
+                return self;
+            }
+            let result = std::mem::replace(&mut self.result, Ok(String::new()));
+            let is_error = result.is_err();
+            let body = match result {
+                Ok(body) | Err(body) => body,
+            };
+            let body = opts.apply(body, ctx.offload.clone()).await;
+            self.result = if is_error { Err(body) } else { Ok(body) };
+        }
+        self
     }
 
     fn extract_body_handle(t: &mlua::Table) -> (Option<BufferSnapshot>, Option<Arc<SharedBuf>>) {
@@ -2220,12 +2351,75 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
+            output_limits: None,
+            deadline: None,
+            timeout_cleanup: false,
         }
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
         Self::plain(Err(msg.into()))
     }
+}
+
+fn extract_output_limits(
+    t: &Table,
+    mut limits: OutputLimits,
+) -> mlua::Result<Option<OutputLimitOptions>> {
+    let opts = match t.get::<LuaValue>("output_limits")? {
+        LuaValue::Nil => return Ok(None),
+        LuaValue::Table(opts) => opts,
+        _ => return Err(mlua::Error::runtime("expected an options table")),
+    };
+    match t.get::<LuaValue>("llm_output")? {
+        LuaValue::String(output) if output.to_str().is_ok() => {}
+        _ => return Err(mlua::Error::runtime("requires a text llm_output")),
+    }
+    for field in [
+        "image",
+        "diff_path",
+        "diff_before",
+        "diff_after",
+        "state",
+        "instructions",
+    ] {
+        if !matches!(t.get::<LuaValue>(field)?, LuaValue::Nil) {
+            return Err(mlua::Error::runtime(format!(
+                "cannot be combined with {field}"
+            )));
+        }
+    }
+    if !matches!(t.get::<LuaValue>("format")?, LuaValue::Nil)
+        && t.get::<String>("format")? != LUA_FORMAT_PLAIN
+    {
+        return Err(mlua::Error::runtime("requires plain text format"));
+    }
+
+    let trailer = opts.get("trailer")?;
+    let shape = match opts.get::<Option<String>>("preview")?.as_deref() {
+        None | Some(OUTPUT_PREVIEW_HEAD) => PreviewShape::Head,
+        Some(OUTPUT_PREVIEW_HEAD_TAIL) => PreviewShape::HeadTail,
+        Some(other) => {
+            return Err(mlua::Error::runtime(format!(
+                "preview must be \"{OUTPUT_PREVIEW_HEAD}\" or \"{OUTPUT_PREVIEW_HEAD_TAIL}\", got \"{other}\""
+            )));
+        }
+    };
+    let lines_clipped = opts.get::<Option<bool>>("lines_clipped")?.unwrap_or(false);
+    if let Some(max_lines) = opts.get("max_lines")? {
+        limits.max_lines = max_lines;
+    }
+    if let Some(max_bytes) = opts.get("max_bytes")? {
+        limits.max_bytes = max_bytes;
+    }
+
+    Ok(Some(OutputLimitOptions {
+        deadline: None,
+        trailer,
+        shape,
+        lines_clipped,
+        limits,
+    }))
 }
 
 fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
@@ -2301,25 +2495,30 @@ fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
     }
 }
 
+fn extract_tool_output(t: &Table) -> mlua::Result<Option<String>> {
+    let output = match t.get::<LuaValue>("llm_output")? {
+        LuaValue::Nil => t.get::<LuaValue>("content")?,
+        output => output,
+    };
+    match output {
+        LuaValue::Nil => Ok(None),
+        LuaValue::String(output) => output.to_str().map(|output| Some(output.to_owned())),
+        _ => Err(mlua::Error::runtime("tool output must be a string")),
+    }
+}
+
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
     match result {
         LuaValue::String(s) => s.to_str().map(|s| s.to_owned()).map_err(|e| e.to_string()),
-        LuaValue::Table(t) => {
-            let output = t.get::<LuaValue>("llm_output").ok().and_then(|v| {
-                if let LuaValue::String(s) = v {
-                    s.to_str().ok().map(|s| s.to_owned())
-                } else {
-                    None
-                }
-            });
-            match output {
-                Some(s) if matches!(t.get::<LuaValue>("is_error"), Ok(LuaValue::Boolean(true))) => {
-                    Err(s)
-                }
-                Some(s) => Ok(s),
-                None => Err(TOOL_HANDLER_RETURN_ERR.to_string()),
+        LuaValue::Table(t) => match extract_tool_output(t) {
+            Ok(Some(output))
+                if matches!(t.get::<LuaValue>("is_error"), Ok(LuaValue::Boolean(true))) =>
+            {
+                Err(output)
             }
-        }
+            Ok(Some(output)) => Ok(output),
+            Ok(None) | Err(_) => Err(TOOL_HANDLER_RETURN_ERR.to_string()),
+        },
         _ => Err(TOOL_HANDLER_RETURN_ERR.to_string()),
     }
 }
@@ -2362,6 +2561,24 @@ impl LuaToolInvocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case::test_case(None, Some(Duration::from_millis(1900)), Some(Duration::from_millis(1900)); "fractional_inherited")]
+    #[test_case::test_case(Some(Duration::from_secs(1)), Some(Duration::from_millis(1900)), Some(Duration::from_secs(1)); "tool_timeout_caps_inherited")]
+    #[test_case::test_case(Some(Duration::from_secs(2)), Some(Duration::from_millis(1900)), Some(Duration::from_millis(1900)); "inherited_caps_tool_timeout")]
+    #[test_case::test_case(Some(Duration::from_secs(2)), None, Some(Duration::from_secs(2)); "tool_timeout_only")]
+    #[test_case::test_case(None, None, None; "unbounded")]
+    fn invocation_preserves_exact_deadline(
+        timeout: Option<Duration>,
+        inherited: Option<Duration>,
+        expected: Option<Duration>,
+    ) {
+        let now = Instant::now();
+        let inherited = inherited.map_or(Deadline::None, |duration| Deadline::At(now + duration));
+        assert_eq!(
+            invocation_deadline(inherited, timeout, now),
+            expected.map(|duration| now + duration)
+        );
+    }
 
     fn collect_twice(lua: &Lua) {
         lua.gc_collect().unwrap();
@@ -2672,6 +2889,47 @@ mod tests {
         );
     }
 
+    #[test_case::test_case(false; "success")]
+    #[test_case::test_case(true; "error")]
+    fn coerce_legacy_content_preserves_result_kind(is_error: bool) {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("content", "body").unwrap();
+        t.set("is_error", is_error).unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            if is_error {
+                Err("body".to_owned())
+            } else {
+                Ok("body".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn coerce_llm_output_precedes_legacy_content() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", "primary").unwrap();
+        t.set("content", "legacy").unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Ok("primary".to_owned())
+        );
+    }
+
+    #[test]
+    fn coerce_unsupported_llm_output_does_not_fall_back_to_content() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("llm_output", false).unwrap();
+        t.set("content", "legacy").unwrap();
+        assert_eq!(
+            coerce_tool_result(&LuaValue::Table(t)),
+            Err(TOOL_HANDLER_RETURN_ERR.to_owned())
+        );
+    }
+
     #[test]
     fn coerce_error_paths() {
         let lua = Lua::new();
@@ -2849,6 +3107,96 @@ mod tests {
             t.set("format", f).unwrap();
         }
         LuaValue::Table(t)
+    }
+
+    #[test]
+    fn output_limits_parse_preview_and_zero_per_tool_limits() {
+        let lua = Lua::new();
+        let reply = lua.create_table().unwrap();
+        reply.set("llm_output", "body").unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("preview", OUTPUT_PREVIEW_HEAD_TAIL).unwrap();
+        options.set("trailer", "Exit code: 0").unwrap();
+        options.set("lines_clipped", true).unwrap();
+        options.set("max_lines", 0).unwrap();
+        options.set("max_bytes", 0).unwrap();
+        reply.set("output_limits", options).unwrap();
+
+        let parsed = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply));
+        let options = parsed.output_limits.expect("limits should be parsed");
+        assert_eq!(options.deadline, None);
+        assert_eq!(options.trailer.as_deref(), Some("Exit code: 0"));
+        assert_eq!(options.shape, PreviewShape::HeadTail);
+        assert!(options.lines_clipped);
+        assert_eq!(options.limits.max_lines, 0);
+        assert_eq!(options.limits.max_bytes, 0);
+    }
+
+    #[test]
+    fn output_limits_require_plain_llm_text_without_sidecar_fields() {
+        let lua = Lua::new();
+        let cases = [
+            (
+                "format",
+                LuaValue::String(lua.create_string(LUA_FORMAT_MARKDOWN).unwrap()),
+            ),
+            ("state", LuaValue::Boolean(true)),
+            ("instructions", LuaValue::Boolean(true)),
+            ("image", LuaValue::Boolean(true)),
+            (
+                "diff_path",
+                LuaValue::String(lua.create_string("file.rs").unwrap()),
+            ),
+        ];
+        for (field, value) in cases {
+            let reply = lua.create_table().unwrap();
+            reply.set("llm_output", "body").unwrap();
+            reply
+                .set("output_limits", lua.create_table().unwrap())
+                .unwrap();
+            reply.set(field, value).unwrap();
+            let parsed = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply));
+            assert!(
+                parsed.result.is_err(),
+                "output_limits accepted incompatible field {field}"
+            );
+            assert!(parsed.output_limits.is_none());
+        }
+
+        let reply = lua.create_table().unwrap();
+        reply.set("content", "legacy body").unwrap();
+        reply
+            .set("output_limits", lua.create_table().unwrap())
+            .unwrap();
+        let parsed = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply));
+        assert!(
+            parsed.result.is_err(),
+            "content alias must not satisfy llm_output"
+        );
+
+        let reply = lua.create_table().unwrap();
+        reply
+            .set("llm_output", lua.create_string(&[0xff][..]).unwrap())
+            .unwrap();
+        reply
+            .set("output_limits", lua.create_table().unwrap())
+            .unwrap();
+        let parsed = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply));
+        assert!(
+            parsed.result.is_err(),
+            "invalid UTF-8 must not satisfy llm_output"
+        );
+
+        let reply = lua.create_table().unwrap();
+        reply.set("llm_output", "body").unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("preview", "middle").unwrap();
+        reply.set("output_limits", options).unwrap();
+        let parsed = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply));
+        assert!(
+            parsed.result.is_err(),
+            "unsupported preview shape must be rejected"
+        );
     }
 
     #[test]

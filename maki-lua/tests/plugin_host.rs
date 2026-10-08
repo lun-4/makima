@@ -1,23 +1,28 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use maki_agent::agent::tool_dispatch;
 use maki_agent::template::Vars;
+use maki_agent::tools::hook::{
+    HookCall, HookStage, OUTPUT_TEXT, OUTPUT_TRAILER, ToolHook, Verdict,
+};
+use maki_agent::tools::offload::{LINE_CUT_PREFIX, OffloadStore};
 use maki_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, QuestionMode, Tool,
-    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry,
-    ToolSource, TurnToolBindings, timeout_annotation,
+    BoxFuture, CallOrigin, DescriptionContext, ExecFuture, FILE_TRUNCATED_MARKER, HeaderFuture,
+    HeaderResult, ParseError, QuestionMode, Tool, ToolAudience, ToolContext, ToolExecResult,
+    ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource, TurnToolBindings,
+    format_line_truncated_marker, timeout_annotation,
 };
 use maki_agent::{AgentMode, SharedBuf, ToolOutput};
 use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
+use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend};
 use maki_lua::{
     MAX_INFLIGHT_TOOLS, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
     WinCommand, WinEvent,
@@ -44,6 +49,9 @@ const PICKER_CLOSE_TIMEOUT: &str = "sessions picker did not close";
 const SHADOWED_TOOL: &str = "skill";
 const REPLACEMENT_PLUGIN: &str = "my_skill";
 const REPLACEMENT_DESC: &str = "took the builtin name over";
+const ZERO_LINES_OPTION: &str = "max_output_lines";
+const ZERO_BASH_COMMAND: &str = "printf '%s%s\\n' X Y";
+const ZERO_BASH_TIMEOUT_SECS: u64 = 10;
 
 struct FakeCommandHost;
 
@@ -117,6 +125,17 @@ fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost)
 
 fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
     builtins_host_with(&PluginsConfig::from_plugins(HashMap::new()))
+}
+
+fn builtins_host_with_zero_output_limit(
+    plugin: &str,
+    option: &str,
+) -> (Arc<ToolRegistry>, PluginHost) {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config
+        .opts
+        .insert(plugin.to_owned(), json_obj(json!({ (option): 0 })));
+    builtins_host_with(&config)
 }
 
 /// A tool can be registered and still stay invisible to the model, so this
@@ -6532,4 +6551,958 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     assert_eq!(version, set_version);
     responder.join().unwrap();
     smol::block_on(session.close()).unwrap();
+}
+
+const CUT_LINE_BYTES: usize = 100;
+const LONG_LINE_BYTES: usize = 300;
+
+fn ctx_with_line_bytes(max_line_bytes: usize) -> ToolContext {
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.max_line_bytes = max_line_bytes;
+    ctx
+}
+
+#[test]
+fn read_and_grep_use_the_global_line_cap() {
+    let (reg, _host) = builtins_host();
+    let ctx = ctx_with_line_bytes(CUT_LINE_BYTES);
+    for tool in ["read", "grep"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        let content = format!("needle{}", "x".repeat(LONG_LINE_BYTES));
+        std::fs::write(&path, &content).unwrap();
+        let input = if tool == "read" {
+            json!({"path": path.to_str().unwrap(), "offset": 1, "limit": 0})
+        } else {
+            json!({"pattern": "needle", "path": dir.path().to_str().unwrap()})
+        };
+        let out = exec_with_ctx(&reg, tool, input, &ctx).unwrap();
+        let line = out
+            .lines()
+            .find(|line| line.contains("needle"))
+            .expect("content line")
+            .trim_start()
+            .trim_start_matches("1: ");
+        assert!(line.len() <= CUT_LINE_BYTES, "{tool}: {line}");
+        let hidden = content.len() - line.find('[').unwrap();
+        assert!(
+            line.ends_with(&format_line_truncated_marker(hidden)),
+            "{tool}: {line}"
+        );
+    }
+}
+
+const GUARD_LONG_LINE_BYTES: usize = 1500;
+const LONG_LINE_CHANGED_FRAGMENT: &str = "longer than agent.max_line_bytes";
+const MARKER_ADDED_FRAGMENT: &str = "marker from truncated read or grep output";
+
+fn edit_tools_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config.opts.insert(
+        "edit".to_owned(),
+        json_obj(json!({ "edit_lines": true, "insert_lines": true })),
+    );
+    builtins_host_with(&config)
+}
+
+struct LongLineFile {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    content: String,
+}
+
+impl LongLineFile {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        let content = format!("short\n{}\nend\n", "x".repeat(GUARD_LONG_LINE_BYTES));
+        std::fs::write(&path, &content).unwrap();
+        Self {
+            _dir: dir,
+            path,
+            content,
+        }
+    }
+
+    fn path_str(&self) -> &str {
+        self.path.to_str().unwrap()
+    }
+
+    fn on_disk(&self) -> String {
+        std::fs::read_to_string(&self.path).unwrap()
+    }
+}
+
+fn fresh_ctx() -> ToolContext {
+    maki_agent::tools::test_support::stub_ctx(&AgentMode::Build)
+}
+
+fn exec_succeeds(reg: &ToolRegistry, name: &str, input: serde_json::Value) {
+    let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
+    let output = smol::block_on(async { inv.execute(&fresh_ctx()).await }).output;
+    assert!(output.is_ok(), "{name} failed: {output:?}");
+}
+
+/// What a model holding only the read output would write back: the shown
+/// lines with their `N: ` gutters stripped.
+fn content_from_read(reg: &ToolRegistry, path: &str) -> String {
+    let out = exec_with_ctx(
+        reg,
+        "read",
+        json!({"path": path, "offset": 1, "limit": 0}),
+        &fresh_ctx(),
+    )
+    .unwrap();
+    let mut text: String = out
+        .lines()
+        .filter_map(|line| line.split_once(": ").map(|(_, rest)| rest))
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.push('\n');
+    text
+}
+
+#[test]
+fn write_after_truncated_read_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let lossy = content_from_read(&reg, file.path_str());
+
+    let err = exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": file.path_str(), "content": lossy}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(LONG_LINE_CHANGED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn guard_holds_with_fresh_ctx() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+
+    let err = exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": file.path_str(), "content": "short\nend\n"}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(LONG_LINE_CHANGED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn write_preserving_long_lines_succeeds() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let moved = format!("end\n{}\nSHORT\n", "x".repeat(GUARD_LONG_LINE_BYTES));
+
+    exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": file.path_str(), "content": moved}),
+        &fresh_ctx(),
+    )
+    .unwrap();
+    assert_eq!(file.on_disk(), moved);
+}
+
+#[test]
+fn write_over_non_utf8_file_succeeds() {
+    let (reg, _host) = edit_tools_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("latin1.txt");
+    std::fs::write(&path, [0xe9, b'\n', 0xff]).unwrap();
+
+    exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": path.to_str().unwrap(), "content": "fresh\n"}),
+        &fresh_ctx(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+}
+
+#[test]
+fn edit_lines_altering_long_line_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+
+    let err = exec_with_ctx(
+        &reg,
+        "edit_lines",
+        json!({"path": file.path_str(), "start": 1, "end": 2, "new_string": "SHORT\nxxx"}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(LONG_LINE_CHANGED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn edit_lines_deleting_long_line_succeeds() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+
+    exec_succeeds(
+        &reg,
+        "edit_lines",
+        json!({"path": file.path_str(), "start": 2, "end": 2, "new_string": ""}),
+    );
+    assert_eq!(file.on_disk(), "short\nend\n");
+}
+
+#[test]
+fn insert_lines_next_to_long_line_succeeds() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+
+    exec_succeeds(
+        &reg,
+        "insert_lines",
+        json!({"path": file.path_str(), "line": 2, "new_string": "after"}),
+    );
+    assert_eq!(
+        file.on_disk(),
+        format!("short\n{}\nafter\nend\n", "x".repeat(GUARD_LONG_LINE_BYTES))
+    );
+}
+
+#[test]
+fn multiedit_new_string_with_truncated_marker_is_rejected() {
+    let (reg, _host) = edit_tools_host();
+    let file = LongLineFile::new();
+    let lossy_line = content_from_read(&reg, file.path_str())
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+
+    let err = exec_with_ctx(
+        &reg,
+        "multiedit",
+        json!({"path": file.path_str(), "edits": [
+            {"old_string": "short", "new_string": "SHORT"},
+            {"old_string": "end", "new_string": lossy_line},
+        ]}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
+    assert_eq!(file.on_disk(), file.content);
+}
+
+#[test]
+fn editing_other_lines_keeps_existing_marker_line() {
+    let (reg, _host) = edit_tools_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("doc.md");
+    let marker_line = format!("example{}", format_line_truncated_marker(42));
+    std::fs::write(&path, format!("{marker_line}\nold\n")).unwrap();
+
+    exec_succeeds(
+        &reg,
+        "edit",
+        json!({"path": path.to_str().unwrap(), "old_string": "old", "new_string": "new"}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{marker_line}\nnew\n")
+    );
+}
+
+#[test]
+fn read_byte_cut_reports_remaining_lines() {
+    const LINE_BYTES: usize = 900;
+    const LINES: usize = 100;
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.txt");
+    std::fs::write(&path, vec!["y".repeat(LINE_BYTES); LINES].join("\n")).unwrap();
+
+    let out = exec_tool(
+        &reg,
+        "read",
+        json!({"path": path.to_str().unwrap(), "offset": 1, "limit": 0}),
+    )
+    .unwrap();
+    let shown = out.lines().filter(|l| l.contains(": y")).count();
+    assert!(shown < LINES, "the byte cap must cut this file");
+    let marker = maki_agent::tools::format_file_truncated_marker(Some(LINES - shown));
+    assert!(out.ends_with(&marker), "{}", out.lines().last().unwrap());
+}
+
+const SEQ_LINES: usize = 5000;
+const BIG_BASH_CMD: &str = "seq 1 5000";
+const OFFLOAD_SECRET: &str = "offload-secret";
+const OFFLOAD_REDACTED: &str = "redacted";
+const OFFLOAD_DENIED: &str = "output denied";
+const OFFLOAD_HOOK_ID: &str = "offload-hook-test";
+
+struct OffloadOutputHook {
+    deny: bool,
+}
+
+impl ToolHook for OffloadOutputHook {
+    fn wraps(&self, _tool: &str, stage: HookStage) -> bool {
+        stage == HookStage::Output
+    }
+
+    fn run<'a>(
+        &'a self,
+        _stage: HookStage,
+        mut value: Value,
+        _call: &'a HookCall<'a>,
+    ) -> BoxFuture<'a, Verdict> {
+        Box::pin(async move {
+            let text = value[OUTPUT_TEXT].as_str().unwrap();
+            assert!(
+                text.contains(OFFLOAD_SECRET),
+                "hook must see the full body: {text}"
+            );
+            if self.deny {
+                Verdict::Denied(OFFLOAD_DENIED.to_owned())
+            } else {
+                value[OUTPUT_TEXT] = Value::String(text.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+                if let Some(trailer) = value[OUTPUT_TRAILER].as_str() {
+                    value[OUTPUT_TRAILER] =
+                        Value::String(trailer.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+                }
+                Verdict::Replaced(value)
+            }
+        })
+    }
+}
+
+#[test_case::test_case(false; "redaction")]
+#[test_case::test_case(true; "denial")]
+fn builtin_output_hook_precedes_offload(deny: bool) {
+    let (reg, host) = builtins_host_with_zero_output_limit("glob", ZERO_LINES_OPTION);
+    let store_dir = tempfile::tempdir().unwrap();
+    let work_dir = tempfile::tempdir().unwrap();
+    std::fs::write(work_dir.path().join(OFFLOAD_SECRET), "").unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(store_dir.path()));
+    reg.set_hook(OffloadOutputHook { deny });
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    let done = smol::block_on(tool_dispatch::run(
+        OFFLOAD_HOOK_ID.to_owned(),
+        "glob",
+        &json!({ "pattern": "*", "path": work_dir.path() }),
+        &ctx,
+        CallOrigin::Nested,
+    ));
+    let output = done.output.as_text();
+    assert_eq!(done.is_error, deny, "{output}");
+    let artifacts: Vec<_> = std::fs::read_dir(store_dir.path()).unwrap().collect();
+    if deny {
+        assert_eq!(output, OFFLOAD_DENIED);
+        assert!(artifacts.is_empty());
+    } else {
+        assert_eq!(artifacts.len(), 1);
+        let saved = std::fs::read_to_string(artifacts[0].as_ref().unwrap().path()).unwrap();
+        assert!(saved.contains(OFFLOAD_REDACTED), "{saved}");
+        assert!(!saved.contains(OFFLOAD_SECRET), "{saved}");
+    }
+}
+const CANCEL_OFFLOAD_TOOL: &str = "cancel_offload_probe";
+const CANCEL_OFFLOAD_DISPATCH_TOOL: &str = "cancel_offload_dispatch";
+
+struct GatedOffloadOutputHook {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+impl ToolHook for GatedOffloadOutputHook {
+    fn wraps(&self, _: &str, stage: HookStage) -> bool {
+        stage == HookStage::Output
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookStage,
+        mut value: Value,
+        _: &'a HookCall<'a>,
+    ) -> BoxFuture<'a, Verdict> {
+        let text = value[OUTPUT_TEXT].as_str().unwrap();
+        assert!(text.contains(OFFLOAD_SECRET), "{text}");
+        value[OUTPUT_TEXT] = Value::String(text.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+        if let Some(trailer) = value[OUTPUT_TRAILER].as_str() {
+            value[OUTPUT_TRAILER] =
+                Value::String(trailer.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+        }
+        self.entered.send(()).unwrap();
+        Box::pin(async move {
+            self.release.recv_async().await.unwrap();
+            Verdict::Replaced(value)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct GatedOffloadInvocation {
+    tool: Arc<dyn Tool>,
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+    input: Value,
+}
+
+impl Tool for GatedOffloadInvocation {
+    fn name(&self) -> &str {
+        CANCEL_OFFLOAD_DISPATCH_TOOL
+    }
+
+    fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+        self.tool.description(ctx)
+    }
+
+    fn schema(&self) -> Value {
+        self.tool.schema()
+    }
+
+    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(Self {
+            input: input.clone(),
+            ..self.clone()
+        }))
+    }
+}
+
+impl ToolInvocation for GatedOffloadInvocation {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(CANCEL_OFFLOAD_DISPATCH_TOOL.to_owned()))
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            let result = self.tool.parse(&self.input).unwrap().execute(ctx).await;
+            let text = result.output.as_ref().unwrap().as_text();
+            assert!(text.contains(OFFLOAD_SECRET), "{text}");
+            self.entered.send(()).unwrap();
+            self.release.recv_async().await.unwrap();
+            result
+        })
+    }
+}
+
+#[test]
+fn cancelled_output_hook_does_not_offload_raw_output() {
+    let (reg, host) = builtins_host();
+    host.load_source(
+        CANCEL_OFFLOAD_TOOL,
+        &format!(
+            r#"
+        maki.api.register_tool({{
+            name = "{CANCEL_OFFLOAD_TOOL}", description = "cancellation output probe",
+            schema = {{ type = "object", properties = {{}} }},
+            handler = function()
+                return {{ llm_output = "head\n{OFFLOAD_SECRET}\ntail",
+                    output_limits = {{ max_lines = 0 }} }}
+            end,
+        }})
+    "#
+        ),
+    )
+    .unwrap();
+    let (execution_tx, execution_rx) = flume::bounded(1);
+    let (execution_release_tx, execution_release_rx) = flume::bounded(1);
+    reg.register(
+        Arc::new(GatedOffloadInvocation {
+            tool: Arc::clone(&reg.get(CANCEL_OFFLOAD_TOOL).unwrap().tool),
+            entered: execution_tx,
+            release: execution_release_rx,
+            input: Value::Null,
+        }),
+        ToolSource::Lua {
+            plugin: Arc::from(CANCEL_OFFLOAD_TOOL),
+        },
+    )
+    .unwrap();
+    let (hook_tx, hook_rx) = flume::bounded(1);
+    let (_hook_release_tx, hook_release_rx) = flume::bounded(1);
+    reg.set_hook(GatedOffloadOutputHook {
+        entered: hook_tx,
+        release: hook_release_rx,
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    let (trigger, token) = maki_agent::CancelToken::new();
+    ctx.cancel = token;
+    let done = smol::block_on(async {
+        let caller = smol::spawn(async move {
+            tool_dispatch::run(
+                OFFLOAD_HOOK_ID.to_owned(),
+                CANCEL_OFFLOAD_DISPATCH_TOOL,
+                &json!({}),
+                &ctx,
+                CallOrigin::Nested,
+            )
+            .await
+        });
+        execution_rx.recv_async().await.unwrap();
+        execution_release_tx.send(()).unwrap();
+        hook_rx.recv_async().await.unwrap();
+        trigger.cancel();
+        futures_lite::future::race(caller, async {
+            smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
+            panic!("cancelled output hook did not settle");
+        })
+        .await
+    });
+    let output = done.output.as_text();
+    assert!(done.is_error, "{output}");
+    assert!(!output.contains(OFFLOAD_SECRET), "{output}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert!(
+        hook_rx.try_recv().is_err(),
+        "hook invoked after cancellation"
+    );
+}
+
+#[cfg(unix)]
+const BASH_TIMEOUT_SENTINEL: &str = "timeout-cleanup-sentinel";
+#[cfg(unix)]
+const BASH_TIMEOUT_REDACTED: &str = "filtered-timeout-cleanup";
+#[cfg(unix)]
+const BASH_TIMEOUT_TRAILER: &str = "[timed out after 1s; output above is partial]";
+#[cfg(unix)]
+const BASH_CANCEL_OUTPUT_BYTES: usize = 60 * 1024;
+
+#[cfg(unix)]
+#[test]
+fn timed_out_bash_keeps_hooked_partial_output_offloaded() {
+    let (reg, host) = builtins_host_with_zero_output_limit("bash", ZERO_LINES_OPTION);
+    host.load_source(
+        "timeout_redactor",
+        &format!(
+            r#"
+            maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
+                assert(out.text:find("{BASH_TIMEOUT_SENTINEL}", 1, true))
+                local sentinel = ("{BASH_TIMEOUT_SENTINEL}"):gsub("%-", "%%-")
+                out.text = out.text:gsub(sentinel, "{BASH_TIMEOUT_REDACTED}")
+                return prev(out, ctx)
+            end)
+        "#
+        ),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = disk_store(dir.path());
+    let (mut ctx, _session) = offload_ctx(&host, &store);
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    let command = format!("printf '%s\\n' '{BASH_TIMEOUT_SENTINEL}'; kill -STOP $$");
+    let done = smol::block_on(futures_lite::future::race(
+        tool_dispatch::run(
+            OFFLOAD_HOOK_ID.to_owned(),
+            "bash",
+            &json!({ "command": command, "timeout": 1 }),
+            &ctx,
+            CallOrigin::Nested,
+        ),
+        async {
+            smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
+            panic!("timed out bash dispatch did not settle");
+        },
+    ));
+    let output = done.output.as_text();
+    assert!(done.is_error, "{output}");
+    assert!(output.ends_with(BASH_TIMEOUT_TRAILER), "{output}");
+    let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(files.len(), 1);
+    let saved = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
+    assert!(saved.contains(BASH_TIMEOUT_REDACTED), "{saved}");
+    assert!(!saved.contains(BASH_TIMEOUT_SENTINEL), "{saved}");
+}
+
+fn disk_store(dir: &Path) -> Arc<OffloadStore> {
+    Arc::new(OffloadStore::on_disk(dir.to_path_buf()))
+}
+
+/// bash reads session options, so it needs a live coordinator: keep the
+/// returned handle alive for the test's duration.
+fn offload_ctx(
+    host: &PluginHost,
+    store: &Arc<OffloadStore>,
+) -> (
+    ToolContext,
+    maki_agent::session_coordinator::SessionCoordinatorHandle,
+) {
+    let session = test_session(host);
+    let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
+        &AgentMode::Build,
+        None,
+        None,
+        session.read().session_id(),
+    );
+    ctx.config.rtk = false;
+    ctx.offload = Some(Arc::clone(store));
+    (ctx, session)
+}
+
+#[cfg(unix)]
+fn only_offloaded_file(dir: &Path) -> PathBuf {
+    let mut files = std::fs::read_dir(dir).unwrap();
+    let path = files.next().unwrap().unwrap().path();
+    assert!(files.next().is_none(), "expected one offloaded file");
+    path
+}
+
+#[test]
+fn bash_zero_output_override_finishes_on_exit() {
+    let (reg, host) = builtins_host_with_zero_output_limit("bash", ZERO_LINES_OPTION);
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    ctx.offload = None;
+    let output = exec_with_ctx(
+        &reg,
+        "bash",
+        json!({ "command": ZERO_BASH_COMMAND, "timeout": ZERO_BASH_TIMEOUT_SECS }),
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(output, FILE_TRUNCATED_MARKER);
+}
+
+#[test]
+fn write_new_file_with_preview_cut_marker_is_rejected() {
+    let (reg, host) = edit_tools_host();
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _session) = offload_ctx(&host, &disk_store(&dir.path().join("store")));
+    let out = exec_with_ctx(
+        &reg,
+        "bash",
+        json!({"command": "printf 'q%.0s' $(seq 1 80000)"}),
+        &ctx,
+    )
+    .unwrap();
+    let cut_line = out
+        .lines()
+        .find(|l| l.contains(LINE_CUT_PREFIX))
+        .unwrap_or_else(|| panic!("no cut line in: {out}"))
+        .to_owned();
+    let target = dir.path().join("pasted.txt");
+
+    let err = exec_with_ctx(
+        &reg,
+        "write",
+        json!({"path": target.to_str().unwrap(), "content": cut_line}),
+        &fresh_ctx(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cut tool-output preview"), "{err}");
+    assert!(!target.exists());
+}
+
+/// Esc on a run whose output already passed the limits: the full output is
+/// saved, and the partial marker still comes last.
+#[cfg(unix)]
+#[test]
+fn cancelled_bash_large_output_keeps_partial_marker_last() {
+    let (tx, events) = flume::unbounded();
+    let event_tx = maki_agent::EventSender::new(tx, 0);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    let (result_tx, result_rx) = flume::bounded(1);
+    let dir = tempfile::tempdir().unwrap();
+    let store = disk_store(dir.path());
+    let worker = std::thread::spawn(move || {
+        let (reg, host) = builtins_host();
+        let session = test_session(&host);
+        let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
+            &maki_agent::AgentMode::Build,
+            Some(&event_tx),
+            Some(BASH_CANCEL_ID),
+            session.read().session_id(),
+        );
+        ctx.cancel = token;
+        ctx.config.rtk = false;
+        ctx.offload = Some(store);
+        let command = format!(
+            "printf '%*s\\n' {BASH_CANCEL_OUTPUT_BYTES} '' | tr ' ' q; printf '%s%s\\n' X Y; kill -STOP $$"
+        );
+        result_tx
+            .send(exec_with_ctx(
+                &reg,
+                "bash",
+                json!({ "command": command }),
+                &ctx,
+            ))
+            .unwrap();
+    });
+
+    let buf = poll_until("bash must publish its live buf", || {
+        recv_live_buf(&events, BASH_CANCEL_ID)
+    });
+    poll_until("bash output never reached the live buf", || {
+        buf.take().text().contains(BASH_PARTIAL_PROBE).then_some(())
+    });
+
+    trigger.cancel();
+
+    let err = result_rx
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("cancelled bash must settle")
+        .expect_err("a partial reply is an error reply");
+    worker.join().unwrap();
+    assert!(err.ends_with(BASH_PARTIAL_MARKER), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(only_offloaded_file(dir.path())).unwrap(),
+        format!(
+            "{}\n{BASH_PARTIAL_PROBE}",
+            "q".repeat(BASH_CANCEL_OUTPUT_BYTES)
+        )
+    );
+}
+
+const CODE_EXECUTION_BLOCKED_TOOL: &str = "blocked_interpreter_child";
+const CODE_EXECUTION_CANCEL_BODY: &str = "first\nsecond\nthird\nfourth";
+const CODE_EXECUTION_CANCEL_WATCHDOG: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+struct BlockedInterpreterChild {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+impl Tool for BlockedInterpreterChild {
+    fn name(&self) -> &str {
+        CODE_EXECUTION_BLOCKED_TOOL
+    }
+
+    fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+        "waits for the cancellation test".into()
+    }
+
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    fn audience(&self) -> ToolAudience {
+        ToolAudience::MAIN | ToolAudience::INTERPRETER
+    }
+
+    fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl ToolInvocation for BlockedInterpreterChild {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(CODE_EXECUTION_BLOCKED_TOOL.to_owned()))
+    }
+
+    fn execute<'a>(self: Box<Self>, _: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_async().await;
+            ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(String::new().into())))
+        })
+    }
+}
+
+struct ReleaseInterpreterChild(flume::Sender<()>);
+
+impl Drop for ReleaseInterpreterChild {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+#[test]
+fn code_execution_cancel_deferred_output_offloads() {
+    let (reg, host) = builtins_host_with_zero_output_limit("code_execution", ZERO_LINES_OPTION);
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let _release = ReleaseInterpreterChild(release_tx);
+    reg.register(
+        Arc::new(BlockedInterpreterChild {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+        ToolSource::Lua {
+            plugin: Arc::from("cancellation_fixture"),
+        },
+    )
+    .unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
+        Arc::clone(&fs),
+        PathBuf::from("/interpreter-cancel-output"),
+    ))));
+    let mut ctx = fresh_ctx();
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    ctx.offload = Some(store);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    ctx.cancel = token;
+    let (events_tx, events_rx) = flume::unbounded();
+    ctx.event_tx = maki_agent::EventSender::new(events_tx, 0);
+    ctx.tool_use_id = Some("interpreter-cancel-output".to_owned());
+    let invocation = reg.get("code_execution").unwrap().tool.parse(&json!({
+        "code": format!("print({})\nawait {CODE_EXECUTION_BLOCKED_TOOL}()", json!(CODE_EXECUTION_CANCEL_BODY)),
+        "timeout": 10,
+    })).unwrap();
+    let reply = smol::block_on(async {
+        let caller = smol::spawn(async move { invocation.execute(&ctx).await });
+        futures_lite::future::race(entered_rx.recv_async(), async {
+            smol::Timer::after(CODE_EXECUTION_CANCEL_WATCHDOG).await;
+            panic!("code_execution did not enter its blocking child");
+        })
+        .await
+        .unwrap();
+        trigger.cancel();
+        futures_lite::future::race(caller, async {
+            smol::Timer::after(CODE_EXECUTION_CANCEL_WATCHDOG).await;
+            panic!("code_execution cancellation did not settle");
+        })
+        .await
+    });
+    let output = reply.output.unwrap_err();
+    assert!(output.ends_with(BASH_PARTIAL_MARKER), "{output}");
+    let files = fs.files();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, CODE_EXECUTION_CANCEL_BODY.as_bytes());
+    let buf = recv_live_buf(&events_rx, "interpreter-cancel-output").unwrap();
+    assert_eq!(buf.take().text().matches(BASH_PARTIAL_MARKER).count(), 1);
+    drop(host);
+}
+
+const DEFERRED_CALLBACK_BODY: &str = "first\nsecond\nthird\nfourth";
+const DEFERRED_CALLBACK_TRAILER: &str = "Exit code: 3";
+const DEFERRED_CALLBACK_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "deferred_exit", description = "finishes from a job callback",
+    schema = { type = "object", properties = {
+        body = { type = "string" }, is_error = { type = "boolean" }, trailer = { type = "string" },
+    } },
+    handler = function(input, ctx)
+        maki.fn.jobstart("true", {
+            on_exit = function()
+                ctx:finish({
+                    llm_output = input.body, is_error = input.is_error,
+                    output_limits = { max_lines = 0, trailer = input.trailer },
+                })
+            end,
+        })
+        return nil
+    end,
+})
+maki.api.register_tool({
+    name = "memoized_partial", description = "closes partial output once",
+    schema = { type = "object", properties = { body = { type = "string" } } },
+    handler = function(input)
+        local partial = require("maki.partial")
+        local paints, closes = 0, 0
+        local view = {
+            append = function() paints = paints + 1 end,
+            finish = function() closes = closes + 1 end,
+            clear = function() end,
+        }
+        local limits = { max_lines = 0 }
+        local reply = partial.cut(view, input.body, "cancelled", 10, limits)
+        local repeated = partial.cut(view, "changed", "timeout", 10, limits)
+        assert(reply == repeated and paints == 1 and closes == 1)
+        assert(reply.llm_output == input.body and limits.trailer == nil)
+        return reply
+    end,
+})
+"#;
+
+#[test_case::test_case(false; "success")]
+#[test_case::test_case(true; "error")]
+fn job_exit_callback_uses_deferred_output_limits(is_error: bool) {
+    let (reg, host) = builtins_host();
+    host.load_source("deferred_callbacks", DEFERRED_CALLBACK_PLUGIN)
+        .unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
+        Arc::clone(&fs),
+        PathBuf::from("/deferred-callback-output"),
+    ))));
+    let mut ctx = fresh_ctx();
+    ctx.offload = Some(store);
+    let result = exec_with_ctx(
+        &reg,
+        "deferred_exit",
+        json!({
+            "body": DEFERRED_CALLBACK_BODY, "is_error": is_error,
+            "trailer": DEFERRED_CALLBACK_TRAILER,
+        }),
+        &ctx,
+    );
+    assert_eq!(result.is_err(), is_error);
+    let output = match result {
+        Ok(output) | Err(output) => output,
+    };
+    assert!(output.ends_with(DEFERRED_CALLBACK_TRAILER), "{output}");
+    let files = fs.files();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, DEFERRED_CALLBACK_BODY.as_bytes());
+}
+
+#[test]
+fn partial_cut_memoizes_raw_reply_and_paints_marker_once() {
+    let (reg, host) = builtins_host();
+    host.load_source("deferred_callbacks", DEFERRED_CALLBACK_PLUGIN)
+        .unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
+        Arc::clone(&fs),
+        PathBuf::from("/partial-callback-output"),
+    ))));
+    let mut ctx = fresh_ctx();
+    ctx.offload = Some(store);
+    let output = exec_with_ctx(
+        &reg,
+        "memoized_partial",
+        json!({
+            "body": DEFERRED_CALLBACK_BODY,
+        }),
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(output.ends_with(BASH_PARTIAL_MARKER), "{output}");
+    let files = fs.files();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, DEFERRED_CALLBACK_BODY.as_bytes());
+}
+
+/// The store is the host's choice: with an in-memory backend the offloaded
+/// output lands in the in-memory map and nowhere on disk.
+#[test]
+fn bash_large_output_offloads_into_in_memory_store() {
+    let (reg, host) = builtins_host();
+    let fs = Arc::new(InMemoryFs::new());
+    let store_dir = PathBuf::from("/maki-test-state/sessions/offload/s");
+    let store = Arc::new(OffloadStore::new(Box::new(InMemoryOffloadBackend::new(
+        Arc::clone(&fs),
+        store_dir.clone(),
+    ))));
+    let (ctx, _session) = offload_ctx(&host, &store);
+
+    let err = exec_with_ctx(
+        &reg,
+        "bash",
+        json!({"command": format!("{BIG_BASH_CMD}; exit 3")}),
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(err.contains("Exit code: 3"), "{err}");
+    let expected: String = (1..=SEQ_LINES).map(|i| format!("{i}\n")).collect();
+    let files = fs.files();
+    assert_eq!(files.len(), 1);
+    let saved = &files[0].0;
+    assert!(saved.starts_with(&store_dir), "{}", saved.display());
+    assert!(!saved.exists(), "nothing may reach the disk");
+    assert_eq!(
+        String::from_utf8(files[0].1.clone()).unwrap(),
+        expected.trim_end()
+    );
 }
