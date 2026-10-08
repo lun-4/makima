@@ -1116,18 +1116,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_context_carries_offload_store() {
-        let mut history = History::new(Vec::new());
-        let (mut agent, _rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
-        let store = Arc::new(OffloadStore::on_disk(PathBuf::from("/unused")));
-        agent.offload = Some(Arc::clone(&store));
-        assert!(Arc::ptr_eq(
-            agent.tool_context().offload.as_ref().unwrap(),
-            &store
-        ));
-    }
-
-    #[test]
     fn run_uses_input_options_without_settings_snapshot() {
         let mut history = History::new(Vec::new());
         let (mut agent, _rx) = make_agent(

@@ -13,9 +13,7 @@ local opts = maki.api.register_options(output_limits.extend({
     min = 10,
     desc = "Max match groups per search. A call's `limit` param overrides it.",
   },
-  max_line_bytes = output_limits.deprecated_line_bytes_spec,
 }))
-output_limits.warn_deprecated_line_bytes(opts, "grep")
 
 local function has_context(groups)
   for _, group in ipairs(groups) do

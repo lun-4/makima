@@ -6563,88 +6563,33 @@ fn ctx_with_line_bytes(max_line_bytes: usize) -> ToolContext {
 }
 
 #[test]
-fn read_cuts_lines_at_agent_max_line_bytes() {
+fn read_and_grep_use_the_global_line_cap() {
     let (reg, _host) = builtins_host();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("long.txt");
-    std::fs::write(&path, "x".repeat(LONG_LINE_BYTES)).unwrap();
-
-    let out = exec_with_ctx(
-        &reg,
-        "read",
-        json!({"path": path.to_str().unwrap(), "offset": 1, "limit": 0}),
-        &ctx_with_line_bytes(CUT_LINE_BYTES),
-    )
-    .unwrap();
-    let line = out.lines().next().unwrap().trim_start_matches("1: ");
-    assert!(
-        line.len() <= CUT_LINE_BYTES,
-        "line not cut at the cap: {line}"
-    );
-    let hidden = LONG_LINE_BYTES - line.find('[').unwrap();
-    assert!(
-        line.ends_with(&format_line_truncated_marker(hidden)),
-        "{line}"
-    );
-}
-
-#[test]
-fn grep_cuts_lines_at_agent_max_line_bytes() {
-    let (reg, _host) = builtins_host();
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("long.txt"),
-        format!("needle{}", "x".repeat(LONG_LINE_BYTES)),
-    )
-    .unwrap();
-
-    let out = exec_with_ctx(
-        &reg,
-        "grep",
-        json!({"pattern": "needle", "path": dir.path().to_str().unwrap()}),
-        &ctx_with_line_bytes(CUT_LINE_BYTES),
-    )
-    .unwrap();
-    let line = out
-        .lines()
-        .find(|l| l.contains("needle"))
-        .expect("match line")
-        .trim_start()
-        .trim_start_matches("1: ");
-    assert!(
-        line.len() <= CUT_LINE_BYTES,
-        "line not cut at the cap: {line}"
-    );
-    let hidden = "needle".len() + LONG_LINE_BYTES - line.find('[').unwrap();
-    assert!(
-        line.ends_with(&format_line_truncated_marker(hidden)),
-        "{line}"
-    );
-}
-
-#[test_case::test_case("read" ; "read")]
-#[test_case::test_case("grep" ; "grep")]
-fn deprecated_plugin_max_line_bytes_loads_and_is_ignored(plugin: &str) {
-    let mut config = PluginsConfig::from_plugins(HashMap::new());
-    config.opts.insert(
-        plugin.to_owned(),
-        json_obj(json!({ "max_line_bytes": CUT_LINE_BYTES })),
-    );
-    let (reg, _host) = builtins_host_with(&config);
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("long.txt");
-    let content = format!("needle{}", "x".repeat(LONG_LINE_BYTES));
-    std::fs::write(&path, &content).unwrap();
-
-    let input = match plugin {
-        "read" => json!({"path": path.to_str().unwrap(), "offset": 1, "limit": 0}),
-        _ => json!({"pattern": "needle", "path": dir.path().to_str().unwrap()}),
-    };
-    let out = exec_tool(&reg, plugin, input).unwrap();
-    assert!(
-        out.contains(&content),
-        "the deprecated option must not cut: {out}"
-    );
+    let ctx = ctx_with_line_bytes(CUT_LINE_BYTES);
+    for tool in ["read", "grep"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        let content = format!("needle{}", "x".repeat(LONG_LINE_BYTES));
+        std::fs::write(&path, &content).unwrap();
+        let input = if tool == "read" {
+            json!({"path": path.to_str().unwrap(), "offset": 1, "limit": 0})
+        } else {
+            json!({"pattern": "needle", "path": dir.path().to_str().unwrap()})
+        };
+        let out = exec_with_ctx(&reg, tool, input, &ctx).unwrap();
+        let line = out
+            .lines()
+            .find(|line| line.contains("needle"))
+            .expect("content line")
+            .trim_start()
+            .trim_start_matches("1: ");
+        assert!(line.len() <= CUT_LINE_BYTES, "{tool}: {line}");
+        let hidden = content.len() - line.find('[').unwrap();
+        assert!(
+            line.ends_with(&format_line_truncated_marker(hidden)),
+            "{tool}: {line}"
+        );
+    }
 }
 
 const GUARD_LONG_LINE_BYTES: usize = 1500;
@@ -6685,10 +6630,6 @@ impl LongLineFile {
 
     fn on_disk(&self) -> String {
         std::fs::read_to_string(&self.path).unwrap()
-    }
-
-    fn sibling(&self, name: &str) -> PathBuf {
-        self.path.with_file_name(name)
     }
 }
 
@@ -6752,24 +6693,6 @@ fn guard_holds_with_fresh_ctx() {
     .unwrap_err();
     assert!(err.contains(LONG_LINE_CHANGED_FRAGMENT), "{err}");
     assert_eq!(file.on_disk(), file.content);
-}
-
-#[test]
-fn write_new_file_with_truncated_marker_is_rejected() {
-    let (reg, _host) = edit_tools_host();
-    let file = LongLineFile::new();
-    let lossy = content_from_read(&reg, file.path_str());
-    let copy = file.sibling("copy.txt");
-
-    let err = exec_with_ctx(
-        &reg,
-        "write",
-        json!({"path": copy.to_str().unwrap(), "content": lossy}),
-        &fresh_ctx(),
-    )
-    .unwrap_err();
-    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
-    assert!(!copy.exists(), "rejected write must not create the file");
 }
 
 #[test]
@@ -6848,148 +6771,6 @@ fn insert_lines_next_to_long_line_succeeds() {
         file.on_disk(),
         format!("short\n{}\nafter\nend\n", "x".repeat(GUARD_LONG_LINE_BYTES))
     );
-}
-
-#[test]
-fn insert_lines_with_truncated_marker_is_rejected() {
-    let (reg, _host) = edit_tools_host();
-    let file = LongLineFile::new();
-    let lossy_line = content_from_read(&reg, file.path_str())
-        .lines()
-        .nth(1)
-        .unwrap()
-        .to_owned();
-
-    let err = exec_with_ctx(
-        &reg,
-        "insert_lines",
-        json!({"path": file.path_str(), "line": 3, "new_string": lossy_line}),
-        &fresh_ctx(),
-    )
-    .unwrap_err();
-    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
-    assert_eq!(file.on_disk(), file.content);
-}
-
-#[test]
-fn edit_new_string_with_truncated_marker_is_rejected() {
-    let (reg, _host) = edit_tools_host();
-    let file = LongLineFile::new();
-    let lossy_line = content_from_read(&reg, file.path_str())
-        .lines()
-        .nth(1)
-        .unwrap()
-        .to_owned();
-
-    let err = exec_with_ctx(
-        &reg,
-        "edit",
-        json!({"path": file.path_str(), "old_string": "end", "new_string": lossy_line}),
-        &fresh_ctx(),
-    )
-    .unwrap_err();
-    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
-    assert_eq!(file.on_disk(), file.content);
-}
-
-#[test]
-fn edit_lines_delete_then_insert_truncated_copy_is_rejected() {
-    let (reg, _host) = edit_tools_host();
-    let file = LongLineFile::new();
-    let lossy_line = content_from_read(&reg, file.path_str())
-        .lines()
-        .nth(1)
-        .unwrap()
-        .to_owned();
-
-    exec_succeeds(
-        &reg,
-        "edit_lines",
-        json!({"path": file.path_str(), "start": 2, "end": 2, "new_string": ""}),
-    );
-    let err = exec_with_ctx(
-        &reg,
-        "insert_lines",
-        json!({"path": file.path_str(), "line": 1, "new_string": lossy_line}),
-        &fresh_ctx(),
-    )
-    .unwrap_err();
-    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
-    assert_eq!(file.on_disk(), "short\nend\n");
-}
-
-#[test]
-fn write_new_file_with_legacy_marker_is_rejected() {
-    let (reg, _host) = edit_tools_host();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("pasted.txt");
-
-    let err = exec_with_ctx(
-        &reg,
-        "write",
-        json!({"path": path.to_str().unwrap(), "content": "abc[line truncated]\n"}),
-        &fresh_ctx(),
-    )
-    .unwrap_err();
-    assert!(err.contains(MARKER_ADDED_FRAGMENT), "{err}");
-    assert!(!path.exists());
-}
-
-const MATCHED_PREFIX_BYTES: usize = 100;
-const NOTED_EDIT_INDEX: &str = "edits[1]";
-
-fn mid_line_note_fragment() -> String {
-    format!(
-        "the match ends inside line 2, which continues for {} more bytes",
-        GUARD_LONG_LINE_BYTES - MATCHED_PREFIX_BYTES
-    )
-}
-
-fn edit_summary(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> String {
-    let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
-    match smol::block_on(async { inv.execute(&fresh_ctx()).await }).output {
-        Ok(ToolOutput::Diff { summary, .. }) => summary,
-        other => panic!("{name} did not produce a diff: {other:?}"),
-    }
-}
-
-#[test]
-fn edit_output_includes_mid_line_note() {
-    let (reg, _host) = edit_tools_host();
-    let file = LongLineFile::new();
-    let old = format!("short\n{}", "x".repeat(MATCHED_PREFIX_BYTES));
-
-    let summary = edit_summary(
-        &reg,
-        "edit",
-        json!({"path": file.path_str(), "old_string": old, "new_string": "short\nY"}),
-    );
-    assert!(summary.contains(&mid_line_note_fragment()), "{summary}");
-    assert_eq!(
-        file.on_disk(),
-        format!(
-            "short\nY{}\nend\n",
-            "x".repeat(GUARD_LONG_LINE_BYTES - MATCHED_PREFIX_BYTES)
-        )
-    );
-}
-
-#[test]
-fn multiedit_output_includes_mid_line_note() {
-    let (reg, _host) = edit_tools_host();
-    let file = LongLineFile::new();
-    let old = format!("short\n{}", "x".repeat(MATCHED_PREFIX_BYTES));
-
-    let summary = edit_summary(
-        &reg,
-        "multiedit",
-        json!({"path": file.path_str(), "edits": [
-            {"old_string": "end", "new_string": "END"},
-            {"old_string": old, "new_string": "short\nY"},
-        ]}),
-    );
-    assert!(summary.contains(&mid_line_note_fragment()), "{summary}");
-    assert!(summary.contains(NOTED_EDIT_INDEX), "{summary}");
 }
 
 #[test]

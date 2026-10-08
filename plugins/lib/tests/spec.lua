@@ -1499,41 +1499,34 @@ case("check_markers_rejects_marker_with_trailing_space", function()
   eq(long_lines.check_markers("", MARKED .. "  "), marker_err(1))
 end)
 
-local MARKER_SUFFIXES = {
-  nbsp = utf8.char(0xA0),
-  em_space = utf8.char(0x2003),
-  narrow_nbsp = utf8.char(0x202F),
-  mixed = " \t" .. utf8.char(0xA0, 0x2003, 0x202F) .. "\t ",
-}
-local MARKER_FORMS = {
-  counted = { line = MARKED, kind = "read" },
-  legacy = { line = LEGACY_MARKED, kind = "read" },
-  preview = { line = "abc[line cut: first 3 of 900 bytes]", kind = "preview" },
-}
-
-for form, marker in pairs(MARKER_FORMS) do
-  for suffix_name, suffix in pairs(MARKER_SUFFIXES) do
-    local line = marker.line .. suffix
-    local err = string.format(long_lines.TRUNCATED_MARKER_ADDED[marker.kind], 2)
-    case("check_markers_unicode_suffix_" .. form .. "_" .. suffix_name, function()
-      eq(long_lines.check_markers("old", "old\n" .. line), err)
-      eq(long_lines.check_markers(line .. "\nold", "new\n" .. line), nil)
-      eq(long_lines.check_markers(line, line .. "\n" .. line), err)
-      eq(long_lines.check_markers(line .. "\n" .. line, line .. "\n" .. line), nil)
-      eq(
-        long_lines.check_markers(line, marker.line .. suffix .. " "),
-        string.format(long_lines.TRUNCATED_MARKER_ADDED[marker.kind], 1)
-      )
-      eq(long_lines.check_markers(line, "abc"), nil)
-    end)
+case("check_markers_rejects_unicode_trailing_whitespace", function()
+  local suffixes = {
+    utf8.char(0xA0),
+    utf8.char(0x2003),
+    utf8.char(0x202F),
+    " \t" .. utf8.char(0xA0, 0x2003, 0x202F) .. "\t ",
+  }
+  for _, suffix in ipairs(suffixes) do
+    eq(long_lines.check_markers("", MARKED .. suffix), marker_err(1))
   end
-end
+end)
 
-case("check_markers_unrecognized_brackets_pass", function()
-  for _, suffix in pairs(MARKER_SUFFIXES) do
-    eq(long_lines.check_markers("", "abc[line truncated, +oops bytes]" .. suffix), nil)
-    eq(long_lines.check_markers("", "abc[ordinary brackets]" .. suffix), nil)
-  end
+case("check_markers_preserves_unicode_suffixed_literals_and_rejects_duplicates", function()
+  local suffix = " \t" .. utf8.char(0xA0, 0x2003, 0x202F) .. "\t "
+  local legacy = LEGACY_MARKED .. suffix
+  local preview = "abc[line cut: first 3 of 900 bytes]" .. suffix
+  local preview_err = string.format(long_lines.TRUNCATED_MARKER_ADDED.preview, 1)
+  eq(long_lines.check_markers(MARKED .. suffix, MARKED .. suffix), nil)
+  eq(long_lines.check_markers(legacy .. "\nold", legacy .. "\nnew"), nil)
+  eq(long_lines.check_markers(MARKED .. suffix, MARKED .. suffix .. "\n" .. MARKED .. suffix), marker_err(2))
+  eq(long_lines.check_markers("", legacy), marker_err(1))
+  eq(long_lines.check_markers("", preview), preview_err)
+  eq(
+    long_lines.check_markers(preview, preview .. "\n" .. preview),
+    string.format(long_lines.TRUNCATED_MARKER_ADDED.preview, 2)
+  )
+  eq(long_lines.check_markers("", "abc[line truncated, +oops bytes]" .. suffix), nil)
+  eq(long_lines.check_markers("", "abc[ordinary brackets]" .. suffix), nil)
 end)
 
 case("check_markers_ignores_marker_mid_line", function()

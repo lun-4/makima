@@ -652,39 +652,10 @@ local function covers_long_lines(matched, find, max_line_bytes)
   return true
 end
 
--- Where a match ends partway through a line longer than {max_line_bytes},
--- the line number and the bytes left after the match, for the first such
--- match in {at}. The model may have pasted a visible prefix meaning the
--- whole line, and would otherwise not learn that the rest survived.
-local function mid_line_end(content, at, len, max_line_bytes)
-  local line_start = 1
-  local line_number = 1
-  local newline = content:find("\n", line_start, true)
-  local line_end = newline and newline - 1 or #content
-
-  for _, start in ipairs(at) do
-    local last = start + len - 1
-    while newline and last > newline do
-      line_start = newline + 1
-      line_number = line_number + 1
-      newline = content:find("\n", line_start, true)
-      line_end = newline and newline - 1 or #content
-    end
-
-    local next_byte = content:byte(last + 1)
-    if content:byte(last) ~= NEWLINE_BYTE and next_byte and next_byte ~= NEWLINE_BYTE then
-      if line_end - line_start + 1 > max_line_bytes then
-        return { line = line_number, rest = line_end - last }
-      end
-    end
-  end
-end
-
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
 -- one of the error constants above. With {max_line_bytes}, fuzzy matches
--- must cover long lines in full, and a third value reports a match that
--- ends inside a long line (see mid_line_end).
+-- must cover long lines in full.
 function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
   if old_string == "" then
     return nil, M.EMPTY_OLD_STRING
@@ -703,8 +674,7 @@ function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
           if all_start_a_line(content, at) then
             text = reindent(matched, find, replacement)
           end
-          local note = max_line_bytes and mid_line_end(content, at, #matched, max_line_bytes)
-          return splice(content, at, #matched, text), note
+          return splice(content, at, #matched, text)
         end
       end
     end
@@ -712,9 +682,9 @@ function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
   end
 
   for _, r in ipairs(REPLACERS) do
-    local res, note = try_match(r(content, old_string), old_string, new_string, r ~= exact)
+    local res = try_match(r(content, old_string), old_string, new_string, r ~= exact)
     if res then
-      return res, nil, note
+      return res
     end
   end
 
@@ -722,16 +692,16 @@ function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
   if unescaped ~= old_string then
     -- Unguarded: every candidate unescapes line for line to the find, so it
     -- already holds each long line in full.
-    local res, note = try_match(escape_normalized(content, unescaped), unescaped, unescape(new_string), false)
+    local res = try_match(escape_normalized(content, unescaped), unescaped, unescape(new_string), false)
     if res then
-      return res, nil, note
+      return res
     end
   end
 
   for _, r in ipairs(LATE_REPLACERS) do
-    local res, note = try_match(r(content, old_string), old_string, new_string, true)
+    local res = try_match(r(content, old_string), old_string, new_string, true)
     if res then
-      return res, nil, note
+      return res
     end
   end
 

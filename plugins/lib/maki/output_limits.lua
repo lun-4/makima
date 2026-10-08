@@ -13,19 +13,6 @@ M.specs = {
   max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
 }
 
--- Read and grep once had their own line caps; the guard in `maki.long_lines`
--- must use the same cap the model saw, so only `agent.max_line_bytes` counts.
-M.deprecated_line_bytes_spec = {
-  type = "integer",
-  desc = "Deprecated and ignored; use `agent.max_line_bytes`.",
-}
-
-function M.warn_deprecated_line_bytes(opts, plugin)
-  if opts.max_line_bytes ~= nil then
-    maki.log.warn(plugin .. ": max_line_bytes is deprecated and ignored; use agent.max_line_bytes")
-  end
-end
-
 function M.line_bytes(ctx)
   return ctx:config("max_line_bytes", DEFAULT_MAX_LINE_BYTES)
 end

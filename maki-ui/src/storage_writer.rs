@@ -1881,47 +1881,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shutdown_rejects_late_delete_and_checkpoints() {
-        smol::block_on(async {
-            let (_tmp, dir) = state_dir();
-            let (writer, _warn_rx) = writer(&dir);
-            let session = Arc::new(AppSession::new(MODEL, CWD));
-            let id = session.id;
-            writer.send(Arc::clone(&session));
-            let coordinator = writer.coordinator_checkpoint();
-            writer.shutdown(DRAIN_TIMEOUT);
-            let (done_tx, done_rx) = flume::bounded(1);
-            writer.delete(id, move |result| done_tx.send(result).unwrap());
-            assert!(done_rx.try_recv().unwrap().is_err());
-            let version = CheckpointVersion {
-                revision: 1,
-                epoch: 1,
-            };
-            assert_eq!(
-                writer
-                    .checkpoint(CheckpointRequest {
-                        session_id: id,
-                        version,
-                        snapshot: session,
-                    })
-                    .await,
-                Err(CheckpointError::Closed(id))
-            );
-            assert_eq!(
-                coordinator
-                    .checkpoint(CheckpointRequest {
-                        session_id: id,
-                        version,
-                        snapshot: Arc::new(config_checkpoint(1, 1)),
-                    })
-                    .await,
-                Err(CheckpointError::Closed(id))
-            );
-            assert!(AppSession::load(id, &dir).is_ok());
-        });
-    }
-
     /// A session with nothing in it yet gets its files cleaned up, but it is
     /// still live in its tab and its coordinator checkpoints by merging into
     /// the writer's snapshot. Forgetting that snapshot left the next

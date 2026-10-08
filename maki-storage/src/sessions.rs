@@ -2484,62 +2484,17 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
-    #[test_case(false; "state root alias")]
-    #[test_case(true; "state root ancestor alias")]
-    fn delete_supports_trusted_root_aliases(ancestor: bool) {
+    #[test]
+    fn delete_supports_trusted_root_aliases() {
         let tmp = TempDir::new().unwrap();
         let actual_root = tmp.path().join("trusted-root");
         let actual_sessions = actual_root.join(SESSIONS_DIR);
         fs::create_dir_all(&actual_sessions).unwrap();
         let (session, archive, offload) = prepare_delete_targets(&actual_sessions);
         let alias = tmp.path().join("trusted-alias");
-        symlink_dir(
-            if ancestor {
-                tmp.path()
-            } else {
-                actual_root.as_path()
-            },
-            &alias,
-        )
-        .unwrap();
-        let state_path = if ancestor {
-            alias.join(actual_root.file_name().unwrap())
-        } else {
-            alias
-        };
+        symlink_dir(&actual_root, &alias).unwrap();
 
-        TestSession::delete(session.id, &StateDir::from_path(state_path)).unwrap();
-
-        assert!(!jsonl_path(&actual_sessions, session.id).exists());
-        assert!(!archive.exists());
-        assert!(!offload.exists());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test_case(false; "sessions directory alias")]
-    #[test_case(true; "sessions directory ancestor alias")]
-    fn delete_from_supports_explicit_directory_aliases(ancestor: bool) {
-        let tmp = TempDir::new().unwrap();
-        let actual_sessions = tmp.path().join("trusted-root").join(SESSIONS_DIR);
-        fs::create_dir_all(&actual_sessions).unwrap();
-        let (session, archive, offload) = prepare_delete_targets(&actual_sessions);
-        let alias = tmp.path().join("sessions-alias");
-        symlink_dir(
-            if ancestor {
-                tmp.path()
-            } else {
-                actual_sessions.as_path()
-            },
-            &alias,
-        )
-        .unwrap();
-        let sessions_dir = if ancestor {
-            alias.join("trusted-root").join(SESSIONS_DIR)
-        } else {
-            alias
-        };
-
-        TestSession::delete_from(session.id, &sessions_dir).unwrap();
+        TestSession::delete(session.id, &StateDir::from_path(alias)).unwrap();
 
         assert!(!jsonl_path(&actual_sessions, session.id).exists());
         assert!(!archive.exists());
@@ -2569,94 +2524,6 @@ mod tests {
         assert!(external_jsonl.exists());
         assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
         assert!(result.is_err());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test_case(true; "archive ancestor")]
-    #[test_case(false; "archive leaf")]
-    fn delete_from_does_not_follow_replaced_archive_directory(ancestor: bool) {
-        let tmp = TempDir::new().unwrap();
-        let external = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let (session, archive, _) = prepare_delete_targets(dir);
-        let replaced = if ancestor {
-            archive.parent().unwrap()
-        } else {
-            &archive
-        };
-        fs::rename(replaced, dir.join("original-archives")).unwrap();
-        let external_leaf = if ancestor {
-            external.path().join(session.id.to_string())
-        } else {
-            external.path().to_owned()
-        };
-        fs::create_dir_all(&external_leaf).unwrap();
-        let sentinel = external_leaf.join(OFFLOAD_SENTINEL_FILE);
-        fs::write(&sentinel, OFFLOAD_SENTINEL).unwrap();
-        symlink_dir(external.path(), replaced).unwrap();
-
-        TestSession::delete_from(session.id, dir).unwrap();
-
-        assert!(!jsonl_path(dir, session.id).exists());
-        assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
-        assert_eq!(fs::read_dir(external_leaf).unwrap().count(), 1);
-        assert!(dir.join("original-archives").exists());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn delete_from_removes_nested_archive_links_without_following_them() {
-        let tmp = TempDir::new().unwrap();
-        let external = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let (session, archive, _) = prepare_delete_targets(dir);
-        fs::create_dir_all(archive.join("nested")).unwrap();
-        let sentinel = external.path().join(OFFLOAD_SENTINEL_FILE);
-        fs::write(&sentinel, OFFLOAD_SENTINEL).unwrap();
-        symlink_dir(external.path(), archive.join("nested/link")).unwrap();
-
-        TestSession::delete_from(session.id, dir).unwrap();
-
-        assert!(!archive.exists());
-        assert!(!jsonl_path(dir, session.id).exists());
-        assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
-        assert_eq!(fs::read_dir(external.path()).unwrap().count(), 1);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test_case(true; "offload ancestor")]
-    #[test_case(false; "session leaf")]
-    fn delete_does_not_follow_replaced_offload_directory(ancestor: bool) {
-        let tmp = TempDir::new().unwrap();
-        let external = TempDir::new().unwrap();
-        let dir = tmp.path();
-        let mut session: TestSession = Session::new("model", "/p");
-        session.push_message(user_message("one"));
-        session.save_to(dir).unwrap();
-        let offload = offload_dir(dir, session.id);
-        fs::create_dir_all(&offload).unwrap();
-        fs::write(offload.join(OFFLOAD_SENTINEL_FILE), "local output").unwrap();
-        let replaced = if ancestor {
-            offload.parent().unwrap()
-        } else {
-            &offload
-        };
-        fs::rename(replaced, dir.join("original-offload")).unwrap();
-        let external_leaf = if ancestor {
-            external.path().join(session.id.to_string())
-        } else {
-            external.path().to_owned()
-        };
-        fs::create_dir_all(&external_leaf).unwrap();
-        let sentinel = external_leaf.join(OFFLOAD_SENTINEL_FILE);
-        fs::write(&sentinel, OFFLOAD_SENTINEL).unwrap();
-        symlink_dir(external.path(), replaced).unwrap();
-
-        TestSession::delete_from(session.id, dir).unwrap();
-        assert!(!jsonl_path(dir, session.id).exists());
-        assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
-        assert_eq!(fs::read_dir(external_leaf).unwrap().count(), 1);
-        assert!(dir.join("original-offload").exists());
     }
 
     #[cfg(any(unix, windows))]

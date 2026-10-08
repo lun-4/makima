@@ -6592,8 +6592,7 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 -- Replace {old_string} with {new_string} in {content}, tolerating small
 -- whitespace and indentation drift. Returns the new content, or nil plus
 -- one of the error constants above. With {max_line_bytes}, fuzzy matches
--- must cover long lines in full, and a third value reports a match that
--- ends inside a long line (see mid_line_end).
+-- must cover long lines in full.
 function M.replace(content, old_string, new_string, replace_all, max_line_bytes)
 ```
 
@@ -6650,13 +6649,37 @@ function M.check_markers(before, after)
 ```lua
 -- Shared per-tool output limit options, so the tools that support them
 -- cannot drift apart.
+
+local DEFAULT_MAX_OUTPUT_LINES = 2000
+local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
+local DEFAULT_MAX_LINE_BYTES = 1000
+
+local M = {}
+
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
-function M.warn_deprecated_line_bytes(opts, plugin)
+M.specs = {
+  max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
+  max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
+}
+
 function M.line_bytes(ctx)
+  return ctx:config("max_line_bytes", DEFAULT_MAX_LINE_BYTES)
+end
+
 function M.extend(spec)
+  for name, s in pairs(M.specs) do
+    spec[name] = s
+  end
+  return spec
+end
 
 --- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
 function M.resolve(opts, ctx)
+  return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES),
+    opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+end
+
+return M
 ```
 
 ### `require("maki.partial")`

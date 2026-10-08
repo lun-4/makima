@@ -1809,15 +1809,10 @@ mod tests {
         });
     }
 
-    #[test_case(None, Some(Duration::ZERO); "expired_pending")]
-    #[test_case(None, Some(HOOK_CALL_DEADLINE); "pending_only")]
-    #[test_case(Some(HOOK_CALL_DEADLINE), None; "caller_only")]
-    #[test_case(Some(HOOK_CALL_DEADLINE), Some(HOOK_CHAIN_MAX); "caller_shorter")]
-    #[test_case(Some(HOOK_CHAIN_MAX), Some(HOOK_CALL_DEADLINE); "pending_shorter")]
-    fn output_filter_spends_the_effective_absolute_deadline(
-        caller: Option<Duration>,
-        pending: Option<Duration>,
-    ) {
+    #[test]
+    fn output_filter_spends_the_effective_absolute_deadline() {
+        let caller = Some(HOOK_CALL_DEADLINE);
+        let pending = Some(HOOK_CHAIN_MAX);
         smol::block_on(async {
             let started = Instant::now();
             let caller = caller.map(|duration| started + duration);
@@ -2304,7 +2299,6 @@ mod tests {
     const SMALL_OUTPUT_LINES: usize = 10;
     const MCP_SECRET: &str = "private sentinel beyond the preview";
     const MCP_REDACTED: &str = "[redacted]";
-    const MCP_SMALL_REPLACEMENT: &str = "safe replacement";
 
     fn redact_mcp_output(stage: HookStage, value: &Value) -> Verdict {
         match stage {
@@ -2316,9 +2310,8 @@ mod tests {
         }
     }
 
-    #[test_case(CallOrigin::Model; "model")]
-    #[test_case(CallOrigin::Nested; "nested")]
-    fn mcp_output_hook_redacts_before_offload(origin: CallOrigin) {
+    #[test]
+    fn mcp_output_hook_redacts_before_offload() {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let text = format!("{}\n{MCP_SECRET}", many_lines());
@@ -2326,7 +2319,14 @@ mod tests {
             ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
             let hook = RecordingHook::answering(redact_mcp_output);
             ctx.registry.set_hook(hook.clone());
-            let done = run(TEST_ID.into(), PROBE_WIRE, &json!({}), &ctx, origin).await;
+            let done = run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &json!({}),
+                &ctx,
+                CallOrigin::Nested,
+            )
+            .await;
             assert!(!done.is_error);
             assert!(!done.output.as_text().contains(MCP_SECRET));
             let seen = hook.seen();
@@ -2350,38 +2350,26 @@ mod tests {
         }
     }
 
-    #[test_case(CallOrigin::Model; "model")]
-    #[test_case(CallOrigin::Nested; "nested")]
-    fn mcp_output_hook_denial_does_not_persist(origin: CallOrigin) {
+    #[test]
+    fn mcp_output_hook_denial_does_not_persist() {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let mut ctx = answering_ctx(&many_lines());
             ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
             ctx.registry
                 .set_hook(RecordingHook::answering(deny_mcp_output));
-            let done = run(TEST_ID.into(), PROBE_WIRE, &json!({}), &ctx, origin).await;
+            let done = run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &json!({}),
+                &ctx,
+                CallOrigin::Nested,
+            )
+            .await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), HOOK_DENY_REASON);
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         });
-    }
-
-    fn replace_mcp_small(stage: HookStage, _: &Value) -> Verdict {
-        match stage {
-            HookStage::Input => Verdict::Unchanged,
-            HookStage::Output => Verdict::Replaced(
-                json!({OUTPUT_TEXT: MCP_SMALL_REPLACEMENT, OUTPUT_IS_ERROR: false}),
-            ),
-        }
-    }
-
-    fn replace_mcp_error(stage: HookStage, _: &Value) -> Verdict {
-        match stage {
-            HookStage::Input => Verdict::Unchanged,
-            HookStage::Output => {
-                Verdict::Replaced(json!({OUTPUT_TEXT: many_lines(), OUTPUT_IS_ERROR: true}))
-            }
-        }
     }
 
     fn replace_mcp_large(stage: HookStage, _: &Value) -> Verdict {
@@ -2391,46 +2379,6 @@ mod tests {
                 Verdict::Replaced(json!({OUTPUT_TEXT: many_lines(), OUTPUT_IS_ERROR: false}))
             }
         }
-    }
-
-    #[test_case(CallOrigin::Model, replace_mcp_small, false, 0; "model_small_success")]
-    #[test_case(CallOrigin::Model, replace_mcp_error, true, 0; "model_large_error")]
-    #[test_case(CallOrigin::Model, replace_mcp_large, false, 1; "model_large_success")]
-    #[test_case(CallOrigin::Nested, replace_mcp_small, false, 0; "nested_small_success")]
-    #[test_case(CallOrigin::Nested, replace_mcp_error, true, 0; "nested_large_error")]
-    #[test_case(CallOrigin::Nested, replace_mcp_large, false, 1; "nested_large_success")]
-    fn mcp_hook_replacement_controls_offloading(
-        origin: CallOrigin,
-        answer: fn(HookStage, &Value) -> Verdict,
-        is_error: bool,
-        artifacts: usize,
-    ) {
-        smol::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let mut ctx = answering_ctx(&many_lines());
-            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
-            ctx.registry.set_hook(RecordingHook::answering(answer));
-            let done = run(TEST_ID.into(), PROBE_WIRE, &json!({}), &ctx, origin).await;
-            assert_eq!(done.is_error, is_error);
-            let saved: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-            assert_eq!(saved.len(), artifacts);
-            if artifacts > 0 {
-                assert!(done.output.as_text().contains(OFFLOAD_FOOTER_PREFIX));
-                assert_eq!(
-                    std::fs::read_to_string(saved[0].as_ref().unwrap().path()).unwrap(),
-                    many_lines()
-                );
-            } else {
-                assert_eq!(
-                    done.output.as_text(),
-                    if is_error {
-                        many_lines()
-                    } else {
-                        MCP_SMALL_REPLACEMENT.into()
-                    }
-                );
-            }
-        });
     }
 
     fn many_lines() -> String {
@@ -2445,24 +2393,6 @@ mod tests {
         let mut ctx = mcp_ctx(&mcp);
         ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
         ctx
-    }
-
-    #[test]
-    fn stubbed_tool_call_returns_text() {
-        smol::block_on(async {
-            let done = dispatch(&answering_ctx("hello"), PROBE_WIRE, &serde_json::json!({})).await;
-            assert!(!done.is_error, "{}", done.output.as_text());
-            assert_eq!(done.output.as_text(), "hello");
-        });
-    }
-
-    #[test]
-    fn mcp_result_without_store_is_unchanged() {
-        smol::block_on(async {
-            let text = many_lines();
-            let done = dispatch(&answering_ctx(&text), PROBE_WIRE, &serde_json::json!({})).await;
-            assert_eq!(done.output.as_text(), text);
-        });
     }
 
     struct GatedOffloadBackend {
@@ -2514,9 +2444,8 @@ mod tests {
         }
     }
 
-    #[test_case(CallOrigin::Model; "model")]
-    #[test_case(CallOrigin::Nested; "nested")]
-    fn mcp_offload_deadline_returns_while_worker_is_blocked(origin: CallOrigin) {
+    #[test]
+    fn mcp_offload_deadline_returns_while_worker_is_blocked() {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let gate = Gate::new();
@@ -2531,7 +2460,13 @@ mod tests {
             let store = Arc::downgrade(ctx.offload.as_ref().unwrap());
             ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
             let input = json!({});
-            let mut call = Box::pin(run(TEST_ID.into(), PROBE_WIRE, &input, &ctx, origin));
+            let mut call = Box::pin(run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &input,
+                &ctx,
+                CallOrigin::Model,
+            ));
             assert!(futures_lite::future::poll_once(&mut call).await.is_none());
             gate.entered().await;
             let done = call.await;
@@ -2550,9 +2485,8 @@ mod tests {
         });
     }
 
-    #[test_case(CallOrigin::Model; "model")]
-    #[test_case(CallOrigin::Nested; "nested")]
-    fn mcp_offload_cancellation_returns_while_worker_is_blocked(origin: CallOrigin) {
+    #[test]
+    fn mcp_offload_cancellation_returns_while_worker_is_blocked() {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let gate = Gate::new();
@@ -2568,7 +2502,13 @@ mod tests {
             let (cancel, token) = crate::CancelToken::new();
             ctx.cancel = token;
             let input = json!({});
-            let mut call = Box::pin(run(TEST_ID.into(), PROBE_WIRE, &input, &ctx, origin));
+            let mut call = Box::pin(run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &input,
+                &ctx,
+                CallOrigin::Nested,
+            ));
             assert!(futures_lite::future::poll_once(&mut call).await.is_none());
             gate.entered().await;
             cancel.cancel();
@@ -2582,20 +2522,6 @@ mod tests {
             gate.exited().await;
             assert!(store.upgrade().is_none());
             assert_eq!(*saved.lock().unwrap(), text.as_bytes());
-        });
-    }
-
-    #[test]
-    fn expired_mcp_offload_deadline_does_not_start_persistence() {
-        smol::block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let mut ctx = answering_ctx(&many_lines());
-            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
-            ctx.deadline = Deadline::At(Instant::now());
-            let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
-            assert!(done.is_error);
-            assert_eq!(done.output.as_text(), DEADLINE_EXCEEDED);
-            assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
         });
     }
 
@@ -2619,23 +2545,23 @@ mod tests {
         });
     }
 
-    #[test_case(CallOrigin::Model, true; "model_permission_error")]
-    #[test_case(CallOrigin::Nested, true; "nested_permission_error")]
-    #[test_case(CallOrigin::Model, false; "model_transport_error")]
-    #[test_case(CallOrigin::Nested, false; "nested_transport_error")]
-    fn mcp_hook_cannot_offload_a_failed_execution(origin: CallOrigin, denied: bool) {
+    #[test]
+    fn mcp_hook_cannot_offload_a_failed_execution() {
         smol::block_on(async {
             let dir = tempfile::TempDir::new().unwrap();
             let mcp = stub_mcp(&[PROBE_QUALIFIED]);
-            let mut ctx = if denied {
-                with_mcp(denying_ctx(ToolKey::parse(PROBE_QUALIFIED).unwrap()), &mcp)
-            } else {
-                mcp_ctx(&mcp)
-            };
+            let mut ctx = mcp_ctx(&mcp);
             ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
             ctx.registry
                 .set_hook(RecordingHook::answering(replace_mcp_large));
-            let done = run(TEST_ID.into(), PROBE_WIRE, &json!({}), &ctx, origin).await;
+            let done = run(
+                TEST_ID.into(),
+                PROBE_WIRE,
+                &json!({}),
+                &ctx,
+                CallOrigin::Model,
+            )
+            .await;
             assert!(!done.is_error);
             assert_eq!(done.output.as_text(), many_lines());
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);

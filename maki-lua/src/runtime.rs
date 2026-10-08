@@ -149,7 +149,7 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// Generous on purpose: legit restores of heavy items take double-digit
 /// seconds on a loaded debug build, and a wrongly killed restore loses the
 /// tool's rendered output.
-const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(120);
+const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.

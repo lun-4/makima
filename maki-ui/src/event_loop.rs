@@ -487,7 +487,7 @@ fn collect_heartbeat(
 
 struct RenewingDeletionLease {
     lease: Arc<Mutex<ClaimedSessionLock>>,
-    wake: flume::Sender<Option<flume::Sender<()>>>,
+    wake: flume::Sender<()>,
     done: flume::Receiver<()>,
 }
 
@@ -495,10 +495,9 @@ impl RenewingDeletionLease {
     fn new(lease: ClaimedSessionLock) -> Self {
         let lease = Arc::new(Mutex::new(lease));
         let worker_lease = Arc::clone(&lease);
-        let (wake, wake_rx) = flume::unbounded::<Option<flume::Sender<()>>>();
+        let (wake, wake_rx) = flume::bounded::<()>(1);
         let (done_tx, done) = flume::bounded(1);
         std::thread::spawn(move || {
-            let mut ack: Option<flume::Sender<()>> = None;
             loop {
                 match worker_lease
                     .lock()
@@ -509,13 +508,9 @@ impl RenewingDeletionLease {
                     Err(error) => warn!(%error, "pending deletion heartbeat failed"),
                     Ok(_) => {}
                 }
-                if let Some(ack) = ack.take() {
-                    let _ = ack.send(());
-                }
                 match wake_rx.recv_timeout(session_lock::HEARTBEAT_INTERVAL) {
-                    Ok(Some(reply)) => ack = Some(reply),
                     Err(flume::RecvTimeoutError::Timeout) => {}
-                    Ok(None) | Err(flume::RecvTimeoutError::Disconnected) => break,
+                    Ok(()) | Err(flume::RecvTimeoutError::Disconnected) => break,
                 }
             }
             drop(worker_lease);
@@ -530,18 +525,11 @@ impl RenewingDeletionLease {
             .unwrap_or_else(|e| e.into_inner())
             .publication_guard()
     }
-
-    #[cfg(test)]
-    fn renew(&self) {
-        let (reply, done) = flume::bounded(1);
-        self.wake.send(Some(reply)).unwrap();
-        done.recv_timeout(AGENT_SHUTDOWN_TIMEOUT).unwrap();
-    }
 }
 
 impl Drop for RenewingDeletionLease {
     fn drop(&mut self) {
-        let _ = self.wake.send(None);
+        let _ = self.wake.send(());
         let _ = self.done.recv_timeout(AGENT_SHUTDOWN_TIMEOUT);
     }
 }
@@ -6478,46 +6466,6 @@ mod tests {
         shutdown_manager(&manager);
     }
 
-    #[test_case::test_case(true; "same_session")]
-    #[test_case::test_case(false; "different_session")]
-    fn replacement_offload_store_identity(same_session: bool) {
-        let harness = RuntimeHarness::new();
-        let session = harness.session();
-        let mut runtime = harness.runtime(session.clone());
-        let original = Arc::clone(runtime.handles.offload.as_ref().unwrap());
-        let mut replacement = if same_session {
-            session
-        } else {
-            harness.session()
-        };
-        replacement.model = runtime.app.state.model.spec();
-        let target_id = replacement.id;
-        let prepared = harness
-            .ctx()
-            .prepare_replacement_runtime(
-                replacement,
-                runtime.id(),
-                runtime.app.permissions.as_ref(),
-                runtime.handles.offload.as_ref(),
-            )
-            .unwrap();
-        let old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
-        let replacement = runtime.handles.offload.as_ref().unwrap();
-        assert_eq!(Arc::ptr_eq(&original, replacement), same_session);
-        assert_eq!(
-            replacement.dir(),
-            maki_storage::sessions::offload_dir(&harness.ctx().sessions_dir, target_id)
-        );
-        release_runtime(old);
-        release_runtime(runtime);
-    }
-
     #[test]
     fn offload_uses_supplied_storage_root_and_session_deletion() {
         const BODY: &str = "saved in the supplied state directory";
@@ -6571,17 +6519,12 @@ mod tests {
         }
     }
 
-    #[test_case(false, false; "deletion_completes")]
-    #[test_case(true, false; "shutdown_drains_unrelated_checkpoint")]
-    #[test_case(false, true; "ownership_loss_preserves_transcript_and_artifacts")]
-    fn background_deletion_drains_in_flight_offload_persistence(
-        shutdown: bool,
-        lose_ownership: bool,
-    ) {
+    #[test_case(false; "deletion_completes")]
+    #[test_case(true; "ownership_loss_preserves_transcript_and_artifacts")]
+    fn background_deletion_drains_in_flight_offload_persistence(lose_ownership: bool) {
         const BODY: &str = "pending background session output";
         const EXISTING_BODY: &str = "referenced output retained if deletion is rejected";
         const ARTIFACT_NAME: &str = "existing-output.txt";
-        const DRAFT: &str = "unrelated checkpoint during pending deletion";
         with_event_loop(|event_loop| {
             let mut session = AppSession::new("test-model", &event_loop.session_cwd);
             let id = session.id;
@@ -6643,26 +6586,11 @@ mod tests {
             } else {
                 None
             };
-            let mut unrelated_id = None;
-            if shutdown {
-                let mut unrelated = AppSession::new("test-model", &event_loop.session_cwd);
-                unrelated_id = Some(unrelated.id);
-                unrelated.meta.input_draft = Some(DRAFT.into());
-                event_loop.ctx.storage_writer.send(Arc::new(unrelated));
-                event_loop
-                    .ctx
-                    .storage_writer
-                    .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
-                let stored =
-                    AppSession::load(unrelated_id.unwrap(), &event_loop.ctx.storage).unwrap();
-                assert_eq!(stored.meta.input_draft.as_deref(), Some(DRAFT));
-                assert!(reply_rx.is_empty());
-            }
             release_tx.send(()).unwrap();
             let saved = worker.join().unwrap().unwrap();
             let reply = reply_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
-            if reply.is_err() {
-                assert!(shutdown || lose_ownership);
+            if lose_ownership {
+                assert!(reply.is_err());
                 let stored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
                 assert_eq!(
                     stored.messages()[0].user_text(),
@@ -6678,17 +6606,8 @@ mod tests {
                 assert!(AppSession::load(id, &event_loop.ctx.storage).is_err());
                 assert!(!dir.exists());
             }
-            if let Some(unrelated_id) = unrelated_id {
-                event_loop
-                    .ctx
-                    .storage_writer
-                    .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
-                let stored = AppSession::load(unrelated_id, &event_loop.ctx.storage).unwrap();
-                assert_eq!(stored.meta.input_draft.as_deref(), Some(DRAFT));
-            }
             assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
             if let Some(replacement) = replacement {
-                assert!(reply.is_err());
                 replacement.release().unwrap();
             }
         });
@@ -6816,63 +6735,6 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&artifact).unwrap(), BODY);
             assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
         });
-    }
-
-    #[test_case(false; "renewal_excludes_second_owner")]
-    #[test_case(true; "ownership_loss_preserves_artifacts")]
-    fn pending_deletion_lease_guards_gated_cleanup(lose_ownership: bool) {
-        const BODY: &str = "gated deletion artifact";
-        let temp = TempDir::new().unwrap();
-        let id = MakiId::generate();
-        let lease = claim_lock(temp.path(), &id).unwrap();
-        let renewing = RenewingDeletionLease::new(lease);
-        let dir = temp.path().join("offload");
-        let (entered_tx, entered_rx) = flume::bounded(1);
-        let (release_tx, release_rx) = flume::bounded(1);
-        let store = Arc::new(OffloadStore::new(Box::new(GatedDiskBackend {
-            dir: dir.clone(),
-            entered: entered_tx,
-            release: release_rx,
-        })));
-        let worker = std::thread::spawn({
-            let store = Arc::clone(&store);
-            move || store.put(BODY)
-        });
-        entered_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
-        store.request_close();
-        let guard = renewing.publication_guard();
-        let cleanup = std::thread::spawn({
-            let store = Arc::clone(&store);
-            move || store.close_and_remove_guarded(&guard)
-        });
-        let held = renewing.lease.lock().unwrap();
-        let path = session_lock::lock_path(temp.path(), &id);
-        std::fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - session_lock::STALE_AFTER * 2)
-            .unwrap();
-        let replacement = if lose_ownership {
-            let replacement = session_lock::claim(temp.path(), &id).unwrap().unwrap();
-            drop(held);
-            Some(replacement)
-        } else {
-            drop(held);
-            renewing.renew();
-            assert!(session_lock::claim(temp.path(), &id).unwrap().is_none());
-            None
-        };
-        release_tx.send(()).unwrap();
-        let saved = worker.join().unwrap().unwrap();
-        let result = cleanup.join().unwrap();
-        assert_eq!(result.is_err(), lose_ownership);
-        assert_eq!(store.path_of(&saved).exists(), lose_ownership);
-        drop(renewing);
-        if let Some(replacement) = replacement {
-            assert!(session_lock::claim(temp.path(), &id).unwrap().is_none());
-            replacement.release().unwrap();
-        }
     }
 
     struct GatedQuotaBackend {

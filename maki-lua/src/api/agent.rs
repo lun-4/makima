@@ -1197,8 +1197,29 @@ async fn session(
         Some(agent_ctx.modes.current(&child_mode))
     });
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
-    let build_params =
-        |agent_id| child_agent_params(&agent_ctx, agent_id, provider, model, audience);
+    let build_params = |agent_id| AgentParams {
+        agent_id,
+        provider,
+        model,
+        config: agent_ctx.config.clone(),
+        tool_output_lines: maki_config::ToolOutputLines::default(),
+        permissions: Arc::clone(&agent_ctx.permissions),
+        session_id: agent_ctx.session_id.clone(),
+        mailbox: None,
+        timeouts: agent_ctx.timeouts,
+        file_tracker: FileReadTracker::fresh(),
+        prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
+        modes: Arc::clone(&agent_ctx.modes),
+        subagent_cancels: Arc::new(CancelMap::new()),
+        ledger: RunLedger::child(&agent_ctx.ledger),
+        registry: Arc::clone(ToolRegistry::global_arc()),
+        audience,
+        question_mode: agent_ctx.question_mode,
+        model_policy: Arc::clone(&agent_ctx.model_policy),
+        file_write_locks: Arc::clone(&agent_ctx.file_write_locks),
+        offload: agent_ctx.offload.clone(),
+        managed_turn: None,
+    };
     let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
     let cancel = SubagentCancel::new({
         let cancel_actor = Arc::clone(&cancel_actor);
@@ -1931,41 +1952,6 @@ fn call_local_tool(
     result
 }
 
-/// What a subagent inherits from the context that spawns it. Shared state
-/// that must stay shared across the session (permissions, write locks, the
-/// offload store) is cloned by handle, not rebuilt.
-fn child_agent_params(
-    agent_ctx: &ToolContext,
-    agent_id: AgentId,
-    provider: Arc<dyn provider::Provider>,
-    model: Model,
-    audience: ToolAudience,
-) -> AgentParams {
-    AgentParams {
-        agent_id,
-        provider,
-        model,
-        config: agent_ctx.config.clone(),
-        tool_output_lines: maki_config::ToolOutputLines::default(),
-        permissions: Arc::clone(&agent_ctx.permissions),
-        session_id: agent_ctx.session_id.clone(),
-        mailbox: None,
-        timeouts: agent_ctx.timeouts,
-        file_tracker: FileReadTracker::fresh(),
-        prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
-        modes: Arc::clone(&agent_ctx.modes),
-        subagent_cancels: Arc::new(CancelMap::new()),
-        ledger: RunLedger::child(&agent_ctx.ledger),
-        registry: Arc::clone(ToolRegistry::global_arc()),
-        audience,
-        question_mode: agent_ctx.question_mode,
-        model_policy: Arc::clone(&agent_ctx.model_policy),
-        file_write_locks: Arc::clone(&agent_ctx.file_write_locks),
-        offload: agent_ctx.offload.clone(),
-        managed_turn: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2190,24 +2176,6 @@ mod tests {
         flume::Receiver<Envelope>,
     ) {
         session_with_provider_and_parent(provider, semaphore, relay_gate, None)
-    }
-
-    #[test]
-    fn child_agent_shares_parent_offload_store() {
-        let mut parent = stub_ctx(&AgentMode::Build);
-        let store = Arc::new(maki_agent::tools::offload::OffloadStore::on_disk(
-            std::path::PathBuf::from("/unused"),
-        ));
-        parent.offload = Some(Arc::clone(&store));
-
-        let params = child_agent_params(
-            &parent,
-            AgentId::generate(),
-            Arc::clone(&parent.provider),
-            parent.model.as_ref().clone(),
-            DEFAULT_SESSION_AUDIENCE,
-        );
-        assert!(Arc::ptr_eq(params.offload.as_ref().unwrap(), &store));
     }
 
     fn session_with_provider_and_parent(

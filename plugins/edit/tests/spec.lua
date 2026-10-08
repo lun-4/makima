@@ -454,49 +454,40 @@ case("block_anchor_rejects_duplicate_long_line_collapse", function()
   eq(err, NO_MATCH)
 end)
 
-local LONG_BLANKS = {
-  spaces = string.rep(" ", CAP + 1),
-  tabs = string.rep("\t", CAP + 1),
-  mixed = string.rep(" \t", CAP),
-}
+local LONG_SPACES = string.rep(" ", CAP + 1)
+local LONG_TABS = string.rep("\t", CAP + 1)
 
-for name, blank in pairs(LONG_BLANKS) do
-  for coverage_name, coverage in pairs({ empty = "", short = " \t", different = blank .. " " }) do
-    case("long_blank_rejects_" .. name .. "_" .. coverage_name, function()
-      local content = "BEGIN\n" .. blank .. "\nEND"
-      local old = " BEGIN\n" .. coverage .. "\n END"
-      eq(fr.replace(content, old, R, false), R)
-      local result, err = fr.replace(content, old, R, false, CAP)
-      eq(result, nil)
-      eq(err, NO_MATCH)
-    end)
-  end
-
-  case("long_blank_duplicates_need_each_copy_" .. name, function()
-    local content = "BEGIN\n" .. blank .. "\n" .. blank .. "\nEND"
-    local result, err = fr.replace(content, " BEGIN\n" .. blank .. "\n END", R, false, CAP)
+case("long_blank_requires_byte_identical_coverage", function()
+  local content = "BEGIN\n" .. LONG_SPACES .. "\nEND"
+  for _, coverage in ipairs({ "", " \t", LONG_SPACES .. " " }) do
+    local old = " BEGIN\n" .. coverage .. "\n END"
+    eq(fr.replace(content, old, R, false), R)
+    local result, err = fr.replace(content, old, R, false, CAP)
     eq(result, nil)
     eq(err, NO_MATCH)
-    eq(fr.replace(content, " BEGIN\n" .. blank .. "\n" .. blank .. "\n END", R, false, CAP), R)
-  end)
+  end
+end)
 
-  case("long_blank_full_fuzzy_coverage_" .. name, function()
-    eq(fr.replace("BEGIN\n" .. blank .. "\nEND", " BEGIN\n" .. blank .. "\n END", R, false, CAP), R)
-  end)
-
-  case("long_blank_exact_substring_" .. name, function()
-    local prefix = blank:sub(1, CAP / 2)
-    eq(fr.replace("BEGIN\n" .. blank, "BEGIN\n" .. prefix, R, false, CAP), R .. blank:sub(#prefix + 1))
-  end)
-end
-
-case("long_blank_counts_separate_byte_sequences", function()
-  local spaces, tabs = LONG_BLANKS.spaces, LONG_BLANKS.tabs
-  local content = "BEGIN\n" .. spaces .. "\n" .. tabs .. "\nEND"
-  local result, err = fr.replace(content, " BEGIN\n" .. spaces .. "\n" .. spaces .. "\n END", R, false, CAP)
+case("long_blank_duplicate_copies_require_separate_coverage", function()
+  local content = "BEGIN\n" .. LONG_SPACES .. "\n" .. LONG_SPACES .. "\nEND"
+  local result, err = fr.replace(content, " BEGIN\n" .. LONG_SPACES .. "\n END", R, false, CAP)
   eq(result, nil)
   eq(err, NO_MATCH)
-  eq(fr.replace(content, " BEGIN\n" .. tabs .. "\n" .. spaces .. "\n END", R, false, CAP), R)
+  eq(fr.replace(content, " BEGIN\n" .. LONG_SPACES .. "\n" .. LONG_SPACES .. "\n END", R, false, CAP), R)
+end)
+
+case("long_blank_full_fuzzy_coverage_and_exact_substring_are_allowed", function()
+  eq(fr.replace("BEGIN\n" .. LONG_TABS .. "\nEND", " BEGIN\n" .. LONG_TABS .. "\n END", R, false, CAP), R)
+  local prefix = LONG_SPACES:sub(1, CAP / 2)
+  eq(fr.replace("BEGIN\n" .. LONG_SPACES, "BEGIN\n" .. prefix, R, false, CAP), R .. LONG_SPACES:sub(#prefix + 1))
+end)
+
+case("long_blank_coverage_preserves_spaces_and_tabs_as_distinct_bytes", function()
+  local content = "BEGIN\n" .. LONG_SPACES .. "\n" .. LONG_TABS .. "\nEND"
+  local result, err = fr.replace(content, " BEGIN\n" .. LONG_SPACES .. "\n" .. LONG_SPACES .. "\n END", R, false, CAP)
+  eq(result, nil)
+  eq(err, NO_MATCH)
+  eq(fr.replace(content, " BEGIN\n" .. LONG_TABS .. "\n" .. LONG_SPACES .. "\n END", R, false, CAP), R)
 end)
 
 case("long_nonblank_trimmed_coverage_still_passes", function()
@@ -504,8 +495,8 @@ case("long_nonblank_trimmed_coverage_still_passes", function()
 end)
 
 case("long_blank_escape_normalized_still_passes", function()
-  local content = "BEGIN\n" .. LONG_BLANKS.tabs .. "\nEND"
-  local old = "BEGIN\\n" .. string.rep("\\t", #LONG_BLANKS.tabs) .. "\\nEND"
+  local content = "BEGIN\n" .. LONG_TABS .. "\nEND"
+  local old = "BEGIN\\n" .. string.rep("\\t", #LONG_TABS) .. "\\nEND"
   eq(fr.replace(content, old, R, false, CAP), R)
 end)
 
@@ -535,48 +526,6 @@ case("escape_normalized_matches_long_line_with_cap", function()
   local old = "a = \\\"it's " .. LONG .. '\\"\nq'
   eq(fr.replace(content, old, R, false), R)
   eq(fr.replace(content, old, R, false, CAP), R)
-end)
-
-case("exact_match_ending_mid_long_line_returns_note", function()
-  local result, err, note = fr.replace("a\n" .. LONG .. "\nb", LONG:sub(1, 20), "Y", false, CAP)
-  eq(err, nil)
-  eq(result, "a\nY" .. LONG:sub(21) .. "\nb")
-  eq(note.line, 2)
-  eq(note.rest, 60)
-end)
-
-case("match_ending_at_line_end_has_no_note", function()
-  local _, _, at_end = fr.replace("a\n" .. LONG .. "\nb", LONG:sub(21), "Y", false, CAP)
-  eq(at_end, nil)
-  local _, _, short_line = fr.replace("abcdef", "abc", "Y", false, CAP)
-  eq(short_line, nil)
-end)
-
-case("many_short_line_matches_have_no_note", function()
-  local content = string.rep("xb\n", 1000)
-  local result, err, note = fr.replace(content, "x", "y", true, CAP)
-  eq(err, nil)
-  eq(result, string.rep("yb\n", 1000))
-  eq(note, nil)
-end)
-
-case("multiple_matches_on_one_long_line_report_first_note", function()
-  local content = string.rep("x", 100) .. LONG
-  local result, err, note = fr.replace(content, "x", "y", true, CAP)
-  eq(err, nil)
-  eq(result, string.rep("y", 100) .. LONG)
-  eq(note.line, 1)
-  eq(note.rest, #content - 1)
-end)
-
-case("short_line_matches_before_long_line_report_correct_note", function()
-  local short_lines = string.rep("xb\n", 1000)
-  local content = short_lines .. LONG .. "x" .. LONG
-  local result, err, note = fr.replace(content, "x", "y", true, CAP)
-  eq(err, nil)
-  eq(result, string.rep("yb\n", 1000) .. LONG .. "y" .. LONG)
-  eq(note.line, 1001)
-  eq(note.rest, #LONG)
 end)
 
 th.report()

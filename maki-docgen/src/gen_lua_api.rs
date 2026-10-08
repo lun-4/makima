@@ -19,30 +19,6 @@ mod tests {
 
     const MUTABLE_PATH_CONTRACT: &str = "same-path mutation is already in progress";
     const SERIALIZATION_CONTRACT: &str = "same-process per-path mutation serialization";
-    const OUTPUT_LIMIT_CONTRACT: [&str; 5] = [
-        "output_limits",
-        "host applies limits",
-        "synchronous callbacks",
-        "llm_output",
-        "trailer",
-    ];
-
-    #[test]
-    fn lua_api_output_limit_contract_docs() {
-        let source = include_str!("../../maki-lua/src/api/tool.rs");
-        let page = generate();
-        for contract in OUTPUT_LIMIT_CONTRACT {
-            assert!(
-                source.contains(contract),
-                "API source is missing {contract}"
-            );
-            assert!(
-                page.contains(contract),
-                "generated API is missing {contract}"
-            );
-        }
-    }
-
     #[test]
     fn generated_docs_contain_mutable_path_reentry_contract() {
         let page = generate();

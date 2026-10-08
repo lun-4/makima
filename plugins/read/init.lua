@@ -14,7 +14,6 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Only read the sections you actually need.
 - Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
 - When output ends with `[file truncated, N lines remaining]`, continue from the next offset.
-- Lines longer than `agent.max_line_bytes` end with `[line truncated, +N bytes]`. That marker is not file content. Change such a line with **edit** and an exact old_string; **write** and **edit_lines** refuse to alter it.
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
 - Call in parallel when reading multiple files.
@@ -22,10 +21,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
-local opts = maki.api.register_options(output_limits.extend({
-  max_line_bytes = output_limits.deprecated_line_bytes_spec,
-}))
-output_limits.warn_deprecated_line_bytes(opts, "read")
+local opts = maki.api.register_options(output_limits.extend({}))
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()

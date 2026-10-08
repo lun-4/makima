@@ -17,7 +17,6 @@ use maki_config::AgentConfig;
 use maki_storage::id::SessionRef;
 #[cfg(any(unix, windows))]
 use maki_storage::remove_offload_dir_from;
-use maki_storage::session_lock::SessionPublicationGuard;
 use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
 #[cfg(unix)]
 use rustix::fs::{self as anchored, AtFlags, Dir, FileType, Mode, OFlags};
@@ -178,16 +177,6 @@ impl OffloadStore {
     pub fn close_and_drain(&self) {
         self.request_close();
         let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
-    }
-
-    pub fn close_and_remove_guarded(&self, guard: &SessionPublicationGuard) -> io::Result<()> {
-        self.request_close();
-        let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .publish(|| self.backend.remove_all())?
-            .ok_or_else(|| {
-                io::Error::new(ErrorKind::PermissionDenied, "session lock ownership lost")
-            })?
     }
 
     fn remove_after_close(&self) -> io::Result<()> {
