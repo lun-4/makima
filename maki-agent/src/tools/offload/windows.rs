@@ -218,7 +218,7 @@ fn walk(root: &File, relative: &Path, create: bool, deletable: bool) -> io::Resu
 }
 
 pub(super) fn read_file(dir: &File, name: &str) -> io::Result<Option<File>> {
-    match open_relative(dir, OsStr::new(name), Some(false), false, false, false) {
+    match open_relative(dir, OsStr::new(name), None, false, false, false) {
         Ok(file) if super::regular_metadata(&file.metadata()?) => Ok(Some(file)),
         Ok(_) => Ok(None),
         Err(error) if super::not_regular_error(&error) => Ok(None),
@@ -505,6 +505,24 @@ mod tests {
         drop(leaf);
         assert!(!moved.join(remaining).exists());
         assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+    }
+
+    #[test_case(false; "directory")]
+    #[test_case(true; "directory_link")]
+    fn read_file_rejects_directory_occupants(link: bool) {
+        let root = TempDir::new().unwrap();
+        let backend = DiskBackend::new(root.path().join("store"));
+        let dir = backend.open_dir(true).unwrap();
+        let occupant = backend.dir.join(SLOT);
+        if link {
+            let target = root.path().join("outside");
+            fs::create_dir(&target).unwrap();
+            symlink_dir(target, &occupant).unwrap();
+        } else {
+            fs::create_dir(&occupant).unwrap();
+        }
+        assert!(read_file(&dir, SLOT).unwrap().is_none());
+        assert!(fs::symlink_metadata(&occupant).is_ok());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::borrow::Cow;
 #[cfg(test)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::io::Write;
 use std::io::{self, ErrorKind, Read};
 #[cfg(unix)]
