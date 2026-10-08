@@ -917,19 +917,21 @@ impl Writer {
                 Entry::Delete(done, guard, store) => {
                     self.forget(id);
                     let result = match guard {
-                        Some(guard) => store
-                            .map_or(Ok(()), |store| store.close_and_remove_guarded(&guard))
+                        Some(guard) => guard
+                            .publish(|| {
+                                let result = AppSession::delete(id, &self.dir);
+                                if (result.is_ok()
+                                    || matches!(result, Err(SessionError::Storage(StorageError::NotFound(_)))))
+                                    && let Some(store) = store
+                                    && let Err(error) = store.close_and_remove()
+                                {
+                                    warn!(%error, session_id = %id, "offload cleanup failed after session deletion");
+                                }
+                                result
+                            })
                             .map_err(StorageError::from)
                             .map_err(SessionError::from)
-                            .and_then(|()| {
-                                guard
-                                    .publish(|| AppSession::delete(id, &self.dir))
-                                    .map_err(StorageError::from)
-                                    .map_err(SessionError::from)
-                                    .and_then(|result| {
-                                        result.unwrap_or(Err(SessionError::OpenElsewhere))
-                                    })
-                            }),
+                            .and_then(|result| result.unwrap_or(Err(SessionError::OpenElsewhere))),
                         None => AppSession::delete(id, &self.dir),
                     };
                     done(match result {
@@ -1591,6 +1593,87 @@ mod tests {
     fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
         let (warn_tx, warn_rx) = flume::unbounded();
         (StorageWriter::new(dir.clone(), warn_tx), warn_rx)
+    }
+
+    #[test_case(false; "failed_log_delete_preserves_artifacts")]
+    #[test_case(true; "cleanup_failure_does_not_fail_log_delete")]
+    fn guarded_deletion_preserves_artifacts_until_log_removal(cleanup_failure: bool) {
+        use maki_agent::tools::offload::{OffloadBackend, OffloadSnapshot};
+        use maki_storage::session_lock;
+        use std::path::PathBuf;
+
+        struct FailingCleanup {
+            path: PathBuf,
+            attempted: Arc<AtomicBool>,
+        }
+
+        impl OffloadBackend for FailingCleanup {
+            fn matches(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+                Ok(false)
+            }
+
+            fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+                unreachable!()
+            }
+
+            fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+                Ok(OffloadSnapshot {
+                    names: Vec::new(),
+                    total_bytes: 0,
+                })
+            }
+
+            fn remove_all(&self) -> io::Result<()> {
+                self.attempted.store(true, Ordering::Release);
+                Err(io::Error::other("gated cleanup failure"))
+            }
+
+            fn path(&self, _: &str) -> PathBuf {
+                self.path.clone()
+            }
+        }
+
+        const BODY: &str = "referenced output";
+        let (_temp, dir) = state_dir();
+        let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::observation(BODY.into()));
+        session.save(&dir).unwrap();
+        let id = session.id;
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+        let lease = session_lock::claim(&sessions_dir, &id).unwrap().unwrap();
+        let guard = lease.publication_guard();
+        let artifact = dir.path().join("retained-artifact.txt");
+        std::fs::write(&artifact, BODY).unwrap();
+        let attempted = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(OffloadStore::new(Box::new(FailingCleanup {
+            path: artifact.clone(),
+            attempted: Arc::clone(&attempted),
+        })));
+        store.close_and_drain();
+        let log = sessions_dir.join(format!("{id}.jsonl"));
+        let backup = sessions_dir.join("retained-log.jsonl");
+        if !cleanup_failure {
+            std::fs::rename(&log, &backup).unwrap();
+            std::fs::create_dir(&log).unwrap();
+        }
+        let (writer, _) = writer(&dir);
+        let (done_tx, done_rx) = flume::bounded(1);
+        writer.delete_guarded(id, guard, Some(store), move |result| {
+            done_tx.send(result).unwrap();
+        });
+        let result = done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
+        assert_eq!(result.is_ok(), cleanup_failure);
+        assert_eq!(attempted.load(Ordering::Acquire), cleanup_failure);
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), BODY);
+        if cleanup_failure {
+            assert!(AppSession::load(id, &dir).is_err());
+        } else {
+            std::fs::remove_dir(&log).unwrap();
+            std::fs::rename(&backup, &log).unwrap();
+            assert_eq!(message_texts(&AppSession::load(id, &dir).unwrap()), [BODY]);
+        }
+        writer.shutdown(DRAIN_TIMEOUT);
+        drop(lease);
     }
 
     fn message_texts(session: &AppSession) -> Vec<String> {

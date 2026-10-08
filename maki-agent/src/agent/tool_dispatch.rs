@@ -37,7 +37,7 @@ const SOURCE_MCP: &str = "mcp";
 const SOURCE_UNKNOWN: &str = "unknown";
 
 const ERROR_CANCELLED: &str = "cancelled";
-const UNFILTERABLE_LIMITED_OUTPUT: &str = "output limits with an output hook require filterable text without structured state, image, or diff";
+const UNFILTERABLE_LIMITED_OUTPUT: &str = "output limits with an output hook require filterable text without instructions, structured state, image, or diff";
 
 /// The window a chain gets when the call carries no deadline of its own.
 /// Generous, because a layer may shell out before it decides, but a layer that
@@ -160,7 +160,9 @@ pub async fn run(
         authority: hook.authority,
     });
     let mut pending = finalization.and_then(|metadata| metadata.limits);
-    if pending.is_some() && done.output.filterable_text_mut().is_none() {
+    if pending.is_some()
+        && (done.output.instructions().is_some() || done.output.filterable_text_mut().is_none())
+    {
         pending = None;
         done.output = ToolOutput::Plain(UNFILTERABLE_LIMITED_OUTPUT.into());
         done.is_error = true;

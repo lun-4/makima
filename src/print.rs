@@ -265,11 +265,15 @@ fn run_and_settle<T>(
     // Body state is never reused after unwinding. Settlement only borrows the
     // task, and the cleanup controller stays outside every unwind boundary.
     let body_result = catch_unwind(AssertUnwindSafe(body));
+    let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
     let mut task = task;
     let settlement = if matches!(&body_result, Ok(Ok(_))) {
         smol::block_on(
             AssertUnwindSafe(async {
-                futures_lite::future::or(&mut task, shutdown).await;
+                futures_lite::future::or(futures_lite::future::or(&mut task, shutdown), async {
+                    smol::Timer::at(deadline).await;
+                })
+                .await;
             })
             .catch_unwind(),
         )
@@ -277,7 +281,10 @@ fn run_and_settle<T>(
         Ok(())
     };
     drop(task);
-    let teardown = smol::block_on(teardown);
+    let teardown = smol::block_on(futures_lite::future::or(teardown, async {
+        smol::Timer::at(deadline).await;
+        Ok(())
+    }));
     let settlement = match (settlement, teardown) {
         (Err(panic), teardown) => {
             if teardown.is_err() {
@@ -292,7 +299,15 @@ fn run_and_settle<T>(
     smol::block_on(async {
         if let Some(cleanup) = cleanup {
             cleanup.request();
-            let _ = cleanup.wait().await;
+            futures_lite::future::or(
+                async {
+                    let _ = cleanup.wait().await;
+                },
+                async {
+                    smol::Timer::at(deadline).await;
+                },
+            )
+            .await;
         }
     });
 
@@ -644,7 +659,7 @@ mod tests {
         tools::{
             DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
             ToolContext, ToolInvocation, ToolRegistry, ToolSource,
-            offload::{OffloadBackend, OffloadSnapshot, OffloadStore},
+            offload::{OffloadBackend, OffloadError, OffloadSnapshot, OffloadStore},
         },
     };
     use maki_providers::{
@@ -669,6 +684,7 @@ mod tests {
     const CLEANUP_ERROR: &str = "offload removal failed";
 
     struct GatedRemoval {
+        persistence: Option<(Sender<()>, Receiver<()>)>,
         entered: flume::Sender<()>,
         release: flume::Receiver<()>,
         removed: Arc<AtomicBool>,
@@ -681,6 +697,10 @@ mod tests {
         }
 
         fn create_new(&self, _: &str, _: &[u8]) -> io::Result<bool> {
+            if let Some((entered, release)) = &self.persistence {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
             Ok(true)
         }
 
@@ -727,6 +747,7 @@ mod tests {
         let (release, released) = flume::bounded(1);
         let removed = Arc::new(AtomicBool::new(false));
         let store = Arc::new(OffloadStore::new(Box::new(GatedRemoval {
+            persistence: None,
             entered,
             release: released,
             removed: Arc::clone(&removed),
@@ -891,6 +912,75 @@ mod tests {
                 BodyExit::Panic => unreachable!(),
             }
         }
+    }
+
+    #[test_case(false ; "shutdown_timeout")]
+    #[test_case(true ; "output_error")]
+    fn print_cancellation_returns_with_persistence_still_gated(output_error: bool) {
+        let (writing, writing_rx) = flume::bounded(1);
+        let (release_write, write_gate) = flume::bounded(1);
+        let release_write = ReleaseRemoval(release_write);
+        let (removing, removing_rx) = flume::bounded(1);
+        let (release_remove, remove_gate) = flume::bounded(1);
+        let release_remove = ReleaseRemoval(release_remove);
+        let removed = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(OffloadStore::new(Box::new(GatedRemoval {
+            persistence: Some((writing, write_gate)),
+            entered: removing,
+            release: remove_gate,
+            removed: Arc::clone(&removed),
+            fail: false,
+        })));
+        let writer_store = Arc::clone(&store);
+        let writer = std::thread::spawn(move || writer_store.put("pending output"));
+        writing_rx.recv_timeout(GATE_TIMEOUT).unwrap();
+        let cleanup = OffloadCleanup::new(Arc::clone(&store));
+        let observer = cleanup.clone();
+        let (destroyed, destruction) = flume::bounded(1);
+        let marker = ReleaseRemoval(destroyed);
+        let task = smol::spawn(async move {
+            let _marker = marker;
+            std::future::pending().await
+        });
+        let (completed, returned) = flume::bounded(1);
+        let thread = std::thread::spawn(move || {
+            let result = run_and_settle(
+                task,
+                async {
+                    destruction.recv_async().await.unwrap();
+                    Ok(())
+                },
+                Some(cleanup),
+                std::future::pending(),
+                || {
+                    if output_error {
+                        FailingOutput.write_all(b"result")?;
+                    }
+                    Ok(())
+                },
+            );
+            completed.send(()).unwrap();
+            result
+        });
+        returned.recv_timeout(GATE_TIMEOUT).unwrap();
+        let result = thread.join().unwrap();
+        if output_error {
+            assert_eq!(result.unwrap_err().to_string(), OUTPUT_ERROR);
+        } else {
+            result.unwrap();
+        }
+        assert!(matches!(
+            store.put("late output"),
+            Err(OffloadError::Closed)
+        ));
+        assert!(removing_rx.try_recv().is_err());
+        assert!(!removed.load(Ordering::Acquire));
+        drop(release_write);
+        writer.join().unwrap().unwrap();
+        removing_rx.recv_timeout(GATE_TIMEOUT).unwrap();
+        drop(release_remove);
+        smol::block_on(observer.wait()).unwrap();
+        assert!(removed.load(Ordering::Acquire));
     }
 
     #[test]

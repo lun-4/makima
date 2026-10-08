@@ -219,6 +219,11 @@ impl OffloadStore {
         self.remove_after_close()
     }
 
+    pub fn close_and_drain(&self) {
+        self.request_close();
+        let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
+    }
+
     pub fn close_and_remove_guarded(&self, guard: &SessionPublicationGuard) -> io::Result<()> {
         self.request_close();
         let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());

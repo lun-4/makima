@@ -42,6 +42,9 @@ const EXIT_TRAILER: &str = "Exit code: 7";
 const SECRET_LABEL: &str = "secret cancellation token label";
 const REPLACEMENT: &str = "replacement first\nreplacement second";
 const REPLACEMENT_TRAILER: &str = "Exit code: 3";
+const INSTRUCTION_LIMITS_ERROR: &str = "cannot be combined with instructions";
+const STAGED_INSTRUCTION_LIMITS_ERROR: &str =
+    "output limits with an output hook require filterable text";
 const SOURCE: &str = r#"
 maki.api.register_tool({
     name = "limited", description = "limits output", schema = {
@@ -49,7 +52,11 @@ maki.api.register_tool({
             mode = { type = "string" }, body = { type = "string" },
             trailer = { type = "string" }, is_error = { type = "boolean" }, max_lines = { type = "integer" },
             deadline = { type = "integer" }, max_bytes = { type = "integer" },
-            label = { type = "string" },
+            label = { type = "string" }, instructions = { type = "array", items = {
+                type = "object", properties = {
+                    path = { type = "string" }, content = { type = "string" },
+                },
+            } },
         },
     },
     handler = function(input, ctx)
@@ -58,13 +65,15 @@ maki.api.register_tool({
         local limits = { max_lines = input.max_lines, max_bytes = input.max_bytes,
             trailer = input.trailer, label = input.label }
         if input.mode == "deferred" then
-            return { llm_output = input.body, output_limits = limits, is_error = input.is_error }
+            return { llm_output = input.body, output_limits = limits, is_error = input.is_error,
+                instructions = input.instructions }
         end
         if input.mode == "content_deferred" then
             return { content = input.body, output_limits = limits, is_error = input.is_error }
         end
         if input.mode == "finish" then
-            ctx:finish({ llm_output = input.body, output_limits = limits, is_error = input.is_error })
+            ctx:finish({ llm_output = input.body, output_limits = limits, is_error = input.is_error,
+                instructions = input.instructions })
             return nil
         end
         if input.mode == "content_finish" then
@@ -79,6 +88,13 @@ maki.api.register_tool({
         end
         local output, err = ctx:limit_output(input.body, limits)
         if err then return { llm_output = err, is_error = true } end
+        if input.mode == "staged" then
+            return { llm_output = output, instructions = input.instructions }
+        end
+        if input.mode == "staged_finish" then
+            ctx:finish({ llm_output = output, instructions = input.instructions })
+            return nil
+        end
         return output
     end,
 })
@@ -891,6 +907,38 @@ fn output_hook_redacts_trailer_before_offloading(mode: &str, is_error: bool) {
     });
 }
 
+#[test_case("deferred", INSTRUCTION_LIMITS_ERROR; "direct_reply")]
+#[test_case("finish", INSTRUCTION_LIMITS_ERROR; "early_finish")]
+#[test_case("staged", STAGED_INSTRUCTION_LIMITS_ERROR; "staged_handler_return")]
+#[test_case("staged_finish", STAGED_INSTRUCTION_LIMITS_ERROR; "staged_early_finish")]
+fn deferred_instruction_sidecars_are_rejected_before_output_hooks(mode: &str, error: &str) {
+    let (registry, _host) = host();
+    let (seen_tx, seen) = flume::unbounded();
+    registry.set_hook(OutputHook(seen_tx));
+    let gate = Gate::new();
+    smol::block_on(async {
+        let ctx = dispatch_ctx(&registry, &gate);
+        let input = json!({
+            "mode": mode, "body": SIBLING_REPLY, "max_bytes": 0,
+            "instructions": [{"path": "secret.txt", "content": SECRET_TRAILER}],
+        });
+        let done = checked(tool_dispatch::run(
+            DISPATCH_ID.to_owned(),
+            "limited",
+            &input,
+            &ctx,
+            CallOrigin::Nested,
+        ))
+        .await;
+        assert!(done.is_error);
+        let output = done.output.as_text();
+        assert!(output.contains(error), "{output}");
+        assert!(!output.contains(SECRET_TRAILER), "{output}");
+        assert_eq!(checked(seen.recv_async()).await.unwrap(), output);
+        assert!(gate.saved_bodies().is_empty());
+    });
+}
+
 #[test_case("async", 0; "immediate_zero")]
 #[test_case("async", 1; "immediate_tiny")]
 #[test_case("deferred", 0; "deferred_zero")]
@@ -1059,6 +1107,9 @@ fn deferred_limits_preserve_result_kind_and_use_context_defaults(is_error: bool)
 #[test_case(json!({"output_limits": {}, "diff_path": "file"}); "diff")]
 #[test_case(json!({"output_limits": {}, "state": {"nested": true}}); "structured_state")]
 #[test_case(json!({"output_limits": {}, "format": "markdown"}); "markdown")]
+#[test_case(json!({"output_limits": {"max_bytes": 0}, "instructions": [{"path": "secret.txt", "content": SECRET_TRAILER}]}); "instructions")]
+#[test_case(json!({"output_limits": {}, "instructions": []}); "empty_instructions")]
+#[test_case(json!({"output_limits": {}, "instructions": false}); "malformed_instructions")]
 fn invalid_deferred_output_limits_are_rejected(fields: Value) {
     let registry = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();

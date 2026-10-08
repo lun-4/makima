@@ -518,6 +518,7 @@ impl RenewingDeletionLease {
                     Ok(None) | Err(flume::RecvTimeoutError::Disconnected) => break,
                 }
             }
+            drop(worker_lease);
             let _ = done_tx.send(());
         });
         Self { lease, wake, done }
@@ -3269,6 +3270,13 @@ impl<'t> EventLoop<'t> {
                     let (lease, guard) = smol::unblock(move || {
                         let guard = lease.publication_guard();
                         (lease, guard)
+                    })
+                    .await;
+                    let store = smol::unblock(move || {
+                        if let Some(store) = &store {
+                            store.close_and_drain();
+                        }
+                        store
                     })
                     .await;
                     let (done_tx, done_rx) = flume::bounded(1);
@@ -6572,9 +6580,13 @@ mod tests {
         }
     }
 
-    #[test_case(false; "deletion_completes")]
-    #[test_case(true; "shutdown_drains_unrelated_checkpoint")]
-    fn background_deletion_drains_in_flight_offload_persistence(shutdown: bool) {
+    #[test_case(false, false; "deletion_completes")]
+    #[test_case(true, false; "shutdown_drains_unrelated_checkpoint")]
+    #[test_case(false, true; "ownership_loss_preserves_transcript_and_artifacts")]
+    fn background_deletion_drains_in_flight_offload_persistence(
+        shutdown: bool,
+        lose_ownership: bool,
+    ) {
         const BODY: &str = "pending background session output";
         const EXISTING_BODY: &str = "referenced output retained if deletion is rejected";
         const ARTIFACT_NAME: &str = "existing-output.txt";
@@ -6633,19 +6645,33 @@ mod tests {
                     .is_none()
             );
             assert_eq!(std::fs::read_to_string(&artifact).unwrap(), EXISTING_BODY);
+            let replacement = if lose_ownership {
+                std::fs::remove_file(session_lock::lock_path(&event_loop.ctx.sessions_dir, &id))
+                    .unwrap();
+                Some(claim_lock(&event_loop.ctx.sessions_dir, &id).unwrap())
+            } else {
+                None
+            };
             let mut unrelated_id = None;
             if shutdown {
                 let mut unrelated = AppSession::new("test-model", &event_loop.session_cwd);
                 unrelated_id = Some(unrelated.id);
                 unrelated.meta.input_draft = Some(DRAFT.into());
                 event_loop.ctx.storage_writer.send(Arc::new(unrelated));
-                event_loop.ctx.storage_writer.shutdown(Duration::ZERO);
+                event_loop
+                    .ctx
+                    .storage_writer
+                    .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+                let stored =
+                    AppSession::load(unrelated_id.unwrap(), &event_loop.ctx.storage).unwrap();
+                assert_eq!(stored.meta.input_draft.as_deref(), Some(DRAFT));
+                assert!(reply_rx.is_empty());
             }
             release_tx.send(()).unwrap();
             let saved = worker.join().unwrap().unwrap();
             let reply = reply_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
             if reply.is_err() {
-                assert!(shutdown);
+                assert!(shutdown || lose_ownership);
                 let stored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
                 assert_eq!(
                     stored.messages()[0].user_text(),
@@ -6670,6 +6696,10 @@ mod tests {
                 assert_eq!(stored.meta.input_draft.as_deref(), Some(DRAFT));
             }
             assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
+            if let Some(replacement) = replacement {
+                assert!(reply.is_err());
+                replacement.release().unwrap();
+            }
         });
     }
 

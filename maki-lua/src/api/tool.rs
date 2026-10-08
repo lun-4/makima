@@ -511,27 +511,13 @@ impl ToolInvocation for LuaToolInvocation {
         let tool_timeout = self.timeout;
 
         Box::pin(async move {
-            let effective_secs: Option<u64> = match tool_timeout {
-                Some(d) => match deadline.cap_timeout(d.as_secs()) {
-                    Ok(s) => Some(s),
-                    Err(e) => return Err(e).into(),
-                },
-                None => match deadline {
-                    Deadline::At(_) => match deadline.cap_timeout(u64::MAX) {
-                        Ok(s) => Some(s),
-                        Err(e) => return Err(e).into(),
-                    },
-                    Deadline::None => None,
-                },
-            };
-
-            let invocation_deadline = effective_secs.map(|secs| {
-                let timeout = Instant::now() + Duration::from_secs(secs);
-                match deadline {
-                    Deadline::At(deadline) => timeout.min(deadline),
-                    Deadline::None => timeout,
-                }
-            });
+            let now = Instant::now();
+            let invocation_deadline = invocation_deadline(deadline, tool_timeout, now);
+            let effective_secs = invocation_deadline
+                .map(|deadline| deadline.saturating_duration_since(now).as_secs());
+            if let Err(error) = deadline.check() {
+                return Err(error).into();
+            }
             let mut invocation_ctx = ctx.clone();
             invocation_ctx.deadline = invocation_deadline.map_or(Deadline::None, Deadline::At);
             let ctx = &invocation_ctx;
@@ -680,6 +666,19 @@ impl ToolInvocation for LuaToolInvocation {
                 }
             }
         })
+    }
+}
+
+fn invocation_deadline(
+    inherited: Deadline,
+    timeout: Option<Duration>,
+    now: Instant,
+) -> Option<Instant> {
+    let deadline =
+        inherited.min(timeout.map_or(Deadline::None, |timeout| Deadline::At(now + timeout)));
+    match deadline {
+        Deadline::At(deadline) => Some(deadline),
+        Deadline::None => None,
     }
 }
 
@@ -2364,7 +2363,14 @@ fn extract_output_limits(
     if extract_tool_output(t)?.is_none() {
         return Err(mlua::Error::runtime("requires a text llm_output"));
     }
-    for field in ["image", "diff_path", "diff_before", "diff_after", "state"] {
+    for field in [
+        "image",
+        "diff_path",
+        "diff_before",
+        "diff_after",
+        "state",
+        "instructions",
+    ] {
         if !matches!(t.get::<LuaValue>(field)?, LuaValue::Nil) {
             return Err(mlua::Error::runtime(format!(
                 "cannot be combined with {field}"
@@ -2518,6 +2524,24 @@ impl LuaToolInvocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case::test_case(None, Some(Duration::from_millis(1900)), Some(Duration::from_millis(1900)); "fractional_inherited")]
+    #[test_case::test_case(Some(Duration::from_secs(1)), Some(Duration::from_millis(1900)), Some(Duration::from_secs(1)); "tool_timeout_caps_inherited")]
+    #[test_case::test_case(Some(Duration::from_secs(2)), Some(Duration::from_millis(1900)), Some(Duration::from_millis(1900)); "inherited_caps_tool_timeout")]
+    #[test_case::test_case(Some(Duration::from_secs(2)), None, Some(Duration::from_secs(2)); "tool_timeout_only")]
+    #[test_case::test_case(None, None, None; "unbounded")]
+    fn invocation_preserves_exact_deadline(
+        timeout: Option<Duration>,
+        inherited: Option<Duration>,
+        expected: Option<Duration>,
+    ) {
+        let now = Instant::now();
+        let inherited = inherited.map_or(Deadline::None, |duration| Deadline::At(now + duration));
+        assert_eq!(
+            invocation_deadline(inherited, timeout, now),
+            expected.map(|duration| now + duration)
+        );
+    }
 
     fn collect_twice(lua: &Lua) {
         lua.gc_collect().unwrap();
