@@ -16,6 +16,7 @@ use maki_config::Permission;
 
 /// Fields of the value a [`HookStage::Output`] hook sees and returns.
 pub const OUTPUT_TEXT: &str = "text";
+pub const OUTPUT_TRAILER: &str = "trailer";
 pub const OUTPUT_IS_ERROR: &str = "is_error";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -89,7 +90,7 @@ pub trait ToolHook: Send + Sync + 'static {
 
     /// `value` is the call's input at [`HookStage::Input`], and
     /// `{ [OUTPUT_TEXT]: string, [OUTPUT_IS_ERROR]: bool }` at
-    /// [`HookStage::Output`].
+    /// [`HookStage::Output`], with optional `[OUTPUT_TRAILER]: string` for staged limits.
     fn run<'a>(
         &'a self,
         stage: HookStage,

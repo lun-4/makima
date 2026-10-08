@@ -472,6 +472,33 @@ pub struct OutputLimitOptions {
 }
 
 impl OutputLimitOptions {
+    pub fn prepare_for_output_hook(&mut self, body: &mut String) {
+        self.label = DEFAULT_LABEL.to_owned();
+        if let Some(trailer) = self.trailer.as_mut() {
+            trailer.truncate(trailer.trim_end_matches('\n').len());
+            *body = with_trailer(body.trim_end_matches('\n'), Some(trailer));
+        }
+    }
+
+    pub fn recover_filtered_trailer(&mut self, body: &mut String) {
+        let Some(trailer) = self.trailer.take().filter(|trailer| !trailer.is_empty()) else {
+            return;
+        };
+        let filtered = body.trim_end_matches('\n');
+        let Some(prefix) = filtered.strip_suffix(&trailer) else {
+            return;
+        };
+        let boundary = if prefix.is_empty() {
+            0
+        } else if let Some(prefix) = prefix.strip_suffix('\n') {
+            prefix.len()
+        } else {
+            return;
+        };
+        body.truncate(boundary);
+        self.trailer = Some(trailer);
+    }
+
     pub async fn apply(self, body: String, store: Option<Arc<OffloadStore>>) -> String {
         smol::unblock(move || {
             limit_output(
@@ -829,6 +856,45 @@ mod tests {
         fn path(&self, name: &str) -> PathBuf {
             PathBuf::from("/offload").join(name)
         }
+    }
+
+    #[test_case("stored body\nExit code: 3", Some(SHORT_TRAILER); "unchanged")]
+    #[test_case("stored body\nExit code: [redacted]", None; "implicit_redaction_unprotected")]
+    #[test_case("replacement first\nreplacement second", None; "same_line_count_replacement")]
+    #[test_case("stored body\nprefixExit code: 3", None; "not_separate_terminal_suffix")]
+    #[test_case(TEST_BODY, None; "removed")]
+    #[test_case("replacement", None; "whole_output_replaced")]
+    fn filtered_trailer_recovery_preserves_only_retained_terminal_metadata(
+        filtered: &str,
+        expected: Option<&str>,
+    ) {
+        let mut options = OutputLimitOptions {
+            deadline: None,
+            trailer: Some(SHORT_TRAILER.to_owned()),
+            shape: PreviewShape::Head,
+            label: TEST_BODY.to_owned(),
+            lines_clipped: false,
+            limits: OutputLimits {
+                max_lines: 0,
+                max_bytes: 0,
+                max_line_bytes: 0,
+            },
+        };
+        let mut body = TEST_BODY.to_owned();
+        options.prepare_for_output_hook(&mut body);
+        assert_eq!(body, format!("{TEST_BODY}\n{SHORT_TRAILER}"));
+        assert_eq!(options.label, DEFAULT_LABEL);
+        body = filtered.to_owned();
+        options.recover_filtered_trailer(&mut body);
+        assert_eq!(options.trailer.as_deref(), expected);
+        assert_eq!(
+            body,
+            if expected.is_some() {
+                TEST_BODY
+            } else {
+                filtered
+            }
+        );
     }
 
     fn map_store() -> (Arc<MapBackend>, OffloadStore) {

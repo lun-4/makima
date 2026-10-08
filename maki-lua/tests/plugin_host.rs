@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyModifiers};
 use maki_agent::agent::tool_dispatch;
 use maki_agent::template::Vars;
-use maki_agent::tools::hook::{HookCall, HookStage, OUTPUT_TEXT, ToolHook, Verdict};
+use maki_agent::tools::hook::{
+    HookCall, HookStage, OUTPUT_TEXT, OUTPUT_TRAILER, ToolHook, Verdict,
+};
 use maki_agent::tools::offload::{
     LINE_CUT_PREFIX, OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore,
 };
@@ -7092,6 +7094,10 @@ impl ToolHook for OffloadOutputHook {
                 Verdict::Denied(OFFLOAD_DENIED.to_owned())
             } else {
                 value[OUTPUT_TEXT] = Value::String(text.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+                if let Some(trailer) = value[OUTPUT_TRAILER].as_str() {
+                    value[OUTPUT_TRAILER] =
+                        Value::String(trailer.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+                }
                 Verdict::Replaced(value)
             }
         })
@@ -7158,10 +7164,261 @@ fn builtin_output_hook_precedes_offload(tool: &str, deny: bool) {
     } else {
         assert_eq!(artifacts.len(), 1);
         let saved = std::fs::read_to_string(offloaded_path(&output)).unwrap();
-        assert!(saved.contains(OFFLOAD_REDACTED), "{saved}");
+        if tool == "trailer_probe" {
+            assert!(output.ends_with(OFFLOAD_REDACTED), "{output}");
+        } else {
+            assert!(saved.contains(OFFLOAD_REDACTED), "{saved}");
+        }
         assert!(!saved.contains(OFFLOAD_SECRET), "{saved}");
     }
 }
+const CANCEL_OFFLOAD_TOOL: &str = "cancel_offload_probe";
+const CANCEL_OFFLOAD_DISPATCH_TOOL: &str = "cancel_offload_dispatch";
+
+struct GatedOffloadOutputHook {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+impl ToolHook for GatedOffloadOutputHook {
+    fn wraps(&self, _: &str, stage: HookStage) -> bool {
+        stage == HookStage::Output
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookStage,
+        mut value: Value,
+        _: &'a HookCall<'a>,
+    ) -> BoxFuture<'a, Verdict> {
+        let text = value[OUTPUT_TEXT].as_str().unwrap();
+        assert!(text.contains(OFFLOAD_SECRET), "{text}");
+        value[OUTPUT_TEXT] = Value::String(text.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+        if let Some(trailer) = value[OUTPUT_TRAILER].as_str() {
+            value[OUTPUT_TRAILER] =
+                Value::String(trailer.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+        }
+        self.entered.send(()).unwrap();
+        Box::pin(async move {
+            self.release.recv_async().await.unwrap();
+            Verdict::Replaced(value)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct GatedOffloadInvocation {
+    tool: Arc<dyn Tool>,
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+    input: Value,
+}
+
+impl Tool for GatedOffloadInvocation {
+    fn name(&self) -> &str {
+        CANCEL_OFFLOAD_DISPATCH_TOOL
+    }
+
+    fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+        self.tool.description(ctx)
+    }
+
+    fn schema(&self) -> Value {
+        self.tool.schema()
+    }
+
+    fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(Self {
+            input: input.clone(),
+            ..self.clone()
+        }))
+    }
+}
+
+impl ToolInvocation for GatedOffloadInvocation {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(CANCEL_OFFLOAD_DISPATCH_TOOL.to_owned()))
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            let result = self.tool.parse(&self.input).unwrap().execute(ctx).await;
+            let text = result.output.as_ref().unwrap().as_text();
+            assert!(text.contains(OFFLOAD_SECRET), "{text}");
+            self.entered.send(()).unwrap();
+            self.release.recv_async().await.unwrap();
+            result
+        })
+    }
+}
+
+#[test_case::test_case(false, false; "immediate_cancelled_before_filter")]
+#[test_case::test_case(true, false; "deferred_cancelled_before_filter")]
+#[test_case::test_case(false, true; "immediate_cancelled_during_filter")]
+#[test_case::test_case(true, true; "deferred_cancelled_during_filter")]
+fn cancelled_output_hook_does_not_offload_raw_output(deferred: bool, during_filter: bool) {
+    let (reg, host) = builtins_host();
+    host.load_source(
+        CANCEL_OFFLOAD_TOOL,
+        &format!(
+            r#"
+        maki.api.register_tool({{
+            name = "{CANCEL_OFFLOAD_TOOL}", description = "cancellation output probe",
+            schema = {{ type = "object", properties = {{ deferred = {{ type = "boolean" }} }} }},
+            handler = function(input, ctx)
+                local reply = {{ llm_output = "head\n{OFFLOAD_SECRET}\ntail",
+                    output_limits = {{ max_lines = 0 }} }}
+                if input.deferred then
+                    maki.fn.jobstart("true", {{ on_exit = function() ctx:finish(reply) end }})
+                    return nil
+                end
+                return reply
+            end,
+        }})
+    "#
+        ),
+    )
+    .unwrap();
+    let (execution_tx, execution_rx) = flume::bounded(1);
+    let (execution_release_tx, execution_release_rx) = flume::bounded(1);
+    reg.register(
+        Arc::new(GatedOffloadInvocation {
+            tool: Arc::clone(&reg.get(CANCEL_OFFLOAD_TOOL).unwrap().tool),
+            entered: execution_tx,
+            release: execution_release_rx,
+            input: Value::Null,
+        }),
+        ToolSource::Lua {
+            plugin: Arc::from(CANCEL_OFFLOAD_TOOL),
+        },
+    )
+    .unwrap();
+    let (hook_tx, hook_rx) = flume::bounded(1);
+    let (_hook_release_tx, hook_release_rx) = flume::bounded(1);
+    reg.set_hook(GatedOffloadOutputHook {
+        entered: hook_tx,
+        release: hook_release_rx,
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    let (trigger, token) = maki_agent::CancelToken::new();
+    ctx.cancel = token;
+    let done = smol::block_on(async {
+        let caller = smol::spawn(async move {
+            tool_dispatch::run(
+                OFFLOAD_HOOK_ID.to_owned(),
+                CANCEL_OFFLOAD_DISPATCH_TOOL,
+                &json!({ "deferred": deferred }),
+                &ctx,
+                CallOrigin::Nested,
+            )
+            .await
+        });
+        futures_lite::future::race(
+            async {
+                execution_rx.recv_async().await.unwrap();
+                if during_filter {
+                    execution_release_tx.send(()).unwrap();
+                    hook_rx.recv_async().await.unwrap();
+                    trigger.cancel();
+                } else {
+                    trigger.cancel();
+                    execution_release_tx.send(()).unwrap();
+                }
+                caller.await
+            },
+            async {
+                smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
+                panic!("cancelled output hook did not settle");
+            },
+        )
+        .await
+    });
+    let output = done.output.as_text();
+    assert!(done.is_error, "{output}");
+    assert!(!output.contains(OFFLOAD_SECRET), "{output}");
+    assert!(!output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+    assert!(!output.contains(OFFLOAD_POINTER_PREFIX), "{output}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert!(
+        hook_rx.try_recv().is_err(),
+        "hook invoked after cancellation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_bash_partial_output_hook_does_not_offload_raw_output() {
+    let (events_tx, events_rx) = flume::unbounded();
+    let (result_tx, result_rx) = flume::bounded(1);
+    let (hook_tx, hook_rx) = flume::bounded(1);
+    let (_hook_release_tx, hook_release_rx) = flume::bounded(1);
+    let (trigger, token) = maki_agent::CancelToken::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = disk_store(dir.path());
+    let worker = std::thread::spawn(move || {
+        let (reg, host) = builtins_host_with_zero_output_limit("bash", ZERO_LINES_OPTION);
+        reg.set_hook(GatedOffloadOutputHook {
+            entered: hook_tx,
+            release: hook_release_rx,
+        });
+        let (mut ctx, _session) = offload_ctx(&host, &store);
+        ctx.registry = Arc::clone(&reg);
+        ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+        ctx.event_tx = maki_agent::EventSender::new(events_tx, 0);
+        ctx.tool_use_id = Some(BASH_CANCEL_ID.to_owned());
+        ctx.cancel = token;
+        let command = format!("printf '%s\\n' '{OFFLOAD_SECRET}'; kill -STOP $$");
+        result_tx
+            .send(smol::block_on(tool_dispatch::run(
+                BASH_CANCEL_ID.to_owned(),
+                "bash",
+                &json!({ "command": command }),
+                &ctx,
+                CallOrigin::Nested,
+            )))
+            .unwrap();
+    });
+    let deadline = Instant::now() + CANCEL_TEST_TIMEOUT;
+    let buf = loop {
+        let env = events_rx
+            .recv_deadline(deadline)
+            .expect("bash must publish its live buffer");
+        if let maki_agent::AgentEvent::LiveToolBuf { id, body } = env.event
+            && id == BASH_CANCEL_ID
+        {
+            break body;
+        }
+    };
+    let (changed_tx, changed_rx) = flume::unbounded();
+    buf.set_on_change(move || {
+        let _ = changed_tx.send(());
+    });
+    while !buf.take().text().contains(OFFLOAD_SECRET) {
+        changed_rx
+            .recv_deadline(deadline)
+            .expect("bash must accumulate the secret before cancellation");
+    }
+    buf.clear_on_change();
+    trigger.cancel();
+    let done = result_rx
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("cancelled bash dispatch must settle");
+    worker.join().unwrap();
+    let output = done.output.as_text();
+    assert!(done.is_error, "{output}");
+    assert!(!output.contains(OFFLOAD_SECRET), "{output}");
+    assert!(!output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+    assert!(!output.contains(OFFLOAD_POINTER_PREFIX), "{output}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert!(
+        hook_rx.try_recv().is_err(),
+        "hook invoked after cancellation"
+    );
+}
+
 #[test]
 fn immediate_output_limits_with_state_fail_without_artifact() {
     let (reg, host) = builtins_host();
@@ -7293,6 +7550,64 @@ fn glob_zero_output_override_returns_metadata_only(option: &str, with_store: boo
         let saved = std::fs::read_to_string(offloaded_path(&output)).unwrap();
         assert!(saved.contains(ZERO_GLOB_FILE), "{saved}");
     }
+}
+
+#[test_case::test_case(0; "zero_limits")]
+#[test_case::test_case(1; "tiny_limits")]
+fn hooked_failed_bash_preserves_terminal_exit_status_and_restore(budget: usize) {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config.opts.insert(
+        "bash".to_owned(),
+        json_obj(json!({ "max_output_lines": budget, "max_output_bytes": budget })),
+    );
+    let (reg, host) = builtins_host_with(&config);
+    reg.set_hook(OffloadOutputHook { deny: false });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    let input = json!({
+        "command": format!("{OFFLOAD_SECRET_COMMAND}; exit 3"),
+        "timeout": ZERO_BASH_TIMEOUT_SECS,
+    });
+    for notice in [OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX] {
+        let done = smol::block_on(tool_dispatch::run(
+            OFFLOAD_HOOK_ID.to_owned(),
+            "bash",
+            &input,
+            &ctx,
+            CallOrigin::Nested,
+        ));
+        let output = done.output.as_text();
+        assert!(done.is_error, "{output}");
+        assert!(output.contains(notice), "{output}");
+        assert!(output.ends_with(BASH_FAILURE_EXIT_LINE), "{output}");
+        assert!(!output.contains(OFFLOAD_SECRET), "{output}");
+        let saved = std::fs::read_to_string(offloaded_path(&output)).unwrap();
+        assert!(saved.contains(OFFLOAD_REDACTED), "{saved}");
+        assert!(!saved.contains(OFFLOAD_SECRET), "{saved}");
+        let handle = host.event_handle();
+        let (tx, rx) = flume::unbounded();
+        handle.request_restore(
+            maki_lua::RestoreItem {
+                tool: Arc::from("bash"),
+                tool_use_id: OFFLOAD_HOOK_ID.to_owned(),
+                output: output.to_owned(),
+                input: input.clone(),
+                is_error: true,
+                tool_output_lines: ToolOutputLines::default(),
+                theme_gen: None,
+                clicks: vec![0],
+                state: None,
+            },
+            maki_agent::EventSender::new(tx, 0),
+        );
+        handle.wait_restore_complete_for_test();
+        let restored = snapshot_texts(&rx, OFFLOAD_HOOK_ID).join("\n");
+        assert!(restored.contains(BASH_FAILURE_EXIT_LINE), "{restored}");
+        assert!(restored.contains(notice), "{restored}");
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 #[test_case::test_case(ZERO_LINES_OPTION, false; "zero_lines_without_store")]

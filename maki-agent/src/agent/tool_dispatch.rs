@@ -10,8 +10,12 @@ use tracing::{debug, error, warn};
 
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
-use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
-use crate::tools::offload::{DEFAULT_LABEL, LimitOpts, OutputLimits, PreviewShape, limit_output};
+use crate::tools::hook::{
+    Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
+};
+use crate::tools::offload::{
+    DEFAULT_LABEL, LimitOpts, OutputLimitOptions, OutputLimits, PreviewShape, limit_output,
+};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
     CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
@@ -145,26 +149,26 @@ pub async fn run(
         done.output = ToolOutput::Plain(UNFILTERABLE_LIMITED_OUTPUT.into());
         done.is_error = true;
     }
-    if let Some(opts) = &mut pending
-        && let Some(trailer) = opts.trailer.take()
+    if let Some(opts) = pending.as_mut()
         && let Some(text) = done.output.filterable_text_mut()
     {
-        let body = text.trim_end_matches('\n');
-        *text = if body.is_empty() {
-            trailer
-        } else {
-            format!("{body}\n{trailer}")
-        };
+        opts.prepare_for_output_hook(text);
     }
     let denied = if let Some(hook) = &hook {
-        hook.filter_output(&mut done).await
+        hook.filter_output(
+            &mut done,
+            pending.as_ref().and_then(|opts| opts.deadline),
+            pending.as_mut(),
+        )
+        .await
     } else {
         false
     };
     if !denied
-        && let Some(opts) = pending
+        && let Some(mut opts) = pending
         && let Some(text) = done.output.filterable_text_mut()
     {
+        opts.recover_filtered_trailer(text);
         let deadline = opts.deadline;
         let apply = opts.apply(std::mem::take(text), ctx.offload.clone());
         let limited = match deadline {
@@ -237,13 +241,18 @@ impl<'a> Hook<'a> {
             return Verdict::Unchanged;
         }
         let cancelled = Verdict::Denied(ERROR_CANCELLED.to_owned());
-        self.fire(HookStage::Input, tool_id, input.clone(), cancelled)
+        self.fire(HookStage::Input, tool_id, input.clone(), cancelled, None)
             .await
     }
 
     /// Rewrites the finished event in place. Text and error flag move together,
     /// so a hook that cannot reach the text cannot flip the flag either.
-    async fn filter_output(&self, done: &mut ToolDoneEvent) -> bool {
+    async fn filter_output(
+        &self,
+        done: &mut ToolDoneEvent,
+        deadline: Option<Instant>,
+        mut limits: Option<&mut OutputLimitOptions>,
+    ) -> bool {
         if !self.installed.wraps(self.tool, HookStage::Output) {
             return false;
         }
@@ -255,23 +264,40 @@ impl<'a> Hook<'a> {
             );
             return false;
         };
-        let value = json!({ OUTPUT_TEXT: &*text, OUTPUT_IS_ERROR: was_error });
+        let mut value = json!({ OUTPUT_TEXT: &*text, OUTPUT_IS_ERROR: was_error });
+        if let Some(trailer) = limits.as_ref().and_then(|opts| opts.trailer.as_deref()) {
+            value[OUTPUT_TRAILER] = Value::String(trailer.to_owned());
+        }
         let (rewritten, is_error, denied) = match self
-            .fire(HookStage::Output, &done.id, value, Verdict::Unchanged)
+            .fire(
+                HookStage::Output,
+                &done.id,
+                value,
+                Verdict::Denied(ERROR_CANCELLED.to_owned()),
+                deadline,
+            )
             .await
         {
             Verdict::Unchanged => return false,
             // Nothing left to stop, so the reason becomes what the model reads.
             Verdict::Denied(reason) => (reason, true, true),
             Verdict::Replaced(value) => match value.get(OUTPUT_TEXT).and_then(Value::as_str) {
-                Some(replaced) => (
-                    replaced.to_owned(),
-                    value
-                        .get(OUTPUT_IS_ERROR)
-                        .and_then(Value::as_bool)
-                        .unwrap_or(was_error),
-                    false,
-                ),
+                Some(replaced) => {
+                    if let Some(opts) = limits.as_mut() {
+                        opts.trailer = value
+                            .get(OUTPUT_TRAILER)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                    }
+                    (
+                        replaced.to_owned(),
+                        value
+                            .get(OUTPUT_IS_ERROR)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(was_error),
+                        false,
+                    )
+                }
                 None => {
                     warn!(
                         tool = %self.tool,
@@ -296,7 +322,11 @@ impl<'a> Hook<'a> {
         tool_id: &str,
         value: Value,
         on_cancel: Verdict,
+        deadline: Option<Instant>,
     ) -> Verdict {
+        if self.ctx.cancel.is_cancelled() {
+            return on_cancel;
+        }
         let call = HookCall {
             tool: self.tool,
             tool_id,
@@ -304,13 +334,31 @@ impl<'a> Hook<'a> {
             origin: self.origin,
             authority: self.authority,
             cancel: &self.ctx.cancel,
-            deadline: self.window(),
+            deadline: deadline.map_or_else(|| self.window(), |at| at.min(self.window())),
         };
-        self.ctx
+        let run = self.installed.run(stage, value, &call);
+        let verdict = self
+            .ctx
             .cancel
-            .race(self.installed.run(stage, value, &call))
-            .await
-            .unwrap_or(on_cancel)
+            .race(async {
+                if call.deadline <= Instant::now() {
+                    return Verdict::Denied(DEADLINE_EXCEEDED.to_owned());
+                }
+                futures_lite::future::race(run, async {
+                    smol::Timer::at(call.deadline).await;
+                    Verdict::Denied(DEADLINE_EXCEEDED.to_owned())
+                })
+                .await
+            })
+            .await;
+        match verdict {
+            _ if self.ctx.cancel.is_cancelled() => on_cancel,
+            Err(_) => on_cancel,
+            Ok(_) if call.deadline <= Instant::now() => {
+                Verdict::Denied(DEADLINE_EXCEEDED.to_owned())
+            }
+            Ok(verdict) => verdict,
+        }
     }
 
     /// Read when a stage fires, not once per call: the input chain and the tool
@@ -1401,7 +1449,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Reply {
         Answers(fn(HookStage, &Value) -> Verdict),
-        /// Never resolves, so only cancellation can end the wait.
+        /// Never resolves, so cancellation or the deadline ends the wait.
         Pending,
     }
 
@@ -1652,11 +1700,8 @@ mod tests {
         });
     }
 
-    /// Nobody is left reading the answer, so waiting on a verdict that never
-    /// comes would only keep the call alive. Each stage keeps what it has: no
-    /// input was judged, and an output already produced stands.
-    #[test_case(&[HookStage::Input],  true,  ERROR_CANCELLED.to_owned() ; "input")]
-    #[test_case(&[HookStage::Output], false, ran(HOOK_PLAIN)            ; "output")]
+    #[test_case(&[HookStage::Input],  true, ERROR_CANCELLED.to_owned() ; "input")]
+    #[test_case(&[HookStage::Output], true, ERROR_CANCELLED.to_owned() ; "output")]
     fn a_cancelled_call_does_not_wait_for_a_verdict(
         wrapped: &'static [HookStage],
         is_error: bool,
@@ -1674,6 +1719,105 @@ mod tests {
         });
     }
 
+    #[test_case(false; "already_cancelled")]
+    #[test_case(true; "cancelled_while_filtering")]
+    fn interrupted_output_filter_denies_unfiltered_text(during_filter: bool) {
+        smol::block_on(async {
+            let (trigger, token) = CancelToken::new();
+            let mut ctx = build_ctx();
+            ctx.cancel = token;
+            let (ctx, recording) = hooked_with(
+                ctx,
+                None,
+                RecordingHook::never_answering(&[HookStage::Output]),
+            );
+            let mut trigger = Some(trigger);
+            if !during_filter {
+                trigger.take().unwrap().cancel();
+            }
+            let resolved = resolve(&ctx, HOOK_TOOL_NAME);
+            let hook = Hook::of(&ctx, &resolved, CallOrigin::Model).unwrap();
+            let mut done = ToolDoneEvent {
+                id: TEST_ID.into(),
+                tool: Arc::from(HOOK_TOOL_NAME),
+                output: ToolOutput::Plain(MCP_SECRET.into()),
+                is_error: false,
+                annotation: None,
+                written_path: None,
+            };
+            let denied = if during_filter {
+                let mut filtering = Box::pin(hook.filter_output(&mut done, None, None));
+                assert!(
+                    futures_lite::future::poll_once(&mut filtering)
+                        .await
+                        .is_none()
+                );
+                assert_eq!(recording.seen().len(), 1);
+                trigger.take().unwrap().cancel();
+                filtering.await
+            } else {
+                hook.filter_output(&mut done, None, None).await
+            };
+            assert!(denied);
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), ERROR_CANCELLED);
+            assert_eq!(recording.seen().len(), usize::from(during_filter));
+        });
+    }
+
+    #[test_case(None, Some(Duration::ZERO); "expired_pending")]
+    #[test_case(None, Some(HOOK_CALL_DEADLINE); "pending_only")]
+    #[test_case(Some(HOOK_CALL_DEADLINE), None; "caller_only")]
+    #[test_case(Some(HOOK_CALL_DEADLINE), Some(HOOK_CHAIN_MAX); "caller_shorter")]
+    #[test_case(Some(HOOK_CHAIN_MAX), Some(HOOK_CALL_DEADLINE); "pending_shorter")]
+    fn output_filter_spends_the_effective_absolute_deadline(
+        caller: Option<Duration>,
+        pending: Option<Duration>,
+    ) {
+        smol::block_on(async {
+            let started = Instant::now();
+            let caller = caller.map(|duration| started + duration);
+            let pending = pending.map(|duration| started + duration);
+            let expected = match (caller, pending) {
+                (Some(left), Some(right)) => left.min(right),
+                (Some(at), None) | (None, Some(at)) => at,
+                (None, None) => unreachable!(),
+            };
+            let (trigger, token) = CancelToken::new();
+            let mut ctx = build_ctx();
+            ctx.cancel = token;
+            ctx.deadline = caller.map_or(Deadline::None, Deadline::At);
+            let (ctx, recording) = hooked_with(
+                ctx,
+                None,
+                RecordingHook::never_answering(&[HookStage::Output]),
+            );
+            let resolved = resolve(&ctx, HOOK_TOOL_NAME);
+            let hook = Hook::of(&ctx, &resolved, CallOrigin::Model).unwrap();
+            let mut done = ToolDoneEvent {
+                id: TEST_ID.into(),
+                tool: Arc::from(HOOK_TOOL_NAME),
+                output: ToolOutput::Plain(MCP_SECRET.into()),
+                is_error: false,
+                annotation: None,
+                written_path: None,
+            };
+            let mut filtering = Box::pin(hook.filter_output(&mut done, pending, None));
+            let result = futures_lite::future::poll_once(&mut filtering).await;
+            assert_eq!(recording.at(HookStage::Output).unwrap().deadline, expected);
+            if expected <= started {
+                assert_eq!(result, Some(true));
+                drop(filtering);
+                assert!(done.is_error);
+                assert_eq!(done.output.as_text(), DEADLINE_EXCEEDED);
+            } else {
+                assert!(result.is_none());
+                trigger.cancel();
+                assert!(filtering.await);
+            }
+        });
+    }
+
     /// A chain runs off this thread, so it only dies with the call it filters
     /// when it is handed that call's own token and an instant to be killed at.
     #[test]
@@ -1682,14 +1826,16 @@ mod tests {
             let at = Instant::now() + HOOK_CALL_DEADLINE;
             let mut ctx = build_ctx();
             ctx.deadline = Deadline::At(at);
-            ctx.cancel = cancelled_token();
+            let (trigger, token) = CancelToken::new();
+            ctx.cancel = token;
             let (ctx, hook) = hooked_ctx(ctx);
 
             dispatch(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await;
 
             let firing = hook.at(HookStage::Input).expect("the input stage fired");
-            assert!(firing.cancelled, "the call's own token, not a fresh one");
+            assert!(!firing.cancelled);
             assert_eq!(firing.deadline, at, "and no later than the call itself");
+            trigger.cancel();
         });
     }
 

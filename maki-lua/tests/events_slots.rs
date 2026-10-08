@@ -1,3 +1,4 @@
+use std::fs;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,8 +10,8 @@ use maki_agent::mcp::test_support::stub_session_with_result;
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadStore};
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{CallOrigin, ToolRegistry, TurnToolBindings};
-use maki_lua::{Permission, PluginHost, PluginPermissions};
+use maki_agent::tools::{CallOrigin, Deadline, ToolRegistry, TurnToolBindings};
+use maki_lua::{Permission, PluginHost, PluginPermissions, UiAction};
 use test_case::test_case;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
@@ -25,6 +26,10 @@ const OFFLOAD_SAVED_TO: &str = "saved to ";
 /// Generous on purpose. A bound a slow machine can trip is a bound that fails
 /// for the wrong reason, and this one is only reached when something is stuck.
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+const OUTPUT_HOOK_DEADLINE: Duration = Duration::from_secs(1);
+const OUTPUT_HOOK_WATCHDOG: Duration = Duration::from_secs(10);
+const OUTPUT_HOOK_TIMEOUT: &str = "timeout exceeded";
+const OUTPUT_HOOK_BODY: &str = "first\nsecond\nthird\nfourth";
 
 fn host() -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
@@ -926,6 +931,78 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
         matches!(verdict, Verdict::Unchanged),
         "the abandoned layer never reached its rewrite"
     );
+}
+
+#[test_case(true ; "registered_tool_timeout")]
+#[test_case(false ; "handler_deadline")]
+fn effective_deadline_denies_a_parked_output_hook(registered_timeout: bool) {
+    let (reg, host) = host();
+    let timeout = if registered_timeout {
+        OUTPUT_HOOK_DEADLINE.as_secs().to_string()
+    } else {
+        "false".to_owned()
+    };
+    let handler_deadline = if registered_timeout {
+        String::new()
+    } else {
+        format!("ctx:set_deadline({})", OUTPUT_HOOK_DEADLINE.as_secs())
+    };
+    load(
+        &host,
+        "output_hook_deadline",
+        &format!(
+            r#"
+local body = {body:?}
+maki.api.register_tool({{
+    name = "{SLOT_TOOL}", description = "deadline probe", schema = {PROBE_SCHEMA},
+    audiences = {{ "main" }}, timeout = {timeout},
+    handler = function(_, ctx)
+        {handler_deadline}
+        return {{ llm_output = body, output_limits = {{ max_lines = 0 }} }}
+    end,
+}})
+maki.api.set_slot("tool.{SLOT_TOOL}.output", function(prev, value, ctx)
+    assert(value.text == body, "output hook must see the unfinalized body")
+    maki.ui.open_editor("parked-output-hook")
+    value.text = "{HIJACKED}"
+    return prev(value, ctx)
+end)
+"#,
+            body = OUTPUT_HOOK_BODY,
+        ),
+    );
+    let actions = host.ui_action_rx();
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    ctx.deadline = Deadline::None;
+    ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+
+    within(async {
+        let dispatch = smol::spawn(async move {
+            tool_dispatch::run(
+                TOOL_ID.into(),
+                SLOT_TOOL,
+                &serde_json::json!({}),
+                &ctx,
+                CallOrigin::Model,
+            )
+            .await
+        });
+        let UiAction::OpenEditor { reply_tx, .. } = actions.recv_async().await.unwrap() else {
+            panic!("output hook did not enter its pending editor request");
+        };
+        let done = smol::future::or(dispatch, async {
+            smol::Timer::after(OUTPUT_HOOK_WATCHDOG).await;
+            panic!("effective deadline did not end the parked output hook");
+        })
+        .await;
+        assert!(done.is_error, "{}", done.output.as_text());
+        assert_eq!(done.output.as_text(), OUTPUT_HOOK_TIMEOUT);
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+        drop(reply_tx);
+    });
 }
 
 #[test]

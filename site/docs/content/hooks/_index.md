@@ -32,7 +32,7 @@ passes through, so builtins, MCP tools, and ACP client tools behave alike:
 | Slot | Fires | Gets |
 | --- | --- | --- |
 | `tool.<name>.input` | before the input is parsed or checked against your permission rules | the call the model wrote |
-| `tool.<name>.output` | on the result of a call that ran, including a failure or a permission refusal | `{ text, is_error }` |
+| `tool.<name>.output` | on the result of a call that ran, including a failure or a permission refusal | `{ text, is_error, trailer? }` |
 
 A call an input layer stopped never reaches the output slot: the reason came
 from a layer, so there is nothing left to filter. A name that resolves to no
@@ -109,6 +109,19 @@ end)
 
 A replacement table has to carry `text`. Without it the output is left alone and the reason is logged. Set `is_error` to turn a success into a failure, or a failure into a success.
 
+Tools with staged output limits pass the full body and trailer in `text`, with the original trailer also in the optional `trailer` string field. An unchanged verdict preserves the original trailer. Replaced text protects a trailer only when the replacement explicitly includes a string `trailer` field matching a separate terminal suffix in `text`. An absent, null, or mismatched field removes protection and leaves the entire replacement in the body saved to the offload artifact. Updating metadata cannot append or restore missing text. Generated notices use the trusted label `output`.
+
+A redactor that changes trailer text must update both fields:
+
+```lua
+out.text = out.text:gsub("sk%-%w+", "[redacted]")
+if out.trailer then
+  out.trailer = out.trailer:gsub("sk%-%w+", "[redacted]")
+end
+```
+
+Body-only redaction can retain the original `trailer` field unchanged when the original terminal suffix remains intact.
+
 MCP output slots receive the complete text before output limiting or saving. A successful replacement is the text saved when it exceeds the limits. A denial or a replacement marked `is_error` creates no artifact. Changing a permission or transport error into success does not make that result eligible for saving. Builtin tools retain their own output-limiting behavior.
 
 An output slot fires only when the text is the whole output. Tools the UI renders
@@ -183,6 +196,9 @@ Slot names are per tool, so a layer on `tool.bash.input` costs nothing when
 ```lua
 local function redact(prev, out, ctx)
   out.text = out.text:gsub("sk%-%w+", "[redacted]")
+  if out.trailer then
+    out.trailer = out.trailer:gsub("sk%-%w+", "[redacted]")
+  end
   return prev(out, ctx)
 end
 

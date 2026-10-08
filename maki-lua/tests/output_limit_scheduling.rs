@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::CancelToken;
-use maki_agent::tools::hook::{HookCall, HookStage, OUTPUT_TEXT, ToolHook, Verdict};
+use maki_agent::tools::hook::{
+    HookCall, HookStage, OUTPUT_TEXT, OUTPUT_TRAILER, ToolHook, Verdict,
+};
 use maki_agent::tools::offload::{
     OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadBackend, OffloadCleanup, OffloadSnapshot,
     OffloadStore,
@@ -35,19 +37,25 @@ const REDACTED_TRAILER: &str = "[redacted cancellation token]";
 const TIMEOUT_FRAGMENT: &str = "timeout";
 const DEADLINE_FRAGMENT: &str = "deadline exceeded";
 const DISPATCH_ID: &str = "output-limit-dispatch";
+const EXIT_TRAILER: &str = "Exit code: 7";
+const SECRET_LABEL: &str = "secret cancellation token label";
+const REPLACEMENT: &str = "replacement first\nreplacement second";
+const REPLACEMENT_TRAILER: &str = "Exit code: 3";
 const SOURCE: &str = r#"
 maki.api.register_tool({
     name = "limited", description = "limits output", schema = {
         type = "object", properties = {
             mode = { type = "string" }, body = { type = "string" },
             trailer = { type = "string" }, is_error = { type = "boolean" }, max_lines = { type = "integer" },
-            deadline = { type = "integer" },
+            deadline = { type = "integer" }, max_bytes = { type = "integer" },
+            label = { type = "string" },
         },
     },
     handler = function(input, ctx)
         if input.deadline then ctx:set_deadline(input.deadline) end
         maki.ui.flash(input.mode .. ":ready")
-        local limits = { max_lines = input.max_lines, trailer = input.trailer }
+        local limits = { max_lines = input.max_lines, max_bytes = input.max_bytes,
+            trailer = input.trailer, label = input.label }
         if input.mode == "deferred" then
             return { llm_output = input.body, output_limits = limits, is_error = input.is_error }
         end
@@ -97,7 +105,155 @@ impl ToolHook for OutputHook {
             let body = value[OUTPUT_TEXT].as_str().unwrap();
             self.0.send(body.to_owned()).unwrap();
             value[OUTPUT_TEXT] = Value::String(body.replace(SECRET_TRAILER, REDACTED_TRAILER));
+            if let Some(trailer) = value[OUTPUT_TRAILER].as_str() {
+                value[OUTPUT_TRAILER] =
+                    Value::String(trailer.replace(SECRET_TRAILER, REDACTED_TRAILER));
+            }
             Verdict::Replaced(value)
+        })
+    }
+}
+
+#[test_case(REPLACEMENT, None, false, REPLACEMENT, None; "same_line_count_replacement")]
+#[test_case(REPLACEMENT, Some(REPLACEMENT_TRAILER), false, REPLACEMENT, None; "stale_original_field")]
+#[test_case(REPLACEMENT, Some("redacted exit"), false, REPLACEMENT, None; "metadata_cannot_reintroduce_missing_trailer")]
+#[test_case("replacement first\nredacted exit", None, false, "replacement first\nredacted exit", None; "implicit_changed_trailer")]
+#[test_case("replacement first\nredacted exit", Some("redacted exit"), false, "replacement first", Some("redacted exit"); "explicit_changed_trailer")]
+#[test_case("replacement first\nredacted exit", Some("mismatch"), false, "replacement first\nredacted exit", None; "mismatched_changed_trailer")]
+#[test_case("replacement first\nredacted exit", Some(""), false, "replacement first\nredacted exit", None; "empty_trailer")]
+#[test_case("replacement first\nExit code: 3", Some(REPLACEMENT_TRAILER), false, "replacement first", Some(REPLACEMENT_TRAILER); "body_only_redaction")]
+#[test_case("replacement first\nExit code: 3", None, false, "replacement first\nExit code: 3", None; "original_suffix_without_metadata")]
+#[test_case("replacement first\nreplacement second\nExit code: 3", Some(REPLACEMENT_TRAILER), false, REPLACEMENT, Some(REPLACEMENT_TRAILER); "body_restructured_original_suffix")]
+#[test_case("replacement first\nprefixredacted exit", Some("redacted exit"), false, "replacement first\nprefixredacted exit", None; "changed_suffix_without_boundary")]
+#[test_case(REPLACEMENT, None, true, "body", Some(REPLACEMENT_TRAILER); "unchanged_verdict")]
+fn replacement_trailer_protection_requires_terminal_provenance(
+    text: &'static str,
+    trailer: Option<&str>,
+    unchanged: bool,
+    saved_body: &str,
+    protected: Option<&str>,
+) {
+    for mode in ["async", "deferred"] {
+        for budget in [0, 1] {
+            for null_trailer in [false, true] {
+                let (registry, _host) = host();
+                registry.set_hook(ReplacementHook {
+                    text,
+                    trailer: trailer
+                        .map(|trailer| json!(trailer))
+                        .or_else(|| null_trailer.then_some(Value::Null)),
+                    unchanged,
+                });
+                let mut gate = Gate::new();
+                smol::block_on(async {
+                    let ctx = dispatch_ctx(&registry, &gate);
+                    let input = json!({
+                        "mode": mode, "body": "body", "trailer": REPLACEMENT_TRAILER,
+                        "max_lines": budget, "max_bytes": budget,
+                    });
+                    let caller = smol::spawn(async move {
+                        tool_dispatch::run(
+                            DISPATCH_ID.to_owned(),
+                            "limited",
+                            &input,
+                            &ctx,
+                            CallOrigin::Nested,
+                        )
+                        .await
+                    });
+                    checked(gate.entered.recv_async()).await.unwrap();
+                    gate.release.release();
+                    let done = checked(caller).await;
+                    assert_eq!(gate.saved_bodies(), vec![saved_body.to_owned()]);
+                    let output = done.output.as_text();
+                    assert!(output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+                    if let Some(trailer) = protected {
+                        assert!(output.ends_with(trailer), "{output}");
+                    } else {
+                        assert!(!output.contains(text), "{output}");
+                        assert!(!output.ends_with(REPLACEMENT_TRAILER), "{output}");
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[test_case(true, false; "explicit_trailer_redaction")]
+#[test_case(false, false; "stale_original_trailer")]
+#[test_case(false, true; "removed_trailer_field")]
+fn lua_output_slot_trailer_metadata_survives_conversion(
+    update_trailer: bool,
+    remove_trailer: bool,
+) {
+    let (registry, host) = host();
+    let source = format!(
+        r#"
+maki.api.set_slot("tool.limited.output", function(prev, out, ctx)
+    assert(out.trailer == "secret cancellation token")
+    out.text = out.text:gsub("secret cancellation token", "[redacted cancellation token]")
+    if {update_trailer} then
+        out.trailer = "[redacted cancellation token]"
+    end
+    if {remove_trailer} then out.trailer = nil end
+    return prev(out, ctx)
+end)
+"#
+    );
+    host.load_source("trailer_redactor", &source).unwrap();
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        let caller = dispatch(
+            dispatch_ctx(&registry, &gate),
+            "deferred",
+            SECRET_TRAILER,
+            false,
+        );
+        checked(gate.entered.recv_async()).await.unwrap();
+        gate.release.release();
+        let done = checked(caller).await;
+        let output = done.output.as_text();
+        assert!(!output.contains(SECRET_TRAILER), "{output}");
+        if update_trailer {
+            assert_eq!(gate.saved_bodies(), vec![BODY.to_owned()]);
+            assert!(output.ends_with(REDACTED_TRAILER), "{output}");
+        } else {
+            assert_eq!(
+                gate.saved_bodies(),
+                vec![format!("{BODY}\n{REDACTED_TRAILER}")]
+            );
+            assert!(!output.contains(REDACTED_TRAILER), "{output}");
+        }
+    });
+}
+
+struct ReplacementHook {
+    text: &'static str,
+    trailer: Option<Value>,
+    unchanged: bool,
+}
+
+impl ToolHook for ReplacementHook {
+    fn wraps(&self, tool: &str, stage: HookStage) -> bool {
+        tool == "limited" && stage == HookStage::Output
+    }
+
+    fn run<'a>(
+        &'a self,
+        _stage: HookStage,
+        value: Value,
+        _call: &'a HookCall<'a>,
+    ) -> BoxFuture<'a, Verdict> {
+        Box::pin(async move {
+            assert_eq!(value[OUTPUT_TRAILER], REPLACEMENT_TRAILER);
+            if self.unchanged {
+                return Verdict::Unchanged;
+            }
+            let mut replacement = json!({ OUTPUT_TEXT: self.text });
+            if let Some(trailer) = &self.trailer {
+                replacement[OUTPUT_TRAILER] = trailer.clone();
+            }
+            Verdict::Replaced(replacement)
         })
     }
 }
@@ -577,8 +733,57 @@ fn output_hook_redacts_trailer_before_offloading(mode: &str, is_error: bool) {
         let saved = gate.saved_bodies();
         assert_eq!(saved.len(), 1);
         assert!(saved[0].contains(BODY));
-        assert!(output.contains(REDACTED_TRAILER) || saved[0].contains(REDACTED_TRAILER));
+        assert!(output.ends_with(REDACTED_TRAILER), "{output}");
         assert!(!saved[0].contains(SECRET_TRAILER), "{}", saved[0]);
+    });
+}
+
+#[test_case("async", 0; "immediate_zero")]
+#[test_case("async", 1; "immediate_tiny")]
+#[test_case("deferred", 0; "deferred_zero")]
+#[test_case("deferred", 1; "deferred_tiny")]
+fn hooked_trailers_and_labels_survive_fresh_and_deduplicated_limits(mode: &str, budget: usize) {
+    let (registry, _host) = host();
+    let (seen_tx, seen) = flume::unbounded();
+    registry.set_hook(OutputHook(seen_tx));
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        for notice in [OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX] {
+            let ctx = dispatch_ctx(&registry, &gate);
+            let input = json!({
+                "mode": mode, "body": format!("{BODY}\n{SECRET_TRAILER}"),
+                "trailer": EXIT_TRAILER, "is_error": true,
+                "label": SECRET_LABEL, "max_lines": budget, "max_bytes": budget,
+            });
+            let caller = smol::spawn(async move {
+                tool_dispatch::run(
+                    DISPATCH_ID.to_owned(),
+                    "limited",
+                    &input,
+                    &ctx,
+                    CallOrigin::Nested,
+                )
+                .await
+            });
+            checked(seen.recv_async()).await.unwrap();
+            if notice == OFFLOAD_FOOTER_PREFIX {
+                checked(gate.entered.recv_async()).await.unwrap();
+                gate.release.release();
+            }
+            let done = checked(caller).await;
+            let output = done.output.as_text();
+            assert!(output.contains(notice), "{output}");
+            assert!(output.ends_with(EXIT_TRAILER), "{output}");
+            assert!(!output.contains(SECRET_TRAILER), "{output}");
+            assert!(!output.contains(SECRET_LABEL), "{output}");
+            if mode == "deferred" {
+                assert!(done.is_error);
+            }
+        }
+        let saved = gate.saved_bodies();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].contains(REDACTED_TRAILER));
+        assert!(!saved[0].contains(SECRET_TRAILER));
     });
 }
 
