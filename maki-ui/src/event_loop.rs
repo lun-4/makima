@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -482,6 +482,66 @@ fn collect_heartbeat(
     match timeout {
         Some(timeout) => completion_rx.recv_timeout(timeout).ok(),
         None => completion_rx.try_recv().ok(),
+    }
+}
+
+struct RenewingDeletionLease {
+    lease: Arc<Mutex<ClaimedSessionLock>>,
+    wake: flume::Sender<Option<flume::Sender<()>>>,
+    done: flume::Receiver<()>,
+}
+
+impl RenewingDeletionLease {
+    fn new(lease: ClaimedSessionLock) -> Self {
+        let lease = Arc::new(Mutex::new(lease));
+        let worker_lease = Arc::clone(&lease);
+        let (wake, wake_rx) = flume::unbounded::<Option<flume::Sender<()>>>();
+        let (done_tx, done) = flume::bounded(1);
+        std::thread::spawn(move || {
+            let mut ack: Option<flume::Sender<()>> = None;
+            loop {
+                match worker_lease
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .heartbeat()
+                {
+                    Ok(session_lock::LockBeat::Lost) => break,
+                    Err(error) => warn!(%error, "pending deletion heartbeat failed"),
+                    Ok(_) => {}
+                }
+                if let Some(ack) = ack.take() {
+                    let _ = ack.send(());
+                }
+                match wake_rx.recv_timeout(session_lock::HEARTBEAT_INTERVAL) {
+                    Ok(Some(reply)) => ack = Some(reply),
+                    Err(flume::RecvTimeoutError::Timeout) => {}
+                    Ok(None) | Err(flume::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        Self { lease, wake, done }
+    }
+
+    fn publication_guard(&self) -> session_lock::SessionPublicationGuard {
+        self.lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publication_guard()
+    }
+
+    #[cfg(test)]
+    fn renew(&self) {
+        let (reply, done) = flume::bounded(1);
+        self.wake.send(Some(reply)).unwrap();
+        done.recv_timeout(AGENT_SHUTDOWN_TIMEOUT).unwrap();
+    }
+}
+
+impl Drop for RenewingDeletionLease {
+    fn drop(&mut self) {
+        let _ = self.wake.send(None);
+        let _ = self.done.recv_timeout(AGENT_SHUTDOWN_TIMEOUT);
     }
 }
 
@@ -3148,9 +3208,6 @@ impl<'t> EventLoop<'t> {
                 })
                 .detach();
             }
-            // Deletes run on the storage writer thread after any queued
-            // flushes, so the loop never blocks on disk and a queued save
-            // cannot resurrect the files.
             SessionRequest::Delete { id } => {
                 let id = match parse_session_id(&id) {
                     Ok(id) => id,
@@ -3159,28 +3216,76 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
-                if let Some(i) = self.position(id) {
+                let mut runtime = if let Some(i) = self.position(id) {
                     if i == self.focused {
                         let _ = reply_tx.send(Err(DELETE_FOCUSED_ERR.into()));
                         return;
                     }
-                    let rt = self.remove_runtime(i);
-                    let coordinator = rt.coordinator.clone();
-                    rt.handles.shutdown().detach();
-                    smol::spawn(async move {
-                        let _ = coordinator.close().await;
-                    })
-                    .detach();
+                    let session_lock = self.sessions[i].session_lock.take();
+                    let mut runtime = self.remove_runtime(i);
+                    runtime.session_lock = session_lock;
+                    Some(runtime)
+                } else {
+                    None
+                };
+                let store = runtime
+                    .as_ref()
+                    .and_then(|rt| rt.handles.offload.as_ref())
+                    .cloned();
+                if let Some(store) = &store {
+                    store.request_close();
                 }
-                self.ctx.storage_writer.delete(id, move |res| {
-                    let reply = match res {
-                        Ok(()) | Err(SessionError::Storage(StorageError::NotFound(_))) => {
+                let storage_writer = Arc::clone(&self.ctx.storage_writer);
+                let sessions_dir = self.ctx.sessions_dir.clone();
+                smol::spawn(async move {
+                    let session_lock = runtime.as_mut().and_then(|rt| rt.session_lock.take());
+                    let lease = smol::unblock(move || {
+                        match settle_lock_state(session_lock, AGENT_SHUTDOWN_TIMEOUT) {
+                            LockSettlement::Held(lease) => Ok(lease),
+                            LockSettlement::None => claim_lock(&sessions_dir, &id),
+                            LockSettlement::Lost | LockSettlement::TimedOut => {
+                                Err(eyre!(LOCK_LOST_MSG))
+                            }
+                        }
+                    })
+                    .await;
+                    let lease = match lease {
+                        Ok(lease) => RenewingDeletionLease::new(lease),
+                        Err(error) => {
+                            if let Some(rt) = runtime {
+                                let shutdown = rt.handles.shutdown();
+                                let _ = rt.coordinator.close().await;
+                                shutdown.await;
+                            }
+                            let _ = reply_tx.send(Err(error.to_string()));
+                            return;
+                        }
+                    };
+                    if let Some(rt) = runtime {
+                        let shutdown = rt.handles.shutdown();
+                        let _ = rt.coordinator.close().await;
+                        shutdown.await;
+                    }
+                    let (lease, guard) = smol::unblock(move || {
+                        let guard = lease.publication_guard();
+                        (lease, guard)
+                    })
+                    .await;
+                    let (done_tx, done_rx) = flume::bounded(1);
+                    storage_writer.delete_guarded(id, guard, store, move |res| {
+                        let _ = done_tx.send(res);
+                    });
+                    let reply = match done_rx.recv_async().await {
+                        Ok(Ok(())) | Ok(Err(SessionError::Storage(StorageError::NotFound(_)))) => {
                             Ok(json!(true))
                         }
-                        Err(e) => Err(e.to_string()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(error) => Err(error.to_string()),
                     };
+                    smol::unblock(move || drop(lease)).await;
                     let _ = reply_tx.send(reply);
-                });
+                })
+                .detach();
             }
             SessionRequest::Live => {
                 let list: Vec<_> = self
@@ -4464,12 +4569,7 @@ impl<'t> EventLoop<'t> {
             smol::block_on(h.shutdown());
         }
         let mcp_shutdown_ms = lap();
-        match Arc::try_unwrap(self.ctx.storage_writer) {
-            Ok(writer) => writer.shutdown(AGENT_SHUTDOWN_TIMEOUT),
-            Err(_) => {
-                warn!("storage writer has outstanding references, skipping graceful shutdown")
-            }
-        }
+        self.ctx.storage_writer.shutdown(AGENT_SHUTDOWN_TIMEOUT);
         let storage_drain_ms = lap();
         for (id, lease) in session_leases {
             if let Err(error) = lease.release() {
@@ -6432,6 +6532,326 @@ mod tests {
         AppSession::delete(id, &storage).unwrap();
         assert!(!artifact.exists());
         assert!(!expected.exists());
+    }
+
+    struct GatedDiskBackend {
+        dir: PathBuf,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl OffloadBackend for GatedDiskBackend {
+        fn matches(&self, name: &str, expected: &[u8]) -> io::Result<bool> {
+            Ok(std::fs::read(self.path(name))? == expected)
+        }
+
+        fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            std::fs::create_dir_all(&self.dir)?;
+            std::fs::write(self.path(name), bytes)?;
+            Ok(true)
+        }
+
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            Ok(OffloadSnapshot {
+                names: Vec::new(),
+                total_bytes: 0,
+            })
+        }
+
+        fn remove_all(&self) -> io::Result<()> {
+            match std::fs::remove_dir_all(&self.dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    #[test_case(false; "deletion_completes")]
+    #[test_case(true; "shutdown_drains_unrelated_checkpoint")]
+    fn background_deletion_drains_in_flight_offload_persistence(shutdown: bool) {
+        const BODY: &str = "pending background session output";
+        const EXISTING_BODY: &str = "referenced output retained if deletion is rejected";
+        const ARTIFACT_NAME: &str = "existing-output.txt";
+        const DRAFT: &str = "unrelated checkpoint during pending deletion";
+        with_event_loop(|event_loop| {
+            let mut session = AppSession::new("test-model", &event_loop.session_cwd);
+            let id = session.id;
+            let dir = maki_storage::sessions::offload_dir(&event_loop.ctx.sessions_dir, id);
+            let artifact = dir.join(ARTIFACT_NAME);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&artifact, EXISTING_BODY).unwrap();
+            session.push_message(Message::observation(artifact.display().to_string()));
+            session.save(&event_loop.ctx.storage).unwrap();
+            let (entered_tx, entered_rx) = flume::unbounded();
+            let (release_tx, release_rx) = flume::unbounded();
+            let store = Arc::new(OffloadStore::new(Box::new(GatedDiskBackend {
+                dir: dir.clone(),
+                entered: entered_tx,
+                release: release_rx,
+            })));
+            let prepared = event_loop
+                .ctx
+                .prepare_runtime_with_config(
+                    session,
+                    None,
+                    &event_loop.ctx.permissions,
+                    true,
+                    None,
+                    Some(Arc::clone(&store)),
+                )
+                .unwrap();
+            let lock = claim_lock(&event_loop.ctx.sessions_dir, &id).unwrap();
+            prepared.seed_storage();
+            let runtime = prepared
+                .activate(
+                    &event_loop.ctx.model_slot,
+                    Some(SessionLockState::Held(lock)),
+                )
+                .unwrap();
+            event_loop.push_runtime(runtime);
+            let worker = std::thread::spawn({
+                let store = Arc::clone(&store);
+                move || store.put(BODY)
+            });
+            entered_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+            let (reply_tx, reply_rx) = flume::unbounded();
+            event_loop
+                .handle_session_request(SessionRequest::Delete { id: id.to_string() }, reply_tx);
+            assert!(event_loop.position(id).is_none());
+            assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
+            assert!(reply_rx.is_empty());
+            assert!(AppSession::load(id, &event_loop.ctx.storage).is_ok());
+            assert!(
+                session_lock::claim(&event_loop.ctx.sessions_dir, &id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(std::fs::read_to_string(&artifact).unwrap(), EXISTING_BODY);
+            let mut unrelated_id = None;
+            if shutdown {
+                let mut unrelated = AppSession::new("test-model", &event_loop.session_cwd);
+                unrelated_id = Some(unrelated.id);
+                unrelated.meta.input_draft = Some(DRAFT.into());
+                event_loop.ctx.storage_writer.send(Arc::new(unrelated));
+                event_loop.ctx.storage_writer.shutdown(Duration::ZERO);
+            }
+            release_tx.send(()).unwrap();
+            let saved = worker.join().unwrap().unwrap();
+            let reply = reply_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+            if reply.is_err() {
+                assert!(shutdown);
+                let stored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
+                assert_eq!(
+                    stored.messages()[0].user_text(),
+                    Some(artifact.display().to_string().as_str())
+                );
+                assert_eq!(std::fs::read_to_string(&artifact).unwrap(), EXISTING_BODY);
+                assert_eq!(
+                    std::fs::read_to_string(store.path_of(&saved)).unwrap(),
+                    BODY
+                );
+            } else {
+                assert_eq!(reply, Ok(json!(true)));
+                assert!(AppSession::load(id, &event_loop.ctx.storage).is_err());
+                assert!(!dir.exists());
+            }
+            if let Some(unrelated_id) = unrelated_id {
+                event_loop
+                    .ctx
+                    .storage_writer
+                    .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+                let stored = AppSession::load(unrelated_id, &event_loop.ctx.storage).unwrap();
+                assert_eq!(stored.meta.input_draft.as_deref(), Some(DRAFT));
+            }
+            assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
+        });
+    }
+
+    #[test]
+    fn background_deletion_lease_failure_cancels_and_drains_active_turn() {
+        use maki_agent::actor::ActorLifecycle;
+        use maki_agent::manager::GraphLifecycle;
+
+        const PROMPT: &str = "hold the background turn";
+        const BODY: &str = "retained output after lease failure";
+
+        struct TurnDrop(Arc<AtomicBool>);
+
+        impl Drop for TurnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct GatedProvider {
+            entered: flume::Sender<()>,
+            release: flume::Receiver<()>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Provider for GatedProvider {
+            fn stream_message<'a>(
+                &'a self,
+                _model: &'a Model,
+                _messages: &'a [Message],
+                _system: &'a str,
+                _tools: &'a serde_json::Value,
+                _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+                _opts: maki_providers::RequestOptions,
+                _session_id: Option<&'a SessionRef>,
+            ) -> maki_providers::provider::BoxFuture<
+                'a,
+                Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+            > {
+                Box::pin(async move {
+                    let _turn_drop = TurnDrop(Arc::clone(&self.dropped));
+                    self.entered.send(()).unwrap();
+                    self.release.recv_async().await.unwrap();
+                    std::future::pending().await
+                })
+            }
+
+            fn list_models(
+                &self,
+            ) -> maki_providers::provider::BoxFuture<
+                '_,
+                Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        with_event_loop(|event_loop| {
+            let mut session = AppSession::new("test-model", &event_loop.session_cwd);
+            let id = session.id;
+            session.save(&event_loop.ctx.storage).unwrap();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (_release_tx, release_rx) = flume::bounded(1);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut runtime = event_loop
+                .ctx
+                .spawn_runtime_with_provider(
+                    session,
+                    Some(PreparedProvider {
+                        model: model_named("test-model"),
+                        provider: Arc::new(GatedProvider {
+                            entered: entered_tx,
+                            release: release_rx,
+                            dropped: Arc::clone(&dropped),
+                        }),
+                    }),
+                )
+                .unwrap();
+            let store = Arc::clone(runtime.handles.offload.as_ref().unwrap());
+            let saved = store.put(BODY).unwrap();
+            let artifact = store.path_of(&saved);
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let Some(SessionLockState::Held(lease)) = runtime.session_lock.take() else {
+                panic!("expected held session lock");
+            };
+            let (completion_tx, completion_rx) = flume::bounded(1);
+            assert!(
+                completion_tx
+                    .send(HeartbeatCompletion {
+                        result: Ok(session_lock::LockBeat::Lost),
+                        lease: Some(lease),
+                    })
+                    .is_ok()
+            );
+            runtime.session_lock = Some(SessionLockState::InFlight(completion_rx));
+            let index = event_loop.push_runtime(runtime);
+            event_loop.submit_text(index, PROMPT.into()).unwrap();
+            entered_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+            assert!(actor.snapshot().active_turn.is_some());
+            assert!(!dropped.load(Ordering::Acquire));
+
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            event_loop
+                .handle_session_request(SessionRequest::Delete { id: id.to_string() }, reply_tx);
+            assert!(event_loop.position(id).is_none());
+            assert_eq!(
+                reply_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                Err(LOCK_LOST_MSG.into())
+            );
+            assert!(dropped.load(Ordering::Acquire));
+            let snapshot = actor.snapshot();
+            assert_eq!(snapshot.lifecycle, ActorLifecycle::Shutdown);
+            assert!(snapshot.active_turn.is_none());
+            assert!(matches!(
+                snapshot.latest,
+                Some(TurnOutcome::Cancelled { .. })
+            ));
+            let nodes = manager.snapshot();
+            let root = nodes.iter().find(|node| node.agent_id == root).unwrap();
+            assert_eq!(root.graph_lifecycle, GraphLifecycle::Closed);
+            assert!(AppSession::load(id, &event_loop.ctx.storage).is_ok());
+            assert_eq!(std::fs::read_to_string(&artifact).unwrap(), BODY);
+            assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
+        });
+    }
+
+    #[test_case(false; "renewal_excludes_second_owner")]
+    #[test_case(true; "ownership_loss_preserves_artifacts")]
+    fn pending_deletion_lease_guards_gated_cleanup(lose_ownership: bool) {
+        const BODY: &str = "gated deletion artifact";
+        let temp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let lease = claim_lock(temp.path(), &id).unwrap();
+        let renewing = RenewingDeletionLease::new(lease);
+        let dir = temp.path().join("offload");
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let store = Arc::new(OffloadStore::new(Box::new(GatedDiskBackend {
+            dir: dir.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        })));
+        let worker = std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || store.put(BODY)
+        });
+        entered_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+        store.request_close();
+        let guard = renewing.publication_guard();
+        let cleanup = std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || store.close_and_remove_guarded(&guard)
+        });
+        let held = renewing.lease.lock().unwrap();
+        let path = session_lock::lock_path(temp.path(), &id);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - session_lock::STALE_AFTER * 2)
+            .unwrap();
+        let replacement = if lose_ownership {
+            let replacement = session_lock::claim(temp.path(), &id).unwrap().unwrap();
+            drop(held);
+            Some(replacement)
+        } else {
+            drop(held);
+            renewing.renew();
+            assert!(session_lock::claim(temp.path(), &id).unwrap().is_none());
+            None
+        };
+        release_tx.send(()).unwrap();
+        let saved = worker.join().unwrap().unwrap();
+        let result = cleanup.join().unwrap();
+        assert_eq!(result.is_err(), lose_ownership);
+        assert_eq!(store.path_of(&saved).exists(), lose_ownership);
+        drop(renewing);
+        if let Some(replacement) = replacement {
+            assert!(session_lock::claim(temp.path(), &id).unwrap().is_none());
+            replacement.release().unwrap();
+        }
     }
 
     struct GatedQuotaBackend {

@@ -1701,11 +1701,17 @@ where
         // Backups, not the session: failing to sweep them must not fail a
         // delete whose log is already gone, and their presence alone does not
         // make a session exist.
-        for (sweep, what) in [
-            (dir.join(ARCHIVE_DIR).join(id.to_string()), "archives"),
-            (offload_dir(dir, id), "offloaded tool output"),
+        for (result, what) in [
+            (
+                crate::offload_cleanup::remove(&dir.join(ARCHIVE_DIR).join(id.to_string())),
+                "archives",
+            ),
+            (
+                crate::offload_cleanup::remove(&offload_dir(dir, id)),
+                "offloaded tool output",
+            ),
         ] {
-            if let Err(e) = fs::remove_dir_all(&sweep)
+            if let Err(e) = result
                 && e.kind() != ErrorKind::NotFound
             {
                 warn!(error = %e, session_id = %id, what, "session data remains after delete");
@@ -1743,6 +1749,10 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_dir;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1750,6 +1760,10 @@ mod tests {
 
     type TestSession = Session<Value, Value, Value>;
 
+    #[cfg(any(unix, windows))]
+    const OFFLOAD_SENTINEL: &str = "external offload sentinel";
+    #[cfg(any(unix, windows))]
+    const OFFLOAD_SENTINEL_FILE: &str = "sentinel.txt";
     const LEGACY_HEX_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
     const SONNET_COST: f64 = 0.42;
     const HAIKU_COST: f64 = 0.08;
@@ -2427,6 +2441,64 @@ mod tests {
 
         TestSession::delete_from(session.id, dir).unwrap();
         assert!(!offload.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test_case(true; "offload ancestor")]
+    #[test_case(false; "session leaf")]
+    fn delete_does_not_follow_replaced_offload_directory(ancestor: bool) {
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.save_to(dir).unwrap();
+        let offload = offload_dir(dir, session.id);
+        fs::create_dir_all(&offload).unwrap();
+        fs::write(offload.join(OFFLOAD_SENTINEL_FILE), "local output").unwrap();
+        let replaced = if ancestor {
+            offload.parent().unwrap()
+        } else {
+            &offload
+        };
+        fs::rename(replaced, dir.join("original-offload")).unwrap();
+        let external_leaf = if ancestor {
+            external.path().join(session.id.to_string())
+        } else {
+            external.path().to_owned()
+        };
+        fs::create_dir_all(&external_leaf).unwrap();
+        let sentinel = external_leaf.join(OFFLOAD_SENTINEL_FILE);
+        fs::write(&sentinel, OFFLOAD_SENTINEL).unwrap();
+        symlink_dir(external.path(), replaced).unwrap();
+
+        TestSession::delete_from(session.id, dir).unwrap();
+        assert!(!jsonl_path(dir, session.id).exists());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
+        assert_eq!(fs::read_dir(external_leaf).unwrap().count(), 1);
+        assert!(dir.join("original-offload").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn delete_removes_nested_offload_links_without_following_them() {
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.save_to(dir).unwrap();
+        let offload = offload_dir(dir, session.id);
+        fs::create_dir_all(offload.join("nested")).unwrap();
+        fs::write(offload.join("nested/output.txt"), "local output").unwrap();
+        let sentinel = external.path().join(OFFLOAD_SENTINEL_FILE);
+        fs::write(&sentinel, OFFLOAD_SENTINEL).unwrap();
+        symlink_dir(external.path(), offload.join("nested/link")).unwrap();
+
+        TestSession::delete_from(session.id, dir).unwrap();
+        assert!(!offload.exists());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
+        assert_eq!(fs::read_dir(external.path()).unwrap().count(), 1);
     }
 
     /// A rename with no new messages must survive restart, while a no-op

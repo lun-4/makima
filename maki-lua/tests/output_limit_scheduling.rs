@@ -26,7 +26,8 @@ use test_case::test_case;
 
 const WATCHDOG: Duration = Duration::from_secs(10);
 const FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
-const TIMEOUT_ERROR: &str = "plugin output_limit_scheduling tool limited exceeded timeout (1s)";
+const TIMEOUT_ERROR: &str = "timeout exceeded";
+const CANCELLED_ERROR: &str = "cancelled";
 const BODY: &str = "first\nsecond\nthird\nfourth";
 const OTHER_BODY: &str = "other\nsecond\nthird\nfourth";
 const TRAILER: &str = "[cancelled by user; output above is partial]";
@@ -587,6 +588,158 @@ fn hooked_dispatch_keeps_sibling_responsive_during_finalization(mode: &str) {
         let saved = gate.saved_bodies();
         assert_eq!(saved.len(), 1);
         assert!(saved[0].contains(BODY));
+    });
+}
+
+#[test_case("async", CallOrigin::Nested; "immediate_nested")]
+#[test_case("deferred", CallOrigin::Nested; "deferred_nested")]
+#[test_case("finish", CallOrigin::Nested; "finish_nested")]
+#[test_case("async", CallOrigin::Model; "immediate_model")]
+#[test_case("deferred", CallOrigin::Model; "deferred_model")]
+#[test_case("finish", CallOrigin::Model; "finish_model")]
+fn cancellation_interrupts_filtered_output_persistence(mode: &str, origin: CallOrigin) {
+    let (registry, _host) = host();
+    let (seen_tx, seen) = flume::unbounded();
+    registry.set_hook(OutputHook(seen_tx));
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        let mut ctx = dispatch_ctx(&registry, &gate);
+        ctx.deadline = Deadline::None;
+        let (trigger, cancel) = CancelToken::new();
+        ctx.cancel = cancel;
+        let input = json!({
+            "mode": mode, "body": BODY, "trailer": SECRET_TRAILER,
+            "is_error": false, "max_lines": 0,
+        });
+        let caller = smol::spawn(async move {
+            tool_dispatch::run(DISPATCH_ID.to_owned(), "limited", &input, &ctx, origin).await
+        });
+        checked(gate.entered.recv_async()).await.unwrap();
+        assert_eq!(
+            checked(seen.recv_async()).await.unwrap(),
+            format!("{BODY}\n{SECRET_TRAILER}")
+        );
+        trigger.cancel();
+        let done = checked(caller).await;
+        let output = done.output.as_text();
+        assert!(done.is_error, "{output}");
+        assert!(!output.contains(BODY), "{output}");
+        assert!(!output.contains(SECRET_TRAILER), "{output}");
+        assert!(!output.contains(OFFLOAD_POINTER_PREFIX), "{output}");
+        assert!(!output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+        assert!(gate.saved_bodies().is_empty());
+        dispatched_sibling(&dispatch_ctx(&registry, &gate)).await;
+        gate.release.release();
+        checked(gate.created.recv_async()).await.unwrap();
+        let saved = gate.saved_bodies();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].contains(BODY));
+        assert!(!saved[0].contains(SECRET_TRAILER));
+    });
+}
+
+#[test_case("async", CallOrigin::Nested, false; "immediate_nested")]
+#[test_case("deferred", CallOrigin::Nested, false; "deferred_nested")]
+#[test_case("finish", CallOrigin::Nested, false; "finish_nested")]
+#[test_case("async", CallOrigin::Model, false; "immediate_model")]
+#[test_case("deferred", CallOrigin::Model, false; "deferred_model")]
+#[test_case("finish", CallOrigin::Model, false; "finish_model")]
+#[test_case("deferred", CallOrigin::Nested, true; "with_deadline")]
+fn cancellation_interrupts_unhooked_output_persistence(
+    mode: &str,
+    origin: CallOrigin,
+    deadline: bool,
+) {
+    let (registry, _host) = host();
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        let mut ctx = dispatch_ctx(&registry, &gate);
+        ctx.deadline = if deadline {
+            Deadline::after(WATCHDOG)
+        } else {
+            Deadline::None
+        };
+        let (trigger, cancel) = CancelToken::new();
+        ctx.cancel = cancel;
+        let input = json!({
+            "mode": mode, "body": BODY, "trailer": TRAILER,
+            "is_error": false, "max_lines": 0,
+        });
+        let caller = smol::spawn(async move {
+            tool_dispatch::run(DISPATCH_ID.to_owned(), "limited", &input, &ctx, origin).await
+        });
+        checked(gate.entered.recv_async()).await.unwrap();
+        trigger.cancel();
+        let done = checked(caller).await;
+        assert!(done.is_error);
+        let output = done.output.as_text();
+        assert!(output.ends_with(CANCELLED_ERROR), "{output}");
+        assert!(!output.contains(BODY), "{output}");
+        assert!(!output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+        assert!(gate.saved_bodies().is_empty());
+        dispatched_sibling(&dispatch_ctx(&registry, &gate)).await;
+        gate.release.release();
+        checked(gate.created.recv_async()).await.unwrap();
+        let saved = gate.saved_bodies();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].contains(BODY));
+    });
+}
+
+#[test_case(false, false; "registered_timeout_string")]
+#[test_case(false, true; "registered_timeout_table")]
+#[test_case(true, false; "dynamic_deadline_string")]
+#[test_case(true, true; "dynamic_deadline_table")]
+fn plain_lua_reply_deadline_bounds_lua_output_hook(dynamic: bool, table: bool) {
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    let actions = host.ui_action_rx();
+    let timeout = if dynamic {
+        0
+    } else {
+        FINALIZATION_TIMEOUT.as_secs()
+    };
+    let deadline = if dynamic { "ctx:set_deadline(1)" } else { "" };
+    let reply = if table {
+        "{ llm_output = input.body }"
+    } else {
+        "input.body"
+    };
+    host.load_source(
+        "plain_reply_deadline",
+        &format!(
+            r#"
+        maki.api.register_tool({{
+            name = "limited", timeout = {timeout}, description = "plain reply deadline",
+            schema = {{ type = "object", properties = {{ body = {{ type = "string" }} }} }},
+            handler = function(input, ctx)
+                {deadline}
+                return {reply}
+            end,
+        }})
+        maki.api.set_slot("tool.limited.output", function(prev, out, ctx)
+            maki.ui.flash("output-hook:entered")
+            maki.async.await(1, function(callback) end)
+            return prev(out, ctx)
+        end)
+        "#
+        ),
+    )
+    .unwrap();
+    let gate = Gate::new();
+    smol::block_on(async {
+        let caller = dispatch(dispatch_ctx(&registry, &gate), "plain", TRAILER, false);
+        flash(&actions, "output-hook:entered").await;
+        let done = checked(caller).await;
+        let output = done.output.as_text();
+        assert!(done.is_error, "{output}");
+        assert!(!output.contains(BODY), "{output}");
+        assert!(
+            output.contains(TIMEOUT_FRAGMENT) || output.contains(DEADLINE_FRAGMENT),
+            "{output}"
+        );
+        assert!(gate.saved_bodies().is_empty());
+        assert!(gate.entered.try_recv().is_err());
     });
 }
 

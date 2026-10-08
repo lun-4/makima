@@ -7419,6 +7419,88 @@ fn cancelled_bash_partial_output_hook_does_not_offload_raw_output() {
     );
 }
 
+#[cfg(unix)]
+const BASH_TIMEOUT_SENTINEL: &str = "timeout-cleanup-sentinel";
+#[cfg(unix)]
+const BASH_TIMEOUT_REDACTED: &str = "filtered-timeout-cleanup";
+#[cfg(unix)]
+const BASH_TIMEOUT_TRAILER: &str = "[timed out after 1s; output above is partial]";
+
+#[cfg(unix)]
+#[test_case::test_case(false, false, false; "direct_timeout_partial")]
+#[test_case::test_case(true, false, false; "lua_hook_timeout_partial")]
+#[test_case::test_case(true, true, false; "lua_hook_timeout_partial_offloaded")]
+#[test_case::test_case(true, true, true; "lua_hook_cleanup_expiry_fails_closed")]
+fn timed_out_bash_keeps_partial_output(hooked: bool, offloaded: bool, blocked: bool) {
+    let (reg, host) = if offloaded {
+        builtins_host_with_zero_output_limit("bash", ZERO_LINES_OPTION)
+    } else {
+        builtins_host()
+    };
+    if hooked {
+        host.load_source(
+            "timeout_redactor",
+            &format!(
+                r#"
+            maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
+                assert(out.text:find("{BASH_TIMEOUT_SENTINEL}", 1, true))
+                assert(out.trailer == "{BASH_TIMEOUT_TRAILER}")
+                if {blocked} then maki.async.await(1, function(callback) end) end
+                local sentinel = ("{BASH_TIMEOUT_SENTINEL}"):gsub("%-", "%%-")
+                out.text = out.text:gsub(sentinel, "{BASH_TIMEOUT_REDACTED}")
+                return prev(out, ctx)
+            end)
+        "#
+            ),
+        )
+        .unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    let command = format!("printf '%s\\n' '{BASH_TIMEOUT_SENTINEL}'; kill -STOP $$");
+    let done = smol::block_on(futures_lite::future::race(
+        tool_dispatch::run(
+            OFFLOAD_HOOK_ID.to_owned(),
+            "bash",
+            &json!({ "command": command, "timeout": 1 }),
+            &ctx,
+            CallOrigin::Nested,
+        ),
+        async {
+            smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
+            panic!("timed out bash dispatch did not settle");
+        },
+    ));
+    let output = done.output.as_text();
+    assert!(done.is_error, "{output}");
+    if blocked {
+        assert!(!output.contains(BASH_TIMEOUT_SENTINEL), "{output}");
+        assert!(!output.contains(BASH_TIMEOUT_REDACTED), "{output}");
+        assert!(!output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        return;
+    }
+    assert!(output.ends_with(BASH_TIMEOUT_TRAILER), "{output}");
+    let expected = if hooked {
+        BASH_TIMEOUT_REDACTED
+    } else {
+        BASH_TIMEOUT_SENTINEL
+    };
+    if offloaded {
+        assert!(output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(files.len(), 1);
+        let saved = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
+        assert!(saved.contains(expected), "{saved}");
+        assert!(!saved.contains(BASH_TIMEOUT_SENTINEL), "{saved}");
+    } else {
+        assert!(output.contains(expected), "{output}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
 #[test]
 fn immediate_output_limits_with_state_fail_without_artifact() {
     let (reg, host) = builtins_host();

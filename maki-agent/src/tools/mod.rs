@@ -229,6 +229,7 @@ pub const WRITE_TOOL_NAME: &str = "write";
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
+pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Deadline {
@@ -441,6 +442,12 @@ pub enum QuestionMode {
     Headless,
 }
 
+pub struct OutputFinalization {
+    pub limits: Option<offload::OutputLimitOptions>,
+    pub deadline: Option<Instant>,
+    pub terminal_cleanup: bool,
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub provider: Arc<dyn Provider>,
@@ -489,7 +496,7 @@ pub struct ToolContext {
     /// Where output past the limits is saved, shared by every agent in the
     /// session. `None` without a session, and tools then cut output instead.
     pub offload: Option<Arc<offload::OffloadStore>>,
-    pub pending_output_limits: Option<Arc<Mutex<Option<offload::OutputLimitOptions>>>>,
+    pub pending_output_limits: Option<Arc<Mutex<Option<OutputFinalization>>>>,
     /// Logical owner chain of the dispatch that produced this context: the
     /// tokens of every ancestor dispatch, root first. Empty for root agent
     /// contexts; [`crate::agent::tool_dispatch::run`] appends its own token
@@ -510,7 +517,13 @@ impl ToolContext {
             (None, Deadline::At(deadline)) => Some(deadline),
             (current, Deadline::None) => current,
         };
-        *pending.lock().unwrap_or_else(|error| error.into_inner()) = Some(opts);
+        let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let metadata = pending.get_or_insert_with(|| OutputFinalization {
+            limits: None,
+            deadline: opts.deadline,
+            terminal_cleanup: false,
+        });
+        metadata.limits = Some(opts);
         true
     }
 

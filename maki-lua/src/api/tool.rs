@@ -16,9 +16,10 @@ use maki_agent::tools::offload::OutputLimits;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    is_tool_enabled, timeout_annotation,
+    BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+    OutputFinalization, ParseError, PermissionScopes, TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT,
+    ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation, is_tool_enabled,
+    timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
@@ -58,6 +59,7 @@ const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const OUTPUT_TIMEOUT_ERR: &str = "timeout exceeded";
+const OUTPUT_CANCELLED_ERR: &str = "cancelled";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const TUI_ONLY_ERR: &str = "register_command: 'tui_only' must be a boolean";
 const ARGUMENT_HINT_ERR: &str = "register_command: 'argument_hint' must be a string";
@@ -558,33 +560,11 @@ impl ToolInvocation for LuaToolInvocation {
                 return Err("lua thread disconnected".to_string()).into();
             }
 
-            let recv = async {
-                Some(match reply_rx.recv_async().await {
-                    Ok(reply) => {
-                        let runtime_deadline = reply.deadline.filter(|deadline| {
-                            reply.has_output_limits()
-                                && invocation_deadline.is_none_or(|current| *deadline < current)
-                        });
-                        let finalize = reply.finalize(ctx);
-                        let reply = match runtime_deadline {
-                            Some(deadline) => {
-                                futures_lite::future::race(finalize, async {
-                                    smol::Timer::at(deadline).await;
-                                    ToolCallReply::err(OUTPUT_TIMEOUT_ERR)
-                                })
-                                .await
-                            }
-                            None => finalize.await,
-                        };
-                        Ok(reply)
-                    }
-                    Err(error) => Err(error),
-                })
-            };
+            let recv = async { Some(reply_rx.recv_async().await) };
             let result = match invocation_deadline {
                 Some(deadline) => {
                     futures_lite::future::race(recv, async move {
-                        smol::Timer::at(deadline).await;
+                        smol::Timer::at(deadline + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT).await;
                         None
                     })
                     .await
@@ -601,7 +581,54 @@ impl ToolInvocation for LuaToolInvocation {
                 ))
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
-                Some(Ok(reply)) => {
+                Some(Ok(mut reply)) => {
+                    reply.deadline = if reply.timeout_cleanup {
+                        Some(Instant::now() + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT)
+                    } else {
+                        match (reply.deadline, invocation_deadline) {
+                            (Some(runtime), Some(invocation)) => Some(runtime.min(invocation)),
+                            (runtime, invocation) => runtime.or(invocation),
+                        }
+                    };
+                    let limiting = reply.has_output_limits();
+                    let already_cancelled = ctx.cancel.is_cancelled();
+                    let finalization_deadline = if limiting && already_cancelled {
+                        Some(Instant::now() + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT)
+                    } else {
+                        reply.deadline.filter(|_| limiting)
+                    };
+                    if !limiting {
+                        reply = reply.finalize(ctx).await;
+                    } else {
+                        let finalize = reply.finalize(ctx);
+                        let finalize = async {
+                            match finalization_deadline {
+                                Some(deadline) if deadline <= Instant::now() => {
+                                    ToolCallReply::err(OUTPUT_TIMEOUT_ERR)
+                                }
+                                Some(deadline) => {
+                                    futures_lite::future::race(finalize, async {
+                                        smol::Timer::at(deadline).await;
+                                        ToolCallReply::err(OUTPUT_TIMEOUT_ERR)
+                                    })
+                                    .await
+                                }
+                                None => finalize.await,
+                            }
+                        };
+                        if already_cancelled {
+                            reply = finalize.await;
+                        } else {
+                            let finalized = ctx.cancel.race(finalize).await;
+                            reply = match finalized {
+                                _ if ctx.cancel.is_cancelled() => {
+                                    ToolCallReply::err(OUTPUT_CANCELLED_ERR)
+                                }
+                                Ok(reply) => reply,
+                                Err(reason) => ToolCallReply::err(reason),
+                            };
+                        }
+                    }
                     if let Some(ref id) = ctx.tool_use_id {
                         if let Some(live_buf) = reply.live_buf {
                             crate::runtime::send_render_event(
@@ -2176,6 +2203,7 @@ pub(crate) struct ToolCallReply {
     pub state: Option<Value>,
     output_limits: Option<ParsedOutputLimits>,
     pub(crate) deadline: Option<Instant>,
+    pub(crate) timeout_cleanup: bool,
 }
 
 impl ToolCallReply {
@@ -2243,6 +2271,7 @@ impl ToolCallReply {
             state,
             output_limits,
             deadline: None,
+            timeout_cleanup: false,
         }
     }
 
@@ -2252,22 +2281,19 @@ impl ToolCallReply {
 
     async fn finalize(mut self, ctx: &ToolContext) -> Self {
         let mut ctx = ctx.clone();
-        if let Some(deadline) = self.deadline {
-            ctx.deadline = match ctx.deadline {
-                Deadline::At(current) => Deadline::At(current.min(deadline)),
-                Deadline::None => Deadline::At(deadline),
-            };
-        }
-        if let Some(pending) = &ctx.pending_output_limits
-            && let Some(opts) = pending
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_mut()
-        {
-            opts.deadline = match ctx.deadline {
-                Deadline::At(deadline) => Some(deadline),
-                Deadline::None => None,
-            };
+        ctx.deadline = self.deadline.map_or(Deadline::None, Deadline::At);
+        if let Some(pending) = &ctx.pending_output_limits {
+            let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+            let metadata = pending.get_or_insert_with(|| OutputFinalization {
+                limits: None,
+                deadline: self.deadline,
+                terminal_cleanup: self.timeout_cleanup,
+            });
+            metadata.deadline = self.deadline;
+            metadata.terminal_cleanup = self.timeout_cleanup;
+            if let Some(opts) = metadata.limits.as_mut() {
+                opts.deadline = self.deadline;
+            }
         }
         if let Some(opts) = self.output_limits.take() {
             if ctx.pending_output_limits.is_some() {
@@ -2317,6 +2343,7 @@ impl ToolCallReply {
             state: None,
             output_limits: None,
             deadline: None,
+            timeout_cleanup: false,
         }
     }
 

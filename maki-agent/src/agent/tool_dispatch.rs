@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -133,15 +134,32 @@ pub async fn run(
         .map(|_| Arc::new(Mutex::new(None)));
     let mut done = run_inner(resolved, id, &input, &execution_ctx, origin).await;
     let mcp_succeeded = is_mcp && !done.is_error;
-    let mut pending = execution_ctx
+    let finalization = execution_ctx
         .pending_output_limits
         .as_ref()
-        .and_then(|pending| {
-            pending
-                .lock()
+        .and_then(|slot| {
+            slot.lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .take()
         });
+    let output_deadline = finalization.as_ref().map_or(ctx.deadline, |metadata| {
+        let deadline = metadata.deadline.map_or(Deadline::None, Deadline::At);
+        if metadata.terminal_cleanup {
+            deadline
+        } else {
+            deadline.min(ctx.deadline)
+        }
+    });
+    let mut output_ctx = ctx.clone();
+    output_ctx.deadline = output_deadline;
+    let output_hook = hook.as_ref().map(|hook| Hook {
+        installed: hook.installed.clone(),
+        ctx: &output_ctx,
+        tool: hook.tool,
+        origin: hook.origin,
+        authority: hook.authority,
+    });
+    let mut pending = finalization.and_then(|metadata| metadata.limits);
     if pending.is_some() && done.output.filterable_text_mut().is_none() {
         pending = None;
         done.output = ToolOutput::Plain(UNFILTERABLE_LIMITED_OUTPUT.into());
@@ -152,13 +170,13 @@ pub async fn run(
     {
         opts.prepare_for_output_hook(text);
     }
-    let denied = if let Some(hook) = &hook {
-        hook.filter_output(
-            &mut done,
-            pending.as_ref().and_then(|opts| opts.deadline),
-            pending.as_mut(),
-        )
-        .await
+    let deadline = match output_deadline {
+        Deadline::At(deadline) => Some(deadline),
+        Deadline::None => pending.as_ref().and_then(|opts| opts.deadline),
+    };
+    let denied = if let Some(hook) = &output_hook {
+        hook.filter_output(&mut done, deadline, pending.as_mut())
+            .await
     } else {
         false
     };
@@ -167,23 +185,15 @@ pub async fn run(
         && let Some(text) = done.output.filterable_text_mut()
     {
         opts.recover_filtered_trailer(text);
-        let deadline = opts.deadline;
-        let apply = opts.apply(std::mem::take(text), ctx.offload.clone());
-        let limited = match deadline {
-            Some(deadline) if deadline <= Instant::now() => None,
-            Some(deadline) => {
-                futures_lite::future::race(async { Some(apply.await) }, async {
-                    smol::Timer::at(deadline).await;
-                    None
-                })
-                .await
-            }
-            None => Some(apply.await),
+        let deadline = match (deadline, opts.deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
         };
-        match limited {
-            Some(limited) => *text = limited,
-            None => {
-                *text = DEADLINE_EXCEEDED.to_owned();
+        let apply = opts.apply(std::mem::take(text), ctx.offload.clone());
+        match finalize_output(apply, deadline, ctx).await {
+            Ok(limited) => *text = limited,
+            Err(reason) => {
+                *text = reason.to_owned();
                 done.is_error = true;
             }
         }
@@ -202,26 +212,46 @@ pub async fn run(
             limits: OutputLimits::from_config(&ctx.config),
         };
         let apply = opts.apply(text, Some(store));
-        let limited = match ctx.deadline {
-            Deadline::At(deadline) if deadline <= Instant::now() => None,
-            Deadline::At(deadline) => {
-                futures_lite::future::race(async { Some(apply.await) }, async {
-                    smol::Timer::at(deadline).await;
-                    None
-                })
-                .await
-            }
-            Deadline::None => Some(apply.await),
+        let deadline = match ctx.deadline {
+            Deadline::At(deadline) => Some(deadline),
+            Deadline::None => None,
         };
-        match limited {
-            Some(limited) => done.output = ToolOutput::Plain(limited.into()),
-            None => {
-                done.output = ToolOutput::Plain(DEADLINE_EXCEEDED.into());
+        match finalize_output(apply, deadline, ctx).await {
+            Ok(limited) => done.output = ToolOutput::Plain(limited.into()),
+            Err(reason) => {
+                done.output = ToolOutput::Plain(reason.into());
                 done.is_error = true;
             }
         }
     }
     done
+}
+
+async fn finalize_output(
+    apply: impl Future<Output = String>,
+    deadline: Option<Instant>,
+    ctx: &ToolContext,
+) -> Result<String, &'static str> {
+    let result = ctx
+        .cancel
+        .race(async {
+            match deadline {
+                Some(deadline) if deadline <= Instant::now() => Err(DEADLINE_EXCEEDED),
+                Some(deadline) => {
+                    futures_lite::future::race(async { Ok(apply.await) }, async {
+                        smol::Timer::at(deadline).await;
+                        Err(DEADLINE_EXCEEDED)
+                    })
+                    .await
+                }
+                None => Ok(apply.await),
+            }
+        })
+        .await;
+    if ctx.cancel.is_cancelled() {
+        return Err(ERROR_CANCELLED);
+    }
+    result.map_err(|_| ERROR_CANCELLED)?
 }
 
 /// The hook installed on this registry, bound to one call. `None` when nobody
@@ -2506,6 +2536,41 @@ mod tests {
                 store.upgrade().is_some(),
                 "the blocked worker owns the store"
             );
+            gate.release();
+            gate.exited().await;
+            assert!(store.upgrade().is_none());
+            assert_eq!(*saved.lock().unwrap(), text.as_bytes());
+        });
+    }
+
+    #[test_case(CallOrigin::Model; "model")]
+    #[test_case(CallOrigin::Nested; "nested")]
+    fn mcp_offload_cancellation_returns_while_worker_is_blocked(origin: CallOrigin) {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let gate = Gate::new();
+            let text = many_lines();
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = answering_ctx(&text);
+            ctx.offload = Some(Arc::new(OffloadStore::new(Box::new(GatedOffloadBackend {
+                dir: dir.path().to_path_buf(),
+                saved: Arc::clone(&saved),
+                gate: Arc::clone(&gate),
+            }))));
+            let store = Arc::downgrade(ctx.offload.as_ref().unwrap());
+            let (cancel, token) = crate::CancelToken::new();
+            ctx.cancel = token;
+            let input = json!({});
+            let mut call = Box::pin(run(TEST_ID.into(), PROBE_WIRE, &input, &ctx, origin));
+            assert!(futures_lite::future::poll_once(&mut call).await.is_none());
+            gate.entered().await;
+            cancel.cancel();
+            let done = call.await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), ERROR_CANCELLED);
+            assert!(saved.lock().unwrap().is_empty());
+            drop(ctx);
+            assert!(store.upgrade().is_some());
             gate.release();
             gate.exited().await;
             assert!(store.upgrade().is_none());

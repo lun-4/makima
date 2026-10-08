@@ -10,6 +10,7 @@ pub mod intern;
 pub mod lock;
 pub mod log;
 pub mod model;
+mod offload_cleanup;
 pub mod paths;
 pub mod plans;
 pub mod session_lock;

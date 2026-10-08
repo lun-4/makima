@@ -4017,7 +4017,10 @@ fn cancel_hook_reply(
     reason: KillReason,
 ) -> Option<ToolCallReply> {
     fire_cancel_hooks(lua, handle, reason);
-    finish_rx.try_recv().ok()
+    finish_rx.try_recv().ok().map(|mut reply| {
+        reply.timeout_cleanup = matches!(reason, KillReason::Deadline);
+        reply
+    })
 }
 
 /// Handler returned nil, meaning it went async. Polls job events
