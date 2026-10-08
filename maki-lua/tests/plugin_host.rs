@@ -7147,6 +7147,7 @@ fn offload_ctx(
     (ctx, session)
 }
 
+#[cfg(unix)]
 fn only_offloaded_file(dir: &Path) -> PathBuf {
     let mut files = std::fs::read_dir(dir).unwrap();
     let path = files.next().unwrap().unwrap().path();

@@ -728,13 +728,17 @@ fn head_tail(body: &str, budget: Budget) -> Option<String> {
 mod tests {
     use std::collections::BTreeMap;
     #[cfg(unix)]
+    use std::fs;
+    use std::io;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink as symlink_dir};
-    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::Duration;
-    use std::{fs, io};
 
     #[cfg(unix)]
     use maki_storage::id::{MakiId, SessionRef};
