@@ -153,17 +153,9 @@ Declaring no capability does not mean a tool uses none. `batch`,
 reading undeclared as free would hand a plugin everything. Undeclared costs the
 maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
 
-**A layer may wait, within a window.** Chains are async, so a layer can read a
-file or run a job before it decides. It runs inside the call it is filtering, so
-cancelling the call cancels the layer too. Each stage gets whatever the call has
-left of its own deadline, capped at 60 seconds. A layer still running when the
-window closes is dropped, and the call proceeds as if that layer had passed the
-value along.
+A layer may wait within a window. Chains are async, so a layer can read a file or run a job before returning a verdict. Cancelling the call cancels the layer too. Each stage gets the call's remaining deadline, capped at 60 seconds. A layer still running when the window closes is dropped and the result becomes a deadline error.
 
-Cancellation lands differently on the two stages. An input layer cut short stops
-the call, because nothing has run yet and nobody is left to read a result. An
-output layer cut short leaves the output as it found it, since the work is
-already done.
+Cancellation stops an input layer's call before the tool runs. Cancellation during an output layer replaces the output with a cancellation error. The tool's work is already done, but its unfiltered output is not returned or saved.
 
 **A broken layer is skipped.** If a layer throws, the chain continues as if it
 had passed the value along, and the error is logged with the plugin name.

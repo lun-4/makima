@@ -13,9 +13,7 @@ use crate::task_set::TaskSet;
 use crate::tools::hook::{
     Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
 };
-use crate::tools::offload::{
-    DEFAULT_LABEL, LimitOpts, OutputLimitOptions, OutputLimits, PreviewShape, limit_output,
-};
+use crate::tools::offload::{DEFAULT_LABEL, OutputLimitOptions, OutputLimits, PreviewShape};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
     CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
@@ -195,19 +193,33 @@ pub async fn run(
         && let Some(store) = ctx.offload.clone()
     {
         let text = done.output.as_text();
-        let limits = OutputLimits::from_config(&ctx.config);
-        let limited = smol::unblock(move || {
-            let opts = LimitOpts {
-                trailer: None,
-                shape: PreviewShape::Head,
-                label: DEFAULT_LABEL,
-                lines_clipped: false,
-                limits,
-            };
-            limit_output(&text, &opts, Some(&store))
-        })
-        .await;
-        done.output = ToolOutput::Plain(limited.into());
+        let opts = OutputLimitOptions {
+            deadline: None,
+            trailer: None,
+            shape: PreviewShape::Head,
+            label: DEFAULT_LABEL.to_owned(),
+            lines_clipped: false,
+            limits: OutputLimits::from_config(&ctx.config),
+        };
+        let apply = opts.apply(text, Some(store));
+        let limited = match ctx.deadline {
+            Deadline::At(deadline) if deadline <= Instant::now() => None,
+            Deadline::At(deadline) => {
+                futures_lite::future::race(async { Some(apply.await) }, async {
+                    smol::Timer::at(deadline).await;
+                    None
+                })
+                .await
+            }
+            Deadline::None => Some(apply.await),
+        };
+        match limited {
+            Some(limited) => done.output = ToolOutput::Plain(limited.into()),
+            None => {
+                done.output = ToolOutput::Plain(DEADLINE_EXCEEDED.into());
+                done.is_error = true;
+            }
+        }
     }
     done
 }
@@ -1147,6 +1159,7 @@ pub(super) async fn process_tool_calls(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1162,7 +1175,9 @@ mod tests {
     use crate::mcp::tool_names;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
     use crate::template::Vars;
-    use crate::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadStore};
+    use crate::tools::offload::{
+        OFFLOAD_FOOTER_PREFIX, OffloadBackend, OffloadSnapshot, OffloadStore,
+    };
     use crate::tools::registry::{ToolRegistry, ToolSource};
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
@@ -2418,6 +2433,97 @@ mod tests {
             let text = many_lines();
             let done = dispatch(&answering_ctx(&text), PROBE_WIRE, &serde_json::json!({})).await;
             assert_eq!(done.output.as_text(), text);
+        });
+    }
+
+    struct GatedOffloadBackend {
+        dir: PathBuf,
+        saved: Arc<Mutex<Vec<u8>>>,
+        gate: Arc<Gate>,
+    }
+
+    impl OffloadBackend for GatedOffloadBackend {
+        fn matches(&self, _name: &str, expected: &[u8]) -> io::Result<bool> {
+            Ok(*self.saved.lock().unwrap() == expected)
+        }
+
+        fn create_new(&self, _name: &str, bytes: &[u8]) -> io::Result<bool> {
+            *self.saved.lock().unwrap() = bytes.to_vec();
+            Ok(true)
+        }
+
+        fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+            self.gate.entered.send(()).unwrap();
+            self.gate.release_rx.recv().unwrap();
+            Ok(OffloadSnapshot {
+                names: Vec::new(),
+                total_bytes: 0,
+            })
+        }
+
+        fn remove_all(&self) -> io::Result<()> {
+            self.saved.lock().unwrap().clear();
+            Ok(())
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for GatedOffloadBackend {
+        fn drop(&mut self) {
+            self.gate.exited.send(()).ok();
+        }
+    }
+
+    #[test_case(CallOrigin::Model; "model")]
+    #[test_case(CallOrigin::Nested; "nested")]
+    fn mcp_offload_deadline_returns_while_worker_is_blocked(origin: CallOrigin) {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let gate = Gate::new();
+            let text = many_lines();
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = answering_ctx(&text);
+            ctx.offload = Some(Arc::new(OffloadStore::new(Box::new(GatedOffloadBackend {
+                dir: dir.path().to_path_buf(),
+                saved: Arc::clone(&saved),
+                gate: Arc::clone(&gate),
+            }))));
+            let store = Arc::downgrade(ctx.offload.as_ref().unwrap());
+            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+            let input = json!({});
+            let mut call = Box::pin(run(TEST_ID.into(), PROBE_WIRE, &input, &ctx, origin));
+            assert!(futures_lite::future::poll_once(&mut call).await.is_none());
+            gate.entered().await;
+            let done = call.await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), DEADLINE_EXCEEDED);
+            assert!(saved.lock().unwrap().is_empty());
+            drop(ctx);
+            assert!(
+                store.upgrade().is_some(),
+                "the blocked worker owns the store"
+            );
+            gate.release();
+            gate.exited().await;
+            assert!(store.upgrade().is_none());
+            assert_eq!(*saved.lock().unwrap(), text.as_bytes());
+        });
+    }
+
+    #[test]
+    fn expired_mcp_offload_deadline_does_not_start_persistence() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut ctx = answering_ctx(&many_lines());
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+            ctx.deadline = Deadline::At(Instant::now());
+            let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
+            assert!(done.is_error);
+            assert_eq!(done.output.as_text(), DEADLINE_EXCEEDED);
+            assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
         });
     }
 

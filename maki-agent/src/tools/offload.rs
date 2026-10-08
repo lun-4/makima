@@ -6,8 +6,14 @@
 //! and subagents sharing a store can't race past either.
 
 use std::borrow::Cow;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+#[cfg(test)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+#[cfg(any(unix, test))]
+use std::io::Write;
+use std::io::{self, ErrorKind, Read};
+#[cfg(unix)]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,12 +23,18 @@ use event_listener::Event;
 use maki_config::AgentConfig;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
+#[cfg(unix)]
+use rustix::fs::{self as anchored, AtFlags, Dir, FileType, Mode, OFlags};
+#[cfg(unix)]
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use tracing::warn;
 
 use super::FILE_TRUNCATED_MARKER;
+
+#[cfg(windows)]
+mod windows;
 
 pub const MAX_OFFLOAD_FILE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OFFLOAD_SESSION_BYTES: u64 = 256 * 1024 * 1024;
@@ -109,7 +121,32 @@ impl OffloadStore {
     }
 
     pub fn on_disk(dir: PathBuf) -> Self {
-        Self::new(Box::new(DiskBackend { dir }))
+        Self::new(Box::new(DiskBackend::new(dir)))
+    }
+
+    pub fn for_session(state_root: &Path, session: &SessionRef) -> Self {
+        let dir = offload_dir(&state_root.join(SESSIONS_DIR), session.id());
+        #[cfg(unix)]
+        let backend = DiskBackend {
+            relative: offload_dir(Path::new(SESSIONS_DIR), session.id()),
+            root: anchored::open(
+                state_root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from),
+            dir,
+        };
+        #[cfg(windows)]
+        let backend = DiskBackend {
+            relative: offload_dir(Path::new(SESSIONS_DIR), session.id()),
+            root: windows::trusted_root(state_root),
+            dir,
+        };
+        #[cfg(not(any(unix, windows)))]
+        let backend = DiskBackend::new(dir);
+        Self::new(Box::new(backend))
     }
 
     pub fn path_of(&self, saved: &Saved) -> PathBuf {
@@ -287,6 +324,7 @@ fn stored_form(body: &str, saved_bytes: usize) -> Cow<'_, str> {
     ))
 }
 
+#[cfg(test)]
 fn open_regular(path: &Path) -> io::Result<Option<File>> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -324,6 +362,16 @@ fn not_regular_error(error: &io::Error) -> bool {
         Some(libc::ELOOP | libc::ENXIO | libc::ENODEV)
     ) {
         return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            ERROR_CANT_ACCESS_FILE, ERROR_DIRECTORY, ERROR_REPARSE_POINT_ENCOUNTERED,
+        };
+        if matches!(error.raw_os_error(), Some(code) if code == ERROR_CANT_ACCESS_FILE as i32 || code == ERROR_DIRECTORY as i32 || code == ERROR_REPARSE_POINT_ENCOUNTERED as i32)
+        {
+            return true;
+        }
     }
     false
 }
@@ -382,73 +430,324 @@ fn matches_open_file(file: File, expected: &[u8]) -> io::Result<bool> {
 
 pub struct DiskBackend {
     dir: PathBuf,
+    #[cfg(any(unix, windows))]
+    root: io::Result<File>,
+    #[cfg(any(unix, windows))]
+    relative: PathBuf,
 }
 
 impl DiskBackend {
-    fn ensure_dir(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
+    fn new(dir: PathBuf) -> Self {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.dir, fs::Permissions::from_mode(DIR_MODE))?;
+            let (anchor, relative) = if dir.is_absolute() {
+                (
+                    Path::new("/"),
+                    dir.strip_prefix("/").unwrap_or(&dir).to_owned(),
+                )
+            } else {
+                (Path::new("."), dir.clone())
+            };
+            let root = anchored::open(
+                anchor,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from);
+            Self {
+                dir,
+                root,
+                relative,
+            }
+        }
+        #[cfg(windows)]
+        {
+            let (root, relative) = windows::disk_root(&dir);
+            Self {
+                dir,
+                root,
+                relative,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        Self { dir }
+    }
+
+    fn validate_name(name: &str) -> io::Result<()> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':', '\0']) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "offload artifact name must be a single normal path component",
+            ));
         }
         Ok(())
     }
 
-    fn entries(&self) -> io::Result<Vec<fs::DirEntry>> {
-        match fs::read_dir(&self.dir) {
-            Ok(entries) => entries.collect(),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
+    #[cfg(unix)]
+    fn open_dir(&self, create: bool) -> io::Result<File> {
+        let root = self
+            .root
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+        Self::walk_dir(root, &self.relative, create)
+    }
+
+    #[cfg(unix)]
+    fn walk_dir(root: &File, relative: &Path, create: bool) -> io::Result<File> {
+        if relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "offload directory must contain only normal relative components",
+            ));
         }
+        let mut dir = root.try_clone()?;
+        for part in relative.components() {
+            if create {
+                match anchored::mkdirat(&dir, part.as_os_str(), Mode::from_raw_mode(DIR_MODE)) {
+                    Err(error) if error == Errno::EXIST => {}
+                    result => result?,
+                }
+            }
+            dir = anchored::openat(
+                &dir,
+                part.as_os_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?
+            .into();
+        }
+        Ok(dir)
+    }
+
+    #[cfg(unix)]
+    fn remove_contents(dir: &File) -> io::Result<()> {
+        for entry in Dir::read_from(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            let stat = match anchored::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(Errno::NOENT) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let flags = if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+                let child = File::from(anchored::openat(
+                    dir,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?);
+                Self::remove_contents(&child)?;
+                AtFlags::REMOVEDIR
+            } else {
+                AtFlags::empty()
+            };
+            match anchored::unlinkat(dir, name, flags) {
+                Err(Errno::NOENT) => {}
+                result => result?,
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn create_in(dir: &File, name: &str, bytes: &[u8]) -> io::Result<bool> {
+        Self::validate_name(name)?;
+        anchored::fchmod(dir, Mode::from_raw_mode(DIR_MODE))?;
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
+        let temporary = format!(".offload-{:032x}", u128::from_ne_bytes(random));
+        let mut file = File::from(anchored::openat(
+            dir,
+            temporary.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        let result = file.write_all(bytes).and_then(|()| {
+            match anchored::linkat(dir, temporary.as_str(), dir, name, AtFlags::empty()) {
+                Ok(()) => Ok(true),
+                Err(error) if error == Errno::EXIST => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        });
+        let cleanup = anchored::unlinkat(dir, temporary.as_str(), AtFlags::empty());
+        let created = result?;
+        cleanup?;
+        Ok(created)
+    }
+
+    #[cfg(windows)]
+    fn open_dir(&self, create: bool) -> io::Result<File> {
+        let root = self
+            .root
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+        windows::walk_dir(root, &self.relative, create)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn open_dir(&self, _create: bool) -> io::Result<File> {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "secure offload directories are unsupported on this platform",
+        ))
     }
 }
 
 impl OffloadBackend for DiskBackend {
     fn matches(&self, name: &str, expected: &[u8]) -> io::Result<bool> {
-        match open_regular(&self.dir.join(name))? {
-            Some(file) => matches_open_file(file, expected),
-            None => Ok(false),
+        Self::validate_name(name)?;
+        #[cfg(unix)]
+        {
+            let dir = self.open_dir(false)?;
+            let file = match anchored::openat(
+                &dir,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => File::from(fd),
+                Err(error) if not_regular_error(&error.into()) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            if !regular_metadata(&file.metadata()?) {
+                return Ok(false);
+            }
+            matches_open_file(file, expected)
+        }
+        #[cfg(windows)]
+        {
+            let dir = self.open_dir(false)?;
+            match windows::read_file(&dir, name)? {
+                Some(file) => matches_open_file(file, expected),
+                None => Ok(false),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.open_dir(false)?;
+            Ok(false)
         }
     }
 
     fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
-        self.ensure_dir()?;
-        let mut file = NamedTempFile::new_in(&self.dir)?;
-        file.write_all(bytes)?;
-        match file.persist_noclobber(self.dir.join(name)) {
-            Ok(_) => Ok(true),
-            Err(e) if e.error.kind() == ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(e.error),
+        Self::validate_name(name)?;
+        let _dir = self.open_dir(true)?;
+        #[cfg(unix)]
+        {
+            Self::create_in(&_dir, name, bytes)
+        }
+        #[cfg(windows)]
+        {
+            windows::create_in(&_dir, name, bytes)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = bytes;
+            Ok(false)
         }
     }
 
     fn snapshot(&self) -> io::Result<OffloadSnapshot> {
+        #[cfg(unix)]
         let mut snapshot = OffloadSnapshot {
             names: Vec::new(),
             total_bytes: 0,
         };
-        for entry in self.entries()? {
-            if let Ok(name) = entry.file_name().into_string() {
-                snapshot.names.push(name);
+        #[cfg(not(unix))]
+        let snapshot = OffloadSnapshot {
+            names: Vec::new(),
+            total_bytes: 0,
+        };
+        let dir = match self.open_dir(false) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(snapshot),
+            Err(error) => return Err(error),
+        };
+        #[cfg(unix)]
+        for entry in Dir::read_from(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
             }
-            match entry.metadata() {
-                Ok(metadata) if regular_metadata(&metadata) => {
-                    snapshot.total_bytes = snapshot.total_bytes.saturating_add(metadata.len());
+            if let Ok(name) = name.to_str() {
+                snapshot.names.push(name.to_owned());
+            }
+            match anchored::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {
+                    snapshot.total_bytes = snapshot.total_bytes.saturating_add(stat.st_size as u64);
                 }
                 Ok(_) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+                Err(error) if error == Errno::NOENT => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        Ok(snapshot)
+        #[cfg(windows)]
+        {
+            windows::snapshot(&dir)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(snapshot)
+        }
     }
 
     fn remove_all(&self) -> io::Result<()> {
-        match fs::remove_dir_all(&self.dir) {
-            Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+        #[cfg(unix)]
+        {
+            let result: io::Result<()> = (|| {
+                if self.relative.as_os_str().is_empty() {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "cannot remove the offload root",
+                    ));
+                }
+                let dir = self.open_dir(false)?;
+                Self::remove_contents(&dir)?;
+                let parent = self.relative.parent().unwrap_or_else(|| Path::new(""));
+                let root = self
+                    .root
+                    .as_ref()
+                    .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+                let parent = Self::walk_dir(root, parent, false)?;
+                let name = self.relative.file_name().ok_or_else(|| {
+                    io::Error::new(ErrorKind::InvalidInput, "cannot remove the offload root")
+                })?;
+                anchored::unlinkat(&parent, name, AtFlags::REMOVEDIR)?;
+                Ok(())
+            })();
+            match result {
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
         }
+        #[cfg(windows)]
+        {
+            if self.relative.as_os_str().is_empty() {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "cannot remove the offload root",
+                ));
+            }
+            let root = self
+                .root
+                .as_ref()
+                .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+            match windows::walk_deletable_dir(root, &self.relative) {
+                Ok(dir) => windows::remove_all(&dir),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        self.open_dir(false).map(|_| ())
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -1542,13 +1841,279 @@ mod tests {
         std::os::windows::fs::symlink_dir(target, link).unwrap();
     }
 
+    #[test_case("../outside"; "parent_traversal")]
+    #[test_case("nested/slot"; "nested_path")]
+    #[test_case("nested\\slot"; "windows_separator")]
+    #[test_case("slot:stream"; "windows_stream")]
+    #[test_case(""; "empty")]
+    #[test_case("."; "current_directory")]
+    #[test_case(".."; "parent_directory")]
+    #[test_case("slot\0"; "nul")]
+    fn disk_backend_rejects_non_component_names(name: &str) {
+        let root = TempDir::new().unwrap();
+        let backend = DiskBackend::new(root.path().join("store"));
+        assert_eq!(
+            backend
+                .create_new(name, TEST_BODY.as_bytes())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            backend
+                .matches(name, TEST_BODY.as_bytes())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test_case(false; "existing_target")]
+    #[test_case(true; "dangling_target")]
+    fn symlink_store_directory_rejects_saves(dangling: bool) {
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("outside");
+        if !dangling {
+            fs::create_dir(&target).unwrap();
+        }
+        #[cfg(unix)]
+        let permissions = if dangling {
+            None
+        } else {
+            use std::os::unix::fs::PermissionsExt;
+            const TARGET_MODE: u32 = 0o755;
+            fs::set_permissions(&target, fs::Permissions::from_mode(TARGET_MODE)).unwrap();
+            Some(fs::metadata(&target).unwrap().permissions().mode())
+        };
+        let path = root.path().join("store");
+        symlink_dir(&target, &path);
+        let store = OffloadStore::on_disk(path.clone());
+        assert!(matches!(store.put(TEST_BODY), Err(OffloadError::Io(_))));
+        assert!(
+            store
+                .backend
+                .create_new("slot", TEST_BODY.as_bytes())
+                .is_err()
+        );
+        assert!(store.backend.matches("slot", TEST_BODY.as_bytes()).is_err());
+        assert_eq!(fs::read_link(path).unwrap(), target);
+        if dangling {
+            assert!(!target.exists());
+        } else {
+            assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode(),
+                    permissions.unwrap()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test_case(SESSIONS_DIR, true; "sessions_parent")]
+    #[test_case("sessions/offload", true; "offload_parent")]
+    #[test_case("sessions/offload", false; "arbitrary_disk_path")]
+    fn parent_symlink_rejects_operations_without_external_changes(
+        parent: &str,
+        session_store: bool,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        const TARGET_MODE: u32 = 0o755;
+        let root = TempDir::new().unwrap();
+        let session = SessionRef::from(maki_storage::id::MakiId::generate());
+        let relative = offload_dir(Path::new(SESSIONS_DIR), session.id());
+        let external = root.path().join("outside");
+        let external_leaf = external.join(relative.strip_prefix(parent).unwrap());
+        fs::create_dir_all(&external_leaf).unwrap();
+        fs::set_permissions(&external_leaf, fs::Permissions::from_mode(TARGET_MODE)).unwrap();
+        let permissions = fs::metadata(&external_leaf).unwrap().permissions().mode();
+        let link = root.path().join(parent);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink_dir(&external, &link);
+        let store = if session_store {
+            OffloadStore::for_session(root.path(), &session)
+        } else {
+            OffloadStore::on_disk(root.path().join(&relative))
+        };
+        assert!(matches!(store.put(TEST_BODY), Err(OffloadError::Io(_))));
+        assert!(
+            store
+                .backend
+                .create_new("slot", TEST_BODY.as_bytes())
+                .is_err()
+        );
+        assert!(store.backend.matches("slot", TEST_BODY.as_bytes()).is_err());
+        assert!(store.backend.snapshot().is_err());
+        assert!(store.close_and_remove().is_err());
+        assert_eq!(fs::read_dir(&external_leaf).unwrap().count(), 0);
+        assert_eq!(
+            fs::metadata(&external_leaf).unwrap().permissions().mode(),
+            permissions
+        );
+        assert_eq!(fs::read_link(link).unwrap(), external);
+    }
+
+    #[cfg(unix)]
+    #[test_case("../outside"; "parent_escape")]
+    #[test_case("nested/../../outside"; "nested_parent_escape")]
+    fn disk_directory_rejects_parent_components(relative: &str) {
+        let root = TempDir::new().unwrap();
+        let store = OffloadStore::on_disk(root.path().join(relative));
+        assert!(matches!(store.put(TEST_BODY), Err(OffloadError::Io(_))));
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn cleanup_rejects_empty_managed_suffix_without_deleting_root_contents() {
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("slot"), TEST_BODY).unwrap();
+        #[cfg(unix)]
+        let handle = File::from(
+            anchored::open(
+                root.path(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap(),
+        );
+        #[cfg(windows)]
+        let handle = windows::trusted_root(root.path()).unwrap();
+        let backend = DiskBackend {
+            dir: root.path().to_owned(),
+            root: Ok(handle),
+            relative: PathBuf::new(),
+        };
+        assert_eq!(
+            backend.remove_all().unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            fs::read(root.path().join("slot")).unwrap(),
+            TEST_BODY.as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_cleanup_does_not_follow_nested_symlinks() {
+        let root = TempDir::new().unwrap();
+        let external = root.path().join("outside");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("slot"), TEST_BODY).unwrap();
+        let store = OffloadStore::on_disk(root.path().join("store"));
+        store.put(TEST_BODY).unwrap();
+        fs::create_dir(store.dir().join("nested")).unwrap();
+        symlink_dir(&external, &store.dir().join("nested/link"));
+        store.close_and_remove().unwrap();
+        assert!(!store.dir().exists());
+        assert_eq!(
+            fs::read(external.join("slot")).unwrap(),
+            TEST_BODY.as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_state_root_symlink_is_anchored_at_construction() {
+        let root = TempDir::new().unwrap();
+        let original = root.path().join("state");
+        let external = root.path().join("outside");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&external).unwrap();
+        let link = root.path().join("state-link");
+        symlink_dir(&original, &link);
+        let session = SessionRef::from(maki_storage::id::MakiId::generate());
+        let store = OffloadStore::for_session(&link, &session);
+        fs::remove_file(&link).unwrap();
+        symlink_dir(&external, &link);
+        let saved = store.put(TEST_BODY).unwrap();
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(offload_dir(&original.join(SESSIONS_DIR), session.id()).join(saved.name))
+                .unwrap(),
+            TEST_BODY.as_bytes()
+        );
+        store.close_and_remove().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test_case(SESSIONS_DIR; "sessions")]
+    #[test_case("sessions/offload"; "offload")]
+    fn ancestor_replacement_during_traversal_cannot_redirect_descendants(parent: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        const TARGET_MODE: u32 = 0o755;
+        let root = TempDir::new().unwrap();
+        let backend = DiskBackend::new(root.path().join(parent));
+        let opened = backend.open_dir(true).unwrap();
+        let moved = root.path().join("original");
+        fs::rename(&backend.dir, &moved).unwrap();
+        let target = root.path().join("outside");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(TARGET_MODE)).unwrap();
+        let permissions = fs::metadata(&target).unwrap().permissions().mode();
+        symlink_dir(&target, &backend.dir);
+        let remaining = if parent == SESSIONS_DIR {
+            "offload/session"
+        } else {
+            "session"
+        };
+        let leaf = DiskBackend::walk_dir(&opened, Path::new(remaining), true).unwrap();
+        assert!(DiskBackend::create_in(&leaf, "slot", TEST_BODY.as_bytes()).unwrap());
+        assert_eq!(
+            fs::read(moved.join(remaining).join("slot")).unwrap(),
+            TEST_BODY.as_bytes()
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode(),
+            permissions
+        );
+        assert!(backend.open_dir(true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_swap_after_open_does_not_redirect_chmod_or_save() {
+        use std::os::unix::fs::PermissionsExt;
+        const TARGET_MODE: u32 = 0o755;
+        let root = TempDir::new().unwrap();
+        let backend = DiskBackend::new(root.path().join("store"));
+        let opened = backend.open_dir(true).unwrap();
+        let original = root.path().join("original");
+        fs::rename(&backend.dir, &original).unwrap();
+        let target = root.path().join("outside");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(TARGET_MODE)).unwrap();
+        let permissions = fs::metadata(&target).unwrap().permissions().mode();
+        symlink_dir(&target, &backend.dir);
+        assert!(DiskBackend::create_in(&opened, "slot", TEST_BODY.as_bytes()).unwrap());
+        assert!(!DiskBackend::create_in(&opened, "slot", b"replacement").unwrap());
+        assert_eq!(
+            fs::read(original.join("slot")).unwrap(),
+            TEST_BODY.as_bytes()
+        );
+        assert_eq!(fs::read_dir(&original).unwrap().count(), 1);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode(),
+            permissions
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert!(backend.create_new("other", TEST_BODY.as_bytes()).is_err());
+        assert!(backend.snapshot().is_err());
+        assert!(backend.matches("slot", TEST_BODY.as_bytes()).is_err());
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn symlink_swap_before_open_is_not_followed() {
         let root = TempDir::new().unwrap();
-        let backend = DiskBackend {
-            dir: root.path().join("store"),
-        };
+        let backend = DiskBackend::new(root.path().join("store"));
         backend.create_new("slot", TEST_BODY.as_bytes()).unwrap();
         let snapshot = backend.snapshot().unwrap();
         let path = backend.path("slot");
@@ -1566,9 +2131,7 @@ mod tests {
     #[test]
     fn replacement_after_open_does_not_change_compared_handle() {
         let root = TempDir::new().unwrap();
-        let backend = DiskBackend {
-            dir: root.path().to_owned(),
-        };
+        let backend = DiskBackend::new(root.path().to_owned());
         backend.create_new("slot", TEST_BODY.as_bytes()).unwrap();
         let opened = open_regular(&backend.path("slot")).unwrap().unwrap();
         fs::rename(backend.path("slot"), backend.path("original")).unwrap();
@@ -2050,11 +2613,12 @@ mod tests {
     #[test]
     fn disappeared_entry_is_ignored_by_snapshot() {
         let root = TempDir::new().unwrap();
-        let backend = DiskBackend {
-            dir: root.path().to_owned(),
-        };
+        let backend = DiskBackend::new(root.path().to_owned());
         backend.create_new("slot", TEST_BODY.as_bytes()).unwrap();
-        let entries = backend.entries().unwrap();
+        let entries = fs::read_dir(&backend.dir)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
         fs::remove_file(backend.path("slot")).unwrap();
         assert!(open_regular(&entries[0].path()).unwrap().is_none());
         assert_eq!(backend.snapshot().unwrap().total_bytes, 0);

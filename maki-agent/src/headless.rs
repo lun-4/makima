@@ -27,7 +27,7 @@ use crate::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
 };
 use crate::template;
-use crate::tools::offload::{OffloadCleanup, OffloadStore, offload_dir_for};
+use crate::tools::offload::{OffloadCleanup, OffloadStore};
 use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -153,7 +153,7 @@ fn setup(
 }
 
 fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc<OffloadStore>> {
-    offload_dir_for(state_dir?, Some(session)).map(|dir| Arc::new(OffloadStore::on_disk(dir)))
+    Some(Arc::new(OffloadStore::for_session(state_dir?, session)))
 }
 
 /// Cancellation and unwinding cannot await removal. The handle retains the
@@ -1381,7 +1381,7 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::offload::{OffloadBackend, OffloadSnapshot};
+    use crate::tools::offload::{OffloadBackend, OffloadSnapshot, offload_dir_for};
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;

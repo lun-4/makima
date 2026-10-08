@@ -35,7 +35,7 @@ use maki_agent::session_options::{
     ENABLED_VALUE, FAST_OPTION_ID, SessionOptionOwner, SessionOptionsSnapshot, THINKING_OPTION_ID,
     WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
 };
-use maki_agent::tools::offload::{OffloadStore, offload_dir_for};
+use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle,
     McpSnapshotReader, RunSettings, mcp,
@@ -1611,8 +1611,10 @@ impl SpawnCtx {
         let resumed = session_has_content(&session);
         let session_id = session.id;
         let offload = offload.or_else(|| {
-            offload_dir_for(self.storage.path(), Some(&SessionRef::from(session_id)))
-                .map(|dir| Arc::new(OffloadStore::on_disk(dir)))
+            Some(Arc::new(OffloadStore::for_session(
+                self.storage.path(),
+                &SessionRef::from(session_id),
+            )))
         });
         let history = session.messages().to_vec();
         let cwd = PathBuf::from(&session.cwd);
