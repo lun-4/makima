@@ -1,23 +1,80 @@
-use std::io;
-use std::path::Path;
+use std::io::{self, ErrorKind};
+use std::path::{Component, Path};
 
 #[cfg(windows)]
 mod windows;
 
-pub(crate) fn remove(path: &Path) -> io::Result<()> {
+pub(crate) struct Root {
     #[cfg(unix)]
-    let result = unix::remove(path);
+    inner: unix::Root,
     #[cfg(windows)]
-    let result = windows::remove(path);
-    #[cfg(not(any(unix, windows)))]
-    let result = Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "anchored offload cleanup is unavailable on this platform",
-    ));
-    match result {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
+    inner: windows::Root,
+}
+
+impl Root {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        let inner = unix::Root::open(path)?;
+        #[cfg(windows)]
+        let inner = windows::Root::open(path)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Ok(Self {})
+        }
+        #[cfg(any(unix, windows))]
+        {
+            Ok(Self { inner })
+        }
     }
+
+    pub(crate) fn directory(&self, relative: &Path) -> io::Result<Self> {
+        validate_relative(relative)?;
+        #[cfg(unix)]
+        let inner = self.inner.directory(relative)?;
+        #[cfg(windows)]
+        let inner = self.inner.directory(relative)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = relative;
+            Ok(Self {})
+        }
+        #[cfg(any(unix, windows))]
+        {
+            Ok(Self { inner })
+        }
+    }
+
+    pub(crate) fn remove(&self, relative: &Path) -> io::Result<()> {
+        validate_relative(relative)?;
+        #[cfg(unix)]
+        let result = self.inner.remove(relative);
+        #[cfg(windows)]
+        let result = self.inner.remove(relative);
+        #[cfg(not(any(unix, windows)))]
+        let result = Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "anchored offload cleanup is unavailable on this platform",
+        ));
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
+}
+
+fn validate_relative(relative: &Path) -> io::Result<()> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "offload cleanup needs normal relative components",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -25,43 +82,46 @@ mod unix {
     use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
     use rustix::io::Errno;
     use std::fs::File;
-    use std::io::{self, ErrorKind};
-    use std::path::{Component, Path};
+    use std::io;
+    use std::path::Path;
 
-    const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    const ROOT_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::DIRECTORY)
-        .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
+    const DESCENDANT_FLAGS: OFlags = ROOT_FLAGS.union(OFlags::NOFOLLOW);
 
-    pub(super) fn remove(path: &Path) -> io::Result<()> {
-        let (anchor, relative) = if path.is_absolute() {
-            (
-                Path::new("/"),
-                path.strip_prefix("/").map_err(io::Error::other)?,
-            )
-        } else {
-            (Path::new("."), path)
-        };
-        if relative.as_os_str().is_empty()
-            || relative
-                .components()
-                .any(|part| !matches!(part, Component::Normal(_)))
-        {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "offload cleanup needs normal relative components",
-            ));
+    pub(super) struct Root(File);
+
+    impl Root {
+        pub(super) fn open(path: &Path) -> io::Result<Self> {
+            Ok(Self(File::from(fs::open(path, ROOT_FLAGS, Mode::empty())?)))
         }
-        let mut parent = File::from(fs::open(anchor, DIRECTORY_FLAGS, Mode::empty())?);
-        let mut parts = relative.components().peekable();
-        while let Some(part) = parts.next() {
-            let name = part.as_os_str();
-            if parts.peek().is_none() {
-                return remove_entry(&parent, name);
+
+        pub(super) fn directory(&self, relative: &Path) -> io::Result<Self> {
+            let mut parent = self.0.try_clone()?;
+            for part in relative.components() {
+                parent = File::from(fs::openat(
+                    &parent,
+                    part.as_os_str(),
+                    DESCENDANT_FLAGS,
+                    Mode::empty(),
+                )?);
             }
-            parent = File::from(fs::openat(&parent, name, DIRECTORY_FLAGS, Mode::empty())?);
+            Ok(Self(parent))
         }
-        Ok(())
+
+        pub(super) fn remove(&self, relative: &Path) -> io::Result<()> {
+            let mut parent = self.0.try_clone()?;
+            let mut parts = relative.components().peekable();
+            while let Some(part) = parts.next() {
+                let name = part.as_os_str();
+                if parts.peek().is_none() {
+                    return remove_entry(&parent, name);
+                }
+                parent = File::from(fs::openat(&parent, name, DESCENDANT_FLAGS, Mode::empty())?);
+            }
+            Ok(())
+        }
     }
 
     fn remove_entry(parent: &File, name: impl rustix::path::Arg + Copy) -> io::Result<()> {
@@ -71,7 +131,7 @@ mod unix {
             Err(error) => return Err(error.into()),
         };
         let flags = if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-            let child = File::from(fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty())?);
+            let child = File::from(fs::openat(parent, name, DESCENDANT_FLAGS, Mode::empty())?);
             for entry in Dir::read_from(&child)? {
                 let entry = entry?;
                 let name = entry.file_name();

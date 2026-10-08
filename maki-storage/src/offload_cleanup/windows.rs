@@ -5,7 +5,7 @@ use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::path::{Component, Path, Prefix};
+use std::path::{Component, Path};
 use std::ptr::{null, null_mut};
 use std::slice;
 
@@ -28,60 +28,42 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
 
-pub(super) fn remove(path: &Path) -> io::Result<()> {
-    let (anchor, relative) =
-        if path.is_relative() && !matches!(path.components().next(), Some(Component::Prefix(_))) {
-            (OsString::from("."), path)
-        } else {
-            let mut parts = path.components();
-            let prefix = match parts.next() {
-                Some(Component::Prefix(prefix)) => prefix,
-                _ => {
-                    return Err(io::Error::new(
-                        ErrorKind::InvalidInput,
-                        "offload path needs a volume root",
-                    ));
-                }
-            };
-            if !matches!(
-                prefix.kind(),
-                Prefix::Disk(_)
-                    | Prefix::VerbatimDisk(_)
-                    | Prefix::UNC(_, _)
-                    | Prefix::VerbatimUNC(_, _)
-            ) || !matches!(parts.next(), Some(Component::RootDir))
-            {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "offload path needs an absolute disk or UNC root",
-                ));
-            }
-            let mut anchor = prefix.as_os_str().to_owned();
-            anchor.push("\\");
-            (anchor, parts.as_path())
-        };
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "offload cleanup needs normal relative components",
-        ));
+pub(super) struct Root(File);
+
+impl Root {
+    pub(super) fn open(path: &Path) -> io::Result<Self> {
+        let root = OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_GENERIC_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        if !root.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                ErrorKind::NotADirectory,
+                "offload cleanup root must be a directory",
+            ));
+        }
+        Ok(Self(root))
     }
-    let mut dir = OpenOptions::new()
-        .read(true)
-        .access_mode(FILE_GENERIC_READ)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(Path::new(&anchor))?;
-    let mut parts = relative.components().peekable();
-    while let Some(part) = parts.next() {
-        let leaf = parts.peek().is_none();
-        dir = open_relative(&dir, part.as_os_str(), !leaf, leaf)?;
+
+    pub(super) fn directory(&self, relative: &Path) -> io::Result<Self> {
+        let mut dir = self.0.try_clone()?;
+        for part in relative.components() {
+            dir = open_relative(&dir, part.as_os_str(), true, false)?;
+        }
+        Ok(Self(dir))
     }
-    remove_all(&dir)
+
+    pub(super) fn remove(&self, relative: &Path) -> io::Result<()> {
+        let mut dir = self.0.try_clone()?;
+        let mut parts = relative.components().peekable();
+        while let Some(part) = parts.next() {
+            let leaf = parts.peek().is_none();
+            dir = open_relative(&dir, part.as_os_str(), !leaf, leaf)?;
+        }
+        remove_all(&dir)
+    }
 }
 
 fn open_relative(dir: &File, name: &OsStr, directory: bool, deletable: bool) -> io::Result<File> {

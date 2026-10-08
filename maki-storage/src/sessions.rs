@@ -10,7 +10,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::id::MakiId;
+use crate::offload_cleanup::Root;
 use crate::paths::canonical_key;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1688,11 +1689,25 @@ where
     }
 
     pub fn delete(id: MakiId, dir: &StateDir) -> Result<(), SessionError> {
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::delete_from(id, &sessions_dir)
+        fs::create_dir_all(dir.path()).map_err(StorageError::from)?;
+        let root = Root::open(dir.path()).map_err(StorageError::from)?;
+        let cleanup_root = match root.directory(Path::new(SESSIONS_DIR)) {
+            Ok(root) => Ok(root),
+            Err(error) if error.kind() == ErrorKind::NotFound => Err(error),
+            Err(error) => return Err(StorageError::from(error).into()),
+        };
+        Self::delete_from_with_cleanup(id, &dir.path().join(SESSIONS_DIR), cleanup_root)
     }
 
     pub fn delete_from(id: MakiId, dir: &Path) -> Result<(), SessionError> {
+        Self::delete_from_with_cleanup(id, dir, Root::open(dir))
+    }
+
+    fn delete_from_with_cleanup(
+        id: MakiId,
+        dir: &Path,
+        cleanup_root: io::Result<Root>,
+    ) -> Result<(), SessionError> {
         if session_lock::open_elsewhere(dir, &id) {
             return Err(SessionError::OpenElsewhere);
         }
@@ -1701,21 +1716,30 @@ where
         // Backups, not the session: failing to sweep them must not fail a
         // delete whose log is already gone, and their presence alone does not
         // make a session exist.
-        for (result, what) in [
+        let session_id = id.to_string();
+        let paths = [
+            (Path::new(ARCHIVE_DIR).join(&session_id), "archives"),
             (
-                crate::offload_cleanup::remove(&dir.join(ARCHIVE_DIR).join(id.to_string())),
-                "archives",
-            ),
-            (
-                crate::offload_cleanup::remove(&offload_dir(dir, id)),
+                Path::new(OFFLOAD_DIR).join(&session_id),
                 "offloaded tool output",
             ),
-        ] {
-            if let Err(e) = result
-                && e.kind() != ErrorKind::NotFound
-            {
-                warn!(error = %e, session_id = %id, what, "session data remains after delete");
+        ];
+        match &cleanup_root {
+            Ok(root) => {
+                for (path, what) in paths {
+                    if let Err(error) = root.remove(&path)
+                        && error.kind() != ErrorKind::NotFound
+                    {
+                        warn!(error = %error, session_id = %id, what, "session data remains after delete");
+                    }
+                }
             }
+            Err(error) if error.kind() != ErrorKind::NotFound => {
+                for (_, what) in paths {
+                    warn!(error = %error, session_id = %id, what, "session data remains after delete");
+                }
+            }
+            Err(_) => {}
         }
         session_lock::release(dir, &id);
         if !removed {
@@ -1733,8 +1757,8 @@ mod tests {
     use super::ThinkingParseError;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, StoredSubagent, TAIL_BUF,
-        generate_title, json_path, jsonl_path, load_cwd_index, next_epoch, offload_dir,
+        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
+        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, next_epoch, offload_dir,
         update_cwd_index, write_full_session,
     };
     use super::{
@@ -2444,6 +2468,162 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
+    fn prepare_delete_targets(dir: &Path) -> (TestSession, PathBuf, PathBuf) {
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.push_message(user_message("two"));
+        session.save_to(dir).unwrap();
+        session.replace_messages(vec![user_message("summary")]);
+        session.save_to(dir).unwrap();
+
+        let archive = archive_dir_for(dir, session.id);
+        let offload = offload_dir(dir, session.id);
+        fs::create_dir_all(&offload).unwrap();
+        fs::write(offload.join(OFFLOAD_SENTINEL_FILE), OFFLOAD_SENTINEL).unwrap();
+        (session, archive, offload)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test_case(false; "state root alias")]
+    #[test_case(true; "state root ancestor alias")]
+    fn delete_supports_trusted_root_aliases(ancestor: bool) {
+        let tmp = TempDir::new().unwrap();
+        let actual_root = tmp.path().join("trusted-root");
+        let actual_sessions = actual_root.join(SESSIONS_DIR);
+        fs::create_dir_all(&actual_sessions).unwrap();
+        let (session, archive, offload) = prepare_delete_targets(&actual_sessions);
+        let alias = tmp.path().join("trusted-alias");
+        symlink_dir(
+            if ancestor {
+                tmp.path()
+            } else {
+                actual_root.as_path()
+            },
+            &alias,
+        )
+        .unwrap();
+        let state_path = if ancestor {
+            alias.join(actual_root.file_name().unwrap())
+        } else {
+            alias
+        };
+
+        TestSession::delete(session.id, &StateDir::from_path(state_path)).unwrap();
+
+        assert!(!jsonl_path(&actual_sessions, session.id).exists());
+        assert!(!archive.exists());
+        assert!(!offload.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test_case(false; "sessions directory alias")]
+    #[test_case(true; "sessions directory ancestor alias")]
+    fn delete_from_supports_explicit_directory_aliases(ancestor: bool) {
+        let tmp = TempDir::new().unwrap();
+        let actual_sessions = tmp.path().join("trusted-root").join(SESSIONS_DIR);
+        fs::create_dir_all(&actual_sessions).unwrap();
+        let (session, archive, offload) = prepare_delete_targets(&actual_sessions);
+        let alias = tmp.path().join("sessions-alias");
+        symlink_dir(
+            if ancestor {
+                tmp.path()
+            } else {
+                actual_sessions.as_path()
+            },
+            &alias,
+        )
+        .unwrap();
+        let sessions_dir = if ancestor {
+            alias.join("trusted-root").join(SESSIONS_DIR)
+        } else {
+            alias
+        };
+
+        TestSession::delete_from(session.id, &sessions_dir).unwrap();
+
+        assert!(!jsonl_path(&actual_sessions, session.id).exists());
+        assert!(!archive.exists());
+        assert!(!offload.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn delete_does_not_follow_replaced_sessions_directory() {
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let state_root = tmp.path().join("trusted-root");
+        let sessions_dir = state_root.join(SESSIONS_DIR);
+        fs::create_dir_all(&state_root).unwrap();
+        let external_sessions = external.path().join(SESSIONS_DIR);
+        fs::create_dir_all(&external_sessions).unwrap();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.save_to(&external_sessions).unwrap();
+        let external_jsonl = jsonl_path(&external_sessions, session.id);
+        let sentinel = external_sessions.join(OFFLOAD_SENTINEL_FILE);
+        fs::write(&sentinel, OFFLOAD_SENTINEL).unwrap();
+        symlink_dir(&external_sessions, &sessions_dir).unwrap();
+
+        let result = TestSession::delete(session.id, &StateDir::from_path(state_root));
+
+        assert!(external_jsonl.exists());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
+        assert!(result.is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test_case(true; "archive ancestor")]
+    #[test_case(false; "archive leaf")]
+    fn delete_from_does_not_follow_replaced_archive_directory(ancestor: bool) {
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let (session, archive, _) = prepare_delete_targets(dir);
+        let replaced = if ancestor {
+            archive.parent().unwrap()
+        } else {
+            &archive
+        };
+        fs::rename(replaced, dir.join("original-archives")).unwrap();
+        let external_leaf = if ancestor {
+            external.path().join(session.id.to_string())
+        } else {
+            external.path().to_owned()
+        };
+        fs::create_dir_all(&external_leaf).unwrap();
+        let sentinel = external_leaf.join(OFFLOAD_SENTINEL_FILE);
+        fs::write(&sentinel, OFFLOAD_SENTINEL).unwrap();
+        symlink_dir(external.path(), replaced).unwrap();
+
+        TestSession::delete_from(session.id, dir).unwrap();
+
+        assert!(!jsonl_path(dir, session.id).exists());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
+        assert_eq!(fs::read_dir(external_leaf).unwrap().count(), 1);
+        assert!(dir.join("original-archives").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn delete_from_removes_nested_archive_links_without_following_them() {
+        let tmp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let (session, archive, _) = prepare_delete_targets(dir);
+        fs::create_dir_all(archive.join("nested")).unwrap();
+        let sentinel = external.path().join(OFFLOAD_SENTINEL_FILE);
+        fs::write(&sentinel, OFFLOAD_SENTINEL).unwrap();
+        symlink_dir(external.path(), archive.join("nested/link")).unwrap();
+
+        TestSession::delete_from(session.id, dir).unwrap();
+
+        assert!(!archive.exists());
+        assert!(!jsonl_path(dir, session.id).exists());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), OFFLOAD_SENTINEL);
+        assert_eq!(fs::read_dir(external.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(any(unix, windows))]
     #[test_case(true; "offload ancestor")]
     #[test_case(false; "session leaf")]
     fn delete_does_not_follow_replaced_offload_directory(ancestor: bool) {
@@ -2834,6 +3014,24 @@ mod tests {
         assert!(matches!(
             err,
             SessionError::Storage(StorageError::NotFound(_))
+        ));
+    }
+
+    #[test_case(true; "state_root_exists")]
+    #[test_case(false; "state_root_missing")]
+    fn delete_missing_sessions_directory_returns_not_found(state_root_exists: bool) {
+        let tmp = TempDir::new().unwrap();
+        let state_root = tmp.path().join("state");
+        if state_root_exists {
+            fs::create_dir(&state_root).unwrap();
+        }
+        let state_dir = StateDir::from_path(state_root);
+        let id = MakiId::generate();
+
+        let err = TestSession::delete(id, &state_dir).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::Storage(StorageError::NotFound(missing_id)) if missing_id == id.to_string()
         ));
     }
 
