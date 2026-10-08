@@ -5,33 +5,47 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::CancelToken;
+use maki_agent::tools::hook::{HookCall, HookStage, OUTPUT_TEXT, ToolHook, Verdict};
 use maki_agent::tools::offload::{
     OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadBackend, OffloadCleanup, OffloadSnapshot,
     OffloadStore,
 };
+use maki_agent::tools::registry::BoxFuture;
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
-use maki_agent::{AgentMode, ToolOutput};
+use maki_agent::tools::{
+    CallOrigin, Deadline, ToolContext, ToolExecResult, ToolRegistry, TurnToolBindings,
+};
+use maki_agent::{AgentMode, ToolDoneEvent, ToolOutput};
 use maki_lua::{PluginHost, UiAction};
 use serde_json::{Value, json};
 use test_case::test_case;
 
 const WATCHDOG: Duration = Duration::from_secs(10);
+const FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
+const TIMEOUT_ERROR: &str = "plugin output_limit_scheduling tool limited exceeded timeout (1s)";
 const BODY: &str = "first\nsecond\nthird\nfourth";
 const OTHER_BODY: &str = "other\nsecond\nthird\nfourth";
 const TRAILER: &str = "[cancelled by user; output above is partial]";
 const SIBLING_REPLY: &str = "sibling completed";
 const STORE_DIR: &str = "/output-limit-test";
+const SECRET_TRAILER: &str = "secret cancellation token";
+const REDACTED_TRAILER: &str = "[redacted cancellation token]";
+const TIMEOUT_FRAGMENT: &str = "timeout";
+const DEADLINE_FRAGMENT: &str = "deadline exceeded";
+const DISPATCH_ID: &str = "output-limit-dispatch";
 const SOURCE: &str = r#"
 maki.api.register_tool({
     name = "limited", description = "limits output", schema = {
         type = "object", properties = {
             mode = { type = "string" }, body = { type = "string" },
             trailer = { type = "string" }, is_error = { type = "boolean" }, max_lines = { type = "integer" },
+            deadline = { type = "integer" },
         },
     },
     handler = function(input, ctx)
+        if input.deadline then ctx:set_deadline(input.deadline) end
         maki.ui.flash(input.mode .. ":ready")
         local limits = { max_lines = input.max_lines, trailer = input.trailer }
         if input.mode == "deferred" then
@@ -65,6 +79,28 @@ maki.api.register_tool({
     handler = function() return "sibling completed" end,
 })
 "#;
+
+struct OutputHook(flume::Sender<String>);
+
+impl ToolHook for OutputHook {
+    fn wraps(&self, tool: &str, stage: HookStage) -> bool {
+        tool == "limited" && stage == HookStage::Output
+    }
+
+    fn run<'a>(
+        &'a self,
+        _stage: HookStage,
+        mut value: Value,
+        _call: &'a HookCall<'a>,
+    ) -> BoxFuture<'a, Verdict> {
+        Box::pin(async move {
+            let body = value[OUTPUT_TEXT].as_str().unwrap();
+            self.0.send(body.to_owned()).unwrap();
+            value[OUTPUT_TEXT] = Value::String(body.replace(SECRET_TRAILER, REDACTED_TRAILER));
+            Verdict::Replaced(value)
+        })
+    }
+}
 
 struct ReleaseOnDrop(Option<flume::Sender<()>>);
 
@@ -223,6 +259,47 @@ fn start_with_error(
     smol::spawn(async move { invocation.execute(&ctx).await })
 }
 
+fn dispatch_ctx(registry: &Arc<ToolRegistry>, gate: &Gate) -> ToolContext {
+    let mut ctx = gate.ctx();
+    ctx.registry = Arc::clone(registry);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(registry, &ctx.local_tools, None));
+    ctx
+}
+
+fn dispatch(
+    ctx: ToolContext,
+    mode: &str,
+    trailer: &str,
+    is_error: bool,
+) -> smol::Task<ToolDoneEvent> {
+    let input = json!({
+        "mode": mode, "body": BODY, "trailer": trailer, "is_error": is_error, "max_lines": 0,
+    });
+    smol::spawn(async move {
+        tool_dispatch::run(
+            DISPATCH_ID.to_owned(),
+            "limited",
+            &input,
+            &ctx,
+            CallOrigin::Nested,
+        )
+        .await
+    })
+}
+
+async fn dispatched_sibling(ctx: &ToolContext) {
+    let done = checked(tool_dispatch::run(
+        DISPATCH_ID.to_owned(),
+        "sibling",
+        &json!({}),
+        ctx,
+        CallOrigin::Nested,
+    ))
+    .await;
+    assert!(!done.is_error);
+    assert_eq!(done.output.as_text(), SIBLING_REPLY);
+}
+
 async fn sibling(registry: &ToolRegistry, ctx: &ToolContext) {
     let invocation = registry
         .get("sibling")
@@ -324,6 +401,204 @@ fn cancel_hook_defers_limits_and_releases_ctx_borrow() {
         let output = text(checked(worker).await.output).unwrap_err();
         assert!(output.contains(OFFLOAD_POINTER_PREFIX), "{output}");
         assert!(output.ends_with(TRAILER), "{output}");
+        assert_eq!(gate.saved_bodies(), [BODY]);
+    });
+}
+
+#[test_case("async"; "ctx_limit_output")]
+#[test_case("deferred"; "direct_reply")]
+#[test_case("finish"; "ctx_finish")]
+fn hooked_dispatch_keeps_sibling_responsive_during_finalization(mode: &str) {
+    let (registry, _host) = host();
+    let (seen_tx, seen) = flume::unbounded();
+    registry.set_hook(OutputHook(seen_tx));
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        let ctx = dispatch_ctx(&registry, &gate);
+        let caller = dispatch(ctx.clone(), mode, TRAILER, true);
+        checked(gate.entered.recv_async()).await.unwrap();
+        assert_eq!(
+            checked(seen.recv_async()).await.unwrap(),
+            format!("{BODY}\n{TRAILER}")
+        );
+        dispatched_sibling(&ctx).await;
+        assert!(gate.saved_bodies().is_empty());
+        gate.release.release();
+        let done = checked(caller).await;
+        assert_eq!(done.is_error, mode != "async");
+        let output = done.output.as_text();
+        assert!(output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+        let saved = gate.saved_bodies();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].contains(BODY));
+    });
+}
+
+#[test_case("deferred", false; "direct_reply_absolute_deadline")]
+#[test_case("finish", false; "ctx_finish_absolute_deadline")]
+#[test_case("deferred", true; "direct_reply_tool_timeout")]
+#[test_case("finish", true; "ctx_finish_tool_timeout")]
+fn hooked_dispatch_finalization_obeys_timeout(mode: &str, tool_timeout: bool) {
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    let source = if tool_timeout {
+        SOURCE.replacen(
+            "name = \"limited\",",
+            &format!(
+                "name = \"limited\", timeout = {},",
+                FINALIZATION_TIMEOUT.as_secs()
+            ),
+            1,
+        )
+    } else {
+        SOURCE.to_owned()
+    };
+    host.load_source("output_limit_scheduling", &source)
+        .unwrap();
+    let (seen_tx, seen) = flume::unbounded();
+    registry.set_hook(OutputHook(seen_tx));
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        let mut ctx = dispatch_ctx(&registry, &gate);
+        if !tool_timeout {
+            ctx.deadline = Deadline::after(FINALIZATION_TIMEOUT);
+        }
+        let caller = dispatch(ctx, mode, TRAILER, false);
+        checked(gate.entered.recv_async()).await.unwrap();
+        assert_eq!(
+            checked(seen.recv_async()).await.unwrap(),
+            format!("{BODY}\n{TRAILER}")
+        );
+        let done = checked(caller).await;
+        assert!(done.is_error);
+        let error = done.output.as_text();
+        assert!(
+            error.contains(TIMEOUT_FRAGMENT) || error.contains(DEADLINE_FRAGMENT),
+            "{error}"
+        );
+        assert!(gate.saved_bodies().is_empty());
+        dispatched_sibling(&dispatch_ctx(&registry, &gate)).await;
+        gate.release.release();
+        checked(gate.created.recv_async()).await.unwrap();
+        let saved = gate.saved_bodies();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].contains(BODY));
+    });
+}
+
+#[test_case("deferred", false; "direct_reply_execute")]
+#[test_case("finish", false; "ctx_finish_execute")]
+#[test_case("deferred", true; "direct_reply_hooked_dispatch")]
+#[test_case("finish", true; "ctx_finish_hooked_dispatch")]
+fn handler_deadline_bounds_blocked_finalization(mode: &str, hooked: bool) {
+    let (registry, _host) = host();
+    let (seen_tx, seen) = flume::unbounded();
+    if hooked {
+        registry.set_hook(OutputHook(seen_tx));
+    }
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        let mut ctx = dispatch_ctx(&registry, &gate);
+        ctx.deadline = Deadline::None;
+        let input = json!({
+            "mode": mode, "body": BODY, "trailer": TRAILER, "max_lines": 0,
+            "deadline": FINALIZATION_TIMEOUT.as_secs(),
+        });
+        let invocation = registry.get("limited").unwrap().tool.parse(&input).unwrap();
+        let caller = smol::spawn(async move {
+            if hooked {
+                let done = tool_dispatch::run(
+                    DISPATCH_ID.to_owned(),
+                    "limited",
+                    &input,
+                    &ctx,
+                    CallOrigin::Nested,
+                )
+                .await;
+                (done.is_error, done.output.as_text())
+            } else {
+                let result = invocation.execute(&ctx).await;
+                let is_error = result.output.is_err();
+                let body = match text(result.output) {
+                    Ok(body) | Err(body) => body,
+                };
+                (is_error, body)
+            }
+        });
+        checked(gate.entered.recv_async()).await.unwrap();
+        if hooked {
+            assert_eq!(
+                checked(seen.recv_async()).await.unwrap(),
+                format!("{BODY}\n{TRAILER}")
+            );
+        }
+        let (is_error, error) = checked(caller).await;
+        assert!(is_error, "{error}");
+        assert!(
+            error.contains(TIMEOUT_FRAGMENT) || error.contains(DEADLINE_FRAGMENT),
+            "{error}"
+        );
+        assert!(gate.saved_bodies().is_empty());
+        gate.release.release();
+        checked(gate.created.recv_async()).await.unwrap();
+        let saved = gate.saved_bodies();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].contains(BODY));
+    });
+}
+
+#[test_case("async", false; "immediate_success")]
+#[test_case("deferred", false; "deferred_success")]
+#[test_case("deferred", true; "deferred_error")]
+#[test_case("finish", true; "finish_error")]
+fn output_hook_redacts_trailer_before_offloading(mode: &str, is_error: bool) {
+    let (registry, _host) = host();
+    let (seen_tx, seen) = flume::unbounded();
+    registry.set_hook(OutputHook(seen_tx));
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        let caller = dispatch(
+            dispatch_ctx(&registry, &gate),
+            mode,
+            SECRET_TRAILER,
+            is_error,
+        );
+        checked(gate.entered.recv_async()).await.unwrap();
+        assert_eq!(
+            checked(seen.recv_async()).await.unwrap(),
+            format!("{BODY}\n{SECRET_TRAILER}")
+        );
+        gate.release.release();
+        let done = checked(caller).await;
+        assert_eq!(done.is_error, is_error);
+        let output = done.output.as_text();
+        assert!(output.contains(OFFLOAD_FOOTER_PREFIX), "{output}");
+        assert!(!output.contains(SECRET_TRAILER), "{output}");
+        let saved = gate.saved_bodies();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].contains(BODY));
+        assert!(output.contains(REDACTED_TRAILER) || saved[0].contains(REDACTED_TRAILER));
+        assert!(!saved[0].contains(SECRET_TRAILER), "{}", saved[0]);
+    });
+}
+
+#[test_case("deferred"; "direct_reply")]
+#[test_case("finish"; "ctx_finish")]
+fn deferred_finalization_obeys_timeout_without_cancelling_started_worker(mode: &str) {
+    let (registry, _host) = host();
+    let mut gate = Gate::new();
+    smol::block_on(async {
+        let mut ctx = gate.ctx();
+        ctx.deadline = Deadline::after(FINALIZATION_TIMEOUT);
+        let caller = start(&registry, ctx, mode, BODY);
+        checked(gate.entered.recv_async()).await.unwrap();
+        assert_eq!(
+            text(checked(caller).await.output),
+            Err(TIMEOUT_ERROR.to_owned())
+        );
+        assert!(gate.saved_bodies().is_empty());
+        gate.release.release();
+        checked(gate.created.recv_async()).await.unwrap();
         assert_eq!(gate.saved_bodies(), [BODY]);
     });
 }

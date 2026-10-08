@@ -5,15 +5,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use maki_agent::agent::tool_dispatch;
 use maki_agent::template::Vars;
+use maki_agent::tools::hook::{HookCall, HookStage, OUTPUT_TEXT, ToolHook, Verdict};
 use maki_agent::tools::offload::{
     LINE_CUT_PREFIX, OFFLOAD_FOOTER_PREFIX, OFFLOAD_POINTER_PREFIX, OffloadStore,
 };
 use maki_agent::tools::{
-    DescriptionContext, ExecFuture, FILE_TRUNCATED_MARKER, HeaderFuture, HeaderResult, ParseError,
-    QuestionMode, Tool, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    ToolLive, ToolRegistry, ToolSource, TurnToolBindings, format_line_truncated_marker,
-    timeout_annotation,
+    BoxFuture, CallOrigin, DescriptionContext, ExecFuture, FILE_TRUNCATED_MARKER, HeaderFuture,
+    HeaderResult, ParseError, QuestionMode, Tool, ToolAudience, ToolContext, ToolExecResult,
+    ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource, TurnToolBindings,
+    format_line_truncated_marker, timeout_annotation,
 };
 use maki_agent::{AgentMode, SharedBuf, ToolOutput};
 use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
@@ -7059,6 +7061,163 @@ fn read_byte_cut_reports_remaining_lines() {
 
 const SEQ_LINES: usize = 5000;
 const BIG_BASH_CMD: &str = "seq 1 5000";
+const OFFLOAD_SECRET: &str = "offload-secret";
+const OFFLOAD_REDACTED: &str = "redacted";
+const OFFLOAD_DENIED: &str = "output denied";
+const OFFLOAD_HOOK_ID: &str = "offload-hook-test";
+const OFFLOAD_SECRET_COMMAND: &str = "printf 'head\noffload-secret\ntail\n'";
+
+struct OffloadOutputHook {
+    deny: bool,
+}
+
+impl ToolHook for OffloadOutputHook {
+    fn wraps(&self, _tool: &str, stage: HookStage) -> bool {
+        stage == HookStage::Output
+    }
+
+    fn run<'a>(
+        &'a self,
+        _stage: HookStage,
+        mut value: Value,
+        _call: &'a HookCall<'a>,
+    ) -> BoxFuture<'a, Verdict> {
+        Box::pin(async move {
+            let text = value[OUTPUT_TEXT].as_str().unwrap();
+            assert!(
+                text.contains(OFFLOAD_SECRET),
+                "hook must see the full body: {text}"
+            );
+            if self.deny {
+                Verdict::Denied(OFFLOAD_DENIED.to_owned())
+            } else {
+                value[OUTPUT_TEXT] = Value::String(text.replace(OFFLOAD_SECRET, OFFLOAD_REDACTED));
+                Verdict::Replaced(value)
+            }
+        })
+    }
+}
+
+#[test_case::test_case("glob", false; "immediate_redaction")]
+#[test_case::test_case("glob", true; "immediate_denial")]
+#[test_case::test_case("bash", false; "deferred_redaction")]
+#[test_case::test_case("bash", true; "deferred_denial")]
+#[test_case::test_case("trailer_probe", false; "trailer_redaction")]
+#[test_case::test_case("trailer_probe", true; "trailer_denial")]
+fn builtin_output_hook_precedes_offload(tool: &str, deny: bool) {
+    let (reg, host) = if tool == "trailer_probe" {
+        builtins_host()
+    } else {
+        builtins_host_with_zero_output_limit(tool, ZERO_LINES_OPTION)
+    };
+    if tool == "trailer_probe" {
+        host.load_source(
+            "trailer_probe",
+            &format!(
+                r#"
+            maki.api.register_tool({{
+                name = "trailer_probe", description = "trailer output probe",
+                schema = {{ type = "object", properties = {{}} }},
+                handler = function()
+                    return {{ llm_output = "head", is_error = true,
+                        output_limits = {{ max_lines = 0, trailer = "{OFFLOAD_SECRET}" }} }}
+                end,
+            }})
+        "#
+            ),
+        )
+        .unwrap();
+    }
+    let store_dir = tempfile::tempdir().unwrap();
+    let work_dir = tempfile::tempdir().unwrap();
+    std::fs::write(work_dir.path().join(OFFLOAD_SECRET), "").unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(store_dir.path()));
+    reg.set_hook(OffloadOutputHook { deny });
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    let input = if tool == "glob" {
+        json!({ "pattern": "*", "path": work_dir.path() })
+    } else if tool == "bash" {
+        json!({ "command": OFFLOAD_SECRET_COMMAND, "timeout": ZERO_BASH_TIMEOUT_SECS })
+    } else {
+        json!({})
+    };
+    let done = smol::block_on(tool_dispatch::run(
+        OFFLOAD_HOOK_ID.to_owned(),
+        tool,
+        &input,
+        &ctx,
+        CallOrigin::Nested,
+    ));
+    let output = done.output.as_text();
+    assert_eq!(done.is_error, deny || tool == "trailer_probe", "{output}");
+    let artifacts: Vec<_> = std::fs::read_dir(store_dir.path()).unwrap().collect();
+    if deny {
+        assert_eq!(output, OFFLOAD_DENIED);
+        assert!(artifacts.is_empty());
+    } else {
+        assert_eq!(artifacts.len(), 1);
+        let saved = std::fs::read_to_string(offloaded_path(&output)).unwrap();
+        assert!(saved.contains(OFFLOAD_REDACTED), "{saved}");
+        assert!(!saved.contains(OFFLOAD_SECRET), "{saved}");
+    }
+}
+#[test]
+fn immediate_output_limits_with_state_fail_without_artifact() {
+    let (reg, host) = builtins_host();
+    host.load_source(
+        "state_probe",
+        &format!(
+            r#"
+        maki.api.register_tool({{
+            name = "state_probe", description = "limited state probe",
+            schema = {{ type = "object", properties = {{}} }},
+            handler = function(_, ctx)
+                local text = ctx:limit_output("{OFFLOAD_SECRET}", {{ max_lines = 0 }})
+                return {{ llm_output = text, state = {{ secret = "{OFFLOAD_SECRET}" }} }}
+            end,
+        }})
+    "#
+        ),
+    )
+    .unwrap();
+    struct UnchangedOutputHook;
+    impl ToolHook for UnchangedOutputHook {
+        fn wraps(&self, _: &str, stage: HookStage) -> bool {
+            stage == HookStage::Output
+        }
+        fn run<'a>(
+            &'a self,
+            _: HookStage,
+            value: Value,
+            _: &'a HookCall<'a>,
+        ) -> BoxFuture<'a, Verdict> {
+            assert!(
+                !value[OUTPUT_TEXT]
+                    .as_str()
+                    .unwrap()
+                    .contains(OFFLOAD_SECRET)
+            );
+            Box::pin(async { Verdict::Unchanged })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ctx, _session) = offload_ctx(&host, &disk_store(dir.path()));
+    reg.set_hook(UnchangedOutputHook);
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    let done = smol::block_on(tool_dispatch::run(
+        OFFLOAD_HOOK_ID.to_owned(),
+        "state_probe",
+        &json!({}),
+        &ctx,
+        CallOrigin::Nested,
+    ));
+    assert!(done.is_error);
+    assert!(!done.output.as_text().contains(OFFLOAD_SECRET));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
 #[cfg(unix)]
 const BASH_CANCEL_OUTPUT_BYTES: usize = 60 * 1024;
 

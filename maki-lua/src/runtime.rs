@@ -4427,7 +4427,8 @@ async fn run_tool_call(
 
     // `tool.rs` timeout is the absolute backstop; the dispatch loop
     // and watchdog interrupt enforce the per-plugin deadline from TaskCell.
-    let reply = call_future.await;
+    let mut reply = call_future.await;
+    reply.deadline = lock_cell(&handle).deadline.get();
     if let Some(id) = &live_id {
         live_tasks.borrow_mut().remove(id);
         // Best-effort cache: any tool with a root buf can serve clicks.

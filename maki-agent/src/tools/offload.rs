@@ -11,6 +11,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use event_listener::Event;
 use maki_config::AgentConfig;
@@ -459,6 +460,34 @@ impl OffloadBackend for DiskBackend {
 pub enum PreviewShape {
     Head,
     HeadTail,
+}
+
+pub struct OutputLimitOptions {
+    pub deadline: Option<Instant>,
+    pub trailer: Option<String>,
+    pub shape: PreviewShape,
+    pub label: String,
+    pub lines_clipped: bool,
+    pub limits: OutputLimits,
+}
+
+impl OutputLimitOptions {
+    pub async fn apply(self, body: String, store: Option<Arc<OffloadStore>>) -> String {
+        smol::unblock(move || {
+            limit_output(
+                &body,
+                &LimitOpts {
+                    trailer: self.trailer.as_deref(),
+                    shape: self.shape,
+                    label: &self.label,
+                    lines_clipped: self.lines_clipped,
+                    limits: self.limits,
+                },
+                store.as_deref(),
+            )
+        })
+        .await
+    }
 }
 
 #[derive(Debug, Clone)]

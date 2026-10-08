@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -14,8 +14,8 @@ use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT
 use crate::tools::offload::{DEFAULT_LABEL, LimitOpts, OutputLimits, PreviewShape, limit_output};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext, TurnToolRoute,
-    truncate_scope,
+    CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
+    TurnToolRoute, truncate_scope,
 };
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{FILE_WRITE_TOOLS, ToolKey};
@@ -34,6 +34,7 @@ const SOURCE_MCP: &str = "mcp";
 const SOURCE_UNKNOWN: &str = "unknown";
 
 const ERROR_CANCELLED: &str = "cancelled";
+const UNFILTERABLE_LIMITED_OUTPUT: &str = "output limits with an output hook require filterable text without structured state, image, or diff";
 
 /// The window a chain gets when the call carries no deadline of its own.
 /// Generous, because a layer may shell out before it decides, but a layer that
@@ -123,10 +124,67 @@ pub async fn run(
         return mode_denied(id, name, reason);
     }
     let is_mcp = matches!(resolved.route, Route::Mcp(..));
-    let mut done = run_inner(resolved, id, &input, ctx, origin).await;
+    let mut execution_ctx = ctx.clone();
+    execution_ctx.pending_output_limits = hook
+        .as_ref()
+        .filter(|hook| hook.installed.wraps(name, HookStage::Output))
+        .map(|_| Arc::new(Mutex::new(None)));
+    let mut done = run_inner(resolved, id, &input, &execution_ctx, origin).await;
     let mcp_succeeded = is_mcp && !done.is_error;
-    if let Some(hook) = &hook {
-        hook.filter_output(&mut done).await;
+    let mut pending = execution_ctx
+        .pending_output_limits
+        .as_ref()
+        .and_then(|pending| {
+            pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        });
+    if pending.is_some() && done.output.filterable_text_mut().is_none() {
+        pending = None;
+        done.output = ToolOutput::Plain(UNFILTERABLE_LIMITED_OUTPUT.into());
+        done.is_error = true;
+    }
+    if let Some(opts) = &mut pending
+        && let Some(trailer) = opts.trailer.take()
+        && let Some(text) = done.output.filterable_text_mut()
+    {
+        let body = text.trim_end_matches('\n');
+        *text = if body.is_empty() {
+            trailer
+        } else {
+            format!("{body}\n{trailer}")
+        };
+    }
+    let denied = if let Some(hook) = &hook {
+        hook.filter_output(&mut done).await
+    } else {
+        false
+    };
+    if !denied
+        && let Some(opts) = pending
+        && let Some(text) = done.output.filterable_text_mut()
+    {
+        let deadline = opts.deadline;
+        let apply = opts.apply(std::mem::take(text), ctx.offload.clone());
+        let limited = match deadline {
+            Some(deadline) if deadline <= Instant::now() => None,
+            Some(deadline) => {
+                futures_lite::future::race(async { Some(apply.await) }, async {
+                    smol::Timer::at(deadline).await;
+                    None
+                })
+                .await
+            }
+            None => Some(apply.await),
+        };
+        match limited {
+            Some(limited) => *text = limited,
+            None => {
+                *text = DEADLINE_EXCEEDED.to_owned();
+                done.is_error = true;
+            }
+        }
     }
     if mcp_succeeded
         && !done.is_error
@@ -185,9 +243,9 @@ impl<'a> Hook<'a> {
 
     /// Rewrites the finished event in place. Text and error flag move together,
     /// so a hook that cannot reach the text cannot flip the flag either.
-    async fn filter_output(&self, done: &mut ToolDoneEvent) {
+    async fn filter_output(&self, done: &mut ToolDoneEvent) -> bool {
         if !self.installed.wraps(self.tool, HookStage::Output) {
-            return;
+            return false;
         }
         let was_error = done.is_error;
         let Some(text) = done.output.filterable_text_mut() else {
@@ -195,16 +253,16 @@ impl<'a> Hook<'a> {
                 tool = %self.tool,
                 "output hook skipped: this output renders from fields, not prose"
             );
-            return;
+            return false;
         };
         let value = json!({ OUTPUT_TEXT: &*text, OUTPUT_IS_ERROR: was_error });
-        let (rewritten, is_error) = match self
+        let (rewritten, is_error, denied) = match self
             .fire(HookStage::Output, &done.id, value, Verdict::Unchanged)
             .await
         {
-            Verdict::Unchanged => return,
+            Verdict::Unchanged => return false,
             // Nothing left to stop, so the reason becomes what the model reads.
-            Verdict::Denied(reason) => (reason, true),
+            Verdict::Denied(reason) => (reason, true, true),
             Verdict::Replaced(value) => match value.get(OUTPUT_TEXT).and_then(Value::as_str) {
                 Some(replaced) => (
                     replaced.to_owned(),
@@ -212,6 +270,7 @@ impl<'a> Hook<'a> {
                         .get(OUTPUT_IS_ERROR)
                         .and_then(Value::as_bool)
                         .unwrap_or(was_error),
+                    false,
                 ),
                 None => {
                     warn!(
@@ -219,13 +278,14 @@ impl<'a> Hook<'a> {
                         field = OUTPUT_TEXT,
                         "output hook replaced the output without a text field, leaving it alone"
                     );
-                    return;
+                    return false;
                 }
             },
         };
         *text = rewritten;
         done.is_error = is_error;
         debug!(tool = %self.tool, "output hook rewrote the output");
+        denied
     }
 
     /// Cancellation outranks a hook: nobody is left to read the verdict, so

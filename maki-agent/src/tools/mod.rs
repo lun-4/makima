@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use humantime::format_duration;
@@ -489,6 +489,7 @@ pub struct ToolContext {
     /// Where output past the limits is saved, shared by every agent in the
     /// session. `None` without a session, and tools then cut output instead.
     pub offload: Option<Arc<offload::OffloadStore>>,
+    pub pending_output_limits: Option<Arc<Mutex<Option<offload::OutputLimitOptions>>>>,
     /// Logical owner chain of the dispatch that produced this context: the
     /// tokens of every ancestor dispatch, root first. Empty for root agent
     /// contexts; [`crate::agent::tool_dispatch::run`] appends its own token
@@ -500,6 +501,19 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub fn defer_output_limits(&self, mut opts: offload::OutputLimitOptions) -> bool {
+        let Some(pending) = &self.pending_output_limits else {
+            return false;
+        };
+        opts.deadline = match (opts.deadline, self.deadline) {
+            (Some(current), Deadline::At(deadline)) => Some(current.min(deadline)),
+            (None, Deadline::At(deadline)) => Some(deadline),
+            (current, Deadline::None) => current,
+        };
+        *pending.lock().unwrap_or_else(|error| error.into_inner()) = Some(opts);
+        true
+    }
+
     pub fn resolve_turn_route(&self, name: &str) -> Option<&TurnToolRoute> {
         self.turn_bindings.get(name).filter(|_| {
             self.turn_bindings.is_current(
@@ -852,6 +866,7 @@ pub fn interpreter_ctx(
         model_policy: Arc::new(ModelPolicy::default()),
         file_write_locks: Arc::new(FileWriteLocks::new()),
         offload: None,
+        pending_output_limits: None,
         write_lock_chain: Arc::new(Vec::new()),
         managed_turn: None,
     }

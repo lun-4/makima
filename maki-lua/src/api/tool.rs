@@ -5,14 +5,14 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
-use maki_agent::tools::offload::{OffloadStore, OutputLimits};
+use maki_agent::tools::offload::OutputLimits;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
@@ -57,6 +57,7 @@ use crate::runtime::{
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
+const OUTPUT_TIMEOUT_ERR: &str = "timeout exceeded";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const TUI_ONLY_ERR: &str = "register_command: 'tui_only' must be a boolean";
 const ARGUMENT_HINT_ERR: &str = "register_command: 'argument_hint' must be a string";
@@ -522,6 +523,16 @@ impl ToolInvocation for LuaToolInvocation {
                 },
             };
 
+            let invocation_deadline = effective_secs.map(|secs| {
+                let timeout = Instant::now() + Duration::from_secs(secs);
+                match deadline {
+                    Deadline::At(deadline) => timeout.min(deadline),
+                    Deadline::None => timeout,
+                }
+            });
+            let mut invocation_ctx = ctx.clone();
+            invocation_ctx.deadline = invocation_deadline.map_or(Deadline::None, Deadline::At);
+            let ctx = &invocation_ctx;
             let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
             let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
                 event_tx: ctx.event_tx.clone(),
@@ -536,10 +547,7 @@ impl ToolInvocation for LuaToolInvocation {
                     generation,
                     input,
                     ctx: Box::new(lua_ctx),
-                    deadline: match deadline {
-                        Deadline::At(t) => Some(t),
-                        Deadline::None => None,
-                    },
+                    deadline: invocation_deadline,
                     reply: reply_tx,
                     live,
                     nested,
@@ -550,11 +558,33 @@ impl ToolInvocation for LuaToolInvocation {
                 return Err("lua thread disconnected".to_string()).into();
             }
 
-            let recv = async { Some(reply_rx.recv_async().await) };
-            let result = match effective_secs {
-                Some(secs) => {
+            let recv = async {
+                Some(match reply_rx.recv_async().await {
+                    Ok(reply) => {
+                        let runtime_deadline = reply.deadline.filter(|deadline| {
+                            reply.has_output_limits()
+                                && invocation_deadline.is_none_or(|current| *deadline < current)
+                        });
+                        let finalize = reply.finalize(ctx);
+                        let reply = match runtime_deadline {
+                            Some(deadline) => {
+                                futures_lite::future::race(finalize, async {
+                                    smol::Timer::at(deadline).await;
+                                    ToolCallReply::err(OUTPUT_TIMEOUT_ERR)
+                                })
+                                .await
+                            }
+                            None => finalize.await,
+                        };
+                        Ok(reply)
+                    }
+                    Err(error) => Err(error),
+                })
+            };
+            let result = match invocation_deadline {
+                Some(deadline) => {
                     futures_lite::future::race(recv, async move {
-                        smol::Timer::after(Duration::from_secs(secs)).await;
+                        smol::Timer::at(deadline).await;
                         None
                     })
                     .await
@@ -572,7 +602,6 @@ impl ToolInvocation for LuaToolInvocation {
                 .into(),
                 Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
                 Some(Ok(reply)) => {
-                    let reply = reply.finalize(ctx.offload.clone()).await;
                     if let Some(ref id) = ctx.tool_use_id {
                         if let Some(live_buf) = reply.live_buf {
                             crate::runtime::send_render_event(
@@ -752,9 +781,9 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   mutable_path    (string|function) Schema field name (type: string) for the primary path the tool writes, or `function(input, ctx)` returning the resolved target path (nil when the call does not mutate). `ctx.cwd` is the invocation session's working directory. When dispatched through the agent, tools declaring a `mutable_path` participate in same-process per-path mutation serialization: concurrent calls mutating the same normalized path run in non-overlapping order. Recursive same-path reentry from inside a locked mutable tool is unsupported and fails with `same-path mutation is already in progress`.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 ///
-/// Handlers bound their model-facing output with `ctx:limit_output(text, opts)`. This method yields from handler coroutines while the full limiting operation runs on a worker, including store-lock waits. Trailing newline characters are removed before limit checks, hashing, and saving. Text within `agent.max_output_lines` / `agent.max_output_bytes` comes back with that normalization. Longer text is saved to the session's offload store and replaced by a preview plus a footer naming the saved file; without a store it is cut instead. `opts`: `preview` ("head" or "head_tail"), `trailer` (a line that always comes last, never cut), `label` (what the footer calls the output), `lines_clipped` (the text already has long lines cut), `max_lines` / `max_bytes` (per-call limits; zero returns metadata only). Returns `(string, nil)` on success or `(nil, err)` outside a handler. Invalid options raise a programmer error.
+/// Handlers bound their model-facing output with `ctx:limit_output(text, opts)`. Without an output hook, this method yields while a worker applies limits, including store-lock waits. With an output hook, it returns the full body and stages the limits for dispatch. Dispatch filters the full body and trailer once before applying limits or saving output. Only accepted or replaced text is saved; denial creates no artifact. Hooked replies with staged limits must remain filterable text; structured state, image, or diff replies fail without saving their output. The trailer becomes part of the filtered body and can be redacted or removed by the hook. Trailing newline characters are removed before limit checks, hashing, and saving. Text within `agent.max_output_lines` / `agent.max_output_bytes` comes back with that normalization. Longer text is saved to the session's offload store and replaced by a preview plus a footer naming the saved file; without a store it is cut instead. `opts`: `preview` ("head" or "head_tail"), `trailer` (a line that always comes last, never cut), `label` (what the footer calls the output), `lines_clipped` (the text already has long lines cut), `max_lines` / `max_bytes` (per-call limits; zero returns metadata only). Returns `(string, nil)` on success or `(nil, err)` outside a handler or for invalid UTF-8 text. Invalid UTF-8 is rejected before limiting or saving. Invalid options raise a programmer error.
 ///
-/// Job exit and cancellation hooks are synchronous callbacks and cannot yield. They pass the raw body as `llm_output` with `output_limits = opts` to `ctx:finish(reply)` instead. Direct handler returns accept the same reply field. The host applies the limits after receiving the reply, outside the Lua cancellation window, and preserves `is_error`. Deferred limits require plain text and reject image, diff, markdown, and structured `state` replies. The body is saved without its trailing newline characters or trailer. A started worker retains its owned text, options, and store even when its caller is dropped; session cleanup closes the store before removing its files.
+/// Job exit and cancellation hooks are synchronous callbacks and cannot yield. They pass the raw body as `llm_output` with `output_limits = opts` to `ctx:finish(reply)` instead. Direct handler returns accept the same reply field. The host applies the limits after receiving the reply and preserves `is_error`. Reply receipt and deferred limiting share the invocation timeout. With an output hook, dispatch filters the full output before limiting. Persistence runs after the Lua invocation completes but retains its absolute deadline, including any per-tool timeout or deadline set with `ctx:set_deadline`. Deferred limits require plain text and reject image, diff, markdown, and structured `state` replies. Without an output hook, the body is saved without its trailing newline characters or trailer. With an output hook, the saved body includes any trailer text retained by the hook. A started worker retains its owned text, options, and store even when its caller is dropped; session cleanup closes the store before removing its files.
 /// @return
 /// @example
 /// maki.api.register_tool({
@@ -2146,6 +2175,7 @@ pub(crate) struct ToolCallReply {
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
     output_limits: Option<ParsedOutputLimits>,
+    pub(crate) deadline: Option<Instant>,
 }
 
 impl ToolCallReply {
@@ -2212,6 +2242,7 @@ impl ToolCallReply {
             image,
             state,
             output_limits,
+            deadline: None,
         }
     }
 
@@ -2219,14 +2250,36 @@ impl ToolCallReply {
         self.output_limits.is_some()
     }
 
-    async fn finalize(mut self, store: Option<Arc<OffloadStore>>) -> Self {
+    async fn finalize(mut self, ctx: &ToolContext) -> Self {
+        let mut ctx = ctx.clone();
+        if let Some(deadline) = self.deadline {
+            ctx.deadline = match ctx.deadline {
+                Deadline::At(current) => Deadline::At(current.min(deadline)),
+                Deadline::None => Deadline::At(deadline),
+            };
+        }
+        if let Some(pending) = &ctx.pending_output_limits
+            && let Some(opts) = pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+        {
+            opts.deadline = match ctx.deadline {
+                Deadline::At(deadline) => Some(deadline),
+                Deadline::None => None,
+            };
+        }
         if let Some(opts) = self.output_limits.take() {
+            if ctx.pending_output_limits.is_some() {
+                ctx.defer_output_limits(opts.into_options());
+                return self;
+            }
             let result = std::mem::replace(&mut self.result, Ok(String::new()));
             let is_error = result.is_err();
             let body = match result {
                 Ok(body) | Err(body) => body,
             };
-            let body = opts.apply(body, store).await;
+            let body = opts.apply(body, ctx.offload.clone()).await;
             self.result = if is_error { Err(body) } else { Ok(body) };
         }
         self
@@ -2263,6 +2316,7 @@ impl ToolCallReply {
             image: None,
             state: None,
             output_limits: None,
+            deadline: None,
         }
     }
 

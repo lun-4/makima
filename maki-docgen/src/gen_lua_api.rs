@@ -21,7 +21,7 @@ mod tests {
     const SERIALIZATION_CONTRACT: &str = "same-process per-path mutation serialization";
     const OUTPUT_LIMIT_CONTRACT: [&str; 5] = [
         "output_limits",
-        "yields from handler coroutines",
+        "yields while a worker applies limits",
         "synchronous callbacks",
         "raw body",
         "trailer",

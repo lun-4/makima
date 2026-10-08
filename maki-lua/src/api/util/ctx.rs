@@ -7,7 +7,7 @@ use maki_agent::AgentEvent;
 use maki_agent::agent::LoadedInstructions;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::offload::{
-    DEFAULT_LABEL, LimitOpts, OffloadStore, OutputLimits, PreviewShape, limit_output,
+    DEFAULT_LABEL, OffloadStore, OutputLimitOptions, OutputLimits, PreviewShape,
 };
 use maki_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
@@ -17,10 +17,11 @@ use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::Pair;
+use crate::api::util::pair::{Pair, err_pair};
 use crate::runtime::{active_task, lock_cell};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
+const INVALID_OUTPUT_UTF8_MSG: &str = "ctx:limit_output() body must be valid UTF-8";
 const PREVIEW_HEAD: &str = "head";
 const PREVIEW_HEAD_TAIL: &str = "head_tail";
 
@@ -66,21 +67,19 @@ impl ParsedOutputLimits {
         Ok(parsed)
     }
 
+    pub(crate) fn into_options(self) -> OutputLimitOptions {
+        OutputLimitOptions {
+            deadline: None,
+            trailer: self.trailer,
+            shape: self.shape,
+            label: self.label,
+            lines_clipped: self.lines_clipped,
+            limits: self.limits,
+        }
+    }
+
     pub(crate) async fn apply(self, body: String, store: Option<Arc<OffloadStore>>) -> String {
-        smol::unblock(move || {
-            limit_output(
-                &body,
-                &LimitOpts {
-                    trailer: self.trailer.as_deref(),
-                    shape: self.shape,
-                    label: &self.label,
-                    lines_clipped: self.lines_clipped,
-                    limits: self.limits,
-                },
-                store.as_deref(),
-            )
-        })
-        .await
+        self.into_options().apply(body, store).await
     }
 }
 
@@ -395,8 +394,12 @@ impl UserData for LuaCtx {
                 return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
             }
             cell.deadline_secs.set(Some(secs));
-            cell.deadline
-                .set(Some(Instant::now() + Duration::from_secs(secs)));
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            cell.deadline.set(Some(
+                cell.deadline
+                    .get()
+                    .map_or(deadline, |current| current.min(deadline)),
+            ));
             cell.deadline_changed.notify(usize::MAX);
             Ok((Some(true), None))
         });
@@ -410,7 +413,16 @@ impl UserData for LuaCtx {
                 let limits = OutputLimits::from_config(&agent.config);
                 let store = agent.offload.clone();
                 let opts = ParsedOutputLimits::parse(opts, limits)?;
-                let body = body.to_string_lossy();
+                let body = match body.to_str() {
+                    Ok(body) => body.to_owned(),
+                    Err(_) => return Ok(err_pair(INVALID_OUTPUT_UTF8_MSG)),
+                };
+                if agent.pending_output_limits.is_some() {
+                    let mut opts = opts.into_options();
+                    opts.deadline = lock_cell(&active_task(&lua)).deadline.get();
+                    agent.defer_output_limits(opts);
+                    return Ok((Some(lua.create_string(body)?), None));
+                }
                 // Cancel hooks can call ctx:finish while the worker holds the store lock.
                 drop(this);
                 let limited = opts.apply(body, store).await;
@@ -759,6 +771,31 @@ mod tests {
         } else {
             assert_eq!(limited, format!("{FILE_TRUNCATED_MARKER}\n{LIMIT_TRAILER}"));
         }
+    }
+
+    #[test_case::test_case(128, false; "within_limits_without_store")]
+    #[test_case::test_case(0, false; "beyond_limits_without_store")]
+    #[test_case::test_case(128, true; "within_limits_with_store")]
+    #[test_case::test_case(0, true; "beyond_limits_with_store")]
+    fn limit_output_rejects_invalid_utf8(max_bytes: usize, with_store: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = populated_ctx();
+        if with_store {
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(dir.path().to_path_buf())));
+        }
+        let lua = mlua::Lua::new();
+        lua.globals().set("ctx", LuaCtx::handler(&ctx)).unwrap();
+        lua.globals().set("max_bytes", max_bytes).unwrap();
+        let (limited, err): (Option<String>, Option<String>) = smol::block_on(
+            lua.load(
+                r#"return ctx:limit_output(string.char(255) .. string.rep("x", 100), { max_bytes = max_bytes })"#,
+            )
+            .eval_async(),
+        )
+        .unwrap();
+        assert_eq!(limited, None);
+        assert_eq!(err.as_deref(), Some(INVALID_OUTPUT_UTF8_MSG));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

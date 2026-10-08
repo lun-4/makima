@@ -752,6 +752,7 @@ impl<'h> Agent<'h> {
             model_policy: Arc::clone(&self.model_policy),
             file_write_locks: Arc::clone(&self.file_write_locks),
             offload: self.offload.clone(),
+            pending_output_limits: None,
             write_lock_chain: Arc::new(Vec::new()),
             managed_turn: self.managed_turn.clone(),
         }
