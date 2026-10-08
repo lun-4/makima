@@ -266,12 +266,16 @@ fn run_and_settle<T>(
     // task, and the cleanup controller stays outside every unwind boundary.
     let body_result = catch_unwind(AssertUnwindSafe(body));
     let mut task = task;
-    let settlement = smol::block_on(
-        AssertUnwindSafe(async {
-            futures_lite::future::or(&mut task, shutdown).await;
-        })
-        .catch_unwind(),
-    );
+    let settlement = if matches!(&body_result, Ok(Ok(_))) {
+        smol::block_on(
+            AssertUnwindSafe(async {
+                futures_lite::future::or(&mut task, shutdown).await;
+            })
+            .catch_unwind(),
+        )
+    } else {
+        Ok(())
+    };
     drop(task);
     let teardown = smol::block_on(teardown);
     let settlement = match (settlement, teardown) {
@@ -634,9 +638,22 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::tools::offload::{OffloadBackend, OffloadSnapshot, OffloadStore};
-    use maki_providers::TokenUsage;
+    use flume::{Receiver, Sender};
+    use maki_agent::{
+        AgentError, ToolOutput,
+        tools::{
+            DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
+            ToolContext, ToolInvocation, ToolRegistry, ToolSource,
+            offload::{OffloadBackend, OffloadSnapshot, OffloadStore},
+        },
+    };
+    use maki_providers::{
+        ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions, Role, StopReason,
+        StreamResponse, TokenUsage,
+        provider::{BoxFuture, Provider},
+    };
     use serde::Serializer;
+    use std::borrow::Cow;
     use std::io::Write;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -975,6 +992,184 @@ mod tests {
             Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
         > {
             Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct SettlementTool {
+        name: &'static str,
+        executed: Sender<()>,
+    }
+
+    impl Tool for SettlementTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            self.name.into()
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(Self {
+                name: self.name,
+                executed: self.executed.clone(),
+            }))
+        }
+    }
+
+    impl ToolInvocation for SettlementTool {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(self.name.into()))
+        }
+
+        fn execute<'a>(self: Box<Self>, _: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                self.executed.send(()).unwrap();
+                Ok(ToolOutput::Plain(String::new().into())).into()
+            })
+        }
+    }
+
+    struct GatedToolProvider {
+        name: &'static str,
+        polled: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Provider for GatedToolProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.polled.send_async(()).await.unwrap();
+                self.release.recv_async().await.unwrap();
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: self.name.into(),
+                            name: self.name.into(),
+                            input: serde_json::json!({}),
+                            thought_signature: None,
+                        }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(StopReason::ToolUse),
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case(BodyExit::Success, "print_settle_success" ; "success_waits_gracefully")]
+    #[test_case(BodyExit::OutputError, "print_settle_output_error" ; "output_failure_cancels")]
+    #[test_case(BodyExit::SerializerError, "print_settle_serializer_error" ; "serializer_failure_cancels")]
+    #[test_case(BodyExit::Panic, "print_settle_body_panic" ; "body_panic_cancels")]
+    fn print_failure_cancels_pending_headless_before_next_tool(
+        body_exit: BodyExit,
+        name: &'static str,
+    ) {
+        let (executed, execution) = flume::bounded(1);
+        ToolRegistry::global()
+            .register(
+                Arc::new(SettlementTool { name, executed }),
+                ToolSource::Lua {
+                    plugin: name.into(),
+                },
+            )
+            .unwrap();
+        let (polled, polling) = flume::bounded(1);
+        let (release, gate) = flume::bounded(1);
+        let cwd = std::env::temp_dir();
+        let handle = maki_agent::headless::spawn_with_provider(
+            HeadlessParams {
+                model: Model::from_spec("anthropic/claude-opus-4-8").unwrap(),
+                config: AgentConfig::default(),
+                permissions_config: PermissionsConfig::default(),
+                timeouts: Default::default(),
+                input: input(name),
+                prompt_slots: Default::default(),
+                excluded_tools: Vec::new(),
+                mcp_handle: None,
+                initial_wd: cwd.clone(),
+                system_prompt_override: None,
+                append_system_prompt: None,
+                model_policy: Arc::default(),
+                plugin_rules: Arc::default(),
+                project_config: ProjectConfig::for_project(&cwd),
+                modes: Arc::default(),
+                session_options: Default::default(),
+                state_dir: None,
+            },
+            Arc::new(GatedToolProvider {
+                name,
+                polled,
+                release: gate,
+            }),
+        )
+        .unwrap();
+        polling.recv_timeout(GATE_TIMEOUT).unwrap();
+        let shutdown_polled = AtomicBool::new(false);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_and_settle(
+                handle.task,
+                handle.teardown.wait(),
+                handle.offload_cleanup,
+                async {
+                    shutdown_polled.store(true, Ordering::Release);
+                    release.send(()).unwrap();
+                    futures_lite::future::or(
+                        async { execution.recv_async().await.unwrap() },
+                        async {
+                            smol::Timer::after(GATE_TIMEOUT).await;
+                            panic!("gated tool must execute during graceful settlement");
+                        },
+                    )
+                    .await;
+                },
+                || match body_exit {
+                    BodyExit::Success => Ok(()),
+                    BodyExit::OutputError => {
+                        FailingOutput.write_all(b"result")?;
+                        Ok(())
+                    }
+                    BodyExit::SerializerError => {
+                        VerboseOutput::Json(Vec::new()).emit(&FailingSerializer)
+                    }
+                    BodyExit::Panic => panic!("{BODY_PANIC}"),
+                },
+            )
+        }));
+        assert_eq!(
+            shutdown_polled.load(Ordering::Acquire),
+            matches!(body_exit, BodyExit::Success),
+            "only successful output may release the next tool invocation"
+        );
+        assert!(execution.try_recv().is_err());
+        match body_exit {
+            BodyExit::Success => result.unwrap().unwrap(),
+            BodyExit::OutputError => {
+                assert_eq!(result.unwrap().unwrap_err().to_string(), OUTPUT_ERROR);
+            }
+            BodyExit::SerializerError => {
+                assert_eq!(result.unwrap().unwrap_err().to_string(), SERIALIZER_ERROR);
+            }
+            BodyExit::Panic => assert!(result.is_err()),
         }
     }
 

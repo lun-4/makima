@@ -418,6 +418,21 @@ impl UserData for LuaCtx {
             },
         );
 
+        methods.add_method("capture_read", |lua, this, path: String| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("capture_read"));
+            };
+            let tracker = Arc::clone(&agent.file_tracker);
+            let mut snapshot = tracker.capture_read(Path::new(&path));
+            let commit = lua.create_function_mut(move |_, ()| {
+                if let Some(snapshot) = snapshot.take() {
+                    tracker.commit_read(snapshot);
+                }
+                Ok(())
+            })?;
+            Ok((Some(commit), None))
+        });
+
         methods.add_method("record_read", |_, this, path: String| {
             let Some(tracker) = this.file_tracker() else {
                 return Ok(this.cap_err_pair("record_read"));

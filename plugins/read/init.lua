@@ -84,13 +84,12 @@ local function build_file_view(lines, start_line, total_lines, path, ctx)
 end
 
 local function read_file(path, offset, limit, ctx)
-  -- Stat before reading: a change in between leaves the older mtime, so the
-  -- next edit is rejected as stale instead of trusting content never shown.
-  ctx:record_read(path)
+  local commit_read = ctx:capture_read(path)
   local content, err = maki.fs.read(path)
   if not content then
     return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
+  commit_read()
 
   local all_lines = split_lines(content)
   local total_lines = #all_lines

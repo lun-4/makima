@@ -1229,6 +1229,47 @@ fn read_racing_modification_leaves_stale_mtime() {
     });
 }
 
+#[test]
+fn failed_reread_preserves_stale_write_protection() {
+    use crate::api::fs::RealFs;
+    use maki_agent::tools::STALE_READ_MSG;
+    use std::fs::{File, read, write};
+    use std::time::{Duration, SystemTime};
+
+    const ORIGINAL: &str = "original\n";
+    const REPLACEMENT: &[u8] = b"external\xff\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reread.txt");
+    write(&path, ORIGINAL).unwrap();
+    let (registry, _host) = boot_with_backend(&["read", "write"], Arc::new(RealFs), HashMap::new());
+    let ctx = shared_ctx(&registry);
+    let input = json!({"path": path, "offset": 1, "limit": 0});
+    let initial = dispatch(&ctx, "r1", "read", input.clone());
+    assert!(!initial.is_error, "{}", initial.output.as_text());
+    assert!(initial.output.as_text().contains(ORIGINAL.trim_end()));
+
+    write(&path, REPLACEMENT).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
+    let reread = dispatch(&ctx, "r2", "read", input);
+    assert!(reread.is_error, "{}", reread.output.as_text());
+
+    let result = dispatch(
+        &ctx,
+        "w1",
+        "write",
+        json!({"path": path, "content": ORIGINAL}),
+    );
+    assert!(result.is_error, "{}", result.output.as_text());
+    assert!(result.output.as_text().contains(STALE_READ_MSG));
+    assert_eq!(read(&path).unwrap(), REPLACEMENT);
+}
+
 fn guarded_content() -> Vec<u8> {
     format!("short\n{}\nend\n", "x".repeat(GUARDED_LONG_LINE_BYTES)).into_bytes()
 }

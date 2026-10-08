@@ -11,6 +11,11 @@ pub const STALE_READ_MSG: &str = "file changed since last read";
 
 pub struct FileReadTracker(Mutex<HashMap<PathBuf, SystemTime>>);
 
+pub struct ReadSnapshot {
+    path: PathBuf,
+    mtime: SystemTime,
+}
+
 fn get_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -31,16 +36,27 @@ impl FileReadTracker {
     }
 
     pub fn record_read(&self, path: &Path) {
+        if let Some(snapshot) = self.capture_read(path) {
+            self.commit_read(snapshot);
+        }
+    }
+
+    pub fn capture_read(&self, path: &Path) -> Option<ReadSnapshot> {
         let key = canonical_key(path);
         match get_mtime(&key) {
-            Some(mtime) => {
-                self.0.lock().unwrap().insert(key, mtime);
+            Some(mtime) => Some(ReadSnapshot { path: key, mtime }),
+            None => {
+                warn!(
+                    path = %path.display(),
+                    "record_read: could not get mtime, file will not be tracked"
+                );
+                None
             }
-            None => warn!(
-                path = %path.display(),
-                "record_read: could not get mtime, file will not be tracked"
-            ),
         }
+    }
+
+    pub fn commit_read(&self, snapshot: ReadSnapshot) {
+        self.0.lock().unwrap().insert(snapshot.path, snapshot.mtime);
     }
 
     pub fn check_before_edit(&self, path: &Path) -> Result<(), String> {
