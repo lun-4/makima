@@ -323,6 +323,7 @@ impl ActorBackend for ScriptedBackend {
 struct CancellableBackend {
     state: Arc<ScriptedState>,
     block_first: std::sync::atomic::AtomicU32,
+    after_cancel: Option<Arc<Gate>>,
 }
 
 impl CancellableBackend {
@@ -330,6 +331,7 @@ impl CancellableBackend {
         Self {
             state: Arc::new(ScriptedState::default()),
             block_first: std::sync::atomic::AtomicU32::new(0),
+            after_cancel: None,
         }
     }
 }
@@ -347,6 +349,9 @@ impl ActorBackend for CancellableBackend {
             history.push(Message::user(input.message));
             if self.block_first.fetch_add(1, Ordering::SeqCst) == 0 {
                 let reason = context.cancel_reason.cancelled().await;
+                if let Some(gate) = &self.after_cancel {
+                    gate.wait().await;
+                }
                 return BackendResult::EnteredRun(TurnOutcome::cancelled(
                     context.agent_id,
                     context.turn_id.unwrap(),
@@ -434,6 +439,410 @@ impl Tool for QueuedTool {
     fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         Ok(Box::new(QueuedInvocation))
     }
+}
+
+#[test_case::test_case(false; "queued_cancel_during_active_history")]
+#[test_case::test_case(true; "close_before_backend_publish")]
+fn synthetic_settlement_has_unavailable_history_boundary(close: bool) {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        let active = actor
+            .admit_turn(input("active"), None, "active".into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        active.output().append_text("partial");
+        let settled = if close {
+            actor.close();
+            active.clone()
+        } else {
+            let queued = actor
+                .admit_turn(input("queued"), None, "queued".into())
+                .unwrap();
+            actor.cancel_turn(queued.turn_id()).unwrap();
+            queued
+        };
+        settled.wait().await;
+        let request = super::TranscriptRequest {
+            through_turn: Some(settled.turn_id()),
+            last_messages: 10,
+            max_bytes: 1024,
+        };
+        assert!(
+            matches!(actor.transcript(request.clone()), Err(ActorError::UnavailableTurnHistory(id)) if id == settled.turn_id())
+        );
+        if close {
+            assert_eq!(settled.peek_result().unwrap().text, "partial");
+        }
+        gate.open();
+        active.wait().await;
+        actor.close();
+        task.await;
+        assert!(matches!(
+            actor.transcript(request),
+            Err(ActorError::UnavailableTurnHistory(_))
+        ));
+    });
+}
+
+#[test]
+fn root_setup_failure_resolves_started_ticket_and_emits_end() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let mut backend = ScriptedBackend::failing_setup();
+        backend.gate = Some(Arc::clone(&gate));
+        let (actor, task) = spawn(backend);
+        let events = actor.subscribe_events();
+        actor
+            .rush(RootWork::new(
+                input("root"),
+                1,
+                false,
+                "root".into(),
+                Vec::new(),
+                "root".into(),
+            ))
+            .unwrap();
+        let super::ActorEvent::Start { turn_id, .. } = events.recv_async().await.unwrap() else {
+            panic!("expected root start")
+        };
+        let ticket = actor.turn_ticket(turn_id).unwrap();
+        gate.open();
+        assert!(matches!(ticket.wait().await, TurnOutcome::Failed { .. }));
+        assert!(
+            matches!(events.recv_async().await.unwrap(), super::ActorEvent::End(result) if result.outcome.turn_id() == turn_id)
+        );
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn typed_actor_events_are_ordered_future_only_and_broadcast() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let (actor, task) = spawn(ScriptedBackend::gated(Arc::clone(&gate)));
+        let first = actor.subscribe_events();
+        actor
+            .initialize_config(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))
+            .unwrap();
+        assert!(
+            matches!(first.recv_async().await.unwrap(), super::ActorEvent::Config(commit) if !commit.config.fast)
+        );
+        let second = actor.subscribe_events();
+        assert!(second.is_empty());
+        let update = actor.reserve_config_update().unwrap();
+        update.resolve(Ok(fast_change(true))).unwrap();
+        update.wait().await.unwrap();
+        for events in [&first, &second] {
+            assert!(
+                matches!(events.recv_async().await.unwrap(), super::ActorEvent::Config(commit) if commit.config.fast)
+            );
+        }
+        let ticket = actor
+            .admit_turn(input("events"), None, "events".into())
+            .unwrap();
+        for events in [&first, &second] {
+            assert!(
+                matches!(events.recv_async().await.unwrap(), super::ActorEvent::Start { turn_id, config: Some(config), .. } if turn_id == ticket.turn_id() && config.config.fast)
+            );
+        }
+        let late = actor.subscribe_events();
+        assert!(late.is_empty());
+        gate.open();
+        ticket.wait().await;
+        for events in [&first, &second, &late] {
+            assert!(
+                matches!(events.recv_async().await.unwrap(), super::ActorEvent::End(result) if result.outcome.turn_id() == ticket.turn_id())
+            );
+            assert!(
+                matches!(events.recv_async().await.unwrap(), super::ActorEvent::Idle { agent_id } if agent_id == actor.agent_id())
+            );
+            assert!(events.is_empty());
+        }
+        actor.close();
+        actor.close();
+        for events in [&first, &second, &late] {
+            assert!(matches!(
+                events.recv_async().await.unwrap(),
+                super::ActorEvent::Close {
+                    lifecycle: ActorLifecycle::Closed,
+                    ..
+                }
+            ));
+            assert!(events.is_empty());
+        }
+        let closed_subscription = actor.subscribe_events();
+        assert!(closed_subscription.is_empty());
+        task.await;
+    });
+}
+
+#[test_case::test_case(true; "streamed_response")]
+#[test_case::test_case(false; "response_without_deltas")]
+fn text_attempt_retry_and_reconcile_preserve_prior_responses(streamed: bool) {
+    const PRIOR: &str = "prior";
+    const FAILED: &str = "failed";
+    const FINAL: &str = "final";
+    const LATE: &str = "late";
+    let ticket = super::TurnTicket::new(crate::TurnId::generate(), Arc::new(()));
+    let output = ticket.output();
+    output.append_text(PRIOR);
+    output.begin_message();
+    output.append_text(FAILED);
+    output.reset_message();
+    if streamed {
+        output.append_text(FINAL);
+    }
+    output.complete_message(FINAL);
+    let outcome = super::cancelled_outcome(
+        AgentId::generate(),
+        ticket.turn_id(),
+        TurnCancellationReason::Closed,
+    );
+    ticket.resolve(outcome.clone());
+    output.reset_message();
+    output.begin_message();
+    output.complete_message(LATE);
+    output.append_text(LATE);
+    ticket.resolve(outcome);
+    assert_eq!(
+        ticket.peek_result().unwrap().text,
+        format!("{PRIOR}{FINAL}")
+    );
+}
+
+#[test_case::test_case(false; "complete")]
+#[test_case::test_case(true; "close")]
+fn idle_admission_frozen_result_and_future_events(close: bool) {
+    smol::block_on(async {
+        const PARTIAL: &str = "partial";
+        const LATE: &str = "late";
+        let gate = Gate::new();
+        let (actor, task) = spawn(ScriptedBackend::gated(Arc::clone(&gate)));
+        let events = actor.subscribe_events();
+        let other_events = actor.subscribe_events();
+        let ticket = actor
+            .admit_turn_if_idle(input("first"), None, "first".into(), None)
+            .unwrap();
+        let output = ticket.output();
+        output.append_text(PARTIAL);
+        assert!(matches!(
+            actor.admit_turn_if_idle(input("second"), None, "second".into(), None),
+            Err(ActorError::Busy)
+        ));
+        assert!(
+            matches!(events.recv_async().await.unwrap(), super::ActorEvent::Start { turn_id, .. } if turn_id == ticket.turn_id())
+        );
+        assert!(
+            matches!(other_events.recv_async().await.unwrap(), super::ActorEvent::Start { turn_id, .. } if turn_id == ticket.turn_id())
+        );
+        if close {
+            actor.close();
+        } else {
+            gate.open();
+        }
+        let first = ticket.wait_result().await;
+        output.append_text(LATE);
+        assert_eq!(ticket.wait_result().await.text, PARTIAL);
+        assert_eq!(ticket.peek_result().unwrap().outcome, first.outcome);
+        assert_eq!(
+            actor
+                .turn_ticket(ticket.turn_id())
+                .unwrap()
+                .peek_result()
+                .unwrap()
+                .text,
+            PARTIAL
+        );
+        if !close {
+            until(|| !actor.has_pending_work()).await;
+            assert!(matches!(
+                actor.admit_turn_if_idle(
+                    input("stale"),
+                    None,
+                    "stale".into(),
+                    Some(crate::TurnId::generate())
+                ),
+                Err(ActorError::StaleTurn)
+            ));
+            let second = actor
+                .admit_turn_if_idle(input("next"), None, "next".into(), Some(ticket.turn_id()))
+                .unwrap();
+            second.wait().await;
+            actor.close();
+        }
+        gate.open();
+        task.await;
+    });
+}
+
+#[test_case::test_case(0, 1024; "zero_messages")]
+#[test_case::test_case(1001, 1024; "message_cap")]
+#[test_case::test_case(10, 0; "zero_bytes")]
+#[test_case::test_case(10, 1; "cannot_encode_empty_array")]
+#[test_case::test_case(10, 1048577; "byte_cap")]
+fn transcript_rejects_invalid_caps(last_messages: usize, max_bytes: usize) {
+    let (actor, task) = spawn(ScriptedBackend::new());
+    assert!(matches!(
+        actor.transcript(super::TranscriptRequest {
+            through_turn: None,
+            last_messages,
+            max_bytes
+        }),
+        Err(ActorError::InvalidTranscriptCaps)
+    ));
+    actor.close();
+    smol::block_on(task);
+}
+
+#[test_case::test_case(1, 1024, 0; "count_cannot_split_group")]
+#[test_case::test_case(2, 1024, 2; "whole_group")]
+#[test_case::test_case(2, 2, 0; "byte_cannot_split_group")]
+fn transcript_keeps_tool_groups(last_messages: usize, max_bytes: usize, expected: usize) {
+    const TOOL_ID: &str = "tool-id";
+    const TOOL_NAME: &str = "test-tool";
+    let messages = vec![
+        Message {
+            content: vec![ContentBlock::ToolUse {
+                id: TOOL_ID.into(),
+                name: TOOL_NAME.into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }],
+            ..Default::default()
+        },
+        Message {
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: TOOL_ID.into(),
+                content: String::new(),
+                is_error: false,
+            }],
+            ..Default::default()
+        },
+    ];
+    let (actor, task) = AgentActorHandle::spawn(
+        AgentId::generate(),
+        Vec::new(),
+        None,
+        Box::new(ScriptedBackend::new()),
+    );
+    actor
+        .inner
+        .history
+        .store(Arc::new(crate::HistorySnapshot::new(messages)));
+    let turn_id = crate::TurnId::generate();
+    let outcome = super::cancelled_outcome(actor.agent_id(), turn_id, TurnCancellationReason::User);
+    super::retire_turn(&actor.inner, turn_id, &outcome, false, true);
+    let snapshot = actor
+        .transcript(super::TranscriptRequest {
+            through_turn: None,
+            last_messages,
+            max_bytes,
+        })
+        .unwrap();
+    assert_eq!(snapshot.messages.as_array().unwrap().len(), expected);
+    assert!(snapshot.bytes <= max_bytes);
+    assert_eq!(
+        snapshot.bytes,
+        serde_json::to_string(&snapshot.messages).unwrap().len()
+    );
+    actor.close();
+    smol::block_on(task);
+}
+
+#[test]
+fn default_transcript_excludes_first_active_and_later_active_history() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        let request = super::TranscriptRequest {
+            through_turn: None,
+            last_messages: 10,
+            max_bytes: 1024,
+        };
+        let first = actor
+            .admit_turn(input("first"), None, "first".into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let empty = actor.transcript(request.clone()).unwrap();
+        assert_eq!(empty.through_turn, None);
+        assert_eq!(empty.total_messages, 0);
+        assert_eq!(empty.messages, serde_json::json!([]));
+        gate.open();
+        first.wait().await;
+        until(|| !actor.has_pending_work()).await;
+        gate.opened.store(false, Ordering::Release);
+        let second = actor
+            .admit_turn(input("second"), None, "second".into())
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 2).await;
+        let bounded = actor.transcript(request).unwrap();
+        assert_eq!(bounded.through_turn, Some(first.turn_id()));
+        assert_eq!(bounded.total_messages, 1);
+        assert_eq!(bounded.messages[0]["content"][0]["text"], "first");
+        gate.open();
+        second.wait().await;
+        actor.close();
+        task.await;
+    });
+}
+
+#[test]
+fn transcript_exact_boundary_pending_unknown_and_rewrite() {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let (actor, task) = spawn(ScriptedBackend::gated(Arc::clone(&gate)));
+        let ticket = actor
+            .admit_turn(input("first"), None, "first".into())
+            .unwrap();
+        let request = super::TranscriptRequest {
+            through_turn: Some(ticket.turn_id()),
+            last_messages: 10,
+            max_bytes: 1024,
+        };
+        assert!(matches!(
+            actor.transcript(request.clone()),
+            Err(ActorError::PendingTurn(_))
+        ));
+        assert!(matches!(
+            actor.transcript(super::TranscriptRequest {
+                through_turn: Some(crate::TurnId::generate()),
+                ..request.clone()
+            }),
+            Err(ActorError::UnknownTurn(_))
+        ));
+        gate.open();
+        ticket.wait().await;
+        let snapshot = actor.transcript(request.clone()).unwrap();
+        assert_eq!(snapshot.total_messages, 1);
+        assert_eq!(snapshot.messages[0]["content"][0]["text"], "first");
+        let second = actor
+            .admit_turn(input("second"), None, "second".into())
+            .unwrap();
+        second.wait().await;
+        assert_eq!(actor.transcript(request.clone()).unwrap().total_messages, 1);
+        let current = actor.inner.history.load_full();
+        actor
+            .inner
+            .history
+            .store(Arc::new(crate::HistorySnapshot::new(
+                (*current.messages).clone(),
+            )));
+        assert!(matches!(
+            actor.transcript(request),
+            Err(ActorError::CompactedTurn(_))
+        ));
+        actor.close();
+        task.await;
+    });
 }
 
 fn spawn(backend: impl ActorBackend + 'static) -> (AgentActorHandle, smol::Task<()>) {
@@ -1067,6 +1476,74 @@ fn event_sink_failure_still_retains() {
     });
 }
 
+#[test_case::test_case(false, false; "matching_plugin")]
+#[test_case::test_case(true, false; "different_origin")]
+#[test_case::test_case(false, true; "reloaded_plugin")]
+fn active_turn_interrupt_respects_provenance(origin_boundary: bool, generation_boundary: bool) {
+    smol::block_on(async {
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        let provenance = super::TurnProvenance {
+            origin: super::TurnOrigin::Plugin,
+            plugin: Some("plugin".into()),
+            plugin_generation: Some(1),
+            ..Default::default()
+        };
+        let ticket = actor
+            .admit_turn_with_options(
+                input("active"),
+                None,
+                "active".into(),
+                super::TurnAdmissionOptions {
+                    provenance: provenance.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let mut queued = provenance;
+        if origin_boundary {
+            queued.origin = super::TurnOrigin::User;
+        }
+        if generation_boundary {
+            queued.plugin_generation = Some(2);
+        }
+        actor
+            .rush(
+                RootWork::new(
+                    input("queued"),
+                    1,
+                    false,
+                    "queued".into(),
+                    Vec::new(),
+                    "queued".into(),
+                )
+                .with_provenance(queued.clone()),
+            )
+            .unwrap();
+        gate.open();
+        ticket.wait().await;
+        until(|| !actor.has_pending_work()).await;
+        let boundary = origin_boundary || generation_boundary;
+        assert_eq!(
+            state.runs.lock().unwrap().len(),
+            if boundary { 2 } else { 1 }
+        );
+        assert_eq!(state.folds.lock().unwrap().len(), usize::from(!boundary));
+        if boundary {
+            let latest = actor.snapshot().latest.unwrap();
+            assert_eq!(
+                actor.turn_ticket(latest.turn_id()).unwrap().provenance(),
+                &queued
+            );
+        }
+        actor.close();
+        task.await;
+    });
+}
+
 #[test]
 fn root_folds_into_active_turn_with_no_orphan() {
     smol::block_on(async {
@@ -1074,7 +1551,20 @@ fn root_folds_into_active_turn_with_no_orphan() {
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
-        let main = handle.admit_turn(input("main"), None, "m".into()).unwrap();
+        let main = handle
+            .admit_turn_with_options(
+                input("main"),
+                None,
+                "m".into(),
+                super::TurnAdmissionOptions {
+                    provenance: super::TurnProvenance {
+                        origin: super::TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         // Wait until the main turn has entered the backend, then queue a
         // root. The gated backend polls the interrupt source only after the
         // gate opens, so ordering is deterministic.
@@ -1119,7 +1609,18 @@ fn permitted_idle_turn_folds_interrupts_like_any_turn() {
         let (handle, task) = spawn(backend);
         let guard = handle.prepare_idle().unwrap();
         let approved = handle
-            .admit_turn(input("approved"), None, "approved".into())
+            .admit_turn_with_options(
+                input("approved"),
+                None,
+                "approved".into(),
+                super::TurnAdmissionOptions {
+                    provenance: super::TurnProvenance {
+                        origin: super::TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
             .unwrap();
         guard.allow_turn(&approved).unwrap();
         until(|| state.entered.load(Ordering::SeqCst) > 0).await;
@@ -1144,22 +1645,37 @@ fn permitted_idle_turn_folds_interrupts_like_any_turn() {
 }
 
 #[test]
-fn permitted_idle_turn_without_outcome_does_not_hold_actor() {
+fn permitted_idle_turn_with_invalid_backend_result_settles_and_releases_actor() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
         *backend.outcomes.lock().unwrap() = vec![BackendResult::ControlDone];
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
+        let events = handle.subscribe_events();
         let guard = handle.prepare_idle().unwrap();
         let approved = handle
-            .admit_turn(input("approved"), None, "approved".into())
+            .admit_turn_with_options(
+                input("approved"),
+                None,
+                "approved".into(),
+                super::TurnAdmissionOptions {
+                    provenance: super::TurnProvenance {
+                        origin: super::TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let later = handle
             .admit_turn(input("later"), None, "later".into())
             .unwrap();
         guard.allow_turn(&approved).unwrap();
         assert!(matches!(later.wait().await, TurnOutcome::Completed { .. }));
-        assert!(approved.peek().is_none());
+        let result = approved.wait_result().await;
+        assert!(matches!(result.outcome, TurnOutcome::Failed { .. }));
+        assert_eq!(handle.outcome(approved.turn_id()), Some(result.outcome));
+        assert_eq!(events.drain().filter(|event| matches!(event, super::ActorEvent::End(result) if result.outcome.turn_id() == approved.turn_id())).count(), 1);
         assert_eq!(state.entered.load(Ordering::SeqCst), 2);
         drop(guard);
         handle.close();
@@ -1331,16 +1847,22 @@ fn first_cancellation_reason_wins() {
     });
 }
 
-#[test]
-fn first_reason_wins_across_sources() {
+#[test_case::test_case(false; "cancel_all_before_close")]
+#[test_case::test_case(true; "cancel_turn_before_close")]
+fn first_reason_wins_across_sources(cancel_one: bool) {
     smol::block_on(async {
-        let backend = CancellableBackend::new();
+        let gate = Gate::new();
+        let mut backend = CancellableBackend::new();
+        backend.after_cancel = Some(Arc::clone(&gate));
         let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let ticket = handle.admit_turn(input("work"), None, "w".into()).unwrap();
         until(|| state.entered.load(Ordering::SeqCst) > 0).await;
-        // cancel_all fires User first; the later close cannot override it.
-        handle.cancel_all();
+        if cancel_one {
+            handle.cancel_turn(ticket.turn_id()).unwrap();
+        } else {
+            handle.cancel_all();
+        }
         handle.close();
         let outcome = ticket.wait().await;
         assert!(matches!(
@@ -1350,6 +1872,7 @@ fn first_reason_wins_across_sources() {
                 ..
             }
         ));
+        gate.open();
         task.await;
     });
 }
@@ -1383,13 +1906,27 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         correlation: "c".into(),
     }));
     assert!(matches!(
-        queue.pop_interrupt(0, &crate::batch_key(&input("t"))),
+        queue.pop_interrupt(
+            0,
+            &crate::batch_key(&input("t")),
+            &super::TurnProvenance {
+                origin: super::TurnOrigin::User,
+                ..Default::default()
+            }
+        ),
         Some(ExtractedCommand::Compact(None))
     ));
     // A control at the front is incompatible: poll must not consume it.
     assert!(
         queue
-            .pop_interrupt(0, &crate::batch_key(&input("t")))
+            .pop_interrupt(
+                0,
+                &crate::batch_key(&input("t")),
+                &super::TurnProvenance {
+                    origin: super::TurnOrigin::User,
+                    ..Default::default()
+                }
+            )
             .is_none()
     );
     assert_eq!(queue.len(), 1);
@@ -1399,7 +1936,6 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         input: Some(input("t")),
         event_sender: None,
         correlation: "t".into(),
-        root: false,
         generation: 0,
         policy: None,
         admission: None,
@@ -1416,7 +1952,14 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
     )));
     assert!(
         queue
-            .pop_interrupt(0, &crate::batch_key(&input("t")))
+            .pop_interrupt(
+                0,
+                &crate::batch_key(&input("t")),
+                &super::TurnProvenance {
+                    origin: super::TurnOrigin::User,
+                    ..Default::default()
+                }
+            )
             .is_none()
     );
     assert_eq!(
@@ -1842,7 +2385,18 @@ fn root_batch_and_interrupt_respect_policy_generation() {
             ))
             .unwrap();
         let active = handle
-            .admit_turn(input("active"), None, "active".into())
+            .admit_turn_with_options(
+                input("active"),
+                None,
+                "active".into(),
+                super::TurnAdmissionOptions {
+                    provenance: super::TurnProvenance {
+                        origin: super::TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
             .unwrap();
         until(|| observed.entered.load(Ordering::SeqCst) == 1).await;
         for (run_id, message) in [(1, "old"), (2, "old too")] {

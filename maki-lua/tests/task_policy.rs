@@ -55,6 +55,7 @@ const SCENARIO_INVALID_THEN_VALID: &str = "invalid_then_valid";
 const SCENARIO_NEVER_STRUCTURED: &str = "never_structured";
 const SCENARIO_INVALID_ONLY: &str = "invalid_only";
 const SCENARIO_PROMPT_ERROR: &str = "prompt_error";
+const SCENARIO_NESTED_FAILED: &str = "nested_failed";
 const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
 const SCENARIO_NO_SUMMARY: &str = "no_summary";
@@ -752,6 +753,45 @@ fn duplicate_task_id_is_rejected_without_overwrite() {
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(2));
     assert_eq!(snap["closed"], json!(1));
+}
+
+#[test]
+fn failed_initial_admission_closes_new_session() {
+    let (reg, _host) = load_task_host();
+    let error = exec_tool(&reg, "task_spawn", task_input(SCENARIO_PROMPT_ERROR, None)).unwrap_err();
+    assert_eq!(error, PROMPT_ERR_MSG);
+    let snapshot = probe(&reg);
+    assert_eq!(snapshot["sessions"], json!(1));
+    assert_eq!(snapshot["closed"], json!(1));
+    assert!(
+        exec_tool(
+            &reg,
+            "task_get",
+            json!({ "task_id": SCENARIO_PROMPT_ERROR })
+        )
+        .unwrap_err()
+        .contains("unknown task_id")
+    );
+}
+
+#[test]
+fn failed_later_admission_keeps_existing_session_open() {
+    let (reg, _host) = load_task_host();
+    let spawned = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_NESTED_FAILED, None));
+    let task_id = spawned["task_id"].as_str().unwrap();
+    assert_eq!(
+        exec_tool(
+            &reg,
+            "task_send",
+            json!({ "task_id": task_id, "message": "rejected" })
+        )
+        .unwrap_err(),
+        PROMPT_ERR_MSG
+    );
+    assert_eq!(probe(&reg)["closed"], json!(0));
+    let despawned = exec_tool_json(&reg, "task_despawn", json!({ "task_id": task_id }));
+    assert_eq!(despawned["ok"], json!(true));
+    assert_eq!(probe(&reg)["closed"], json!(1));
 }
 
 #[test]

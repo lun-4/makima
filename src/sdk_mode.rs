@@ -539,6 +539,10 @@ struct CommandDriverParams {
 }
 
 enum CommandRoute {
+    Selection {
+        selection: maki_commands::ModelSelection,
+        response: Sender<Result<HostResponse, CommandError>>,
+    },
     Model {
         argument: String,
         response: Sender<Result<HostResponse, CommandError>>,
@@ -577,6 +581,18 @@ impl CommandHost for SdkCommandHost {
                 HostRequest::Context(_) => Ok(HostResponse::Context(
                     maki_commands::HostContextResponse::Unavailable,
                 )),
+                HostRequest::Builtin(BuiltinOperation::SelectModel(selection)) => {
+                    let (response, response_rx) = flume::bounded(1);
+                    tx.send(CommandRoute::Selection {
+                        selection,
+                        response,
+                    })
+                    .map_err(|_| CommandError::StaleTarget)?;
+                    response_rx
+                        .recv_async()
+                        .await
+                        .map_err(|_| CommandError::StaleTarget)?
+                }
                 HostRequest::Builtin(BuiltinOperation::SetModel { spec }) => {
                     route_model(&tx, spec.to_string()).await
                 }
@@ -1350,6 +1366,26 @@ fn spawn_command_driver(params: CommandDriverParams) -> smol::Task<()> {
         } = params;
         while let Ok(route) = route_rx.recv_async().await {
             match route {
+                CommandRoute::Selection {
+                    selection,
+                    response,
+                } => {
+                    let result = coordinator
+                        .set_model(selection.spec, selection.fast, selection.thinking)
+                        .await
+                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))
+                        .map(|snapshot| {
+                            if let Some(option) = snapshot.options.iter().find(|option| {
+                                option.definition.id.as_ref()
+                                    == maki_agent::session_options::MODEL_OPTION_ID
+                            }) && let Ok(model) = Model::from_spec(&option.current_value)
+                            {
+                                shared.lock().unwrap().model = model;
+                            }
+                            HostResponse::Completed
+                        });
+                    let _ = response.send(result);
+                }
                 CommandRoute::Model { argument, response } => {
                     let result = coordinator
                         .set_option(maki_agent::session_options::MODEL_OPTION_ID, argument)
@@ -2257,13 +2293,49 @@ mod tests {
         let content = CommandContent::from(input);
         let dispatch = smol::spawn(async move { registry.dispatch_input(&target, content).await });
 
-        let CommandRoute::Model { argument, response } = commands.route_rx.recv().unwrap();
+        let CommandRoute::Model { argument, response } = commands.route_rx.recv().unwrap() else {
+            panic!("expected model route");
+        };
         assert_eq!(argument, expected);
         response.send(Ok(HostResponse::Completed)).unwrap();
         assert!(matches!(
             smol::block_on(dispatch),
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
+    }
+
+    #[test]
+    fn sdk_structured_model_command_routes_partial_selection() {
+        for input in [
+            "/model gpt-5 thinking=high fast=true",
+            "/model thinking=off fast=false",
+        ] {
+            let commands = sdk_commands(CommandRegistry::new());
+            let registry = commands.registry.clone();
+            let target = commands.target.clone();
+            let content = CommandContent::from(input);
+            let dispatch =
+                smol::spawn(async move { registry.dispatch_input(&target, content).await });
+            let CommandRoute::Selection {
+                selection,
+                response,
+            } = commands.route_rx.recv().unwrap()
+            else {
+                panic!("expected structured model route");
+            };
+            let mut expected =
+                maki_commands::ModelSelection::parse(input.strip_prefix("/model ").unwrap())
+                    .unwrap();
+            if expected.spec.is_some() {
+                expected.spec = Some(Arc::from("openai/gpt-5"));
+            }
+            assert_eq!(selection, expected);
+            response.send(Ok(HostResponse::Completed)).unwrap();
+            assert!(matches!(
+                smol::block_on(dispatch),
+                InputDispatch::Dispatched(CommandOutcome::Completed)
+            ));
+        }
     }
 
     #[test]

@@ -148,6 +148,47 @@ pub(super) fn new_backend(
 }
 
 impl TuiActorBackend {
+    pub(super) fn orchestration_template(&self) -> maki_agent::tools::ToolContext {
+        let selected = self.model_slot.load();
+        let tools = self.build_tools(&selected.model, false);
+        let mut history = History::new(Vec::new());
+        let agent = Agent::new(
+            AgentParams {
+                agent_id: self.agent_id,
+                provider: Arc::clone(&selected.provider)
+                    as Arc<dyn maki_providers::provider::Provider>,
+                model: selected.model.clone(),
+                config: self.config.clone(),
+                tool_output_lines: self.tool_output_lines,
+                permissions: Arc::clone(&self.permissions),
+                session_id: self.session_id.clone(),
+                mailbox: self.mailbox.clone(),
+                timeouts: self.timeouts,
+                file_tracker: Arc::clone(&self.file_tracker),
+                prompt_slots: Arc::new(maki_agent::prompt::ResolvedSlots::default()),
+                modes: self.lua_handle.mode_registry(),
+                subagent_cancels: Arc::clone(&self.subagent_cancels),
+                ledger: Arc::new(maki_agent::RunLedger::default()),
+                registry: Arc::clone(ToolRegistry::global_arc()),
+                audience: ToolAudience::MAIN,
+                question_mode: QuestionMode::Tui,
+                model_policy: Arc::clone(&self.model_policy),
+                file_write_locks: Arc::clone(&self.file_write_locks),
+                offload: self.offload.clone(),
+                managed_turn: None,
+            },
+            AgentRunParams {
+                history: &mut history,
+                system: String::new(),
+                event_tx: EventSender::new(self.agent_tx.clone(), 0),
+                tools,
+            },
+        );
+        let mut template = agent.tool_context();
+        template.cwd = (**self.cwd.load()).clone();
+        template
+    }
+
     /// Build the system prompt, honoring the CLI override and append.
     fn build_system_with(
         &self,
@@ -452,7 +493,7 @@ impl TuiActorBackend {
             Ok(prepared) => prepared?,
             Err(_) => return Some(self.cancel_setup(context, turn_id, run_id)),
         };
-        self.run_id.store(run_id, Ordering::Relaxed);
+        self.run_id.fetch_max(run_id, Ordering::Relaxed);
         let mut agent = Agent::new(
             AgentParams {
                 agent_id: self.agent_id,
@@ -480,7 +521,8 @@ impl TuiActorBackend {
             AgentRunParams {
                 history,
                 system,
-                event_tx: EventSender::new(self.agent_tx.clone(), run_id),
+                event_tx: EventSender::new(self.agent_tx.clone(), run_id)
+                    .with_output(context.output.clone()),
                 tools,
             },
         )
@@ -696,14 +738,44 @@ impl ActorBackend for TuiActorBackend {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
-            // Roots carry their own correlation run id in the work metadata;
-            // admitted turns correlate through the admission's correlation.
+            let explicit = matches!(&work, WorkKind::Turn)
+                && !context.correlation.starts_with(ROOT_CORRELATION_PREFIX);
             let run_id = match &work {
                 WorkKind::Root { run_id, .. } => *run_id,
+                WorkKind::Turn if explicit => self.run_id.fetch_add(1, Ordering::Relaxed) + 1,
                 WorkKind::Turn | WorkKind::Control | WorkKind::Compact => {
                     correlation_to_run_id(&context.correlation)
                 }
             };
+            if explicit {
+                if let Some(current) = &context.managed_turn {
+                    let bound = current.manager().actor(context.agent_id).and_then(|actor| {
+                        actor
+                            .bind_active_correlation(
+                                turn_id,
+                                format!("{ROOT_CORRELATION_PREFIX}{run_id}"),
+                            )
+                            .map_err(|error| maki_agent::ManagerError::Policy(error.to_string()))
+                    });
+                    if bound.is_err() {
+                        let _ = self.drain_tx.try_send(run_id);
+                        return BackendResult::EnteredRun(
+                            self.cancel_setup(&context, turn_id, run_id),
+                        );
+                    }
+                }
+                EventSender::new(self.agent_tx.clone(), run_id).try_send(
+                    AgentEvent::QueueItemConsumed {
+                        text: input.message.clone(),
+                        images: input.images.clone(),
+                        mcp_startup_notice: context
+                            .admission
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.mcp_startup_notice),
+                        already_displayed: false,
+                    },
+                );
+            }
             let result = if matches!(&work, WorkKind::Control | WorkKind::Compact) {
                 // The TUI has no standalone controls/compacts; the runner
                 // only reaches here with a Turn or a started Root. Treat an
@@ -780,6 +852,25 @@ impl ActorBackend for TuiActorBackend {
                         turn_id,
                     },
                 }
+            };
+            let result = if explicit && matches!(result, BackendResult::SetupFailed { .. }) {
+                let outcome = TurnOutcome::failed(
+                    context.agent_id,
+                    turn_id,
+                    Default::default(),
+                    0,
+                    maki_agent::TurnFailure {
+                        kind: maki_agent::TurnFailureKind::Internal,
+                        diagnostic: "actor setup failed".into(),
+                        user_message: "The agent could not start this turn.".into(),
+                        retryable: true,
+                    },
+                );
+                EventSender::new(self.agent_tx.clone(), run_id)
+                    .try_send(AgentEvent::TurnOutcome(outcome.clone()));
+                BackendResult::EnteredRun(outcome)
+            } else {
+                result
             };
             let _ = self.drain_tx.try_send(run_id);
             result
@@ -951,6 +1042,225 @@ mod tests {
 
     use super::*;
     use crate::agent::ProviderSlot;
+
+    #[test_case(false; "complete")]
+    #[test_case(true; "cancel")]
+    fn explicit_actual_root_turn_uses_current_ui_run_and_cancel_alias(cancel: bool) {
+        smol::block_on(async {
+            const RUN_ID: u64 = 7;
+            const RESPONSE: &str = "visible explicit response";
+            let (mut backend, mut input, events) = failing_backend();
+            input.prompt = None;
+            let (release, released) = flume::bounded(1);
+            let provider = Arc::new(ExplicitProvider { release: released });
+            let (drain_tx, drain_rx) = flume::unbounded();
+            let agent_tx = backend.agent_tx.clone();
+            backend.drain_tx = drain_tx;
+            backend.run_id.store(RUN_ID - 1, Ordering::Relaxed);
+            let manager = maki_agent::AgentManagerHandle::new(Default::default()).unwrap();
+            let root = manager
+                .create_root_with_config(
+                    Some(
+                        maki_agent::EffectiveAgentConfig::new(
+                            maki_agent::RunSettings {
+                                provider,
+                                model: crate::components::test_model(),
+                                fast: false,
+                                workflow: false,
+                                thinking: Default::default(),
+                            },
+                            AgentMode::Build,
+                        )
+                        .with_mode_def(
+                            maki_agent::ModeRegistry::builtin().get(&maki_agent::ModeId::Build),
+                        ),
+                    ),
+                    Vec::new(),
+                    None,
+                    |agent_id| {
+                        backend.agent_id = agent_id;
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                    },
+                )
+                .unwrap();
+            let actor = root.actor().unwrap();
+            let successor_input = AgentInput::from_defaults(
+                "successor".into(),
+                AgentMode::Build,
+                Vec::new(),
+                Default::default(),
+            );
+            let ticket = actor.admit_turn(input, None, String::new()).unwrap();
+            let successor = actor
+                .admit_turn(successor_input, None, String::new())
+                .unwrap();
+            let mut visible = Vec::new();
+            const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+            loop {
+                let envelope = futures_lite::future::or(events.recv_async(), async {
+                    smol::Timer::after(TEST_TIMEOUT).await;
+                    panic!("waiting for explicit streaming: actor={:?}, outcome={:?}, events={visible:?}", actor.snapshot(), ticket.peek());
+                }).await.unwrap();
+                assert_eq!(envelope.run_id, RUN_ID);
+                let streamed =
+                    matches!(&envelope.event, AgentEvent::TextDelta { text } if text == RESPONSE);
+                visible.push(envelope);
+                if streamed {
+                    break;
+                }
+            }
+            assert!(
+                visible
+                    .iter()
+                    .any(|envelope| matches!(envelope.event, AgentEvent::QueueItemConsumed { .. }))
+            );
+            if cancel {
+                manager
+                    .cancel_correlation(
+                        root.id(),
+                        &format!("{ROOT_CORRELATION_PREFIX}{RUN_ID}"),
+                        TurnCancellationReason::User,
+                    )
+                    .unwrap();
+            } else {
+                release.send(()).unwrap();
+            }
+            let outcome = futures_lite::future::or(ticket.wait(), async {
+                smol::Timer::after(TEST_TIMEOUT).await;
+                panic!(
+                    "waiting for explicit settlement: actor={:?}, events={:?}",
+                    actor.snapshot(),
+                    events.drain().collect::<Vec<_>>()
+                );
+            })
+            .await;
+            assert_eq!(
+                matches!(
+                    outcome,
+                    TurnOutcome::Cancelled {
+                        reason: TurnCancellationReason::User,
+                        ..
+                    }
+                ),
+                cancel
+            );
+            assert_eq!(
+                futures_lite::future::or(drain_rx.recv_async(), async {
+                    smol::Timer::after(TEST_TIMEOUT).await;
+                    panic!("waiting for backend drain: actor={:?}", actor.snapshot());
+                })
+                .await
+                .unwrap(),
+                RUN_ID
+            );
+            let mut terminal = false;
+            loop {
+                let envelope = futures_lite::future::or(events.recv_async(), async {
+                    smol::Timer::after(TEST_TIMEOUT).await;
+                    panic!(
+                        "waiting for successor streaming: actor={:?}",
+                        actor.snapshot()
+                    );
+                })
+                .await
+                .unwrap();
+                terminal |= envelope.run_id == RUN_ID
+                    && matches!(&envelope.event, AgentEvent::TurnOutcome(_));
+                if envelope.run_id == RUN_ID + 1
+                    && matches!(&envelope.event, AgentEvent::TextDelta { .. })
+                {
+                    break;
+                }
+            }
+            assert!(terminal);
+            manager
+                .cancel_correlation(
+                    root.id(),
+                    &format!("{ROOT_CORRELATION_PREFIX}{RUN_ID}"),
+                    TurnCancellationReason::User,
+                )
+                .unwrap();
+            assert!(successor.peek().is_none());
+            release.send(()).unwrap();
+            assert!(matches!(
+                futures_lite::future::or(successor.wait(), async {
+                    smol::Timer::after(TEST_TIMEOUT).await;
+                    panic!("waiting for successor settlement");
+                })
+                .await,
+                TurnOutcome::Completed { .. }
+            ));
+            assert_eq!(drain_rx.recv_async().await.unwrap(), RUN_ID + 1);
+            events.drain().for_each(drop);
+            actor.publish_if_empty(|| {
+                EventSender::new(agent_tx, RUN_ID + 1).try_send(AgentEvent::QueueDrained);
+            });
+            assert!(matches!(
+                futures_lite::future::or(events.recv_async(), async {
+                    smol::Timer::after(TEST_TIMEOUT).await;
+                    panic!("waiting for queue drained: actor={:?}", actor.snapshot());
+                })
+                .await
+                .unwrap(),
+                Envelope {
+                    run_id,
+                    event: AgentEvent::QueueDrained,
+                    ..
+                } if run_id == RUN_ID + 1
+            ));
+            actor.close();
+            manager.shutdown(std::time::Duration::from_secs(1)).await;
+        });
+    }
+
+    struct ExplicitProvider {
+        release: flume::Receiver<()>,
+    }
+
+    impl maki_providers::provider::Provider for ExplicitProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            events: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, AgentError>,
+        > {
+            Box::pin(async move {
+                const RESPONSE: &str = "visible explicit response";
+                events
+                    .send(maki_providers::ProviderEvent::TextDelta {
+                        text: RESPONSE.into(),
+                    })
+                    .unwrap();
+                self.release.recv_async().await.unwrap();
+                Ok(maki_providers::StreamResponse {
+                    message: Message {
+                        role: maki_providers::Role::Assistant,
+                        content: vec![maki_providers::ContentBlock::Text {
+                            text: RESPONSE.into(),
+                        }],
+                        ..Default::default()
+                    },
+                    usage: Default::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
 
     #[test]
     fn idle_compaction_source_uses_pinned_policy() {
@@ -1194,6 +1504,8 @@ mod tests {
         let context = TurnContext {
             agent_id: backend.agent_id,
             turn_id: None,
+            output: Default::default(),
+            provenance: Default::default(),
             cancel: CancelToken::none(),
             cancel_reason: ReasonedCancelToken::none(),
             correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
@@ -1277,6 +1589,8 @@ mod tests {
             let context = TurnContext {
                 agent_id: backend.agent_id,
                 turn_id: Some(turn_id),
+                output: Default::default(),
+                provenance: Default::default(),
                 cancel,
                 cancel_reason,
                 correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
@@ -1319,6 +1633,8 @@ mod tests {
             let successor = TurnContext {
                 agent_id: backend.agent_id,
                 turn_id: Some(TurnId::generate()),
+                output: Default::default(),
+                provenance: Default::default(),
                 cancel: CancelToken::none(),
                 cancel_reason: ReasonedCancelToken::none(),
                 correlation: format!("{ROOT_CORRELATION_PREFIX}1"),

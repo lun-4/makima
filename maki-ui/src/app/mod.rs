@@ -653,6 +653,12 @@ impl App {
         .activate()
     }
 
+    pub(crate) fn selected_agent_id(&self) -> Option<maki_agent::AgentId> {
+        self.chats
+            .get(self.active_chat)
+            .and_then(|chat| chat.agent_id)
+    }
+
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
         &mut self.chats[0]
     }
@@ -1829,7 +1835,14 @@ impl App {
 
     fn handle_cancel(&mut self) -> Vec<Action> {
         let cancelled_run = self.run_id;
-        self.run_id += 1;
+        self.run_id = self
+            .queue
+            .current_run_id()
+            .unwrap_or(self.run_id)
+            .max(self.run_id)
+            + 1;
+        self.queue.set_run_id(self.run_id);
+        self.queue.fence_cancelled_presentations(self.run_id);
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
@@ -1869,6 +1882,16 @@ impl App {
         vec![]
     }
 
+    pub(crate) fn adopt_actor_presentation(&mut self, envelope: &Envelope) {
+        if envelope.subagent.is_none()
+            && matches!(envelope.event, AgentEvent::QueueItemConsumed { .. })
+            && envelope.run_id > self.run_id
+            && self.queue.accepts_actor_presentation(envelope.run_id)
+        {
+            self.record_run_start(envelope.run_id);
+        }
+    }
+
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
@@ -1893,6 +1916,7 @@ impl App {
             }
             return vec![];
         }
+        self.adopt_actor_presentation(&envelope);
         if envelope.subagent.is_none() && envelope.run_id != self.run_id {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
@@ -2572,6 +2596,7 @@ impl App {
                 vec![Action::RefreshModels]
             }
             BuiltinOperation::SetModel { spec } => vec![Action::ChangeModel(spec.to_string())],
+            BuiltinOperation::SelectModel(selection) => vec![Action::SelectModel(selection)],
             BuiltinOperation::OpenThemePicker => {
                 self.theme_picker.open();
                 self.command_runtime

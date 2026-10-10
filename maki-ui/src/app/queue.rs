@@ -24,11 +24,27 @@ pub(crate) enum SubmitOutcome {
 pub(crate) struct MessageQueue {
     shared: Option<QueueSender>,
     focus: Option<usize>,
+    cancelled_through: u64,
 }
 
 impl MessageQueue {
     pub(crate) fn set_shared(&mut self, shared: QueueSender) {
         self.shared = Some(shared);
+    }
+
+    pub(crate) fn fence_cancelled_presentations(&mut self, run_id: u64) {
+        self.cancelled_through = self.cancelled_through.max(run_id);
+    }
+
+    pub(crate) fn accepts_actor_presentation(&self, run_id: u64) -> bool {
+        run_id > self.cancelled_through
+            && self
+                .current_run_id()
+                .is_some_and(|allocated| run_id <= allocated)
+    }
+
+    pub(crate) fn current_run_id(&self) -> Option<u64> {
+        self.shared.as_ref().map(QueueSender::current_run_id)
     }
 
     pub(crate) fn set_run_id(&self, run_id: u64) {
@@ -290,7 +306,13 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
-        self.record_run_start(self.run_id + 1);
+        self.record_run_start(
+            self.queue
+                .current_run_id()
+                .unwrap_or(self.run_id)
+                .max(self.run_id)
+                + 1,
+        );
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());
@@ -300,6 +322,7 @@ impl App {
 
     pub(super) fn record_run_start(&mut self, run_id: u64) {
         self.run_id = run_id;
+        self.queue.set_run_id(run_id);
         self.clear_exit_request();
         self.stamped_subagent_outcomes.clear();
         // New work supersedes text held for recovery after an agent error.

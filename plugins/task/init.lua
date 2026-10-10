@@ -187,8 +187,9 @@ local function prepare(input, ctx)
     return nil, { llm_output = GENERAL_BLOCKED_IN_PLAN_ERR, is_error = true }
   end
 
+  local managed = ctx:_maki_managed()
   local validator
-  if input.output_schema then
+  if input.output_schema and not managed then
     if type(input.output_schema) ~= "table" or input.output_schema.type ~= "object" then
       return nil, { llm_output = SCHEMA_ROOT_ERROR, is_error = true }
     end
@@ -261,6 +262,7 @@ local function prepare(input, ctx)
     tools = tool_defs,
     audience = audience,
     local_tools = local_tools,
+    output_schema = managed and input.output_schema or nil,
     subagent_type = subagent_type,
   },
     nil
@@ -272,6 +274,7 @@ local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
     system = spec.system,
     tools = spec.tools,
     local_tools = spec.local_tools,
+    output_schema = spec.output_schema,
     audience = spec.audience,
     name = input.description,
     semaphore = turn_semaphore,
@@ -280,28 +283,90 @@ local function ctx_opts(spec, input, turn_semaphore, auto_deliver)
   }
 end
 
-local function fail_task(task, err)
+local function create_session(ctx, options)
+  if not ctx:_maki_managed() then
+    return maki.agent.session(ctx, options)
+  end
+  local agent, err = maki.agent.spawn(ctx, options)
+  if not agent then
+    return nil, err
+  end
+  local latest
+  local adapter = {}
+  function adapter:session_id()
+    return agent:_maki_session_id()
+  end
+  function adapter:_maki_managed()
+    return true
+  end
+  function adapter:_maki_task_owner()
+    return agent:_maki_task_owner()
+  end
+  function adapter:close(call_ctx)
+    return agent:close(call_ctx or ctx)
+  end
+  function adapter:send(message, call_ctx)
+    local ticket, send_err = agent:enqueue(call_ctx or ctx, message)
+    if not ticket then
+      return nil, send_err
+    end
+    latest = ticket
+    return true
+  end
+  function adapter:prompt(message)
+    local ticket, send_err = agent:enqueue(ctx, message)
+    if not ticket then
+      return nil, send_err
+    end
+    latest = ticket
+    local result, wait_err = ticket:wait(ctx)
+    return result, wait_err or (result and result.error)
+  end
+  function adapter:status(call_ctx)
+    local status, status_err = agent:status(call_ctx or ctx)
+    if not status then
+      return nil, status_err
+    end
+    if status.status == "closed" then
+      return { status = "closed" }
+    end
+    local result, result_err
+    if latest then
+      result, result_err = latest:result(call_ctx or ctx)
+    end
+    if result_err then
+      return nil, result_err
+    end
+    if status.status == "running" or status.queued > 0 or not result then
+      return { status = "running" }
+    end
+    result.input_tokens = status.input_tokens
+    result.output_tokens = status.output_tokens
+    return { status = "done", result = result, error = result.error }
+  end
+  return adapter
+end
+
+local function fail_task(task, err, ctx)
   if task.closed then
     return
   end
   task.closed = true
   task.error = err
-  task.sess:close()
+  task.sess:close(ctx)
 end
 
-local function enqueue(task, message)
+local function enqueue(task, message, ctx)
   if task.closed then
     return nil, task.error or TASK_CLOSED_ERR
   end
   local ok, admitted, admission_err = pcall(function()
-    return task.sess:send(message)
+    return task.sess:send(message, ctx)
   end)
   if not ok then
-    fail_task(task, admitted or TASK_CLOSED_ERR)
     return nil, admitted or TASK_CLOSED_ERR
   end
   if not admitted then
-    fail_task(task, admission_err or TASK_CLOSED_ERR)
     return nil, admission_err or TASK_CLOSED_ERR
   end
   return true, nil
@@ -309,7 +374,7 @@ end
 
 local function spawn(spec, input, ctx)
   local ok, sess, sess_err = pcall(function()
-    return maki.agent.session(ctx, ctx_opts(spec, input, semaphore, true))
+    return create_session(ctx, ctx_opts(spec, input, semaphore, true))
   end)
   if not ok then
     return nil, sess_err
@@ -326,15 +391,16 @@ local function spawn(spec, input, ctx)
     sess = sess,
     owner = sess:_maki_task_owner(),
     closed = false,
-    validator = spec.local_tools ~= nil,
+    validator = spec.local_tools ~= nil or spec.output_schema ~= nil,
   }
   tasks[task_id] = task
   local message = input.prompt
   if spec.local_tools then
     message = message .. STRUCTURED_OUTPUT_PROMPT_SUFFIX
   end
-  local admitted, enqueue_err = enqueue(task, message)
+  local admitted, enqueue_err = enqueue(task, message, ctx)
   if not admitted then
+    sess:close(ctx)
     tasks[task_id] = nil
     return nil, enqueue_err
   end
@@ -390,12 +456,12 @@ local get_schema = {
   },
 }
 
-local function get_handler(input)
+local function get_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   if not task then
     return { llm_output = access_err, is_error = true }
   end
-  local status, err = task.sess:status()
+  local status, err = task.sess:status(ctx)
   if err then
     return { llm_output = err, is_error = true }
   end
@@ -421,12 +487,12 @@ local send_schema = {
   },
 }
 
-local function send_handler(input)
+local function send_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   if not task then
     return { llm_output = access_err, is_error = true }
   end
-  local ok, err = enqueue(task, input.message)
+  local ok, err = enqueue(task, input.message, ctx)
   if not ok then
     return { llm_output = err, is_error = true }
   end
@@ -444,12 +510,12 @@ local despawn_schema = {
   },
 }
 
-local function despawn_handler(input)
+local function despawn_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
   if not task then
     return { llm_output = access_err, is_error = true }
   end
-  fail_task(task, TASK_CLOSED_ERR)
+  fail_task(task, TASK_CLOSED_ERR, ctx)
   tasks[input.task_id] = nil
   return { llm_output = maki.json.encode({ ok = true }) }
 end
@@ -468,7 +534,7 @@ local function handler(input, ctx)
   -- pcall so a raised error cannot leak the session.
   local ok, out = pcall(function()
     local ok_sess, s, sess_err = pcall(function()
-      return maki.agent.session(ctx, ctx_opts(spec, input, semaphore, false))
+      return create_session(ctx, ctx_opts(spec, input, semaphore, false))
     end)
     if not ok_sess then
       error(s, 0)
@@ -491,7 +557,7 @@ local function handler(input, ctx)
     local retries = 0
     result, prompt_err = sess:prompt(message)
     result = result or {}
-    while not prompt_err and retries < MAX_NUDGES do
+    while not spec.output_schema and not prompt_err and retries < MAX_NUDGES do
       if spec.local_tools then
         if result.captured then
           break
@@ -518,12 +584,12 @@ local function handler(input, ctx)
       end
       return { llm_output = "sub-agent error: " .. prompt_err, is_error = true }
     end
-    if spec.local_tools and not result.captured then
+    if not sess:_maki_managed() and spec.local_tools and not result.captured then
       local last_errors = spec.local_tools[STRUCTURED_OUTPUT_NAME].last_errors
       local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
       return { llm_output = msg, is_error = true }
     end
-    if not spec.local_tools and result.text == "" then
+    if not spec.local_tools and not spec.output_schema and result.text == "" then
       return { llm_output = SUMMARY_MISSING_ERROR, is_error = true }
     end
     return {

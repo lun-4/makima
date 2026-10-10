@@ -225,6 +225,80 @@ impl AgentManagerHandle {
 }
 
 impl AgentManagerHandle {
+    pub fn same_manager(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub fn validate_live_ref(&self, agent: &AgentRef) -> Result<(), ManagerError> {
+        if !self.same_manager(&agent.manager) {
+            return Err(ManagerError::WrongManager);
+        }
+        let graph = self.lock_graph();
+        if graph.shutting_down {
+            return Err(ManagerError::GraphShutdown);
+        }
+        let node = graph
+            .nodes
+            .get(&agent.agent_id)
+            .ok_or(ManagerError::UnknownAgent(agent.agent_id))?;
+        if node.lifecycle != GraphLifecycle::Live
+            || node
+                .actor
+                .as_ref()
+                .is_none_or(|actor| actor.snapshot().lifecycle != ActorLifecycle::Open)
+        {
+            return Err(ManagerError::NonLiveAgent(agent.agent_id));
+        }
+        Ok(())
+    }
+
+    /// Resolves a retained ticket without granting live mutation authority.
+    pub fn retained_turn_ticket(
+        &self,
+        agent: &AgentRef,
+        turn_id: TurnId,
+    ) -> Result<crate::TurnTicket, ManagerError> {
+        if !self.same_manager(&agent.manager) {
+            return Err(ManagerError::WrongManager);
+        }
+        let actor = {
+            let graph = self.lock_graph();
+            let node = graph
+                .nodes
+                .get(&agent.agent_id)
+                .ok_or(ManagerError::UnknownAgent(agent.agent_id))?;
+            node.actor
+                .clone()
+                .ok_or(ManagerError::NonLiveAgent(agent.agent_id))?
+        };
+        actor
+            .turn_ticket(turn_id)
+            .ok_or(ManagerError::TicketActorMismatch {
+                agent_id: agent.agent_id,
+                turn_id,
+            })
+    }
+
+    pub fn lookup(&self, agent_id: AgentId) -> Result<AgentRef, ManagerError> {
+        let agent = AgentRef {
+            manager: self.clone(),
+            agent_id,
+        };
+        self.validate_live_ref(&agent)?;
+        Ok(agent)
+    }
+
+    pub fn root(&self) -> Result<AgentRef, ManagerError> {
+        self.lookup(self.root_id()?)
+    }
+
+    pub fn list(&self) -> Vec<AgentRef> {
+        let ids = self.lock_graph().nodes.keys().copied().collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| self.lookup(id).ok())
+            .collect()
+    }
+
     pub fn limits(&self) -> AgentLimits {
         self.0.limits
     }
@@ -424,12 +498,64 @@ impl AgentManagerHandle {
         E: ToString,
     {
         self.validate_active(current)?;
+        self.spawn_child_inner(
+            current.agent_id(),
+            Some(current),
+            config,
+            metadata,
+            initial_messages,
+            shared_messages,
+            factory,
+        )
+    }
+
+    /// Host-only admission. Do not expose this as model tool authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_child_trusted_with_config<F, E>(
+        &self,
+        parent: &AgentRef,
+        config: crate::actor::EffectiveAgentConfig,
+        metadata: AgentMetadata,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        factory: F,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
+        self.validate_live_ref(parent)?;
+        self.spawn_child_inner(
+            parent.id(),
+            None,
+            config,
+            metadata,
+            initial_messages,
+            shared_messages,
+            factory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_child_inner<F, E>(
+        &self,
+        parent_id: AgentId,
+        current: Option<&CurrentManagedTurn>,
+        config: crate::actor::EffectiveAgentConfig,
+        metadata: AgentMetadata,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        factory: F,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
         if matches!(config.mode, crate::AgentMode::Custom(_)) && config.mode_def.is_none() {
             return Err(ManagerError::Policy(
                 "custom mode requires a resolved definition".into(),
             ));
         }
-        let parent_id = current.agent_id();
         let child_id = AgentId::generate();
         let reservation = {
             let mut graph = self.lock_graph();
@@ -437,7 +563,9 @@ impl AgentManagerHandle {
                 return Err(ManagerError::GraphShutdown);
             }
             Self::reclaim_finished_closings(&mut graph);
-            if graph.active_turns.get(&(parent_id, current.turn_id())) != Some(&current.token.nonce)
+            if let Some(current) = current
+                && graph.active_turns.get(&(parent_id, current.turn_id()))
+                    != Some(&current.token.nonce)
             {
                 return Err(ManagerError::InactiveTurn {
                     agent_id: parent_id,
@@ -449,7 +577,12 @@ impl AgentManagerHandle {
                     .nodes
                     .get(&parent_id)
                     .ok_or(ManagerError::UnknownAgent(parent_id))?;
-                if parent.lifecycle != GraphLifecycle::Live {
+                if parent.lifecycle != GraphLifecycle::Live
+                    || parent
+                        .actor
+                        .as_ref()
+                        .is_none_or(|actor| actor.snapshot().lifecycle != ActorLifecycle::Open)
+                {
                     return Err(ManagerError::NonLiveAgent(parent_id));
                 }
                 (
@@ -629,6 +762,20 @@ impl AgentManagerHandle {
         ticket: crate::TurnTicket,
         timeout: Option<Duration>,
     ) -> Result<ManagedPromptWait, ManagerError> {
+        self.register_turn_wait(current, lease, child_id, actor, ticket, timeout, true)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn register_turn_wait(
+        &self,
+        current: &CurrentManagedTurn,
+        lease: &TurnPermitLease,
+        child_id: AgentId,
+        actor: &AgentActorHandle,
+        ticket: crate::TurnTicket,
+        timeout: Option<Duration>,
+        destructive: bool,
+    ) -> Result<ManagedPromptWait, ManagerError> {
         if !Arc::ptr_eq(&lease.inner, &current.lease.inner) {
             return Err(ManagerError::WrongManager);
         }
@@ -665,6 +812,7 @@ impl AgentManagerHandle {
             lease: Arc::clone(&lease.inner),
             watcher_id,
         };
+        let result_ticket = ticket.clone();
         let task = smol::spawn(async move {
             let outcome = match timeout {
                 Some(duration) => {
@@ -683,7 +831,8 @@ impl AgentManagerHandle {
                     .await
                     .map_err(|_| PromptWaitError::Cancelled),
             };
-            if outcome == Err(PromptWaitError::Timeout)
+            if destructive
+                && outcome == Err(PromptWaitError::Timeout)
                 && let Some(manager) = manager.upgrade()
             {
                 let _ = AgentManagerHandle(manager).close_subtree(child_id);
@@ -711,7 +860,10 @@ impl AgentManagerHandle {
             })
             .detach();
         }
-        Ok(ManagedPromptWait { inner: wait })
+        Ok(ManagedPromptWait {
+            inner: wait,
+            ticket: result_ticket,
+        })
     }
 
     fn rollback_reservation(&self, agent_id: AgentId, reservation: u64) {

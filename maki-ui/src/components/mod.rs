@@ -223,6 +223,7 @@ pub enum Action {
     },
     ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
+    SelectModel(maki_commands::ModelSelection),
     ChangeMode(String),
     ApprovePlan {
         clear_context: bool,

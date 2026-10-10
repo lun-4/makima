@@ -469,6 +469,8 @@ pub struct ToolContext {
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub tool_filter: Arc<ToolFilter>,
+    /// Admitted tool definitions and filter, retained for exact child inheritance.
+    pub request_tools: Option<RequestTools>,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
@@ -857,6 +859,7 @@ pub fn interpreter_ctx(
         deadline: Deadline::None,
         config: AgentConfig::default(),
         tool_filter: Arc::default(),
+        request_tools: None,
         tool_output_lines: ToolOutputLines::default(),
         permissions,
         timeouts: maki_providers::Timeouts::default(),

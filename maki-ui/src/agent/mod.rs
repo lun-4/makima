@@ -1,5 +1,6 @@
 mod agent_loop;
 mod command_router;
+pub(crate) mod orchestration;
 pub(crate) mod shared_queue;
 
 #[cfg(test)]
@@ -316,6 +317,7 @@ pub(crate) struct AgentHandles {
     mailbox: Option<SessionMailbox>,
     cwd: Arc<ArcSwap<PathBuf>>,
     pub(crate) offload: Option<Arc<OffloadStore>>,
+    pub(crate) orchestration_template: maki_agent::tools::ToolContext,
     subagent_cancels: Arc<CancelMap<String>>,
     manager: AgentManagerHandle,
     root_id: maki_agent::AgentId,
@@ -639,6 +641,7 @@ fn spawn_agent_internal(
     };
     drop(selected);
     let (runner_start, start_rx) = flume::bounded(1);
+    let mut orchestration_template = None;
     let root = manager
         .create_root_deferred_with_config(
             Some(initial_config.unwrap_or_else(|| {
@@ -650,7 +653,7 @@ fn spawn_agent_internal(
             initial_history.clone(),
             Some(Arc::clone(&shared_history)),
             |agent_id| {
-                Ok::<Box<dyn maki_agent::ActorBackend>, String>(Box::new(new_backend(
+                let backend = new_backend(
                     agent_id,
                     Arc::clone(model_slot),
                     Arc::clone(&cwd),
@@ -674,7 +677,9 @@ fn spawn_agent_internal(
                     init_cancel,
                     drain_tx,
                     Arc::clone(&run_id),
-                )))
+                );
+                orchestration_template = Some(backend.orchestration_template());
+                Ok::<Box<dyn maki_agent::ActorBackend>, String>(Box::new(backend))
             },
             start_rx,
         )
@@ -727,6 +732,8 @@ fn spawn_agent_internal(
             mailbox,
             cwd,
             offload,
+            orchestration_template: orchestration_template
+                .expect("root factory prepares orchestration template"),
             subagent_cancels,
             manager,
             root_id,

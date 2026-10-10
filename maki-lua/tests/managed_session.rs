@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
+use maki_agent::tools::{RequestTools, ToolAudience, ToolContext, ToolRegistry};
 use maki_agent::{
     ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMetadata,
     AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, GraphLifecycle, History,
@@ -58,6 +58,11 @@ maki.agent.session = function(ctx, opts)
   opts.inherit_provider = true
   return real_session(ctx, opts)
 end
+local real_spawn = maki.agent.spawn
+maki.agent.spawn = function(ctx, opts)
+  opts.inherit_provider = true
+  return real_spawn(ctx, opts)
+end
 
 maki.agent.resolve_model = function()
   return { spec = "anthropic/claude-sonnet-4-20250514" }
@@ -68,7 +73,7 @@ maki.agent.system_prompt = function()
 end
 
 maki.agent.tools = function()
-  return nil
+  return {}
 end
 "#;
 
@@ -143,7 +148,7 @@ maki.api.register_tool({
       local sent = test_task_handlers.task_send({
         task_id = retained_task_id,
         message = "valid later turn",
-      })
+      }, ctx)
       if sent.is_error then
         return sent
       end
@@ -351,6 +356,9 @@ impl ActorBackend for LuaToolBackend {
                     .and_then(|turn| turn.policy_snapshot())
                     .is_some()
             );
+            assert!(!context.cancel.is_cancelled());
+            self.context.cancel = context.cancel;
+            self.context.request_tools = Some(RequestTools::default());
             self.context.managed_turn = context.managed_turn;
             let invocation = self
                 .registry
@@ -422,6 +430,9 @@ impl ActorBackend for NestedTaskBackend {
                     .and_then(|turn| turn.policy_snapshot())
                     .is_some()
             );
+            assert!(!context.cancel.is_cancelled());
+            self.context.cancel = context.cancel;
+            self.context.request_tools = Some(RequestTools::default());
             self.context.managed_turn = context.managed_turn;
             self.context.audience = ToolAudience::GENERAL_SUB;
             let invocation = self

@@ -166,10 +166,10 @@ fn path_completion_item((mut insertion, is_directory): (String, bool)) -> Comple
 impl CommandCompletion for ModelArgSource {
     fn complete(
         &self,
-        _context: CompletionContext,
+        context: CompletionContext,
         _cancellation: CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
-        let items = self.models.load_full().map_or_else(Vec::new, |specs| {
+        let mut items = self.models.load_full().map_or_else(Vec::new, |specs| {
             specs
                 .iter()
                 .map(|spec| CompletionItem {
@@ -179,6 +179,39 @@ impl CommandCompletion for ModelArgSource {
                 })
                 .collect()
         });
+        let preceding = context
+            .preceding_arguments
+            .iter()
+            .flat_map(|argument| argument.values.iter())
+            .filter_map(|value| match value {
+                maki_commands::ArgumentValue::String(value) => Some(value.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if preceding.iter().any(|value| !value.contains('=')) || context.argument.contains('=') {
+            items.clear();
+        }
+        for (key, values) in [
+            (
+                "thinking",
+                maki_providers::ThinkingConfig::options().as_slice(),
+            ),
+            ("fast", &["true", "false"][..]),
+        ] {
+            let prefix = format!("{key}=");
+            if !preceding.iter().any(|value| value.starts_with(&prefix))
+                && (!context.argument.contains('=') || context.argument.starts_with(&prefix))
+            {
+                items.extend(values.iter().map(|value| {
+                    let insertion: Arc<str> = Arc::from(format!("{key}={value}"));
+                    CompletionItem {
+                        label: Arc::clone(&insertion),
+                        insertion,
+                        description: None,
+                    }
+                }));
+            }
+        }
         Box::pin(async move { Ok(items) })
     }
 }
@@ -405,6 +438,78 @@ mod tests {
         session.highlight(candidate).unwrap();
         session.accept(candidate.clone()).unwrap();
         target.id()
+    }
+
+    #[test]
+    fn model_completion_offers_only_remaining_selection_fields() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        let definition = maki_commands::BUILTIN_COMMANDS
+            .iter()
+            .find(|definition| definition.id == maki_commands::BuiltinId::Model)
+            .unwrap();
+        producer
+            .replace(vec![Registration {
+                spec: definition.spec(),
+                behavior: Arc::new(NoBehavior),
+                argument_completions: vec![Some(Arc::new(ModelArgSource::new(Arc::new(
+                    ArcSwapOption::from(Some(Arc::new(vec!["openai/gpt-5".into()]))),
+                ))))],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::ALL, Arc::new(NoBehavior));
+        let command = registry.resolve_for(&target, "/model").unwrap();
+        let session = registry.open_completion(command, target.id()).unwrap();
+        for (input, index, model, thinking, fast) in [
+            ("", 0, true, true, true),
+            ("openai/gpt-5 ", 1, false, true, true),
+            (r#""openai/gpt-5" "#, 1, false, true, true),
+            ("fast=false ", 1, true, true, false),
+            ("thinking=high fast=true ", 2, true, false, false),
+        ] {
+            let CompletionResult::Items(items) = smol::block_on(session.complete(
+                Arc::from(input),
+                Arc::from(""),
+                index,
+                Arc::from("insert"),
+            )) else {
+                panic!("expected model completions");
+            };
+            assert_eq!(
+                items
+                    .iter()
+                    .any(|item| item.item().insertion.as_ref() == "openai/gpt-5"),
+                model
+            );
+            assert_eq!(
+                items
+                    .iter()
+                    .any(|item| item.item().insertion.starts_with("thinking=")),
+                thinking
+            );
+            assert_eq!(
+                items
+                    .iter()
+                    .any(|item| item.item().insertion.starts_with("fast=")),
+                fast
+            );
+        }
+        for (argument, expected_prefix) in [("thinking=", "thinking="), ("fast=", "fast=")] {
+            let CompletionResult::Items(items) = smol::block_on(session.complete(
+                Arc::from(argument),
+                Arc::from(argument),
+                0,
+                Arc::from("insert"),
+            )) else {
+                panic!("expected option completions");
+            };
+            assert!(!items.is_empty());
+            assert!(
+                items
+                    .iter()
+                    .all(|item| item.item().insertion.starts_with(expected_prefix))
+            );
+        }
     }
 
     const BASE_THEME: &str = "dracula";

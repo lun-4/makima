@@ -1,3 +1,4 @@
+use maki_domain::ThinkingConfig;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -114,6 +115,7 @@ pub enum BuiltinOperation {
     SetModel {
         spec: Arc<str>,
     },
+    SelectModel(ModelSelection),
     OpenThemePicker,
     SetTheme {
         name: Arc<str>,
@@ -133,6 +135,50 @@ pub enum BuiltinOperation {
     Exit,
     Reload,
     Trust,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelSelection {
+    pub spec: Option<Arc<str>>,
+    pub thinking: Option<ThinkingConfig>,
+    pub fast: Option<bool>,
+}
+
+impl ModelSelection {
+    pub fn parse(arguments: &str) -> Result<Self, crate::CommandError> {
+        let invalid = |message: String| crate::CommandError::Producer(Arc::from(message));
+        let mut selection = Self::default();
+        for token in crate::lex_strict(arguments).map_err(|error| invalid(error.to_string()))? {
+            if let Some((key, value)) = token.value.split_once('=') {
+                match key {
+                    "thinking" if selection.thinking.is_none() => {
+                        selection.thinking = Some(
+                            ThinkingConfig::parse_setting(value)
+                                .map_err(|error| invalid(error.to_string()))?,
+                        );
+                    }
+                    "fast" if selection.fast.is_none() => {
+                        selection.fast = Some(match value {
+                            "true" => true,
+                            "false" => false,
+                            _ => return Err(invalid("fast must be true or false".into())),
+                        });
+                    }
+                    "thinking" | "fast" => {
+                        return Err(invalid(format!("duplicate model option: {key}")));
+                    }
+                    _ => return Err(invalid(format!("unknown model option: {key}"))),
+                }
+            } else if token.value.is_empty() {
+                return Err(invalid("model spec must not be empty".into()));
+            } else if selection.spec.is_none() {
+                selection.spec = Some(token.value);
+            } else {
+                return Err(invalid("expected at most one model spec".into()));
+            }
+        }
+        Ok(selection)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +275,7 @@ const MODEL_ARGUMENTS: &[StaticPositionalArgument] = &[StaticPositionalArgument 
     name: "model",
     kind: StaticArgumentKind::String,
     optional: true,
-    variadic: false,
+    variadic: true,
 }];
 const THEME_ARGUMENTS: &[StaticPositionalArgument] = &[StaticPositionalArgument {
     name: "theme",
@@ -305,7 +351,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         "Switch model",
         typed MODEL_ARGUMENTS,
         MODEL_COMPLETIONS,
-        Some("<model>"),
+        Some("[spec] [thinking=value] [fast=true|false]"),
         MODEL,
     ),
     builtin!(

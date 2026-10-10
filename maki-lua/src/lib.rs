@@ -7,6 +7,8 @@ mod error;
 pub(crate) mod hook;
 pub mod language;
 mod loader;
+pub mod orchestration;
+pub use runtime::current_managed_turn;
 pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
@@ -14,6 +16,7 @@ mod splash;
 #[cfg(test)]
 mod write_lock_regression;
 
+pub use api::agent::{PlanPathPreparer, install_plan_path_preparer};
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::time::format_ago;

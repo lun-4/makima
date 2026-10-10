@@ -90,6 +90,10 @@ The rules:
 | [`maki.store`](#maki-store) | Shared key-value store for plugin contributions. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
+| [`maki.agent.Agent`](#maki-agent-Agent) | A nonowning live agent handle. |
+| [`maki.agent.AgentRef`](#maki-agent-AgentRef) | Visibility-only identity. |
+| [`maki.agent.AgentSubscription`](#maki-agent-AgentSubscription) | A revocable subscription. |
+| [`maki.agent.AgentTurn`](#maki-agent-AgentTurn) | A nonowning exact-turn ticket with repeatable result reads. |
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
@@ -1514,6 +1518,94 @@ Commit a result to the session whose local tool is currently executing.
 
 **Returns:** (`boolean?`, `string?`) `true` while a session-local tool is active.
 
+---
+
+### `maki.agent.current()` {#maki-agent-current}
+
+```lua
+maki.agent.current({ctx})
+```
+
+Read the agent associated with an explicit invocation context.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning agent handle.
+
+---
+
+### `maki.agent.root()` {#maki-agent-root}
+
+```lua
+maki.agent.root({ctx})
+```
+
+Read the root agent of this context's graph.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Root agent, subject to caller authority.
+
+---
+
+### `maki.agent.list()` {#maki-agent-list}
+
+```lua
+maki.agent.list({ctx})
+```
+
+List accessible live agents in this context's graph.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`table?`, `string?`) Array of nonowning handles.
+
+---
+
+### `maki.agent.get()` {#maki-agent-get}
+
+```lua
+maki.agent.get({ctx}, {reference})
+```
+
+Look up a live agent by ID in this context's graph.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+- `{reference}` ([`AgentRef`](#maki-agent-AgentRef)) Visibility-only reference.
+
+**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning handle or error.
+
+---
+
+### `maki.agent.spawn()` {#maki-agent-spawn}
+
+```lua
+maki.agent.spawn({ctx}, {opts})
+```
+
+Spawn a child with a copy of its parent's configuration.
+
+Omitted tools inherit the parent's capability-filtered request tools and
+cannot widen the parent's audience or mode policy. `tools = {}` excludes
+all request tools. Explicit tools select the child's request definitions.
+Unlike spawn, the compatibility Session API defaults to no request tools.
+Unmanaged children use the current host task's authority, not a managed graph.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Active agent context or trusted pinned parent.
+- `{opts}` (`table`) Spawn options; tools is an optional array of request definitions.
+
+**Returns:** ([`Agent?`](#maki-agent-Agent), `string?`) Nonowning child handle. Garbage collection does not close it.
+
 
 ## maki.agent.Session {#maki-agent-Session}
 
@@ -1623,6 +1715,448 @@ Session:session_id()
 Return this session's stable id, used as a `task_id` by the task plugin.
 
 **Returns:** (`string`) The session's id.
+
+
+## maki.agent.Agent {#maki-agent-Agent}
+
+A nonowning live agent handle. Garbage collection never closes its actor.
+
+---
+
+### `Agent:id()` {#Agent-id}
+
+```lua
+Agent:id()
+```
+
+Read the stable agent ID.
+
+**Returns:** (`string?`, `string?`) Agent ID.
+
+---
+
+### `Agent:status()` {#Agent-status}
+
+```lua
+Agent:status({ctx})
+```
+
+Read lifecycle, active turn, queue size, and cumulative usage.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`table?`, `string?`) Current actor snapshot.
+
+---
+
+### `Agent:model()` {#Agent-model}
+
+```lua
+Agent:model({ctx})
+```
+
+Read the actor's committed model configuration.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`table?`, `string?`) Model descriptor.
+
+---
+
+### `Agent:available_models()` {#Agent-available_models}
+
+```lua
+Agent:available_models({ctx})
+```
+
+List authenticated host model descriptors without changing focus.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`table?`, `string?`) Available model catalog.
+
+---
+
+### `Agent:transcript()` {#Agent-transcript}
+
+```lua
+Agent:transcript({ctx}, {opts})
+```
+
+Read a bounded committed transcript, optionally through a completed turn.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+- `{opts}` (`table`) Required positive last_messages and max_bytes; optional through_turn.
+
+**Returns:** (`table?`, `string?`) Messages and truncation metadata.
+
+---
+
+### `Agent:ref()` {#Agent-ref}
+
+```lua
+Agent:ref()
+```
+
+Return another nonowning handle to this agent.
+
+**Returns:** ([`AgentRef?`](#maki-agent-AgentRef), `string?`) Stable reference.
+
+---
+
+### `Agent:send()` {#Agent-send}
+
+```lua
+Agent:send({ctx}, {message}, {opts?})
+```
+
+Admit a turn only when this agent and its descendants are idle.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+- `{message}` (`string`) User message.
+- `{opts?}` (`table?`) Optional after_turn ID required to match the latest completed turn.
+
+**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket.
+
+---
+
+### `Agent:enqueue()` {#Agent-enqueue}
+
+```lua
+Agent:enqueue({ctx}, {message})
+```
+
+Queue a turn behind already admitted work.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+- `{message}` (`string`) User message.
+
+**Returns:** ([`AgentTurn?`](#maki-agent-AgentTurn), `string?`) Exact-turn ticket.
+
+---
+
+### `Agent:prompt()` {#Agent-prompt}
+
+```lua
+Agent:prompt({ctx}, {message}, {opts?})
+```
+
+Send an idle-only turn and wait for its exact result.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+- `{message}` (`string`) User message.
+- `{opts?}` (`table?`) Optional timeout and after_turn.
+
+**Returns:** (`table?`, `string?`) Per-turn result.
+
+---
+
+### `Agent:set_model()` {#Agent-set_model}
+
+```lua
+Agent:set_model({ctx}, {patch})
+```
+
+Switch model through a reserved actor configuration operation.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+- `{patch}` (`string|table`) Spec string or partial spec/thinking/fast selection.
+
+**Returns:** (`table?`, `string?`) Committed model descriptor.
+
+---
+
+### `Agent:set_mode()` {#Agent-set_mode}
+
+```lua
+Agent:set_mode({ctx}, {name})
+```
+
+Switch mode through the actor configuration FIFO.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+- `{name}` (`string`) Registered mode name.
+
+**Returns:** (`boolean?`, `string?`) Success or error.
+
+---
+
+### `Agent:cancel()` {#Agent-cancel}
+
+```lua
+Agent:cancel({ctx})
+```
+
+Cancel existing work without closing the agent.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`boolean?`, `string?`) Success or error.
+
+---
+
+### `Agent:cancel_subtree()` {#Agent-cancel_subtree}
+
+```lua
+Agent:cancel_subtree({ctx})
+```
+
+Cancel existing work in this agent and its descendants.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`boolean?`, `string?`) Success or error.
+
+---
+
+### `Agent:close()` {#Agent-close}
+
+```lua
+Agent:close({ctx})
+```
+
+Permanently close this agent and its descendants.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`boolean?`, `string?`) Success or error.
+
+---
+
+### `Agent:defer_close()` {#Agent-defer_close}
+
+```lua
+Agent:defer_close({ctx})
+```
+
+Close this agent at the end of the current host task, even on cancellation.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`boolean?`, `string?`) Cleanup registered.
+
+---
+
+### `Agent:on_turn_start()` {#Agent-on_turn_start}
+
+```lua
+Agent:on_turn_start({ctx}, {handler})
+```
+
+Subscribe to future turn admissions. Handlers may overlap.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Trusted invocation context.
+- `{handler}` (`function`) Receives immutable event payload and a fresh scoped ctx.
+
+**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+
+---
+
+### `Agent:on_turn_end()` {#Agent-on_turn_end}
+
+```lua
+Agent:on_turn_end({ctx}, {handler})
+```
+
+Subscribe to exact settled turn results. Handlers may overlap.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Trusted invocation context.
+- `{handler}` (`function`) Receives result payload and a fresh scoped ctx.
+
+**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+
+---
+
+### `Agent:on_idle()` {#Agent-on_idle}
+
+```lua
+Agent:on_idle({ctx}, {handler})
+```
+
+Subscribe to transitions to no pending turn work.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Trusted invocation context.
+- `{handler}` (`function`) Receives agent identity and a fresh scoped ctx.
+
+**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+
+---
+
+### `Agent:on_config_change()` {#Agent-on_config_change}
+
+```lua
+Agent:on_config_change({ctx}, {handler})
+```
+
+Subscribe to committed model or mode changes.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Trusted invocation context.
+- `{handler}` (`function`) Receives selection/generation and a fresh scoped ctx.
+
+**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+
+---
+
+### `Agent:on_close()` {#Agent-on_close}
+
+```lua
+Agent:on_close({ctx}, {handler})
+```
+
+Subscribe to permanent lifecycle closure.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Trusted invocation context.
+- `{handler}` (`function`) Receives lifecycle and a fresh scoped ctx.
+
+**Returns:** ([`AgentSubscription?`](#maki-agent-AgentSubscription), `string?`) Revocable subscription.
+
+
+## maki.agent.AgentRef {#maki-agent-AgentRef}
+
+Visibility-only identity. Resolve with get(ctx, reference) to request control.
+
+---
+
+### `AgentRef:id()` {#AgentRef-id}
+
+```lua
+AgentRef:id()
+```
+
+Read a reference's stable identity.
+
+**Returns:** (`string?`, `string?`) Agent ID.
+
+
+## maki.agent.AgentSubscription {#maki-agent-AgentSubscription}
+
+A revocable subscription. Close explicitly to cancel active callbacks.
+
+---
+
+### `AgentSubscription:close()` {#AgentSubscription-close}
+
+```lua
+AgentSubscription:close()
+```
+
+Revoke future deliveries and cancel active handlers.
+
+**Returns:** (`boolean?`, `string?`) Success.
+
+
+## maki.agent.AgentTurn {#maki-agent-AgentTurn}
+
+A nonowning exact-turn ticket with repeatable result reads.
+
+---
+
+### `AgentTurn:id()` {#AgentTurn-id}
+
+```lua
+AgentTurn:id()
+```
+
+Read the stable turn ID.
+
+**Returns:** (`string?`, `string?`) Turn ID.
+
+---
+
+### `AgentTurn:agent_id()` {#AgentTurn-agent_id}
+
+```lua
+AgentTurn:agent_id()
+```
+
+Read the target agent ID.
+
+**Returns:** (`string?`, `string?`) Agent ID.
+
+---
+
+### `AgentTurn:result()` {#AgentTurn-result}
+
+```lua
+AgentTurn:result({ctx})
+```
+
+Read a retained result without waiting or consuming it.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`table?`, `string?`) Nil without error while pending.
+
+---
+
+### `AgentTurn:wait()` {#AgentTurn-wait}
+
+```lua
+AgentTurn:wait({ctx}, {opts?})
+```
+
+Wait for this exact turn. Timeout stops waiting, not the agent.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+- `{opts?}` (`table?`) Optional timeout in seconds.
+
+**Returns:** (`table?`, `string?`) Per-turn result or error.
+
+---
+
+### `AgentTurn:cancel()` {#AgentTurn-cancel}
+
+```lua
+AgentTurn:cancel({ctx})
+```
+
+Cancel only this admitted turn.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Invocation context.
+
+**Returns:** (`boolean?`, `string?`) Success or error.
 
 
 ## maki.async {#maki-async}

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,14 +78,9 @@ impl CommandRegistry {
                 return Box::pin(async move { InputDispatch::LiteralInput(content) });
             }
         };
-        let registry = self.clone();
-        Box::pin(async move {
-            InputDispatch::Dispatched(
-                registry
-                    .dispatch_resolved(resolved.command, resolved.arguments, content, target, depth)
-                    .await,
-            )
-        })
+        let dispatched =
+            self.dispatch_resolved(resolved.command, resolved.arguments, content, target, depth);
+        Box::pin(async move { InputDispatch::Dispatched(dispatched.await) })
     }
 
     pub fn dispatch_command(
@@ -116,6 +112,15 @@ impl CommandRegistry {
         target: TargetHandle,
         depth: usize,
     ) -> CommandFuture<CommandOutcome> {
+        let admission = {
+            let state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            target_record(&state, self.0.id, &target).map(|record| Arc::clone(&record.host))
+        }
+        .and_then(|host| host.admission_context());
         let registry = self.clone();
         Box::pin(async move {
             if depth > MAX_COMMAND_DEPTH {
@@ -163,6 +168,7 @@ impl CommandRegistry {
                 }
             };
             let invocation = CommandInvocation {
+                admission,
                 command_id: command.command_id(),
                 canonical_name: Arc::clone(&command.spec().name),
                 invoked_name: Arc::clone(&command.invoked_name),
@@ -345,6 +351,9 @@ pub enum HostResponse {
 }
 
 pub trait CommandHost: Send + Sync + 'static {
+    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>>;
 }
 
@@ -357,6 +366,7 @@ pub trait CommandBehavior: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct CommandInvocation {
+    admission: Option<Arc<dyn Any + Send + Sync>>,
     pub command_id: CommandId,
     pub canonical_name: Arc<str>,
     pub invoked_name: Arc<str>,
@@ -371,6 +381,9 @@ pub struct CommandInvocation {
 }
 
 impl CommandInvocation {
+    pub fn admission_context<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.admission.as_ref()?.downcast_ref()
+    }
     pub fn host_request(
         &self,
         request: HostRequest,

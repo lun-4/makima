@@ -90,6 +90,7 @@ impl ActorQueue {
                 while items.front().is_some_and(|work| {
                     matches!(work,
                         ActorWork::Root(next) if next.generation == roots[0].generation
+                            && next.provenance == roots[0].provenance
                             && crate::batch_key(&next.input) == key
                     )
                 }) {
@@ -285,6 +286,7 @@ impl ActorQueue {
         &self,
         generation: u64,
         batch_key: &Option<BatchKey>,
+        provenance: &super::TurnProvenance,
     ) -> Option<ExtractedCommand> {
         let mut items = lock(&self.items);
 
@@ -292,6 +294,7 @@ impl ActorQueue {
             Some(ActorWork::Root(root))
                 if batch_key.is_some()
                     && root.generation == generation
+                    && root.provenance == *provenance
                     && crate::batch_key(&root.input).as_ref() == batch_key.as_ref() => {}
             Some(ActorWork::Compact {
                 generation: compact_generation,
@@ -302,11 +305,13 @@ impl ActorQueue {
         match items.pop_front()? {
             ActorWork::Root(first) => {
                 let key = crate::batch_key(&first.input);
+                let provenance = first.provenance;
                 let mut inputs = vec![first.input];
                 while key.is_some()
                     && items.front().is_some_and(|work| {
                         matches!(work,
                             ActorWork::Root(next) if next.generation == generation
+                                && next.provenance == provenance
                                 && crate::batch_key(&next.input) == key
                         )
                     })
@@ -341,6 +346,7 @@ pub struct InterruptQueue {
     cancellation_generation: u64,
     policy_generation: u64,
     batch_key: Option<BatchKey>,
+    provenance: super::TurnProvenance,
 }
 
 impl InterruptQueue {
@@ -349,12 +355,14 @@ impl InterruptQueue {
         cancellation_generation: u64,
         policy_generation: u64,
         batch_key: Option<BatchKey>,
+        provenance: super::TurnProvenance,
     ) -> Self {
         Self {
             inner,
             cancellation_generation,
             policy_generation,
             batch_key,
+            provenance,
         }
     }
 }
@@ -364,9 +372,11 @@ impl crate::InterruptSource for InterruptQueue {
         let state = lock(&self.inner.state);
         (state.cancellation_generation == self.cancellation_generation)
             .then(|| {
-                self.inner
-                    .queue
-                    .pop_interrupt(self.policy_generation, &self.batch_key)
+                self.inner.queue.pop_interrupt(
+                    self.policy_generation,
+                    &self.batch_key,
+                    &self.provenance,
+                )
             })
             .flatten()
     }
@@ -402,6 +412,90 @@ mod tests {
             images,
             format!("r{run_id}"),
         )
+    }
+
+    #[test_case::test_case(false; "matching_active_origin")]
+    #[test_case::test_case(true; "active_origin_boundary")]
+    fn interrupt_keeps_incompatible_front_root_in_fifo(boundary: bool) {
+        let queue = ActorQueue::new();
+        let active = test_root("user", 0, Vec::new()).provenance;
+        let queued = if boundary {
+            super::super::TurnProvenance {
+                origin: super::super::TurnOrigin::Plugin,
+                plugin_generation: Some(1),
+                ..Default::default()
+            }
+        } else {
+            active.clone()
+        };
+        queue.push(ActorWork::Root(
+            test_root("first", 1, Vec::new()).with_provenance(queued),
+        ));
+        queue.push(ActorWork::Root(test_root("second", 2, Vec::new())));
+        let extracted = queue.pop_interrupt(0, &crate::batch_key(&test_input("active")), &active);
+        assert_eq!(extracted.is_none(), boundary);
+        assert_eq!(queue.len(), if boundary { 2 } else { 0 });
+        if boundary {
+            let ActorWork::Root(first) = queue.pop().unwrap() else {
+                panic!("expected root")
+            };
+            assert_eq!(first.input.message, "first");
+            let ActorWork::Root(second) = queue.pop().unwrap() else {
+                panic!("expected root")
+            };
+            assert_eq!(second.input.message, "second");
+        }
+    }
+
+    #[test_case::test_case(false, false; "same_origin")]
+    #[test_case::test_case(true, false; "different_origin")]
+    #[test_case::test_case(false, true; "different_plugin_generation")]
+    fn root_coalescing_respects_provenance(origin_boundary: bool, generation_boundary: bool) {
+        let queue = ActorQueue::new();
+        let provenance = super::super::TurnProvenance {
+            origin: super::super::TurnOrigin::Plugin,
+            plugin: Some("plugin".into()),
+            plugin_generation: Some(1),
+            ..Default::default()
+        };
+        let mut next = provenance.clone();
+        if origin_boundary {
+            next.origin = super::super::TurnOrigin::User;
+        }
+        if generation_boundary {
+            next.plugin_generation = Some(2);
+        }
+        queue.push(ActorWork::Root(
+            test_root("first", 1, Vec::new()).with_provenance(provenance.clone()),
+        ));
+        queue.push(ActorWork::Root(
+            test_root("second", 2, Vec::new()).with_provenance(next.clone()),
+        ));
+        let ActorWork::Root(root) = queue.pop().unwrap() else {
+            panic!("expected root")
+        };
+        let boundary = origin_boundary || generation_boundary;
+        assert_eq!(root.earlier.len(), usize::from(!boundary));
+        assert_eq!(root.provenance, provenance.clone());
+        assert_eq!(queue.len(), usize::from(boundary));
+        let queue = ActorQueue::new();
+        queue.push(ActorWork::Root(
+            test_root("first", 1, Vec::new()).with_provenance(provenance.clone()),
+        ));
+        queue.push(ActorWork::Root(
+            test_root("second", 2, Vec::new()).with_provenance(next),
+        ));
+        let Some(ExtractedCommand::Interrupt(inputs)) =
+            queue.pop_interrupt(0, &crate::batch_key(&test_input("active")), &provenance)
+        else {
+            panic!("expected interrupt")
+        };
+        assert_eq!(inputs.len(), if boundary { 1 } else { 2 });
+        assert_eq!(queue.len(), usize::from(boundary));
+        assert_eq!(
+            test_root("user", 3, Vec::new()).provenance.origin,
+            super::super::TurnOrigin::User
+        );
     }
 
     #[test]
@@ -465,20 +559,37 @@ mod tests {
 
         assert!(
             queue
-                .pop_interrupt(2, &crate::batch_key(&test_input("old")))
+                .pop_interrupt(
+                    2,
+                    &crate::batch_key(&test_input("old")),
+                    &super::super::TurnProvenance {
+                        origin: super::super::TurnOrigin::User,
+                        ..Default::default()
+                    }
+                )
                 .is_none()
         );
         assert_eq!(queue.len(), 2);
-        let Some(ExtractedCommand::Interrupt(inputs)) =
-            queue.pop_interrupt(1, &crate::batch_key(&test_input("old")))
-        else {
+        let Some(ExtractedCommand::Interrupt(inputs)) = queue.pop_interrupt(
+            1,
+            &crate::batch_key(&test_input("old")),
+            &super::super::TurnProvenance {
+                origin: super::super::TurnOrigin::User,
+                ..Default::default()
+            },
+        ) else {
             panic!("expected interrupt");
         };
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].message, "old");
-        let Some(ExtractedCommand::Interrupt(inputs)) =
-            queue.pop_interrupt(2, &crate::batch_key(&test_input("old")))
-        else {
+        let Some(ExtractedCommand::Interrupt(inputs)) = queue.pop_interrupt(
+            2,
+            &crate::batch_key(&test_input("old")),
+            &super::super::TurnProvenance {
+                origin: super::super::TurnOrigin::User,
+                ..Default::default()
+            },
+        ) else {
             panic!("expected next interrupt");
         };
         assert_eq!(inputs.len(), 1);
@@ -497,7 +608,15 @@ mod tests {
         root.input.cancel = Some(crate::CancelToken::new().1);
         queue.push(ActorWork::Root(root));
 
-        assert!(queue.pop_interrupt(0, &crate::batch_key(&active)).is_none());
+        assert!(
+            queue
+                .pop_interrupt(
+                    0,
+                    &crate::batch_key(&active),
+                    &test_root("user", 0, Vec::new()).provenance
+                )
+                .is_none()
+        );
         assert_eq!(queue.len(), 1);
     }
 
@@ -511,7 +630,15 @@ mod tests {
         }));
         queue.push(ActorWork::Root(test_root("plain", 1, Vec::new())));
 
-        assert!(queue.pop_interrupt(0, &crate::batch_key(&active)).is_none());
+        assert!(
+            queue
+                .pop_interrupt(
+                    0,
+                    &crate::batch_key(&active),
+                    &test_root("user", 0, Vec::new()).provenance
+                )
+                .is_none()
+        );
         assert_eq!(queue.len(), 1);
     }
 
@@ -524,7 +651,11 @@ mod tests {
 
         assert!(
             queue
-                .pop_interrupt(0, &crate::batch_key(&test_input("build")))
+                .pop_interrupt(
+                    0,
+                    &crate::batch_key(&test_input("build")),
+                    &test_root("user", 0, Vec::new()).provenance
+                )
                 .is_none()
         );
         assert_eq!(queue.len(), 1);

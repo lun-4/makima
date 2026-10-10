@@ -21,7 +21,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/clear` | Alias for `/new` | none |  | TUI only |
 | `/help` | Show keybindings | none |  | TUI only |
 | `/queue` | Remove items from queue | none |  | TUI only |
-| `/model` | Switch model | typed | <model> | all |
+| `/model` | Switch model | typed | [spec] [thinking=value] [fast=true\|false] | all |
 | `/theme` | Switch color theme | typed | <theme> | TUI only |
 | `/mcp` | Configure MCP servers | none |  | TUI only |
 | `/login` | Authenticate with an LLM provider | none |  | TUI only |

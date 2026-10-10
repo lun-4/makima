@@ -80,12 +80,17 @@ impl AgentContext {
 /// not existing, so callers can probe without pcall.
 pub(crate) struct LuaCtx {
     caps: Caps,
+    origin: Option<crate::runtime::TaskHandle>,
     pub(crate) cancel: CancelToken,
     tool_output_lines: ToolOutputLines,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
 
 enum Caps {
+    Trusted {
+        authority: Box<crate::orchestration::TrustedContext>,
+        agent: Box<AgentContext>,
+    },
     Handler {
         agent: Box<AgentContext>,
         /// Kept apart from `agent`, which resets its copy so child calls
@@ -109,10 +114,40 @@ impl LuaCtx {
     fn new(ctx: &ToolContext, caps: Caps) -> Self {
         Self {
             caps,
+            origin: None,
             cancel: ctx.cancel.clone(),
             tool_output_lines: ctx.tool_output_lines,
             finish_tx: None,
         }
+    }
+
+    pub(crate) fn bind_origin(&mut self, task: &crate::runtime::TaskHandle) {
+        self.origin = Some(task.clone());
+    }
+
+    pub(crate) fn validate_origin(&self, lua: &mlua::Lua) -> Result<(), String> {
+        if matches!(self.caps, Caps::Trusted { .. }) {
+            return self.trusted(lua).map(|_| ());
+        }
+        let origin = self
+            .origin
+            .as_ref()
+            .ok_or("context is not bound to an invocation")?;
+        let current = crate::runtime::active_task_id(lua);
+        let cell = lock_cell(origin);
+        if !cell.scope_alive
+            || cell.cancel.is_cancelled()
+            || cell
+                .deadline
+                .get()
+                .is_some_and(|deadline| Instant::now() > deadline)
+        {
+            return Err("context invocation expired".into());
+        }
+        if current != Some(cell.id) {
+            return Err("context belongs to another invocation".into());
+        }
+        Ok(())
     }
 
     pub(crate) fn handler(ctx: &ToolContext) -> Self {
@@ -143,13 +178,63 @@ impl LuaCtx {
     ) -> Self {
         Self {
             caps: Caps::Restore { state },
+            origin: None,
             cancel: CancelToken::none(),
             tool_output_lines,
             finish_tx: None,
         }
     }
 
-    /// Dispatch capability: only handler ctxs can call `maki.agent.*`.
+    pub(crate) fn trusted_context(
+        lua: &mlua::Lua,
+        target: crate::orchestration::TrustedTarget,
+        plugin: Arc<str>,
+    ) -> Self {
+        let agent = Box::new(AgentContext::from(&target.template));
+        let cancel = lock_cell(&active_task(lua)).cancel.clone();
+        let owner = crate::orchestration::plugin_authority(lua, plugin.clone());
+        let authority = Box::new(crate::orchestration::TrustedContext::new(
+            lua,
+            target,
+            &active_task(lua),
+            plugin,
+            owner,
+        ));
+        lock_cell(&active_task(lua)).plugin_origin =
+            Some((authority.plugin.clone(), authority.generation));
+        Self {
+            caps: Caps::Trusted { authority, agent },
+            origin: None,
+            cancel,
+            tool_output_lines: ToolOutputLines::default(),
+            finish_tx: None,
+        }
+    }
+
+    pub(crate) fn trusted_event_context(
+        lua: &mlua::Lua,
+        target: crate::orchestration::TrustedTarget,
+        plugin: Arc<str>,
+    ) -> Self {
+        let mut ctx = Self::trusted_context(lua, target, plugin);
+        if let Caps::Trusted { authority, .. } = &mut ctx.caps {
+            **authority = (**authority).clone().for_event();
+        }
+        ctx
+    }
+
+    pub(crate) fn trusted(
+        &self,
+        lua: &mlua::Lua,
+    ) -> Result<&crate::orchestration::TrustedContext, String> {
+        let Caps::Trusted { authority, .. } = &self.caps else {
+            return Err(self.cap_err("orchestration"));
+        };
+        authority.validate(lua)?;
+        Ok(authority)
+    }
+
+    /// Restricted dispatch capability; trusted orchestration uses `trusted`.
     pub(crate) fn agent(&self) -> Option<&AgentContext> {
         match &self.caps {
             Caps::Handler { agent, .. } => Some(agent),
@@ -159,7 +244,7 @@ impl LuaCtx {
 
     fn config(&self) -> Option<&AgentConfig> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(&agent.config),
+            Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(&agent.config),
             Caps::Start { config, .. } => Some(config),
             Caps::Restore { .. } => None,
         }
@@ -167,7 +252,7 @@ impl LuaCtx {
 
     fn workflow(&self) -> Option<bool> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(agent.workflow),
+            Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(agent.workflow),
             Caps::Start { workflow, .. } => Some(*workflow),
             Caps::Restore { .. } => None,
         }
@@ -175,7 +260,7 @@ impl LuaCtx {
 
     fn audience(&self) -> Option<ToolAudience> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(agent.audience),
+            Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(agent.audience),
             Caps::Start { audience, .. } => Some(*audience),
             Caps::Restore { .. } => None,
         }
@@ -185,7 +270,9 @@ impl LuaCtx {
     /// means this run has one but it is not tied to a session.
     fn session_id(&self) -> Option<Option<&SessionRef>> {
         match &self.caps {
-            Caps::Handler { agent, .. } => Some(agent.session_id.as_ref()),
+            Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => {
+                Some(agent.session_id.as_ref())
+            }
             Caps::Start { session_id, .. } => Some(session_id.as_ref()),
             Caps::Restore { .. } => None,
         }
@@ -214,6 +301,7 @@ impl LuaCtx {
 
     fn kind(&self) -> &'static str {
         match self.caps {
+            Caps::Trusted { .. } => "trusted",
             Caps::Handler { .. } => "handler",
             Caps::Start { .. } => "start",
             Caps::Restore { .. } => "restore",
@@ -232,6 +320,14 @@ impl LuaCtx {
 impl UserData for LuaCtx {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
+        methods.add_function(
+            "defer_close",
+            |lua, (ctx, agent): (mlua::AnyUserData, mlua::AnyUserData)| {
+                let ctx = ctx.borrow::<LuaCtx>()?;
+                let agent = agent.borrow::<crate::api::agent::LuaAgent>()?;
+                crate::api::agent::agent_defer_close(lua, &agent, ctx)
+            },
+        );
 
         methods.add_method("workflow", |_, this, ()| {
             let Some(workflow) = this.workflow() else {
@@ -492,6 +588,27 @@ mod tests {
     use maki_agent::tools::{LocalTool, ToolAudience};
 
     use super::*;
+
+    #[test]
+    fn unmanaged_handler_origin_rejects_sibling_and_expired_scope() {
+        let lua = mlua::Lua::new();
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        let mut ctx = LuaCtx::handler(&populated_ctx());
+        ctx.bind_origin(scope.handle());
+        assert!(ctx.validate_origin(&lua).is_ok());
+        let sibling = crate::runtime::TaskScope::detached(&lua);
+        assert_eq!(
+            ctx.validate_origin(&lua).unwrap_err(),
+            "context belongs to another invocation"
+        );
+        drop(sibling);
+        assert!(ctx.validate_origin(&lua).is_ok());
+        drop(scope);
+        assert_eq!(
+            ctx.validate_origin(&lua).unwrap_err(),
+            "context invocation expired"
+        );
+    }
 
     const TOOL_USE_ID: &str = "tu-1";
     const INSTRUCTION_PATH: &str = "/tmp/nested/AGENTS.md";

@@ -18,10 +18,11 @@ pub use mcp::{
 pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 pub(crate) mod task_set;
 pub use actor::{
-    ActorBackend, ActorError, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
+    ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
     AgentActorHandle, BackendResult, ConfigChange, ConfigCommit, ConfigPatch, ConfigUpdateTicket,
     ControlWork, EffectiveAgentConfig, InterruptQueue, PreparedModel, QueueProjection, RootWork,
-    TurnAdmission, TurnContext, TurnTicket, WorkKind,
+    TranscriptRequest, TranscriptSnapshot, TurnAdmission, TurnAdmissionOptions, TurnContext,
+    TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket, WorkKind,
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,

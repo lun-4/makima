@@ -2393,8 +2393,12 @@ fn failed_plugin_reload_preserves_old_job_and_kills_candidate() {
         "transactional_jobs",
         &format!(
             r#"
-            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
-            maki.fn.jobwait(id, 100)
+            assert(maki.async.await(1, function(ready)
+                maki.fn.jobstart("printf %s $$ > '{}' && printf 'ready\\n'; exec sleep 30", {{
+                    owner = "plugin",
+                    on_stdout = function(_, line) if line == "ready" then ready(true) end end,
+                }})
+            end))
             error("reject candidate")
             "#,
             candidate_path.display()

@@ -34,6 +34,9 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+const REQUIRED_OUTPUT_BUDGET_EXHAUSTED: &str =
+    "turn budget exhausted before required output was reported";
+type CompletionCheck = Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
@@ -230,6 +233,7 @@ pub struct Agent<'h> {
     offload: Option<Arc<OffloadStore>>,
     managed_turn: Option<crate::CurrentManagedTurn>,
     admission: Option<TurnAdmissionSnapshot>,
+    completion_check: Option<CompletionCheck>,
 }
 
 impl<'h> Agent<'h> {
@@ -279,6 +283,7 @@ impl<'h> Agent<'h> {
             offload: params.offload,
             managed_turn: params.managed_turn,
             admission: None,
+            completion_check: None,
         }
     }
 
@@ -315,6 +320,11 @@ impl<'h> Agent<'h> {
 
     pub fn with_local_tools(mut self, local_tools: LocalTools) -> Self {
         self.local_tools = local_tools;
+        self
+    }
+
+    pub fn with_completion_check(mut self, check: CompletionCheck) -> Self {
+        self.completion_check = Some(check);
         self
     }
 
@@ -468,14 +478,39 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
+            if self.cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
             if let Some(max) = self.config.max_turns
                 && self.num_turns >= max
             {
+                if let Some(check) = &self.completion_check {
+                    match check().map_err(|message| AgentError::Config { message })? {
+                        None => {}
+                        Some(_) => {
+                            return Err(AgentError::Config {
+                                message: REQUIRED_OUTPUT_BUDGET_EXHAUSTED.into(),
+                            });
+                        }
+                    }
+                }
                 return Ok(DoneReason::MaxTurns);
             }
             match self.turn().await? {
                 TurnProgress::Continue => {}
-                TurnProgress::Done(reason) => return Ok(reason),
+                TurnProgress::Done(reason) => {
+                    if self.cancel.is_cancelled() {
+                        return Err(AgentError::Cancelled);
+                    }
+                    if let Some(check) = &self.completion_check
+                        && let Some(message) =
+                            check().map_err(|message| AgentError::Config { message })?
+                    {
+                        self.history.push(Message::user(message));
+                        continue;
+                    }
+                    return Ok(reason);
+                }
             }
         }
     }
@@ -707,7 +742,7 @@ impl<'h> Agent<'h> {
         .await
     }
 
-    fn tool_context(&self) -> ToolContext {
+    pub fn tool_context(&self) -> ToolContext {
         let cwd = self
             .session_id
             .as_ref()
@@ -734,6 +769,7 @@ impl<'h> Agent<'h> {
             deadline: Deadline::None,
             config: self.config.clone(),
             tool_filter: Arc::clone(self.tools.filter()),
+            request_tools: Some(self.tools.clone()),
             tool_output_lines: self.tool_output_lines,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
@@ -1115,6 +1151,106 @@ mod tests {
         make_agent_with_sender(provider, history, raw_tx, event_rx)
     }
 
+    #[test_case(false; "report_after_recovery")]
+    #[test_case(true; "missing_report_exhausts_recovery")]
+    fn completion_recovery_stays_in_one_turn_and_emits_one_outcome(exhaust: bool) {
+        const NUDGE: &str = "report required output";
+        const MISSING: &str = "missing required output";
+        smol::block_on(async {
+            let checks = Arc::new(Mutex::new(0));
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(
+                MockProvider::new((0..3).map(|_| text_response(StopReason::EndTurn)).collect()),
+                &mut history,
+            );
+            let count = Arc::clone(&checks);
+            let mut agent = agent.with_completion_check(Arc::new(move || {
+                let mut checks = count.lock().unwrap();
+                *checks += 1;
+                match *checks {
+                    1 | 2 => Ok(Some(NUDGE.into())),
+                    _ if exhaust => Err(MISSING.into()),
+                    _ => Ok(None),
+                }
+            }));
+            let turn_id = TurnId::generate();
+            let outcome = agent.run(turn_id, default_input()).await;
+            assert_eq!(outcome.turn_id(), turn_id);
+            assert_eq!(outcome.num_turns(), 3);
+            assert_eq!(matches!(outcome, TurnOutcome::Failed { .. }), exhaust);
+            drop(agent);
+            assert_eq!(*checks.lock().unwrap(), 3);
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| matches!(event.event, AgentEvent::TurnOutcome(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::User)
+                        && message.content.iter().any(
+                            |block| matches!(block, ContentBlock::Text { text } if text == NUDGE)
+                        ))
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn cancellation_does_not_attempt_missing_report_recovery() {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let mut agent = agent
+                .with_cancel(cancel)
+                .with_completion_check(Arc::new(|| {
+                    panic!("cancelled turns must not recover output")
+                }));
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Cancelled { .. }));
+            drop(agent);
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| matches!(event.event, AgentEvent::TurnOutcome(_)))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn completion_recovery_respects_turn_budget() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let mut agent =
+                agent.with_completion_check(Arc::new(|| Ok(Some("report output".into()))));
+            agent.config.max_turns = Some(1);
+            let outcome = agent.run(TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            assert_eq!(outcome.num_turns(), 1);
+            drop(agent);
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| matches!(event.event, AgentEvent::TurnOutcome(_)))
+                    .count(),
+                1
+            );
+        });
+    }
+
     #[test]
     fn run_uses_input_options_without_settings_snapshot() {
         let mut history = History::new(Vec::new());
@@ -1483,6 +1619,87 @@ mod tests {
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
         }
+    }
+
+    #[test_case(false, false, false; "text_disconnected")]
+    #[test_case(true, false, false; "text_full")]
+    #[test_case(false, true, false; "tool_disconnected")]
+    #[test_case(true, true, false; "tool_full")]
+    #[test_case(false, true, true; "retry_tool_disconnected")]
+    #[test_case(true, true, true; "retry_tool_full")]
+    fn retained_runs_finish_text_tools_and_retries_without_a_presentation_sink(
+        full: bool,
+        tools: bool,
+        retry: bool,
+    ) {
+        smol::block_on(async {
+            const TOOL: &str = "report_result";
+            const TEXT: &str = "response";
+            let mut results = VecDeque::new();
+            if retry {
+                results.push_back(Err(AgentError::api(429, "retry fixture")));
+            }
+            if tools {
+                results.push_back(Ok(tool_use_response(TOOL, serde_json::json!({"ok":true}))));
+            }
+            results.push_back(Ok(text_response(StopReason::EndTurn)));
+            let provider = ScriptedProvider {
+                results: Mutex::new(results),
+            };
+            let (tx, rx) = flume::bounded(1);
+            if full {
+                tx.send(Envelope {
+                    event: AgentEvent::Nudge,
+                    subagent: None,
+                    run_id: 0,
+                })
+                .unwrap();
+            }
+            let (unused_tx, unused_rx) = flume::unbounded();
+            drop(unused_tx);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _) = make_agent_with_sender(provider, &mut history, tx, unused_rx);
+            let retained_rx = if full {
+                Some(rx)
+            } else {
+                drop(rx);
+                None
+            };
+            let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+            agent.event_tx = agent.event_tx.with_output(ticket.output());
+            agent.timeouts.retry.base_delay = std::time::Duration::ZERO;
+            agent.timeouts.retry.max_delay = std::time::Duration::ZERO;
+            let calls = Arc::new(Mutex::new(0));
+            let recorded = Arc::clone(&calls);
+            let report = crate::tools::local_tool(ToolAudience::MODEL, move |value, _ctx| {
+                assert_eq!(value, serde_json::json!({"ok":true}));
+                *recorded.lock().unwrap() += 1;
+                Box::pin(async { Ok("recorded".into()) })
+            });
+            agent = agent.with_local_tools(Arc::new(std::collections::HashMap::from([(
+                TOOL.into(),
+                report,
+            )])));
+            agent.tools = RequestTools::assembled(
+                serde_json::json!([{"name":TOOL,"description":"fixture","input_schema":{"type":"object"}}]),
+                &agent.config,
+                &agent.model,
+            );
+            let outcome = agent.run(ticket.turn_id(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            assert_eq!(*calls.lock().unwrap(), usize::from(tools));
+            ticket.resolve(outcome);
+            assert_eq!(ticket.peek_result().unwrap().text, TEXT);
+            drop(agent);
+            drop(retained_rx);
+            assert!(history.as_slice().iter().any(|message| {
+                matches!(message.role, Role::Assistant)
+                    && message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Text { text } if text == TEXT))
+            }));
+        });
     }
 
     #[test]
@@ -1894,6 +2111,21 @@ mod tests {
 
     /// Wiring this to `None` to make the struct literal compile would
     /// silently reintroduce the bug the field exists to fix.
+    #[test]
+    fn tool_context_preserves_admitted_tool_definitions_and_filter() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let definitions =
+            serde_json::json!([{ "name": "read", "description": "pinned description" }]);
+        agent.tools =
+            crate::tools::RequestTools::assembled(definitions.clone(), &agent.config, &agent.model);
+        let context = agent.tool_context();
+        let snapshot = context.request_tools.unwrap();
+        assert_eq!(snapshot.definitions(), &definitions);
+        assert!(Arc::ptr_eq(snapshot.filter(), &context.tool_filter));
+        assert!(Arc::ptr_eq(snapshot.filter(), agent.tools.filter()));
+    }
+
     #[test]
     fn tool_context_carries_the_session() {
         let mut history = History::new(Vec::new());

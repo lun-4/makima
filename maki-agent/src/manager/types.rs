@@ -73,6 +73,22 @@ impl std::fmt::Debug for AgentRef {
 }
 
 impl AgentRef {
+    pub fn manager(&self) -> super::AgentManagerHandle {
+        self.manager.clone()
+    }
+
+    pub fn same_manager(&self, other: &Self) -> bool {
+        self.manager.same_manager(&other.manager)
+    }
+
+    pub fn turn_ticket(&self, turn_id: TurnId) -> Result<TurnTicket, super::ManagerError> {
+        self.manager.retained_turn_ticket(self, turn_id)
+    }
+
+    pub fn validate_live(&self) -> Result<(), super::ManagerError> {
+        self.manager.validate_live_ref(self)
+    }
+
     pub fn id(&self) -> AgentId {
         self.agent_id
     }
@@ -116,6 +132,14 @@ pub struct CurrentManagedTurn {
 }
 
 impl CurrentManagedTurn {
+    pub fn manager(&self) -> super::AgentManagerHandle {
+        self.token.manager.clone()
+    }
+
+    pub fn agent_ref(&self) -> Result<AgentRef, super::ManagerError> {
+        self.token.manager.lookup(self.agent_id())
+    }
+
     pub fn agent_id(&self) -> AgentId {
         self.token.agent_id
     }
@@ -230,6 +254,20 @@ impl TurnPermitLease {
             .register_prompt_wait(current, self, child_id, actor, ticket, timeout)
     }
 
+    pub fn observe_descendant(
+        &self,
+        current: &CurrentManagedTurn,
+        child_id: AgentId,
+        actor: &AgentActorHandle,
+        ticket: TurnTicket,
+        timeout: Option<Duration>,
+    ) -> Result<ManagedPromptWait, super::ManagerError> {
+        current
+            .token
+            .manager
+            .register_turn_wait(current, self, child_id, actor, ticket, timeout, false)
+    }
+
     pub fn admit_and_wait_for_descendant(
         &self,
         current: &CurrentManagedTurn,
@@ -280,9 +318,17 @@ impl TurnPermitLease {
 
 pub struct ManagedPromptWait {
     pub(crate) inner: Arc<super::PromptWaitInner>,
+    pub(crate) ticket: TurnTicket,
 }
 
 impl ManagedPromptWait {
+    pub async fn wait_result(self) -> Result<crate::TurnResult, PromptWaitError> {
+        let result = self.inner.wait_result().await;
+        self.inner.lease.wait_until_owned().await;
+        result?;
+        Ok(self.ticket.wait_result().await)
+    }
+
     pub async fn wait(self) -> Result<crate::TurnOutcome, PromptWaitError> {
         let result = self.inner.wait_result().await;
         self.inner.lease.wait_until_owned().await;

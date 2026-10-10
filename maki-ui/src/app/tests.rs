@@ -925,6 +925,120 @@ fn queue_item_consumed_shows_mcp_startup_notice() {
 /// Restored queue items start runs without `start_run`, so the consumed
 /// event is the only signal that the agent went busy: it must flip status
 /// or the busy-guard and esc-to-cancel stay off during the whole run.
+#[test_case(false; "backend_outruns_ui")]
+#[test_case(true; "cancel_fences_buffered_presentations")]
+fn buffered_explicit_turn_presentations_preserve_fifo_and_cancel_fence(cancel: bool) {
+    const FIRST_RUN: u64 = 7;
+    const SECOND_RUN: u64 = 8;
+    let mut app = test_app();
+    app.run_id = FIRST_RUN - 1;
+    app.queue.set_run_id(SECOND_RUN);
+    let mut buffered = Vec::new();
+    for (run_id, input, response) in [
+        (FIRST_RUN, "input a", "response a"),
+        (SECOND_RUN, "input b", "response b"),
+    ] {
+        buffered.push(agent_msg_with_run_id(
+            AgentEvent::QueueItemConsumed {
+                text: input.into(),
+                images: Vec::new(),
+                mcp_startup_notice: None,
+                already_displayed: false,
+            },
+            run_id,
+        ));
+        buffered.push(agent_msg_with_run_id(
+            AgentEvent::TextDelta {
+                text: response.into(),
+            },
+            run_id,
+        ));
+        buffered.push(agent_msg_with_run_id(done(), run_id));
+        buffered.push(agent_msg_with_run_id(AgentEvent::QueueDrained, run_id));
+    }
+    let before = app.main_chat().message_count();
+    if cancel {
+        app.handle_cancel();
+    }
+    let after_cancel = app.main_chat().message_count();
+    let cancel_text = app.main_chat().last_message_text().to_owned();
+    for message in buffered {
+        app.update(message);
+    }
+    if cancel {
+        assert_eq!(app.main_chat().message_count(), after_cancel);
+        assert_eq!(app.main_chat().last_message_text(), cancel_text);
+        assert_eq!(app.status, Status::Idle);
+        assert_eq!(app.run_id, SECOND_RUN + 1);
+    } else {
+        assert_eq!(app.run_id, SECOND_RUN);
+        assert_eq!(app.main_chat().message_count(), before + 4);
+        assert_eq!(app.main_chat().last_message_text(), "response b");
+        assert_eq!(app.status, Status::Idle);
+    }
+}
+
+#[test_case(false; "complete")]
+#[test_case(true; "cancel")]
+fn explicit_root_presentation_after_prior_ui_turn(cancel: bool) {
+    const RUN_ID: u64 = 7;
+    const RESPONSE: &str = "explicit response";
+    let mut app = test_app();
+    app.run_id = RUN_ID - 1;
+    app.queue.set_run_id(RUN_ID);
+    app.status = Status::Idle;
+    app.update(agent_msg_with_run_id(
+        AgentEvent::QueueItemConsumed {
+            text: "explicit input".into(),
+            images: Vec::new(),
+            mcp_startup_notice: None,
+            already_displayed: false,
+        },
+        RUN_ID,
+    ));
+    assert_eq!(app.status, Status::Streaming);
+    app.update(agent_msg_with_run_id(
+        AgentEvent::TextDelta {
+            text: RESPONSE.into(),
+        },
+        RUN_ID,
+    ));
+    if cancel {
+        let actions = app.handle_cancel();
+        assert!(
+            actions.iter().any(
+                |action| matches!(action, Action::CancelAgent { run_id } if *run_id == RUN_ID)
+            )
+        );
+        assert_eq!(app.queue.current_run_id(), Some(RUN_ID + 1));
+        app.queue.set_run_id(RUN_ID + 2);
+        app.update(agent_msg_with_run_id(
+            AgentEvent::QueueItemConsumed {
+                text: "after cancel".into(),
+                images: Vec::new(),
+                mcp_startup_notice: None,
+                already_displayed: false,
+            },
+            RUN_ID + 2,
+        ));
+        assert_eq!(app.run_id, RUN_ID + 2);
+        assert_eq!(app.status, Status::Streaming);
+        app.update(agent_msg_with_run_id(
+            AgentEvent::TextDelta {
+                text: RESPONSE.into(),
+            },
+            RUN_ID + 2,
+        ));
+        app.update(agent_msg_with_run_id(done(), RUN_ID + 2));
+        assert_eq!(app.status, Status::Idle);
+        assert_eq!(app.main_chat().last_message_text(), RESPONSE);
+    } else {
+        app.update(agent_msg_with_run_id(done(), RUN_ID));
+        assert_eq!(app.status, Status::Idle);
+        assert_eq!(app.main_chat().last_message_text(), RESPONSE);
+    }
+}
+
 #[test]
 fn queue_item_consumed_marks_agent_streaming() {
     let mut app = test_app();
@@ -2978,6 +3092,48 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
 /// `/model <provider/id>` emits `ChangeModel` for the spec without the picker,
 /// even when the spec is absent from the discovered list (explicit specs
 /// bypass the list).
+#[test]
+fn model_structured_selection_emits_one_atomic_action() {
+    let (mut app, models) = app_with_model_slot();
+    models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+    for args in [
+        format!("{LATE_MODEL_SPEC} thinking=high fast=true"),
+        "thinking=off fast=false".into(),
+    ] {
+        let expected = maki_commands::ModelSelection::parse(&args).unwrap();
+        let actions = app.execute_command(
+            ParsedCommand {
+                name: "/model".into(),
+                args,
+            },
+            0,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::SelectModel(selection)] if selection == &expected)
+        );
+        assert!(!app.model_picker.is_open());
+    }
+    for args in [
+        "fast=true fast=false",
+        "fast=on",
+        "thinking=0",
+        "unknown=value",
+    ] {
+        let actions = app.execute_command(
+            ParsedCommand {
+                name: "/model".into(),
+                args: args.into(),
+            },
+            0,
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::SelectModel(_) | Action::ChangeModel(_)))
+        );
+    }
+}
+
 #[test]
 fn model_arg_spec_emits_change_model() {
     let (mut app, models) = app_with_model_slot();

@@ -1,4 +1,9 @@
-use std::sync::Arc;
+use maki_lua::orchestration::TrustedTarget;
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::components::arg_completion::{ModelArgSource, PathArgSource, ThemeArgSource};
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
@@ -22,6 +27,7 @@ pub(crate) enum CommandEvent {
 struct UiCommandHost {
     target: std::sync::OnceLock<maki_commands::InvocationTargetId>,
     tx: flume::Sender<CommandEvent>,
+    admissions: Arc<Mutex<HashMap<maki_commands::InvocationTargetId, TrustedTarget>>>,
 }
 
 pub(crate) struct PreparedCommandTarget {
@@ -49,6 +55,15 @@ impl PreparedCommandTarget {
 }
 
 impl CommandHost for UiCommandHost {
+    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        let target = self.target.get()?;
+        self.admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(target)
+            .cloned()
+            .map(|target| Arc::new(target) as Arc<dyn Any + Send + Sync>)
+    }
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
         let Some(target) = self.target.get().copied() else {
             return Box::pin(async { Err(CommandError::StaleTarget) });
@@ -72,6 +87,7 @@ impl CommandHost for UiCommandHost {
 
 pub(crate) struct CommandRuntime {
     pub registry: CommandRegistry,
+    admissions: Arc<Mutex<HashMap<maki_commands::InvocationTargetId, TrustedTarget>>>,
     event_tx: flume::Sender<CommandEvent>,
     #[cfg(test)]
     event_rx: flume::Receiver<CommandEvent>,
@@ -116,6 +132,7 @@ impl CommandRuntime {
         (
             Self {
                 registry,
+                admissions: Arc::default(),
                 event_tx,
                 #[cfg(test)]
                 event_rx: event_rx.clone(),
@@ -127,10 +144,21 @@ impl CommandRuntime {
         )
     }
 
+    pub(crate) fn sync_admissions(
+        &self,
+        targets: HashMap<maki_commands::InvocationTargetId, TrustedTarget>,
+    ) {
+        *self
+            .admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = targets;
+    }
+
     pub(crate) fn prepare_target(&self) -> PreparedCommandTarget {
         let host = Arc::new(UiCommandHost {
             target: std::sync::OnceLock::new(),
             tx: self.event_tx.clone(),
+            admissions: self.admissions.clone(),
         });
         PreparedCommandTarget {
             target: self

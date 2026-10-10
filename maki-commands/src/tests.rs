@@ -36,6 +36,54 @@ impl CommandBehavior for CountingBehavior {
 struct Host;
 
 #[test]
+fn queued_dispatch_pins_host_admission_before_focus_changes() {
+    struct FocusHost(Arc<AtomicU64>);
+    impl CommandHost for FocusHost {
+        fn admission_context(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            Some(Arc::new(self.0.load(Ordering::SeqCst)))
+        }
+        fn request(&self, _: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+            Box::pin(async { Ok(HostResponse::Completed) })
+        }
+    }
+    struct Probe(Arc<AtomicU64>);
+    impl CommandBehavior for Probe {
+        fn execute(
+            &self,
+            invocation: CommandInvocation,
+        ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
+            self.0.store(
+                *invocation.admission_context::<u64>().unwrap(),
+                Ordering::SeqCst,
+            );
+            Box::pin(async { Ok(CommandOutcome::Completed) })
+        }
+    }
+    let registry = CommandRegistry::new();
+    let focus = Arc::new(AtomicU64::new(1));
+    let seen = Arc::new(AtomicU64::new(0));
+    let target = registry
+        .prepare_target(TargetCapabilities::NONE, Arc::new(FocusHost(focus.clone())))
+        .activate();
+    let producer = registry.create_producer(ProducerPrecedence::Application);
+    producer
+        .replace(vec![registration_with(
+            "/pinned",
+            &[],
+            Arc::new(Probe(seen.clone())),
+            TargetCapabilities::NONE,
+        )])
+        .unwrap();
+    let queued = registry.dispatch_input(&target, "/pinned".into());
+    focus.store(2, Ordering::SeqCst);
+    assert!(matches!(
+        futures_lite::future::block_on(queued),
+        InputDispatch::Dispatched(CommandOutcome::Completed)
+    ));
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn prepared_target_is_stale_until_activation() {
     let registry = CommandRegistry::new();
     let prepared = registry.prepare_target(TargetCapabilities::NONE, Arc::new(Host));

@@ -20,6 +20,20 @@ pub enum ActorError {
     UnsupportedOption(#[from] crate::session_options::SessionOptionError),
     #[error("configuration preparation expired")]
     ConfigExpired,
+    #[error("transcript caps must be 1..=1000 messages and 2..=1048576 bytes")]
+    InvalidTranscriptCaps,
+    #[error("turn is still pending: {0}")]
+    PendingTurn(TurnId),
+    #[error("exact history boundary is unavailable for turn: {0}")]
+    UnavailableTurnHistory(TurnId),
+    #[error("turn history has been compacted: {0}")]
+    CompactedTurn(TurnId),
+    #[error("could not serialize transcript: {0}")]
+    TranscriptSerialization(String),
+    #[error("the actor has pending work")]
+    Busy,
+    #[error("the after_turn boundary is not the latest settled turn")]
+    StaleTurn,
     #[error("no such turn: {0}")]
     UnknownTurn(TurnId),
 }

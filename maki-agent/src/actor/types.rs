@@ -97,6 +97,8 @@ pub enum WorkKind {
 pub struct TurnContext {
     pub agent_id: AgentId,
     pub turn_id: Option<TurnId>,
+    pub output: super::TurnOutput,
+    pub provenance: super::TurnProvenance,
     pub cancel: CancelToken,
     pub cancel_reason: ReasonedCancelToken,
     /// Adapter-local correlation (the sink's run id or the control's key).
@@ -142,12 +144,18 @@ pub struct RootWork {
     pub images: Vec<ImageSource>,
     pub correlation: String,
     pub earlier: Vec<EarlierRoot>,
+    pub provenance: super::TurnProvenance,
     pub generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     pub(crate) admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
 
 impl RootWork {
+    pub fn with_provenance(mut self, provenance: super::TurnProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
     pub fn new(
         input: crate::AgentInput,
         run_id: u64,
@@ -164,6 +172,10 @@ impl RootWork {
             images,
             correlation,
             earlier: Vec::new(),
+            provenance: super::TurnProvenance {
+                origin: super::TurnOrigin::User,
+                ..Default::default()
+            },
             generation: 0,
             policy: None,
             admission: None,
@@ -187,10 +199,6 @@ pub struct TurnAdmission {
     pub input: Option<crate::AgentInput>,
     pub event_sender: Option<crate::EventSender>,
     pub correlation: String,
-    /// True when this admission was synthesized from a queued root input.
-    /// A root-started turn that is cancelled before entering produces no
-    /// retained outcome and no terminal delivery.
-    pub(crate) root: bool,
     pub(crate) generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     pub(crate) ticket: super::TurnTicket,

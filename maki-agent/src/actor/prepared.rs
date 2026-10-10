@@ -216,6 +216,7 @@ impl PreparedOperationTicket {
             state
                 .config_observers
                 .retain(|observer| observer.send(commit.clone()).is_ok());
+            state.emit(super::ActorEvent::Config(commit.clone()));
         }
         drive_operations(&self.inner, &mut state);
         self.inner.policy_changed.notify(usize::MAX);

@@ -124,12 +124,17 @@ pub(crate) fn correlation(run_id: u64) -> String {
 }
 
 impl QueueSender {
+    pub(crate) fn current_run_id(&self) -> u64 {
+        self.last_run_id.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn set_run_id(&self, run_id: u64) {
-        self.last_run_id.store(run_id, Ordering::Relaxed);
+        self.last_run_id.fetch_max(run_id, Ordering::Relaxed);
     }
 
     pub(crate) fn push(&self, entry: QueueItem) {
-        self.last_run_id.store(entry.run_id(), Ordering::Relaxed);
+        self.last_run_id
+            .fetch_max(entry.run_id(), Ordering::Relaxed);
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).push_back(entry),

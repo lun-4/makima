@@ -5511,6 +5511,107 @@ mod tests {
     }
 
     #[test]
+    fn portable_model_options_commit_atomically_without_an_agent_turn() {
+        smol::block_on(async {
+            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let coordinator = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .clone();
+            let value = |snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
+                         id: &str| {
+                snapshot
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == id)
+                    .unwrap()
+                    .current_value
+                    .to_string()
+            };
+            let before = coordinator.read().options();
+            dispatch_prompt(
+                &mut srv,
+                &format!("/model \"{FAST_SPEC}\" thinking=high fast=true"),
+                false,
+                &RequestId::Number(3),
+            )
+            .await
+            .unwrap();
+            let selected = coordinator.read().options();
+            assert_eq!(selected.version, before.version + 1);
+            assert_eq!(
+                value(&selected, maki_agent::session_options::MODEL_OPTION_ID),
+                FAST_SPEC
+            );
+            assert_eq!(
+                value(&selected, maki_agent::session_options::FAST_OPTION_ID),
+                maki_agent::session_options::ENABLED_VALUE
+            );
+            assert_eq!(
+                value(&selected, maki_agent::session_options::THINKING_OPTION_ID),
+                "high"
+            );
+            dispatch_prompt(
+                &mut srv,
+                "/model thinking=off fast=false",
+                false,
+                &RequestId::Number(4),
+            )
+            .await
+            .unwrap();
+            let disabled = coordinator.read().options();
+            assert_eq!(disabled.version, selected.version + 1);
+            assert_eq!(
+                value(&disabled, maki_agent::session_options::MODEL_OPTION_ID),
+                FAST_SPEC
+            );
+            assert_eq!(
+                value(&disabled, maki_agent::session_options::FAST_OPTION_ID),
+                maki_agent::session_options::DISABLED_VALUE
+            );
+            assert_eq!(
+                value(&disabled, maki_agent::session_options::THINKING_OPTION_ID),
+                "off"
+            );
+            // Repeating explicit values does not toggle either option.
+            dispatch_prompt(
+                &mut srv,
+                "/model thinking=off fast=false",
+                false,
+                &RequestId::Number(5),
+            )
+            .await
+            .unwrap();
+            let repeated = coordinator.read().options();
+            assert_eq!(repeated, disabled);
+            assert_eq!(
+                value(&repeated, maki_agent::session_options::FAST_OPTION_ID),
+                maki_agent::session_options::DISABLED_VALUE
+            );
+            assert_eq!(
+                value(&repeated, maki_agent::session_options::THINKING_OPTION_ID),
+                "off"
+            );
+            for input in [
+                format!("/model {OFFLINE_SPEC} fast=true"),
+                "/model fast=true fast=false".into(),
+                "/model thinking=toggle".into(),
+            ] {
+                dispatch_prompt(&mut srv, &input, false, &RequestId::Number(6))
+                    .await
+                    .unwrap_err();
+                assert_eq!(coordinator.read().options(), repeated);
+            }
+            assert!(input_rx.is_empty());
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn portable_bare_model_returns_shared_usage_error() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
 

@@ -73,7 +73,7 @@ fn claim_lock(dir: &std::path::Path, id: &MakiId) -> Result<ClaimedSessionLock> 
 use crate::AppSession;
 use crate::agent::{
     AgentCommand, AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot,
-    SystemPromptOverride, shared_queue::QueueItem,
+    SystemPromptOverride, orchestration::AgentOrchestration, shared_queue::QueueItem,
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{
@@ -1890,6 +1890,7 @@ pub(crate) struct EventLoop<'t> {
     terminal_focused: bool,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
+    orchestration: Arc<AgentOrchestration>,
     sessions_dir: PathBuf,
     session_cwd: String,
     last_heartbeat: Instant,
@@ -2208,6 +2209,9 @@ impl<'t> EventLoop<'t> {
         }
 
         let session_cwd = runtimes[focused].app.state.session.cwd.clone();
+        let orchestration = Arc::new(AgentOrchestration::new(Arc::clone(&ctx.available_models)));
+        ctx.lua_event_handle
+            .install_orchestration_services(orchestration.clone());
         Ok(Self {
             terminal,
             sessions: runtimes,
@@ -2217,6 +2221,7 @@ impl<'t> EventLoop<'t> {
             terminal_focused: false,
             notifier,
             ctx,
+            orchestration,
             sessions_dir,
             session_cwd,
             last_heartbeat: Instant::now(),
@@ -2234,6 +2239,46 @@ impl<'t> EventLoop<'t> {
             internal_rx,
             _model_fetch_task: bg.task,
         })
+    }
+
+    fn sync_orchestration(&self) {
+        let mut commands = std::collections::HashMap::new();
+        let mut admissions = std::collections::HashMap::new();
+        let mut focused = None;
+        for (index, runtime) in self.sessions.iter().enumerate() {
+            let (manager, root_id) = runtime.handles.manager_and_root();
+            let Ok(root) = manager.lookup(root_id) else {
+                continue;
+            };
+            let mut template = runtime.handles.orchestration_template.clone();
+            template.cwd = (**runtime.handles.cwd_slot().load()).clone();
+            self.orchestration
+                .register_root(maki_lua::orchestration::TrustedTarget {
+                    target: root.clone(),
+                    template,
+                });
+            let selected = runtime.app.selected_agent_id().unwrap_or(root_id);
+            if let Ok(target) = manager.lookup(selected) {
+                if let Ok(template) = maki_lua::orchestration::OrchestrationServices::template(
+                    &*self.orchestration,
+                    &target,
+                ) {
+                    admissions.insert(
+                        runtime.app.command_target.id(),
+                        maki_lua::orchestration::TrustedTarget {
+                            target: target.clone(),
+                            template,
+                        },
+                    );
+                }
+                commands.insert(runtime.app.command_target.id(), target.clone());
+                if index == self.focused {
+                    focused = Some(target);
+                }
+            }
+        }
+        self.ctx.command_runtime.sync_admissions(admissions);
+        self.orchestration.select(commands, focused);
     }
 
     fn focused_app(&mut self) -> &mut App {
@@ -2255,6 +2300,7 @@ impl<'t> EventLoop<'t> {
         // an animation tick owes another.
         let mut dirty = Dirty::YES;
         let result = loop {
+            self.sync_orchestration();
             dirty |= self.tick();
             if self.sessions[self.focused].app.take_pending_bell() {
                 ring_bell();
@@ -2682,6 +2728,7 @@ impl<'t> EventLoop<'t> {
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
         let rt = &mut self.sessions[idx];
+        rt.app.adopt_actor_presentation(&envelope);
         let current = is_current_top_level(rt.app.run_id, &envelope);
         match &envelope.event {
             AgentEvent::QueueDrained => {
@@ -2865,6 +2912,7 @@ impl<'t> EventLoop<'t> {
             } => {
                 // Answer before dispatching: the caller only waits on the name
                 // resolving, and dispatch may take a while (or exit the app).
+                self.sync_orchestration();
                 match self.focused_app().run_cmdline(&cmdline, depth) {
                     Ok(actions) => {
                         let _ = reply_tx.send(Ok(()));
@@ -3912,6 +3960,7 @@ impl<'t> EventLoop<'t> {
     fn handle_input(&mut self, raw: Event) {
         let mut pending = Some(raw);
         while let Some(ev) = pending.take() {
+            self.sync_orchestration();
             let (msg, leftover) = self.translate(ev);
             if let Some(msg) = msg {
                 let actions = self.sessions[self.focused].update(msg);
@@ -4019,6 +4068,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_action(&mut self, idx: usize, action: Action) {
+        self.sync_orchestration();
         match action {
             Action::SendMessage(input) => {
                 let rt = &mut self.sessions[idx];
@@ -4068,6 +4118,21 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
+            Action::SelectModel(selection) => {
+                self.note_if_deferred(idx, "model");
+                let coordinator = self.sessions[idx].coordinator.clone();
+                let spec = selection.spec.clone().map_or_else(
+                    || self.sessions[idx].model_slot.load().model.spec(),
+                    |spec| spec.to_string(),
+                );
+                self.dispatch_session_op(idx, SessionOpKind::ModelChanged { spec }, async move {
+                    coordinator
+                        .set_model(selection.spec, selection.fast, selection.thinking)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                });
+            }
             Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode),
             Action::ApprovePlan {
                 clear_context,
@@ -6311,6 +6376,7 @@ mod tests {
             notifier: None,
             sessions_dir: ctx.sessions_dir.clone(),
             session_cwd: harness._temp_dir.path().to_string_lossy().into_owned(),
+            orchestration: Arc::new(AgentOrchestration::new(Arc::clone(&ctx.available_models))),
             ctx,
             last_heartbeat: Instant::now(),
             input: InputReader::disconnected(),
@@ -7713,6 +7779,76 @@ mod tests {
         assert_eq!(runtime.app.input_box.buffer.value(), PROMPT);
         release_runtime(old);
         release_runtime(runtime);
+    }
+
+    #[test]
+    fn queued_command_admission_keeps_agent_after_ui_selection_changes() {
+        struct Probe(Arc<Mutex<Option<maki_agent::AgentId>>>);
+        impl maki_commands::CommandBehavior for Probe {
+            fn execute(
+                &self,
+                invocation: maki_commands::CommandInvocation,
+            ) -> maki_commands::CommandFuture<
+                Result<maki_commands::CommandOutcome, maki_commands::CommandError>,
+            > {
+                *self.0.lock().unwrap() = Some(
+                    invocation
+                        .admission_context::<maki_lua::orchestration::TrustedTarget>()
+                        .unwrap()
+                        .target
+                        .id(),
+                );
+                Box::pin(async { Ok(maki_commands::CommandOutcome::Completed) })
+            }
+        }
+        let harness = RuntimeHarness::new();
+        let first = harness.runtime(harness.session());
+        let second = harness.runtime(harness.session());
+        let command_runtime = &harness.ctx().command_runtime;
+        let (first_manager, first_id) = first.handles.manager_and_root();
+        let (second_manager, second_id) = second.handles.manager_and_root();
+        let target_id = first.app.command_target.id();
+        command_runtime.sync_admissions(std::collections::HashMap::from([(
+            target_id,
+            maki_lua::orchestration::TrustedTarget {
+                target: first_manager.lookup(first_id).unwrap(),
+                template: first.handles.orchestration_template.clone(),
+            },
+        )]));
+        let seen = Arc::new(Mutex::new(None));
+        let producer = command_runtime
+            .registry
+            .create_producer(maki_commands::ProducerPrecedence::Application);
+        producer
+            .replace(vec![maki_commands::Registration {
+                spec: maki_commands::CommandSpec {
+                    name: Arc::from("/admission-race"),
+                    aliases: Arc::from([]),
+                    arguments: maki_commands::CommandArguments::Raw { required: false },
+                    docs: maki_commands::CommandDocs {
+                        summary: Arc::from("Admission race probe"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: maki_commands::TargetCapabilities::NONE,
+                },
+                behavior: Arc::new(Probe(seen.clone())),
+                argument_completions: Vec::new(),
+            }])
+            .unwrap();
+        let queued = command_runtime
+            .registry
+            .dispatch_input(&first.app.command_target, "/admission-race".into());
+        command_runtime.sync_admissions(std::collections::HashMap::from([(
+            target_id,
+            maki_lua::orchestration::TrustedTarget {
+                target: second_manager.lookup(second_id).unwrap(),
+                template: second.handles.orchestration_template.clone(),
+            },
+        )]));
+        smol::block_on(queued);
+        assert_eq!(*seen.lock().unwrap(), Some(first_id));
+        release_runtime(first);
+        release_runtime(second);
     }
 
     #[test]

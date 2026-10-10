@@ -316,6 +316,17 @@ impl maki_commands::CommandHost for SessionCommandHost {
                     ))
                 })
             }
+            maki_commands::BuiltinOperation::SelectModel(selection) => {
+                let coordinator = self.coordinator.clone();
+                Box::pin(async move {
+                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
+                    coordinator
+                        .set_model(selection.spec, selection.fast, selection.thinking)
+                        .await
+                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
+                    Ok(HostResponse::Completed)
+                })
+            }
             maki_commands::BuiltinOperation::SetModel { spec } => {
                 let coordinator = self.coordinator.clone();
                 Box::pin(async move {
@@ -515,7 +526,7 @@ impl CommandBehavior for BuiltinBehavior {
             });
         }
         let arguments = invocation.arguments.trim().to_owned();
-        let model = parsed_string_argument(&invocation, "model");
+        let model = maki_commands::ModelSelection::parse(&arguments);
         let theme = parsed_string_argument(&invocation, "theme");
         let directory = parsed_directory_argument(&invocation, "path");
         let id = self.id;
@@ -529,7 +540,7 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::New => BuiltinOperation::ResetSession,
                 maki_commands::BuiltinId::Help => BuiltinOperation::ToggleHelp,
                 maki_commands::BuiltinId::Queue => BuiltinOperation::FocusQueue,
-                maki_commands::BuiltinId::Model if model.as_ref().is_ok_and(Option::is_none) => {
+                maki_commands::BuiltinId::Model if arguments.is_empty() => {
                     if !invocation.target_supports(TargetCapability::InteractiveUi) {
                         return Err(CommandError::Producer(Arc::from(
                             NONINTERACTIVE_MODEL_USAGE,
@@ -538,10 +549,9 @@ impl CommandBehavior for BuiltinBehavior {
                     BuiltinOperation::OpenModelPicker
                 }
                 maki_commands::BuiltinId::Model => {
-                    let model = model?.ok_or_else(|| {
-                        CommandError::Producer(Arc::from("model argument is unavailable"))
-                    })?;
-                    let specs = if model.contains('/') {
+                    let mut selection = model?;
+                    let model = selection.spec.as_deref().unwrap_or("");
+                    let specs = if model.is_empty() || model.contains('/') {
                         Arc::from([])
                     } else {
                         let HostContextResponse::Values(specs) =
@@ -553,8 +563,16 @@ impl CommandBehavior for BuiltinBehavior {
                         };
                         specs
                     };
-                    BuiltinOperation::SetModel {
-                        spec: resolve_model(&model, &specs)?,
+                    if !model.is_empty() {
+                        selection.spec = Some(resolve_model(model, &specs)?);
+                    }
+                    match selection {
+                        maki_commands::ModelSelection {
+                            spec: Some(spec),
+                            thinking: None,
+                            fast: None,
+                        } => BuiltinOperation::SetModel { spec },
+                        selection => BuiltinOperation::SelectModel(selection),
                     }
                 }
                 maki_commands::BuiltinId::Theme if theme.as_ref().is_ok_and(Option::is_none) => {
@@ -1219,6 +1237,63 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn structured_model_routes_options_and_rejects_invalid_input() {
+        let registry = maki_commands::CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let host = Arc::new(RecordingCommandHost::default());
+        let target = registry.bind_target(portable_capabilities(), host.clone());
+        for input in [
+            r#"/model "openai/gpt-5" thinking="high" fast=true"#,
+            "/model fast=false",
+            "/model thinking=2048",
+        ] {
+            assert!(matches!(
+                smol::block_on(registry.dispatch_input(&target, input.into())),
+                maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+            ));
+        }
+        let operations = host.0.lock().unwrap().clone();
+        assert_eq!(
+            operations,
+            vec![
+                BuiltinOperation::SelectModel(maki_commands::ModelSelection {
+                    spec: Some(Arc::from("openai/gpt-5")),
+                    thinking: Some(maki_providers::ThinkingConfig::parse_setting("high").unwrap()),
+                    fast: Some(true),
+                }),
+                BuiltinOperation::SelectModel(maki_commands::ModelSelection {
+                    fast: Some(false),
+                    ..Default::default()
+                }),
+                BuiltinOperation::SelectModel(maki_commands::ModelSelection {
+                    thinking: Some(maki_providers::ThinkingConfig::Budget(2048)),
+                    ..Default::default()
+                }),
+            ]
+        );
+        for input in [
+            "/model fast=true fast=false",
+            "/model thinking=high thinking=off",
+            "/model wat=true",
+            "/model fast=on",
+            "/model thinking=0",
+            "/model thinking=toggle",
+            "/model fast=toggle",
+            r#"/model "" fast=false"#,
+            r#"/model "openai/gpt-5" "openai/gpt-4""#,
+            r#"/model "openai/gpt-5" thinking="high" thinking=off"#,
+            "/model openai/gpt-5 openai/gpt-4",
+        ] {
+            assert!(matches!(
+                smol::block_on(registry.dispatch_input(&target, input.into())),
+                maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(_))
+            ));
+        }
+        assert_eq!(*host.0.lock().unwrap(), operations);
     }
 
     #[test]

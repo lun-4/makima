@@ -301,6 +301,7 @@ impl PluginHost {
                 state_dir,
                 fs,
                 session_provider_preparer,
+                orchestration_services: Default::default(),
             },
         )?;
         Ok(Self {
@@ -1052,6 +1053,15 @@ impl EventHandle {
     /// something to answer with instead of "no interactive UI attached". The UI
     /// leaves the slot empty and answers through its event loop, which owns the
     /// live session runtimes.
+    pub fn install_orchestration_services(
+        &self,
+        services: Arc<dyn crate::orchestration::OrchestrationServices>,
+    ) {
+        let _ = self.tx.try_send(Request::InstallOrchestrationServices(
+            crate::orchestration::OrchestrationServicesSlot(Some(services)),
+        ));
+    }
+
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
         let _ = self
             .tx

@@ -54,7 +54,7 @@ async fn forward_provider_events(
                 cache,
             },
         };
-        if event_tx.send(ae).is_err() {
+        if event_tx.send(ae).is_err() && event_tx.output().is_none() {
             break;
         }
     }
@@ -107,6 +107,9 @@ pub(crate) async fn stream_with_retry(
         provider.keys().map_or(1, |keys| keys.key_count()),
     );
     let mut attempt = 0;
+    if let Some(output) = event_tx.output() {
+        output.begin_text_attempt();
+    }
     loop {
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
@@ -126,6 +129,18 @@ pub(crate) async fn stream_with_retry(
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
+                if let Some(output) = event_tx.output() {
+                    let text = r
+                        .message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    output.reconcile_text_attempt(&text);
+                }
                 return Ok(r);
             }
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
@@ -218,6 +233,46 @@ mod tests {
         });
     }
 
+    #[test_case(false; "disconnected_sink")]
+    #[test_case(true; "full_sink")]
+    fn output_capture_drains_all_deltas_when_delivery_fails(full: bool) {
+        smol::block_on(async {
+            const DELTAS: [&str; 3] = ["first", "second", "third"];
+            const EXPECTED: &str = "firstsecondthird";
+            let ticket = crate::TurnTicket::new(crate::TurnId::generate(), std::sync::Arc::new(()));
+            let (event_tx, event_rx) = flume::bounded(1);
+            if full {
+                event_tx
+                    .send(crate::Envelope {
+                        event: AgentEvent::Nudge,
+                        subagent: None,
+                        run_id: 0,
+                    })
+                    .unwrap();
+            } else {
+                drop(event_rx);
+            }
+            let sender = EventSender::new(event_tx, 0).with_output(ticket.output());
+            let (provider_tx, provider_rx) = flume::unbounded();
+            for text in DELTAS {
+                provider_tx
+                    .send(ProviderEvent::TextDelta { text: text.into() })
+                    .unwrap();
+            }
+            drop(provider_tx);
+            let streamed = forward_provider_events(provider_rx, &sender).await;
+            ticket.resolve(crate::TurnOutcome::cancelled(
+                crate::AgentId::generate(),
+                ticket.turn_id(),
+                maki_providers::TokenUsage::default(),
+                0,
+                crate::TurnCancellationReason::User,
+            ));
+            assert_eq!(streamed, EXPECTED);
+            assert_eq!(ticket.peek_result().unwrap().text, EXPECTED);
+        });
+    }
+
     const POOL_KEYS: [&str; 3] = ["sk-first", "sk-second", "sk-third"];
     const FULL_POOL: usize = POOL_KEYS.len();
     const SINGLE_KEY: usize = 1;
@@ -232,6 +287,110 @@ mod tests {
             max_timeout_retries: 0,
             ..RetryPolicy::default()
         }
+    }
+
+    struct CapturedProvider {
+        attempt: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Provider for CapturedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let attempt = self
+                    .attempt
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                events
+                    .send(ProviderEvent::TextDelta {
+                        text: REJECTED_BODY.into(),
+                    })
+                    .unwrap();
+                if attempt == 0 {
+                    return Err(AgentError::api(RATE_LIMITED, REJECTED_BODY));
+                }
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![
+                            ContentBlock::Text {
+                                text: "accepted".into(),
+                            },
+                            ContentBlock::Text {
+                                text: " response".into(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    usage: maki_providers::TokenUsage::default(),
+                    stop_reason: Some(maki_providers::StopReason::EndTurn),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn retry_reconciliation_preserves_prior_messages_and_all_final_text_blocks() {
+        smol::block_on(async {
+            const PRIOR: &str = "prior message";
+            const EXPECTED: &str = "prior messageaccepted responseaccepted response";
+            let provider = CapturedProvider {
+                attempt: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let ticket = crate::TurnTicket::new(crate::TurnId::generate(), std::sync::Arc::new(()));
+            let (tx, _rx) = flume::unbounded();
+            let sender = EventSender::new(tx, 0).with_output(ticket.output());
+            sender
+                .send(AgentEvent::TextDelta { text: PRIOR.into() })
+                .unwrap();
+            let policy = RetryPolicy {
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+                max_retries: 1,
+                max_timeout_retries: 0,
+            };
+            let model = Model::from_spec("ollama/qwen3").unwrap();
+            for _ in 0..2 {
+                stream_with_retry(
+                    &provider,
+                    &model,
+                    &[],
+                    "",
+                    &json!([]),
+                    &sender,
+                    &CancelToken::none(),
+                    RequestOptions::default(),
+                    None,
+                    policy,
+                )
+                .await
+                .unwrap();
+            }
+            ticket.resolve(crate::TurnOutcome::completed(
+                crate::AgentId::generate(),
+                ticket.turn_id(),
+                maki_providers::TokenUsage::default(),
+                2,
+                crate::DoneReason::EndTurn,
+            ));
+            assert_eq!(ticket.peek_result().unwrap().text, EXPECTED);
+        });
     }
 
     struct PooledServer {
