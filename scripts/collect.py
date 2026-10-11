@@ -6,7 +6,7 @@ import csv
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 AGENTS = ("makima", "claude-code", "opencode")
@@ -70,7 +70,7 @@ _active_agent = ""
 
 
 def _ts():
-    return datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+    return datetime.now(UTC).astimezone().strftime("%H:%M:%S")
 
 
 def _log(msg):
@@ -411,7 +411,7 @@ def run(args):
         "agent": args.agent,
         "model": args.model,
         "tag": args.tag,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "session_id": None,
     }
 

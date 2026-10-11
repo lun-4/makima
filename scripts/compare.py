@@ -8,12 +8,12 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
 def _ts():
-    return datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+    return datetime.now(UTC).astimezone().strftime("%H:%M:%S")
 
 
 DEFAULT_AGENTS = ["claude-code", "makima", "opencode"]
@@ -131,7 +131,7 @@ def merge_csvs(tmp_paths, output):
 def main():
     args = parse_args()
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     output = Path(args.output) if args.output else Path(f"compare_{ts}.csv")
 
     print(
