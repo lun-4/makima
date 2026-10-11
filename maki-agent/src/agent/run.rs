@@ -34,6 +34,9 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+const MAX_COMPLETION_RECOVERY_ATTEMPTS: u32 = 2;
+const COMPLETION_RECOVERY_EXHAUSTED: &str =
+    "required output recovery exhausted before output was reported";
 const REQUIRED_OUTPUT_BUDGET_EXHAUSTED: &str =
     "turn budget exhausted before required output was reported";
 type CompletionCheck = Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
@@ -477,6 +480,7 @@ impl<'h> Agent<'h> {
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
+        let mut completion_recovery_attempts = 0;
         loop {
             if self.cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
@@ -506,6 +510,12 @@ impl<'h> Agent<'h> {
                         && let Some(message) =
                             check().map_err(|message| AgentError::Config { message })?
                     {
+                        if completion_recovery_attempts >= MAX_COMPLETION_RECOVERY_ATTEMPTS {
+                            return Err(AgentError::Config {
+                                message: COMPLETION_RECOVERY_EXHAUSTED.into(),
+                            });
+                        }
+                        completion_recovery_attempts += 1;
                         self.history.push(Message::user(message));
                         continue;
                     }
@@ -1197,6 +1207,55 @@ mod tests {
                         ))
                     .count(),
                 2
+            );
+        });
+    }
+
+    #[test_case(None; "unlimited_turn_budget")]
+    #[test_case(Some(10); "larger_turn_budget")]
+    fn completion_recovery_bounds_an_always_nudging_check(max_turns: Option<u32>) {
+        const NUDGE: &str = "report required output";
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(
+                MockProvider::new(
+                    (0..=MAX_COMPLETION_RECOVERY_ATTEMPTS)
+                        .map(|_| text_response(StopReason::EndTurn))
+                        .collect(),
+                ),
+                &mut history,
+            );
+            let mut agent = agent.with_completion_check(Arc::new(|| Ok(Some(NUDGE.into()))));
+            agent.config.max_turns = max_turns;
+            let turn_id = TurnId::generate();
+            let outcome = agent.run(turn_id, default_input()).await;
+            assert_eq!(outcome.turn_id(), turn_id);
+            assert_eq!(outcome.num_turns(), MAX_COMPLETION_RECOVERY_ATTEMPTS + 1);
+            assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+            drop(agent);
+            let outcomes: Vec<_> = events
+                .drain()
+                .filter_map(|event| match event.event {
+                    AgentEvent::TurnOutcome(outcome) => Some(outcome),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(outcomes.len(), 1);
+            assert!(matches!(
+                &outcomes[0],
+                TurnOutcome::Failed { failure, .. }
+                    if failure.diagnostic.contains(COMPLETION_RECOVERY_EXHAUSTED)
+            ));
+            assert_eq!(
+                history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::User)
+                        && message.content.iter().any(
+                            |block| matches!(block, ContentBlock::Text { text } if text == NUDGE)
+                        ))
+                    .count(),
+                MAX_COMPLETION_RECOVERY_ATTEMPTS as usize
             );
         });
     }
