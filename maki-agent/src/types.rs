@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
+use maki_domain::Post;
 use maki_providers::{
     AgentError, ContentBlock, ImageSource, Message, Role, StopReason, TokenUsage, add_cost,
 };
@@ -702,6 +703,9 @@ pub enum TurnCancellationReason {
     Closed,
     Shutdown,
     Interrupted,
+    /// A queued child-result delivery whose result the parent already
+    /// received through an exact wait.
+    Withdrawn,
 }
 
 /// The authoritative terminal result of an accepted turn.
@@ -971,6 +975,7 @@ pub enum AgentEvent {
     },
     /// A live child was permanently closed and no longer accepts input.
     SubagentClosed,
+    Post(Post),
     ToolSnapshot {
         id: String,
         snapshot: BufferSnapshot,
@@ -1331,17 +1336,51 @@ pub struct SubagentInfo {
 pub struct EventSender {
     tx: Sender<Envelope>,
     run_id: u64,
+    output: Option<crate::TurnOutput>,
 }
 
 impl EventSender {
     pub fn new(tx: Sender<Envelope>, run_id: u64) -> Self {
-        Self { tx, run_id }
+        Self {
+            tx,
+            run_id,
+            output: None,
+        }
+    }
+
+    pub fn with_output(mut self, output: crate::TurnOutput) -> Self {
+        self.output = Some(output);
+        self
+    }
+
+    pub fn without_output(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            run_id: self.run_id,
+            output: None,
+        }
+    }
+
+    pub fn output(&self) -> Option<&crate::TurnOutput> {
+        self.output.as_ref()
+    }
+
+    fn capture(&self, event: &AgentEvent) {
+        if let Some(output) = &self.output {
+            match event {
+                AgentEvent::TextDelta { text } => output.append_text(text),
+                AgentEvent::Retry { .. } => output.reset_text_attempt(),
+                _ => {}
+            }
+        }
     }
 
     pub fn send(&self, event: impl Into<AgentEvent>) -> Result<(), AgentError> {
+        let event = event.into();
+        self.capture(&event);
         self.tx
             .try_send(Envelope {
-                event: event.into(),
+                event,
                 subagent: None,
                 run_id: self.run_id,
             })
@@ -1353,8 +1392,10 @@ impl EventSender {
     }
 
     pub fn try_send(&self, event: impl Into<AgentEvent>) {
+        let event = event.into();
+        self.capture(&event);
         let _ = self.tx.try_send(Envelope {
-            event: event.into(),
+            event,
             subagent: None,
             run_id: self.run_id,
         });
@@ -1374,6 +1415,7 @@ impl EventSender {
         Self {
             tx: self.tx.clone(),
             run_id,
+            output: self.output.clone(),
         }
     }
 }
@@ -1470,6 +1512,113 @@ impl SessionEvents {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test_case(false; "send")]
+    #[test_case(true; "try_send")]
+    fn output_capture_is_synchronous_and_frozen_without_a_receiver(best_effort: bool) {
+        const FIRST: &str = "first";
+        const FAILED: &str = "discarded";
+        const SECOND: &str = "second";
+        const EXPECTED: &str = SECOND;
+        let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+        let (tx, rx) = flume::unbounded();
+        drop(rx);
+        let sender = EventSender::new(tx, 0).with_output(ticket.output());
+        let emit = |event| {
+            if best_effort {
+                sender.try_send(event);
+            } else {
+                assert!(matches!(sender.send(event), Err(AgentError::Channel)));
+            }
+        };
+        sender.output().unwrap().begin_text_attempt();
+        emit(AgentEvent::TextDelta { text: FIRST.into() });
+        sender.output().unwrap().begin_text_attempt();
+        emit(AgentEvent::TextDelta {
+            text: FAILED.into(),
+        });
+        emit(AgentEvent::Retry {
+            attempt: 1,
+            message: FAILED.into(),
+            delay_ms: 0,
+        });
+        emit(AgentEvent::TextDelta {
+            text: SECOND.into(),
+        });
+        ticket.resolve(TurnOutcome::cancelled(
+            AgentId::generate(),
+            ticket.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::Closed,
+        ));
+        emit(AgentEvent::TextDelta {
+            text: FAILED.into(),
+        });
+        emit(AgentEvent::Retry {
+            attempt: 2,
+            message: FAILED.into(),
+            delay_ms: 0,
+        });
+        assert_eq!(ticket.peek_result().unwrap().text, EXPECTED);
+    }
+
+    #[test_case(false; "full_channel")]
+    #[test_case(true; "disconnected_channel")]
+    fn output_capture_preserves_channel_errors_in_derived_senders(disconnected: bool) {
+        const TEXT: &str = "captured despite channel failure";
+        const RUN_ID: u64 = 7;
+        let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+        let (tx, rx) = flume::bounded(1);
+        let sender = EventSender::new(tx, 0).with_output(ticket.output());
+        if disconnected {
+            drop(rx);
+        } else {
+            sender.send(AgentEvent::Nudge).unwrap();
+        }
+        let derived = sender.with_run_id(RUN_ID);
+        assert!(matches!(
+            derived.send(AgentEvent::TextDelta { text: TEXT.into() }),
+            Err(AgentError::Channel)
+        ));
+        assert!(matches!(
+            derived.without_output().send(AgentEvent::Nudge),
+            Err(AgentError::Channel)
+        ));
+        ticket.resolve(TurnOutcome::cancelled(
+            AgentId::generate(),
+            ticket.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::Closed,
+        ));
+        assert_eq!(ticket.peek_result().unwrap().text, TEXT);
+    }
+
+    #[test]
+    fn relayed_envelopes_do_not_contaminate_turn_output() {
+        const RELAYED: &str = "relayed child text";
+        let ticket = crate::TurnTicket::new(TurnId::generate(), Arc::new(()));
+        let (tx, _rx) = flume::unbounded();
+        let sender = EventSender::new(tx, 0).with_output(ticket.output());
+        sender
+            .send_envelope(Envelope {
+                event: AgentEvent::TextDelta {
+                    text: RELAYED.into(),
+                },
+                subagent: None,
+                run_id: 1,
+            })
+            .unwrap();
+        ticket.resolve(TurnOutcome::cancelled(
+            AgentId::generate(),
+            ticket.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::User,
+        ));
+        assert!(ticket.peek_result().unwrap().text.is_empty());
+    }
 
     #[test]
     fn test_session_events_guard_emits_stream_closed_on_drop() {

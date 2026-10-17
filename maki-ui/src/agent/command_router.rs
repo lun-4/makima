@@ -2,12 +2,11 @@ use std::sync::Arc;
 
 use maki_agent::{AgentId, AgentManagerHandle, CancelMap, CancelTrigger, TurnCancellationReason};
 
-use super::AgentCommand;
-use super::shared_queue::correlation;
+use super::{AgentCommand, shared_queue::correlation};
 
 /// Routes commands from the UI to the actor's cancellation APIs.
 ///
-/// `AgentCommand::Cancel { run_id }` permanently closes managed descendants and
+/// `AgentCommand::Cancel` permanently closes managed descendants and
 /// cancels only the matching root run, leaving the root actor reusable.
 /// `CancelAll` cancels the manager's entire root subtree, compatibility
 /// subagents outside that graph, and startup so an early command aborts MCP
@@ -26,13 +25,16 @@ pub(super) fn spawn_command_router(
     smol::spawn(async move {
         while let Ok(cmd) = cmd_rx.recv_async().await {
             match cmd {
-                AgentCommand::Cancel { run_id } => {
-                    let correlation = correlation(run_id);
-                    let _ = manager.cancel_correlation(
-                        root_id,
-                        &correlation,
-                        TurnCancellationReason::User,
-                    );
+                AgentCommand::Cancel { turn_id, run_id } => {
+                    if let Some(turn_id) = turn_id {
+                        let _ = manager.cancel_turn(root_id, turn_id, TurnCancellationReason::User);
+                    } else {
+                        let _ = manager.cancel_correlation(
+                            root_id,
+                            &correlation(run_id),
+                            TurnCancellationReason::User,
+                        );
+                    }
                 }
                 AgentCommand::CancelAll => {
                     if let Some(trigger) = init_trigger.take() {
@@ -235,8 +237,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cancel_closes_managed_descendants_and_preserves_root_reuse() {
+    #[test_case::test_case(true; "nominal_turn")]
+    #[test_case::test_case(false; "pre_admit_correlation_fallback")]
+    fn cancel_closes_managed_descendants_and_preserves_root_reuse(nominal: bool) {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let (current_tx, current_rx) = flume::bounded(2);
@@ -291,7 +294,10 @@ mod tests {
                 init_trigger,
             );
             cmd_tx
-                .send_async(AgentCommand::Cancel { run_id: 1 })
+                .send_async(AgentCommand::Cancel {
+                    turn_id: nominal.then(|| root_ticket.turn_id()),
+                    run_id: 1,
+                })
                 .await
                 .unwrap();
 
@@ -311,7 +317,7 @@ mod tests {
             );
             assert!(matches!(
                 manager.actor(child.id()),
-                Err(ManagerError::NonLiveAgent(id)) if id == child.id()
+                Err(ManagerError::UnknownAgent(id)) if id == child.id()
             ));
             assert!(matches!(
                 child_actor.admit_turn(input(), None, "retained-task".into()),

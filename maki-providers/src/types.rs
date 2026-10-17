@@ -235,6 +235,7 @@ pub async fn adapt_images_for_model<'a>(
             content,
             display_text: message.display_text.clone(),
             kind: message.kind,
+            observation_source: message.observation_source.clone(),
         });
     }
     Cow::Owned(adapted)
@@ -325,6 +326,12 @@ impl ContentBlock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObservationSource {
+    ChildResult { agent_id: String, turn_id: String },
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -335,6 +342,8 @@ pub struct Message {
     /// load unchanged.
     #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
     pub kind: MessageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_source: Option<ObservationSource>,
 }
 
 impl Message {

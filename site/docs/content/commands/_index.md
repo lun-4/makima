@@ -21,7 +21,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/clear` | Alias for `/new` | none |  | TUI only |
 | `/help` | Show keybindings | none |  | TUI only |
 | `/queue` | Remove items from queue | none |  | TUI only |
-| `/model` | Switch model | typed | <model> | all |
+| `/model` | Switch model | typed | [spec] [thinking=value] [fast=true\|false] | all |
 | `/theme` | Switch color theme | typed | <theme> | TUI only |
 | `/mcp` | Configure MCP servers | none |  | TUI only |
 | `/login` | Authenticate with an LLM provider | none |  | TUI only |
@@ -29,7 +29,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/btw` | Ask a quick question (no tools, no history pollution) | raw (required) | <question> | all |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) | none |  | all |
 | `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) | none |  | all |
-| `/workflow` | Toggle workflow mode (task callable inside code_execution) | none |  | all |
+| `/workflow` | Toggle workflow mode (task tools callable inside code_execution) | none |  | all |
 | `/exit` | Exit the application | none |  | TUI only |
 | `/reload` | Reload plugins and config | none |  | TUI only |
 | `/trust` | Trust this folder and load its shared project config | none |  | TUI only |
@@ -65,6 +65,7 @@ Completion callbacks receive the typed argument name as `ctx.argument`, its type
 `/model` and `/theme` also accept an argument. While you type it, the palette lists the possible values (model specs, theme names), and submitting resolves the argument without opening the picker:
 
 - **`/model <spec>`**: a full `provider/id` spec is used as-is, even if it is not in the discovered list. A fragment is fuzzy-matched against the discovered specs, and a unique match switches to it. Zero or multiple matches flash a note and keep the current model.
+- **`/model [spec] [thinking=value] [fast=true|false]`**: options change the thinking level and fast mode together with the spec, as one change to the selected agent. Options without a spec keep the current model, so `/model thinking=high` only changes thinking. The same options also fit in braces after the spec, as in `/model openai/gpt-5{thinking=high,fast=true}`; braces are understood by `/model` only. Each option may appear once, and unknown options are rejected. Asking for fast mode or thinking on a model without them is rejected; values carried over from the previous model are adjusted to what the new model supports.
 - **`/theme <name>`**: the exact name is applied and persisted. A fragment that matches one theme name (like `toky` for `tokyonight`) is resolved the same way; unknown or ambiguous names flash a note and leave the current theme. With no argument, the picker opens and previews each theme as you navigate.
 
 ## Sessions
@@ -76,7 +77,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`.
 - **`/thinking`**: bare opens the selector; an optional setting applies and persists the default. Completion lists the finite options supplied by the host. Positive numeric token budgets are accepted as arguments but are not suggested. Config: `always_thinking`.
 - **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
-- **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
+- **`/workflow`**: let `code_execution` call the task tools (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.

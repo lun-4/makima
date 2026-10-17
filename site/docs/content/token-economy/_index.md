@@ -30,12 +30,12 @@ read main.rs                 index main.rs
                              + read offset=812 limit=40
 ```
 
-**Subagents as garbage collectors.** A `task` subagent gets its own throwaway context. It can grep, read, and hit dead ends as much as it wants; only its final summary returns to your conversation. The mess is collected when it exits. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
+**Subagents as garbage collectors.** A subagent started with `task_spawn` gets its own throwaway context. It can grep, read, and hit dead ends as much as it wants; only its final summary returns to your conversation. The mess is collected when it exits. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
 
 ```
 main context                subagent context (discarded)
 ────────────                ────────────────────────────
-task("find auth") ───────►  glob, grep ×6, read ×9, ...
+task_spawn("find auth") ─►  glob, grep ×6, read ×9, ...
                   ◄───────  "JWT middleware, auth.rs:120"
 one line stays              ~20k tokens never seen
 ```
@@ -58,7 +58,7 @@ MCP results go through the same limit only when a session has a place to save th
 
 Fuzzy `edit` and `multi_edit` matches require full coverage of long lines. Nonblank long lines tolerate indentation changes. A long whitespace-only line requires a byte-identical line in `old_string` for each occurrence. An empty, shorter, or differently spaced blank line does not cover it. Exact substring edits remain available.
 
-**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
+**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 
 Lua tool handlers return raw `llm_output` and `output_limits` in a result table or through `ctx:finish`. Output limits apply after the terminal reply leaves Lua. See the [tool API](/docs/lua-api/#maki-api-register_tool).
 

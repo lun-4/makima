@@ -219,6 +219,11 @@ pub fn generate() -> color_eyre::Result<String> {
     .unwrap();
     writeln!(
         out,
+        "- **`/model [spec] [thinking=value] [fast=true|false]`**: options change the thinking level and fast mode together with the spec, as one change to the selected agent. Options without a spec keep the current model, so `/model thinking=high` only changes thinking. The same options also fit in braces after the spec, as in `/model openai/gpt-5{{thinking=high,fast=true}}`; braces are understood by `/model` only. Each option may appear once, and unknown options are rejected. Asking for fast mode or thinking on a model without them is rejected; values carried over from the previous model are adjusted to what the new model supports."
+    )
+    .unwrap();
+    writeln!(
+        out,
         "- **`/theme <name>`**: the exact name is applied and persisted. A fragment that matches one theme name (like `toky` for `tokyonight`) is resolved the same way; unknown or ambiguous names flash a note and leave the current theme. With no argument, the picker opens and previews each theme as you navigate."
     )
     .unwrap();
@@ -252,7 +257,7 @@ pub fn generate() -> color_eyre::Result<String> {
     .unwrap();
     writeln!(
         out,
-        "- **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`."
+        "- **`/workflow`**: let `code_execution` call the task tools (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`."
     )
     .unwrap();
     writeln!(

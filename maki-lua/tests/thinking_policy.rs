@@ -8,7 +8,6 @@
 //! the model actually received.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
@@ -32,16 +31,17 @@ maki.api.register_tool({
     local sess, err = maki.agent.session(ctx, {
       name = "probe",
       inherit_provider = true,
-      thinking = input.thinking,
+      model = { thinking = input.thinking },
     })
     if not sess then
       return { llm_output = "spawn failed: " .. tostring(err), is_error = true }
     end
-    local _, serr = sess:send("hi")
+    local result, serr = sess:prompt("hi")
+    sess:close()
     if serr then
-      return { llm_output = "send failed: " .. tostring(serr), is_error = true }
+      return { llm_output = "prompt failed: " .. tostring(serr), is_error = true }
     end
-    return maki.json.encode({ ok = true })
+    return maki.json.encode({ ok = result ~= nil })
   end,
 })
 "#;
@@ -53,17 +53,14 @@ fn load_thinking_host() -> (Arc<ToolRegistry>, PluginHost) {
     (reg, host)
 }
 
-/// Drive the executor until the canned provider records a request, then return
-/// the thinking config it saw.
 fn wait_capture(provider: &CannedProvider) -> ThinkingConfig {
-    for _ in 0..400 {
-        let caps = provider.captured_thinking();
-        if !caps.is_empty() {
-            return caps[0];
-        }
-        smol::block_on(async { smol::Timer::after(Duration::from_millis(5)).await });
-    }
-    panic!("canned provider never received a request");
+    let captured = provider.captured_thinking();
+    assert_eq!(
+        captured.len(),
+        1,
+        "prompt must complete one provider request"
+    );
+    captured[0]
 }
 
 #[test_case::test_case(json!("off"), ThinkingConfig::Off ; "off")]

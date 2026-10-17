@@ -7,14 +7,22 @@
 //!    the reply back to the main agent (SubagentHistory must be emitted, not
 //!    only on explicit close).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use maki_agent::AgentEvent;
+use maki_agent::tools::ToolContext;
 use maki_agent::tools::ToolRegistry;
-use maki_lua::PluginHost;
+use maki_agent::{
+    ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentRef, BackendResult,
+    ControlWork, History, TurnContext, WorkKind,
+};
+use maki_commands::CommandInvocation;
+use maki_lua::orchestration::{OrchestrationServices, TrustedTarget};
+use maki_lua::{EventHandle, PluginHost};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
     AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, Role, StreamResponse,
@@ -23,7 +31,9 @@ use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 mod common;
-use common::{ctx_with_canned_provider, ctx_with_provider, exec_tool, production_like_ctx};
+use common::{
+    ctx_with_canned_provider, ctx_with_provider, exec_tool, production_like_ctx, with_request_tools,
+};
 
 const PROVIDER_FAILURE: &str = "deterministic provider failure";
 const RECOVERED_REPLY: &str = "recovered on the same session";
@@ -32,15 +42,36 @@ const SECOND_REPLY: &str = "VIOLET";
 const TURN_TIMEOUT: Duration = Duration::from_secs(2);
 
 const PROBE_SRC: &str = r#"
-session_holder = { sess = nil }
+local session_holder = { sess = nil }
+local results = {}
+
+local function register_probe(spec)
+  maki.api.register_command({
+    name = "/" .. spec.name,
+    tui_only = false,
+    arguments = { raw = true, required = true },
+    handler = function(opts, ctx)
+      local input = assert(maki.json.decode(opts.args))
+      results[input.request_id] = spec.handler(input, ctx)
+    end,
+  })
+end
 
 maki.api.register_tool({
+  name = "probe_result",
+  description = "read a completed probe command result",
+  schema = { type = "object", properties = { request_id = { type = "string" } }, required = { "request_id" } },
+  handler = function(input)
+    local result = assert(results[input.request_id], "missing probe result")
+    results[input.request_id] = nil
+    return result
+  end,
+})
+
+register_probe({
   name = "probe_spawn",
-  description = "create a subagent session without running it",
-  schema = { type = "object", properties = {}, additionalProperties = false },
-  audiences = { "main" },
   handler = function(input, ctx)
-    local sess, err = maki.agent.session(ctx, { name = "probe" })
+    local sess, err = maki.agent.session(ctx, { name = "probe", inherit_provider = true })
     if not sess then
       return { llm_output = "spawn failed: " .. err, is_error = true }
     end
@@ -49,21 +80,15 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+register_probe({
   name = "probe_status",
-  description = "read the subagent session's status",
-  schema = { type = "object", properties = {}, additionalProperties = false },
-  audiences = { "main" },
   handler = function()
     return maki.json.encode(session_holder.sess:status())
   end,
 })
 
-maki.api.register_tool({
+register_probe({
   name = "probe_send",
-  description = "send a message to the subagent session",
-  schema = { type = "object", properties = { message = { type = "string" } }, additionalProperties = false },
-  audiences = { "main" },
   handler = function(input)
     local _, err = session_holder.sess:send(input.message)
     if err then
@@ -73,18 +98,8 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+register_probe({
   name = "probe_prompt",
-  description = "run one blocking turn on the subagent session",
-  schema = {
-    type = "object",
-    properties = {
-      message = { type = "string" },
-      timeout = { type = "integer" },
-    },
-    additionalProperties = false,
-  },
-  audiences = { "main" },
   handler = function(input)
     local opts = input.timeout and { timeout = input.timeout } or nil
     local result, err = session_holder.sess:prompt(input.message, opts)
@@ -93,11 +108,101 @@ maki.api.register_tool({
 })
 "#;
 
-fn load_probe_host() -> (Arc<ToolRegistry>, PluginHost) {
+struct ProbeServices(TrustedTarget);
+
+impl OrchestrationServices for ProbeServices {
+    fn resolve_target(
+        &self,
+        _: Option<&CommandInvocation>,
+    ) -> Result<Option<TrustedTarget>, String> {
+        Ok(Some(self.0.clone()))
+    }
+
+    fn template(&self, _: &AgentRef) -> Result<ToolContext, String> {
+        Ok(self.0.template.clone())
+    }
+
+    fn register_target(&self, _: TrustedTarget) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct IdleRoot;
+
+impl ActorBackend for IdleRoot {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+fn load_probe_host(ctx: &ToolContext) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("probe", PROBE_SRC).unwrap();
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let root = manager
+        .create_root(Vec::new(), None, Box::new(IdleRoot))
+        .unwrap();
+    let mut template = with_request_tools(&reg, ctx);
+    template.registry = Arc::clone(&reg);
+    host.event_handle()
+        .install_orchestration_services(Arc::new(ProbeServices(TrustedTarget {
+            target: root,
+            template,
+        })));
+    host.wait_for_worker_barrier_for_test();
     (reg, host)
+}
+
+fn exec_probe(
+    reg: &ToolRegistry,
+    handle: &EventHandle,
+    ctx: &ToolContext,
+    name: &str,
+    mut input: Value,
+) -> Result<Value, String> {
+    static NEXT_REQUEST: AtomicUsize = AtomicUsize::new(0);
+    let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed).to_string();
+    input["request_id"] = json!(request_id);
+    handle
+        .run_command_for_test(
+            Arc::from("probe"),
+            Arc::from(format!("/{name}")),
+            input.to_string(),
+            0,
+        )
+        .recv_timeout(TURN_TIMEOUT)
+        .map_err(|error| format!("probe command did not resolve: {error}"))??;
+    exec_tool(
+        reg,
+        ctx,
+        "probe_result",
+        json!({ "request_id": request_id }),
+    )
 }
 
 struct FailOnceProvider {
@@ -255,7 +360,6 @@ impl Provider for PendingProvider {
 
 #[test]
 fn async_sends_are_fifo_and_surface_each_history_snapshot() {
-    let (reg, _host) = load_probe_host();
     let (entered_tx, entered_rx) = flume::bounded(2);
     let (release_tx, release_rx) = flume::unbounded();
     let provider = Arc::new(GatedProvider {
@@ -265,18 +369,36 @@ fn async_sends_are_fifo_and_surface_each_history_snapshot() {
         requests: Mutex::new(Vec::new()),
     });
     let (ctx, parent_rx, _run_trigger) = ctx_with_provider(Arc::clone(&provider));
-    let spawn = exec_tool(&reg, &ctx, "probe_spawn", json!({})).unwrap();
+    let (reg, host) = load_probe_host(&ctx);
+    let handle = host.event_handle();
+    let spawn = exec_probe(&reg, &handle, &ctx, "probe_spawn", json!({})).unwrap();
     let first = {
         let reg = Arc::clone(&reg);
         let ctx = ctx.clone();
-        std::thread::spawn(move || exec_tool(&reg, &ctx, "probe_send", json!({"message": "first"})))
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            exec_probe(
+                &reg,
+                &handle,
+                &ctx,
+                "probe_send",
+                json!({"message": "first"}),
+            )
+        })
     };
     assert_eq!(entered_rx.recv_timeout(TURN_TIMEOUT).unwrap(), 0);
     let second = {
         let reg = Arc::clone(&reg);
         let ctx = ctx.clone();
+        let handle = handle.clone();
         std::thread::spawn(move || {
-            exec_tool(&reg, &ctx, "probe_send", json!({"message": "second"}))
+            exec_probe(
+                &reg,
+                &handle,
+                &ctx,
+                "probe_send",
+                json!({"message": "second"}),
+            )
         })
     };
     release_tx.send(()).unwrap();
@@ -323,19 +445,22 @@ fn async_sends_are_fifo_and_surface_each_history_snapshot() {
 
 #[test]
 fn child_cancellation_keeps_session_open_for_recovery() {
-    let (reg, _host) = load_probe_host();
     let (entered_tx, entered_rx) = flume::bounded(1);
     let provider = Arc::new(CancelThenRecoverProvider {
         calls: AtomicUsize::new(0),
         entered: entered_tx,
     });
     let (ctx, parent_rx, _run_trigger) = ctx_with_provider(Arc::clone(&provider));
-    exec_tool(&reg, &ctx, "probe_spawn", json!({})).unwrap();
+    let (reg, host) = load_probe_host(&ctx);
+    let handle = host.event_handle();
+    exec_probe(&reg, &handle, &ctx, "probe_spawn", json!({})).unwrap();
     let reg_for_prompt = Arc::clone(&reg);
     let ctx_for_prompt = ctx.clone();
+    let handle_for_prompt = handle.clone();
     let prompt = std::thread::spawn(move || {
-        exec_tool(
+        exec_probe(
             &reg_for_prompt,
+            &handle_for_prompt,
             &ctx_for_prompt,
             "probe_prompt",
             json!({"message": "cancel me"}),
@@ -349,7 +474,14 @@ fn child_cancellation_keeps_session_open_for_recovery() {
         }
     };
     cancel.cancel();
-    exec_tool(&reg, &ctx, "probe_send", json!({"message": "recover"})).unwrap();
+    exec_probe(
+        &reg,
+        &handle,
+        &ctx,
+        "probe_send",
+        json!({"message": "recover"}),
+    )
+    .unwrap();
 
     let cancelled = prompt.join().unwrap().unwrap();
     assert!(
@@ -383,12 +515,13 @@ fn child_cancellation_keeps_session_open_for_recovery() {
 /// `status()` should report it as `running`/`done`, never `closed`.
 #[test]
 fn subagent_outlives_the_run_that_spawned_it() {
-    let (reg, _host) = load_probe_host();
     let (ctx, run_trigger) = production_like_ctx();
+    let (reg, host) = load_probe_host(&ctx);
+    let handle = host.event_handle();
 
-    exec_tool(&reg, &ctx, "probe_spawn", json!({})).expect("spawn failed");
+    exec_probe(&reg, &handle, &ctx, "probe_spawn", json!({})).expect("spawn failed");
 
-    let before = exec_tool(&reg, &ctx, "probe_status", json!({})).unwrap();
+    let before = exec_probe(&reg, &handle, &ctx, "probe_status", json!({})).unwrap();
     eprintln!("status (before run end) -> {before}");
     assert_ne!(
         before["status"], "closed",
@@ -399,7 +532,7 @@ fn subagent_outlives_the_run_that_spawned_it() {
 
     let mut status = Value::Null;
     for _ in 0..20 {
-        status = exec_tool(&reg, &ctx, "probe_status", json!({})).unwrap();
+        status = exec_probe(&reg, &handle, &ctx, "probe_status", json!({})).unwrap();
         eprintln!("status (after run end) -> {status}");
         if status["status"] == "done" || status["status"] == "closed" {
             break;
@@ -413,16 +546,18 @@ fn subagent_outlives_the_run_that_spawned_it() {
 
 #[test]
 fn failed_subagent_turn_resolves_and_same_session_recovers() {
-    let (reg, _host) = load_probe_host();
     let provider = Arc::new(FailOnceProvider {
         calls: AtomicUsize::new(0),
     });
     let (ctx, parent_rx, _run_trigger) = ctx_with_provider(provider);
+    let (reg, host) = load_probe_host(&ctx);
+    let handle = host.event_handle();
 
-    exec_tool(&reg, &ctx, "probe_spawn", json!({})).expect("spawn failed");
+    exec_probe(&reg, &handle, &ctx, "probe_spawn", json!({})).expect("spawn failed");
 
-    let failed = exec_tool(
+    let failed = exec_probe(
         &reg,
+        &handle,
         &ctx,
         "probe_prompt",
         json!({ "message": "fail this turn" }),
@@ -435,7 +570,7 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
     // wait for it to settle instead of racing it.
     let deadline = Instant::now() + TURN_TIMEOUT;
     let status = loop {
-        let status = exec_tool(&reg, &ctx, "probe_status", json!({})).unwrap();
+        let status = exec_probe(&reg, &handle, &ctx, "probe_status", json!({})).unwrap();
         if status["status"] == json!("done") {
             break status;
         }
@@ -457,8 +592,9 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
         }
     }
 
-    let recovered = exec_tool(
+    let recovered = exec_probe(
         &reg,
+        &handle,
         &ctx,
         "probe_prompt",
         json!({ "message": "reuse the same session" }),
@@ -470,14 +606,16 @@ fn failed_subagent_turn_resolves_and_same_session_recovers() {
 
 #[test]
 fn prompt_timeout_cancels_in_flight_provider_request() {
-    let (reg, _host) = load_probe_host();
     let (dropped_tx, dropped_rx) = flume::bounded(1);
     let provider = Arc::new(PendingProvider { dropped_tx });
     let (ctx, _parent_rx, _run_trigger) = ctx_with_provider(provider);
+    let (reg, host) = load_probe_host(&ctx);
+    let handle = host.event_handle();
 
-    exec_tool(&reg, &ctx, "probe_spawn", json!({})).expect("spawn failed");
-    let result = exec_tool(
+    exec_probe(&reg, &handle, &ctx, "probe_spawn", json!({})).expect("spawn failed");
+    let result = exec_probe(
         &reg,
+        &handle,
         &ctx,
         "probe_prompt",
         json!({ "message": "wait forever", "timeout": 1 }),
@@ -496,12 +634,14 @@ fn prompt_timeout_cancels_in_flight_provider_request() {
 /// close, so a completed async subagent's reply never reached the main agent.
 #[test]
 fn subagent_completion_surfaces_reply_to_parent() {
-    let (reg, _host) = load_probe_host();
     let (ctx, parent_rx, _run_trigger) = ctx_with_canned_provider();
+    let (reg, host) = load_probe_host(&ctx);
+    let handle = host.event_handle();
 
-    exec_tool(&reg, &ctx, "probe_spawn", json!({})).expect("spawn failed");
-    exec_tool(
+    exec_probe(&reg, &handle, &ctx, "probe_spawn", json!({})).expect("spawn failed");
+    exec_probe(
         &reg,
+        &handle,
         &ctx,
         "probe_send",
         json!({ "message": "do the thing" }),

@@ -11,7 +11,10 @@ use std::time::Duration;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
+use crate::agent_errors::DELEGATED_REGISTRATION;
+use crate::api::timer::require_trusted_authority;
 use crate::api::util::command::{UiAction, ui_send};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::runtime::{DeferQueue, DeferredCallback};
 
 /// The one `maki.notify` override for the whole process. `create_maki_global`
@@ -31,11 +34,13 @@ pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>
 /// You get back a handle. Its `:stop()` cancels a callback that has not
 /// fired yet, which is how you debounce: schedule, then stop and
 /// reschedule on every new event. An error raised by the callback is
-/// logged and dropped, since nobody is waiting for a result.
+/// logged and dropped, since nobody is waiting for a result. Delegated tool
+/// tasks, including their async children, cannot schedule deferred callbacks.
 ///
 /// @param callback function Called with no arguments.
 /// @param ms integer Delay in milliseconds. Zero fires on the next tick.
-/// @return (maki.Timer) Handle with `:stop()` to cancel before it fires.
+/// @return maki.Timer|nil Handle with `:stop()` to cancel before it fires.
+/// @return string|nil Error on failure.
 /// @example
 /// -- A toast that dismisses itself 4 seconds later:
 /// local buf = maki.ui.buf({ scratch = true })
@@ -52,11 +57,18 @@ pub(crate) struct NotifyHandler(pub(crate) Mutex<Option<(Arc<str>, RegistryKey)>
 ///   pending = maki.defer_fn(repaint, 500)
 /// end
 #[lua_fn]
-fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> LuaResult<Timer> {
-    let queue = lua
-        .app_data_ref::<DeferQueue>()
-        .ok_or_else(|| mlua::Error::runtime("defer queue not initialized"))?;
-    let func = lua.create_registry_value(callback)?;
+fn defer_fn(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    callback: Function,
+    ms: u64,
+) -> LuaResult<Pair<Timer>> {
+    try_pair!(require_trusted_authority(lua));
+    let queue = try_pair!(
+        lua.app_data_ref::<DeferQueue>()
+            .ok_or("defer queue not initialized")
+    );
+    let func = try_pair!(lua.create_registry_value(callback));
     let cancel = Arc::new(AtomicBool::new(false));
     if let Err(rejected) = queue.push(DeferredCallback {
         func,
@@ -66,9 +78,9 @@ fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> 
     }) {
         // Reclaim the registry slot, the runtime never got the callback.
         let _ = lua.remove_registry_value(rejected.func);
-        return Err(mlua::Error::runtime("defer queue closed"));
+        return Ok(err_pair("defer queue closed"));
     }
-    Ok(Timer { cancel })
+    Ok((Some(Timer { cancel }), None))
 }
 
 /// Handle returned by `maki.defer_fn`. The runtime reads the flag once the
@@ -124,16 +136,24 @@ fn notify(
     level: Option<String>,
     opts: Option<Table>,
 ) -> LuaResult<()> {
+    crate::runtime::validate_plugin_effect(lua).map_err(mlua::Error::runtime)?;
     let title = match &opts {
         Some(t) => t.get::<Option<String>>("title")?,
         None => None,
     };
     let handler_fn = lua.app_data_ref::<NotifyHandler>().and_then(|slot| {
         let guard = locked(&slot);
-        let (_, key) = guard.as_ref()?;
-        lua.registry_value::<Function>(key).ok()
+        let (plugin, key) = guard.as_ref()?;
+        Some((plugin.clone(), lua.registry_value::<Function>(key).ok()?))
     });
-    if let Some(func) = handler_fn {
+    if let Some((owner_plugin, func)) = handler_fn {
+        // Trusted plugin code installed the handler, so it keeps that
+        // authority when a delegated tool notifies; its own timers must work.
+        let _scope = crate::runtime::TaskScope::detached(lua);
+        let owner = crate::orchestration::plugin_authority(lua, owner_plugin.clone());
+        if owner.is_alive() {
+            crate::runtime::bind_plugin_owner(lua, owner_plugin, owner)?;
+        }
         // A broken override must not swallow the message, so fall through.
         match func.call::<()>((msg.clone(), level.clone(), opts)) {
             Ok(()) => return Ok(()),
@@ -163,21 +183,29 @@ fn notify(
 /// default.
 ///
 /// @param handler function|nil Handler `function(msg, level?, opts?)`, or nil.
-/// @return
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// local Toast = require("maki.toast")
 /// maki.set_notify_handler(function(msg, level, opts)
 ///   Toast.show(msg, { title = opts and opts.title, level = level })
 /// end)
 #[lua_fn]
-fn set_notify_handler(lua: &Lua, #[ctx] plugin: Arc<str>, handler: Value) -> LuaResult<()> {
-    install_notify_handler(lua, plugin, handler)
+fn set_notify_handler(lua: &Lua, #[ctx] plugin: Arc<str>, handler: Value) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    install_notify_handler(lua, plugin, handler)?;
+    Ok((Some(true), None))
 }
 
 /// Install a `maki.notify` override into the shared slot. Reached both by
 /// `set_notify_handler` and by the `maki.notify = fn` sugar that the `maki`
 /// global's `__newindex` routes here.
+/// The assignment form can only report errors by raising, so a delegated
+/// caller gets a raised error here rather than a `(nil, err)` pair.
 pub(crate) fn install_notify_handler(lua: &Lua, plugin: Arc<str>, handler: Value) -> LuaResult<()> {
+    crate::runtime::deny_delegated_registration(lua)?;
     // Validate the argument before touching the slot: a wrong-typed
     // handler must not silently clear a previously installed one.
     let new_key = match handler {
@@ -343,6 +371,25 @@ mod tests {
         clear_notify_handler(&lua, "maki_b");
         lua.load(r#"maki.notify("back to flash")"#).exec().unwrap();
         assert_eq!(flashed(&rx), "back to flash");
+    }
+
+    #[test]
+    fn notify_handler_keeps_installer_authority_in_delegated_tools() {
+        let lua = Lua::new();
+        let (tx, _rx) = flume::unbounded();
+        install(&lua, Some(tx), "maki");
+        let delegated = lua
+            .create_function(|lua, ()| Ok(crate::runtime::in_delegated_tool(lua)))
+            .unwrap();
+        lua.globals().set("delegated", delegated).unwrap();
+        lua.load(r#"maki.set_notify_handler(function() seen = delegated() end)"#)
+            .exec()
+            .unwrap();
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        crate::runtime::lock_cell(scope.handle()).delegated_tool = Some(Default::default());
+        lua.load(r#"maki.notify("from a tool")"#).exec().unwrap();
+        assert!(!lua.globals().get::<bool>("seen").unwrap());
+        assert!(crate::runtime::in_delegated_tool(&lua));
     }
 
     #[test]

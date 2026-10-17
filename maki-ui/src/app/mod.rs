@@ -62,13 +62,11 @@ use crate::text_buffer::is_newline_key;
 use arc_swap::{ArcSwap, ArcSwapOption};
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
-    SharedMessages, SubagentInfo, TurnCompleteEvent,
+    AgentEvent, AgentId, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, Post,
+    SharedBuf, SharedMessages, SubagentInfo, TurnCompleteEvent, TurnId,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -81,16 +79,19 @@ use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, Role, add_cost, format_tokens};
+use maki_providers::{ContentBlock, Message, Model, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
+use maki_storage::sessions::StoredPost;
 
 use crate::storage_writer::StorageWriter;
 use crate::theme::ThemesProvider;
 use ratatui::layout::Position;
 
 const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
+const COMPLETION_LABEL_CHARS: usize = 80;
+const COMPLETION_PREVIEW_CHARS: usize = 512;
 
 pub(crate) use crate::agent::QueuedMessage;
 
@@ -128,10 +129,6 @@ const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
-/// Wraps an auto-queued subagent reply with its task id so the main agent can
-/// tell it apart from a directly typed user message.
-const SUBAGENT_REPLY_HEADER: &str = "[msg from ";
-const SUBAGENT_REPLY_SUFFIX: &str = "] ";
 /// Length cap for the `/tasks` row message snippet (AC.10).
 const SNIPPET_CHARS: usize = 64;
 
@@ -282,21 +279,6 @@ fn ago(since: Instant) -> String {
     maki_lua::format_ago(since.elapsed().as_secs())
 }
 
-/// Last assistant text block in a subagent's flushed history, used to feed an
-/// async subagent's reply back into the main agent's queue.
-fn terminal_reply(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, Role::Assistant))
-        .and_then(|m| {
-            m.content.iter().find_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-        })
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) enum PendingInput {
     #[default]
@@ -365,6 +347,7 @@ pub struct App {
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
     model_picker_purpose: ModelPickerPurpose,
+    pub(crate) model_picker_target: Option<maki_agent::AgentRef>,
     pub(crate) plan_approval_pending: bool,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
@@ -417,6 +400,7 @@ pub struct App {
     pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) theme_provider: Arc<dyn ThemesProvider>,
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
+    model_picker_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
@@ -440,8 +424,6 @@ pub struct App {
     subagent_channels: HashMap<maki_agent::AgentId, SubagentChannels>,
     /// Stamped child outcomes outrank duplicate terminal delivery.
     stamped_subagent_outcomes: HashSet<(maki_agent::AgentId, maki_agent::TurnId)>,
-    /// Last cumulative history delivered to the root for each live child.
-    delivered_subagent_histories: HashMap<maki_agent::AgentId, Vec<u8>>,
 }
 
 pub(crate) struct PreparedApp {
@@ -475,6 +457,34 @@ impl PreparedApp {
 }
 
 impl App {
+    pub(crate) fn handle_actor_event(&mut self, event: maki_agent::actor::ActorEvent) {
+        let maki_agent::actor::ActorEvent::Delivery(event) = event else {
+            return;
+        };
+        if !matches!(
+            event.status,
+            maki_agent::actor::DeliveryStatus::Executed { .. }
+        ) {
+            return;
+        }
+        let delivery = event.delivery;
+        let source = delivery.label.as_deref().map_or_else(
+            || delivery.result.outcome.agent_id().to_string(),
+            str::to_owned,
+        );
+        let source: String = source.chars().take(COMPLETION_LABEL_CHARS).collect();
+        let text: String = delivery
+            .result
+            .text
+            .chars()
+            .take(COMPLETION_PREVIEW_CHARS)
+            .collect();
+        self.chats[0].push(DisplayMessage::new(
+            DisplayRole::Done,
+            format!("[Result from {source}] {text}"),
+        ));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         model: &Model,
@@ -505,6 +515,7 @@ impl App {
             InputHistory::load(&storage, input_history_size),
             ui_config.max_input_lines,
         );
+        let model_picker_models = Arc::new(ArcSwapOption::from(Some(Arc::new(Vec::new()))));
         let prepared_command_target = command_runtime.prepare_target();
         let command_target = prepared_command_target.handle().clone();
         let mut app = Self {
@@ -532,8 +543,9 @@ impl App {
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
             theme_picker: ThemePicker::new(Arc::clone(&theme_provider)),
-            model_picker: ModelPicker::new(Arc::clone(&available_models)),
+            model_picker: ModelPicker::new(Arc::clone(&model_picker_models)),
             model_picker_purpose: ModelPickerPurpose::Session,
+            model_picker_target: None,
             plan_approval_pending: false,
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
@@ -574,6 +586,7 @@ impl App {
             trust_question: None,
             theme_provider,
             available_models,
+            model_picker_models,
             shared_history: None,
             btw_system: None,
             image_paste_rx: vec![],
@@ -595,7 +608,6 @@ impl App {
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_channels: HashMap::new(),
             stamped_subagent_outcomes: HashSet::new(),
-            delivered_subagent_histories: HashMap::new(),
             pending_dirty: Dirty::NO,
         };
         app.model_picker.set_recents(
@@ -651,6 +663,12 @@ impl App {
             command_runtime,
         )
         .activate()
+    }
+
+    pub(crate) fn selected_agent_id(&self) -> Option<maki_agent::AgentId> {
+        self.chats
+            .get(self.active_chat)
+            .and_then(|chat| chat.agent_id)
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -1253,7 +1271,47 @@ impl App {
         None
     }
 
+    pub(crate) fn project_model_discovery(&mut self, specs: Vec<String>) {
+        self.model_picker_models.store(Some(Arc::new(specs)));
+        self.command_palette.refresh_model_arguments();
+        self.pending_dirty |= self.model_picker.refresh();
+    }
+
+    pub(crate) fn open_pinned_model_picker(
+        &mut self,
+        target: maki_agent::AgentRef,
+    ) -> Result<(), CommandError> {
+        target
+            .validate_live()
+            .map_err(|_| CommandError::StaleTarget)?;
+        let config = target
+            .effective_config()
+            .map_err(|_| CommandError::StaleTarget)?
+            .ok_or(CommandError::StaleTarget)?;
+        self.model_picker_purpose = ModelPickerPurpose::Session;
+        self.model_picker_target = Some(target);
+        self.model_picker.open(&config.model.spec());
+        Ok(())
+    }
+
     fn open_model_picker(&mut self, purpose: ModelPickerPurpose) {
+        if purpose == ModelPickerPurpose::Session
+            && let Some(target) = self.command_runtime.target_agent(&self.command_target)
+        {
+            if let Err(error) = self.open_pinned_model_picker(target) {
+                self.close_model_picker();
+                self.flash(error.to_string());
+            }
+            return;
+        }
+        if purpose == ModelPickerPurpose::Session
+            && (self.selected_agent_id().is_some() || self.coordinator.is_some())
+        {
+            self.close_model_picker();
+            self.flash(CommandError::StaleTarget.to_string());
+            return;
+        }
+        self.model_picker_target = None;
         let spec = match purpose {
             ModelPickerPurpose::PlanImplementation => self
                 .plan_form
@@ -1271,6 +1329,7 @@ impl App {
     fn close_model_picker(&mut self) {
         self.model_picker.close();
         self.model_picker_purpose = ModelPickerPurpose::Session;
+        self.model_picker_target = None;
     }
 
     fn handle_model_picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1282,6 +1341,8 @@ impl App {
                     self.plan_form
                         .set_implementation_model(spec, &self.state.model.spec());
                     vec![]
+                } else if let Some(target) = self.model_picker_target.take() {
+                    vec![Action::ChangePinnedModel { target, spec }]
                 } else {
                     vec![Action::ChangeModel(spec)]
                 }
@@ -1398,9 +1459,9 @@ impl App {
         }
 
         if !(self.status == Status::Streaming && is_streaming_stop_key(key))
-            && self.dispatch_override(key)
+            && let Some(id) = self.dispatch_override(key)
         {
-            return vec![];
+            return vec![Action::RunKeybind(id)];
         }
 
         if let Some(actions) = self.handle_ctrl(key) {
@@ -1429,16 +1490,14 @@ impl App {
         self.handle_main_chat_key(key)
     }
 
-    fn dispatch_override(&self, key: KeyEvent) -> bool {
-        self.dispatch_keymap(key.code, key.modifiers)
-    }
-
-    fn dispatch_keymap(&self, key: KeyCode, modifiers: KeyModifiers) -> bool {
-        self.keymap_reader.load().entries.iter().any(|entry| {
-            entry.key == key
-                && entry.modifiers == modifiers
-                && self.lua_event_handle.run_keybind_callback(entry.id)
-        })
+    fn dispatch_override(&self, key: KeyEvent) -> Option<u64> {
+        self.keymap_reader
+            .load()
+            .entries
+            .iter()
+            .find(|entry| entry.key == key.code && entry.modifiers == key.modifiers)
+            .filter(|_| !self.lua_event_handle.is_disconnected())
+            .map(|entry| entry.id)
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1827,9 +1886,20 @@ impl App {
         }
     }
 
+    fn capture_cancel(&mut self) -> (Option<TurnId>, u64) {
+        let run_id = self.run_id;
+        let (turn_id, fence) = self.queue.capture_cancel(self.run_id);
+        self.run_id = fence;
+        self.queue.fence_cancelled_presentations(fence);
+        (turn_id, run_id)
+    }
+
     fn handle_cancel(&mut self) -> Vec<Action> {
-        let cancelled_run = self.run_id;
-        self.run_id += 1;
+        let (turn_id, run_id) = self.capture_cancel();
+        self.finish_cancel(turn_id, run_id)
+    }
+
+    fn finish_cancel(&mut self, turn_id: Option<TurnId>, run_id: u64) -> Vec<Action> {
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
@@ -1844,12 +1914,10 @@ impl App {
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
-        self.queue.clear();
+        self.queue.unfocus();
         self.recoverable_queue.clear();
         self.status = Status::Idle;
-        vec![Action::CancelAgent {
-            run_id: cancelled_run,
-        }]
+        vec![Action::CancelAgent { turn_id, run_id }]
     }
 
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
@@ -1867,6 +1935,19 @@ impl App {
             cancel.cancel();
         }
         vec![]
+    }
+
+    pub(crate) fn adopt_actor_presentation(&mut self, envelope: &Envelope) {
+        if envelope.subagent.is_none()
+            && matches!(
+                envelope.event,
+                AgentEvent::QueueItemConsumed { .. } | AgentEvent::ModelSwitched { .. }
+            )
+            && envelope.run_id > self.run_id
+            && self.queue.accepts_actor_presentation(envelope.run_id)
+        {
+            self.record_run_start(envelope.run_id);
+        }
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
@@ -1893,6 +1974,12 @@ impl App {
             }
             return vec![];
         }
+        // Posts belong to no run, so the stale-run filter below must not see them.
+        if let AgentEvent::Post(post) = envelope.event {
+            self.push_post(envelope.subagent.as_ref(), post);
+            return vec![];
+        }
+        self.adopt_actor_presentation(&envelope);
         if envelope.subagent.is_none() && envelope.run_id != self.run_id {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
@@ -1944,7 +2031,6 @@ impl App {
                 if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
                     channels.closed = true;
                 }
-                self.delivered_subagent_histories.remove(&subagent.agent_id);
                 self.stamped_subagent_outcomes
                     .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
                 self.cleanup_subagent_input(subagent.agent_id);
@@ -1962,7 +2048,6 @@ impl App {
         if let (Some(subagent), AgentEvent::TurnOutcome(outcome)) =
             (&envelope.subagent, &envelope.event)
         {
-            let tool_use_id = subagent.parent_tool_use_id.clone();
             let agent_id = subagent.agent_id;
             let turn_id = match outcome {
                 maki_agent::TurnOutcome::Completed { turn_id, .. }
@@ -1982,19 +2067,6 @@ impl App {
                 }
                 maki_agent::TurnOutcome::Failed { failure, .. } => {
                     self.chats[chat_idx].mark_failed(&failure.user_message);
-                    if subagent.auto_deliver
-                        && subagent.parent_is_root
-                        && subagent.input_tx.is_some()
-                    {
-                        let text = format!(
-                            "{SUBAGENT_REPLY_HEADER}{tool_use_id}{SUBAGENT_REPLY_SUFFIX}failed: {}",
-                            truncate_snippet(&failure.user_message)
-                        );
-                        self.queue_and_notify(QueuedMessage {
-                            text,
-                            images: Vec::new(),
-                        });
-                    }
                 }
             }
             self.sync_task_picker();
@@ -2019,44 +2091,6 @@ impl App {
                 && !self.chats[sub_idx].is_finished()
             {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
-            }
-            // An async subagent's reply is delivered to the main agent so it
-            // becomes a new turn; one-shot subagents already see their reply as
-            // the tool result, so only async (input_tx-named) subtasks queue it.
-            let auto_deliver = envelope
-                .subagent
-                .as_ref()
-                .is_some_and(|subagent| subagent.auto_deliver && subagent.parent_is_root);
-            let reply = subagent_agent_id
-                .filter(|_| auto_deliver)
-                .filter(|agent_id| {
-                    self.subagent_channels
-                        .get(agent_id)
-                        .is_some_and(|channels| channels.input_tx.is_some())
-                })
-                .filter(|agent_id| {
-                    let Ok(history) = serde_json::to_vec(&messages) else {
-                        tracing::warn!(%agent_id, "subagent history dedup serialization failed");
-                        return true;
-                    };
-                    if self.delivered_subagent_histories.get(agent_id) == Some(&history) {
-                        false
-                    } else {
-                        self.delivered_subagent_histories.insert(*agent_id, history);
-                        true
-                    }
-                })
-                .and_then(|_| terminal_reply(&messages))
-                .filter(|reply| !reply.is_empty());
-            if let Some(reply) = reply {
-                // Header the reply with the task id so it reads as subagent
-                // output rather than a message typed by the user.
-                let text =
-                    format!("{SUBAGENT_REPLY_HEADER}{tool_use_id}{SUBAGENT_REPLY_SUFFIX}{reply}");
-                self.queue_and_notify(QueuedMessage {
-                    text,
-                    images: Vec::new(),
-                });
             }
             self.sync_task_picker();
             self.state
@@ -2246,7 +2280,7 @@ impl App {
                     self.terminalize_turn(&message);
                     self.retain_live_async_subagents();
                     self.recoverable_queue = self.queue.text_messages();
-                    self.queue.clear();
+                    self.queue.clear_user_work();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -2303,6 +2337,30 @@ impl App {
             }
         }
         !defer
+    }
+
+    fn push_post(&mut self, subagent: Option<&SubagentInfo>, post: Post) {
+        let (chat_idx, chat) = match subagent {
+            Some(subagent) => (
+                self.resolve_or_create_chat(subagent),
+                Some(subagent.parent_tool_use_id.clone()),
+            ),
+            None => (0, None),
+        };
+        self.chats[chat_idx].push_post(&post.text, post.level);
+        let session = &self.state.session;
+        let after_message = match &chat {
+            Some(id) => session
+                .subagent_messages()
+                .get(id)
+                .map_or(0, |messages| messages.len()),
+            None => session.messages().len(),
+        };
+        self.state.session_mut().push_post(StoredPost {
+            chat,
+            after_message,
+            post,
+        });
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
@@ -2568,10 +2626,11 @@ impl App {
                 vec![]
             }
             BuiltinOperation::OpenModelPicker => {
-                self.model_picker.open(&self.state.model.spec());
+                self.open_model_picker(ModelPickerPurpose::Session);
                 vec![Action::RefreshModels]
             }
             BuiltinOperation::SetModel { spec } => vec![Action::ChangeModel(spec.to_string())],
+            BuiltinOperation::SelectModel(selection) => vec![Action::SelectModel(selection)],
             BuiltinOperation::OpenThemePicker => {
                 self.theme_picker.open();
                 self.command_runtime

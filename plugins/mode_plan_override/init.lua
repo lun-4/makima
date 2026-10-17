@@ -29,12 +29,12 @@ Everything above applies to delegated work too: any subagent you spawn is strict
 
 ## Subagents
 
-`task` spawns strictly read-only researchers. Plan mode admits two subagent types:
+`task_spawn` spawns strictly read-only researchers. Plan mode admits two subagent types:
 
 - **`research`** — generic read-only research: investigate the codebase and report back.
 - **`plan_reviewer`** — reviews a completed plan file against the plan specification (see "Plan review before handoff" below).
 
-Give each subagent a scoped task with `task`; its report is returned in the tool result when it settles. `general` spawns are blocked in plan mode.
+Give each subagent a scoped task with `task_spawn`, then observe its report with `task_wait`. `general` spawns are blocked in plan mode, and `general` tasks started earlier cannot take new work through `task_send`.
 
 ## Classifying user intent
 
@@ -65,7 +65,7 @@ Only if building the missing infrastructure is genuinely out of scope — too la
 
 Do not silently hand off a plan with known test infrastructure gaps. Either the plan includes the infrastructure work, or luna has explicitly accepted the gap.
 
-If the `task` tool is disabled, self-review the plan against the specification above instead.
+If the `task_spawn` tool is disabled, self-review the plan against the specification above instead.
 
 Only call `plan_submit` after the plan is fully written to `{plan_path}`; then call `plan_submit` by itself, with no other tool calls in the same assistant message. If the user has not actually asked for implementation, do not submit.
 
@@ -77,7 +77,19 @@ local ok, err = maki.api.mode.define({
   label = "[PLAN]",
   system_prompt = PLAN_DIRECTIVE,
   restrict_write_to = PLAN_FILE,
-  tools = { "read", "grep", "glob", "webfetch", "write", "edit", "plan_submit", "task" },
+  tools = {
+    "read",
+    "grep",
+    "glob",
+    "webfetch",
+    "write",
+    "edit",
+    "plan_submit",
+    "task_spawn",
+    "task_wait",
+    "task_send",
+    "task_despawn",
+  },
   -- tool search / mcp stay available through the per-request MCP injection.
 })
 if not ok then

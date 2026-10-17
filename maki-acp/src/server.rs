@@ -30,6 +30,7 @@ use maki_commands::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
+use maki_lua::host_root::{HostRootRetirementGuard, HostRootServices};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
@@ -205,6 +206,8 @@ impl OptionProjection {
 
 struct SessionState {
     handle: InteractiveHandle,
+    host_root: Arc<HostRootServices>,
+    _host_root_retirement: HostRootRetirementGuard,
     coordinator: Option<maki_agent::session_coordinator::SessionCoordinatorHandle>,
     checkpoint: Option<Arc<maki_agent::session_checkpoint::SessionLogCheckpoint>>,
     mcp: Option<McpHandle>,
@@ -575,15 +578,16 @@ async fn load_session(
         .map(maki_agent::ThinkingConfig::from)
         .filter(|_| recorded_model.supports_thinking())
         .unwrap_or_default();
-    let replay_history = restored.history.clone();
-    let coordinator_history = restored.history.clone();
-    let handle = spawn_session(
+    let replay_history = Arc::clone(&restored.history.messages);
+    let coordinator_history = restored.history.messages.as_ref().clone();
+    let history_snapshot = restored.history;
+    let handle = spawn_session_with_history(
         params,
         SpawnSession {
             model: recorded_model.clone(),
             cwd: session_cwd.clone(),
             session_id: Some(session_ref),
-            history: restored.history,
+            history: Vec::new(),
             mcp_handle: mcp.clone(),
             elicitation: srv.elicitation,
             yolo,
@@ -595,6 +599,7 @@ async fn load_session(
             },
             project_config,
         },
+        Some(history_snapshot),
     );
     let restored_cost = settle_session(
         &restored.usage,
@@ -630,6 +635,14 @@ async fn load_session(
 }
 
 fn spawn_session(params: &AcpParams, session: SpawnSession) -> InteractiveHandle {
+    spawn_session_with_history(params, session, None)
+}
+
+fn spawn_session_with_history(
+    params: &AcpParams,
+    session: SpawnSession,
+    snapshot: Option<maki_agent::agent::HistorySnapshot>,
+) -> InteractiveHandle {
     let SpawnSession {
         model,
         cwd,
@@ -642,7 +655,7 @@ fn spawn_session(params: &AcpParams, session: SpawnSession) -> InteractiveHandle
         project_config,
     } = session;
     let permissions_config = maki_config::load_permissions(&project_config);
-    headless::spawn_interactive(InteractiveParams {
+    let interactive = InteractiveParams {
         model,
         config: params.config.clone(),
         permissions_config,
@@ -668,7 +681,11 @@ fn spawn_session(params: &AcpParams, session: SpawnSession) -> InteractiveHandle
         project_config,
         local_tools: Default::default(),
         state_dir: Some(params.storage.path().to_path_buf()),
-    })
+    };
+    match snapshot {
+        Some(snapshot) => headless::spawn_interactive_with_history(interactive, snapshot),
+        None => headless::spawn_interactive(interactive),
+    }
 }
 
 /// Servers the client injects on `session/new` and `session/load`. A transport we
@@ -748,6 +765,7 @@ async fn close_session(srv: &mut Server) {
     let Some(mut state) = srv.session.take() else {
         return;
     };
+    state.host_root.retire();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
     let (operation, permission_answers, elicitation) = {
@@ -920,25 +938,26 @@ async fn install_session_with_lock(
             model: Arc::from(current_model.as_str()),
             cwd: cwd.clone(),
             model_policy: Arc::clone(&params.model_policy),
-            model_adopter: Arc::new({
+            model_adopter: Arc::new(maki_agent::session_coordinator::GuardedModelAdopter({
                 // Install into the shared source without waiting for the
                 // running turn. The actor pins model settings at admission, so
                 // this takes effect for later turns while the active turn keeps
                 // its selected model.
                 let shared = handle.model.clone();
                 let timeouts = params.timeouts;
-                move |mut model: Model| {
+                move |mut model: Model, validator: maki_agent::session_coordinator::ModelMutationValidator| {
                     let shared = shared.clone();
                     Box::pin(async move {
                         let provider =
                             maki_providers::provider::from_model_async(&mut model, timeouts)
                                 .await
                                 .map_err(|error| Arc::from(error.user_message()))?;
+                        validator()?;
                         shared.install(Arc::from(provider), model);
                         Ok(())
                     }) as maki_agent::session_coordinator::ModelAdoptionFuture
                 }
-            }),
+            })),
             directory_adopter: maki_agent::headless::interactive_directory_adopter(
                 handle.control_tx.clone(),
             ),
@@ -953,6 +972,15 @@ async fn install_session_with_lock(
             return Err(error.to_string());
         }
     };
+    let host_root = Arc::new(HostRootServices::coordinated(
+        handle.agent_id,
+        coordinator.clone(),
+        Arc::clone(&params.model_policy),
+    ));
+    let host_root_retirement = host_root.retirement_guard();
+    params
+        .lua_event_handle
+        .install_host_root_services(Arc::clone(&host_root));
     let pending = PendingState::default();
     let project_trusted = handle.permissions.project_is_trusted();
     start_event_pump(
@@ -1018,6 +1046,8 @@ async fn install_session_with_lock(
     );
     srv.session = Some(SessionState {
         handle,
+        host_root,
+        _host_root_retirement: host_root_retirement,
         coordinator: Some(coordinator),
         checkpoint: Some(checkpoint),
         mcp,
@@ -1125,9 +1155,8 @@ fn watch_available_commands(
     })
 }
 
-#[derive(Debug)]
 struct Restored {
-    history: Vec<Message>,
+    history: maki_agent::agent::HistorySnapshot,
     cwd: Option<PathBuf>,
     usage: TokenUsage,
     by_model: HashMap<String, StoredTokenUsage>,
@@ -1159,7 +1188,7 @@ fn load_history_from(
     let usage = session.token_usage;
     let by_model = session.usage_by_model().clone();
     let meta = session.meta.clone();
-    let history = session.take_messages();
+    let history = session.history_snapshot();
     Ok(Restored {
         history,
         cwd,
@@ -2510,6 +2539,22 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn acp_restoration_preserves_compacted_history() {
+        let tmp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new(OFFLINE_SPEC, "/project");
+        session.meta.compacted = true;
+        session.save(&storage).unwrap();
+        let restored = load_history_from(&storage, session.id).unwrap();
+        assert!(restored.history.compacted);
+        assert_eq!(
+            serde_json::to_value(restored.history.messages.as_ref()).unwrap(),
+            serde_json::to_value(session.history_snapshot().messages.as_ref()).unwrap()
+        );
+    }
+
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
             "id": id,
@@ -2581,6 +2626,7 @@ mod tests {
             state_dir: None,
         });
         let handle = InteractiveHandle {
+            agent_id: input_handle.agent_id,
             model: Default::default(),
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
@@ -2629,6 +2675,12 @@ mod tests {
                 .with_coordinator(coordinator.clone()),
             ),
         );
+        let host_root = Arc::new(HostRootServices::coordinated(
+            handle.agent_id,
+            coordinator.clone(),
+            Arc::new(ModelPolicy::default()),
+        ));
+        let host_root_retirement = host_root.retirement_guard();
         let server = Server {
             out_tx: out_tx.clone(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
@@ -2644,6 +2696,8 @@ mod tests {
                     emitted_version: Mutex::new(coordinator.read().options().version),
                 })),
                 handle,
+                host_root,
+                _host_root_retirement: host_root_retirement,
                 coordinator: Some(coordinator),
                 checkpoint: None,
                 mcp: None,
@@ -4996,8 +5050,9 @@ mod tests {
         });
     }
 
-    #[test]
-    fn acp_immediate_prompt_and_option_change() {
+    #[test_case(false; "protocol_option")]
+    #[test_case(true; "host_root_option")]
+    fn acp_immediate_prompt_and_option_change(use_host_root: bool) {
         const SPEC: &str = "anthropic/claude-opus-4-8";
         const FIRST: &str = "initial provider";
         const SECOND: &str = "replacement provider";
@@ -5054,6 +5109,15 @@ mod tests {
             );
             let previous = std::mem::replace(&mut session.handle, handle);
             previous.task.cancel().await;
+            let host_root = Arc::new(HostRootServices::coordinated(
+                session.handle.agent_id,
+                session.coordinator.as_ref().unwrap().clone(),
+                Arc::new(ModelPolicy::default()),
+            ));
+            session._host_root_retirement = host_root.retirement_guard();
+            session.host_root = host_root;
+            let reference = session.host_root.reference();
+            assert_eq!(reference.id(), session.handle.agent_id);
             start_event_pump(
                 session.handle.event_rx.clone(),
                 id.clone(),
@@ -5090,16 +5154,36 @@ mod tests {
                 }
             }
             assert_eq!(received.try_recv().unwrap(), (FIRST, SPEC.into(), false));
-            handle_set_config(
-                &mut srv,
-                &serde_json::json!({ "params": {
-                    "sessionId": session_id,
-                    "configId": maki_agent::session_options::FAST_OPTION_ID,
-                    "value": maki_agent::session_options::ENABLED_VALUE,
-                }}),
-            )
-            .await
-            .unwrap();
+            if use_host_root {
+                let root = &srv.session.as_ref().unwrap().host_root;
+                assert!(matches!(
+                    root.unsupported(&reference),
+                    Err(maki_lua::host_root::HostRootError::UnsupportedOperation)
+                ));
+                let selection = root
+                    .set_model(
+                        &reference,
+                        maki_providers::ModelSelection {
+                            fast: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(selection.fast);
+                assert_eq!(selection.spec.as_ref(), SPEC);
+            } else {
+                handle_set_config(
+                    &mut srv,
+                    &serde_json::json!({ "params": {
+                        "sessionId": session_id,
+                        "configId": maki_agent::session_options::FAST_OPTION_ID,
+                        "value": maki_agent::session_options::ENABLED_VALUE,
+                    }}),
+                )
+                .await
+                .unwrap();
+            }
             srv.session.as_ref().unwrap().handle.model.install(
                 Arc::new(RecordingAcpProvider {
                     name: SECOND,
@@ -5128,7 +5212,12 @@ mod tests {
             }
             assert_eq!(received.try_recv().unwrap(), (SECOND, SPEC.into(), true));
             assert!(received.is_empty());
+            let root = Arc::clone(&srv.session.as_ref().unwrap().host_root);
             close_session(&mut srv).await;
+            assert!(matches!(
+                root.model(&reference),
+                Err(maki_lua::host_root::HostRootError::Stale)
+            ));
         });
     }
 
@@ -5511,6 +5600,121 @@ mod tests {
     }
 
     #[test]
+    fn portable_model_options_commit_atomically_without_an_agent_turn() {
+        smol::block_on(async {
+            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let coordinator = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .clone();
+            let value = |snapshot: &maki_agent::session_options::SessionOptionsSnapshot,
+                         id: &str| {
+                snapshot
+                    .options
+                    .iter()
+                    .find(|option| option.definition.id.as_ref() == id)
+                    .unwrap()
+                    .current_value
+                    .to_string()
+            };
+            let before = coordinator.read().options();
+            dispatch_prompt(
+                &mut srv,
+                &format!("/model \"{FAST_SPEC}\" thinking=high fast=true"),
+                false,
+                &RequestId::Number(3),
+            )
+            .await
+            .unwrap();
+            let selected = coordinator.read().options();
+            assert_eq!(selected.version, before.version + 1);
+            assert_eq!(
+                value(&selected, maki_agent::session_options::MODEL_OPTION_ID),
+                FAST_SPEC
+            );
+            assert_eq!(
+                value(&selected, maki_agent::session_options::FAST_OPTION_ID),
+                maki_agent::session_options::ENABLED_VALUE
+            );
+            assert_eq!(
+                value(&selected, maki_agent::session_options::THINKING_OPTION_ID),
+                "high"
+            );
+            dispatch_prompt(
+                &mut srv,
+                "/model thinking=off fast=false",
+                false,
+                &RequestId::Number(4),
+            )
+            .await
+            .unwrap();
+            let disabled = coordinator.read().options();
+            assert_eq!(disabled.version, selected.version + 1);
+            assert_eq!(
+                value(&disabled, maki_agent::session_options::MODEL_OPTION_ID),
+                FAST_SPEC
+            );
+            assert_eq!(
+                value(&disabled, maki_agent::session_options::FAST_OPTION_ID),
+                maki_agent::session_options::DISABLED_VALUE
+            );
+            assert_eq!(
+                value(&disabled, maki_agent::session_options::THINKING_OPTION_ID),
+                "off"
+            );
+            // Repeating explicit values does not toggle either option.
+            dispatch_prompt(
+                &mut srv,
+                "/model thinking=off fast=false",
+                false,
+                &RequestId::Number(5),
+            )
+            .await
+            .unwrap();
+            let repeated = coordinator.read().options();
+            assert_eq!(repeated, disabled);
+            assert_eq!(
+                value(&repeated, maki_agent::session_options::FAST_OPTION_ID),
+                maki_agent::session_options::DISABLED_VALUE
+            );
+            assert_eq!(
+                value(&repeated, maki_agent::session_options::THINKING_OPTION_ID),
+                "off"
+            );
+            assert!(input_rx.is_empty());
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(&format!("/model {OFFLINE_SPEC} fast=true") ; "fast_unsupported_by_model")]
+    #[test_case("/model fast=true fast=false" ; "duplicate_option")]
+    #[test_case("/model thinking=toggle" ; "thinking_toggle")]
+    fn portable_invalid_model_options_leave_session_options_unchanged(input: &str) {
+        smol::block_on(async {
+            let (mut srv, _, _, input_rx) = server_awaiting_answer();
+            let coordinator = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .clone();
+            let before = coordinator.read().options();
+            dispatch_prompt(&mut srv, input, false, &RequestId::Number(3))
+                .await
+                .unwrap_err();
+            assert_eq!(coordinator.read().options(), before);
+            assert!(input_rx.is_empty());
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn portable_bare_model_returns_shared_usage_error() {
         let (mut srv, _, _, input_rx) = server_awaiting_answer();
 
@@ -5523,7 +5727,13 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, AcpError::invalid_params().code);
-        assert_eq!(error.message, "command failed: Usage: /model <model>");
+        assert_eq!(
+            error.message,
+            format!(
+                "command failed: {}",
+                maki_agent::command::NONINTERACTIVE_MODEL_USAGE
+            )
+        );
         assert!(input_rx.is_empty());
     }
 
@@ -5753,7 +5963,7 @@ mod tests {
         let id: MakiId = session.id;
         let history = load_history_from(&dir, id).unwrap();
         assert_eq!(
-            serde_json::to_value(&history.history).unwrap(),
+            serde_json::to_value(history.history.messages.as_ref()).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
     }
@@ -5792,7 +6002,7 @@ mod tests {
     fn load_missing_session_is_resource_not_found() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let err = load_history_from(&dir, MakiId::generate()).unwrap_err();
+        let err = load_history_from(&dir, MakiId::generate()).err().unwrap();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
     }
 
@@ -5810,7 +6020,7 @@ mod tests {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR).unwrap();
         let lock = session_lock::lock_path(&sessions_dir, &id);
         std::fs::write(&lock, FAKE_PID.to_string()).unwrap();
-        let err = load_history_from(&dir, id).unwrap_err();
+        let err = load_history_from(&dir, id).err().unwrap();
         assert_eq!(err.code, AcpError::internal_error().code);
         assert_eq!(
             err.data,

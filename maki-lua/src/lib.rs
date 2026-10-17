@@ -1,12 +1,16 @@
 pub mod agent_autocmd;
+pub mod agent_errors;
 mod api;
 mod coalesced_latest;
 pub mod docs;
 pub mod docs_render;
 mod error;
 pub(crate) mod hook;
+pub mod host_root;
 pub mod language;
 mod loader;
+pub mod orchestration;
+pub use runtime::current_managed_turn;
 pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;

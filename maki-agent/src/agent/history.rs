@@ -26,12 +26,19 @@ impl History {
         }
     }
 
+    pub fn restored_snapshot(snapshot: HistorySnapshot) -> Self {
+        let mut history = Self::restored(Arc::unwrap_or_clone(snapshot.messages));
+        history.snapshot.compacted = snapshot.compacted;
+        history
+    }
+
     pub fn restored(mut messages: Vec<Message>) -> Self {
         sanitize_restored(&mut messages);
         Self::new(messages)
     }
 
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
+        self.snapshot.compacted |= mirror.load().compacted;
         self.mirror = Some(mirror);
         self.publish();
         self
@@ -81,6 +88,11 @@ impl History {
 
     pub fn replace(&mut self, messages: Vec<Message>) {
         self.rewrite(|msgs| *msgs = messages);
+    }
+
+    pub fn replace_compacted(&mut self, messages: Vec<Message>) {
+        self.snapshot.compacted = true;
+        self.replace(messages);
     }
 
     pub fn truncate(&mut self, len: usize) {
@@ -237,6 +249,21 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const GO: &str = "go";
+
+    #[test]
+    fn compaction_metadata_survives_append_and_snapshot_restoration() {
+        let mirror = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        let mut history =
+            History::new(vec![Message::user(FIRST.into())]).with_mirror(Arc::clone(&mirror));
+        history.truncate(0);
+        assert!(!mirror.load().compacted);
+        history.replace_compacted(vec![Message::observation(SECOND.into())]);
+        history.push(Message::user(GO.into()));
+        assert!(mirror.load().compacted);
+        let restored = History::restored_snapshot((*mirror.load_full()).clone());
+        assert!(restored.snapshot.compacted);
+        assert_eq!(restored.len(), 2);
+    }
 
     #[track_caller]
     fn assert_ends_with_cancel_marker(history: &History) {

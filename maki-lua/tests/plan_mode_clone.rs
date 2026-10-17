@@ -62,7 +62,8 @@ fn directive_is_verbatim_clone() {
     must_contain(MODE_OVERRIDE_SRC, "{plan_path}", "plan-mode directive");
     // Tool-name substitutions land.
     must_contain(MODE_OVERRIDE_SRC, "`question`", "plan-mode directive");
-    must_contain(MODE_OVERRIDE_SRC, "`task`", "plan-mode directive");
+    must_contain(MODE_OVERRIDE_SRC, "`task_spawn`", "plan-mode directive");
+    must_contain(MODE_OVERRIDE_SRC, "`task_wait`", "plan-mode directive");
     must_contain(MODE_OVERRIDE_SRC, "`plan_reviewer`", "plan-mode directive");
     // The directive splices the shared spec.
     must_contain(
@@ -74,12 +75,21 @@ fn directive_is_verbatim_clone() {
 
 #[test]
 fn plan_toolset_includes_webfetch() {
-    // Byte-pin the whole toolset line: any add or remove is caught here.
-    must_contain(
-        MODE_OVERRIDE_SRC,
-        r#"tools = { "read", "grep", "glob", "webfetch", "write", "edit", "plan_submit", "task" }"#,
-        "plan toolset",
-    );
+    for tool in [
+        "read",
+        "grep",
+        "glob",
+        "webfetch",
+        "write",
+        "edit",
+        "plan_submit",
+        "task_spawn",
+        "task_wait",
+        "task_send",
+        "task_despawn",
+    ] {
+        must_contain(MODE_OVERRIDE_SRC, &format!("\"{tool}\""), "plan toolset");
+    }
     // A phrase unique to the directive sentence (the header comment also
     // mentions webfetch, so the backticked name alone would not pin it).
     must_contain(

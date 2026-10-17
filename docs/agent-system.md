@@ -1,8 +1,6 @@
 # Agent system
 
-This document describes the agent implementation that exists now. It covers the reliable turn lifecycle, shared actor, and per-outer-session agent manager introduced by the first three Issue 24 deliveries.
-
-It does not describe the intended final form of Issue 24 as if it already exists. See [Deferred work](#deferred-work) for the current boundary.
+The reliable turn lifecycle, shared actor, and per-outer-session agent manager below reflect the first three Issue 24 deliveries. Later deliveries add actor-owned configuration and the public Lua Agent API. The deferred-work list below reflects this earlier boundary, not current implementation status. See the [Lua API reference](../site/docs/content/lua-api/_index.md) and [plugin guide](../site/docs/content/plugins/_index.md) for the current public contract.
 
 ## Vocabulary
 

@@ -1,5 +1,6 @@
 mod agent_loop;
 mod command_router;
+pub(crate) mod orchestration;
 pub(crate) mod shared_queue;
 
 #[cfg(test)]
@@ -15,7 +16,7 @@ use maki_agent::tools::offload::OffloadStore;
 use maki_agent::{
     AgentConfig, AgentEvent, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
     McpCommand, McpConfigErrors, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages,
-    ToolOutputLines,
+    ToolOutputLines, TurnId,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
@@ -239,9 +240,14 @@ pub(crate) struct SystemPromptOverride {
 }
 
 pub(crate) enum AgentCommand {
-    Cancel { run_id: u64 },
+    Cancel {
+        turn_id: Option<TurnId>,
+        run_id: u64,
+    },
     CancelAll,
-    CancelSubagent { tool_use_id: String },
+    CancelSubagent {
+        tool_use_id: String,
+    },
 }
 
 /// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old
@@ -299,6 +305,7 @@ impl Drop for PreparedAgentHandles {
 pub(crate) struct AgentHandles {
     pub(crate) cmd_tx: flume::Sender<AgentCommand>,
     pub(crate) agent_rx: flume::Receiver<Envelope>,
+    pub(crate) actor_rx: flume::Receiver<maki_agent::actor::ActorEvent>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
@@ -316,6 +323,7 @@ pub(crate) struct AgentHandles {
     mailbox: Option<SessionMailbox>,
     cwd: Arc<ArcSwap<PathBuf>>,
     pub(crate) offload: Option<Arc<OffloadStore>>,
+    pub(crate) orchestration_template: maki_agent::tools::ToolContext,
     subagent_cancels: Arc<CancelMap<String>>,
     manager: AgentManagerHandle,
     root_id: maki_agent::AgentId,
@@ -363,7 +371,7 @@ impl AgentHandles {
         let mut handles = Self::prepare(
             model_slot,
             initial_config,
-            initial_history,
+            HistorySnapshot::new(initial_history),
             config,
             tool_output_lines,
             permissions,
@@ -386,7 +394,7 @@ impl AgentHandles {
     pub(crate) fn prepare(
         model_slot: &Arc<ProviderSlot>,
         initial_config: maki_agent::EffectiveAgentConfig,
-        initial_history: Vec<Message>,
+        initial_history: HistorySnapshot,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -508,7 +516,10 @@ impl AgentHandles {
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
             None,
-            history,
+            HistorySnapshot {
+                messages: Arc::new(history),
+                ..(*self.history.load_full()).clone()
+            },
             config,
             tool_output_lines,
             permissions,
@@ -579,7 +590,7 @@ fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ProviderSlot>,
     initial_config: Option<maki_agent::EffectiveAgentConfig>,
-    initial_history: Vec<Message>,
+    initial_history: HistorySnapshot,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
@@ -600,8 +611,8 @@ fn spawn_agent_internal(
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     // Seeded empty because `AgentActorHandle::spawn` publishes the real
     // snapshot synchronously, before any handle escapes.
-    let shared_history: SharedMessages =
-        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+    let shared_history: SharedMessages = Arc::new(ArcSwap::from_pointee(initial_history.clone()));
+    let initial_history = Arc::unwrap_or_clone(initial_history.messages);
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let prepared_mailbox = mailbox
@@ -639,6 +650,7 @@ fn spawn_agent_internal(
     };
     drop(selected);
     let (runner_start, start_rx) = flume::bounded(1);
+    let mut orchestration_template = None;
     let root = manager
         .create_root_deferred_with_config(
             Some(initial_config.unwrap_or_else(|| {
@@ -650,7 +662,7 @@ fn spawn_agent_internal(
             initial_history.clone(),
             Some(Arc::clone(&shared_history)),
             |agent_id| {
-                Ok::<Box<dyn maki_agent::ActorBackend>, String>(Box::new(new_backend(
+                let backend = new_backend(
                     agent_id,
                     Arc::clone(model_slot),
                     Arc::clone(&cwd),
@@ -674,7 +686,9 @@ fn spawn_agent_internal(
                     init_cancel,
                     drain_tx,
                     Arc::clone(&run_id),
-                )))
+                );
+                orchestration_template = Some(backend.orchestration_template());
+                Ok::<Box<dyn maki_agent::ActorBackend>, String>(Box::new(backend))
             },
             start_rx,
         )
@@ -710,6 +724,7 @@ fn spawn_agent_internal(
         handles: Some(AgentHandles {
             cmd_tx,
             agent_rx,
+            actor_rx: actor.subscribe_events(),
             agent_tx,
             answer_tx,
             history: shared_history,
@@ -727,6 +742,8 @@ fn spawn_agent_internal(
             mailbox,
             cwd,
             offload,
+            orchestration_template: orchestration_template
+                .expect("root factory prepares orchestration template"),
             subagent_cancels,
             manager,
             root_id,
@@ -1022,6 +1039,8 @@ mod tests {
             match envelope.event {
                 AgentEvent::TextDelta { ref text } if text == PROBE_TEXT => probe_seen = true,
                 AgentEvent::QueueItemConsumed { ref text, .. } if text == RESTORED_TEXT => {
+                    assert_eq!(envelope.run_id, app.run_id + 1);
+                    app.adopt_actor_presentation(&envelope);
                     assert_eq!(envelope.run_id, app.run_id);
                     restored_seen += 1;
                 }

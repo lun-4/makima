@@ -7,6 +7,7 @@ pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
+pub mod selection;
 pub mod tokens;
 pub(crate) mod types;
 
@@ -28,10 +29,15 @@ pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 pub use retry::{RetryKind, RetryPolicy, RetryState};
+pub use selection::{
+    CompleteModelSelection, FAST_VALUES, MODEL_FAST_KEY, MODEL_OPTION_KEYS, MODEL_SPEC_KEY,
+    MODEL_THINKING_KEY, ModelSelection, ModelSelectionError, parse_fast, parse_thinking,
+};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, EffortDialect, IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE,
     IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, Message, MessageKind,
-    ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role, StopReason, StreamResponse,
-    THINKING_USAGE, ThinkingConfigExt, UsageLimit, UsageWindow, adapt_images_for_model, dialect,
+    ModelUsageRow, ObservationSource, ProviderEvent, ProviderUsage, RequestOptions, Role,
+    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfigExt, UsageLimit, UsageWindow,
+    adapt_images_for_model, dialect,
 };

@@ -29,7 +29,8 @@ const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 const STANDARD_COMMANDS_ALREADY_REGISTERED: &str = "standard commands are already registered";
 const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text content";
-const NONINTERACTIVE_MODEL_USAGE: &str = "Usage: /model <model>";
+pub const NONINTERACTIVE_MODEL_USAGE: &str =
+    "Usage: /model [spec] [thinking=value] [fast=true|false]";
 pub const FAST_UNSUPPORTED: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 
 pub fn portable_capabilities() -> TargetCapabilities {
@@ -316,6 +317,17 @@ impl maki_commands::CommandHost for SessionCommandHost {
                     ))
                 })
             }
+            maki_commands::BuiltinOperation::SelectModel(selection) => {
+                let coordinator = self.coordinator.clone();
+                Box::pin(async move {
+                    let coordinator = coordinator.ok_or(CommandError::StaleTarget)?;
+                    coordinator
+                        .set_model(selection.spec, selection.fast, selection.thinking)
+                        .await
+                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?;
+                    Ok(HostResponse::Completed)
+                })
+            }
             maki_commands::BuiltinOperation::SetModel { spec } => {
                 let coordinator = self.coordinator.clone();
                 Box::pin(async move {
@@ -515,7 +527,6 @@ impl CommandBehavior for BuiltinBehavior {
             });
         }
         let arguments = invocation.arguments.trim().to_owned();
-        let model = parsed_string_argument(&invocation, "model");
         let theme = parsed_string_argument(&invocation, "theme");
         let directory = parsed_directory_argument(&invocation, "path");
         let id = self.id;
@@ -529,7 +540,7 @@ impl CommandBehavior for BuiltinBehavior {
                 maki_commands::BuiltinId::New => BuiltinOperation::ResetSession,
                 maki_commands::BuiltinId::Help => BuiltinOperation::ToggleHelp,
                 maki_commands::BuiltinId::Queue => BuiltinOperation::FocusQueue,
-                maki_commands::BuiltinId::Model if model.as_ref().is_ok_and(Option::is_none) => {
+                maki_commands::BuiltinId::Model if arguments.is_empty() => {
                     if !invocation.target_supports(TargetCapability::InteractiveUi) {
                         return Err(CommandError::Producer(Arc::from(
                             NONINTERACTIVE_MODEL_USAGE,
@@ -538,10 +549,9 @@ impl CommandBehavior for BuiltinBehavior {
                     BuiltinOperation::OpenModelPicker
                 }
                 maki_commands::BuiltinId::Model => {
-                    let model = model?.ok_or_else(|| {
-                        CommandError::Producer(Arc::from("model argument is unavailable"))
-                    })?;
-                    let specs = if model.contains('/') {
+                    let mut selection = maki_commands::parse_model_selection(&arguments)?;
+                    let model = selection.spec.as_deref().unwrap_or("");
+                    let specs = if model.is_empty() || model.contains('/') {
                         Arc::from([])
                     } else {
                         let HostContextResponse::Values(specs) =
@@ -553,8 +563,16 @@ impl CommandBehavior for BuiltinBehavior {
                         };
                         specs
                     };
-                    BuiltinOperation::SetModel {
-                        spec: resolve_model(&model, &specs)?,
+                    if !model.is_empty() {
+                        selection.spec = Some(resolve_model(model, &specs)?);
+                    }
+                    match selection {
+                        maki_commands::ModelSelection {
+                            spec: Some(spec),
+                            thinking: None,
+                            fast: None,
+                        } => BuiltinOperation::SetModel { spec },
+                        selection => BuiltinOperation::SelectModel(selection),
                     }
                 }
                 maki_commands::BuiltinId::Theme if theme.as_ref().is_ok_and(Option::is_none) => {
@@ -901,7 +919,9 @@ fn parse_command(content: &str, path: &Path, scope: CommandScope) -> Option<Cust
 mod tests {
     use crate::session_coordinator::SessionCoordinatorHandle;
     use maki_commands::CommandHost;
+    use maki_commands::ModelSelection;
     use maki_config::ModelPolicy;
+    use maki_providers::{Effort, ThinkingConfig};
     use maki_storage::checkpoint::{
         CheckpointAck, CheckpointFuture, CheckpointRequest, CheckpointWriter,
     };
@@ -975,7 +995,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    maki_providers::ThinkingConfig::Off,
+                    ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
                 history: Vec::new(),
@@ -1219,6 +1239,67 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .is_empty()
         );
+    }
+
+    const STRUCTURED_MODEL_SPEC: &str = "openai/gpt-5";
+
+    fn dispatch_model_input(input: &str) -> (maki_commands::InputDispatch, Vec<BuiltinOperation>) {
+        let registry = maki_commands::CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let host = Arc::new(RecordingCommandHost::default());
+        let target = registry.bind_target(portable_capabilities(), host.clone());
+        let dispatched = smol::block_on(registry.dispatch_input(&target, input.into()));
+        let operations = host.0.lock().unwrap().clone();
+        (dispatched, operations)
+    }
+
+    #[test_case(
+        &format!("/model {STRUCTURED_MODEL_SPEC}{{thinking=high, fast=true}}"),
+        ModelSelection {
+            spec: Some(Arc::from(STRUCTURED_MODEL_SPEC)),
+            thinking: Some(ThinkingConfig::Effort(Effort::High)),
+            fast: Some(true),
+        }
+        ; "spec_with_brace_options"
+    )]
+    #[test_case(
+        "/model fast=false",
+        ModelSelection { fast: Some(false), ..Default::default() }
+        ; "fast_only"
+    )]
+    #[test_case(
+        "/model thinking=2048",
+        ModelSelection { thinking: Some(ThinkingConfig::Budget(2048)), ..Default::default() }
+        ; "thinking_budget_only"
+    )]
+    fn structured_model_routes_options(input: &str, expected: ModelSelection) {
+        let (dispatched, operations) = dispatch_model_input(input);
+        assert!(matches!(
+            dispatched,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        assert_eq!(operations, vec![BuiltinOperation::SelectModel(expected)]);
+    }
+
+    #[test_case("/model fast=true fast=false" ; "duplicate_fast")]
+    #[test_case("/model thinking=high thinking=off" ; "duplicate_thinking")]
+    #[test_case("/model wat=true" ; "unknown_option")]
+    #[test_case("/model fast=on" ; "invalid_fast")]
+    #[test_case("/model thinking=0" ; "zero_budget")]
+    #[test_case("/model thinking=toggle" ; "thinking_toggle")]
+    #[test_case("/model fast=toggle" ; "fast_toggle")]
+    #[test_case(r#"/model "" fast=false"# ; "empty_quoted_spec")]
+    #[test_case(r#"/model "openai/gpt-5" "openai/gpt-4""# ; "two_quoted_specs")]
+    #[test_case(r#"/model "openai/gpt-5" thinking="high" thinking=off"# ; "duplicate_after_quoted_spec")]
+    #[test_case("/model openai/gpt-5 openai/gpt-4" ; "two_specs")]
+    fn structured_model_rejects_invalid_input(input: &str) {
+        let (dispatched, operations) = dispatch_model_input(input);
+        assert!(matches!(
+            dispatched,
+            maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(_))
+        ));
+        assert!(operations.is_empty());
     }
 
     #[test]

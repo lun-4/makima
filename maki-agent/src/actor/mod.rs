@@ -17,6 +17,14 @@
 mod actor_error;
 mod config;
 pub use config::{ConfigChange, ConfigCommit, ConfigPatch, PreparedModel};
+pub(crate) mod delivery;
+pub use delivery::{
+    ChildDelivery, DeliveryEvent, DeliveryRejection, DeliveryStatus, MAX_DELIVERY_BATCH,
+    MAX_DELIVERY_BATCH_BYTES, MAX_DELIVERY_PREVIEW_BYTES, MAX_PENDING_DELIVERIES,
+    MAX_PENDING_PREVIEW_BYTES, delivery_summary,
+};
+mod inbox;
+pub use inbox::{MAX_PENDING_INSTRUCTION_BYTES, MAX_PENDING_INSTRUCTIONS, TurnInbox};
 mod idle;
 pub use idle::ActorIdleGuard;
 use idle::IdleReservation;
@@ -25,6 +33,8 @@ pub use prepared::{PreparedCommit, PreparedOperationTicket, PreparedTurn};
 mod queue;
 mod runner;
 mod tickets;
+mod transcript;
+pub use transcript::{TranscriptRequest, TranscriptSnapshot};
 mod types;
 
 #[cfg(test)]
@@ -32,7 +42,74 @@ mod tests;
 
 pub use actor_error::ActorError;
 pub use queue::{ActorQueue, InterruptQueue, QueueProjection};
-pub use tickets::TurnTicket;
+pub use tickets::{TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket};
+
+pub const MAX_RETAINED_TURN_RESULTS: usize = 128;
+const ADMISSION_PREPARATION_FAILED: &str =
+    "The agent could not start this turn: admission preparation failed.";
+
+pub type AdmissionPolicyConstraint =
+    Arc<dyn Fn(&EffectiveAgentConfig) -> Result<(), String> + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct TurnAdmissionOptions {
+    pub idle_only: bool,
+    pub existing_only: bool,
+    pub after_turn: Option<TurnId>,
+    pub provenance: TurnProvenance,
+    pub policy_constraint: Option<AdmissionPolicyConstraint>,
+}
+
+#[derive(Default)]
+struct CallbackDrain {
+    pending: Mutex<usize>,
+    changed: Event,
+}
+
+pub struct ActorEventLease(Arc<CallbackDrain>);
+
+impl Drop for ActorEventLease {
+    fn drop(&mut self) {
+        *self.0.pending.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.changed.notify(usize::MAX);
+    }
+}
+
+pub struct LeasedActorEvent {
+    event: ActorEvent,
+    _lease: ActorEventLease,
+}
+
+impl LeasedActorEvent {
+    pub fn into_parts(self) -> (ActorEvent, ActorEventLease) {
+        (self.event, self._lease)
+    }
+}
+
+#[derive(Clone)]
+pub enum ActorEvent {
+    Start {
+        agent_id: AgentId,
+        turn_id: TurnId,
+        provenance: TurnProvenance,
+        config: Option<ConfigCommit>,
+    },
+    End(TurnResult),
+    Delivery(DeliveryEvent),
+    DeliveryContinuationFailed {
+        parent_turn_id: TurnId,
+        reason: Option<TurnCancellationReason>,
+    },
+    Idle {
+        agent_id: AgentId,
+    },
+    Config(ConfigCommit),
+    Close {
+        agent_id: AgentId,
+        lifecycle: ActorLifecycle,
+    },
+}
+
 pub(crate) use types::ManagedTurnAdmission;
 pub use types::{
     ActorBackend, ActorLifecycle, ActorSnapshot, ActorStatus, AdmissionPreparation, BackendResult,
@@ -50,6 +127,7 @@ use maki_providers::{Message, TokenUsage};
 use tracing::info;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken, ReasonedCancelTrigger};
+use crate::tools::offload::OffloadStore;
 use crate::types::{AgentEvent, AgentId, EventSender, TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{AgentInput, CancelTrigger, History, RunSettings, SharedMessages};
 
@@ -97,12 +175,19 @@ impl ActorWork {
 pub(crate) struct ActorInner {
     pub(crate) agent_id: AgentId,
     pub(crate) identity: Arc<()>,
+    callback_drain: Arc<CallbackDrain>,
     pub(crate) state: Mutex<ActorState>,
     pub(crate) policy_changed: Event,
     pub(crate) queue: Arc<ActorQueue>,
     pub(crate) outcomes: Mutex<HashMap<TurnId, TurnOutcome>>,
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
+    retained_tickets: Mutex<HashMap<TurnId, TurnTicket>>,
+    latest_admitted: Mutex<Option<TurnId>>,
+    history: SharedMessages,
+    coverage: Mutex<HashMap<TurnId, Option<(u64, usize)>>>,
+    delivery_records: Mutex<HashMap<TurnId, (Option<ConfigCommit>, String)>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
+    offload: Option<Arc<OffloadStore>>,
     admission_preparation: Option<AdmissionPreparation>,
     prepared_readiness: Option<PreparedReadiness>,
     root_preparation_error: Option<Arc<dyn Fn(u64, String) + Send + Sync>>,
@@ -114,6 +199,20 @@ pub(crate) struct ActorInner {
     before_snapshot_state: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     #[cfg(test)]
     stale_preparation: Mutex<Option<flume::Sender<()>>>,
+}
+
+impl ActorInner {
+    /// Registers a live ticket and records it as the most recently admitted turn.
+    pub(crate) fn admit_ticket(&self, turn_id: TurnId, ticket: TurnTicket) {
+        self.tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(turn_id, ticket);
+        *self
+            .latest_admitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(turn_id);
+    }
 }
 
 pub(crate) struct ProcessingWork {
@@ -149,21 +248,36 @@ impl ProcessingWork {
 /// run starts; runs always push with the latest run id, so an older mark can
 /// never match again.
 pub(crate) struct ActorState {
+    instructions: HashMap<TurnId, inbox::InstructionInbox>,
+    pub(super) deliveries: HashMap<TurnId, delivery::PendingDelivery>,
+    pub(super) delivery_order: VecDeque<TurnId>,
+    pub(super) delivery_seen: VecDeque<TurnId>,
+    pub(super) delivery_runs: HashMap<TurnId, Vec<TurnId>>,
+    pub(super) delivery_suspended: bool,
+    pub(super) parent_delivery_policy: Option<delivery::ParentDeliveryPolicy>,
+
     pub(crate) lifecycle: ActorLifecycle,
+    close_pending: bool,
+    pending_publications: usize,
+    idle_pending: bool,
     pub(crate) status: ActorStatus,
     pub(crate) active: Option<ActiveCancel>,
     pub(crate) processing: Option<ProcessingWork>,
     idle: Option<IdleReservation>,
     pub(crate) cancelled_correlations: HashMap<String, TurnCancellationReason>,
-    pub(crate) cancelled_turns: HashSet<TurnId>,
     pub(crate) cancellation_generation: u64,
     pub(crate) policy_generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     latest: Option<TurnOutcome>,
+    latest_history_turn: Option<(TurnId, u64, usize)>,
+    retained_order: VecDeque<TurnId>,
+    presentation: u64,
     usage: TokenUsage,
     operations: VecDeque<ActorOperation>,
     preparing: Option<u64>,
     config_observers: Vec<flume::Sender<ConfigCommit>>,
+    event_observers: Vec<flume::Sender<ActorEvent>>,
+    leased_event_observers: Vec<(flume::Sender<LeasedActorEvent>, Arc<CallbackDrain>)>,
     next_operation_id: u64,
 }
 
@@ -186,6 +300,7 @@ enum ActorOperation {
         event_sender: Option<EventSender>,
         correlation: String,
         ticket: TurnTicket,
+        policy_constraint: Option<AdmissionPolicyConstraint>,
     },
     Root {
         id: u64,
@@ -347,7 +462,6 @@ fn settle_deferred(
                 input: Some(input),
                 event_sender,
                 correlation,
-                root: false,
                 generation: 0,
                 policy: None,
                 admission: None,
@@ -356,9 +470,16 @@ fn settle_deferred(
             finalize_turn(inner, turn_id, outcome, Some(&admission), true);
         }
     }
+    inner
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .publish_idle(inner);
 }
 
 fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
+    inner.policy_changed.notify(usize::MAX);
+    state.idle_pending |= state.has_pending_work(&inner.queue);
     loop {
         if state.lifecycle != ActorLifecycle::Open {
             return;
@@ -399,16 +520,84 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
                     config: state.policy.clone().unwrap(),
                 })
             });
+            if result.is_ok() {
+                state.delivery_suspended = false;
+                inner.queue.notify();
+            }
             if let Ok(commit) = &result
                 && commit.generation != previous_generation
             {
                 state
                     .config_observers
                     .retain(|observer| observer.send(commit.clone()).is_ok());
+                state.emit(ActorEvent::Config(commit.clone()));
             }
             *pending.completion.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
             inner.policy_changed.notify(usize::MAX);
             continue;
+        }
+        if let ActorOperation::Turn {
+            ticket,
+            correlation,
+            ..
+        } = head
+        {
+            delivery::record(
+                inner,
+                ticket.turn_id(),
+                state.policy_generation,
+                state.policy.clone(),
+                correlation.clone(),
+            );
+        }
+        if let ActorOperation::Turn {
+            policy_constraint: Some(constraint),
+            ..
+        } = head
+        {
+            let constraint = Arc::clone(constraint);
+            let policy = state.policy.clone();
+            let inner = Arc::clone(inner);
+            state.preparing = Some(id);
+            smol::spawn(async move {
+                let result = smol::unblock(move || {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let policy = policy
+                            .ok_or_else(|| "actor configuration is not initialized".to_string())?;
+                        constraint(&policy)
+                    }))
+                    .unwrap_or_else(|_| Err("admission policy constraint panicked".into()))
+                })
+                .await;
+                let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.preparing != Some(id)
+                    || state.operations.front().is_none_or(|work| work.id() != id)
+                {
+                    return;
+                }
+                state.preparing = None;
+                match result {
+                    Ok(()) => {
+                        if let Some(ActorOperation::Turn {
+                            policy_constraint, ..
+                        }) = state.operations.front_mut()
+                        {
+                            *policy_constraint = None;
+                        }
+                        drive_operations(&inner, &mut state);
+                    }
+                    Err(diagnostic) => {
+                        let work = state.operations.pop_front().unwrap();
+                        state.pending_publications += 1;
+                        drop(state);
+                        fail_admission(&inner, work, diagnostic, false);
+                        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        drive_operations(&inner, &mut state);
+                    }
+                }
+            })
+            .detach();
+            return;
         }
         let input = match head {
             ActorOperation::Turn { input, .. } => Some(input),
@@ -455,10 +644,11 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
                 let work = state.operations.pop_front().unwrap();
                 match snapshot {
                     Ok(snapshot) => {
-                        materialize(&inner, &state, work, Some(snapshot));
+                        materialize(&inner, &mut state, work, Some(snapshot));
                         drive_operations(&inner, &mut state);
                     }
                     Err(_) => {
+                        state.pending_publications += 1;
                         drive_operations(&inner, &mut state);
                         drop(state);
                         fail_preparation(&inner, work);
@@ -474,14 +664,15 @@ fn drive_operations(inner: &Arc<ActorInner>, state: &mut ActorState) {
 }
 
 fn fail_preparation(inner: &ActorInner, work: ActorOperation) {
-    tracing::error!(agent_id = %inner.agent_id, "admission preparation panicked");
+    fail_admission(inner, work, "admission preparation panicked".into(), true);
+}
+
+fn fail_admission(inner: &ActorInner, work: ActorOperation, diagnostic: String, retryable: bool) {
+    tracing::error!(agent_id = %inner.agent_id, %diagnostic, retryable, "turn admission failed");
     if let ActorOperation::Root { root, .. } = &work
         && let Some(report) = &inner.root_preparation_error
     {
-        report(
-            root.run_id,
-            "The agent could not start this turn: admission preparation failed.".into(),
-        );
+        report(root.run_id, ADMISSION_PREPARATION_FAILED.into());
     }
     if let ActorOperation::Turn {
         input,
@@ -498,7 +689,6 @@ fn fail_preparation(inner: &ActorInner, work: ActorOperation) {
             event_sender,
             correlation,
             ticket,
-            root: false,
             generation: 0,
             policy: None,
             admission: None,
@@ -510,13 +700,17 @@ fn fail_preparation(inner: &ActorInner, work: ActorOperation) {
             0,
             crate::types::TurnFailure {
                 kind: crate::types::TurnFailureKind::Internal,
-                diagnostic: "admission preparation panicked".into(),
+                diagnostic,
                 user_message: "The agent could not start this turn.".into(),
-                retryable: true,
+                retryable,
             },
         );
         finalize_turn(inner, turn_id, outcome, Some(&admission), true);
     }
+    let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.pending_publications -= 1;
+    state.finish_close(inner);
+    state.publish_idle(inner);
 }
 
 fn preparation_input(input: &AgentInput) -> AgentInput {
@@ -536,7 +730,7 @@ fn preparation_input(input: &AgentInput) -> AgentInput {
 
 fn materialize(
     inner: &ActorInner,
-    state: &ActorState,
+    state: &mut ActorState,
     work: ActorOperation,
     snapshot: Option<crate::agent::TurnAdmissionSnapshot>,
 ) {
@@ -551,13 +745,28 @@ fn materialize(
             if let Some(config) = &state.policy {
                 input.mode = config.mode.clone();
             }
+            delivery::record(
+                inner,
+                ticket.turn_id(),
+                state.policy_generation,
+                state.policy.clone(),
+                correlation.clone(),
+            );
+            if !state.delivery_runs.contains_key(&ticket.turn_id()) {
+                state
+                    .instructions
+                    .entry(ticket.turn_id())
+                    .or_insert_with(|| inbox::InstructionInbox::new(ticket.clone()));
+            }
+            if let Some(inbox) = state.instructions.get_mut(&ticket.turn_id()) {
+                inbox.policy = state.policy.clone();
+            }
             inner.queue.push(ActorWork::Turn(TurnAdmission {
                 turn_id: ticket.turn_id(),
                 input: Some(input),
                 event_sender,
                 correlation,
                 ticket,
-                root: false,
                 generation: state.policy_generation,
                 policy: state.policy.clone(),
                 admission: snapshot,
@@ -588,6 +797,83 @@ fn materialize(
 }
 
 impl ActorState {
+    pub(super) fn publish_idle(&mut self, inner: &ActorInner) {
+        if self.idle_pending
+            && self.lifecycle == ActorLifecycle::Open
+            && self.pending_publications == 0
+            && !self.has_pending_work(&inner.queue)
+            && inner
+                .tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            self.idle_pending = false;
+            self.emit(ActorEvent::Idle {
+                agent_id: inner.agent_id,
+            });
+        }
+    }
+
+    pub(super) fn emit(&mut self, event: ActorEvent) {
+        if let ActorEvent::Delivery(event) = &event {
+            let delivery = &event.delivery;
+            info!(
+                parent_id = %delivery.parent_id,
+                child_id = %delivery.result.outcome.agent_id(),
+                child_turn_id = %delivery.result.outcome.turn_id(),
+                compatibility_id = ?delivery.compatibility_id,
+                correlation = %delivery.correlation,
+                status = ?event.status,
+                config_generation = ?delivery.child_config.as_ref().map(|config| config.generation),
+                origin = ?delivery.result.provenance.origin,
+                plugin = ?delivery.result.provenance.plugin,
+                plugin_generation = ?delivery.result.provenance.plugin_generation,
+                "child lifecycle delivery"
+            );
+        }
+        self.event_observers
+            .retain(|sender| sender.send(event.clone()).is_ok());
+        self.leased_event_observers.retain(|(sender, drain)| {
+            *drain.pending.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            sender
+                .send(LeasedActorEvent {
+                    event: event.clone(),
+                    _lease: ActorEventLease(Arc::clone(drain)),
+                })
+                .is_ok()
+        });
+    }
+    pub(super) fn finish_close(&mut self, inner: &ActorInner) {
+        if self.close_pending
+            && self.processing.is_none()
+            && self.pending_publications == 0
+            && inner
+                .tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            self.close_pending = false;
+            self.emit(ActorEvent::Close {
+                agent_id: inner.agent_id,
+                lifecycle: self.lifecycle,
+            });
+            // Close is terminal: dropping the senders frees leases stranded in
+            // channels whose receivers stopped before draining.
+            self.event_observers.clear();
+            self.leased_event_observers.clear();
+            self.config_observers.clear();
+            inner.callback_drain.changed.notify(usize::MAX);
+        }
+    }
+
+    /// After Close, a new subscriber gets a disconnected channel rather than
+    /// one that never receives anything.
+    fn close_emitted(&self) -> bool {
+        self.lifecycle != ActorLifecycle::Open && !self.close_pending
+    }
+
     pub(crate) fn active_matches_correlation(&self, correlation: &str) -> bool {
         self.active.as_ref().is_some_and(|active| {
             active.correlation() == Some(correlation)
@@ -606,11 +892,18 @@ impl ActorState {
     }
 
     fn drain_work(&mut self) -> Vec<ActorOperation> {
+        self.drain_work_except(|_| false)
+    }
+
+    /// Drains queued work, keeping configuration barriers and entries `keep`
+    /// selects in their original order.
+    fn drain_work_except(&mut self, keep: impl Fn(&ActorOperation) -> bool) -> Vec<ActorOperation> {
         let mut work = Vec::new();
         let mut configs = VecDeque::new();
         for entry in self.operations.drain(..) {
             if matches!(entry, ActorOperation::Config(_))
                 || matches!(&entry, ActorOperation::Prepared(pending) if pending.turn.is_none())
+                || keep(&entry)
             {
                 configs.push_back(entry);
             } else {
@@ -623,8 +916,8 @@ impl ActorState {
 
     pub(crate) fn settle_runner(&mut self) {
         self.active = None;
-        self.status = ActorStatus::Idle;
         self.processing = None;
+        self.status = ActorStatus::Idle;
     }
 
     /// A started run supersedes every precancel mark it could match: pushes
@@ -650,24 +943,44 @@ impl ActorState {
 
     fn idle(policy: Option<Arc<EffectiveAgentConfig>>) -> Self {
         Self {
+            instructions: HashMap::new(),
+            deliveries: HashMap::new(),
+            delivery_order: VecDeque::new(),
+            delivery_seen: VecDeque::new(),
+            delivery_runs: HashMap::new(),
+            delivery_suspended: false,
+            parent_delivery_policy: None,
             lifecycle: ActorLifecycle::Open,
+            close_pending: false,
+            pending_publications: 0,
+            idle_pending: false,
             status: ActorStatus::Idle,
             active: None,
             processing: None,
             idle: None,
             cancelled_correlations: HashMap::new(),
-            cancelled_turns: HashSet::new(),
             cancellation_generation: 0,
             policy_generation: 0,
             policy,
             latest: None,
+            latest_history_turn: None,
+            retained_order: VecDeque::new(),
+            presentation: 0,
             usage: TokenUsage::default(),
             operations: VecDeque::new(),
             preparing: None,
             config_observers: Vec::new(),
+            event_observers: Vec::new(),
+            leased_event_observers: Vec::new(),
             next_operation_id: 0,
         }
     }
+}
+
+pub(crate) struct TurnCancelCut {
+    active: Option<ActiveCancel>,
+    deferred: Vec<ActorOperation>,
+    queued: Option<TurnAdmission>,
 }
 
 pub(crate) struct CorrelationCancelCut {
@@ -723,37 +1036,62 @@ fn retire_turn(
     turn_id: TurnId,
     outcome: &TurnOutcome,
     settle_runner: bool,
-) -> bool {
+    history_ready: bool,
+) -> Option<Option<TurnTicket>> {
     let mut outcomes = inner.outcomes.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.instructions.remove(&turn_id);
     if settle_runner {
         state.settle_runner();
     }
     let std::collections::hash_map::Entry::Vacant(vacant) = outcomes.entry(turn_id) else {
-        return false;
+        return None;
     };
     let mut tickets = inner.tickets.lock().unwrap_or_else(|e| e.into_inner());
     vacant.insert(outcome.clone());
-    state.cancelled_turns.remove(&turn_id);
     if state.release_idle_permission(turn_id) {
         inner.queue.notify();
     }
+    let history = inner.history.load();
+    inner
+        .coverage
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            turn_id,
+            history_ready.then_some((history.epoch, history.messages.len())),
+        );
     state.latest = Some(outcome.clone());
-    state.usage += outcome.usage();
-    tickets.remove(&turn_id);
-    true
-}
-
-pub(crate) fn publish_turn(outcome: TurnOutcome, admission: Option<&TurnAdmission>, deliver: bool) {
-    if deliver
-        && let Some(admission) = admission
-        && let Some(sender) = &admission.event_sender
+    if history_ready {
+        state.latest_history_turn = Some((turn_id, history.epoch, history.messages.len()));
+    }
+    state.retained_order.push_back(turn_id);
+    if state.retained_order.len() > MAX_RETAINED_TURN_RESULTS
+        && let Some(evicted) = state.retained_order.pop_front()
     {
-        let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
+        outcomes.remove(&evicted);
+        inner
+            .retained_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&evicted);
+        inner
+            .coverage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&evicted);
     }
-    if let Some(admission) = admission {
-        admission.ticket.resolve(outcome);
+    state.usage += outcome.usage();
+    state.pending_publications += 1;
+    let ticket = tickets.remove(&turn_id);
+    if let Some(ticket) = &ticket {
+        inner
+            .retained_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(turn_id, ticket.clone());
     }
+    Some(ticket)
 }
 
 pub(crate) fn finalize_turn(
@@ -763,7 +1101,7 @@ pub(crate) fn finalize_turn(
     admission: Option<&TurnAdmission>,
     deliver: bool,
 ) {
-    retire_and_publish(inner, turn_id, outcome, admission, deliver, false);
+    retire_and_publish(inner, turn_id, outcome, admission, deliver, false, false);
 }
 
 /// Finalizes the runner's own turn, clearing its active slot atomically
@@ -773,6 +1111,7 @@ pub(crate) fn settle_and_finalize_turn(
     admission: &TurnAdmission,
     outcome: TurnOutcome,
     deliver: bool,
+    history_ready: bool,
 ) {
     retire_and_publish(
         inner,
@@ -781,6 +1120,7 @@ pub(crate) fn settle_and_finalize_turn(
         Some(admission),
         deliver,
         true,
+        history_ready,
     );
 }
 
@@ -791,8 +1131,12 @@ fn retire_and_publish(
     admission: Option<&TurnAdmission>,
     deliver: bool,
     settle_runner: bool,
+    history_ready: bool,
 ) {
-    if retire_turn(inner, turn_id, &outcome, settle_runner) {
+    let presentation = admission
+        .filter(|_| deliver)
+        .and_then(|admission| admission.event_sender.as_ref());
+    if let Some(ticket) = retire_turn(inner, turn_id, &outcome, settle_runner, history_ready) {
         #[cfg(test)]
         if let Some((retired, release)) = inner
             .after_finalization_retire
@@ -803,7 +1147,31 @@ fn retire_and_publish(
             let _ = retired.send(());
             let _ = release.recv();
         }
-        publish_turn(outcome, admission, deliver);
+        if let Some(sender) = presentation {
+            let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
+        }
+        if let Some(ticket) = &ticket {
+            ticket.seal(&outcome);
+            delivery::publish(inner, ticket, admission);
+        }
+        delivery::settle(
+            inner,
+            turn_id,
+            match &outcome {
+                TurnOutcome::Cancelled { reason, .. } => Some(*reason),
+                _ => None,
+            },
+        );
+        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ticket) = ticket {
+            ticket.resolve(outcome);
+            if let Some(result) = ticket.peek_result() {
+                state.emit(ActorEvent::End(result));
+            }
+        }
+        state.pending_publications -= 1;
+        state.finish_close(inner);
+        state.publish_idle(inner);
     }
 }
 
@@ -814,6 +1182,11 @@ fn terminalize_work(inner: &ActorInner, drained: Vec<ActorWork>, reason: TurnCan
             finalize_turn(inner, admission.turn_id, outcome, Some(&admission), true);
         }
     }
+    inner
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .publish_idle(inner);
 }
 
 pub(super) fn cancelled_outcome(
@@ -896,21 +1269,30 @@ impl AgentActorHandle {
         initial_config: Option<Arc<EffectiveAgentConfig>>,
         start: Option<flume::Receiver<()>>,
     ) -> (Self, smol::Task<()>) {
-        let history = match shared_messages {
-            Some(mirror) => History::restored(initial_messages).with_mirror(mirror),
-            None => History::restored(initial_messages),
-        };
+        let mirror = shared_messages.unwrap_or_else(|| {
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::HistorySnapshot::default(),
+            ))
+        });
+        let history = History::restored(initial_messages).with_mirror(Arc::clone(&mirror));
         let admission_preparation = backend.admission_preparation();
         let root_preparation_error = backend.root_preparation_error_handler();
         let inner = Arc::new(ActorInner {
             agent_id,
             identity: Arc::new(()),
+            callback_drain: Arc::default(),
             state: Mutex::new(ActorState::idle(initial_config)),
             policy_changed: Event::new(),
             queue: Arc::new(ActorQueue::new()),
             outcomes: Mutex::new(HashMap::new()),
             tickets: Mutex::new(HashMap::new()),
+            retained_tickets: Mutex::new(HashMap::new()),
+            latest_admitted: Mutex::new(None),
+            history: mirror,
+            coverage: Mutex::new(HashMap::new()),
             managed_admission,
+            offload: backend.offload_store(),
+            delivery_records: Mutex::new(HashMap::new()),
             admission_preparation,
             prepared_readiness: backend.prepared_readiness(),
             root_preparation_error,
@@ -961,22 +1343,280 @@ impl AgentActorHandle {
         (handle, task)
     }
 
+    /// Sets child-result routing before any work is admitted.
+    pub fn configure_parent_delivery(
+        &self,
+        auto_deliver: bool,
+        compatibility_id: Option<String>,
+    ) -> Result<(), ActorError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        if state.next_operation_id != 0 || state.parent_delivery_policy.is_some() {
+            return Err(ActorError::Busy);
+        }
+        state.parent_delivery_policy = Some(delivery::ParentDeliveryPolicy {
+            auto_deliver,
+            compatibility_id,
+        });
+        Ok(())
+    }
+
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
+    }
+
+    /// Any admitted turn whose ticket has not resolved, including one retired
+    /// but still publishing its delivery.
+    pub(crate) fn unsettled_ticket(&self) -> Option<TurnTicket> {
+        let active = self
+            .inner
+            .tickets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .find(|ticket| ticket.peek().is_none())
+            .cloned();
+        active.or_else(|| {
+            self.inner
+                .retained_tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .find(|ticket| ticket.peek().is_none())
+                .cloned()
+        })
+    }
+
+    /// Whether settled turns are published to the recorded parent's inbox.
+    pub(crate) fn reports_to_parent(&self) -> bool {
+        self.inner
+            .managed_admission
+            .as_ref()
+            .is_some_and(|managed| managed.parent_delivery.is_some())
+            && self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .parent_delivery_policy
+                .as_ref()
+                .is_some_and(|policy| policy.auto_deliver)
+    }
+
+    pub(crate) fn lifecycle(&self) -> ActorLifecycle {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .lifecycle
+    }
+
+    /// Captures the nominal processing turn, including the pop/install gap.
+    #[cfg(test)]
+    pub(crate) fn processing_turn_id(&self) -> Option<TurnId> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .processing
+            .as_ref()
+            .and_then(|processing| processing.turn_id)
+    }
+
+    pub fn capture_processing_presentation_cut(&self, displayed: u64) -> (Option<TurnId>, u64) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let turn_id = state
+            .processing
+            .as_ref()
+            .and_then(|processing| processing.turn_id);
+        if let Some(processing) = &mut state.processing
+            && processing.turn_id.is_some()
+        {
+            processing
+                .cancellation_reason
+                .get_or_insert(TurnCancellationReason::User);
+        }
+        state.instructions.clear();
+        state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
+        let deferred = state.drain_work();
+        if let Some(active) = state.active.take() {
+            active.fire(TurnCancellationReason::User);
+        }
+        let drained = self.inner.queue.drain_all();
+        drive_operations(&self.inner, &mut state);
+        state.presentation = state.presentation.max(displayed) + 1;
+        let fence = state.presentation;
+        drop(state);
+        settle_deferred(&self.inner, deferred, TurnCancellationReason::User);
+        terminalize_work(&self.inner, drained, TurnCancellationReason::User);
+        (turn_id, fence)
+    }
+
+    pub fn presentation_id(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .presentation
+    }
+
+    pub fn observe_presentation(&self, id: u64) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.presentation = state.presentation.max(id);
+    }
+
+    pub fn reserve_presentation(&self, displayed: u64) -> u64 {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.presentation = state.presentation.max(displayed) + 1;
+        state.presentation
+    }
+
+    pub fn allocate_processing_presentation(
+        &self,
+        turn_id: TurnId,
+        displayed: Option<u64>,
+    ) -> Result<u64, ActorError> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        let processing = state
+            .processing
+            .as_ref()
+            .filter(|processing| processing.turn_id == Some(turn_id))
+            .ok_or(ActorError::UnknownTurn(turn_id))?;
+        if processing.cancellation_reason.is_some() {
+            return Err(ActorError::PolicyCancelled);
+        }
+        if displayed == Some(state.presentation) {
+            return Ok(state.presentation);
+        }
+        state.presentation += 1;
+        Ok(state.presentation)
+    }
+
+    pub fn bind_active_correlation(
+        &self,
+        turn_id: TurnId,
+        correlation: String,
+    ) -> Result<(), ActorError> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        if state.status != ActorStatus::Running(turn_id) {
+            return Err(ActorError::UnknownTurn(turn_id));
+        }
+        let reason = state.cancelled_correlations.remove(&correlation);
+        let processing = state
+            .processing
+            .as_mut()
+            .ok_or(ActorError::UnknownTurn(turn_id))?;
+        if !processing.matches_correlation(&correlation) {
+            processing.correlations.push(correlation);
+        }
+        let reason = reason.map(|reason| *processing.cancellation_reason.get_or_insert(reason));
+        let active = if reason.is_some() {
+            state.active.take().zip(reason)
+        } else {
+            None
+        };
+        drop(state);
+        if let Some((active, reason)) = active {
+            active.fire(reason);
+        }
+        Ok(())
     }
 
     pub fn identity(&self) -> Arc<()> {
         Arc::clone(&self.inner.identity)
     }
 
-    pub fn subscribe_config_commits(&self) -> flume::Receiver<ConfigCommit> {
+    pub fn subscribe_leased_events(&self) -> flume::Receiver<LeasedActorEvent> {
         let (sender, receiver) = flume::unbounded();
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.close_emitted() {
+            state
+                .leased_event_observers
+                .push((sender, Arc::clone(&self.inner.callback_drain)));
+        }
+        receiver
+    }
+
+    /// Close has been emitted and every leased event handed out, Close
+    /// included, has been released. Until Close is emitted a closing actor
+    /// can still lease events, so an empty count alone is not enough.
+    pub(crate) fn callbacks_drained(&self) -> bool {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.close_emitted()
+            && *self
+                .inner
+                .callback_drain
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                == 0
+    }
+
+    pub(crate) async fn wait_callback_drain(&self) {
+        loop {
+            let listener = self.inner.callback_drain.changed.listen();
+            if self.callbacks_drained() {
+                return;
+            }
+            listener.await;
+        }
+    }
+
+    pub fn subscribe_events(&self) -> flume::Receiver<ActorEvent> {
+        let (sender, receiver) = flume::unbounded();
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.close_emitted() {
+            state.event_observers.push(sender);
+        }
+        receiver
+    }
+
+    /// The ticket of the most recently admitted turn, whatever admitted it,
+    /// while it is live or retained.
+    pub fn latest_ticket(&self) -> Option<TurnTicket> {
+        let turn_id = (*self
+            .inner
+            .latest_admitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()))?;
+        self.turn_ticket(turn_id)
+    }
+
+    pub fn turn_ticket(&self, turn_id: TurnId) -> Option<TurnTicket> {
         self.inner
-            .state
+            .tickets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .config_observers
-            .push(sender);
+            .get(&turn_id)
+            .cloned()
+            .or_else(|| {
+                self.inner
+                    .retained_tickets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&turn_id)
+                    .cloned()
+            })
+    }
+
+    pub fn subscribe_config_commits(&self) -> flume::Receiver<ConfigCommit> {
+        let (sender, receiver) = flume::unbounded();
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.close_emitted() {
+            state.config_observers.push(sender);
+        }
         receiver
     }
 
@@ -1035,27 +1675,224 @@ impl AgentActorHandle {
         event_sender: Option<EventSender>,
         correlation: String,
     ) -> Result<TurnTicket, ActorError> {
+        self.admit_turn_with_options(
+            input,
+            event_sender,
+            correlation,
+            TurnAdmissionOptions::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_turn_if_idle(
+        &self,
+        input: AgentInput,
+        event_sender: Option<EventSender>,
+        correlation: String,
+        after_turn: Option<TurnId>,
+    ) -> Result<TurnTicket, ActorError> {
+        self.admit_turn_with_options(
+            input,
+            event_sender,
+            correlation,
+            TurnAdmissionOptions {
+                idle_only: true,
+                after_turn,
+                ..TurnAdmissionOptions::default()
+            },
+        )
+    }
+
+    /// Starts ordinary work or steers its open instruction admission. The host
+    /// must authorize the sender before calling; provenance never changes the
+    /// execution's original authority. Lock order is actor state, then queue or
+    /// tickets. No policy callback or backend operation runs under these locks.
+    pub fn submit(
+        &self,
+        input: AgentInput,
+        event_sender: Option<EventSender>,
+        correlation: String,
+        options: TurnAdmissionOptions,
+    ) -> Result<TurnTicket, ActorError> {
+        if !input.images.is_empty() || !input.preamble.is_empty() {
+            return Err(ActorError::InvalidInstruction);
+        }
+        let bytes = input.message.len();
+        if bytes > MAX_PENDING_INSTRUCTION_BYTES {
+            return Err(ActorError::InstructionOverflow);
+        }
+        loop {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.lifecycle != ActorLifecycle::Open {
+                return Err(lifecycle_error(state.lifecycle));
+            }
+            let active =
+                state
+                    .processing
+                    .as_ref()
+                    .and_then(|work| work.turn_id)
+                    .or(match state.status {
+                        ActorStatus::Running(id) => Some(id),
+                        ActorStatus::Idle => None,
+                    });
+            let target = active
+                .filter(|id| state.instructions.get(id).is_some_and(|inbox| inbox.open))
+                .or_else(|| {
+                    state.instructions.iter().find_map(|(id, inbox)| {
+                        (inbox.open && inbox.submit_operation == Some(state.next_operation_id))
+                            .then_some(*id)
+                    })
+                });
+            if let Some(target) = target {
+                if options.idle_only || options.after_turn.is_some() {
+                    return Err(ActorError::Busy);
+                }
+                if state.cancelled_correlations.contains_key(&correlation) {
+                    return Err(ActorError::Busy);
+                }
+                if let Some(constraint) = &options.policy_constraint {
+                    let generation = state.policy_generation;
+                    let operation_boundary = state.next_operation_id;
+                    let policy = state
+                        .instructions
+                        .get(&target)
+                        .and_then(|inbox| inbox.policy.clone())
+                        .ok_or(ActorError::PolicyPending)?;
+                    drop(state);
+                    constraint(&policy).map_err(ActorError::InvalidConfig)?;
+                    state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.policy_generation != generation
+                        || state.next_operation_id != operation_boundary
+                        || state.cancelled_correlations.contains_key(&correlation)
+                        || state.lifecycle != ActorLifecycle::Open
+                        || state
+                            .instructions
+                            .get(&target)
+                            .is_none_or(|inbox| !inbox.open)
+                    {
+                        continue;
+                    }
+                }
+                let (count, total) = state
+                    .instructions
+                    .values()
+                    .map(inbox::InstructionInbox::outstanding)
+                    .fold((0, 0), |(count, bytes), (n, b)| (count + n, bytes + b));
+                if count >= MAX_PENDING_INSTRUCTIONS
+                    || total + bytes > MAX_PENDING_INSTRUCTION_BYTES
+                {
+                    return Err(ActorError::InstructionOverflow);
+                }
+                let inbox = state
+                    .instructions
+                    .get_mut(&target)
+                    .expect("target checked under actor lock");
+                inbox.pending.push_back(inbox::InstructionEntry {
+                    input,
+                    provenance: options.provenance,
+                    bytes,
+                });
+                return Ok(inbox.ticket.clone());
+            }
+            if options.existing_only {
+                return Err(ActorError::Busy);
+            }
+            if (options.idle_only || options.after_turn.is_some())
+                && (state.idle.is_some() || state.has_pending_work(&self.inner.queue))
+            {
+                return Err(ActorError::Busy);
+            }
+            if let Some(after) = options.after_turn
+                && state.latest.as_ref().map(TurnOutcome::turn_id) != Some(after)
+            {
+                return Err(ActorError::StaleTurn);
+            }
+            let (count, total) = state
+                .instructions
+                .values()
+                .map(inbox::InstructionInbox::outstanding)
+                .fold((0, 0), |(count, bytes), (n, b)| (count + n, bytes + b));
+            if count >= MAX_PENDING_INSTRUCTIONS || total + bytes > MAX_PENDING_INSTRUCTION_BYTES {
+                return Err(ActorError::InstructionOverflow);
+            }
+            let turn_id = TurnId::generate();
+            let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity))
+                .with_provenance(options.provenance);
+            state.next_operation_id = state.next_operation_id.wrapping_add(1);
+            let id = state.next_operation_id;
+            let mut inbox = inbox::InstructionInbox::new(ticket.clone());
+            inbox.drained.push((ticket.provenance().clone(), bytes));
+            inbox.submit_operation = Some(id);
+            state.delivery_suspended = false;
+            state.instructions.insert(turn_id, inbox);
+            self.inner.admit_ticket(turn_id, ticket.clone());
+            let reason = state.cancelled_correlations.get(&correlation).copied();
+            let work = ActorOperation::Turn {
+                id,
+                input,
+                event_sender,
+                correlation,
+                ticket: ticket.clone(),
+                policy_constraint: options.policy_constraint,
+            };
+            if let Some(reason) = reason {
+                drop(state);
+                settle_deferred(&self.inner, vec![work], reason);
+            } else {
+                state.operations.push_back(work);
+                drive_operations(&self.inner, &mut state);
+            }
+            return Ok(ticket);
+        }
+    }
+
+    pub fn admit_turn_with_options(
+        &self,
+        input: AgentInput,
+        event_sender: Option<EventSender>,
+        correlation: String,
+        options: TurnAdmissionOptions,
+    ) -> Result<TurnTicket, ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
+        if (options.idle_only || options.after_turn.is_some())
+            && (state.idle.is_some() || state.has_pending_work(&self.inner.queue))
+        {
+            return Err(ActorError::Busy);
+        }
+        if let Some(after) = options.after_turn
+            && state.latest.as_ref().map(TurnOutcome::turn_id) != Some(after)
+        {
+            return Err(ActorError::StaleTurn);
+        }
         let turn_id = TurnId::generate();
-        let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
+        let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity))
+            .with_provenance(options.provenance);
+        state.delivery_suspended = false;
+        state
+            .instructions
+            .insert(turn_id, inbox::InstructionInbox::new(ticket.clone()));
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let after = state.next_operation_id;
         let reason = state.cancelled_correlations.get(&correlation).copied();
+        delivery::record(
+            &self.inner,
+            turn_id,
+            state.policy_generation,
+            state.policy.clone(),
+            correlation.clone(),
+        );
         let work = ActorOperation::Turn {
             id: after,
             input,
             event_sender,
             correlation,
             ticket: ticket.clone(),
+            policy_constraint: options.policy_constraint,
         };
-        self.inner
-            .tickets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(turn_id, ticket.clone());
+        self.inner.admit_ticket(turn_id, ticket.clone());
         if let Some(reason) = reason {
             drop(state);
             settle_deferred(&self.inner, vec![work], reason);
@@ -1178,8 +2015,14 @@ impl AgentActorHandle {
                 "custom mode requires a resolved definition".into(),
             ));
         }
-        state.policy = Some(Arc::new(config));
+        let config = Arc::new(config);
+        state.policy = Some(Arc::clone(&config));
         let generation = state.policy_generation;
+        state.emit(ActorEvent::Config(ConfigCommit {
+            identity: Arc::clone(&self.inner.identity),
+            generation,
+            config,
+        }));
         Ok(generation)
     }
 
@@ -1300,6 +2143,11 @@ impl AgentActorHandle {
                 true,
             );
         }
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publish_idle(&self.inner);
         Some(projection)
     }
 
@@ -1355,15 +2203,52 @@ impl AgentActorHandle {
                 true,
             );
         }
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publish_idle(&self.inner);
         Some(projection)
     }
 
     /// Clears every queued item, terminalizing the admitted turns. Returns
     /// the number of items removed.
     pub fn clear(&self) -> usize {
+        self.clear_except(false)
+    }
+
+    /// Clears queued user work after a failed turn while keeping child-result
+    /// deliveries, which the user did not author and cannot resubmit.
+    pub fn clear_user_work(&self) -> usize {
+        self.clear_except(true)
+    }
+
+    fn clear_except(&self, keep_deliveries: bool) -> usize {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let deferred = state.drain_work();
-        let drained = self.inner.queue.drain_all();
+        if !keep_deliveries {
+            delivery::discard(&mut state, TurnCancellationReason::User);
+        }
+        let deliveries = if keep_deliveries {
+            state.delivery_runs.keys().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let deferred = state.drain_work_except(|entry| {
+            matches!(entry, ActorOperation::Turn { ticket, .. } if deliveries.contains(&ticket.turn_id()))
+        });
+        let drained = self.inner.queue.drain_except(
+            |work| matches!(work, ActorWork::Turn(admission) if deliveries.contains(&admission.turn_id)),
+        );
+        for work in &drained {
+            if let ActorWork::Turn(admission) = work {
+                state.instructions.remove(&admission.turn_id);
+            }
+        }
+        for work in &deferred {
+            if let ActorOperation::Turn { ticket, .. } = work {
+                state.instructions.remove(&ticket.turn_id());
+            }
+        }
         drive_operations(&self.inner, &mut state);
         let len = drained.len()
             + deferred
@@ -1387,7 +2272,13 @@ impl AgentActorHandle {
     /// cannot move a turn through the pop/install gap without observing the cut.
     pub fn cancel_existing(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.instructions.clear();
         state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
+        if let Some(processing) = &mut state.processing {
+            processing
+                .cancellation_reason
+                .get_or_insert(TurnCancellationReason::User);
+        }
         let deferred = state.drain_work();
         let active = state.active.take();
         let drained = self.inner.queue.drain_all();
@@ -1406,12 +2297,20 @@ impl AgentActorHandle {
     /// affected.
     pub fn cancel_turn(&self, turn_id: TurnId) -> Result<(), ActorError> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let cut = self.capture_turn_cancel(&mut state, turn_id, TurnCancellationReason::User)?;
+        drop(state);
+        self.settle_turn_cancel(cut, TurnCancellationReason::User);
+        Ok(())
+    }
+
+    pub(crate) fn capture_turn_cancel(
+        &self,
+        state: &mut ActorState,
+        turn_id: TurnId,
+        reason: TurnCancellationReason,
+    ) -> Result<TurnCancelCut, ActorError> {
         if state.lifecycle != ActorLifecycle::Open {
-            return Err(match state.lifecycle {
-                ActorLifecycle::Closed => ActorError::Closed,
-                ActorLifecycle::Shutdown => ActorError::Shutdown,
-                ActorLifecycle::Open => unreachable!(),
-            });
+            return Err(lifecycle_error(state.lifecycle));
         }
         if !self
             .inner
@@ -1422,42 +2321,33 @@ impl AgentActorHandle {
         {
             return Err(ActorError::UnknownTurn(turn_id));
         }
-        let active = if state.status == ActorStatus::Running(turn_id) {
-            state.active.take()
-        } else {
-            None
-        };
+        state.instructions.remove(&turn_id);
+        let running = state.status == ActorStatus::Running(turn_id);
+        if let Some(processing) = &mut state.processing
+            && (running || processing.turn_id == Some(turn_id))
+        {
+            processing.cancellation_reason.get_or_insert(reason);
+        }
+        let active = if running { state.active.take() } else { None };
         let queued = self.inner.queue.remove_turn(turn_id);
         let deferred = state.operations.iter().position(|admission| {
             matches!(admission, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == turn_id)
         }).and_then(|index| state.operations.remove(index));
-        if active.is_none()
-            && queued.is_none()
-            && deferred.is_none()
-            && state.status == ActorStatus::Idle
-            && state
-                .processing
-                .as_ref()
-                .is_some_and(|processing| processing.turn_id == Some(turn_id))
-        {
-            state.cancelled_turns.insert(turn_id);
+        drive_operations(&self.inner, state);
+        Ok(TurnCancelCut {
+            active,
+            deferred: deferred.into_iter().collect(),
+            queued,
+        })
+    }
+
+    pub(crate) fn settle_turn_cancel(&self, cut: TurnCancelCut, reason: TurnCancellationReason) {
+        settle_deferred(&self.inner, cut.deferred, reason);
+        if let Some(active) = cut.active {
+            active.fire(reason);
         }
-        drive_operations(&self.inner, &mut state);
-        drop(state);
-        settle_deferred(
-            &self.inner,
-            deferred.into_iter().collect(),
-            TurnCancellationReason::User,
-        );
-        if let Some(active) = active {
-            active.fire(TurnCancellationReason::User);
-        }
-        if let Some(admission) = queued {
-            let outcome = cancelled_outcome(
-                self.inner.agent_id,
-                admission.turn_id,
-                TurnCancellationReason::User,
-            );
+        if let Some(admission) = cut.queued {
+            let outcome = cancelled_outcome(self.inner.agent_id, admission.turn_id, reason);
             finalize_turn(
                 &self.inner,
                 admission.turn_id,
@@ -1466,12 +2356,11 @@ impl AgentActorHandle {
                 true,
             );
         }
-        Ok(())
     }
 
     /// Closes the actor: admissions are rejected, the active turn is
-    /// cancelled with `Closed`, queued turns terminalize, and the runner
-    /// task exits.
+    /// cancelled with `Closed`, queued turns terminalize immediately, and the
+    /// runner retains the active backend outcome before emitting `Close` and exiting.
     pub fn close(&self) {
         self.close_internal(ActorLifecycle::Closed, TurnCancellationReason::Closed);
     }
@@ -1545,6 +2434,24 @@ impl AgentActorHandle {
                 remaining.push_back(admission);
             }
         }
+        if let Some(id) = active_turn {
+            state.instructions.remove(&id);
+        }
+        if matched_processing
+            && let Some(id) = state.processing.as_ref().and_then(|work| work.turn_id)
+        {
+            state.instructions.remove(&id);
+        }
+        for work in &matched {
+            if let ActorWork::Turn(admission) = work {
+                state.instructions.remove(&admission.turn_id);
+            }
+        }
+        for work in &deferred {
+            if let ActorOperation::Turn { ticket, .. } = work {
+                state.instructions.remove(&ticket.turn_id());
+            }
+        }
         state.operations = remaining;
         drive_operations(&self.inner, state);
         if !matched_active && !matched_processing && matched.is_empty() && deferred.is_empty() {
@@ -1570,18 +2477,7 @@ impl AgentActorHandle {
     ) {
         settle_deferred(&self.inner, cut.deferred, reason);
 
-        for work in cut.matched {
-            if let ActorWork::Turn(admission) = work {
-                let outcome = cancelled_outcome(self.inner.agent_id, admission.turn_id, reason);
-                finalize_turn(
-                    &self.inner,
-                    admission.turn_id,
-                    outcome,
-                    Some(&admission),
-                    true,
-                );
-            }
-        }
+        terminalize_work(&self.inner, cut.matched, reason);
         if let Some(active) = cut.active {
             active.fire(reason);
         }
@@ -1674,7 +2570,7 @@ impl AgentActorHandle {
     }
 
     fn close_internal(&self, lifecycle: ActorLifecycle, reason: TurnCancellationReason) {
-        let (active, deferred) = {
+        let (active, deferred, active_reason) = {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             // First terminal lifecycle/reason wins: repeated close/shutdown are
             // idempotent no-ops, so a race cannot overwrite Closed with Shutdown
@@ -1682,7 +2578,10 @@ impl AgentActorHandle {
             if state.lifecycle != ActorLifecycle::Open {
                 return;
             }
+            state.instructions.clear();
+            delivery::discard(&mut state, reason);
             state.lifecycle = lifecycle;
+            state.close_pending = true;
             state.preparing = None;
             for entry in &state.operations {
                 if let ActorOperation::Prepared(pending) = entry {
@@ -1702,18 +2601,26 @@ impl AgentActorHandle {
             }
             self.inner.policy_changed.notify(usize::MAX);
             state.cancelled_correlations.clear();
-            state.cancelled_turns.clear();
             (
                 state.active.take(),
                 state.operations.drain(..).collect::<Vec<_>>(),
+                state
+                    .processing
+                    .as_ref()
+                    .and_then(|processing| processing.cancellation_reason)
+                    .unwrap_or(reason),
             )
         };
-        settle_deferred(&self.inner, deferred, reason);
         if let Some(active) = active {
-            active.fire(reason);
+            active.fire(active_reason);
         }
+        settle_deferred(&self.inner, deferred, reason);
         let drained = self.inner.queue.drain_all();
         terminalize_work(&self.inner, drained, reason);
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.finish_close(&self.inner);
+        }
         self.inner.queue.notify();
         self.wake.wake();
         info!(agent_id = %self.inner.agent_id, ?reason, ?lifecycle, "actor closed");

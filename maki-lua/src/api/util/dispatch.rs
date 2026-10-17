@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mlua::{FromLuaMulti, Function, IntoLuaMulti, Lua};
 
@@ -119,7 +120,8 @@ pub(crate) async fn call_swallowing<R: FromLuaMulti>(
 /// with plugin and seam name, then swallowed. The detached [`TaskScope`]
 /// matters here, because a callback that inherits the firer's scope gets
 /// cancelled when the firer's task dies, and plugin B should not pay for
-/// plugin A's crash.
+/// plugin A's crash. A callback fired from a delegated tool stays delegated,
+/// so synchronous dispatch cannot hand the tool trusted authority.
 pub(crate) fn call_isolated<R: FromLuaMulti>(
     lua: &Lua,
     func: &Function,
@@ -127,7 +129,17 @@ pub(crate) fn call_isolated<R: FromLuaMulti>(
     seam: &str,
     plugin: &str,
 ) -> Option<R> {
-    let _scope = TaskScope::detached(lua);
+    if crate::runtime::validate_plugin_effect(lua).is_err() {
+        return None;
+    }
+    let delegated = crate::runtime::delegated_tool(lua);
+    let owner_plugin = Arc::<str>::from(plugin);
+    let owner = crate::orchestration::plugin_authority(lua, owner_plugin.clone());
+    let scope = TaskScope::detached(lua);
+    crate::runtime::lock_cell(scope.handle()).delegated_tool = delegated;
+    if owner.is_alive() && crate::runtime::bind_plugin_owner(lua, owner_plugin, owner).is_err() {
+        return None;
+    }
     match func.call::<R>(args) {
         Ok(r) => Some(r),
         Err(e) => {

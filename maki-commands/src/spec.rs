@@ -1,3 +1,4 @@
+pub use maki_domain::ModelSelection;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -15,6 +16,10 @@ pub type CommandFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub const MAX_COMMAND_DEPTH: usize = 8;
 pub const COMPACT_COMMAND_NAME: &str = "/compact";
+pub const MODEL_COMMAND_NAME: &str = "/model";
+pub(crate) const MALFORMED_MODEL_OPTIONS: &str = "malformed model options";
+pub(crate) const MIXED_QUOTED_MODEL_SYNTAX: &str = "mixed quoted model syntax";
+pub(crate) const MODEL_OPTION_KEY_VALUE: &str = "expected model option key=value";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -114,6 +119,7 @@ pub enum BuiltinOperation {
     SetModel {
         spec: Arc<str>,
     },
+    SelectModel(ModelSelection),
     OpenThemePicker,
     SetTheme {
         name: Arc<str>,
@@ -133,6 +139,93 @@ pub enum BuiltinOperation {
     Exit,
     Reload,
     Trust,
+}
+
+pub fn parse_model_selection(arguments: &str) -> Result<ModelSelection, crate::CommandError> {
+    let invalid = |message: String| crate::CommandError::Producer(Arc::from(message));
+    let mut selection = ModelSelection::default();
+    // Quotes and escapes make a token literal; option values may still be quoted.
+    let tokens = crate::lex_strict(arguments).map_err(|error| invalid(error.to_string()))?;
+    let mut tokens = tokens.into_iter();
+    while let Some(token) = tokens.next() {
+        let mut end = token.range.end;
+        let token_raw = &arguments[token.range.clone()];
+        let literal = token_raw.starts_with(['\'', '"', '\\']);
+        if literal && token_raw.contains(['{', '}']) {
+            if token_raw.starts_with('\\') {
+                return Err(invalid(MIXED_QUOTED_MODEL_SYNTAX.into()));
+            }
+            let quote = token_raw.chars().next().unwrap();
+            let mut escaped = false;
+            let close = token_raw.char_indices().skip(1).find_map(|(index, ch)| {
+                if escaped {
+                    escaped = false;
+                    None
+                } else if ch == '\\' {
+                    escaped = true;
+                    None
+                } else {
+                    (ch == quote).then_some(index)
+                }
+            });
+            if close.is_none_or(|close| close + quote.len_utf8() != token_raw.len()) {
+                return Err(invalid(MIXED_QUOTED_MODEL_SYNTAX.into()));
+            }
+        }
+        if !literal && arguments[token.range.clone()].contains('{') {
+            while !arguments[token.range.start..end].ends_with('}') {
+                let Some(next) = tokens.next() else {
+                    return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
+                };
+                end = next.range.end;
+            }
+        }
+        let raw = &arguments[token.range.start..end];
+        if raw.starts_with(['\'', '"', '\\']) {
+            selection
+                .set_spec(token.value)
+                .map_err(|error| invalid(error.to_string()))?;
+        } else if let Some(open) = raw.find('{') {
+            if !raw.ends_with('}') || raw[..open].contains('}') {
+                return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
+            }
+            let spec = &raw[..open];
+            if spec.contains(['\'', '"', '\\']) {
+                return Err(invalid(MIXED_QUOTED_MODEL_SYNTAX.into()));
+            }
+            let options = &raw[open + 1..raw.len() - 1];
+            if options.is_empty() || options.contains(['{', '}']) {
+                return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
+            }
+            selection
+                .set_spec(spec)
+                .map_err(|error| invalid(error.to_string()))?;
+            for option in options.split(',') {
+                let tokens =
+                    crate::lex_strict(option).map_err(|error| invalid(error.to_string()))?;
+                let [token] = tokens.as_slice() else {
+                    return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
+                };
+                let Some((key, value)) = token.value.split_once('=') else {
+                    return Err(invalid(MODEL_OPTION_KEY_VALUE.into()));
+                };
+                selection
+                    .set_option(key, value)
+                    .map_err(|error| invalid(error.to_string()))?;
+            }
+        } else if raw.contains('}') {
+            return Err(invalid(MALFORMED_MODEL_OPTIONS.into()));
+        } else if let Some((key, value)) = token.value.split_once('=') {
+            selection
+                .set_option(key, value)
+                .map_err(|error| invalid(error.to_string()))?;
+        } else {
+            selection
+                .set_spec(token.value)
+                .map_err(|error| invalid(error.to_string()))?;
+        }
+    }
+    Ok(selection)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +322,7 @@ const MODEL_ARGUMENTS: &[StaticPositionalArgument] = &[StaticPositionalArgument 
     name: "model",
     kind: StaticArgumentKind::String,
     optional: true,
-    variadic: false,
+    variadic: true,
 }];
 const THEME_ARGUMENTS: &[StaticPositionalArgument] = &[StaticPositionalArgument {
     name: "theme",
@@ -300,12 +393,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
     ),
     builtin!(
         Model,
-        "/model",
+        MODEL_COMMAND_NAME,
         &[],
         "Switch model",
         typed MODEL_ARGUMENTS,
         MODEL_COMPLETIONS,
-        Some("<model>"),
+        Some("[spec] [thinking=value] [fast=true|false]"),
         MODEL,
     ),
     builtin!(
@@ -381,7 +474,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         Workflow,
         "/workflow",
         &[],
-        "Toggle workflow mode (task callable inside code_execution)",
+        "Toggle workflow mode (task tools callable inside code_execution)",
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,

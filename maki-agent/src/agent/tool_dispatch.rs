@@ -2878,7 +2878,7 @@ mod tests {
     #[test_case("todo_write", "todo_write" ; "todo_write")]
     #[test_case("question", "question" ; "question")]
     #[test_case("plan_submit", "plan_submit_tool" ; "plan_submit")]
-    #[test_case("task", "task" ; "task")]
+    #[test_case("task_spawn", "task" ; "task_spawn")]
     fn restricted_mode_offers_selected_plugin_tool(name: &'static str, plugin: &'static str) {
         smol::block_on(async {
             let mut ctx = stub_ctx(&AgentMode::Plan(PathBuf::from(PLAN_PATH)));

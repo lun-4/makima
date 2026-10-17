@@ -47,7 +47,7 @@ impl HookStage {
 /// untrusted code near it.
 ///
 /// There is no "free" variant on purpose. A tool declaring no capability has
-/// not told us it exercises none, only that nothing asks: `batch`, `task` and
+/// not told us it exercises none, only that nothing asks: `batch`, `task_spawn` and
 /// `code_execution` declare nothing and reach every other tool. So a tool
 /// landing tomorrow is never silently free to layer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

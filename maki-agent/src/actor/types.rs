@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::manager::{CurrentManagedTurn, ManagerInner};
+use crate::tools::offload::OffloadStore;
 use crate::types::{AgentId, TurnId, TurnOutcome};
 use crate::{AgentMode, InterruptSource, RunSettings};
 
@@ -15,6 +16,7 @@ use crate::{AgentMode, InterruptSource, RunSettings};
 pub(crate) struct ManagedTurnAdmission {
     pub(crate) manager: std::sync::Weak<ManagerInner>,
     pub(crate) agent_id: AgentId,
+    pub(crate) parent_delivery: Option<super::delivery::ParentDelivery>,
 }
 
 /// The actor's immutable per-admission configuration snapshot.
@@ -50,7 +52,11 @@ impl std::ops::Deref for EffectiveAgentConfig {
 
 impl ManagedTurnAdmission {
     pub(crate) fn new(manager: std::sync::Weak<ManagerInner>, agent_id: AgentId) -> Self {
-        Self { manager, agent_id }
+        Self {
+            manager,
+            agent_id,
+            parent_delivery: None,
+        }
     }
 }
 
@@ -97,6 +103,8 @@ pub enum WorkKind {
 pub struct TurnContext {
     pub agent_id: AgentId,
     pub turn_id: Option<TurnId>,
+    pub output: super::TurnOutput,
+    pub provenance: super::TurnProvenance,
     pub cancel: CancelToken,
     pub cancel_reason: ReasonedCancelToken,
     /// Adapter-local correlation (the sink's run id or the control's key).
@@ -106,6 +114,7 @@ pub struct TurnContext {
     /// Extracts root/compact work out of the actor's queue while the run is
     /// active, so it can fold them instead of waiting for the turn to end.
     pub interrupt: Option<std::sync::Arc<dyn InterruptSource>>,
+    pub inbox: Option<Arc<dyn super::TurnInbox>>,
     pub managed_turn: Option<CurrentManagedTurn>,
     pub admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
@@ -142,12 +151,18 @@ pub struct RootWork {
     pub images: Vec<ImageSource>,
     pub correlation: String,
     pub earlier: Vec<EarlierRoot>,
+    pub provenance: super::TurnProvenance,
     pub generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     pub(crate) admission: Option<crate::agent::TurnAdmissionSnapshot>,
 }
 
 impl RootWork {
+    pub fn with_provenance(mut self, provenance: super::TurnProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
     pub fn new(
         input: crate::AgentInput,
         run_id: u64,
@@ -164,6 +179,10 @@ impl RootWork {
             images,
             correlation,
             earlier: Vec::new(),
+            provenance: super::TurnProvenance {
+                origin: super::TurnOrigin::User,
+                ..Default::default()
+            },
             generation: 0,
             policy: None,
             admission: None,
@@ -187,10 +206,6 @@ pub struct TurnAdmission {
     pub input: Option<crate::AgentInput>,
     pub event_sender: Option<crate::EventSender>,
     pub correlation: String,
-    /// True when this admission was synthesized from a queued root input.
-    /// A root-started turn that is cancelled before entering produces no
-    /// retained outcome and no terminal delivery.
-    pub(crate) root: bool,
     pub(crate) generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
     pub(crate) ticket: super::TurnTicket,
@@ -256,6 +271,12 @@ pub type PreparedReadiness = Arc<
 >;
 
 pub trait ActorBackend: Send {
+    fn offload_store(&self) -> Option<Arc<OffloadStore>> {
+        None
+    }
+
+    fn on_work_settled(&mut self) {}
+
     fn prepared_readiness(&self) -> Option<PreparedReadiness> {
         None
     }

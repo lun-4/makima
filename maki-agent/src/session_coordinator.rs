@@ -61,6 +61,8 @@ struct DirectoryEntry {
     mailbox: SessionMailbox,
 }
 
+pub type ModelMutationValidator = Arc<dyn Fn() -> Result<(), Arc<str>> + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SessionCoordinatorError {
     #[error("session already live: {0}")]
@@ -273,6 +275,34 @@ where
 
 pub trait ModelAdopter: Send + Sync {
     fn adopt(&self, model: Model) -> ModelAdoptionFuture;
+
+    fn adopt_guarded(
+        &self,
+        model: Model,
+        validator: ModelMutationValidator,
+    ) -> ModelAdoptionFuture {
+        let prepared = validator().map(|()| self.adopt(model));
+        Box::pin(async move { prepared?.await })
+    }
+}
+
+pub struct GuardedModelAdopter<F>(pub F);
+
+impl<F> ModelAdopter for GuardedModelAdopter<F>
+where
+    F: Fn(Model, ModelMutationValidator) -> ModelAdoptionFuture + Send + Sync,
+{
+    fn adopt(&self, model: Model) -> ModelAdoptionFuture {
+        (self.0)(model, Arc::new(|| Ok(())))
+    }
+
+    fn adopt_guarded(
+        &self,
+        model: Model,
+        validator: ModelMutationValidator,
+    ) -> ModelAdoptionFuture {
+        (self.0)(model, validator)
+    }
 }
 
 impl<F> ModelAdopter for F
@@ -340,6 +370,7 @@ enum Operation {
         reply: flume::Sender<Result<(bool, SessionOptionsSnapshot), SessionCoordinatorError>>,
     },
     SetModel {
+        validator: Option<ModelMutationValidator>,
         spec: Option<Arc<str>>,
         fast: Option<bool>,
         thinking: Option<ThinkingConfig>,
@@ -760,10 +791,22 @@ impl SessionCoordinatorHandle {
         fast: Option<bool>,
         thinking: Option<ThinkingConfig>,
     ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
+        self.set_model_guarded(spec, fast, thinking, None).await
+    }
+
+    pub async fn set_model_guarded(
+        &self,
+        spec: Option<Arc<str>>,
+        fast: Option<bool>,
+        thinking: Option<ThinkingConfig>,
+        validator: Option<ModelMutationValidator>,
+    ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
         self.ensure_live()?;
+        validate_model_mutation(validator.as_ref())?;
         let (reply, response) = flume::bounded(1);
         self.tx
             .send_async(Operation::SetModel {
+                validator,
                 spec,
                 fast,
                 thinking,
@@ -1268,6 +1311,7 @@ async fn handle_operation(
                     Some(Arc::clone(&value)),
                     None,
                     None,
+                    None,
                 )
                 .await
             } else {
@@ -1280,6 +1324,7 @@ async fn handle_operation(
             let _ = reply.send(result);
         }
         Operation::SetModel {
+            validator,
             spec,
             fast,
             thinking,
@@ -1293,6 +1338,7 @@ async fn handle_operation(
                 spec,
                 fast,
                 thinking,
+                validator.as_ref(),
             )
             .await;
             let _ = reply.send(result);
@@ -1442,17 +1488,13 @@ async fn run(
                     continue;
                 }
                 if hold_lease(&ctx, &rx, &wait, &mut deferred).await.is_break() {
-                    for operation in deferred.drain(..).chain(rx.try_iter()) {
-                        reject_operation(operation, ctx.session_id);
-                    }
+                    reject_until_disconnected(&mut deferred, &rx, ctx.session_id).await;
                     return;
                 }
             }
             other => {
                 if handle_operation(&ctx, other, reservation).await.is_break() {
-                    for operation in deferred.drain(..).chain(rx.try_iter()) {
-                        reject_operation(operation, ctx.session_id);
-                    }
+                    reject_until_disconnected(&mut deferred, &rx, ctx.session_id).await;
                     return;
                 }
             }
@@ -1460,6 +1502,23 @@ async fn run(
     }
     unregister(ctx.session_id, ctx.generation);
     ctx.catalog.unregister(ctx.session_id, ctx.generation);
+}
+
+/// Rejects deferred operations and every later send until the last handle
+/// drops. A single drain before returning would strand an operation sent
+/// between the drain and the receiver dropping, and its caller would wait on
+/// a reply that never comes.
+async fn reject_until_disconnected(
+    deferred: &mut VecDeque<Operation>,
+    rx: &flume::Receiver<Operation>,
+    session_id: MakiId,
+) {
+    for operation in deferred.drain(..) {
+        reject_operation(operation, session_id);
+    }
+    while let Ok(operation) = rx.recv_async().await {
+        reject_operation(operation, session_id);
+    }
 }
 
 /// Serves operations for as long as the lease is held. History replacement and
@@ -1954,6 +2013,10 @@ async fn change_directory(
     Ok(canonical)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit reducer services and partial selection with authority guard"
+)]
 async fn set_model(
     read: &SessionReadHandle,
     model_policy: &ModelPolicy,
@@ -1962,7 +2025,9 @@ async fn set_model(
     spec: Option<Arc<str>>,
     fast: Option<bool>,
     thinking: Option<ThinkingConfig>,
+    validator: Option<&ModelMutationValidator>,
 ) -> Result<SessionOptionsSnapshot, SessionCoordinatorError> {
+    validate_model_mutation(validator)?;
     let previous_spec = read.model();
     let target_spec = spec.as_deref().unwrap_or(&previous_spec);
     if !model_policy.allows(target_spec) {
@@ -2000,17 +2065,48 @@ async fn set_model(
     else {
         return Ok(read.options.snapshot());
     };
+    validate_model_mutation(validator)?;
     let options = SessionOptions::candidate_snapshot(&candidate);
     let model_changed = target_spec != previous_spec.as_ref();
     if model_changed {
-        model_adopter
-            .adopt(model)
+        let adoption = match validator {
+            Some(validator) => model_adopter.adopt_guarded(model, Arc::clone(validator)),
+            None => model_adopter.adopt(model),
+        };
+        adoption
             .await
             .map_err(SessionCoordinatorError::ModelAdoption)?;
     }
     let cwd = lock(&read.state).cwd.clone();
-    let checkpoint_result =
-        checkpoint_state(read, checkpoint, None, Arc::from(target_spec), cwd, options).await;
+    let checkpoint_result = match validate_model_mutation(validator) {
+        Ok(()) => match checkpoint_state(
+            read,
+            checkpoint,
+            None,
+            Arc::from(target_spec),
+            cwd.clone(),
+            options,
+        )
+        .await
+        {
+            Ok(()) => match validate_model_mutation(validator) {
+                Ok(()) => Ok(()),
+                Err(error) => checkpoint_state(
+                    read,
+                    checkpoint,
+                    None,
+                    Arc::clone(&previous_spec),
+                    cwd,
+                    read.options.snapshot(),
+                )
+                .await
+                .map_err(SessionCoordinatorError::from)
+                .and(Err(error)),
+            },
+            Err(error) => Err(error.into()),
+        },
+        Err(error) => Err(error),
+    };
     if let Err(error) = checkpoint_result {
         if model_changed {
             let previous_model = Model::from_spec(&previous_spec).map_err(|rollback_error| {
@@ -2024,7 +2120,7 @@ async fn set_model(
                 ))));
             }
         }
-        return Err(error.into());
+        return Err(error);
     }
     lock(&read.state).model = Arc::from(target_spec);
     match read.options.commit(candidate) {
@@ -2034,6 +2130,15 @@ async fn set_model(
             Err(error.into())
         }
     }
+}
+
+fn validate_model_mutation(
+    validator: Option<&ModelMutationValidator>,
+) -> Result<(), SessionCoordinatorError> {
+    if let Some(validator) = validator {
+        validator().map_err(SessionOptionError::StaleHandle)?;
+    }
+    Ok(())
 }
 
 fn current_option_value(read: &SessionReadHandle, id: &str) -> Option<Arc<str>> {
@@ -2285,6 +2390,149 @@ mod tests {
 
     fn register(id: MakiId) -> SessionCoordinatorHandle {
         SessionCoordinatorHandle::register(params(id, writer(false))).unwrap()
+    }
+
+    #[test]
+    fn revoked_checkpoint_restores_persisted_and_runtime_selection() {
+        const OLD: &str = "ollama/old";
+        const NEW: &str = "ollama/new";
+        const REVOKED: &str = "revoked model authority";
+        smol::block_on(async {
+            let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let installed = Arc::new(Mutex::new(Vec::new()));
+            let captured_saved = Arc::clone(&saved);
+            let revoke = Arc::clone(&alive);
+            let mut params = params(
+                MakiId::generate(),
+                Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
+                    lock(&captured_saved).push(request.snapshot.model.clone());
+                    revoke.store(false, Ordering::Release);
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                }),
+            );
+            params.model = Arc::from(OLD);
+            params.definitions = builtin_option_definitions(
+                OLD,
+                [Arc::from(OLD), Arc::from(NEW)],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            let captured_installed = Arc::clone(&installed);
+            params.model_adopter = Arc::new(move |model: Model| {
+                lock(&captured_installed).push(model.spec());
+                Box::pin(async { Ok(()) }) as ModelAdoptionFuture
+            });
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let before = coordinator.read().options();
+            let validator: ModelMutationValidator = Arc::new(move || {
+                if alive.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(Arc::from(REVOKED))
+                }
+            });
+            assert!(
+                coordinator
+                    .set_model_guarded(Some(Arc::from(NEW)), None, None, Some(validator))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                lock(&saved).as_slice(),
+                &[Arc::<str>::from(NEW), Arc::from(OLD)]
+            );
+            assert_eq!(
+                lock(&installed).as_slice(),
+                &[NEW.to_owned(), OLD.to_owned()]
+            );
+            assert_eq!(coordinator.read().model().as_ref(), OLD);
+            assert_eq!(coordinator.read().options(), before);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn revoked_model_preparation_does_not_install_or_checkpoint() {
+        const OLD: &str = "ollama/old";
+        const NEW: &str = "ollama/new";
+        const REVOKED: &str = "revoked model authority";
+        smol::block_on(async {
+            let (started, preparing) = flume::bounded(1);
+            let (release, gate) = flume::bounded(1);
+            let installed = Arc::new(Mutex::new(Vec::new()));
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let captured_saved = Arc::clone(&saved);
+            let mut params = params(
+                MakiId::generate(),
+                Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
+                    lock(&captured_saved).push(request.snapshot.model.clone());
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                }),
+            );
+            params.model = Arc::from(OLD);
+            params.definitions = builtin_option_definitions(
+                OLD,
+                [Arc::from(OLD), Arc::from(NEW)],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            let captured_installed = Arc::clone(&installed);
+            params.model_adopter = Arc::new(GuardedModelAdopter(
+                move |model: Model, validator: ModelMutationValidator| {
+                    let started = started.clone();
+                    let gate = gate.clone();
+                    let installed = Arc::clone(&captured_installed);
+                    Box::pin(async move {
+                        started.send(()).unwrap();
+                        gate.recv_async().await.unwrap();
+                        validator()?;
+                        lock(&installed).push(model.spec());
+                        Ok(())
+                    }) as ModelAdoptionFuture
+                },
+            ));
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+            let before = coordinator.read().options();
+            let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let captured_alive = Arc::clone(&alive);
+            let validator: ModelMutationValidator = Arc::new(move || {
+                if captured_alive.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(Arc::from(REVOKED))
+                }
+            });
+            let changing = coordinator.clone();
+            let pending = smol::spawn(async move {
+                changing
+                    .set_model_guarded(Some(Arc::from(NEW)), None, None, Some(validator))
+                    .await
+            });
+            preparing.recv_async().await.unwrap();
+            alive.store(false, Ordering::Release);
+            release.send(()).unwrap();
+            assert!(pending.await.is_err());
+            assert!(lock(&installed).is_empty());
+            assert!(lock(&saved).is_empty());
+            assert_eq!(coordinator.read().model().as_ref(), OLD);
+            assert_eq!(coordinator.read().options(), before);
+            coordinator.close().await.unwrap();
+        });
     }
 
     #[test]

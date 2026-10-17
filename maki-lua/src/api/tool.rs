@@ -38,6 +38,7 @@ use mlua::{
 };
 use serde_json::{Value, json};
 
+use crate::agent_errors::{DELEGATED_REGISTRATION, TRUSTED_RUN_COMMAND_REQUIRED};
 use crate::api::PluginLoadContext;
 use crate::api::completion::add_completion_fns;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -49,7 +50,7 @@ use crate::api::util::command::{
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintRegistration, Request, command_depth, command_invocation,
@@ -137,7 +138,7 @@ fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
 
 fn dctx_json(ctx: &DescriptionContext) -> Value {
     let mut obj = json!({
-        "audience": ctx.audience.name().unwrap_or("main"),
+        "audience": if ctx.audience.is_empty() { "reference" } else { ctx.audience.name().unwrap_or("main") },
         "workflow": ctx.workflow,
         "mcp": ctx.mcp,
     });
@@ -1024,8 +1025,14 @@ fn allow_is_delegated(
 ///   arguments   (table)    Use `{ raw = true }` for an unparsed argument
 ///                          remainder. Add `required = true` to reject empty
 ///                          input. Raw handlers receive `opts.args` only.
-///   handler     (function) Required. Called with one opts table after the
-///                          command arguments pass validation. `opts.args` is
+///   handler     (function) Required. Called as `handler(opts, ctx)` after the
+///                          command arguments pass validation. `ctx` is a trusted
+///                          invocation-scoped LuaCtx, or nil if the host has no
+///                          agent target. `maki.agent.current(ctx)` resolves its
+///                          pinned agent; later focus changes do not retarget it.
+///                          Retaining ctx does not extend its authority beyond
+///                          the handler. Existing one-argument handlers still work.
+///                          `opts.args` is
 ///                          the outer-trimmed original argument remainder. It
 ///                          keeps inner whitespace and source quotes. For typed
 ///                          commands, `opts.fargs` is the decoded token array
@@ -1054,6 +1061,7 @@ fn allow_is_delegated(
 ///                            and the command completion context. Raw commands do
 ///                            not have argument completion providers.
 /// @return
+/// @return (boolean|nil, string|nil) true, or nil and an error. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// -- Documentation and test example. It is not bundled and never copies files.
 /// local recorded
@@ -1088,8 +1096,14 @@ fn register_command(
     #[ctx] pending: PendingCommandMap,
     #[ctx] plugin: Arc<str>,
     spec: Table,
-) -> LuaResult<()> {
-    register_command_from_lua(lua, &spec, plugin, pending)
+) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<()> { register_command_from_lua(lua, &spec, plugin, pending) };
+    registered()?;
+    Ok((Some(true), None))
 }
 
 /// Runs a slash command by name, as the explicit name-based executor: the
@@ -1111,6 +1125,9 @@ fn register_command(
 /// This returns as soon as the command has been dispatched, not when it
 /// finishes, so aliasing something long-running like `/compact` does not
 /// block your handler.
+///
+/// Delegated tool handlers cannot call this trusted command executor. Nested
+/// trusted command calls retain the invoking command's pinned agent target.
 ///
 /// Called from inside another command's handler there is no frontend waiting
 /// on the result, so a command that needs one to run it -- a model turn, a
@@ -1139,6 +1156,10 @@ async fn run_command(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     let depth = command_depth(&lua).saturating_add(1);
     let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));
     if let Some(invocation) = command_invocation(&lua) {
@@ -1152,6 +1173,7 @@ async fn run_command(
             ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
                 cmdline,
                 depth,
+                target: crate::runtime::pinned_target(&lua).map(Box::new),
                 reply_tx,
             })
             .await

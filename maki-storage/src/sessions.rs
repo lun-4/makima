@@ -25,7 +25,9 @@ use crate::paths::canonical_key;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub use maki_domain::{Effort, MIN_THINKING_BUDGET, StoredThinking, ThinkingParseError};
+pub use maki_domain::{
+    Effort, MIN_THINKING_BUDGET, Post, PostLevel, StoredThinking, ThinkingParseError,
+};
 
 use crate::{StateDir, StorageError, atomic_write, now_epoch, session_lock};
 
@@ -141,6 +143,8 @@ pub fn add_cost(total: &mut Option<f64>, addend: Option<f64>) {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compacted: bool,
     #[serde(default)]
     pub mode: Option<StoredMode>,
     #[serde(default)]
@@ -171,9 +175,10 @@ pub struct SessionMeta {
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
 /// an append from a rewrite, with no need to diff the lists.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct HistorySnapshot<M> {
     pub epoch: u64,
+    pub compacted: bool,
     pub messages: Arc<Vec<M>>,
 }
 
@@ -187,6 +192,7 @@ impl<M> HistorySnapshot<M> {
     pub fn new(messages: Vec<M>) -> Self {
         Self {
             epoch: next_epoch(),
+            compacted: false,
             messages: Arc::new(messages),
         }
     }
@@ -225,6 +231,8 @@ pub struct Session<M, U, T> {
     subagent_messages: HashMap<String, Arc<Vec<M>>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     subagents: Vec<StoredSubagent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    posts: Vec<StoredPost>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     usage_by_model: HashMap<String, StoredTokenUsage>,
     #[serde(flatten)]
@@ -324,6 +332,17 @@ pub struct StoredSubagent {
     pub fast: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPost {
+    /// Transcript id of the chat holding the post; `None` is the main chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
+    /// How many committed messages that chat had when the post arrived.
+    pub after_message: usize,
+    #[serde(flatten)]
+    pub post: Post,
+}
+
 #[derive(Deserialize)]
 struct LegacyHeader {
     version: u32,
@@ -367,6 +386,10 @@ pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "t")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "records live one line at a time while reading or writing the log"
+)]
 enum LogRecord<M, U, T> {
     #[serde(rename = "header")]
     Header {
@@ -389,6 +412,8 @@ enum LogRecord<M, U, T> {
         updated_at: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         subagents: Vec<StoredSubagent>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        posts: Vec<StoredPost>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(flatten)]
@@ -776,6 +801,7 @@ where
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
+            posts: session.posts.clone(),
             usage_by_model: session.usage_by_model.clone(),
             meta: session.meta.clone(),
         },
@@ -858,6 +884,7 @@ where
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
     let mut subagents = Vec::new();
+    let mut posts = Vec::new();
     let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
     for line in data.split(|&b| b == b'\n') {
@@ -908,6 +935,7 @@ where
                 token_usage: m_usage,
                 updated_at: m_updated,
                 subagents: m_subagents,
+                posts: m_posts,
                 usage_by_model: m_usage_by_model,
                 meta: m_meta,
             } => {
@@ -915,6 +943,7 @@ where
                 token_usage = m_usage;
                 updated_at = m_updated;
                 subagents = m_subagents;
+                posts = m_posts;
                 usage_by_model = m_usage_by_model;
                 meta = m_meta;
             }
@@ -939,6 +968,7 @@ where
             .map(|(id, msgs)| (id, Arc::new(msgs)))
             .collect(),
         subagents,
+        posts,
         usage_by_model,
         meta,
         created_at,
@@ -1346,6 +1376,7 @@ where
             tool_outputs: HashMap::new(),
             subagent_messages: HashMap::new(),
             subagents: Vec::new(),
+            posts: Vec::new(),
             usage_by_model: HashMap::new(),
             meta: SessionMeta {
                 mode: Some(StoredMode::Build),
@@ -1374,6 +1405,7 @@ where
     pub fn history_snapshot(&self) -> HistorySnapshot<M> {
         HistorySnapshot {
             epoch: self.epoch,
+            compacted: self.meta.compacted,
             messages: Arc::clone(&self.messages),
         }
     }
@@ -1455,6 +1487,7 @@ where
     pub fn adopt_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
+        self.meta.compacted = snapshot.compacted;
         self.touch();
     }
 
@@ -1465,14 +1498,17 @@ where
     pub fn checkpoint(
         this: &mut Arc<Self>,
         history: Option<&HistorySnapshot<M>>,
-        meta: SessionMeta,
+        mut meta: SessionMeta,
         token_usage: U,
     ) where
         M: Clone,
         U: PartialEq + Clone,
         T: Clone,
     {
-        let history = history.filter(|h| !Arc::ptr_eq(&this.messages, &h.messages));
+        meta.compacted = history.map_or(this.meta.compacted, |snapshot| snapshot.compacted);
+        let history = history.filter(|h| {
+            !Arc::ptr_eq(&this.messages, &h.messages) || h.compacted != this.meta.compacted
+        });
         if history.is_none() && this.meta == meta && this.token_usage == token_usage {
             return;
         }
@@ -1536,6 +1572,15 @@ where
         self.touch();
     }
 
+    pub fn posts(&self) -> &[StoredPost] {
+        &self.posts
+    }
+
+    pub fn push_post(&mut self, post: StoredPost) {
+        self.posts.push(post);
+        self.touch();
+    }
+
     pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
         &self.usage_by_model
     }
@@ -1586,10 +1631,29 @@ where
     ///
     /// If you add another field keyed by tool_use_id, prune it here too.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
-        let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
+        let message_count = self.messages.len();
+        self.posts
+            .retain(|stored| stored.chat.is_some() || stored.after_message <= message_count);
+        let main_ids: HashSet<String> = self
+            .messages
+            .iter()
+            .flat_map(&tool_ids)
+            .chain(
+                self.posts
+                    .iter()
+                    .filter(|stored| stored.chat.is_none())
+                    .filter_map(|stored| stored.post.agent.clone()),
+            )
+            .collect();
         self.subagent_messages.retain(|id, _| main_ids.contains(id));
         self.subagents
             .retain(|sa| main_ids.contains(&sa.tool_use_id));
+        self.posts.retain(|stored| {
+            stored
+                .chat
+                .as_ref()
+                .is_none_or(|chat| main_ids.contains(chat))
+        });
 
         let live: HashSet<String> = self
             .subagent_messages
@@ -1765,6 +1829,7 @@ mod tests {
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
         StorageError, TitleSource,
     };
+    use super::{Post, PostLevel, StoredPost};
     use super::{Prefs, read_prefs, write_prefs};
     use crate::StateDir;
     use crate::id::MakiId;
@@ -1793,6 +1858,8 @@ mod tests {
     const HAIKU_COST: f64 = 0.08;
     const TAMPERED_TITLE: &str = "tampered cached title";
     const PENDING_DRAFT: &str = "half typed thought";
+    const POST_TEXT: &str = "reviewer has findings";
+    const POST_AGENT: &str = "session-reviewer";
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
@@ -2116,9 +2183,86 @@ mod tests {
         assert_eq!(loaded.subagent_messages["sub-2"].len(), 1);
     }
 
+    fn stored_post(chat: Option<&str>, after_message: usize, agent: Option<&str>) -> StoredPost {
+        StoredPost {
+            chat: chat.map(str::to_owned),
+            after_message,
+            post: Post {
+                text: POST_TEXT.into(),
+                level: PostLevel::Warn,
+                agent: agent.map(str::to_owned),
+            },
+        }
+    }
+
+    #[test]
+    fn posts_survive_an_append_and_reload() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("first"));
+        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+
+        let post = stored_post(None, 1, Some(POST_AGENT));
+        session.push_post(post.clone());
+        log.append(&session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.posts(), [post]);
+    }
+
+    #[test]
+    fn prune_orphans_drops_rewound_posts_and_keeps_their_agents() {
+        fn ids(m: &Value) -> Vec<String> {
+            vec![m.as_str().unwrap().to_owned()]
+        }
+        const STALE_AGENT: &str = "session-stale";
+
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message("task-live".into());
+        for agent in [POST_AGENT, STALE_AGENT] {
+            session
+                .subagent_messages
+                .insert(agent.into(), Arc::new(Vec::new()));
+        }
+        let kept = stored_post(None, 1, Some(POST_AGENT));
+        let nested = stored_post(Some(POST_AGENT), 0, None);
+        session.push_post(kept.clone());
+        session.push_post(stored_post(None, 2, Some(STALE_AGENT)));
+        session.push_post(nested.clone());
+        session.push_post(stored_post(Some(STALE_AGENT), 0, None));
+
+        session.prune_orphans(ids);
+
+        assert_eq!(session.posts(), [kept, nested]);
+        assert_eq!(
+            session.subagent_messages().keys().collect::<Vec<_>>(),
+            [POST_AGENT]
+        );
+    }
+
     /// The mirror re-adopts the run's snapshot on every checkpoint; that must
     /// not erase the void minted by a same-frame in-place replacement, or the
     /// writer appends onto a stale prefix and persists a mixed transcript.
+    #[test]
+    fn compacted_history_metadata_round_trips_and_survives_meta_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let mut snapshot = HistorySnapshot::new(vec![user_message("summary")]);
+        snapshot.compacted = true;
+        Session::checkpoint(
+            &mut session,
+            Some(&snapshot),
+            SessionMeta::default(),
+            Value::Null,
+        );
+        Session::checkpoint(&mut session, None, SessionMeta::default(), Value::Null);
+        assert!(session.history_snapshot().compacted);
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(loaded.history_snapshot().compacted);
+    }
+
     #[test]
     fn snapshot_adoption_does_not_erase_a_local_rewrite() {
         let tmp = TempDir::new().unwrap();
@@ -2126,6 +2270,7 @@ mod tests {
         let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
         let run = HistorySnapshot {
             epoch: next_epoch(),
+            compacted: false,
             messages: Arc::new(vec![user_message("hi")]),
         };
         let meta = session.meta.clone();
@@ -2138,6 +2283,7 @@ mod tests {
             .set_subagent_messages("sub-1".into(), vec![user_message("new")]);
         let advanced = HistorySnapshot {
             epoch: run.epoch,
+            compacted: run.compacted,
             messages: Arc::new(vec![user_message("hi"), assistant_message("reply")]),
         };
         Session::checkpoint(&mut session, Some(&advanced), meta, Value::Null);

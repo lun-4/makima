@@ -78,7 +78,7 @@ impl ActorState {
             .filter(|reservation| Arc::ptr_eq(&reservation.owner, owner))
     }
 
-    fn has_pending_work(&self, queue: &ActorQueue) -> bool {
+    pub(super) fn has_pending_work(&self, queue: &ActorQueue) -> bool {
         self.status != ActorStatus::Idle
             || self.active.is_some()
             || self.processing.is_some()

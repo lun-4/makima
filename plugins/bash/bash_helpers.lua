@@ -91,7 +91,7 @@ function M.spawn_opts(opts)
     silent = true,
   }
   if opts.auto_model then
-    out.model_spec = opts.auto_model
+    out.model = { spec = opts.auto_model }
   end
   return out
 end

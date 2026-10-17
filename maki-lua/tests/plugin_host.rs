@@ -22,13 +22,16 @@ use maki_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use maki_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
 };
+use maki_lua::agent_errors::{
+    DELEGATED_FOCUS, DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE,
+};
 use maki_lua::test_support::{InMemoryFs, InMemoryOffloadBackend};
 use maki_lua::{
     MAX_INFLIGHT_TOOLS, PluginError, PluginHost, SessionRequest, UiAction, WARM_TOOL_CAP,
     WinCommand, WinEvent,
 };
 use maki_providers::Model;
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
@@ -219,7 +222,7 @@ fn exec_tool_in(
     input: serde_json::Value,
     registry_override: Option<Arc<ToolRegistry>>,
 ) -> Result<String, String> {
-    exec_output_in(reg, name, input, registry_override).map(|out| match out {
+    exec_output_in(reg, name, input, registry_override, None).map(|out| match out {
         maki_agent::ToolOutput::Plain(s) => s.text,
         other => panic!("unexpected output: {other:?}"),
     })
@@ -230,7 +233,19 @@ fn exec_tool_output(
     name: &str,
     input: serde_json::Value,
 ) -> Result<maki_agent::ToolOutput, String> {
-    exec_output_in(reg, name, input, None)
+    exec_output_in(reg, name, input, None, None)
+}
+
+fn exec_tool_in_session(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    session: MakiId,
+) -> String {
+    match exec_output_in(reg, name, input, None, Some(session)).unwrap() {
+        maki_agent::ToolOutput::Plain(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    }
 }
 
 fn exec_output_in(
@@ -238,6 +253,7 @@ fn exec_output_in(
     name: &str,
     input: serde_json::Value,
     registry_override: Option<Arc<ToolRegistry>>,
+    session: Option<MakiId>,
 ) -> Result<maki_agent::ToolOutput, String> {
     let entry = reg
         .get(name)
@@ -246,6 +262,9 @@ fn exec_output_in(
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
     if let Some(r) = registry_override {
         ctx.registry = r;
+    }
+    if let Some(session) = session {
+        maki_agent::tools::test_support::set_session(&mut ctx, session);
     }
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
         &ctx.registry,
@@ -2393,8 +2412,12 @@ fn failed_plugin_reload_preserves_old_job_and_kills_candidate() {
         "transactional_jobs",
         &format!(
             r#"
-            local id = maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{ owner = "plugin" }})
-            maki.fn.jobwait(id, 100)
+            assert(maki.async.await(1, function(ready)
+                maki.fn.jobstart("printf %s $$ > '{}' && printf 'ready\\n'; exec sleep 30", {{
+                    owner = "plugin",
+                    on_stdout = function(_, line) if line == "ready" then ready(true) end end,
+                }})
+            end))
             error("reject candidate")
             "#,
             candidate_path.display()
@@ -3859,6 +3882,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         cmdline,
         depth,
         reply_tx,
+        ..
     } = rx
         .recv_timeout(Duration::from_secs(5))
         .expect(RUN_COMMAND_NO_ACTION)
@@ -6229,6 +6253,7 @@ fn session_picker_requested_routes_through_sessions_command() {
         cmdline,
         depth,
         reply_tx,
+        ..
     } = next_picker_action(&actions)
     else {
         panic!("SessionPickerRequested did not route through RunCommand");
@@ -6428,7 +6453,7 @@ fn sessions_keybind_initializes_and_closes(close_key: &str) {
                 && entry.plugin.as_ref() == "sessions"
         })
         .expect("bundled sessions Ctrl+P keybind is missing");
-    assert!(handle.run_keybind_callback(entry.id));
+    assert!(handle.run_keybind_callback(entry.id, None));
     let picker = SessionsPicker::load(&actions);
     picker.wait_for_unfiltered_rows();
     picker.close(close_key);
@@ -6525,23 +6550,24 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     let (value, _) = plugin_option_state(&session);
     assert_eq!(value, "a");
 
-    let out = exec_tool(
+    let own_session = session.read().session_id();
+    let out = exec_tool_in_session(
         &reg,
         "set_choice",
         json!({ "session": session_id, "value": "b" }),
-    )
-    .unwrap();
+        own_session,
+    );
     assert_eq!(out, SESSION_OPTION_SET_OK);
     let (value, version) = plugin_option_state(&session);
     assert_eq!(value, "b");
     let set_version = version;
 
-    let out = exec_tool(
+    let out = exec_tool_in_session(
         &reg,
         "set_choice",
         json!({ "session": session_id, "value": "c" }),
-    )
-    .unwrap();
+        own_session,
+    );
     assert!(
         out.contains(SESSION_OPTION_VALIDATOR_REJECTION),
         "expected validator rejection, got: {out}"
@@ -6551,6 +6577,63 @@ fn session_set_option_applies_plugin_owned_option_on_live_session() {
     assert_eq!(version, set_version);
     responder.join().unwrap();
     smol::block_on(session.close()).unwrap();
+}
+
+const SESSION_MUTATION_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "mutate_session",
+    description = "calls one maki.session function",
+    schema = {
+        type = "object",
+        properties = { call = { type = "string" }, session = { type = "string" } },
+        required = { "call", "session" },
+    },
+    handler = function(input)
+        local calls = {
+            prompt = function() return maki.session.prompt("hi", { session = input.session }) end,
+            set_option = function()
+                return maki.session.set_option("fast", "enabled", { session = input.session })
+            end,
+            set_title = function() return maki.session.set_title({ id = input.session, title = "t" }) end,
+            new = function() return maki.session.new() end,
+            focus = function() return maki.session.focus(input.session) end,
+            delete = function() return maki.session.delete(input.session) end,
+            current = function() return maki.session.current() end,
+            usage = function() return maki.session.usage() end,
+            thinking = function() return maki.session.thinking() end,
+            read = function() return maki.session.read() end,
+            options = function() return maki.session.options() end,
+            model_get = function() return maki.model.get() end,
+        }
+        local _, err = calls[input.call]()
+        return tostring(err)
+    end,
+})
+"#;
+
+#[test_case::test_case("prompt", DELEGATED_FOREIGN_SESSION ; "prompt")]
+#[test_case::test_case("set_option", DELEGATED_FOREIGN_SESSION ; "set_option")]
+#[test_case::test_case("set_title", DELEGATED_FOREIGN_SESSION ; "set_title")]
+#[test_case::test_case("new", DELEGATED_SESSION_LIFECYCLE ; "new")]
+#[test_case::test_case("focus", DELEGATED_SESSION_LIFECYCLE ; "focus")]
+#[test_case::test_case("delete", DELEGATED_SESSION_LIFECYCLE ; "delete")]
+#[test_case::test_case("current", DELEGATED_FOCUS ; "current")]
+#[test_case::test_case("usage", DELEGATED_FOCUS ; "usage")]
+#[test_case::test_case("thinking", DELEGATED_FOCUS ; "thinking")]
+#[test_case::test_case("read", DELEGATED_FOCUS ; "read")]
+#[test_case::test_case("options", DELEGATED_FOCUS ; "options")]
+#[test_case::test_case("model_get", DELEGATED_FOCUS ; "model_get")]
+fn tool_handlers_cannot_reach_other_sessions_or_focus(call: &str, expected: &str) {
+    let (reg, host) = builtins_host();
+    host.load_source("session_mutation", SESSION_MUTATION_PLUGIN)
+        .unwrap();
+    let out = exec_tool_in_session(
+        &reg,
+        "mutate_session",
+        json!({ "call": call, "session": MakiId::generate().to_string() }),
+        MakiId::generate(),
+    );
+    assert_eq!(out, expected);
 }
 
 const CUT_LINE_BYTES: usize = 100;

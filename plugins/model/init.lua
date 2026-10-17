@@ -30,5 +30,5 @@ maki.api.register_expander("m", expand_model)
 -- what the token means without costing subagent prompts any tokens.
 maki.api.register_prompt_hint({
   slot = "after_instructions",
-  content = "A `<model:spec>` token in a user message (typed as `@model:spec`) requests that model for an accompanying subagent reference: pass the spec to the task tool's `model` input when its schema offers one. A `<model:spec>` with no subagent has no effect; the /model command switches the session model.",
+  content = "A `<model:spec>` token in a user message (typed as `@model:spec`) requests that model for an accompanying subagent reference: pass the spec to task_spawn's `model` input when its schema offers one. A `<model:spec>` with no subagent has no effect; the /model command switches the session model.",
 })

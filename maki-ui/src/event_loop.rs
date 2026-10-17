@@ -52,7 +52,6 @@ use maki_lua::{
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
     ProviderUsageWindow, SessionRequest, StatusContentReader, UiAction, UiReply,
 };
-use maki_providers::ThinkingConfigExt;
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model, TokenUsage};
@@ -73,7 +72,7 @@ fn claim_lock(dir: &std::path::Path, id: &MakiId) -> Result<ClaimedSessionLock> 
 use crate::AppSession;
 use crate::agent::{
     AgentCommand, AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot,
-    SystemPromptOverride, shared_queue::QueueItem,
+    SystemPromptOverride, orchestration::AgentOrchestration, shared_queue::QueueItem,
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{
@@ -101,6 +100,8 @@ use crate::terminal;
 use crate::theme::ThemesProvider;
 
 mod approval;
+#[cfg(test)]
+mod discovery_tests;
 
 use approval::{ApprovalStep, PendingPlanApproval};
 
@@ -113,6 +114,8 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const CLOSED_TARGET_ERR: &str =
+    "the selected agent has closed; switch to a live chat to change its model";
 const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
 const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
@@ -693,7 +696,7 @@ fn dispatch_thinking_change(
     let change = match thinking_change(thinking) {
         Ok(change) => change,
         Err(error) => {
-            let _ = reply_tx.send(Err(error.into()));
+            let _ = reply_tx.send(Err(error));
             return;
         }
     };
@@ -741,27 +744,36 @@ fn thinking_reply(commit: &maki_agent::actor::ConfigCommit) -> serde_json::Value
     json!({ "mode": commit.config.thinking.to_string() })
 }
 
-fn thinking_change(input: &str) -> Result<maki_agent::actor::ConfigChange, &'static str> {
+fn thinking_change(input: &str) -> Result<maki_agent::actor::ConfigChange, String> {
     if input.trim().is_empty() {
-        Ok(maki_agent::actor::ConfigChange::ToggleThinking)
-    } else {
-        Ok(maki_agent::actor::ConfigChange::Patch(
-            maki_agent::actor::ConfigPatch {
-                thinking: Some(DomainThinkingConfig::parse(
-                    input.trim(),
-                    DomainThinkingConfig::default(),
-                )?),
-                ..Default::default()
-            },
-        ))
+        return Ok(maki_agent::actor::ConfigChange::ToggleThinking);
     }
+    let thinking = maki_domain::parse_thinking(input.trim()).map_err(|error| error.to_string())?;
+    Ok(maki_agent::actor::ConfigChange::Patch(
+        maki_agent::actor::ConfigPatch {
+            thinking: Some(thinking),
+            ..Default::default()
+        },
+    ))
+}
+
+/// The agent a session's commands and keymaps address: the selected chat's
+/// agent. A closed agent addresses nothing; there is no fallback to the root.
+fn selected_agent(runtime: &SessionRuntime) -> Option<maki_agent::AgentRef> {
+    let (manager, root) = runtime.handles.manager_and_root();
+    manager
+        .lookup(runtime.app.selected_agent_id().unwrap_or(root))
+        .ok()
 }
 
 fn config_model_state(config: &maki_agent::EffectiveAgentConfig) -> serde_json::Value {
-    json!({ "spec": config.model.spec(), "id": config.model.id,
-        "provider": config.model.provider.to_string(), "thinking": config.thinking.to_string(),
-        "fast": config.fast, "supports_thinking": config.model.supports_thinking(),
-        "supports_fast": config.model.supports_fast() })
+    json!(maki_providers::CompleteModelSelection::from_model(
+        &config.model,
+        maki_providers::RequestOptions {
+            thinking: config.thinking,
+            fast: config.fast
+        },
+    ))
 }
 
 fn project_actor_config(app: &mut App, config: &maki_agent::EffectiveAgentConfig) {
@@ -1731,7 +1743,7 @@ impl SpawnCtx {
         let handles = AgentHandles::prepare(
             &model_slot,
             effective_config.unwrap_or(initial_config),
-            history.clone(),
+            session.history_snapshot(),
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
@@ -1881,6 +1893,52 @@ enum SessionOpKind {
     },
 }
 
+struct OrchestrationRevision {
+    runtime: u64,
+    selected: maki_agent::AgentId,
+    live: bool,
+    root_config: Option<Arc<maki_agent::EffectiveAgentConfig>>,
+    selected_config: Option<Arc<maki_agent::EffectiveAgentConfig>>,
+    model_policy: Arc<ModelPolicy>,
+    cwd: Arc<PathBuf>,
+}
+
+impl OrchestrationRevision {
+    fn matches(&self, other: &Self) -> bool {
+        let same_config =
+            |left: &Option<Arc<maki_agent::EffectiveAgentConfig>>,
+             right: &Option<Arc<maki_agent::EffectiveAgentConfig>>| {
+                match (left, right) {
+                    (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                    (None, None) => true,
+                    _ => false,
+                }
+            };
+        self.runtime == other.runtime
+            && self.selected == other.selected
+            && self.live == other.live
+            && self.cwd == other.cwd
+            && same_config(&self.root_config, &other.root_config)
+            && same_config(&self.selected_config, &other.selected_config)
+            && Arc::ptr_eq(&self.model_policy, &other.model_policy)
+    }
+}
+
+fn orchestration_revision(runtime: &SessionRuntime) -> OrchestrationRevision {
+    let (manager, root) = runtime.handles.manager_and_root();
+    let selected = runtime.app.selected_agent_id().unwrap_or(root);
+    let config = |id| manager.effective_config(id).ok().flatten();
+    OrchestrationRevision {
+        runtime: runtime.generation,
+        selected,
+        live: manager.lookup(selected).is_ok(),
+        root_config: config(root),
+        selected_config: config(selected),
+        model_policy: Arc::clone(&runtime.handles.orchestration_template.model_policy),
+        cwd: runtime.handles.cwd_slot().load_full(),
+    }
+}
+
 pub(crate) struct EventLoop<'t> {
     terminal: &'t mut ratatui::DefaultTerminal,
     sessions: Vec<SessionRuntime>,
@@ -1890,6 +1948,9 @@ pub(crate) struct EventLoop<'t> {
     terminal_focused: bool,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
+    orchestration: Arc<AgentOrchestration>,
+    orchestration_revisions: Vec<OrchestrationRevision>,
+    orchestration_focus: Option<usize>,
     sessions_dir: PathBuf,
     session_cwd: String,
     last_heartbeat: Instant,
@@ -1917,6 +1978,7 @@ enum Wake {
     InputGone,
     Ui(UiAction),
     Agent(usize, Box<maki_agent::Envelope>),
+    Actor(usize, maki_agent::actor::ActorEvent),
     Shell(usize, ShellEvent),
     Warn(String),
     Command(CommandEvent),
@@ -2208,6 +2270,9 @@ impl<'t> EventLoop<'t> {
         }
 
         let session_cwd = runtimes[focused].app.state.session.cwd.clone();
+        let orchestration = Arc::new(AgentOrchestration::new(Arc::clone(&ctx.available_models)));
+        ctx.lua_event_handle
+            .install_orchestration_services(orchestration.clone());
         Ok(Self {
             terminal,
             sessions: runtimes,
@@ -2217,6 +2282,9 @@ impl<'t> EventLoop<'t> {
             terminal_focused: false,
             notifier,
             ctx,
+            orchestration,
+            orchestration_revisions: Vec::new(),
+            orchestration_focus: None,
             sessions_dir,
             session_cwd,
             last_heartbeat: Instant::now(),
@@ -2236,11 +2304,86 @@ impl<'t> EventLoop<'t> {
         })
     }
 
+    fn sync_orchestration(&mut self) {
+        if self.orchestration_focus == Some(self.focused)
+            && self.sessions.len() == self.orchestration_revisions.len()
+            && self
+                .sessions
+                .iter()
+                .zip(&self.orchestration_revisions)
+                .all(|(runtime, previous)| orchestration_revision(runtime).matches(previous))
+        {
+            return;
+        }
+        self.orchestration_focus = Some(self.focused);
+        self.orchestration_revisions = self.sessions.iter().map(orchestration_revision).collect();
+        let mut admissions = HashMap::new();
+        let mut focused = None;
+        for (index, runtime) in self.sessions.iter().enumerate() {
+            let (manager, root_id) = runtime.handles.manager_and_root();
+            let Ok(root) = manager.lookup(root_id) else {
+                continue;
+            };
+            let mut template = runtime.handles.orchestration_template.clone();
+            template.cwd = (**runtime.handles.cwd_slot().load()).clone();
+            self.orchestration
+                .register_root(maki_lua::orchestration::TrustedTarget {
+                    target: root.clone(),
+                    template,
+                });
+            if let Some(target) = selected_agent(runtime) {
+                if let Ok(template) = maki_lua::orchestration::OrchestrationServices::template(
+                    &*self.orchestration,
+                    &target,
+                ) {
+                    admissions.insert(
+                        runtime.app.command_target.id(),
+                        maki_lua::orchestration::TrustedTarget {
+                            target: target.clone(),
+                            template,
+                        },
+                    );
+                }
+                if index == self.focused {
+                    focused = Some(target);
+                }
+            }
+        }
+        self.ctx.command_runtime.sync_admissions(admissions);
+        self.orchestration.select(focused);
+        self.sync_model_discovery();
+    }
+
+    fn sync_model_discovery(&mut self) {
+        for runtime in &mut self.sessions {
+            let target = if runtime.app.model_picker.is_open() {
+                runtime
+                    .app
+                    .model_picker_target
+                    .clone()
+                    .or_else(|| selected_agent(runtime))
+            } else {
+                selected_agent(runtime)
+            };
+            let specs = target
+                .and_then(|target| {
+                    maki_lua::orchestration::OrchestrationServices::available_models(
+                        &*self.orchestration,
+                        &target,
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            runtime.app.project_model_discovery(specs);
+        }
+    }
+
     fn focused_app(&mut self) -> &mut App {
         &mut self.sessions[self.focused].app
     }
 
-    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
+    fn start(&mut self, initial_prompt: Option<String>) {
+        self.sync_orchestration();
         if let Some(prompt) = initial_prompt {
             let sub = Submission {
                 text: prompt,
@@ -2251,10 +2394,15 @@ impl<'t> EventLoop<'t> {
         } else if self.session_picker {
             self.focused_app().open_startup_session_picker();
         }
+    }
+
+    pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
+        self.start(initial_prompt);
         // The first frame always paints. After that only a poller, an event or
         // an animation tick owes another.
         let mut dirty = Dirty::YES;
         let result = loop {
+            self.sync_orchestration();
             dirty |= self.tick();
             if self.sessions[self.focused].app.take_pending_bell() {
                 ring_bell();
@@ -2332,6 +2480,11 @@ impl<'t> EventLoop<'t> {
                     res.ok().map(|env| Wake::Agent(i, Box::new(env)))
                 });
             }
+            if !rt.handles.actor_rx.is_disconnected() {
+                sel = sel.recv(&rt.handles.actor_rx, move |res| {
+                    res.ok().map(|event| Wake::Actor(i, event))
+                });
+            }
             sel = sel.recv(&rt.shell_rx, move |res| {
                 res.ok().map(|ev| Wake::Shell(i, ev))
             });
@@ -2345,6 +2498,7 @@ impl<'t> EventLoop<'t> {
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
+            Wake::Actor(i, event) => self.sessions[i].app.handle_actor_event(event),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Command(command) => self.handle_command(command),
@@ -2593,7 +2747,76 @@ impl<'t> EventLoop<'t> {
             return;
         };
         match event {
-            CommandEvent::Host { request, reply, .. } => {
+            CommandEvent::Host {
+                request,
+                admission,
+                reply,
+                ..
+            } => {
+                if let maki_commands::HostRequest::Builtin(operation) = &request {
+                    let selection = match operation {
+                        maki_commands::BuiltinOperation::SelectModel(selection) => {
+                            Some(selection.clone())
+                        }
+                        maki_commands::BuiltinOperation::SetModel { spec } => {
+                            Some(maki_commands::ModelSelection {
+                                spec: Some(Arc::clone(spec)),
+                                ..Default::default()
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(selection) = selection {
+                        let Some(pinned) = admission else {
+                            let _ = reply.send(Err(maki_commands::CommandError::StaleTarget));
+                            return;
+                        };
+                        self.dispatch_model_selection(
+                            index,
+                            Some(pinned.target),
+                            selection,
+                            Some(reply),
+                        );
+                        return;
+                    }
+                }
+                if let (
+                    maki_commands::HostRequest::Context(
+                        maki_commands::HostContextRequest::ModelSpecs,
+                    ),
+                    Some(pinned),
+                ) = (&request, &admission)
+                {
+                    let _ = reply.send(self.target_model_specs(&pinned.target));
+                    return;
+                }
+                if matches!(
+                    request,
+                    maki_commands::HostRequest::Builtin(
+                        maki_commands::BuiltinOperation::OpenModelPicker
+                    )
+                ) {
+                    let result = admission
+                        .ok_or(maki_commands::CommandError::StaleTarget)
+                        .and_then(|pinned| {
+                            let (manager, root) = self.sessions[index].handles.manager_and_root();
+                            let runtime_root = manager
+                                .lookup(root)
+                                .map_err(|_| maki_commands::CommandError::StaleTarget)?;
+                            if !runtime_root.same_manager(&pinned.target) {
+                                return Err(maki_commands::CommandError::StaleTarget);
+                            }
+                            self.sessions[index]
+                                .app
+                                .open_pinned_model_picker(pinned.target)
+                        });
+                    if result.is_ok() {
+                        self.handle_action(index, Action::RefreshModels);
+                        self.sync_model_discovery();
+                    }
+                    let _ = reply.send(result.map(|()| maki_commands::HostResponse::Completed));
+                    return;
+                }
                 let result = self.sessions[index].app.execute_host_request(request);
                 match result {
                     Ok((response, actions)) => {
@@ -2682,6 +2905,7 @@ impl<'t> EventLoop<'t> {
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
         let rt = &mut self.sessions[idx];
+        rt.app.adopt_actor_presentation(&envelope);
         let current = is_current_top_level(rt.app.run_id, &envelope);
         match &envelope.event {
             AgentEvent::QueueDrained => {
@@ -2821,8 +3045,9 @@ impl<'t> EventLoop<'t> {
                 ModelRequest::Set {
                     spec,
                     thinking,
+                    toggle_thinking,
                     fast,
-                } => self.dispatch_model_set(spec, thinking, fast, reply_tx),
+                } => self.dispatch_model_set(spec, thinking, toggle_thinking, fast, reply_tx),
                 req => {
                     let _ = reply_tx.send(self.handle_model_request(req));
                 }
@@ -2861,10 +3086,20 @@ impl<'t> EventLoop<'t> {
             UiAction::RunCommand {
                 cmdline,
                 depth,
+                target: Some(target),
+                reply_tx,
+            } => {
+                let _ = reply_tx.send(self.run_pinned_cmdline(&cmdline, depth, *target));
+            }
+            UiAction::RunCommand {
+                cmdline,
+                depth,
+                target: None,
                 reply_tx,
             } => {
                 // Answer before dispatching: the caller only waits on the name
                 // resolving, and dispatch may take a while (or exit the app).
+                self.sync_orchestration();
                 match self.focused_app().run_cmdline(&cmdline, depth) {
                     Ok(actions) => {
                         let _ = reply_tx.send(Ok(()));
@@ -3393,6 +3628,21 @@ impl<'t> EventLoop<'t> {
                 set_default,
                 thinking,
             } => self.dispatch_thinking_set(set_default, &thinking, reply_tx),
+            SessionRequest::SetDefaultThinking { thinking } => {
+                let reply = maki_domain::parse_thinking(thinking.trim())
+                    .map_err(|error| error.to_string())
+                    .and_then(|thinking| {
+                        write_prefs(
+                            &self.ctx.storage,
+                            &Prefs {
+                                default_thinking: Some(thinking.into()),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(json!({ "mode": thinking.to_string() }))
+                    });
+                let _ = reply_tx.send(reply);
+            }
         }
     }
 
@@ -3548,30 +3798,17 @@ impl<'t> EventLoop<'t> {
         );
     }
 
-    /// `maki.model.set`: atomically adopt all requested model settings through
-    /// the coordinator off-thread, then apply the app-side state and reply.
+    /// `maki.model.set` reserves one actor update before provider preparation,
+    /// then projects the committed configuration and replies.
     fn dispatch_model_set(
         &mut self,
         spec: Option<String>,
-        thinking: Option<String>,
+        thinking: Option<DomainThinkingConfig>,
+        toggle_thinking: bool,
         fast: Option<bool>,
         reply_tx: flume::Sender<UiReply>,
     ) {
         let idx = self.focused;
-        let toggle_thinking = thinking
-            .as_ref()
-            .is_some_and(|input| input.trim().is_empty());
-        let thinking = match thinking
-            .filter(|_| !toggle_thinking)
-            .map(|input| DomainThinkingConfig::parse(input.trim(), DomainThinkingConfig::default()))
-            .transpose()
-        {
-            Ok(thinking) => thinking,
-            Err(error) => {
-                let _ = reply_tx.send(Err(error.to_owned()));
-                return;
-            }
-        };
         if spec.is_some() {
             self.note_if_deferred(idx, "model");
         }
@@ -3589,47 +3826,32 @@ impl<'t> EventLoop<'t> {
         let internal_tx = self.internal_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
         let timeouts = self.ctx.timeouts;
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
         smol::spawn(async move {
             let mut committed = None;
             let result = match reservation {
-                Ok(reservation) => {
-                    let requested_spec = spec.clone();
-                    prepare_config_change(
-                        reservation,
-                        async move {
-                            let model = smol::unblock(move || {
-                                requested_spec
-                                    .map(|spec| {
-                                        if !policy.allows(&spec) {
-                                            return Err(format!("model is not allowed: {spec}"));
-                                        }
-                                        let model = Model::from_spec(&spec)
-                                            .map_err(|error| error.to_string())?;
-                                        prepare_provider(model, timeouts)
-                                            .map_err(|error| error.to_string())
-                                    })
-                                    .transpose()
-                            })
-                            .await?;
-                            Ok(maki_agent::actor::ConfigChange::Patch(
-                                maki_agent::actor::ConfigPatch {
-                                    model,
-                                    thinking,
-                                    toggle_thinking,
-                                    fast,
-                                    ..Default::default()
-                                },
-                            ))
+                Ok(reservation) => prepare_config_change(
+                    reservation,
+                    prepare_model_patch(
+                        spec.as_deref().map(Arc::from),
+                        maki_agent::actor::ConfigPatch {
+                            thinking,
+                            toggle_thinking,
+                            fast,
+                            ..Default::default()
                         },
-                        async {
-                            smol::Timer::after(SESSION_OP_TIMEOUT).await;
-                        },
-                    )
-                    .await
-                    .map(|commit| {
-                        committed = Some(commit);
-                    })
-                }
+                        policy,
+                        prepare,
+                        timeouts,
+                    ),
+                    async {
+                        smol::Timer::after(SESSION_OP_TIMEOUT).await;
+                    },
+                )
+                .await
+                .map(|commit| {
+                    committed = Some(commit);
+                }),
                 Err(error) => Err(error),
             };
             let _ = internal_tx.send(InternalEvent::SessionOp {
@@ -3912,6 +4134,7 @@ impl<'t> EventLoop<'t> {
     fn handle_input(&mut self, raw: Event) {
         let mut pending = Some(raw);
         while let Some(ev) = pending.take() {
+            self.sync_orchestration();
             let (msg, leftover) = self.translate(ev);
             if let Some(msg) = msg {
                 let actions = self.sessions[self.focused].update(msg);
@@ -4019,6 +4242,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_action(&mut self, idx: usize, action: Action) {
+        self.sync_orchestration();
         match action {
             Action::SendMessage(input) => {
                 let rt = &mut self.sessions[idx];
@@ -4034,10 +4258,13 @@ impl<'t> EventLoop<'t> {
                     displayed: true,
                 });
             }
-            Action::CancelAgent { run_id } => {
+            Action::CancelAgent { turn_id, run_id } => {
                 let rt = &mut self.sessions[idx];
                 rt.notifications.reset();
-                let _ = rt.handles.cmd_tx.try_send(AgentCommand::Cancel { run_id });
+                let _ = rt
+                    .handles
+                    .cmd_tx
+                    .try_send(AgentCommand::Cancel { turn_id, run_id });
             }
             Action::CancelSubagent { tool_use_id } => {
                 let _ = self.sessions[idx]
@@ -4068,6 +4295,21 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
+            Action::ChangePinnedModel { target, spec } => self.dispatch_model_selection(
+                idx,
+                Some(target),
+                maki_commands::ModelSelection {
+                    spec: Some(Arc::from(spec)),
+                    ..Default::default()
+                },
+                None,
+            ),
+            Action::RunKeybind(id) => self.run_keybind(idx, id),
+            Action::SelectModel(selection) => {
+                self.note_if_deferred(idx, "model");
+                let target = self.selected_target(idx);
+                self.dispatch_model_selection(idx, target, selection, None);
+            }
             Action::ChangeMode(mode) => self.dispatch_mode_change(idx, mode),
             Action::ApprovePlan {
                 clear_context,
@@ -4289,14 +4531,10 @@ impl<'t> EventLoop<'t> {
                     let commit = commit.ok_or("missing committed model configuration")?;
                     let rt = &mut self.sessions[idx];
                     rt.project_config(&commit);
-                    if let Some(spec) = &spec { rt.app.record_recent_model(spec); }
-                    let config = &commit.config;
-                    Ok(json!({
-                        "spec": config.model.spec(), "id": config.model.id,
-                        "provider": config.model.provider.to_string(), "thinking": config.thinking.to_string(),
-                        "fast": config.fast, "supports_thinking": config.model.supports_thinking(),
-                        "supports_fast": config.model.supports_fast(),
-                    }))
+                    if let Some(spec) = &spec {
+                        rt.app.record_recent_model(spec);
+                    }
+                    Ok(config_model_state(&commit.config))
                 });
                 let _ = reply_tx.send(reply);
             }
@@ -4355,6 +4593,7 @@ impl<'t> EventLoop<'t> {
             return;
         }
         self.published_model_specs = available.clone();
+        self.sync_model_discovery();
         // A refresh clears the list before refetching; publishing the empty
         // state would strip every session back to its current model.
         let Some(available) = available else {
@@ -4389,10 +4628,204 @@ impl<'t> EventLoop<'t> {
 
     fn change_model(&mut self, idx: usize, spec: &str) {
         self.note_if_deferred(idx, "model");
-        self.dispatch_prepared_model(idx, spec.to_owned(), false);
+        let target = self.selected_target(idx);
+        self.dispatch_model_selection(
+            idx,
+            target,
+            maki_commands::ModelSelection {
+                spec: Some(Arc::from(spec)),
+                ..Default::default()
+            },
+            None,
+        );
     }
 
-    fn dispatch_prepared_model(&self, idx: usize, spec: String, refresh: bool) {
+    /// Runs a command for a keymap or event callback against the agent that
+    /// callback was pinned to, in the session that owns it.
+    fn run_pinned_cmdline(
+        &self,
+        cmdline: &str,
+        depth: u8,
+        target: maki_lua::orchestration::TrustedTarget,
+    ) -> Result<(), String> {
+        target
+            .target
+            .validate_live()
+            .map_err(|_| CLOSED_TARGET_ERR.to_owned())?;
+        let runtime = self
+            .sessions
+            .iter()
+            .find(|runtime| {
+                let (manager, _) = runtime.handles.manager_and_root();
+                target.target.manager().same_manager(&manager)
+            })
+            .ok_or_else(|| NOT_LIVE_ERR.to_owned())?;
+        let input = format!("/{}", cmdline.trim().trim_start_matches('/'));
+        let resolved = self
+            .ctx
+            .command_runtime
+            .registry
+            .resolve_input_for(&runtime.app.command_target, &input)
+            .map_err(|error| match error {
+                maki_commands::ResolutionError::UnknownCommand(name) => {
+                    format!("unknown command '{name}'")
+                }
+                maki_commands::ResolutionError::StaleTarget => error.to_string(),
+            })?;
+        self.ctx.command_runtime.dispatch_command_pinned(
+            &runtime.app.command_target,
+            resolved.command,
+            resolved.arguments,
+            depth.into(),
+            target,
+        );
+        Ok(())
+    }
+
+    /// Pins the keymap callback to the agent selected when the key was
+    /// pressed, so later focus changes do not retarget it.
+    fn run_keybind(&mut self, idx: usize, id: u64) {
+        self.sync_orchestration();
+        let target = self.selected_target(idx).and_then(|target| {
+            maki_lua::orchestration::OrchestrationServices::template(&*self.orchestration, &target)
+                .ok()
+                .map(|template| maki_lua::orchestration::TrustedTarget { target, template })
+        });
+        if !self.sessions[idx]
+            .app
+            .lua_event_handle
+            .run_keybind_callback(id, target)
+        {
+            tracing::warn!(keybind_id = id, "keybind callback queue is full");
+        }
+    }
+
+    /// The model catalog filtered by {target}'s model policy, so `/model`
+    /// fragments resolve only to models the pinned agent may use.
+    fn target_model_specs(
+        &self,
+        target: &maki_agent::AgentRef,
+    ) -> Result<maki_commands::HostResponse, maki_commands::CommandError> {
+        let policy =
+            maki_lua::orchestration::OrchestrationServices::template(&*self.orchestration, target)
+                .map_err(|_| maki_commands::CommandError::StaleTarget)?
+                .model_policy;
+        let specs = self
+            .ctx
+            .available_models
+            .load_full()
+            .map(|models| {
+                models
+                    .iter()
+                    .filter(|spec| policy.allows(spec))
+                    .map(|spec| Arc::from(spec.as_str()))
+                    .collect()
+            })
+            .unwrap_or_else(|| Arc::from([]));
+        Ok(maki_commands::HostResponse::Context(
+            maki_commands::HostContextResponse::Values(specs),
+        ))
+    }
+
+    fn selected_target(&self, idx: usize) -> Option<maki_agent::AgentRef> {
+        selected_agent(&self.sessions[idx])
+    }
+
+    fn dispatch_model_selection(
+        &self,
+        idx: usize,
+        target: Option<maki_agent::AgentRef>,
+        selection: maki_commands::ModelSelection,
+        reply: Option<
+            flume::Sender<Result<maki_commands::HostResponse, maki_commands::CommandError>>,
+        >,
+    ) {
+        let (manager, root) = self.sessions[idx].handles.manager_and_root();
+        let root_spec = target
+            .as_ref()
+            .filter(|target| target.id() == root)
+            .and_then(|_| selection.spec.clone());
+        let target_policy = target.as_ref().and_then(|target| {
+            maki_lua::orchestration::OrchestrationServices::template(&*self.orchestration, target)
+                .ok()
+                .map(|template| template.model_policy)
+        });
+        let reservation = target
+            .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+            .and_then(|target| {
+                let runtime_root = manager.lookup(root).map_err(|error| error.to_string())?;
+                if !runtime_root.same_manager(&target) {
+                    return Err(NOT_LIVE_ERR.to_owned());
+                }
+                target.validate_live().map_err(|error| error.to_string())?;
+                target
+                    .manager()
+                    .actor(target.id())
+                    .map_err(|error| error.to_string())?
+                    .reserve_config_update()
+                    .map_err(|error| error.to_string())
+            });
+        let timeouts = self.ctx.timeouts;
+        let policy = target_policy.unwrap_or_else(|| Arc::clone(&self.ctx.model_policy));
+        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let internal_tx = self.internal_tx.clone();
+        let session = self.sessions[idx].id();
+        let runtime = self.sessions[idx].handles.identity();
+        smol::spawn(async move {
+            let result = match reservation {
+                Ok(ticket) => prepare_config_change(
+                    ticket,
+                    prepare_model_patch(
+                        selection.spec,
+                        maki_agent::actor::ConfigPatch {
+                            thinking: selection.thinking,
+                            fast: selection.fast,
+                            ..Default::default()
+                        },
+                        policy,
+                        prepare,
+                        timeouts,
+                    ),
+                    async {
+                        smol::Timer::after(SESSION_OP_TIMEOUT).await;
+                    },
+                )
+                .await
+                .map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if result.is_ok()
+                && let Some(spec) = root_spec
+            {
+                let _ = internal_tx.send(InternalEvent::SessionOp {
+                    session,
+                    runtime: Arc::clone(&runtime),
+                    kind: SessionOpKind::ModelChanged {
+                        spec: spec.to_string(),
+                    },
+                    result: Ok(()),
+                });
+            }
+            if let Some(reply) = reply {
+                let _ = reply.send(
+                    result
+                        .map(|()| maki_commands::HostResponse::Completed)
+                        .map_err(|error| maki_commands::CommandError::Producer(Arc::from(error))),
+                );
+            } else {
+                let _ = internal_tx.send(InternalEvent::SessionOp {
+                    session,
+                    runtime,
+                    kind: SessionOpKind::ProviderRefreshed,
+                    result,
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Re-prepares the root's current model, for instance after logging in to its provider.
+    fn reprepare_root_model(&self, idx: usize, spec: String) {
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
         let actor = manager.actor(root).map_err(|error| error.to_string());
         let reserved = actor.and_then(|actor| {
@@ -4413,7 +4846,7 @@ impl<'t> EventLoop<'t> {
         smol::spawn(async move {
             let result = match reserved {
                 Ok((ticket, expected)) => {
-                    let requested = spec.clone();
+                    let requested = spec;
                     prepare_config_change(
                         ticket,
                         async move {
@@ -4426,21 +4859,12 @@ impl<'t> EventLoop<'t> {
                                 prepare(model, timeouts).map_err(|error| error.to_string())
                             })
                             .await?;
-                            Ok(if refresh {
-                                maki_agent::actor::ConfigChange::Refresh {
-                                    expected: maki_agent::actor::PreparedModel {
-                                        provider: Arc::clone(&expected.provider),
-                                        model: expected.model.clone(),
-                                    },
-                                    replacement,
-                                }
-                            } else {
-                                maki_agent::actor::ConfigChange::Patch(
-                                    maki_agent::actor::ConfigPatch {
-                                        model: Some(replacement),
-                                        ..Default::default()
-                                    },
-                                )
+                            Ok(maki_agent::actor::ConfigChange::Refresh {
+                                expected: maki_agent::actor::PreparedModel {
+                                    provider: Arc::clone(&expected.provider),
+                                    model: expected.model.clone(),
+                                },
+                                replacement,
                             })
                         },
                         async {
@@ -4452,15 +4876,10 @@ impl<'t> EventLoop<'t> {
                 }
                 Err(error) => Err(error),
             };
-            let kind = if refresh {
-                SessionOpKind::ProviderRefreshed
-            } else {
-                SessionOpKind::ModelChanged { spec }
-            };
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
                 runtime: identity,
-                kind,
+                kind: SessionOpKind::ProviderRefreshed,
                 result,
             });
         })
@@ -4471,7 +4890,6 @@ impl<'t> EventLoop<'t> {
         let available = Arc::clone(&self.ctx.available_models);
         let warn_tx = self.warn_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
-        available.store(None);
         smol::spawn(async move {
             fetch_all_models(
                 &policy,
@@ -4488,7 +4906,7 @@ impl<'t> EventLoop<'t> {
         let slot = Arc::clone(self.focused_model_slot());
         let model = slot.load().model.clone();
         if model.provider.to_string() == slug {
-            self.dispatch_prepared_model(idx, model.spec(), true);
+            self.reprepare_root_model(idx, model.spec());
         } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
             self.change_model(self.focused, builtin.default_model);
         }
@@ -4666,6 +5084,27 @@ fn provider_usage_limit(limit: maki_providers::UsageLimit) -> ProviderUsageLimit
         reset_at_ms: limit.reset_at,
         detail: limit.detail,
     }
+}
+
+async fn prepare_model_patch(
+    spec: Option<Arc<str>>,
+    mut patch: maki_agent::actor::ConfigPatch,
+    policy: Arc<ModelPolicy>,
+    prepare: PrepareProvider,
+    timeouts: Timeouts,
+) -> Result<maki_agent::actor::ConfigChange, String> {
+    patch.model = smol::unblock(move || {
+        spec.map(|spec| {
+            if !policy.allows(&spec) {
+                return Err(format!("model is not allowed: {spec}"));
+            }
+            let model = Model::from_spec(&spec).map_err(|error| error.to_string())?;
+            prepare(model, timeouts).map_err(|error| error.to_string())
+        })
+        .transpose()
+    })
+    .await?;
+    Ok(maki_agent::actor::ConfigChange::Patch(patch))
 }
 
 async fn prepare_config_change<F, E>(
@@ -5021,11 +5460,12 @@ mod tests {
         }
     }
     use crate::selection::SelectionZone;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use maki_agent::tools::offload::{MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError};
     use maki_agent::{AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
-    use maki_providers::TokenUsage;
+    use maki_lua::BuiltinAction;
+    use maki_providers::{Effort, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
@@ -5323,7 +5763,7 @@ mod tests {
             predecessor.wait().await.unwrap();
             let commit = combined.wait().await.unwrap();
             assert!(commit.config.workflow);
-            assert!(commit.config.thinking.enabled());
+            assert!(commit.config.thinking.is_enabled());
             assert_eq!(commit.config.model.id, "replacement");
             release_runtime(runtime);
         });
@@ -5373,10 +5813,7 @@ mod tests {
             assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
             let later = actor.reserve_config_update().unwrap();
             later
-                .resolve(
-                    thinking_change("high")
-                        .map_err(|error| maki_agent::ActorError::InvalidConfig(error.into())),
-                )
+                .resolve(thinking_change("high").map_err(maki_agent::ActorError::InvalidConfig))
                 .unwrap();
             later.wait().await.unwrap();
             assert_eq!(thinking_reply(&commit), json!({ "mode": "minimal" }));
@@ -5415,7 +5852,7 @@ mod tests {
                 };
                 result.unwrap();
                 let commit = commit.unwrap();
-                values.push((commit.generation, commit.config.thinking.enabled()));
+                values.push((commit.generation, commit.config.thinking.is_enabled()));
             }
             values.sort();
             assert_eq!(
@@ -5425,7 +5862,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![true, false]
             );
-            assert!(!actor.effective_config().unwrap().thinking.enabled());
+            assert!(!actor.effective_config().unwrap().thinking.is_enabled());
             release_runtime(runtime);
         });
     }
@@ -6311,6 +6748,9 @@ mod tests {
             notifier: None,
             sessions_dir: ctx.sessions_dir.clone(),
             session_cwd: harness._temp_dir.path().to_string_lossy().into_owned(),
+            orchestration: Arc::new(AgentOrchestration::new(Arc::clone(&ctx.available_models))),
+            orchestration_revisions: Vec::new(),
+            orchestration_focus: None,
             ctx,
             last_heartbeat: Instant::now(),
             input: InputReader::disconnected(),
@@ -6332,6 +6772,81 @@ mod tests {
             release_runtime(runtime);
         }
         harness.ctx = Some(event_loop.ctx);
+    }
+
+    #[test_case(false; "bare_model")]
+    #[test_case(true; "explicit_model")]
+    fn initial_cli_model_prompt_syncs_admission_before_submission(explicit_model: bool) {
+        const MODEL: &str = "anthropic/claude-sonnet-4-6";
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let app = &mut event_loop.sessions[0].app;
+            app.command_runtime = Arc::clone(&command_runtime);
+            app.command_target = command_runtime.bind_target();
+            let target = app.command_target.clone();
+            assert!(command_runtime.target_agent(&target).is_none());
+            assert!(event_loop.orchestration_revisions.is_empty());
+            event_loop.ctx.prepare_provider = Arc::new(|model, _| {
+                Ok(maki_agent::actor::PreparedModel {
+                    model,
+                    provider: Arc::new(StubProvider),
+                })
+            });
+            let initial_prompt = if explicit_model {
+                format!("/model {MODEL}")
+            } else {
+                "/model".into()
+            };
+
+            event_loop.start(Some(initial_prompt));
+
+            let command = command_runtime
+                .recv_timeout_for_test(RUNTIME_SHUTDOWN_TIMEOUT)
+                .unwrap();
+            let CommandEvent::Host {
+                target: captured_target,
+                admission: Some(admission),
+                ..
+            } = &command
+            else {
+                panic!("initial model prompt must capture admission before dispatch");
+            };
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            assert_eq!(*captured_target, target.id());
+            assert_eq!(admission.target.id(), root);
+            assert!(
+                admission
+                    .target
+                    .same_manager(&manager.lookup(root).unwrap())
+            );
+            event_loop.handle_command(command);
+            assert!(matches!(
+                command_runtime
+                    .recv_timeout_for_test(RUNTIME_SHUTDOWN_TIMEOUT)
+                    .unwrap(),
+                CommandEvent::Outcome {
+                    outcome: maki_commands::CommandOutcome::Completed,
+                    ..
+                }
+            ));
+            if explicit_model {
+                assert_eq!(
+                    manager
+                        .actor(root)
+                        .unwrap()
+                        .effective_config()
+                        .unwrap()
+                        .model
+                        .spec(),
+                    MODEL
+                );
+            } else {
+                let app = &event_loop.sessions[0].app;
+                assert!(app.model_picker.is_open());
+                assert_eq!(app.model_picker_target.as_ref().unwrap().id(), root);
+            }
+        });
     }
 
     struct RuntimeHarness {
@@ -6616,7 +7131,6 @@ mod tests {
     #[test]
     fn background_deletion_lease_failure_cancels_and_drains_active_turn() {
         use maki_agent::actor::ActorLifecycle;
-        use maki_agent::manager::GraphLifecycle;
 
         const PROMPT: &str = "hold the background turn";
         const BODY: &str = "retained output after lease failure";
@@ -6728,9 +7242,10 @@ mod tests {
                 snapshot.latest,
                 Some(TurnOutcome::Cancelled { .. })
             ));
-            let nodes = manager.snapshot();
-            let root = nodes.iter().find(|node| node.agent_id == root).unwrap();
-            assert_eq!(root.graph_lifecycle, GraphLifecycle::Closed);
+            assert!(
+                matches!(manager.node(root), Err(maki_agent::ManagerError::UnknownAgent(id)) if id == root)
+            );
+            assert!(manager.snapshot().is_empty());
             assert!(AppSession::load(id, &event_loop.ctx.storage).is_ok());
             assert_eq!(std::fs::read_to_string(&artifact).unwrap(), BODY);
             assert!(matches!(store.put(BODY), Err(OffloadError::Closed)));
@@ -6889,8 +7404,9 @@ mod tests {
         release_runtime(runtime);
     }
 
-    #[test]
-    fn live_session_requests_remain_independent_during_changes_and_restore() {
+    #[test_case("/model anthropic/claude-opus-4-6 thinking=high fast=false"; "trailing_options")]
+    #[test_case("/model anthropic/claude-opus-4-6{thinking=high,fast=false}"; "embedded_options")]
+    fn live_session_requests_remain_independent_during_changes_and_restore(command: &str) {
         use maki_agent::actor::PreparedModel;
         use maki_providers::{RequestOptions, Role, StopReason, StreamResponse};
 
@@ -6992,6 +7508,14 @@ mod tests {
                 }
                 .clamped(&model(spec))
             };
+            let changed = |fast| {
+                RequestOptions {
+                    thinking: DomainThinkingConfig::Effort(maki_providers::Effort::High),
+                    fast,
+                }
+                .clamped(&model(FIRST))
+            };
+            assert_ne!(changed(false), expected(FIRST, false));
             send(event_loop, 1);
             assert_eq!(
                 requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
@@ -7021,22 +7545,56 @@ mod tests {
                     }),
                 })
             });
-            event_loop.set_focused(1);
-            event_loop.change_model(2, FIRST);
-            let completion = event_loop
-                .internal_rx
-                .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+            event_loop.set_focused(2);
+            event_loop.sync_orchestration();
+            let command_target = event_loop.sessions[2].app.command_target.clone();
+            let dispatch = event_loop
+                .ctx
+                .command_runtime
+                .registry
+                .dispatch_input(&command_target, command.into());
+            let dispatch = smol::spawn(dispatch);
+            let command = event_loop
+                .ctx
+                .command_runtime
+                .recv_timeout_for_test(RUNTIME_SHUTDOWN_TIMEOUT)
                 .unwrap();
-            assert!(
-                matches!(&completion, InternalEvent::SessionOp { session, result: Ok(()), .. } if *session == event_loop.sessions[2].id())
-            );
-            event_loop.handle_internal(completion);
+            event_loop.set_focused(1);
+            event_loop.handle_command(command);
+            smol::block_on(dispatch);
             let _ = event_loop.tick();
             releases[1].send(()).unwrap();
             send(event_loop, 2);
             assert_eq!(
                 requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
-                ("changed", FIRST.into(), expected(FIRST, false))
+                ("changed", FIRST.into(), changed(false))
+            );
+
+            event_loop.set_focused(2);
+            event_loop.sync_orchestration();
+            let dispatch = smol::spawn(
+                event_loop
+                    .ctx
+                    .command_runtime
+                    .registry
+                    .dispatch_input(&command_target, "/model fast=true".into()),
+            );
+            let command = event_loop
+                .ctx
+                .command_runtime
+                .recv_timeout_for_test(RUNTIME_SHUTDOWN_TIMEOUT)
+                .unwrap();
+            event_loop.set_focused(1);
+            event_loop.handle_command(command);
+            assert!(matches!(
+                smol::block_on(dispatch),
+                maki_commands::InputDispatch::Dispatched(maki_commands::CommandOutcome::Completed)
+            ));
+            changed_release.send(()).unwrap();
+            send(event_loop, 2);
+            assert_eq!(
+                requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
+                ("changed", FIRST.into(), changed(true))
             );
 
             let mut stored = AppSession::new(THIRD, &event_loop.session_cwd);
@@ -7713,6 +8271,771 @@ mod tests {
         assert_eq!(runtime.app.input_box.buffer.value(), PROMPT);
         release_runtime(old);
         release_runtime(runtime);
+    }
+
+    #[test_case(true; "closed_task_selected_before_dispatch")]
+    #[test_case(false; "pinned_task_closed_before_handler")]
+    fn lua_command_runs_without_authority_for_closed_task(closed_before_dispatch: bool) {
+        const SPAWNED: &str = "task spawned";
+        const OBSERVED: &str = "ordinary handler executed without authority";
+        const TASK_NAME: &str = "command regression task";
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            event_loop.sessions[0].app.command_target = command_runtime.bind_target();
+            event_loop.sessions[0].app.command_runtime = Arc::clone(&command_runtime);
+            let registry = command_runtime.registry.clone();
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "closed_task_command",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "/spawn-command-task", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{
+                                inherit_provider = true, silent = true,
+                            }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "/ordinary-command", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(ctx == nil)
+                            local ok, child = pcall(maki.agent.spawn, ctx, {{
+                                inherit_provider = true, silent = true,
+                            }})
+                            assert(not ok or child == nil)
+                            maki.ui.flash("{OBSERVED}")
+                        end,
+                    }})
+                    "#
+                ),
+            )
+            .unwrap();
+            let actions = host.ui_action_rx();
+            event_loop.sync_orchestration();
+            smol::block_on(registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                "/spawn-command-task".into(),
+            ));
+            assert!(matches!(
+                actions.recv_timeout(Duration::from_secs(5)).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+            let child_id = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root_id))
+                .unwrap()
+                .agent_id;
+            let app = &mut event_loop.sessions[0].app;
+            let mut chat = crate::chat::Chat::new(
+                TASK_NAME.into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            chat.agent_id = Some(child_id);
+            chat.mark_finished(crate::components::DisplayRole::Assistant, "done");
+            app.chats.push(chat);
+            app.active_chat = 1;
+            assert_eq!(app.selected_agent_id(), Some(child_id));
+            if closed_before_dispatch {
+                manager.close_subtree(child_id).unwrap();
+            }
+            event_loop.sync_orchestration();
+            let queued = registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                "/ordinary-command".into(),
+            );
+            if !closed_before_dispatch {
+                manager.close_subtree(child_id).unwrap();
+            }
+            assert!(manager.lookup(child_id).is_err());
+            smol::block_on(queued);
+            assert!(matches!(
+                actions.recv_timeout(Duration::from_secs(5)).unwrap(),
+                UiAction::Flash(text) if text == OBSERVED
+            ));
+            assert!(manager.lookup(root_id).is_ok());
+            smol::block_on(futures_lite::future::race(
+                async {
+                    while !manager.runner_finished(child_id).unwrap() {
+                        smol::future::yield_now().await;
+                    }
+                },
+                async {
+                    smol::Timer::after(RUNTIME_SHUTDOWN_TIMEOUT).await;
+                    panic!("closed child runner did not finish");
+                },
+            ));
+            assert_eq!(manager.snapshot().len(), 1);
+        });
+    }
+
+    #[test]
+    fn model_spec_requests_follow_the_pinned_target_policy() {
+        const ALLOWED: &str = "anthropic/claude-opus-4-6";
+        const EXCLUDED: &str = "openai/gpt-5";
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            let app = &mut event_loop.sessions[0].app;
+            app.command_runtime = Arc::clone(&command_runtime);
+            app.command_target = command_runtime.bind_target();
+            event_loop
+                .ctx
+                .available_models
+                .store(Some(Arc::new(vec![ALLOWED.into(), EXCLUDED.into()])));
+            event_loop.sessions[0]
+                .handles
+                .orchestration_template
+                .model_policy = Arc::new(ModelPolicy::new(&[], &[EXCLUDED.into()]).unwrap());
+            event_loop.sync_orchestration();
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let target = manager.lookup(root).unwrap();
+            let Ok(maki_commands::HostResponse::Context(
+                maki_commands::HostContextResponse::Values(specs),
+            )) = event_loop.target_model_specs(&target)
+            else {
+                panic!("model specs request failed");
+            };
+            assert_eq!(&*specs, [Arc::<str>::from(ALLOWED)]);
+            let complete = |target: &maki_commands::TargetHandle| {
+                let registry = &command_runtime.registry;
+                let command = registry.resolve_for(target, "/model").unwrap();
+                let completion = registry.open_completion(command, target.id()).unwrap();
+                let maki_commands::CompletionResult::Items(items) = smol::block_on(
+                    completion.complete(Arc::from(""), Arc::from(""), 0, Arc::from("insert")),
+                ) else {
+                    panic!("expected model completions");
+                };
+                items
+                    .iter()
+                    .map(|item| item.item().insertion.to_string())
+                    .collect::<Vec<_>>()
+            };
+            let original = event_loop.sessions[0].app.command_target.clone();
+            let items = complete(&original);
+            assert!(items.iter().any(|spec| spec == ALLOWED));
+            assert!(!items.iter().any(|spec| spec == EXCLUDED));
+            assert!(items.iter().any(|spec| spec == "thinking=high"));
+            assert!(items.iter().any(|spec| spec == "fast=true"));
+            let picker = &mut event_loop.sessions[0].app.model_picker;
+            picker.set_recents(vec![EXCLUDED.into()]);
+            picker.open(EXCLUDED);
+            assert!(matches!(
+                picker.handle_key(crate::components::key(KeyCode::Enter)),
+                crate::components::model_picker::ModelPickerAction::Select(spec) if spec == ALLOWED
+            ));
+
+            picker.open(ALLOWED);
+            event_loop.sessions[0]
+                .handles
+                .orchestration_template
+                .model_policy = Arc::new(ModelPolicy::new(&[], &[ALLOWED.into()]).unwrap());
+            event_loop.sync_orchestration();
+            assert!(matches!(
+                event_loop.sessions[0].app.model_picker.handle_key(crate::components::key(KeyCode::Enter)),
+                crate::components::model_picker::ModelPickerAction::Select(spec) if spec == EXCLUDED
+            ));
+
+            let mut second = test_runtime(model_named("other-model"));
+            second.app.command_runtime = Arc::clone(&command_runtime);
+            second.app.command_target = command_runtime.bind_target();
+            second.handles.orchestration_template.model_policy =
+                Arc::new(ModelPolicy::new(&[], &[EXCLUDED.into()]).unwrap());
+            event_loop.sessions.push(second);
+            event_loop.set_focused(1);
+            event_loop.sync_orchestration();
+            let original_items = complete(&original);
+            assert!(!original_items.iter().any(|spec| spec == ALLOWED));
+            assert!(original_items.iter().any(|spec| spec == EXCLUDED));
+            let focused_items = complete(&event_loop.sessions[1].app.command_target);
+            assert!(focused_items.iter().any(|spec| spec == ALLOWED));
+            assert!(!focused_items.iter().any(|spec| spec == EXCLUDED));
+        });
+    }
+
+    #[test_case(false, false, false ; "direct_action")]
+    #[test_case(true, false, false ; "slash_command")]
+    #[test_case(false, true, false ; "direct_closed_target")]
+    #[test_case(true, true, false ; "slash_closed_target")]
+    #[test_case(false, false, true ; "direct_closed_before_open")]
+    #[test_case(true, false, true ; "slash_closed_before_handle")]
+    fn model_picker_keeps_admitted_child_through_confirmation(
+        slash_command: bool,
+        close_child: bool,
+        close_before_open: bool,
+    ) {
+        const CHILD_MODEL: &str = "anthropic/child-model";
+        const NEXT_MODEL: &str = "anthropic/claude-sonnet-4-6";
+        const SPAWNED: &str = "picker child spawned";
+        let open_picker = |event_loop: &mut EventLoop<'_>| {
+            if slash_command {
+                let target = event_loop.sessions[0].app.command_target.clone();
+                let dispatch = smol::spawn(
+                    event_loop
+                        .ctx
+                        .command_runtime
+                        .registry
+                        .dispatch_input(&target, "/model".into()),
+                );
+                let command = event_loop
+                    .ctx
+                    .command_runtime
+                    .recv_timeout_for_test(RUNTIME_SHUTDOWN_TIMEOUT)
+                    .unwrap();
+                if close_before_open {
+                    let target = selected_agent(&event_loop.sessions[0]).unwrap();
+                    target.manager().actor(target.id()).unwrap().close();
+                    event_loop.sync_orchestration();
+                }
+                event_loop.sessions[0].app.active_chat = 0;
+                event_loop.sync_orchestration();
+                event_loop.handle_command(command);
+                let outcome = smol::block_on(dispatch);
+                if close_before_open {
+                    assert!(matches!(
+                        outcome,
+                        maki_commands::InputDispatch::Dispatched(
+                            maki_commands::CommandOutcome::Failed(
+                                maki_commands::CommandError::StaleTarget
+                            )
+                        )
+                    ));
+                } else {
+                    assert!(matches!(
+                        outcome,
+                        maki_commands::InputDispatch::Dispatched(
+                            maki_commands::CommandOutcome::Completed
+                        )
+                    ));
+                }
+            } else {
+                if close_before_open {
+                    let target = selected_agent(&event_loop.sessions[0]).unwrap();
+                    target.manager().actor(target.id()).unwrap().close();
+                    event_loop.sync_orchestration();
+                    assert!(
+                        event_loop
+                            .ctx
+                            .command_runtime
+                            .target_agent(&event_loop.sessions[0].app.command_target)
+                            .is_none()
+                    );
+                }
+                event_loop.sessions[0]
+                    .app
+                    .run_builtin(BuiltinAction::ModelPicker);
+            }
+        };
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            event_loop.ctx.prepare_provider = Arc::new(|model, _| {
+                Ok(maki_agent::actor::PreparedModel {
+                    model,
+                    provider: Arc::new(StubProvider),
+                })
+            });
+            let app = &mut event_loop.sessions[0].app;
+            app.command_target = command_runtime.bind_target();
+            app.command_runtime = Arc::clone(&command_runtime);
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                command_runtime.registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "model_picker_child",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "/spawn-picker-child", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    "#
+                ),
+            )
+            .unwrap();
+            event_loop.sync_orchestration();
+            smol::block_on(command_runtime.registry.dispatch_input(
+                &event_loop.sessions[0].app.command_target,
+                "/spawn-picker-child".into(),
+            ));
+            assert!(matches!(
+                host.ui_action_rx().recv_timeout(SESSION_OP_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            event_loop.sessions[0]
+                .handles
+                .orchestration_template
+                .model_policy = Arc::new(ModelPolicy::new(&[], &[NEXT_MODEL.into()]).unwrap());
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let child = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root))
+                .unwrap()
+                .agent_id;
+            let actor = manager.actor(child).unwrap();
+            let ticket = actor.reserve_config_update().unwrap();
+            ticket
+                .resolve(Ok(maki_agent::actor::ConfigChange::Patch(
+                    maki_agent::actor::ConfigPatch {
+                        model: Some(maki_agent::actor::PreparedModel {
+                            provider: Arc::new(StubProvider),
+                            model: model_named("child-model"),
+                        }),
+                        ..Default::default()
+                    },
+                )))
+                .unwrap();
+            smol::block_on(ticket.wait()).unwrap();
+            let app = &mut event_loop.sessions[0].app;
+            let root_model = app.state.model.spec();
+            assert_ne!(root_model, CHILD_MODEL);
+            let mut chat = crate::chat::Chat::new(
+                "picker child".into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            chat.agent_id = Some(child);
+            app.chats.push(chat);
+            app.active_chat = 1;
+            event_loop.ctx.available_models.store(Some(Arc::new(vec![
+                root_model.clone(),
+                CHILD_MODEL.into(),
+                NEXT_MODEL.into(),
+            ])));
+            event_loop.sync_orchestration();
+            open_picker(event_loop);
+            if close_before_open {
+                assert!(!event_loop.sessions[0].app.model_picker.is_open());
+                assert!(event_loop.sessions[0].app.model_picker_target.is_none());
+                event_loop.sessions[0].app.active_chat = 0;
+                event_loop.sync_orchestration();
+                let actions = event_loop.sessions[0]
+                    .app
+                    .update(crate::app::Msg::Key(crate::components::key(KeyCode::Enter)));
+                assert!(!actions.iter().any(|action| matches!(
+                    action,
+                    Action::ChangeModel(_)
+                        | Action::ChangePinnedModel { .. }
+                        | Action::SelectModel(_)
+                )));
+                assert_eq!(
+                    manager
+                        .actor(root)
+                        .unwrap()
+                        .effective_config()
+                        .unwrap()
+                        .model
+                        .spec(),
+                    root_model
+                );
+                return;
+            }
+            event_loop.sessions[0].app.active_chat = 1;
+            event_loop.sync_orchestration();
+            event_loop.sessions[0].app.active_chat = 0;
+            event_loop.sync_orchestration();
+            event_loop.sync_model_discovery();
+            let app = &mut event_loop.sessions[0].app;
+            let actions = app.update(crate::app::Msg::Key(crate::components::key(KeyCode::Enter)));
+            assert!(
+                matches!(actions.as_slice(), [Action::ChangePinnedModel { target, spec }]
+                if target.id() == child && spec == CHILD_MODEL)
+            );
+            assert_eq!(app.state.model.spec(), root_model);
+            assert_eq!(actor.effective_config().unwrap().model.spec(), CHILD_MODEL);
+
+            app.active_chat = 1;
+            event_loop.sync_orchestration();
+            open_picker(event_loop);
+            event_loop.sessions[0].app.active_chat = 0;
+            event_loop.sync_orchestration();
+            event_loop.sync_model_discovery();
+            if close_child {
+                actor.close();
+            }
+            let app = &mut event_loop.sessions[0].app;
+            app.update(crate::app::Msg::Paste(
+                NEXT_MODEL.split_once('/').unwrap().1.into(),
+            ));
+            let actions = app.update(crate::app::Msg::Key(crate::components::key(KeyCode::Enter)));
+            assert!(
+                matches!(actions.as_slice(), [Action::ChangePinnedModel { target, spec }]
+                if target.id() == child && spec == NEXT_MODEL)
+            );
+            event_loop.dispatch(0, actions);
+            let completion = event_loop
+                .internal_rx
+                .recv_timeout(SESSION_OP_TIMEOUT)
+                .unwrap();
+            assert!(
+                matches!(&completion, InternalEvent::SessionOp { result, .. } if result.is_err() == close_child)
+            );
+            event_loop.handle_internal(completion);
+            assert_eq!(
+                manager
+                    .actor(root)
+                    .unwrap()
+                    .effective_config()
+                    .unwrap()
+                    .model
+                    .spec(),
+                root_model
+            );
+            if !close_child {
+                assert_eq!(actor.effective_config().unwrap().model.spec(), NEXT_MODEL);
+            }
+        });
+    }
+
+    #[test]
+    fn keymap_run_command_addresses_its_pinned_target_after_focus_moves() {
+        const PINNED_THINKING: &str = "high";
+        const CHILD_CHAT: &str = "keymap pin child";
+        const SPAWNED: &str = "keymap pin child spawned";
+        const INNER_DONE: &str = "keymap pin command finished";
+        const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            event_loop.sessions[0].app.command_target = command_runtime.bind_target();
+            event_loop.sessions[0].app.command_runtime = Arc::clone(&command_runtime);
+            let registry = command_runtime.registry.clone();
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            event_loop.sessions[0].app.lua_event_handle = host.event_handle();
+            host.load_source(
+                "keymap_pin_command",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "/spawn-keymap-child", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "/keymap-inner", tui_only = false,
+                        handler = function(_, ctx)
+                            local target = assert(maki.agent.current(ctx))
+                            assert(target:set_model(ctx, {{ thinking = "{PINNED_THINKING}" }}))
+                            maki.ui.flash("{INNER_DONE}")
+                        end,
+                    }})
+                    maki.keymap.set("n", "<C-y>", function()
+                        assert(maki.api.run_command("/keymap-inner"))
+                    end)
+                    "#
+                ),
+            )
+            .unwrap();
+            let actions = host.ui_action_rx();
+            event_loop.sync_orchestration();
+            let command_target = event_loop.sessions[0].app.command_target.clone();
+            smol::block_on(registry.dispatch_input(&command_target, "/spawn-keymap-child".into()));
+            assert!(matches!(
+                actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+            let child_id = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root_id))
+                .unwrap()
+                .agent_id;
+            let thinking = |id| {
+                manager
+                    .actor(id)
+                    .unwrap()
+                    .effective_config()
+                    .unwrap()
+                    .thinking
+            };
+            let pinned_thinking = DomainThinkingConfig::Effort(Effort::High);
+            let root_thinking = thinking(root_id);
+            assert_ne!(root_thinking, pinned_thinking);
+            assert_ne!(thinking(child_id), pinned_thinking);
+
+            let app = &mut event_loop.sessions[0].app;
+            let mut chat = crate::chat::Chat::new(
+                CHILD_CHAT.into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            chat.agent_id = Some(child_id);
+            app.chats.push(chat);
+            app.active_chat = 1;
+            event_loop.sync_orchestration();
+            let keymap = host.keymap_reader().load().entries[0].id;
+            event_loop.run_keybind(0, keymap);
+            event_loop.sessions[0].app.active_chat = 0;
+            event_loop.sync_orchestration();
+            let action = actions.recv_timeout(ACTION_TIMEOUT).unwrap();
+            assert!(matches!(
+                &action,
+                UiAction::RunCommand {
+                    target: Some(_),
+                    ..
+                }
+            ));
+            event_loop.handle_ui_action(action);
+            assert!(matches!(
+                actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == INNER_DONE
+            ));
+            assert_eq!(thinking(child_id), pinned_thinking);
+            assert_eq!(thinking(root_id), root_thinking);
+        });
+    }
+
+    #[test]
+    fn nested_lua_command_acts_on_target_pinned_before_selection_changes() {
+        const PINNED_THINKING: &str = "high";
+        const CHILD_CHAT: &str = "nested pin child";
+        const SPAWNED: &str = "nested pin child spawned";
+        const INNER_DONE: &str = "nested pin inner command finished";
+        const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+        with_event_loop(|event_loop| {
+            let command_runtime = Arc::clone(&event_loop.ctx.command_runtime);
+            event_loop.sessions[0].app.command_target = command_runtime.bind_target();
+            event_loop.sessions[0].app.command_runtime = Arc::clone(&command_runtime);
+            let registry = command_runtime.registry.clone();
+            let host = maki_lua::PluginHost::with_command_registry(
+                Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                registry.clone(),
+                false,
+            )
+            .unwrap();
+            host.event_handle()
+                .install_orchestration_services(event_loop.orchestration.clone());
+            host.load_source(
+                "nested_pin_command",
+                &format!(
+                    r#"
+                    maki.api.register_command({{
+                        name = "/spawn-pin-child", tui_only = false,
+                        handler = function(_, ctx)
+                            assert(maki.agent.spawn(ctx, {{ inherit_provider = true, silent = true }}))
+                            maki.ui.flash("{SPAWNED}")
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "/pin-outer", tui_only = false,
+                        handler = function()
+                            assert(maki.fn.winsaveview())
+                            assert(maki.api.run_command("/pin-inner"))
+                        end,
+                    }})
+                    maki.api.register_command({{
+                        name = "/pin-inner", tui_only = false,
+                        handler = function(_, ctx)
+                            local target = assert(maki.agent.current(ctx))
+                            assert(target:set_model(ctx, {{ thinking = "{PINNED_THINKING}" }}))
+                            maki.ui.flash("{INNER_DONE}")
+                        end,
+                    }})
+                    "#
+                ),
+            )
+            .unwrap();
+            let actions = host.ui_action_rx();
+            event_loop.sync_orchestration();
+            let command_target = event_loop.sessions[0].app.command_target.clone();
+            smol::block_on(registry.dispatch_input(&command_target, "/spawn-pin-child".into()));
+            assert!(matches!(
+                actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == SPAWNED
+            ));
+            let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+            let child_id = manager
+                .snapshot()
+                .into_iter()
+                .find(|node| node.parent_id == Some(root_id))
+                .unwrap()
+                .agent_id;
+            let thinking = |id| {
+                manager
+                    .actor(id)
+                    .unwrap()
+                    .effective_config()
+                    .unwrap()
+                    .thinking
+            };
+            let pinned_thinking = DomainThinkingConfig::Effort(Effort::High);
+            let child_thinking = thinking(child_id);
+            assert_ne!(thinking(root_id), pinned_thinking);
+            assert_ne!(child_thinking, pinned_thinking);
+
+            smol::block_on(registry.dispatch_input(&command_target, "/pin-outer".into()));
+            let UiAction::WinSaveView { reply_tx } = actions.recv_timeout(ACTION_TIMEOUT).unwrap()
+            else {
+                panic!("outer command did not reach its gate");
+            };
+            let app = &mut event_loop.sessions[0].app;
+            let mut chat = crate::chat::Chat::new(
+                CHILD_CHAT.into(),
+                app.ui_config.clone(),
+                app.lua_event_handle.clone(),
+                Arc::clone(&app.theme_provider),
+            );
+            chat.agent_id = Some(child_id);
+            app.chats.push(chat);
+            app.active_chat = 1;
+            assert_eq!(app.selected_agent_id(), Some(child_id));
+            event_loop.sync_orchestration();
+            reply_tx
+                .send(maki_lua::WinView {
+                    scroll_top: 0,
+                    line_count: 0,
+                    height: 0,
+                    auto_scroll: false,
+                })
+                .unwrap();
+            assert!(matches!(
+                actions.recv_timeout(ACTION_TIMEOUT).unwrap(),
+                UiAction::Flash(text) if text == INNER_DONE
+            ));
+            assert_eq!(thinking(root_id), pinned_thinking);
+            assert_eq!(thinking(child_id), child_thinking);
+        });
+    }
+
+    #[test]
+    fn unchanged_orchestration_keeps_registered_templates() {
+        with_event_loop(|event_loop| {
+            event_loop.sync_orchestration();
+            let revision = &event_loop.orchestration_revisions[0];
+            let original = revision.root_config.clone().unwrap();
+            let revisions = event_loop.orchestration_revisions.as_ptr();
+            event_loop.sync_orchestration();
+            assert_eq!(event_loop.orchestration_revisions.as_ptr(), revisions);
+            assert!(Arc::ptr_eq(
+                event_loop.orchestration_revisions[0]
+                    .root_config
+                    .as_ref()
+                    .unwrap(),
+                &original,
+            ));
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let ticket = manager
+                .actor(root)
+                .unwrap()
+                .reserve_config_update()
+                .unwrap();
+            ticket
+                .resolve(Ok(maki_agent::actor::ConfigChange::ToggleWorkflow))
+                .unwrap();
+            smol::block_on(ticket.wait()).unwrap();
+            event_loop.sync_orchestration();
+            assert!(!Arc::ptr_eq(
+                event_loop.orchestration_revisions[0]
+                    .root_config
+                    .as_ref()
+                    .unwrap(),
+                &original,
+            ));
+        });
+    }
+
+    #[test]
+    fn queued_command_admission_keeps_agent_after_ui_selection_changes() {
+        struct Probe(Arc<Mutex<Option<maki_agent::AgentId>>>);
+        impl maki_commands::CommandBehavior for Probe {
+            fn execute(
+                &self,
+                invocation: maki_commands::CommandInvocation,
+            ) -> maki_commands::CommandFuture<
+                Result<maki_commands::CommandOutcome, maki_commands::CommandError>,
+            > {
+                *self.0.lock().unwrap() = Some(
+                    invocation
+                        .admission_context::<maki_lua::orchestration::TrustedTarget>()
+                        .unwrap()
+                        .target
+                        .id(),
+                );
+                Box::pin(async { Ok(maki_commands::CommandOutcome::Completed) })
+            }
+        }
+        let harness = RuntimeHarness::new();
+        let first = harness.runtime(harness.session());
+        let second = harness.runtime(harness.session());
+        let command_runtime = &harness.ctx().command_runtime;
+        let (first_manager, first_id) = first.handles.manager_and_root();
+        let (second_manager, second_id) = second.handles.manager_and_root();
+        let target_id = first.app.command_target.id();
+        command_runtime.sync_admissions(std::collections::HashMap::from([(
+            target_id,
+            maki_lua::orchestration::TrustedTarget {
+                target: first_manager.lookup(first_id).unwrap(),
+                template: first.handles.orchestration_template.clone(),
+            },
+        )]));
+        let seen = Arc::new(Mutex::new(None));
+        let producer = command_runtime
+            .registry
+            .create_producer(maki_commands::ProducerPrecedence::Application);
+        producer
+            .replace(vec![maki_commands::Registration {
+                spec: maki_commands::CommandSpec {
+                    name: Arc::from("/admission-race"),
+                    aliases: Arc::from([]),
+                    arguments: maki_commands::CommandArguments::Raw { required: false },
+                    docs: maki_commands::CommandDocs {
+                        summary: Arc::from("Admission race probe"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: maki_commands::TargetCapabilities::NONE,
+                },
+                behavior: Arc::new(Probe(seen.clone())),
+                argument_completions: Vec::new(),
+            }])
+            .unwrap();
+        let queued = command_runtime
+            .registry
+            .dispatch_input(&first.app.command_target, "/admission-race".into());
+        command_runtime.sync_admissions(std::collections::HashMap::from([(
+            target_id,
+            maki_lua::orchestration::TrustedTarget {
+                target: second_manager.lookup(second_id).unwrap(),
+                template: second.handles.orchestration_template.clone(),
+            },
+        )]));
+        smol::block_on(queued);
+        assert_eq!(*seen.lock().unwrap(), Some(first_id));
+        release_runtime(first);
+        release_runtime(second);
     }
 
     #[test]

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
-use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
+use maki_agent::{BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId};
 use maki_providers::{ImageSource, ModelTier};
 use ratatui::text::{Line, Span};
 
@@ -209,6 +209,7 @@ use std::path::PathBuf;
 
 pub enum Action {
     SendMessage(Box<AgentInput>),
+    RunKeybind(u64),
     ManualExit,
     ShellCommand {
         id: String,
@@ -216,6 +217,7 @@ pub enum Action {
         visible: bool,
     },
     CancelAgent {
+        turn_id: Option<TurnId>,
         run_id: u64,
     },
     CancelSubagent {
@@ -223,6 +225,11 @@ pub enum Action {
     },
     ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
+    ChangePinnedModel {
+        target: maki_agent::AgentRef,
+        spec: String,
+    },
+    SelectModel(maki_commands::ModelSelection),
     ChangeMode(String),
     ApprovePlan {
         clear_context: bool,
@@ -413,6 +420,8 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    /// A plugin's display-only row; see `maki.ui.post`.
+    Post(PostLevel),
 }
 
 impl DisplayRole {

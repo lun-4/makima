@@ -470,7 +470,12 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             }
         }
     }
-    specs.retain(|spec| policy.allows(spec));
+    specs.retain(|spec| {
+        policy.allows(spec)
+            && spec
+                .split_once('/')
+                .is_some_and(|(slug, _)| provider_available_offline(slug))
+    });
     specs
 }
 

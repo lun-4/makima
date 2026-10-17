@@ -10,7 +10,7 @@ use maki_agent::agent::estimate_message_tokens;
 #[cfg(test)]
 use maki_providers::Model;
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredSubagent};
+use maki_storage::sessions::{SessionMeta, StoredPost, StoredSubagent};
 
 use crate::AppSession;
 use maki_providers::RequestOptions;
@@ -125,6 +125,7 @@ impl App {
         let state = &self.state;
         let draft = self.input_box.buffer.value();
         SessionMeta {
+            compacted: state.session.meta.compacted,
             mode: Some(state.mode.clone().into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
@@ -212,6 +213,7 @@ impl App {
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
+            &posts_in(self.state.session.posts(), None),
         );
         self.main_chat().load_messages(display_msgs);
         let cost = self.state.cost;
@@ -250,6 +252,7 @@ impl App {
                     messages,
                     self.state.session.tool_outputs(),
                     &self.ui_config.tool_output_lines,
+                    &posts_in(self.state.session.posts(), Some(&sa.tool_use_id)),
                 );
                 chat.load_messages(display);
                 chat.mark_finished(DisplayRole::Done, DONE_TEXT);
@@ -373,4 +376,11 @@ impl App {
             },
         ))]
     }
+}
+
+fn posts_in<'a>(posts: &'a [StoredPost], chat: Option<&str>) -> Vec<&'a StoredPost> {
+    posts
+        .iter()
+        .filter(|stored| stored.chat.as_deref() == chat)
+        .collect()
 }

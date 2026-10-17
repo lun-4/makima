@@ -1,4 +1,9 @@
-use std::sync::Arc;
+use maki_lua::orchestration::TrustedTarget;
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::components::arg_completion::{ModelArgSource, PathArgSource, ThemeArgSource};
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
@@ -11,6 +16,7 @@ pub(crate) enum CommandEvent {
     Host {
         target: maki_commands::InvocationTargetId,
         request: HostRequest,
+        admission: Option<Box<TrustedTarget>>,
         reply: flume::Sender<Result<HostResponse, CommandError>>,
     },
     Outcome {
@@ -22,6 +28,7 @@ pub(crate) enum CommandEvent {
 struct UiCommandHost {
     target: std::sync::OnceLock<maki_commands::InvocationTargetId>,
     tx: flume::Sender<CommandEvent>,
+    admissions: Arc<Mutex<HashMap<maki_commands::InvocationTargetId, TrustedTarget>>>,
 }
 
 pub(crate) struct PreparedCommandTarget {
@@ -49,7 +56,25 @@ impl PreparedCommandTarget {
 }
 
 impl CommandHost for UiCommandHost {
+    fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        let target = self.target.get()?;
+        self.admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(target)
+            .cloned()
+            .map(|target| Arc::new(target) as Arc<dyn Any + Send + Sync>)
+    }
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
+        self.request_with_admission(request, self.admission_context())
+    }
+
+    fn request_with_admission(
+        &self,
+        request: HostRequest,
+        admission: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> CommandFuture<Result<HostResponse, CommandError>> {
+        let admission = admission.and_then(|value| value.downcast_ref::<TrustedTarget>().cloned());
         let Some(target) = self.target.get().copied() else {
             return Box::pin(async { Err(CommandError::StaleTarget) });
         };
@@ -59,6 +84,7 @@ impl CommandHost for UiCommandHost {
             tx.send_async(CommandEvent::Host {
                 target,
                 request,
+                admission: admission.map(Box::new),
                 reply,
             })
             .await
@@ -72,6 +98,7 @@ impl CommandHost for UiCommandHost {
 
 pub(crate) struct CommandRuntime {
     pub registry: CommandRegistry,
+    admissions: Arc<Mutex<HashMap<maki_commands::InvocationTargetId, TrustedTarget>>>,
     event_tx: flume::Sender<CommandEvent>,
     #[cfg(test)]
     event_rx: flume::Receiver<CommandEvent>,
@@ -104,6 +131,8 @@ impl CommandRuntime {
         theme_completion: Arc<ThemeArgSource>,
     ) -> (Self, flume::Receiver<CommandEvent>) {
         let (event_tx, event_rx) = flume::unbounded();
+        let admissions = Arc::default();
+        let model_completion = Arc::new(model_completion.with_targets(Arc::clone(&admissions)));
         let standard_commands = StandardCommands::register(
             &registry,
             custom_commands,
@@ -116,6 +145,7 @@ impl CommandRuntime {
         (
             Self {
                 registry,
+                admissions,
                 event_tx,
                 #[cfg(test)]
                 event_rx: event_rx.clone(),
@@ -127,10 +157,29 @@ impl CommandRuntime {
         )
     }
 
+    pub(crate) fn sync_admissions(
+        &self,
+        targets: HashMap<maki_commands::InvocationTargetId, TrustedTarget>,
+    ) {
+        *self
+            .admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = targets;
+    }
+
+    pub(crate) fn target_agent(&self, target: &TargetHandle) -> Option<maki_agent::AgentRef> {
+        self.admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&target.id())
+            .map(|admission| admission.target.clone())
+    }
+
     pub(crate) fn prepare_target(&self) -> PreparedCommandTarget {
         let host = Arc::new(UiCommandHost {
             target: std::sync::OnceLock::new(),
             tx: self.event_tx.clone(),
+            admissions: self.admissions.clone(),
         });
         PreparedCommandTarget {
             target: self
@@ -156,6 +205,26 @@ impl CommandRuntime {
         let future = self
             .registry
             .dispatch_command_with_depth(target, command, arguments, content, depth);
+        self.send_outcome(target.id(), future);
+    }
+
+    /// Dispatches with an admission pinned before the request arrived.
+    pub(crate) fn dispatch_command_pinned(
+        &self,
+        target: &TargetHandle,
+        command: ResolvedCommand,
+        arguments: Arc<str>,
+        depth: usize,
+        admission: TrustedTarget,
+    ) {
+        let future = self.registry.dispatch_command_with_admission(
+            target,
+            command,
+            arguments,
+            CommandContent::default(),
+            depth,
+            Arc::new(admission),
+        );
         self.send_outcome(target.id(), future);
     }
 
@@ -194,6 +263,14 @@ impl CommandRuntime {
                 .await;
         })
         .detach();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recv_timeout_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<CommandEvent> {
+        self.event_rx.recv_timeout(timeout).ok()
     }
 
     #[cfg(test)]

@@ -74,17 +74,22 @@ pub fn build_system_prompt_with_def(
     let instructions = format!("{env}{instructions}");
     let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
 
-    if let Some(snippet) = &def.system_prompt {
-        let plan_path = mode
-            .plan_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let vars = vars.clone().with_custom("{plan_path}", plan_path);
-        let snippet = vars.apply(snippet);
-        out.push_str(&snippet);
-    }
-
+    out.push_str(&build_mode_system_prompt(vars, def, mode));
     out
+}
+
+pub fn build_mode_system_prompt(vars: &Vars, def: &crate::ModeDef, mode: &AgentMode) -> String {
+    let Some(snippet) = &def.system_prompt else {
+        return String::new();
+    };
+    let plan_path = mode
+        .plan_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    vars.clone()
+        .with_custom("{plan_path}", plan_path)
+        .apply(snippet)
+        .into_owned()
 }
 
 fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {

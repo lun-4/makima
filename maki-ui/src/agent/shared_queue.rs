@@ -20,8 +20,11 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use maki_agent::actor::{ActorError, AgentActorHandle, QueueProjection, RootWork};
-use maki_agent::{AgentInput, ImageSource};
+use maki_agent::actor::{
+    ActorError, AgentActorHandle, QueueProjection, RootWork, TurnAdmissionOptions, TurnOrigin,
+    TurnProvenance,
+};
+use maki_agent::{AgentInput, ImageSource, TurnId};
 use maki_commands::COMPACT_COMMAND_NAME;
 use tracing::warn;
 
@@ -95,6 +98,7 @@ pub(crate) struct QueueSender {
 
 /// Actor-backed facade used by production `AgentHandles`.
 pub(crate) fn actor_queue(actor: Arc<AgentActorHandle>, run_id: Arc<AtomicU64>) -> QueueSender {
+    actor.observe_presentation(run_id.load(Ordering::Relaxed));
     QueueSender {
         backend: QueueBackend::Actor(actor),
         last_run_id: run_id,
@@ -124,12 +128,59 @@ pub(crate) fn correlation(run_id: u64) -> String {
 }
 
 impl QueueSender {
+    pub(crate) fn capture_cancel(&self, displayed_run_id: u64) -> (Option<TurnId>, u64) {
+        match &self.backend {
+            QueueBackend::Actor(actor) => {
+                let cut = actor.capture_processing_presentation_cut(displayed_run_id);
+                self.last_run_id.fetch_max(cut.1, Ordering::Relaxed);
+                cut
+            }
+            #[cfg(test)]
+            QueueBackend::Test(items) => {
+                let mut items = lock(items);
+                items.clear();
+                (None, self.reserve_run_id(displayed_run_id))
+            }
+        }
+    }
+
+    pub(crate) fn current_run_id(&self) -> u64 {
+        match &self.backend {
+            QueueBackend::Actor(actor) => actor.presentation_id(),
+            #[cfg(test)]
+            QueueBackend::Test(_) => self.last_run_id.load(Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn set_run_id(&self, run_id: u64) {
-        self.last_run_id.store(run_id, Ordering::Relaxed);
+        match &self.backend {
+            QueueBackend::Actor(actor) => actor.observe_presentation(run_id),
+            #[cfg(test)]
+            QueueBackend::Test(_) => {}
+        }
+        self.last_run_id.fetch_max(run_id, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reserve_run_id(&self, displayed_run_id: u64) -> u64 {
+        let id = match &self.backend {
+            QueueBackend::Actor(actor) => actor.reserve_presentation(displayed_run_id),
+            #[cfg(test)]
+            QueueBackend::Test(_) => {
+                self.last_run_id
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
+                        Some(allocated.max(displayed_run_id) + 1)
+                    })
+                    .unwrap_or_else(|allocated| allocated)
+                    .max(displayed_run_id)
+                    + 1
+            }
+        };
+        self.last_run_id.fetch_max(id, Ordering::Relaxed);
+        id
     }
 
     pub(crate) fn push(&self, entry: QueueItem) {
-        self.last_run_id.store(entry.run_id(), Ordering::Relaxed);
+        self.set_run_id(entry.run_id());
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).push_back(entry),
@@ -173,12 +224,23 @@ impl QueueSender {
         self.len() == 0
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&self) {
+        match &self.backend {
+            QueueBackend::Test(items) => lock(items).clear(),
+            QueueBackend::Actor(actor) => {
+                let _ = actor.clear();
+            }
+        }
+    }
+
+    /// Clears what the user queued while keeping child-result deliveries.
+    pub(crate) fn clear_user_work(&self) {
         match &self.backend {
             #[cfg(test)]
             QueueBackend::Test(items) => lock(items).clear(),
             QueueBackend::Actor(actor) => {
-                let _ = actor.clear();
+                let _ = actor.clear_user_work();
             }
         }
     }
@@ -236,7 +298,18 @@ fn push_to_actor(actor: &AgentActorHandle, entry: QueueItem) -> Result<(), Actor
         } => {
             let images = input.images.clone();
             if displayed {
-                let _ticket = actor.admit_turn(input, None, correlation(run_id))?;
+                let _ticket = actor.admit_turn_with_options(
+                    input,
+                    None,
+                    correlation(run_id),
+                    TurnAdmissionOptions {
+                        provenance: TurnProvenance {
+                            origin: TurnOrigin::User,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )?;
                 Ok(())
             } else {
                 actor.rush(RootWork::new(

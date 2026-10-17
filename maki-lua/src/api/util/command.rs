@@ -476,6 +476,9 @@ pub enum SessionRequest {
         set_default: bool,
         thinking: String,
     },
+    SetDefaultThinking {
+        thinking: String,
+    },
     Options {
         session: String,
     },
@@ -496,7 +499,8 @@ pub enum ModelRequest {
     Available,
     Set {
         spec: Option<String>,
-        thinking: Option<String>,
+        thinking: Option<maki_providers::ThinkingConfig>,
+        toggle_thinking: bool,
         fast: Option<bool>,
     },
 }
@@ -635,6 +639,9 @@ pub enum UiAction {
     RunCommand {
         cmdline: String,
         depth: u8,
+        /// The agent a keymap or event callback was pinned to; `None` runs
+        /// against the focused session.
+        target: Option<Box<crate::orchestration::TrustedTarget>>,
         reply_tx: flume::Sender<Result<(), String>>,
     },
 }

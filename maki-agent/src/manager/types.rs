@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{
@@ -61,6 +61,7 @@ pub struct AgentNodeSnapshot {
 pub struct AgentRef {
     pub(crate) manager: super::AgentManagerHandle,
     pub(crate) agent_id: AgentId,
+    pub(crate) terminal: Arc<Mutex<Option<AgentNodeSnapshot>>>,
 }
 
 impl std::fmt::Debug for AgentRef {
@@ -73,6 +74,22 @@ impl std::fmt::Debug for AgentRef {
 }
 
 impl AgentRef {
+    pub fn manager(&self) -> super::AgentManagerHandle {
+        self.manager.clone()
+    }
+
+    pub fn same_manager(&self, other: &Self) -> bool {
+        self.manager.same_manager(&other.manager)
+    }
+
+    pub fn turn_ticket(&self, turn_id: TurnId) -> Result<TurnTicket, super::ManagerError> {
+        self.manager.retained_turn_ticket(self, turn_id)
+    }
+
+    pub fn validate_live(&self) -> Result<(), super::ManagerError> {
+        self.manager.validate_live_ref(self)
+    }
+
     pub fn id(&self) -> AgentId {
         self.agent_id
     }
@@ -82,7 +99,21 @@ impl AgentRef {
     }
 
     pub fn snapshot(&self) -> Result<AgentNodeSnapshot, super::ManagerError> {
-        self.manager.node(self.agent_id)
+        if let Some(snapshot) = self
+            .terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            return Ok(snapshot);
+        }
+        self.manager.node(self.agent_id).or_else(|error| {
+            self.terminal
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+                .ok_or(error)
+        })
     }
 
     pub fn effective_config(
@@ -116,6 +147,14 @@ pub struct CurrentManagedTurn {
 }
 
 impl CurrentManagedTurn {
+    pub fn manager(&self) -> super::AgentManagerHandle {
+        self.token.manager.clone()
+    }
+
+    pub fn agent_ref(&self) -> Result<AgentRef, super::ManagerError> {
+        self.token.manager.lookup(self.agent_id())
+    }
+
     pub fn agent_id(&self) -> AgentId {
         self.token.agent_id
     }
@@ -230,6 +269,20 @@ impl TurnPermitLease {
             .register_prompt_wait(current, self, child_id, actor, ticket, timeout)
     }
 
+    pub fn observe_descendant(
+        &self,
+        current: &CurrentManagedTurn,
+        child_id: AgentId,
+        actor: &AgentActorHandle,
+        ticket: TurnTicket,
+        timeout: Option<Duration>,
+    ) -> Result<ManagedPromptWait, super::ManagerError> {
+        current
+            .token
+            .manager
+            .register_turn_wait(current, self, child_id, actor, ticket, timeout, false)
+    }
+
     pub fn admit_and_wait_for_descendant(
         &self,
         current: &CurrentManagedTurn,
@@ -237,6 +290,25 @@ impl TurnPermitLease {
         actor: &AgentActorHandle,
         admission: PromptAdmission,
         timeout: Option<Duration>,
+    ) -> Result<Option<(TurnId, ManagedPromptWait)>, super::ManagerError> {
+        self.admit_and_wait_for_descendant_with_options(
+            current,
+            child_id,
+            actor,
+            admission,
+            timeout,
+            crate::TurnAdmissionOptions::default(),
+        )
+    }
+
+    pub fn admit_and_wait_for_descendant_with_options(
+        &self,
+        current: &CurrentManagedTurn,
+        child_id: AgentId,
+        actor: &AgentActorHandle,
+        admission: PromptAdmission,
+        timeout: Option<Duration>,
+        options: crate::TurnAdmissionOptions,
     ) -> Result<Option<(TurnId, ManagedPromptWait)>, super::ManagerError> {
         if !Arc::ptr_eq(&self.inner, &current.lease.inner) {
             return Err(super::ManagerError::WrongManager);
@@ -251,10 +323,11 @@ impl TurnPermitLease {
                 actual_id: actor.agent_id(),
             });
         }
-        let Ok(ticket) = managed_actor.admit_turn(
+        let Ok(ticket) = managed_actor.admit_turn_with_options(
             admission.input,
             admission.event_sender,
             admission.correlation,
+            options,
         ) else {
             return Ok(None);
         };
@@ -280,9 +353,17 @@ impl TurnPermitLease {
 
 pub struct ManagedPromptWait {
     pub(crate) inner: Arc<super::PromptWaitInner>,
+    pub(crate) ticket: TurnTicket,
 }
 
 impl ManagedPromptWait {
+    pub async fn wait_result(self) -> Result<crate::TurnResult, PromptWaitError> {
+        let result = self.inner.wait_result().await;
+        self.inner.lease.wait_until_owned().await;
+        result?;
+        Ok(self.ticket.wait_result().await)
+    }
+
     pub async fn wait(self) -> Result<crate::TurnOutcome, PromptWaitError> {
         let result = self.inner.wait_result().await;
         self.inner.lease.wait_until_owned().await;

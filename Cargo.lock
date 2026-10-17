@@ -2795,6 +2795,7 @@ dependencies = [
  "libc",
  "maki-commands",
  "maki-config",
+ "maki-domain",
  "maki-match",
  "maki-providers",
  "maki-storage",
@@ -2882,6 +2883,7 @@ version = "0.5.5-makima"
 dependencies = [
  "serde",
  "serde_json",
+ "test-case",
  "thiserror 2.0.20",
 ]
 

@@ -36,9 +36,8 @@ const SECTIONS: &[(&str, &[&str])] = &[
     (
         "Agent & Knowledge",
         &[
-            "task",
             "task_spawn",
-            "task_get",
+            "task_wait",
             "task_send",
             "task_despawn",
             "todo_write",
@@ -270,7 +269,7 @@ pub fn generate() -> String {
         &vars,
         &DescriptionContext {
             filter: &ToolFilter::All,
-            audience: ToolAudience::MAIN,
+            audience: ToolAudience::empty(),
             workflow: false,
             mcp: false,
         },
@@ -393,6 +392,15 @@ mod tests {
         let (default, cleaned) = extract_default(input);
         assert_eq!(default, expected_default);
         assert!(cleaned.starts_with(remaining_prefix), "cleaned: {cleaned}");
+    }
+
+    #[test_case("task_wait"; "exact_wait")]
+    #[test_case("task_spawn"; "async_spawn")]
+    #[test_case("task_send"; "queued_send")]
+    #[test_case("task_despawn"; "explicit_cleanup")]
+    fn reference_includes_task_adapters(name: &str) {
+        let reference = generate();
+        assert!(reference.contains(&format!("### `{name}`")));
     }
 
     #[test]

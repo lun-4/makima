@@ -149,7 +149,7 @@ debug logs rather than as a warning at load.
 | declares none: `read`, `batch`, MCP tools, ACP client tools, `tool_search` | every permission |
 
 Declaring no capability does not mean a tool uses none. `batch`,
-`code_execution` and `task` declare nothing while invoking any other tool, so
+`code_execution` and `task_spawn` declare nothing while invoking any other tool, so
 reading undeclared as free would hand a plugin everything. Undeclared costs the
 maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
 

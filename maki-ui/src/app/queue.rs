@@ -1,6 +1,6 @@
 //! Queue for messages typed while the agent is busy.
 
-use maki_agent::AgentInput;
+use maki_agent::{AgentInput, TurnId};
 
 use super::{Action, App, Status};
 
@@ -24,11 +24,41 @@ pub(crate) enum SubmitOutcome {
 pub(crate) struct MessageQueue {
     shared: Option<QueueSender>,
     focus: Option<usize>,
+    cancelled_through: u64,
 }
 
 impl MessageQueue {
     pub(crate) fn set_shared(&mut self, shared: QueueSender) {
         self.shared = Some(shared);
+    }
+
+    pub(crate) fn fence_cancelled_presentations(&mut self, run_id: u64) {
+        self.cancelled_through = self.cancelled_through.max(run_id);
+    }
+
+    pub(crate) fn accepts_actor_presentation(&self, run_id: u64) -> bool {
+        run_id > self.cancelled_through
+            && self
+                .current_run_id()
+                .is_some_and(|allocated| run_id <= allocated)
+    }
+
+    pub(crate) fn reserve_run_id(&self, displayed_run_id: u64) -> u64 {
+        self.shared.as_ref().map_or(displayed_run_id + 1, |shared| {
+            shared.reserve_run_id(displayed_run_id)
+        })
+    }
+
+    pub(crate) fn capture_cancel(&self, displayed_run_id: u64) -> (Option<TurnId>, u64) {
+        self.shared
+            .as_ref()
+            .map_or((None, displayed_run_id + 1), |shared| {
+                shared.capture_cancel(displayed_run_id)
+            })
+    }
+
+    pub(crate) fn current_run_id(&self) -> Option<u64> {
+        self.shared.as_ref().map(QueueSender::current_run_id)
     }
 
     pub(crate) fn set_run_id(&self, run_id: u64) {
@@ -55,9 +85,17 @@ impl MessageQueue {
         self.clamp_focus();
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         if let Some(ref shared) = self.shared {
             shared.clear();
+        }
+        self.focus = None;
+    }
+
+    pub(crate) fn clear_user_work(&mut self) {
+        if let Some(ref shared) = self.shared {
+            shared.clear_user_work();
         }
         self.focus = None;
     }
@@ -290,7 +328,7 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
-        self.record_run_start(self.run_id + 1);
+        self.record_run_start(self.queue.reserve_run_id(self.run_id));
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());
@@ -300,6 +338,7 @@ impl App {
 
     pub(super) fn record_run_start(&mut self, run_id: u64) {
         self.run_id = run_id;
+        self.queue.set_run_id(run_id);
         self.clear_exit_request();
         self.stamped_subagent_outcomes.clear();
         // New work supersedes text held for recovery after an agent error.

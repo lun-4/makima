@@ -184,7 +184,9 @@ fn write_tool_output_section(out: &mut String) {
     writeln!(
         out,
         "How many lines of output to show per tool in the UI. \
-         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n"
+         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}. \
+         Earlier configurations must rename `task` to `task_spawn`; the old key is rejected. \
+         See [task and Session migration](/docs/plugins/#migration-from-the-previous-task-and-session-apis).\n"
     )
     .unwrap();
     writeln!(out, "| Field | Default |").unwrap();
@@ -365,7 +367,7 @@ All fields are optional. Typos in field names cause an error right away.
          `enabled = false` to turn one off.\n\n\
          A plugin that is off never loads, so its tool name is free for one \
          of your own plugins to take. Permission rules are keyed by the tool \
-         name alone, and names such as `bash`, `write`, and `task` already \
+         name alone, and names such as `bash`, `write`, and `task_spawn` already \
          have rules in maki. A plugin that takes one of them inherits those \
          rules, together with any \"always allow\" you saved. Maki warns you \
          at load when this happens.\n\n\

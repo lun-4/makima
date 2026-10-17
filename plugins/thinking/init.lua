@@ -1,7 +1,7 @@
 -- /thinking selector: pick an effort level by navigating left/right and
--- confirm with Enter. Any argument still passes straight through to
--- set_thinking, and choosing a level (or passing an argument) saves it as the
--- default for new sessions.
+-- confirm with Enter. Any argument passes straight through to the target
+-- agent's set_model, and choosing a level (or passing an argument) saves it as
+-- the default for new sessions.
 
 local function index_of(list, value)
   for i, v in ipairs(list) do
@@ -27,19 +27,50 @@ local function render_ladder(active, levels)
   return spans
 end
 
-local function set_thinking(mode)
-  local result, err = maki.session.set_thinking({ mode = mode, set_default = true })
-  if err then
-    maki.ui.flash("Thinking: " .. err)
+local function flash_error(err)
+  maki.ui.flash("Thinking: " .. tostring(err))
+end
+
+-- Resolves the agent this invocation targets: the command's pinned target or
+-- the agent selected when the key was pressed.
+local function target(ctx)
+  if not ctx then
+    return nil, nil, "no agent target"
+  end
+  local agent, err = maki.agent.current(ctx)
+  if not agent then
+    return nil, nil, err
+  end
+  local selection, model_err = agent:model(ctx)
+  if not selection then
+    return nil, nil, model_err
+  end
+  return agent, selection
+end
+
+local function set_thinking(ctx, agent, mode)
+  local committed, err = agent:set_model(ctx, { thinking = mode })
+  if not committed then
+    flash_error(err)
+    return
+  end
+  local _, default_err = maki.session.set_default_thinking(committed.thinking)
+  if default_err then
+    maki.ui.flash("Thinking: " .. committed.thinking .. " (default not saved: " .. default_err .. ")")
   else
-    maki.ui.flash("Thinking: " .. result.mode .. " (default for new sessions)")
+    maki.ui.flash("Thinking: " .. committed.thinking .. " (default for new sessions)")
   end
 end
 
-local function open_selector()
-  local info, err = maki.session.thinking()
-  if err then
-    maki.ui.flash("Thinking: " .. err)
+local function open_selector(_, ctx)
+  local agent, selection, err = target(ctx)
+  if not agent then
+    flash_error(err)
+    return
+  end
+  local info, info_err = maki.model.info(selection.spec)
+  if not info then
+    flash_error(info_err)
     return
   end
   if not info.supports_thinking then
@@ -47,12 +78,8 @@ local function open_selector()
     return
   end
 
-  local levels = info.options or {}
-  if #levels == 0 then
-    maki.ui.flash("Thinking: host returned no options")
-    return
-  end
-  local cursor = index_of(levels, info.mode) or 1
+  local levels = maki.model.thinking_levels()
+  local cursor = index_of(levels, selection.thinking) or 1
   local buf = maki.ui.buf()
   buf:set_lines({ render_ladder(cursor, levels) })
 
@@ -80,7 +107,7 @@ local function open_selector()
         buf:set_lines({ render_ladder(cursor, levels) })
       elseif ev.key == "enter" then
         win:close()
-        set_thinking(levels[cursor])
+        set_thinking(ctx, agent, levels[cursor])
         return
       elseif ev.key == "esc" then
         win:close()
@@ -101,26 +128,27 @@ maki.api.register_command({
       optional = true,
       completion = {
         get_items = function()
-          local info, err = maki.session.thinking()
-          if err or not info.supports_thinking or not info.options then
-            return {}
-          end
           local items = {}
-          for _, option in ipairs(info.options) do
-            items[#items + 1] = { label = option, insertion = option }
+          for _, level in ipairs(maki.model.thinking_levels()) do
+            items[#items + 1] = { label = level, insertion = level }
           end
           return items
         end,
       },
     },
   },
-  handler = function(opts)
-    local args = opts.values.effort
-    if args then
-      set_thinking(args)
+  handler = function(opts, ctx)
+    local effort = opts.values.effort
+    if not effort then
+      open_selector(nil, ctx)
       return
     end
-    open_selector()
+    local agent, _, err = target(ctx)
+    if not agent then
+      flash_error(err)
+      return
+    end
+    set_thinking(ctx, agent, effort)
   end,
 })
 

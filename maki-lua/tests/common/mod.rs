@@ -11,11 +11,14 @@
 
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use maki_agent::cancel::{CancelMap, CancelToken, CancelTrigger};
+use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::tools::{DescriptionContext, RequestTools, ToolContext, ToolRegistry};
 use maki_agent::{AgentMode, Envelope, EventSender, ToolOutput};
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -24,6 +27,16 @@ use maki_providers::{
 };
 use maki_storage::id::SessionRef;
 use serde_json::Value;
+
+const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub async fn bounded<T>(future: impl Future<Output = T>) -> T {
+    futures_lite::future::race(future, async {
+        smol::Timer::after(TEST_OPERATION_TIMEOUT).await;
+        panic!("test operation did not finish within {TEST_OPERATION_TIMEOUT:?}");
+    })
+    .await
+}
 
 /// A provider that hands back canned single-turn responses so a run completes
 /// deterministically without any network or credentials. It records the
@@ -170,19 +183,38 @@ pub fn production_like_ctx() -> (ToolContext, CancelTrigger) {
     (ctx, run_trigger)
 }
 
+pub fn with_request_tools(registry: &ToolRegistry, ctx: &ToolContext) -> ToolContext {
+    let mut ctx = ctx.clone();
+    let definitions = registry.definitions(
+        &Vars::new(),
+        &DescriptionContext {
+            filter: &ctx.tool_filter,
+            audience: ctx.audience,
+            workflow: ctx.workflow,
+            mcp: false,
+        },
+        ctx.model.supports_tool_examples(),
+    );
+    let tools = RequestTools::assembled(definitions, &ctx.config, &ctx.model);
+    ctx.tool_filter = Arc::clone(tools.filter());
+    ctx.request_tools = Some(tools);
+    ctx
+}
+
 pub fn exec_tool_text(
     reg: &ToolRegistry,
     ctx: &ToolContext,
     name: &str,
     input: Value,
 ) -> Result<String, String> {
+    let ctx = with_request_tools(reg, ctx);
     let inv = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"))
         .tool
         .parse(&input)
         .expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
+    smol::block_on(bounded(inv.execute(&ctx)))
         .output
         .map(|out| match out {
             ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,

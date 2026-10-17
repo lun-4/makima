@@ -10,13 +10,20 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
+use maki_agent::{POST_LEVELS, Post, PostLevel};
+
+use crate::agent_errors::{
+    BLANK_POST, UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION, UNLINKABLE_POST_AGENT,
+};
+use crate::api::agent::{LuaAgent, LuaAgentRef, focused_agent_ref, send_post};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
     StatusContent, StatusContentEntries, StatusContentWriter, TitlePos, UiAction, WinCommand,
     WinEvent, ui_send,
 };
 use crate::api::util::convert::opt_bool;
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::ctx::LuaCtx;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::picker::{PickerCallbackEntry, PickerCallbacks, PickerResult};
 use crate::docs::{FnDoc, ParamDoc};
 pub(crate) mod blit;
@@ -672,6 +679,88 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
 };
 
+/// Resolve the agent that has UI focus now. Later focus changes do not
+/// retarget the returned reference. Pass it to `maki.agent.get(ctx, ref)` for
+/// control; this call grants no authority. Delegated tool handlers cannot read
+/// UI focus.
+///
+/// @return (AgentRef?, string?) Visibility-only reference, or nil and an error when no agent has focus.
+/// @example
+/// local focused, err = maki.ui.focused_agent()
+/// if focused then
+///   local agent = assert(maki.agent.get(ctx, focused))
+///   local selection = assert(agent:model(ctx))
+/// end
+#[lua_fn]
+fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {
+    Ok((Some(try_pair!(focused_agent_ref(lua))), None))
+}
+
+const POST_OPTIONS: &[&str] = &["agent", "level"];
+
+/// Show {text} as a row in the chat of the agent {ctx} is pinned to. A post
+/// is for the user only: it never reaches the model, and later focus changes
+/// do not move it. It is saved with the session and comes back on restore.
+/// Trusted commands, keymaps and callbacks can post; delegated tool handlers
+/// cannot, since their tool row already speaks for them.
+///
+/// `maki.agent.spawn` posts a row for each child it shows; see its `show`
+/// option.
+///
+/// @param ctx LuaCtx Trusted invocation context.
+/// @param text string Row text. Must not be blank.
+/// @param opts table? Optional fields:
+///   `level` (string?) - "info" (default), "warn" or "error".
+///   `agent` (Agent?) - a child spawned from Lua that the post is about.
+/// Any other option key is an error.
+/// @return (boolean?, string?) True once sent, or nil and an error.
+/// @example
+/// local ok, err = maki.ui.post(ctx, "review found 3 issues", {
+///   level = "warn",
+///   agent = reviewer,
+/// })
+#[lua_fn]
+fn post(
+    lua: &Lua,
+    ctx: mlua::UserDataRef<LuaCtx>,
+    text: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    let target = try_pair!(ctx.trusted(lua));
+    if text.trim().is_empty() {
+        return Ok(err_pair(BLANK_POST));
+    }
+    let mut post = Post {
+        text,
+        level: PostLevel::default(),
+        agent: None,
+    };
+    if let Some(opts) = opts {
+        for entry in opts.pairs::<mlua::Value, mlua::Value>() {
+            let (key, _) = entry?;
+            let known = matches!(&key, mlua::Value::String(name) if POST_OPTIONS.contains(&&*name.to_str()?));
+            if !known {
+                return Ok(err_pair(format!(
+                    "{UNKNOWN_POST_OPTION}: {}",
+                    key.to_string()?
+                )));
+            }
+        }
+        if let Some(level) = opts.get::<Option<String>>("level")? {
+            post.level = try_pair!(PostLevel::parse(&level).ok_or_else(|| format!(
+                "{UNKNOWN_POST_LEVEL} '{level}', expected one of: {}",
+                POST_LEVELS.join(", ")
+            )));
+        }
+        if let Some(agent) = opts.get::<Option<mlua::UserDataRef<LuaAgent>>>("agent")? {
+            post.agent =
+                Some(try_pair!(agent.transcript_id().ok_or(UNLINKABLE_POST_AGENT)).to_owned());
+        }
+    }
+    try_pair!(send_post(lua, target, post));
+    Ok((Some(true), None))
+}
+
 lua_table! {
     /// Functions for building interactive UI. Create buffers to hold
     /// content, open floating or split windows to display them, highlight
@@ -684,7 +773,7 @@ lua_table! {
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
-        display_width, truncate_text,
+        display_width, truncate_text, focused_agent, post,
         manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,
         manual set_status_content, manual set_status_hint, manual set_window_title,
     ]

@@ -1,6 +1,6 @@
 # Agent invariants
 
-This checklist describes current correctness requirements. A change that intentionally alters one of these rules should update the implementation, deterministic regression tests, and [`agent-system.md`](agent-system.md) together.
+These invariants cover the actor and manager from the first three Issue 24 deliveries. Later deliveries add configuration and Lua authority contracts documented in the [Lua API reference](../site/docs/content/lua-api/_index.md) and [plugin guide](../site/docs/content/plugins/_index.md). A change to an invariant should update its implementation, regression coverage, and applicable contract documentation.
 
 ## Identity and authority
 

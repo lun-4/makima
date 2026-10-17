@@ -386,7 +386,7 @@ mod tests {
         }
     }
 
-    /// Shape of workflow mode: a script awaits `task`, and the subagent it
+    /// Shape of workflow mode: a script awaits `task_wait`, and the subagent it
     /// waits on runs a script of its own. Scopes that serialized would sit
     /// on each other forever.
     #[test]

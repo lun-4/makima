@@ -32,9 +32,10 @@ use maki_commands::{
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::EventHandle;
+use maki_lua::host_root::HostRootServices;
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_providers::model::Model;
-use maki_providers::{TokenUsage, add_cost};
+use maki_providers::{RequestOptions, TokenUsage, add_cost};
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Serialize;
 use serde_json::Value;
@@ -371,6 +372,10 @@ pub fn run(
     let terminal_result_emitted = std::cell::Cell::new(false);
     let state_dir = maki_storage::paths::state_dir().ok();
     let runner = |input: AgentInput| {
+        let options = RequestOptions {
+            thinking: input.thinking,
+            fast: input.fast,
+        };
         let handle = maki_agent::headless::spawn(HeadlessParams {
             model: model.clone(),
             config,
@@ -381,7 +386,7 @@ pub fn run(
             excluded_tools: vec![QUESTION_TOOL_NAME],
             mcp_handle,
             initial_wd: cwd,
-            model_policy,
+            model_policy: Arc::clone(&model_policy),
             system_prompt_override,
             append_system_prompt,
             plugin_rules: Arc::clone(&plugin_rules),
@@ -393,6 +398,7 @@ pub fn run(
         .map_err(|error| eyre!("register print session coordinator: {error}"))?;
 
         let HeadlessHandle {
+            agent_id,
             event_rx,
             tool_names,
             session_id,
@@ -400,6 +406,14 @@ pub fn run(
             task,
             offload_cleanup,
         } = handle;
+        let host_root = Arc::new(HostRootServices::fixed(
+            agent_id,
+            model,
+            options,
+            model_policy,
+        ));
+        let _host_root_retirement = host_root.retirement_guard();
+        lua_handle.install_host_root_services(host_root);
         let start = Instant::now();
         let (mut result, verbose_out) = run_and_settle(task, offload_cleanup, || {
             let mut verbose_out = match format {
@@ -483,6 +497,7 @@ pub fn run(
                     | AgentEvent::Question { .. }
                     | AgentEvent::SubagentHistory { .. }
                     | AgentEvent::SubagentClosed
+                    | AgentEvent::Post(_)
                     | AgentEvent::ToolSnapshot { .. }
                     | AgentEvent::ToolHeaderSnapshot { .. }
                     | AgentEvent::LiveToolBuf { .. }
@@ -1005,8 +1020,10 @@ mod tests {
         assert!(!dir.exists(), "print mode must remove its offload dir");
     }
 
-    #[test]
-    fn print_turn_uses_initialized_config() {
+    #[test_case(maki_providers::ModelSelection { fast: Some(false), ..Default::default() }; "options_only") ]
+    #[test_case(maki_providers::ModelSelection::default(); "empty_patch") ]
+    #[test_case(maki_providers::ModelSelection { spec: Some(Arc::from("openai/gpt-5")), ..Default::default() }; "model_switch") ]
+    fn print_turn_uses_initialized_config(patch: maki_providers::ModelSelection) {
         const SPEC: &str = "anthropic/claude-opus-4-8";
         const SYSTEM: &str = "print initialized system";
         let registry = CommandRegistry::new();
@@ -1038,6 +1055,23 @@ mod tests {
                 },
                 Arc::new(RecordingPrintProvider(requests)),
             )?;
+            let root = Arc::new(HostRootServices::fixed(
+                handle.agent_id,
+                &Model::from_spec(SPEC).unwrap(),
+                RequestOptions {
+                    fast: true,
+                    thinking: maki_providers::ThinkingConfig::Off,
+                },
+                Arc::new(ModelPolicy::default()),
+            ));
+            let reference = root.reference();
+            assert_eq!(reference.id(), handle.agent_id);
+            assert!(root.model(&reference).unwrap().fast);
+            assert!(matches!(
+                smol::block_on(root.set_model(&reference, patch)),
+                Err(maki_lua::host_root::HostRootError::FixedModel)
+            ));
+            let _retirement = root.retirement_guard();
             smol::block_on(handle.task);
             Ok(())
         })

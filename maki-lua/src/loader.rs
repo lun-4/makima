@@ -20,6 +20,7 @@ use crate::api::util::command::{CommandGenerationMap, HintReader, StatusContentR
 use crate::api::util::picker::PickerEvent;
 use crate::coalesced_latest::CoalescedLatest;
 use crate::error::PluginError;
+use crate::orchestration::TrustedTarget;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{
     self, ClickFallback, CommandArgumentContext, CommandArgumentLifecycle,
@@ -301,6 +302,7 @@ impl PluginHost {
                 state_dir,
                 fs,
                 session_provider_preparer,
+                orchestration_services: Default::default(),
             },
         )?;
         Ok(Self {
@@ -562,6 +564,22 @@ impl PluginHost {
             })
             .map_err(|_| PluginError::HostDead)?;
         Ok(reply_rx)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn collect_garbage_for_test(&self) -> Result<(), PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TestCollectGarbage { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx
+            .recv()
+            .map_err(|_| PluginError::HostDead)?
+            .map_err(|source| PluginError::Lua {
+                plugin: "<test-gc>".to_owned(),
+                source,
+            })
     }
 
     #[cfg(feature = "test-support")]
@@ -1048,10 +1066,34 @@ impl EventHandle {
         rx
     }
 
-    /// Headless drivers install their own provider so `maki.session.read` has
-    /// something to answer with instead of "no interactive UI attached". The UI
-    /// leaves the slot empty and answers through its event loop, which owns the
-    /// live session runtimes.
+    /// Install explicit agent target and discovery services supplied by the host.
+    pub fn install_orchestration_services(
+        &self,
+        services: Arc<dyn crate::orchestration::OrchestrationServices>,
+    ) {
+        let _ = self.tx.try_send(Request::InstallOrchestrationServices(
+            crate::orchestration::OrchestrationServicesSlot(Some(services)),
+        ));
+    }
+
+    pub fn install_host_root_services(&self, services: Arc<crate::host_root::HostRootServices>) {
+        self.install_host_root_services_with_template(services, None);
+    }
+
+    pub fn install_host_root_services_with_template(
+        &self,
+        services: Arc<crate::host_root::HostRootServices>,
+        template: Option<maki_agent::tools::ToolContext>,
+    ) {
+        let _ = self.tx.try_send(Request::InstallHostRootServices(Box::new(
+            crate::orchestration::HostRootServicesSlot {
+                services: Some(services),
+                template,
+            },
+        )));
+    }
+
+    /// Supply session snapshots for hosts without an interactive event loop.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
         let _ = self
             .tx
@@ -1286,9 +1328,14 @@ impl EventHandle {
             .is_ok()
     }
 
-    pub fn run_keybind_callback(&self, id: u64) -> bool {
+    /// Runs keymap callback {id} against the target the host captured when
+    /// the key was pressed.
+    pub fn run_keybind_callback(&self, id: u64, target: Option<TrustedTarget>) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { id })
+            .try_send(Request::RunKeybindCallback {
+                id,
+                target: target.map(Box::new),
+            })
             .is_ok()
     }
 
@@ -2312,7 +2359,7 @@ mod tests {
         );
 
         let handle = host.event_handle();
-        handle.run_keybind_callback(entry.id);
+        handle.run_keybind_callback(entry.id, None);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2438,7 +2485,7 @@ mod tests {
         assert_eq!(keymaps.entries.len(), 1);
         assert_eq!(keymaps.entries[0].desc, "old keymap");
         host.event_handle()
-            .run_keybind_callback(keymaps.entries[0].id);
+            .run_keybind_callback(keymaps.entries[0].id, None);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while !command_snapshot(&host)

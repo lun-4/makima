@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
+use crate::agent_errors::DELEGATED_REGISTRATION;
 use crate::api::util::dispatch::{DepthGuard, Reentry, call_isolated};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -183,7 +185,7 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   `callback` (function) called with an ev table `{ id, event, match, data }`.
 ///   `once` (boolean) remove the handler after it fires once (default false).
 ///   `pattern` (string|string[]) only fire when the pattern matches. `"*"` matches everything. Omit to match all.
-/// @return (integer) Autocmd id.
+/// @return (integer|nil, string|nil) Autocmd id. Returns nil and an error when called from a delegated tool handler.
 /// @example
 /// local id = maki.api.create_autocmd("TurnEnd", {
 ///   callback = function(ev)
@@ -197,47 +199,55 @@ fn create_autocmd(
     #[ctx] plugin: Arc<str>,
     event: Value,
     opts: Table,
-) -> LuaResult<u64> {
-    let events = parse_string_or_seq(event, "event")?;
-    let callback: Function = opts.get("callback")?;
-    let once: bool = opts.get("once").unwrap_or(false);
-    let patterns = match opts.get::<Value>("pattern")? {
-        Value::Nil => None,
-        v => Some(parse_string_or_seq(v, "pattern")?),
-    };
-    let id = NEXT_AUTOCMD_ID.fetch_add(1, Ordering::Relaxed);
-    if crate::runtime::loading_plugin_is(lua, &plugin) {
-        let mut store = pending.lock().unwrap_or_else(|error| error.into_inner());
-        for event in events {
-            store.register(
-                event,
-                AutocmdEntry {
-                    id,
-                    callback: callback.clone(),
-                    plugin: Arc::clone(&plugin),
-                    once,
-                    patterns: patterns.clone(),
-                },
-            );
-        }
-    } else {
-        let mut store = lua
-            .app_data_mut::<AutocmdStore>()
-            .ok_or_else(|| mlua::Error::runtime("autocmd store not initialized"))?;
-        for event in events {
-            store.register(
-                event,
-                AutocmdEntry {
-                    id,
-                    callback: callback.clone(),
-                    plugin: Arc::clone(&plugin),
-                    once,
-                    patterns: patterns.clone(),
-                },
-            );
-        }
+) -> LuaResult<Pair<u64>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_REGISTRATION));
     }
-    Ok(id)
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
+    let registered = || -> LuaResult<u64> {
+        let events = parse_string_or_seq(event, "event")?;
+        let callback: Function = opts.get("callback")?;
+        let once: bool = opts.get("once").unwrap_or(false);
+        let patterns = match opts.get::<Value>("pattern")? {
+            Value::Nil => None,
+            v => Some(parse_string_or_seq(v, "pattern")?),
+        };
+        let id = NEXT_AUTOCMD_ID.fetch_add(1, Ordering::Relaxed);
+        if crate::runtime::loading_plugin_is(lua, &plugin) {
+            let mut store = pending.lock().unwrap_or_else(|error| error.into_inner());
+            for event in events {
+                store.register(
+                    event,
+                    AutocmdEntry {
+                        id,
+                        callback: callback.clone(),
+                        plugin: Arc::clone(&plugin),
+                        once,
+                        patterns: patterns.clone(),
+                    },
+                );
+            }
+        } else {
+            let mut store = lua
+                .app_data_mut::<AutocmdStore>()
+                .ok_or_else(|| mlua::Error::runtime("autocmd store not initialized"))?;
+            for event in events {
+                store.register(
+                    event,
+                    AutocmdEntry {
+                        id,
+                        callback: callback.clone(),
+                        plugin: Arc::clone(&plugin),
+                        once,
+                        patterns: patterns.clone(),
+                    },
+                );
+            }
+        }
+        Ok(id)
+    };
+    let value = registered()?;
+    Ok((Some(value), None))
 }
 
 /// Remove a previously registered autocmd. Does nothing if the {id}

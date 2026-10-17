@@ -46,9 +46,58 @@ pub struct ParamDoc {
     pub desc: &'static str,
 }
 
+const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
+    name: "LuaCtx",
+    kind: DocKind::Class,
+    desc: "Host-issued invocation context. Tool contexts have delegated authority over the executing agent and allowed descendants. Command/keymap/event contexts have trusted plugin authority over their pinned host target. Authority expires on invocation exit, cancellation or plugin-generation revocation; retaining userdata does not extend it. Unsupported capabilities return nil and an error.",
+    fns: &[
+        FnDoc {
+            name: "agent",
+            args: "",
+            desc: "Resolve the pinned invocation subject, not current UI focus. Equivalent to maki.agent.current(ctx).",
+            params: &[],
+            returns: "(Agent?, string?) Nonowning handle with no authority independent of this context.",
+            example: "",
+            guard: None,
+        },
+        FnDoc {
+            name: "model",
+            args: "",
+            desc: "Read the executing turn's admitted selection. This can differ from Agent:model(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
+            params: &[],
+            returns: "(table?, string?) Complete normalized selection {spec, thinking, fast}; thinking is a setting string or budget integer. Disabled values are off and false.",
+            example: "",
+            guard: None,
+        },
+        FnDoc {
+            name: "mode",
+            args: "",
+            desc: "Read the executing turn's admitted mode. This can differ from Agent:mode(ctx), which reads committed configuration. Trusted command/event contexts without an executing turn return an unsupported-capability error.",
+            params: &[],
+            returns: "(string?, string?) Registered mode name.",
+            example: "",
+            guard: None,
+        },
+        FnDoc {
+            name: "defer_close",
+            args: "{agent}",
+            desc: "Register agent close at the end of the current host task, including cancellation. Validates current close authority before registration; host-held cleanup does not depend on a retained context remaining valid.",
+            params: &[ParamDoc {
+                name: "{agent}",
+                ty: "Agent",
+                desc: "Agent to close. Host roots do not support this operation.",
+            }],
+            returns: "(boolean?, string?) true when cleanup is registered, or nil and an error.",
+            example: "",
+            guard: None,
+        },
+    ],
+};
+
 pub fn api_docs() -> Vec<&'static ModuleDoc> {
     use crate::api;
     vec![
+        &CONTEXT_DOCS,
         &api::util::setup::DOCS,
         &api::tool::DOCS,
         &api::completion::DOCS,
@@ -58,6 +107,10 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::slot::DOCS,
         &api::agent::DOCS,
         &api::agent::SESSION_DOCS,
+        &api::agent::AGENT_DOCS,
+        &api::agent::REF_DOCS,
+        &api::agent::SUBSCRIPTION_DOCS,
+        &api::agent::TURN_DOCS,
         &api::r#async::DOCS,
         &api::r#async::SEMAPHORE_DOCS,
         &api::r#async::PERMIT_DOCS,

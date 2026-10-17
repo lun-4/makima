@@ -35,8 +35,9 @@ pub use registry::{
 pub use spec::{
     BUILTIN_COMMANDS, BuiltinDefinition, BuiltinId, BuiltinOperation, COMPACT_COMMAND_NAME,
     CommandDocs, CommandFuture, CommandId, CommandSpec, CompletionKey, CompletionSessionId,
-    HostContextRequest, HostContextResponse, InvocationTargetId, MAX_COMMAND_DEPTH, ProducerId,
-    Registration, StaticArgumentCompletion, TargetCapabilities, TargetCapability,
+    HostContextRequest, HostContextResponse, InvocationTargetId, MAX_COMMAND_DEPTH,
+    MODEL_COMMAND_NAME, ModelSelection, ProducerId, Registration, StaticArgumentCompletion,
+    TargetCapabilities, TargetCapability, parse_model_selection,
 };
 
 #[cfg(test)]

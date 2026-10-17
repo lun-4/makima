@@ -4,7 +4,7 @@ use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use crate::theme::InMemoryThemesProvider;
-use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
+use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, TASK_SPAWN_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
@@ -325,7 +325,7 @@ fn unknown_tool_id_is_noop() {
 
 #[test]
 fn fail_in_progress_except_preserves_excluded_tool() {
-    let mut panel = panel_with_tools(&[("agent", "task"), ("shell", "bash")]);
+    let mut panel = panel_with_tools(&[("agent", TASK_SPAWN_TOOL_NAME), ("shell", "bash")]);
     let excluded = HashSet::from(["shell".to_string()]);
 
     panel.fail_in_progress_except("missing completion".into(), &excluded);
@@ -845,7 +845,7 @@ fn wrapped_line_count_cases(input: &[&str], width: u16, expected: u16) {
 
 #[test]
 fn update_tool_model_sets_annotation() {
-    let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "bash")]);
+    let mut panel = panel_with_tools(&[("t1", TASK_SPAWN_TOOL_NAME), ("t2", "bash")]);
     rebuild(&mut panel);
 
     panel.update_tool_model("t1", "anthropic/claude-sonnet-4-20250514");
@@ -862,7 +862,7 @@ fn set_tool_turn_usage_updates_exact_tool_and_keeps_annotation() {
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const USAGE: &str = "1.2k↑ 345↓ $0.010";
 
-    let mut panel = panel_with_tools(&[("t1", "task"), ("t2", "task")]);
+    let mut panel = panel_with_tools(&[("t1", TASK_SPAWN_TOOL_NAME), ("t2", TASK_SPAWN_TOOL_NAME)]);
     panel.update_tool_model("t1", MODEL);
 
     panel.set_tool_turn_usage("t1", USAGE.into());

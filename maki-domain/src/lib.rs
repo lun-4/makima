@@ -3,6 +3,15 @@
 use serde::{Deserialize, Serialize};
 
 pub mod maki_thinking;
+pub mod post;
+pub mod selection;
+
+pub use post::{POST_LEVELS, Post, PostLevel};
+
+pub use selection::{
+    FAST_VALUES, MODEL_FAST_KEY, MODEL_OPTION_KEYS, MODEL_SPEC_KEY, MODEL_THINKING_KEY,
+    ModelSelection, ModelSelectionError, parse_fast, parse_thinking,
+};
 
 pub use maki_thinking::{
     Effort, FALLBACK_MAX_THINKING_BUDGET, MIN_THINKING_BUDGET, StoredThinking, THINKING_METADATA,

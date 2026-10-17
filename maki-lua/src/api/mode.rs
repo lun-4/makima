@@ -8,8 +8,9 @@ use maki_agent::{ModeDefSpec, ModeError, ModeId, ModeRegistry};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
+use crate::agent_errors::DELEGATED_HOST_MUTATION;
 use crate::api::util::command::{SessionRequest, UiAction, ui_send};
-use crate::api::util::pair::{Pair, err_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 const NO_REGISTRY_ERR: &str = "mode registry not available";
 
@@ -80,6 +81,10 @@ fn spec_from_table(lua: &Lua, opts: Table) -> LuaResult<ModeDefSpec> {
 /// maki.api.mode.define({ name = "plan", label = "[PLAN]", tools = { "read", "write" } })
 #[lua_fn]
 fn define(lua: &Lua, opts: Table) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let spec = spec_from_table(lua, opts)?;
     let reg = registry(lua)?;
     match reg.define(spec) {
@@ -120,6 +125,10 @@ async fn set(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     name: String,
 ) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(&lua) {
+        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(&lua));
     set_inner(&lua, tx, name).await
 }
 
@@ -180,6 +189,10 @@ fn list(lua: &Lua) -> LuaResult<Pair<Table>> {
 /// maki.api.mode.reset("plan")
 #[lua_fn]
 fn reset(lua: &Lua, name: Option<String>) -> LuaResult<Pair<bool>> {
+    if crate::runtime::in_delegated_tool(lua) {
+        return Ok(err_pair(DELEGATED_HOST_MUTATION));
+    }
+    try_pair!(crate::runtime::validate_plugin_effect(lua));
     let reg = registry(lua)?;
     let result = match name {
         Some(name) => reg.reset(&ModeId::parse(&name)),
