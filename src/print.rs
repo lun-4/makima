@@ -232,7 +232,7 @@ fn drive_print(
             mode: literal.mode.clone(),
             images: command_attachments::into_images(&content.attachments)?,
             preamble: Vec::new(),
-            thinking: Default::default(),
+            thinking: literal.thinking,
             fast: literal.fast,
             workflow: literal.workflow,
             prompt: None,
@@ -371,6 +371,13 @@ pub fn run(
     let terminal_result_emitted = std::cell::Cell::new(false);
     let state_dir = maki_storage::paths::state_dir().ok();
     let runner = |input: AgentInput| {
+        // What this run reports to Lua, read before the input moves.
+        let meta_fast = input.fast && model.supports_fast();
+        let meta_thinking = if model.supports_thinking() {
+            input.thinking
+        } else {
+            maki_agent::ThinkingConfig::Off
+        };
         let handle = maki_agent::headless::spawn(HeadlessParams {
             model: model.clone(),
             config,
@@ -435,8 +442,8 @@ pub fn run(
                     id: session_id.to_string(),
                     cwd: cwd.clone(),
                     model: model.spec(),
-                    fast: false,
-                    thinking: String::new(),
+                    fast: meta_fast,
+                    thinking: meta_thinking.to_string(),
                 },
                 // `makima --print` always runs the agent in build mode
                 // (`headless::spawn` hardcodes `AgentMode::Build`).
@@ -631,6 +638,7 @@ pub fn run(
 mod tests {
     use super::*;
     use flume::{Receiver, Sender};
+    use maki_agent::ThinkingConfig;
     use maki_agent::{
         AgentError, ToolOutput,
         tools::{
@@ -644,7 +652,7 @@ mod tests {
         StreamResponse, TokenUsage,
         provider::{BoxFuture, Provider},
     };
-    use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
+    use maki_storage::sessions::{Effort, SESSIONS_DIR, StoredThinking, offload_dir};
     use std::borrow::Cow;
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -789,7 +797,7 @@ mod tests {
         }
     }
 
-    struct RecordingPrintProvider(flume::Sender<(String, String, bool)>);
+    struct RecordingPrintProvider(flume::Sender<(String, String, bool, ThinkingConfig)>);
 
     impl maki_providers::provider::Provider for RecordingPrintProvider {
         fn stream_message<'a>(
@@ -807,7 +815,12 @@ mod tests {
         > {
             Box::pin(async move {
                 self.0
-                    .send((model.spec(), system.to_owned(), options.fast))
+                    .send((
+                        model.spec(),
+                        system.to_owned(),
+                        options.fast,
+                        options.thinking,
+                    ))
                     .unwrap();
                 Ok(maki_providers::StreamResponse {
                     message: maki_providers::Message {
@@ -1012,8 +1025,20 @@ mod tests {
         let registry = CommandRegistry::new();
         let target = target(&registry);
         let (requests, received) = flume::unbounded();
-        let mut literal = input("print request");
-        literal.fast = true;
+        // Built the way `print::run` builds it, so a literal (non-command)
+        // turn must keep every `always_*` knob.
+        let literal = AgentInput::from_defaults(
+            "print request".into(),
+            AgentMode::Build,
+            Vec::new(),
+            SessionDefaults {
+                fast: true,
+                workflow: false,
+                thinking: Some(StoredThinking::Effort {
+                    level: Effort::XHigh,
+                }),
+            },
+        );
         drive_print(&registry, &target, &CommandTurnMarker, literal, |input| {
             let cwd = std::env::temp_dir();
             let handle = maki_agent::headless::spawn_with_provider(
@@ -1044,7 +1069,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             received.try_recv().unwrap(),
-            (SPEC.into(), SYSTEM.into(), true)
+            (
+                SPEC.into(),
+                SYSTEM.into(),
+                true,
+                ThinkingConfig::Effort(Effort::XHigh)
+            )
         );
         assert!(received.try_recv().is_err());
     }

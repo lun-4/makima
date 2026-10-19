@@ -508,6 +508,8 @@ async fn new_session(
     let session_id = handle.session_id.to_string();
     let spec = params.model.spec();
     let persisted_options = Default::default();
+    // A blank session takes every `always_*` knob; the session options seeded
+    // here are what each turn actually runs with.
     let snapshot = install_session(
         srv,
         params,
@@ -518,9 +520,13 @@ async fn new_session(
             history: Vec::new(),
             initial_cost: None,
             cwd,
-            fast: false,
-            workflow: false,
-            thinking: maki_agent::ThinkingConfig::Off,
+            fast: params.defaults.fast && params.model.supports_fast(),
+            workflow: params.defaults.workflow,
+            thinking: params
+                .defaults
+                .thinking
+                .filter(|_| params.model.supports_thinking())
+                .into(),
             persisted_options: &persisted_options,
         },
     )
@@ -569,12 +575,14 @@ async fn load_session(
     let fast = restored.meta.fast && recorded_model.supports_fast();
     let yolo = restored.meta.yolo.unwrap_or(params.yolo);
     let workflow = restored.meta.workflow;
+    // A stored choice (including off) wins; `always_thinking` covers sessions
+    // that never recorded one.
     let thinking = restored
         .meta
         .thinking
-        .map(maki_agent::ThinkingConfig::from)
+        .or(params.defaults.thinking)
         .filter(|_| recorded_model.supports_thinking())
-        .unwrap_or_default();
+        .into();
     let replay_history = restored.history.clone();
     let coordinator_history = restored.history.clone();
     let handle = spawn_session(

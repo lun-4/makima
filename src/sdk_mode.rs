@@ -741,14 +741,17 @@ pub fn run(params: SdkParams) -> Result<()> {
     } else {
         defaults.workflow
     };
+    // `always_thinking` seeds a session that has no stored choice of its own;
+    // a resumed session's explicit setting (including off) still wins.
+    let thinking = maki_agent::ThinkingConfig::from(
+        restored
+            .meta
+            .thinking
+            .or(defaults.thinking)
+            .filter(|_| model.supports_thinking()),
+    );
     defaults.fast = fast;
     defaults.workflow = workflow;
-    let thinking = restored
-        .meta
-        .thinking
-        .map(maki_agent::ThinkingConfig::from)
-        .filter(|_| model.supports_thinking())
-        .unwrap_or_default();
     let persisted_options = restored.meta.session_options;
     let session_id = restored.id;
     let initial_history = restored.history;
@@ -953,8 +956,8 @@ pub fn run(params: SdkParams) -> Result<()> {
             id: handle.session_id.to_string(),
             cwd: working_dir.clone(),
             model: startup_model.spec(),
-            fast: params.defaults.fast,
-            thinking: maki_agent::ThinkingConfig::from(params.defaults.thinking).to_string(),
+            fast,
+            thinking: thinking.to_string(),
         },
         // `set_permission_mode` can flip this mid-run, so read it per call.
         move || match shared_for_mode.lock().unwrap().permission_mode {
